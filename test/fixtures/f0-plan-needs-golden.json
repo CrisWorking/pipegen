@@ -1,0 +1,522 @@
+{
+ "needs": [
+  {
+   "id": "hooks",
+   "layer": "pre-commit",
+   "category": "hooks",
+   "why": "Sets up the git hook manager that runs the pre-commit checks.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "secrets",
+   "layer": "pre-commit",
+   "category": "secrets",
+   "why": "Stops passwords, keys and tokens from being committed or merged.",
+   "blocking": true,
+   "floor": true
+  },
+  {
+   "id": "format-lint",
+   "layer": "pre-commit",
+   "category": "format-lint",
+   "service": "web",
+   "why": "Checks formatting and lint on changed files before each commit, without blocking it.",
+   "blocking": false,
+   "floor": false
+  },
+  {
+   "id": "format-lint",
+   "layer": "pre-commit",
+   "category": "format-lint",
+   "service": "lib",
+   "why": "Checks formatting and lint on changed files before each commit, without blocking it.",
+   "blocking": false,
+   "floor": false
+  },
+  {
+   "id": "hooks-ci",
+   "layer": "push",
+   "category": "hooks-ci",
+   "why": "Runs the pre-commit hooks in CI on all files, so skipping them locally is caught.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "secrets",
+   "layer": "push",
+   "category": "secrets",
+   "why": "Stops passwords, keys and tokens from being committed or merged.",
+   "blocking": true,
+   "floor": true
+  },
+  {
+   "id": "sast",
+   "layer": "push",
+   "category": "sast",
+   "service": "web",
+   "why": "Scans the source code for common security bugs.",
+   "blocking": true,
+   "floor": true
+  },
+  {
+   "id": "sast",
+   "layer": "push",
+   "category": "sast",
+   "service": "lib",
+   "why": "Scans the source code for common security bugs.",
+   "blocking": true,
+   "floor": true
+  },
+  {
+   "id": "deps",
+   "layer": "push",
+   "category": "deps",
+   "service": "web",
+   "why": "Checks the dependencies for known vulnerabilities.",
+   "blocking": true,
+   "floor": true
+  },
+  {
+   "id": "deps",
+   "layer": "push",
+   "category": "deps",
+   "service": "lib",
+   "why": "Checks the dependencies for known vulnerabilities.",
+   "blocking": true,
+   "floor": true
+  },
+  {
+   "id": "unit-tests",
+   "layer": "push",
+   "category": "unit-tests",
+   "service": "web",
+   "why": "Runs the unit tests so broken code is caught early.",
+   "blocking": true,
+   "floor": true
+  },
+  {
+   "id": "unit-tests",
+   "layer": "push",
+   "category": "unit-tests",
+   "service": "lib",
+   "why": "Runs the unit tests so broken code is caught early.",
+   "blocking": true,
+   "floor": true
+  },
+  {
+   "id": "lint",
+   "layer": "push",
+   "category": "lint",
+   "service": "web",
+   "why": "Runs the linter to catch mistakes and keep the code consistent.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "lint",
+   "layer": "push",
+   "category": "lint",
+   "service": "lib",
+   "why": "Runs the linter to catch mistakes and keep the code consistent.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "hooks-ci",
+   "layer": "merge",
+   "category": "hooks-ci",
+   "why": "Runs the pre-commit hooks in CI on all files, so skipping them locally is caught.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "secrets",
+   "layer": "merge",
+   "category": "secrets",
+   "why": "Stops passwords, keys and tokens from being committed or merged.",
+   "blocking": true,
+   "floor": true
+  },
+  {
+   "id": "sast",
+   "layer": "merge",
+   "category": "sast",
+   "service": "web",
+   "why": "Scans the source code for common security bugs.",
+   "blocking": true,
+   "floor": true
+  },
+  {
+   "id": "sast",
+   "layer": "merge",
+   "category": "sast",
+   "service": "lib",
+   "why": "Scans the source code for common security bugs.",
+   "blocking": true,
+   "floor": true
+  },
+  {
+   "id": "deps",
+   "layer": "merge",
+   "category": "deps",
+   "service": "web",
+   "why": "Checks the dependencies for known vulnerabilities.",
+   "blocking": true,
+   "floor": true
+  },
+  {
+   "id": "deps",
+   "layer": "merge",
+   "category": "deps",
+   "service": "lib",
+   "why": "Checks the dependencies for known vulnerabilities.",
+   "blocking": true,
+   "floor": true
+  },
+  {
+   "id": "unit-tests",
+   "layer": "merge",
+   "category": "unit-tests",
+   "service": "web",
+   "why": "Runs the unit tests so broken code is caught early.",
+   "blocking": true,
+   "floor": true
+  },
+  {
+   "id": "unit-tests",
+   "layer": "merge",
+   "category": "unit-tests",
+   "service": "lib",
+   "why": "Runs the unit tests so broken code is caught early.",
+   "blocking": true,
+   "floor": true
+  },
+  {
+   "id": "lint",
+   "layer": "merge",
+   "category": "lint",
+   "service": "web",
+   "why": "Runs the linter to catch mistakes and keep the code consistent.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "lint",
+   "layer": "merge",
+   "category": "lint",
+   "service": "lib",
+   "why": "Runs the linter to catch mistakes and keep the code consistent.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "full-tests",
+   "layer": "merge",
+   "category": "full-tests",
+   "service": "web",
+   "why": "Runs the full test suite before anything is merged.",
+   "blocking": true,
+   "floor": true
+  },
+  {
+   "id": "full-tests",
+   "layer": "merge",
+   "category": "full-tests",
+   "service": "lib",
+   "why": "Runs the full test suite before anything is merged.",
+   "blocking": true,
+   "floor": true
+  },
+  {
+   "id": "gate",
+   "layer": "merge",
+   "category": "gate",
+   "why": "The merge gate: one required check that sums up every blocking result.",
+   "blocking": true,
+   "floor": true
+  },
+  {
+   "id": "image-build",
+   "layer": "merge",
+   "category": "image-build",
+   "service": "web",
+   "why": "Builds the container image once, so the same image is scanned and deployed.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "image-scan",
+   "layer": "merge",
+   "category": "image-scan",
+   "service": "web",
+   "why": "Scans the container image for known vulnerabilities.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "dast",
+   "layer": "merge",
+   "category": "dast",
+   "service": "web",
+   "why": "Starts the app and probes it for security problems while it runs.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "sbom",
+   "layer": "deploy",
+   "category": "sbom",
+   "service": "web",
+   "why": "Lists every component in the build (an SBOM), so problems can be traced later.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "deploy-verify",
+   "layer": "deploy",
+   "category": "deploy-verify",
+   "service": "web",
+   "why": "Checks before each deploy that the commit passed the pipeline.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "format",
+   "layer": "push",
+   "category": "format",
+   "service": "web",
+   "why": "Checks that the code is formatted one way everywhere, so reviews show real changes.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "format",
+   "layer": "merge",
+   "category": "format",
+   "service": "web",
+   "why": "Checks that the code is formatted one way everywhere, so reviews show real changes.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "format",
+   "layer": "push",
+   "category": "format",
+   "service": "lib",
+   "why": "Checks that the code is formatted one way everywhere, so reviews show real changes.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "format",
+   "layer": "merge",
+   "category": "format",
+   "service": "lib",
+   "why": "Checks that the code is formatted one way everywhere, so reviews show real changes.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "type-check",
+   "layer": "push",
+   "category": "type-check",
+   "service": "web",
+   "why": "Runs the type checker, so type errors fail the build instead of reaching users.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "type-check",
+   "layer": "merge",
+   "category": "type-check",
+   "service": "web",
+   "why": "Runs the type checker, so type errors fail the build instead of reaching users.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "coverage",
+   "layer": "push",
+   "category": "coverage",
+   "service": "web",
+   "why": "Fails the build when test coverage drops below a minimum, so untested code can't creep in.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "coverage",
+   "layer": "merge",
+   "category": "coverage",
+   "service": "web",
+   "why": "Fails the build when test coverage drops below a minimum, so untested code can't creep in.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "coverage",
+   "layer": "push",
+   "category": "coverage",
+   "service": "lib",
+   "why": "Fails the build when test coverage drops below a minimum, so untested code can't creep in.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "coverage",
+   "layer": "merge",
+   "category": "coverage",
+   "service": "lib",
+   "why": "Fails the build when test coverage drops below a minimum, so untested code can't creep in.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "dead-code",
+   "layer": "push",
+   "category": "dead-code",
+   "service": "web",
+   "why": "Finds unused files, exports and dependencies, which hide bugs and slow installs.",
+   "blocking": false,
+   "floor": false
+  },
+  {
+   "id": "dead-code",
+   "layer": "merge",
+   "category": "dead-code",
+   "service": "web",
+   "why": "Finds unused files, exports and dependencies, which hide bugs and slow installs.",
+   "blocking": false,
+   "floor": false
+  },
+  {
+   "id": "dead-code",
+   "layer": "push",
+   "category": "dead-code",
+   "service": "lib",
+   "why": "Finds unused files, exports and dependencies, which hide bugs and slow installs.",
+   "blocking": false,
+   "floor": false
+  },
+  {
+   "id": "dead-code",
+   "layer": "merge",
+   "category": "dead-code",
+   "service": "lib",
+   "why": "Finds unused files, exports and dependencies, which hide bugs and slow installs.",
+   "blocking": false,
+   "floor": false
+  },
+  {
+   "id": "duplication",
+   "layer": "merge",
+   "category": "duplication",
+   "why": "Warns when a pull request adds copy-pasted code, which tends to get fixed in one copy and forgotten in the other.",
+   "blocking": false,
+   "floor": false
+  },
+  {
+   "id": "workflow-lint",
+   "layer": "push",
+   "category": "workflow-lint",
+   "why": "Checks the GitHub Actions workflows for mistakes and risky patterns such as script injection.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "workflow-lint",
+   "layer": "merge",
+   "category": "workflow-lint",
+   "why": "Checks the GitHub Actions workflows for mistakes and risky patterns such as script injection.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "workflow-pin-check",
+   "layer": "push",
+   "category": "workflow-pin-check",
+   "why": "Checks that every action is pinned to an exact commit, so a moved tag can't change what runs.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "workflow-pin-check",
+   "layer": "merge",
+   "category": "workflow-pin-check",
+   "why": "Checks that every action is pinned to an exact commit, so a moved tag can't change what runs.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "dependency-review",
+   "layer": "merge",
+   "category": "dependency-review",
+   "why": "Checks the packages a pull request adds, so a known-vulnerable or malicious package is stopped before merge.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "licences",
+   "layer": "merge",
+   "category": "licences",
+   "why": "Checks dependency licences, so a package the project may not use is caught before merge.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "egress",
+   "layer": "deploy",
+   "category": "egress",
+   "service": "web",
+   "why": "Blocks unexpected network traffic in release jobs, so a compromised tool can't send secrets out.",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "update-config",
+   "layer": "merge",
+   "category": "update-config",
+   "why": "Opens update pull requests for dependencies, waiting 7 days so brand-new releases are skipped.",
+   "blocking": false,
+   "floor": false
+  },
+  {
+   "id": "coverage",
+   "layer": "merge",
+   "category": "coverage",
+   "why": "Watches coverage.",
+   "blocking": false,
+   "floor": false
+  },
+  {
+   "id": "deps",
+   "layer": "merge",
+   "category": "deps",
+   "why": "Flags (link removed) now",
+   "blocking": true,
+   "floor": false
+  },
+  {
+   "id": "migration-check",
+   "layer": "merge",
+   "category": "full-tests",
+   "service": "web",
+   "why": "Checks that database migrations apply cleanly.",
+   "blocking": true,
+   "floor": false
+  }
+ ],
+ "notes": [
+  "The AI suggested skipping the merge layer (\"no need\"), but pipegen keeps it: only the deploy layer can be skipped, and only when nothing runs or deploys.",
+  "The AI suggested skipping the deploy layer (\"nothing deploys\"), but pipegen keeps it: something in this repo runs or deploys.",
+  "The AI tried to add a gate need (gate in merge); pipegen ignored it, since it sets up the one merge gate itself.",
+  "The AI gave the wrong category to migration-check in merge for web; pipegen left those needs out.",
+  "The AI suggested type-check in push for lib (no tsconfig.json or typescript dependency found), signing in deploy for web, which this repo's plan doesn't include (for example signing on a private Free repo, or an image scan with nothing to run); pipegen left them out.",
+  "The AI tried to add duplication in push, migration-check in pre-commit for web, a layer pipegen doesn't add AI checks to here (for example a pull-request-only or scheduled check on push); pipegen left them out.",
+  "The AI suggested image-scan in merge for lib, image-scan in merge, but image checks only apply to services that run; pipegen left them out.",
+  "The AI tried to add workflow-lint in push for web for one service, but that check covers the whole repo; pipegen left them out.",
+  "The AI suggested sbom in deploy for lib, but pipegen's deploy layer doesn't cover that; pipegen left them out."
+ ],
+ "requireDeployApproval": true,
+ "layersSkipped": []
+}

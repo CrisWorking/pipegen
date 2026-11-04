@@ -44,6 +44,9 @@ const isFloorId = (id: NeedId): id is NeedCategory => (NEED_CATEGORIES as readon
 
 /** One note per reason an AI addition was dropped; `items` lists "id in layer" (enum values only). */
 const REFUSED = {
+  // Plan F F0: an id, layer, category or service the caller's schema should never have offered (a judge with its own enums).
+  // planNeeds' schema makes it unreachable there, so its notes are unchanged.
+  unknown: () => 'The AI named a need id, layer, category or service that pipegen did not offer; pipegen left those additions out.',
   gate: (items: string) => `The AI tried to add a gate need (${items}); pipegen ignored it, since it sets up the one merge gate itself.`,
   category: (items: string) => `The AI gave the wrong category to ${items}; pipegen left those needs out.`,
   notInFloor: (items: string) => `The AI suggested ${items}, which this repo's plan doesn't include (for example signing on a private Free repo, or an image scan with nothing to run); pipegen left them out.`,
@@ -377,30 +380,31 @@ export interface PlanNeedsOptions {
 
 /**
  * Text for an AI prompt the way bundleCode cleans file content: known values, then redact() (no path hint, so every
- * rule is on), then known values again.
+ * rule is on), then known values again. Plan F (ruling S6): every debate prompt part that holds repo-derived text
+ * goes through this, with the same `knownValues` the needs call gets.
  */
-function scrubForPrompt(text: string, knownValues: readonly string[]): string {
+export function promptText(text: string, knownValues: readonly string[] = []): string {
   const scrub = (t: string) => (knownValues.length > 0 ? scrubKnownValues(t, [...knownValues]) : t);
   return scrub(redact(scrub(text)));
 }
 
 /**
  * Profile service names safe to show the AI and use as the schema enum: valid names, each once, left out when
- * scrubForPrompt would change them (a name that looks like a token, or holds a known value), since the schema is
- * sent to the AI too.
+ * promptText would change them (a name that looks like a token, or holds a known value), since the schema is
+ * sent to the AI too. Plan F's need keys (src/debate/need-ref.ts) offer a per-service key only for these names.
  */
-const promptServices = (p: RepoProfile, knownValues: readonly string[] = []) => [...new Set(p.services.map((s) => s.name)
-  .filter((n) => SERVICE_NAME_RE.test(n) && scrubForPrompt(n, knownValues) === n))];
+export const promptServiceNames = (p: RepoProfile, knownValues: readonly string[] = []): string[] => [...new Set(p.services.map((s) => s.name)
+  .filter((n) => SERVICE_NAME_RE.test(n) && promptText(n, knownValues) === n))];
 
 type AiNeedsAnswer = {
-  add: { id: NeedId; layer: Layer; category: NeedCategory; service: string | null; why: string; blocking: boolean }[];
+  add: AddedNeed[];
   skipLayers: { layer: Layer; reason: string }[];
   requireDeployApproval: boolean;
 };
 
 /** The answer schema for this profile: ids, layers, categories and services are enums; every object is closed. */
 export function needsSchema(p: RepoProfile, opts: PlanNeedsOptions = {}): AiSchema<AiNeedsAnswer> {
-  const names = promptServices(p, opts.knownValues);
+  const names = promptServiceNames(p, opts.knownValues);
   const service = names.length > 0 ? z.enum(names as [string, ...string[]]).nullable() : z.null();
   return aiSchema<AiNeedsAnswer>(z.strictObject({
     add: z.array(z.strictObject({
@@ -413,10 +417,12 @@ export function needsSchema(p: RepoProfile, opts: PlanNeedsOptions = {}): AiSche
 
 /**
  * The profile as the AI sees it (ruling S29): enum fields, booleans, counts and validated names only, never raw repo
- * text. The whole summary then goes through scrubForPrompt, like the code bundle.
+ * text, workflow text or a need's `why`. The whole summary then goes through promptText, like the code bundle.
+ * Plan F (ruling S6): the needs call and every debate prompt use this one summary.
  */
-function profileSummary(p: RepoProfile, floor: Need[], knownValues: readonly string[]): string {
-  const names = new Set(promptServices(p, knownValues));
+export function promptProfile(p: RepoProfile, caps: Capabilities, knownValues: readonly string[] = []): string {
+  const floor = floorNeeds(p, caps);
+  const names = new Set(promptServiceNames(p, knownValues));
   const services = p.services.filter((s) => names.has(s.name)).map((s) => ({
     name: s.name,
     language: s.language,
@@ -445,7 +451,7 @@ function profileSummary(p: RepoProfile, floor: Need[], knownValues: readonly str
   };
   // One value per line: redact() replaces any line over 4 KB whole, and a compact summary of five or more services is
   // one such line, so the AI would get nothing.
-  return scrubForPrompt(`<repo-profile>\n${JSON.stringify(summary, null, 1)}\n</repo-profile>`, knownValues);
+  return promptText(`<repo-profile>\n${JSON.stringify(summary, null, 1)}\n</repo-profile>`, knownValues);
 }
 
 /** The needs request around `code` (bundleText's output; '' to size the rest of the request). */
@@ -455,7 +461,7 @@ function needsRequest(code: string, p: RepoProfile, caps: Capabilities, knownVal
     schema,
     req: {
       system: NEEDS_SYSTEM,
-      user: `${code}\n${profileSummary(p, floorNeeds(p, caps), knownValues)}\n\n${needsInstructions(NEED_ID_CATEGORY)}`,
+      user: `${code}\n${promptProfile(p, caps, knownValues)}\n\n${needsInstructions(NEED_ID_CATEGORY)}`,
       schemaName: 'needs',
       jsonSchema: schema.jsonSchema,
       timeoutMs: NEEDS_TIMEOUT_MS,
@@ -471,6 +477,94 @@ function needsRequest(code: string, p: RepoProfile, caps: Capabilities, knownVal
 export function needsPromptBytes(p: RepoProfile, caps: Capabilities, opts: PlanNeedsOptions = {}): number {
   const { req } = needsRequest('', p, caps, opts.knownValues ?? []);
   return Buffer.byteLength(req.system) + Buffer.byteLength(req.user) + Buffer.byteLength(JSON.stringify(req.jsonSchema));
+}
+
+// ---------- the AI-addition rule (extracted from planNeeds for Plan F's judge, ruling S7; no behaviour change) ----------
+
+/** One need the AI asks to add: the needs schema's add item (ids, layers, categories and services are enums there). */
+export interface AddedNeed { id: NeedId; layer: Layer; category: NeedCategory; service: string | null; why: string; blocking: boolean }
+
+/** Why an addition was refused; each reason gives one note (refusedAdditionsNote). */
+export type AddedNeedRefusal = keyof typeof REFUSED;
+
+/** What acceptAddedNeed checks an addition against, worked out once per plan (addedNeedContext). */
+export interface AddedNeedContext {
+  readonly p: RepoProfile;
+  /** The service names an addition may name: promptServiceNames, the needs schema's service enum. */
+  readonly services: ReadonlySet<string>;
+  readonly floorIds: ReadonlySet<string>;
+  readonly floorLayers: ReadonlySet<Layer>;
+  readonly skipped: readonly SkippedCheck[];
+  readonly runnable: ReadonlySet<string>;
+  readonly deployNeedTargets: ReadonlySet<string | undefined>;
+}
+
+/** The context of acceptAddedNeed for this repo: the floor, the skipped checks, the runnable services and deploy targets. */
+export function addedNeedContext(p: RepoProfile, caps: Capabilities, knownValues: readonly string[] = []): AddedNeedContext {
+  const floor = floorNeeds(p, caps);
+  return {
+    p,
+    services: new Set(promptServiceNames(p, knownValues)),
+    floorIds: new Set(floor.map((n) => n.id)),
+    floorLayers: new Set(floor.map((n) => n.layer)),
+    skipped: skippedChecks(p, caps),
+    runnable: new Set(p.services.filter(isRunnable).map((s) => s.name)),
+    deployNeedTargets: new Set(floor.filter((n) => n.layer === 'deploy').map((n) => n.service)),
+  };
+}
+
+const LAYER_SET: ReadonlySet<string> = new Set(LAYERS);
+const NEED_ID_SET: ReadonlySet<string> = new Set(NEED_IDS);
+const CATEGORY_SET: ReadonlySet<string> = new Set(NEED_CATEGORIES);
+
+/**
+ * Whether pipegen keeps one AI addition (planNeeds' rule, also the judge's `addNeed` in Plan F): never the gate, the
+ * category must be the id's, a floor id only extends what the floor has and never a check the plan skipped, a table
+ * check only on its table layers, a repo-wide check has no service, never pre-commit or a layer the floor lacks, image
+ * checks only for runnable services, deploy additions only for the floor's deploy targets. A kept need is `floor:
+ * false`; its `blocking` is forced on for a floor category and otherwise needs the table's blocking AND the AI's.
+ * Repeats (needKey) are the caller's to drop. `item` names the addition by enum values and checked names only.
+ */
+export function acceptAddedNeed(a: AddedNeed, ctx: AddedNeedContext): { ok: true; need: Need } | { ok: false; reason: AddedNeedRefusal; item: string } {
+  // Plan F F0: values outside the enums the needs schema offers (unreachable from planNeeds, whose schema holds them).
+  if (!NEED_ID_SET.has(a.id) || !LAYER_SET.has(a.layer) || !CATEGORY_SET.has(a.category) || (a.service !== null && !ctx.services.has(a.service))) {
+    return { ok: false, reason: 'unknown', item: 'an addition pipegen did not offer' };
+  }
+  const item = `${a.id} in ${a.layer}${a.service === null ? '' : ` for ${a.service}`}`; // enum values and checked names only
+  const refuse = (reason: AddedNeedRefusal, it: string = item) => ({ ok: false as const, reason, item: it });
+  if (a.id === 'gate') return refuse('gate');
+  if (NEED_ID_CATEGORY[a.id] !== a.category) return refuse('category');
+  // A floor id only extends what the floor already has (another layer or service): never signing on a repo
+  // that can't sign, attestation without the capability, or an image scan for a repo with nothing to run.
+  // PS9: and never a check this repo's plan skipped on purpose; the note says why it was skipped.
+  const skip = isFloorId(a.id) ? ctx.skipped.find((k) => k.category === a.id && (k.service === undefined || k.service === (a.service ?? undefined))) : undefined;
+  if (skip !== undefined) return refuse('notInFloor', `${item} (${skip.why})`);
+  if (isFloorId(a.id) && !ctx.floorIds.has(a.id)) return refuse('notInFloor');
+  // A scheduled check runs only in the merge layer; a repo-wide check has no service.
+  // A table check goes only on the layers the table gives it (duplication is PR-only, DEC #93; scheduled checks are merge only).
+  const rule = CHECKS.find((c) => c.category === a.category);
+  if (rule !== undefined && !rule.layers.includes(a.layer)) return refuse('layer');
+  if (REPO_WIDE_CATEGORIES.has(a.category) && a.service !== null) return refuse('repoWide');
+  // Only layers the floor sets up (never pre-commit, never a deploy layer the repo doesn't have).
+  if (a.layer === 'pre-commit' || !ctx.floorLayers.has(a.layer)) return refuse('layer');
+  // Image checks need something to run: only for a runnable service, never repo-wide.
+  if (IMAGE_IDS.has(a.id) && (a.service === null || !ctx.runnable.has(a.service))) return refuse('notRunnable');
+  // Deploy additions only for what the floor's deploy layer already covers.
+  if (a.layer === 'deploy' && !ctx.deployNeedTargets.has(a.service ?? undefined)) return refuse('notDeployed');
+  return {
+    ok: true,
+    need: {
+      id: a.id, layer: a.layer, category: a.category, ...(a.service === null ? {} : { service: a.service }),
+      why: cleanAiText(a.why) || needWhy(a.id) || '',
+      blocking: FLOOR.has(a.category) || (checkBlocking(a.category, a.service, ctx.p) && a.blocking), // a floor-category check never runs as warn-only
+      floor: false,
+    },
+  };
+}
+
+/** The one note for every addition refused for `reason` (items: acceptAddedNeed's `item`s, deduped by the caller). */
+export function refusedAdditionsNote(reason: AddedNeedRefusal, items: readonly string[]): string {
+  return REFUSED[reason](listItems([...items]));
 }
 
 /**
@@ -505,43 +599,16 @@ export async function planNeeds(p: RepoProfile, caps: Capabilities, bundle: Code
   }
 
   // Refused additions, grouped by reason so each reason gives one note. Items hold enum values only.
-  const refused = Object.fromEntries(Object.keys(REFUSED).map((k) => [k, new Set<string>()])) as Record<keyof typeof REFUSED, Set<string>>;
-  const floorIds = new Set(floor.map((n) => n.id));
-  const floorLayers = new Set(floor.map((n) => n.layer));
-  const skipped = skippedChecks(p, caps);
-  const runnable = new Set(p.services.filter(isRunnable).map((s) => s.name));
-  const deployNeedTargets = new Set(floor.filter((n) => n.layer === 'deploy').map((n) => n.service));
+  const refused = Object.fromEntries(Object.keys(REFUSED).map((k) => [k, new Set<string>()])) as Record<AddedNeedRefusal, Set<string>>;
+  const ctx = addedNeedContext(p, caps, knownValues);
   const needs = [...floor];
   const seen = new Set(floor.map(needKey));
   let added = 0;
   const read = data.add.slice(0, MAX_AI_ADDS_READ);
   for (const [i, a] of read.entries()) {
-    const item = `${a.id} in ${a.layer}${a.service === null ? '' : ` for ${a.service}`}`; // enum values and checked names only
-    if (a.id === 'gate') { refused.gate.add(item); continue; }
-    if (NEED_ID_CATEGORY[a.id] !== a.category) { refused.category.add(item); continue; }
-    // A floor id only extends what the floor already has (another layer or service): never signing on a repo
-    // that can't sign, attestation without the capability, or an image scan for a repo with nothing to run.
-    // PS9: and never a check this repo's plan skipped on purpose; the note says why it was skipped.
-    const skip = isFloorId(a.id) ? skipped.find((k) => k.category === a.id && (k.service === undefined || k.service === (a.service ?? undefined))) : undefined;
-    if (skip !== undefined) { refused.notInFloor.add(`${item} (${skip.why})`); continue; }
-    if (isFloorId(a.id) && !floorIds.has(a.id)) { refused.notInFloor.add(item); continue; }
-    // A scheduled check runs only in the merge layer; a repo-wide check has no service.
-    // A table check goes only on the layers the table gives it (duplication is PR-only, DEC #93; scheduled checks are merge only).
-    const rule = CHECKS.find((c) => c.category === a.category);
-    if (rule !== undefined && !rule.layers.includes(a.layer)) { refused.layer.add(item); continue; }
-    if (REPO_WIDE_CATEGORIES.has(a.category) && a.service !== null) { refused.repoWide.add(item); continue; }
-    // Only layers the floor sets up (never pre-commit, never a deploy layer the repo doesn't have).
-    if (a.layer === 'pre-commit' || !floorLayers.has(a.layer)) { refused.layer.add(item); continue; }
-    // Image checks need something to run: only for a runnable service, never repo-wide.
-    if (IMAGE_IDS.has(a.id) && (a.service === null || !runnable.has(a.service))) { refused.notRunnable.add(item); continue; }
-    // Deploy additions only for what the floor's deploy layer already covers.
-    if (a.layer === 'deploy' && !deployNeedTargets.has(a.service ?? undefined)) { refused.notDeployed.add(item); continue; }
-    const need: Need = {
-      id: a.id, layer: a.layer, category: a.category, ...(a.service === null ? {} : { service: a.service }),
-      why: cleanAiText(a.why) || needWhy(a.id) || '',
-      blocking: FLOOR.has(a.category) || (checkBlocking(a.category, a.service, p) && a.blocking), // a floor-category check never runs as warn-only
-      floor: false,
-    };
+    const res = acceptAddedNeed(a, ctx);
+    if (!res.ok) { refused[res.reason].add(res.item); continue; }
+    const need = res.need;
     if (seen.has(needKey(need))) continue; // a floor need (or an earlier addition) stays exactly as it is
     seen.add(needKey(need));
     needs.push(need);
@@ -554,8 +621,8 @@ export async function planNeeds(p: RepoProfile, caps: Capabilities, bundle: Code
   if (data.add.length > MAX_AI_ADDS_READ && added < MAX_AI_ADDS_KEPT) {
     notes.add(`pipegen read only the first ${MAX_AI_ADDS_READ} of ${data.add.length} AI suggestions.`);
   }
-  for (const reason of Object.keys(REFUSED) as (keyof typeof REFUSED)[]) {
-    if (refused[reason].size > 0) notes.add(REFUSED[reason](listItems([...refused[reason]])));
+  for (const reason of Object.keys(REFUSED) as AddedNeedRefusal[]) {
+    if (refused[reason].size > 0) notes.add(refusedAdditionsNote(reason, [...refused[reason]]));
   }
 
   return { needs, notes: [...notes], requireDeployApproval: deployApprovalRule(p, writers) || data.requireDeployApproval, layersSkipped, usage };
