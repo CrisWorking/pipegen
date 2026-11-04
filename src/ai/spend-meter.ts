@@ -55,6 +55,7 @@ export class AiSpendMeter {
   /** The metered provider: the same name and model, every call metered (no other field is copied). */
   readonly provider: AiProvider;
   readonly #inner: AiProvider;
+  #refused = false;
   constructor(inner: AiProvider, readonly capUsd: number | null) {
     if (!validCap(capUsd)) throw new Error('The AI cost cap must be a finite number of US dollars (0 or more), or null for a local model.');
     this.#inner = inner;
@@ -71,6 +72,20 @@ export class AiSpendMeter {
   get exceeded(): boolean {
     const cap = this.effectiveCapUsd;
     return cap !== null && this.spentUsd + this.reservedUsd >= cap;
+  }
+
+  /**
+   * Sticky (review I2): true once the meter refused a request (AiError('cost-cap')), whatever the caller did with the
+   * error. After a refusal `exceeded` is usually still false (the next worst case didn't fit, the spend is below the cap),
+   * so the proof's stop (capReached) reads this, not the error a caller may have turned into a note.
+   */
+  get refused(): boolean {
+    return this.#refused;
+  }
+
+  #refuse(): never {
+    this.#refused = true;
+    throw new AiError('cost-cap', COST_CAP_MESSAGE);
   }
 
   /** Resume: adds what the saved state says the run already used. Anything but a number ≥ 0 is refused (thrown). */
@@ -99,8 +114,8 @@ export class AiSpendMeter {
       const worst = requestCeilingUsd(this.#inner, aiRequestBytes(req), limit ?? Number.POSITIVE_INFINITY);
       if (worst !== 'local') {
         // B4: no output limit means no bound, so the attempt can't fit any cap
-        if (limit === undefined) throw new AiError('cost-cap', COST_CAP_MESSAGE);
-        if (!(this.spentUsd + this.reservedUsd + worst <= cap)) throw new AiError('cost-cap', COST_CAP_MESSAGE);
+        if (limit === undefined) this.#refuse();
+        if (!(this.spentUsd + this.reservedUsd + worst <= cap)) this.#refuse();
         reserved = worst;
         this.reservedUsd += worst;
       }
@@ -118,16 +133,18 @@ export class AiSpendMeter {
   }
 
   #settle(reserved: number, u: AiUsage | undefined): void {
+    // The cost is spent BEFORE the reservation is released, and only then is the usage recorded for the report (review
+    // M5): a failure while recording can never release a reservation without spending.
     // An answer that reports no prompt tokens can't be priced: keep the full reservation (review N5).
     if (u === undefined || u === null || count(u.inputTokens) + count(u.cacheReadTokens) + count(u.cacheWriteTokens) === 0) {
-      if (u !== undefined && u !== null) this.#addUsage(u);
       this.#keep(reserved);
+      if (u !== undefined && u !== null) this.#addUsage(u);
       return;
     }
-    this.reservedUsd -= reserved;
-    this.#addUsage(u);
     const c = usageCeilingUsd(this.#inner, u);
     if (c !== 'local') this.spentUsd += c;
+    this.reservedUsd -= reserved;
+    this.#addUsage(u);
   }
 
   #addUsage(u: AiUsage): void {
@@ -156,8 +173,8 @@ export class AiSpendMeter {
   }
 
   #keep(reserved: number): void {
-    this.reservedUsd -= reserved;
     this.spentUsd += reserved;
+    this.reservedUsd -= reserved;
   }
 }
 

@@ -4,8 +4,8 @@
 //   the user said yes to (the consent token's capUsd), for this provider and model; anything else refuses to start
 //   (thrown, nothing sent). One meter per consent: a second meter on the same yes would double the agreed cap.
 // - capReached({ minutes, ai, error }): which cap, if any, stops the proof now. The AI cap is reached when the meter
-//   refuses a call (AiError('cost-cap'), before anything is sent) or `exceeded`; the minutes cap when the minutes meter is
-//   `exceeded` or `blind` (its minutes couldn't be read, fail closed).
+//   refuses a call (AiError('cost-cap'), before anything is sent; the meter remembers it, `refused`) or `exceeded`;
+//   the minutes cap when the minutes meter is `exceeded` or `blind` (its minutes couldn't be read, fail closed).
 // - stopAtCap(cap, steps): cancels the running runs, saves the state, and runs the cleanup even when the cancel or the
 //   save failed; then throws CapReachedError (a ProofStopError) whose message is the explanation. The state file and the
 //   full cleanup are E8's; they are injected here.
@@ -29,7 +29,11 @@ export type CapReached = { kind: 'ai-cost'; limitUsd: number } | { kind: 'action
 
 /** The explanation the user sees (the plan's wording). */
 export function capMessage(cap: CapReached): string {
-  if (cap.kind === 'ai-cost') return `AI cost reached the limit of ${usd(cap.limitUsd)}, 2 × the estimate`;
+  if (cap.kind === 'ai-cost') {
+    // review M4: a cap of 0 (a paid provider with no cap) is no budget at all, and a cap under a cent keeps its digits
+    if (!(cap.limitUsd > 0)) return 'No paid AI budget was agreed to (the AI cost limit is $0), so pipegen stopped before calling the AI';
+    return `AI cost reached the limit of ${cap.limitUsd < 0.01 ? `$${cap.limitUsd.toPrecision(2)}` : usd(cap.limitUsd)}, 2 × the estimate`;
+  }
   if (cap.unread === true) return `pipegen stopped before the Actions minutes limit of ${num(cap.limit)}: it couldn't read the minutes used in ${cap.scratch ?? 'the scratch repo'}`;
   return `Actions minutes reached the limit of ${num(cap.limit)}`;
 }
@@ -71,7 +75,8 @@ export function proofAiMeter(ai: AiProvider, est: Estimates, consent: ConsentTok
 /** Which cap stops the proof now, or null. `error`: an error an AI call threw (the meter's cost-cap refusal). */
 export function capReached(m: { minutes: MinutesMeter; ai: AiSpendMeter; error?: unknown }): CapReached | null {
   const aiCap = m.ai.effectiveCapUsd;
-  if (aiCap !== null && (isCostCap(m.error) || m.ai.exceeded)) return { kind: 'ai-cost', limitUsd: aiCap };
+  // review I2: the meter's own sticky `refused`, so a refusal a caller turned into a note still stops the proof
+  if (aiCap !== null && (isCostCap(m.error) || m.ai.refused || m.ai.exceeded)) return { kind: 'ai-cost', limitUsd: aiCap };
   if (m.minutes.exceeded) return { kind: 'actions-minutes', limit: m.minutes.cap };
   if (m.minutes.blind) return { kind: 'actions-minutes', limit: m.minutes.cap, unread: true, ...(m.minutes.scratch === null ? {} : { scratch: m.minutes.scratch }) };
   return null;

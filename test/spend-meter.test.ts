@@ -205,6 +205,22 @@ describe('E6 AI spend meter (B4)', () => {
     await a;
   });
 
+  it('aiMeter: what a call used is spent before its reservation is released, even if recording it fails (review M5)', async () => {
+    const usage = use(1_000, 100);
+    Object.defineProperty(usage, 'attempts', { get: () => { throw new Error('a broken usage record'); }, enumerable: true });
+    const meter = new AiSpendMeter({ name: 'claude', model: DEFAULT_MODEL, complete: async () => ({ data: {}, usage }) }, 10);
+    await expect(meter.provider.complete(req())).rejects.toThrow(/broken usage record/);
+    expect(meter.reservedUsd).toBe(0);
+    expect(meter.spentUsd).toBeCloseTo(usageCeilingUsd(CLAUDE, use(1_000, 100)) as number, 12);
+    // an answer without prompt tokens keeps its whole reservation as spent, the same way
+    const zero = use(0, 100);
+    Object.defineProperty(zero, 'attempts', { get: () => { throw new Error('a broken usage record'); }, enumerable: true });
+    const m2 = new AiSpendMeter({ name: 'claude', model: DEFAULT_MODEL, complete: async () => ({ data: {}, usage: zero }) }, 10);
+    await expect(m2.provider.complete(req())).rejects.toThrow(/broken usage record/);
+    expect(m2.reservedUsd).toBe(0);
+    expect(m2.spentUsd).toBeCloseTo(requestCeilingUsd(CLAUDE, aiRequestBytes(req()), 1_000) as number, 12);
+  });
+
   it('aiMeter: a request without maxOutputTokens is refused under a finite cap', async () => {
     const ai = scripted('claude', DEFAULT_MODEL, [{ data: {}, usage: use(10, 10) }]);
     for (const cap of [0, 1, 1e6, Number.MAX_VALUE]) {
