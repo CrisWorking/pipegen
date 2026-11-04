@@ -54,6 +54,24 @@ describe('E9 (E3-R7): no bind mount in a key-holding run script', () => {
       'docker compose run -v /:/h app',
       // strict on purpose: a -v word in the container's own command counts too (the check does not parse where the image stands)
       'docker run --rm -e A=1 -w /x img:1 -v',
+      // security scan (E9): a --mount value is parsed as docker's key=value list, never matched as a whole
+      'docker run --mount type=volume,type=bind,src=/,dst=/h img:1',
+      'docker run --mount type=bind,type=volume,src=/,dst=/h img:1',
+      'docker run --mount type=volume,volume-opt=type=none,volume-opt=o=bind,volume-opt=device=/,dst=/h img:1',
+      'docker run --mount type=volume,volume-driver=local,dst=/h img:1',
+      'docker run --mount src=/,dst=/h img:1',
+      'docker run --mount TYPE=bind,src=/,dst=/h img:1',
+      'docker run --mount type=VOLUME2,dst=/h img:1',
+      `docker run --mount 'type=volume,"src=a,type=bind",dst=/h' img:1`,
+      'docker run --mount type=volume,bind-propagation=shared,dst=/h img:1',
+      'docker run --mount img:1',
+      'docker run --mount',
+      'docker volume create --opt type=none --opt o=bind --opt device=/ v1',
+      'docker volume create -o device=/ v1',
+      'docker volume create --opt=device=/ v1',
+      'docker volume create -d local-persist v1',
+      'docker run --volume=named:/h img:1',
+      'docker run -v named:/h img:1',
     ];
     for (const b of bad) expect(problems(wf(run(b))).join(' '), b).toMatch(MOUNT);
   });
@@ -115,8 +133,17 @@ describe('E9 (E4-R4 R5): only vars.PIPEGEN_BLOCK_FROM in a key-holding workflow'
     for (const b of bad) expect(problems(b).join(' '), b).toMatch(/vars/);
   });
 
-  it('the word vars outside an expression is not a reference (a run script that says it)', () => {
-    expect(problems(wf(run('echo "no vars here"; env-vars=1')))).toEqual([]);
+  it('security scan (E9): a `}}` inside a quoted literal does not end the search, so vars after it is still seen', () => {
+    for (const b of [
+      wf(`      - run: echo "\${{ format('}}', vars.SECRET_HOST) }}"\n`),
+      wf(`      - run: echo "\${{ format('{0}}}', vars.SECRET_HOST) }}"\n`),
+      wf(`      - run: echo "\${{ format('x''}}', vars.SECRET_HOST) }}"\n`),
+    ]) expect(problems(b).join(' '), b).toMatch(/vars/);
+  });
+
+  it('strict on purpose: the word vars anywhere in a key-holding workflow is refused, even outside an expression (whole string values, decoded)', () => {
+    expect(problems(wf(run('echo "no vars here"'))).join(' ')).toMatch(/vars/);
+    expect(problems(wf(run('echo ok')))).toEqual([]);
   });
 
   it('compat copies are not checked for it', () => {

@@ -28,7 +28,7 @@
 //   input but its off value, setup-node with package-manager-cache "false"; and, as a lint backstop only (a script can
 //   always be written another way), no run script with a `type=gha` cache or `gh cache`.
 // - E9 (ruling E3-R7): no run script bind-mounts a host path into a container (bindMountProblem; also a lint backstop);
-// - E9 (carry E4-R4 R5): no expression reads a `vars` value other than vars.PIPEGEN_BLOCK_FROM (varsProblem; whole workflow).
+// - E9 (carry E4-R4 R5): no string of the workflow names `vars` other than vars.PIPEGEN_BLOCK_FROM (varsProblem; whole strings).
 // Compat (E3-R2): no egress step (S17) and the user's own tag-pinned actions may stay (no secret, a contents: read token, its
 // own VM); `actions/cache` is still refused. A compat job may keep a setup cache: no key-holding job reads any cache.
 import type { ReviewedTool } from '../types.js';
@@ -82,44 +82,68 @@ const EGRESS_STEP_KEYS: ReadonlySet<string> = new Set(['name', 'id', 'uses', 'wi
 
 /** The container command-line tools whose run/create can bind-mount a host path (by the base name of the word). */
 const CONTAINER_CLI_RE = /^(?:.*\/)?(?:docker|podman|nerdctl)$/;
-/** A `--mount` value that is not a bind mount: an explicit volume or tmpfs type (the default type is volume, but only an explicit one passes). */
-const NOT_BIND_RE = /(?:^|,)type=(?:volume|tmpfs)(?:,|$)/i;
+/** The `--mount` types that are not a bind mount (docker lower-cases the type value; its keys too). */
+const NOT_BIND_TYPES: ReadonlySet<string> = new Set(['volume', 'tmpfs']);
+/**
+ * Security scan (E9): why a `--mount` value may hold a bind mount, or null. The value is read as docker's comma-separated key=value
+ * list (docker lower-cases the keys), never matched as a whole: `type` must appear exactly once and be volume or tmpfs; a volume
+ * option or driver (`volume-opt=o=bind,volume-opt=device=/` makes the local driver bind a host path) and any bind-* key are refused;
+ * an empty field, a quote (docker's CSV reader would read quoted fields another way) or a missing value is unparseable, so refused.
+ */
+function mountProblem(raw: string | undefined): string | null {
+  if (raw === undefined) return 'a --mount with no value';
+  let v = raw;
+  if (v.length >= 2 && (v[0] === '"' || v[0] === "'") && v.at(-1) === v[0]) v = v.slice(1, -1);
+  if (v === '' || /["']/.test(v)) return 'a --mount value pipegen can not read (quotes)';
+  let types = 0;
+  for (const field of v.split(',')) {
+    if (field === '') return 'a --mount value with an empty field';
+    const eq = field.indexOf('=');
+    const key = (eq < 0 ? field : field.slice(0, eq)).toLowerCase();
+    if (key === 'type') {
+      types++;
+      if (eq < 0 || !NOT_BIND_TYPES.has(field.slice(eq + 1).toLowerCase())) return 'a --mount whose type is not volume or tmpfs';
+    } else if (key === 'volume-opt' || key === 'volume-driver' || key.startsWith('bind')) return `a --mount with ${safeText(key, 30)} (a volume option or driver can bind a host path)`;
+  }
+  return types === 1 ? null : 'a --mount without exactly one type';
+}
 /**
  * E9 (ruling E3-R7): why a run script bind-mounts a host path into a container, or null. Bullfrog with sudo off refuses those at run
  * time, and pipegen's own steps copy folders in instead (render-cli.ts), so a mount means a script pipegen did not render. A lint read
  * (a script can always be written another way), strict on purpose: line continuations are joined, the script is cut into simple
- * commands at `;`, `&`, `|`, newlines, parentheses and backquotes, quotes are dropped, and after a docker/podman/nerdctl word
- * every `-v` (alone, with its value attached, or last in a short-flag group), `--volume`, `--volumes-from`, and a `--mount` without an
- * explicit volume or tmpfs type counts, wherever it stands (also in the container's own command).
+ * commands at `;`, `&`, `|`, newlines, parentheses and backquotes, and after a docker/podman/nerdctl word every `-v` (alone, with its
+ * value attached, or last in a short-flag group), `--volume` and `--volumes-from` counts whatever its source (a named volume too),
+ * wherever it stands (also in the container's own command); a `--mount` counts unless mountProblem reads it as a plain volume or tmpfs;
+ * and `volume create` with a driver or an option (`-o`, `--opt`, `-d`, `--driver`) counts (the local driver's options bind a host path).
  */
 export function bindMountProblem(script: string): string | null {
   const commands = script.replace(/\\\r?\n/g, ' ').split(/\|\||&&|\$\(|[;|&()`\n]/);
   for (const c of commands) {
-    const words = c.split(/\s+/).map((w) => w.replace(/["']/g, '')).filter((w) => w !== '');
+    const raws = c.split(/\s+/).filter((w) => w !== '');
+    const words = raws.map((w) => w.replace(/["']/g, ''));
     const at = words.findIndex((w) => CONTAINER_CLI_RE.test(w));
     if (at < 0) continue;
+    const volumeCreate = words.slice(at + 1).join(' ').match(/(?:^| )volume create(?: |$)/) !== null;
     for (let i = at + 1; i < words.length; i++) {
       const w = words[i] as string;
       if (/^-(?!-)[A-Za-z]*v/.test(w) || /^--(?:volume|volumes-from)(?:=|$)/.test(w)) return `a run script bind-mounts a host path into a container (${safeText(w, 40)})`;
-      const mount = /^--mount(?:=(.*))?$/.exec(w);
-      if (mount !== null) {
-        const value = mount[1] ?? words[i + 1] ?? '';
-        if (!NOT_BIND_RE.test(value)) return 'a run script bind-mounts a host path into a container (--mount without an explicit volume or tmpfs type)';
+      if (volumeCreate && /^(?:-o|--opt|-d|--driver)(?:=|$)|^-[od]./.test(w)) return `a run script creates a volume with a driver or an option (${safeText(w, 40)}), which can bind a host path`;
+      if (/^--mount(?:=|$)/.test(w)) {
+        const r = raws[i] as string;
+        const eq = r.indexOf('=');
+        const problem = mountProblem(eq >= 0 && /^["']?--mount=/.test(r) ? r.slice(eq + 1).replace(/^(["'])(.*)\1$/, '$2') : raws[i + 1]);
+        if (problem !== null) return `a run script may bind-mount a host path into a container (${problem})`;
       }
     }
   }
   return null;
 }
 
-/** The expression texts of a parsed workflow: every `${{ … }}` in any key or string value, and the whole of every `if:` value. */
-function expressionsOf(v: unknown, out: string[], key = ''): void {
-  if (typeof v === 'string') {
-    if (key === 'if' && !v.includes('${{')) out.push(v);
-    for (const m of v.matchAll(/\$\{\{([\s\S]*?)\}\}/g)) out.push(m[1] as string);
-    return;
-  }
-  if (Array.isArray(v)) { for (const x of v) expressionsOf(x, out); return; }
-  if (isObj(v)) for (const [k, x] of Object.entries(v)) { expressionsOf(k, out); expressionsOf(x, out, k); }
+/** Every string of a parsed workflow, keys included, decoded (YAML scalars as the runner reads them). */
+function stringsOf(v: unknown, out: string[]): void {
+  if (typeof v === 'string') { out.push(v); return; }
+  if (Array.isArray(v)) { for (const x of v) stringsOf(x, out); return; }
+  if (isObj(v)) for (const [k, x] of Object.entries(v)) { out.push(k); stringsOf(x, out); }
 }
 /**
  * Carry E4-R4 R5: the one `vars` reference a key-holding workflow may make is `vars.PIPEGEN_BLOCK_FROM` (the gate's block-from input).
@@ -127,10 +151,14 @@ function expressionsOf(v: unknown, out: string[], key = ''): void {
  * whole context in toJSON(vars), any case) could carry a value nobody checked into a job beside the keys.
  */
 function varsProblem(wf: Obj): string | null {
-  const exprs: string[] = [];
-  expressionsOf(wf, exprs);
-  for (const e of exprs) {
-    if (/\bvars\b/i.test(e.replace(/\bvars\s*\.\s*PIPEGEN_BLOCK_FROM\b/gi, ''))) return `it reads a variable other than vars.PIPEGEN_BLOCK_FROM (${safeText(e.trim(), 80)}); a key-holding workflow reads no other vars`;
+  // Security scan (E9): the whole of every string is searched, never only between `${{` and the first `}}` (a `}}` inside a quoted
+  // literal, `format('}}', vars.X)`, would end that search early). Strict on purpose: the word vars anywhere else is refused too.
+  const texts: string[] = [];
+  stringsOf(wf, texts);
+  for (const t of texts) {
+    const rest = t.replace(/\bvars\s*\.\s*PIPEGEN_BLOCK_FROM\b/gi, '');
+    const m = /\bvars\b/i.exec(rest);
+    if (m !== null) return `it names vars other than vars.PIPEGEN_BLOCK_FROM (${safeText(rest.slice(Math.max(0, m.index - 30), m.index + 50).trim(), 80)}); a key-holding workflow reads no other variable`;
   }
   return null;
 }
