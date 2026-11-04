@@ -56,6 +56,21 @@ describe('C6: the pipegen-gate reviewed entry', () => {
       expect(t.reviewedBy).toMatch(/delegated/);
     }
   });
+  it('gate-entry: new pin; git diff <pin> -- gate/dist empty', () => {
+    // E9: re-pinned off gate-v0.2.1 (99a0abe) to the commit of the annotated tag gate-v<version>; the checked-out bundle is the pinned one
+    const t = real();
+    const pin = t.candidate.pin.sha as string;
+    const git = (...args: string[]): boolean => { try { execFileSync('git', args, { cwd: ROOT, stdio: 'ignore' }); return true; } catch { return false; } };
+    expect(pin).toMatch(/^[0-9a-f]{40}$/);
+    expect(pin).not.toBe('99a0abec03b3410fbf769ac9bce6516f760e0b57');
+    expect(t.step.action?.uses).toBe(`${PIPEGEN_GATE_USES}@${pin}`);
+    if (!git('cat-file', '-e', `${pin}:gate/dist/index.js`)) return; // not fetched (a depth-1 checkout)
+    expect(git('diff', '--quiet', pin, '--', 'gate/dist'), `git diff ${pin} -- gate/dist is empty`).toBe(true);
+    // where the tag gate-v<version> is fetched (local clones, release), it points at the pin
+    if (git('rev-parse', '-q', '--verify', `refs/tags/gate-v${t.candidate.version}`)) {
+      expect(execFileSync('git', ['rev-parse', `gate-v${t.candidate.version}^{commit}`], { cwd: ROOT, encoding: 'utf8' }).trim()).toBe(pin);
+    }
+  });
   it('dev-time: once reviewed, the pinned commit\'s gate/dist and action.yml equal HEAD\'s (skipped while PENDING or when the commit is not fetched)', () => {
     const t = real();
     if (t.reviewedBy === PENDING) return;
