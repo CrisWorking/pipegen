@@ -3,8 +3,10 @@
 // injected repo text that makes the AI write a link, an image, HTML or an @mention must never survive (spec §19, T22, Review Focus 7).
 import { describe, expect, it } from 'vitest';
 import { CLEAN_DOC_MAX, CLEAN_DOC_PLACEHOLDER, cleanForDoc, stripForDoc } from '../src/debate/clean.js';
+import { findSecretLike } from '../src/ai/redact-core.js';
 import { pipegenDocProblems } from '../src/engine/created-judges/pipegen-doc.js';
 import { safeMarkdown } from '../src/util/safe-text.js';
+import { fake } from './helpers/secret-repo.js';
 
 const cps = (s: string): number => Array.from(s).length;
 // Nothing a renderer turns into a link, an image, HTML or a notification.
@@ -233,6 +235,12 @@ describe('clean', () => {
     expect(cleanForDoc('Trivy (fewer false positives) & faster')).toBe('Trivy (fewer false positives) and faster');
     expect(cleanForDoc('costs $0 and covers #12')).toBe('costs 0 and covers 12');
     expect(cleanForDoc('see a // b')).toBe('see a / / b');
+    // the judge reads UTF-16 units, so a letter or digit outside the BMP (math alphanumerics, CJK Extension B) is refused there:
+    // the cleaner blanks it (review I1)
+    expect(cleanForDoc('Use \u{1D412} now')).toBe('Use now');
+    expect(cleanForDoc('Use \u{1D412}\u{1D41E}\u{1D426}\u{1D420}\u{1D42B}\u{1D41E}\u{1D429} now, \u{1D7CF} rule \u{20000}')).toBe('Use now, rule');
+    expect(stripForDoc('\u{1D7CF}\u{10330}')).toBe('');
+    expect(cleanForDoc('BMP letters stay: \u00e9 \u4e2d \u0645 \u2160')).toBe('BMP letters stay: \u00e9 \u4e2d \u0645 \u2160');
   });
 
   it('clean: seeded fuzz (5,000 hostile mixes): the output passes the PIPEGEN.md judge and safeMarkdown changes nothing', () => {
@@ -252,6 +260,7 @@ describe('clean', () => {
       '3.12', 'node:20', ':rocket:', ':', 'GH-', 'gh-1', '#1', '${{', '}}', '\u200b', '\u200d', '\u202e', '\u2066', '\u00ad', '\u2028', '\u0085',
       '\u0000', '\u001b', '\u001b[31m', '\u0301', '\ufe0f', '\u{E0041}', '\u3164', '\u00a0', '\u3000', '\uff20', '\uff1c', '\uff0f', '\u2026',
       '\u201c', '\u2019', '\u2014', '\u4e2d', '\u00e9', '\u0645', '\u{1F600}', '\u2764', '\ud800', '\u{10FFFF}', '0', '9', 'A', 'z',
+      '\u{1D400}', '\u{1D41E}\u{1D426}', '\u{1D7CF}', '\u{20000}', '\u{10330}', '\u{1D552}\u{1D553}', // astral letters and digits (review I1)
     ];
     const CAPS = [1, 4, 5, 9, 30, 200, 400];
     for (let n = 0; n < 5_000; n++) {
@@ -271,4 +280,22 @@ describe('clean', () => {
       expect(docProblems(out), why).toEqual([]);
     }
   });
+
+  it('clean: secret-shaped text gives the placeholder (the judge\'s secret check would refuse the whole doc)', () => {
+    // built at runtime from pieces, like every secret-like test value (test/no-secret-literals.test.ts)
+    const shapes = [
+      fake.awsKey(), 'AS' + 'IA' + 'Q'.repeat(16), fake.slackBot(), 'xo' + 'xp-1-2-3', fake.jwt(), fake.openaiKey(), 'sk' + '-proj-' + 'Z'.repeat(22),
+      fake.googleKey(),
+    ];
+    for (const shape of shapes) {
+      const x = `use this key ${shape} in the job`;
+      expect(findSecretLike(stripForDoc(x)), shape).not.toEqual([]); // the strip alone leaves it, so the check is what removes it
+      expect(cleanForDoc(x), shape).toBe(CLEAN_DOC_PLACEHOLDER);
+      expect(docProblems(cleanForDoc(x)), shape).toEqual([]);
+      expect(cleanForDoc(x, 30), shape).toBe(cleanForDoc('', 30)); // a cut can't leave half of it either
+    }
+    // ordinary text that only looks a little like one stays
+    expect(cleanForDoc('AKIA is a prefix, sk- too')).toBe('AKIA is a prefix, sk- too');
+  });
 });
+

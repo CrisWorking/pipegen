@@ -18,6 +18,7 @@
 //
 // Every pattern below is linear: each one is either anchored, or scans a run of characters that can't hold its own start (so a
 // failed try ends at the next start), or has a bounded repeat. The round loop is bounded too (CLEAN_ROUNDS).
+import { findSecretLike } from '../ai/redact-core.js';
 import { displayForm, safeMarkdown } from '../util/safe-text.js';
 
 /** The default cap, in code points of the output. */
@@ -73,8 +74,9 @@ const TYPOGRAPHIC: readonly (readonly [RegExp, string])[] = [
 ];
 // Everything outside the doc alphabet: the judge's TEXT_CH (pipegen-doc.ts) without `_ * ~` (safeMarkdown escapes them) and
 // without the backtick (a code span). It becomes a blank (so `_` does too), never nothing: dropping it could glue `www` to a
-// `.` or `/` to `/`. One character at a time, so the pattern is linear.
-const NOT_DOC = /[^\p{L}\p{N} .,;:!?'"()/+=%-]/gu;
+// `.` or `/` to `/`. Code points outside the BMP go too, letters and digits included (math alphanumerics, CJK Extension B):
+// the judge reads UTF-16 units, and half of a surrogate pair is no letter there. One code point at a time, so it is linear.
+const NOT_DOC = /[^\p{L}\p{N} .,;:!?'"()/+=%-]|[\u{10000}-\u{10FFFF}]/gu;
 // Where safeMarkdown would insert U+200B (`//`, `www.`, `GH-1`) and where the judge sees an emoji shortcode (`:name:`; its own
 // pattern): a blank goes in. A blank can't complete any of these, so one pass is enough.
 const SLASH_SLASH = /\/(?=\/)/g;
@@ -156,7 +158,8 @@ function docCut(s: string, max: number): string {
 /**
  * AI-written text made safe for PIPEGEN.md: stripForDoc, the cut to `maxChars` (default 400; ` ...` marks a cut), then
  * safeMarkdown exactly once, which leaves this text as it is; so the cap counts the output, and the output passes the PIPEGEN.md
- * judge in a list item, a table cell or a heading. Empty → CLEAN_DOC_PLACEHOLDER (cut to the cap too), never ''.
+ * judge in a list item, a table cell or a heading. Empty, or shaped like a secret token → CLEAN_DOC_PLACEHOLDER (cut to the cap
+ * too), never ''. The user's typed values (the vault) are not checked here: Plan G checks them before it writes.
  *
  * Caller rules (S5, F1-R1; for Plan G): the result goes into PIPEGEN.md as it is, never through safeMarkdown again, and never in a
  * code span or a fence. Code-built lines (scoreboard, tool names) go through safeMarkdown once and must pass the judge too.
@@ -166,5 +169,8 @@ export function cleanForDoc(text: string, maxChars: number = CLEAN_DOC_MAX): str
   const stripped = stripForDoc(text);
   const cut = docCut(stripped === '' ? CLEAN_DOC_PLACEHOLDER : stripped, maxChars);
   const out = safeMarkdown(cut, maxChars);
-  return out === cut ? out : docCut(CLEAN_DOC_PLACEHOLDER, maxChars);
+  // Text shaped like a token (an AWS key id, a Slack or GitHub token, a JWT, ...): the judge's own secret check (findSecretLike)
+  // would refuse the whole PIPEGEN.md, so none of it is kept. Checked before the cut too, so a cut can't leave half of one.
+  if (out !== cut || findSecretLike(stripped).length > 0 || findSecretLike(out).length > 0) return docCut(CLEAN_DOC_PLACEHOLDER, maxChars);
+  return out;
 }

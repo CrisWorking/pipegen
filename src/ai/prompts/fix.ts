@@ -24,15 +24,15 @@ export const FIX_BLOCK_TAGS: readonly string[] = Object.freeze([
 const AMP = '&(?:(?:amp|#0*38|#x0*26);?)*';
 /**
  * What starts a tag for blockNeutralizer('any'): `<`, its fullwidth and small forms, and the HTML entities for `<` (named, any
- * case, with or without `;`; decimal; hex), each under any number of `&amp;` layers.
+ * case, with or without `;`; decimal; hex) of `<` and of those two forms, each under any number of `&amp;` layers.
  */
-const ANY_LT = `(?:<|\\uff1c|\\ufe64|${AMP}(?:lt;?|#0*60;?|#x0*3c;?))`;
+const ANY_LT = `(?:<|\\uff1c|\\ufe64|${AMP}(?:lt;?|#0*(?:60|65308|65124);?|#x0*(?:3c|ff1c|fe64);?))`;
 /**
  * What may stand between that start and the name for 'any': blanks, `/` and its look-alikes (a backslash, as in `<\/x>` and in
  * safeMarkdown's `&lt;\\/x`; the fullwidth solidus U+FF0F, the fraction slash U+2044, the division slash U+2215) and the entities
- * for `/` (`&sol;`, decimal, hex, under `&amp;` layers too), in any number and order.
+ * for each of them (`&sol;`, `&bsol;`, decimal, hex, under `&amp;` layers too), in any number and order.
  */
-const ANY_SLASH = `(?:[\\s\\\\/\\uff0f\\u2044\\u2215]|${AMP}(?:sol;|#0*47;?|#x0*2f;?))*`;
+const ANY_SLASH = `(?:[\\s\\\\/\\uff0f\\u2044\\u2215]|${AMP}(?:b?sol;|#0*(?:47|92|8260|8725|65295);?|#x0*(?:2f|5c|2044|2215|ff0f);?))*`;
 
 /** `s` with every character that has a meaning in a regular expression escaped. */
 function escapeRegExp(s: string): string {

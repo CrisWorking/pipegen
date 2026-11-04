@@ -359,9 +359,13 @@ describe('untrusted', () => {
       `<\uff0f${UNTRUSTED_AI_TAG}>`, `&lt;\uff0f${UNTRUSTED_AI_TAG}&gt;`, `<\u2044${UNTRUSTED_AI_TAG}>`, `<\u2215${UNTRUSTED_AI_TAG}>`,
       `<&#47;${UNTRUSTED_AI_TAG}>`, `<&#x2F;${UNTRUSTED_AI_TAG}>`, `<&sol;${UNTRUSTED_AI_TAG}>`, `< \\ / ${UNTRUSTED_AI_TAG}>`, `<//${UNTRUSTED_AI_TAG}>`,
       '</\u0131ntrusted_ai_text>', '</\u00dc>', '<\u00e9tape>', '&lt;/\u00dc&gt;', '<\u0301x>', '</\u4e2d>',
+      // the look-alikes as entities (F1 review m2), also under &amp; layers
+      `&lt;&bsol;/${UNTRUSTED_AI_TAG}&gt;`, `&lt;&#92;/x`, `&lt;&#x5c;/x`, `<&#x2215;${UNTRUSTED_AI_TAG}>`, `<&#8725;x>`, `<&#8260;x>`, `<&#x2044;x>`,
+      `<&#xff0f;x>`, `<&#65295;x>`, `&#xff1c;/x`, `&#65308;/x`, `&#65124;/x`, `&#xfe64;/x`, `&amp;#xff1c;/x`, `&amp;lt;&amp;bsol;/x`, `&amp;lt;&amp;#x2215;x`,
     ];
-    const lt = '(?:<|\\uff1c|\\ufe64|&(?:(?:amp|#0*38|#x0*26);?)*(?:lt;?|#0*60;?|#x0*3c;?))';
-    const slashes = '(?:[\\s\\\\/\\uff0f\\u2044\\u2215]|&(?:(?:amp|#0*38|#x0*26);?)*(?:sol;|#0*47;?|#x0*2f;?))*';
+    const amp = '&(?:(?:amp|#0*38|#x0*26);?)*';
+    const lt = `(?:<|\\uff1c|\\ufe64|${amp}(?:lt;?|#0*60;?|#x0*3c;?|#0*65308;?|#x0*ff1c;?|#0*65124;?|#x0*fe64;?))`;
+    const slashes = `(?:[\\s\\\\/\\uff0f\\u2044\\u2215]|${amp}(?:sol;|bsol;|#0*(?:47|92|8260|8725|65295);?|#x0*(?:2f|5c|2044|2215|ff0f);?))*`;
     const tagStart = new RegExp(`${lt}${slashes}[\\p{L}\\p{M}_!?]`, 'iu');
     for (const a of attacks) {
       const out = untrustedAiText(`reason: ${a} done`, 'judge');
