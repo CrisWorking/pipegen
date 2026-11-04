@@ -39,10 +39,10 @@ const renderC8 = (svc: Service | null = npmApp(), choices: Record<string, string
 const lastRun = (r: RenderResult): RenderedStep => r.steps.filter((s) => s.run !== undefined).at(-1) as RenderedStep;
 
 describe('D9: the c8 policy and the fixed test-command table', () => {
-  it('c8 takes --check-coverage and --lines from COVERAGE_MINIMUMS, both required, and runs the service\'s test command (testCommand)', () => {
+  it('c8 takes --check-coverage, --all (E9, D9 review I1) and --lines from COVERAGE_MINIMUMS, all required, and runs the service\'s test command (testCommand)', () => {
     const p = ARGV_POLICIES.c8 as ArgvPolicy;
-    expect(p.flags).toEqual({ 'check-coverage': 'bool', lines: { values: COVERAGE_MINIMUMS } });
-    expect(p.required).toEqual({ 'check-coverage': 'true', lines: null });
+    expect(p.flags).toEqual({ 'check-coverage': 'bool', all: 'bool', lines: { values: COVERAGE_MINIMUMS } });
+    expect(p.required).toEqual({ 'check-coverage': 'true', all: 'true', lines: null });
     expect(p.testCommand).toBe(true);
     expect(p.runsRepoCode).toBe(true);
     expect(p.positionals).toBeUndefined();
@@ -64,14 +64,19 @@ describe('D9: the c8 policy and the fixed test-command table', () => {
 });
 
 describe('D9: the reviewed c8 entry', () => {
-  it('runs `c8 --check-coverage --lines={lines}` with the same fixed args, offers lines 60/70/80/90, and loads', () => {
+  it('runs `c8 --check-coverage --all --lines={lines}` with the same fixed args, offers lines 60/70/80/90, and loads', () => {
     const t = loadReviewed().find((e) => e.id === 'c8') as ReviewedTool;
-    expect(t.step.cli?.command).toEqual(['c8', '--check-coverage', '--lines={lines}']);
-    expect(t.fixedInputs.args).toEqual(['--check-coverage', '--lines={lines}']);
+    expect(t.step.cli?.command).toEqual(['c8', '--check-coverage', '--all', '--lines={lines}']);
+    expect(t.fixedInputs.args).toEqual(['--check-coverage', '--all', '--lines={lines}']);
     expect(t.choices).toEqual({ lines: ['60', '70', '80', '90'] });
     expect(argvPolicyProblems({ ...t, releasedAt: realEntry('c8').releasedAt } as Parameters<typeof argvPolicyProblems>[0])).toEqual([]);
     expect(t.reviewedBy).toBe('Claude delegated DECISIONS 105');
-    expect(t.reviewedAt).toBe('2026-11-03');
+    expect(t.reviewedAt).toBe('2026-11-04');
+  });
+  it('the loader refuses c8 without --all (E9: an empty measurement would pass the minimum)', () => {
+    const e = realEntry('c8');
+    e.step.cli.command = ['c8', '--check-coverage', '--lines={lines}']; e.fixedInputs.args = ['--check-coverage', '--lines={lines}'];
+    expect(() => loadAt([e])).toThrow(/c8/);
   });
   it('the AI is never offered `lines`: pipegen\'s code fills it (Plan F schema uses aiChoiceNames)', () => {
     const t = loadReviewed().find((e) => e.id === 'c8') as ReviewedTool;
@@ -85,6 +90,7 @@ describe('D9: the reviewed c8 entry', () => {
     expect(above).not.toMatch(/\.c8rc\.json \(Plan D\)/);
     expect(above).toMatch(/--lines/);
     expect(above).toMatch(/npm test/);
+    expect(above).toMatch(/--all/);
   });
   it('the loader refuses a test command, a `--`, or any other word in the entry itself (the table is the only source)', () => {
     const both = (change: (xs: string[]) => string[]) => {
@@ -99,32 +105,32 @@ describe('D9: the reviewed c8 entry', () => {
     }
   });
   it('the loader refuses c8 without --lines, with a value off the list, with a choice value off the list, or with --lines turned into a constant', () => {
-    const e1 = realEntry('c8'); e1.step.cli.command = ['c8', '--check-coverage']; e1.fixedInputs.args = ['--check-coverage']; e1.choices = {};
+    const e1 = realEntry('c8'); e1.step.cli.command = ['c8', '--check-coverage', '--all']; e1.fixedInputs.args = ['--check-coverage', '--all']; e1.choices = {};
     const e2 = realEntry('c8'); e2.choices.lines = ['50', '60'];
-    const e3 = realEntry('c8'); e3.step.cli.command = ['c8', '--check-coverage', '--lines=0']; e3.fixedInputs.args = ['--check-coverage', '--lines=0']; e3.choices = {};
-    const e4 = realEntry('c8'); e4.step.cli.command = ['c8', '--check-coverage', '--lines={lines}', '--lines=0'];
-    const e5 = realEntry('c8'); e5.fixedInputs.args = ['--check-coverage'];
-    const e6 = realEntry('c8'); e6.step.cli.command = ['c8', '--check-coverage', '--lines={lines}', '--per-file'];
+    const e3 = realEntry('c8'); e3.step.cli.command = ['c8', '--check-coverage', '--all', '--lines=0']; e3.fixedInputs.args = ['--check-coverage', '--all', '--lines=0']; e3.choices = {};
+    const e4 = realEntry('c8'); e4.step.cli.command = ['c8', '--check-coverage', '--all', '--lines={lines}', '--lines=0'];
+    const e5 = realEntry('c8'); e5.fixedInputs.args = ['--check-coverage', '--all'];
+    const e6 = realEntry('c8'); e6.step.cli.command = ['c8', '--check-coverage', '--all', '--lines={lines}', '--per-file'];
     for (const e of [e1, e2, e3, e4, e5, e6]) expect(() => loadAt([e])).toThrow(/c8/);
     expect(loadAt([realEntry('c8')])).toHaveLength(1);
   });
   it('only `--flag={flag}` (its own placeholder) is a choice slot: a fixed constant or another placeholder still makes the choice a fixed input', () => {
     // a constant --lines=80 in the fixed args with a `lines` choice offered: the AI may not choose a fixed flag
     const constant = realEntry('c8');
-    constant.step.cli.command = ['c8', '--check-coverage', '--lines=80']; constant.fixedInputs.args = ['--check-coverage', '--lines=80'];
+    constant.step.cli.command = ['c8', '--check-coverage', '--all', '--lines=80']; constant.fixedInputs.args = ['--check-coverage', '--all', '--lines=80'];
     expect(() => loadAt([constant])).toThrow(/the AI may not choose lines: it is a fixed input/);
     // --lines={other}: the placeholder is not the flag's own, so --lines is fixed and the `lines` choice is refused
     const other = realEntry('c8');
-    other.step.cli.command = ['c8', '--check-coverage', '--lines={other}']; other.fixedInputs.args = ['--check-coverage', '--lines={other}'];
+    other.step.cli.command = ['c8', '--check-coverage', '--all', '--lines={other}']; other.fixedInputs.args = ['--check-coverage', '--all', '--lines={other}'];
     other.choices = { lines: ['60'], other: ['60'] };
     expect(() => loadAt([other])).toThrow(/the AI may not choose lines: it is a fixed input/);
   });
 });
 
 describe('D9: rendering c8', () => {
-  it('npm service with a test script: `node …/c8.js --check-coverage --lines="$PIPEGEN_ARG_0" -- "$nodebin/npm" test`, the value in env, CI=true', () => {
+  it('render: c8 argv = --check-coverage --all --lines=<n> -- npm test', () => {
     const run = lastRun(renderC8());
-    expect(run.run).toContain('"$nodebin/node" "$PWD/node_modules/c8/bin/c8.js" --check-coverage --lines="$PIPEGEN_ARG_0" -- "$nodebin/npm" test || rc=$?');
+    expect(run.run).toContain('"$nodebin/node" "$PWD/node_modules/c8/bin/c8.js" --check-coverage --all --lines="$PIPEGEN_ARG_0" -- "$nodebin/npm" test || rc=$?');
     expect(run.env?.PIPEGEN_ARG_0).toBe('80');
     expect(run.run).toMatch(/^ {2}"CI=true"$/m);
     expect(run.id).toMatch(/^repocode-[0-9a-f]{16}$/);

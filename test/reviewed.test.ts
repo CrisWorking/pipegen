@@ -1666,7 +1666,7 @@ describe('data/reviewed-tools.yml', () => {
     ruff: '2026-10-30', 'ruff-format': '2026-10-30', prettier: '2026-10-30', knip: '2026-10-30', 'osv-scanner': '2026-10-30', jscpd: '2026-10-30', bandit: '2026-10-30', 'oxlint-typeaware': '2026-10-30',
     lefthook: '2026-10-30', syft: '2026-10-30', zizmor: '2026-10-30', hadolint: '2026-10-30', 'kube-linter': '2026-10-30', poutine: '2026-10-30',
     // D9 (ruling B5): c8 runs the service's tests (fixed table, after --) with the code-filled --lines={lines}
-    c8: '2026-11-03',
+    c8: '2026-11-04',
   };
 
   it('data: every catalogue entry is reviewed by the owner (2026-10-28, DECISIONS #104) or by delegation (listed), with proofs 0', () => {

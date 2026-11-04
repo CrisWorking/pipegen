@@ -1118,6 +1118,8 @@ tools:
   # The renderer adds the command after `--` from its fixed table (TEST_COMMANDS): `npm test` through the Node setup step's npm, for npm
   # services with a test script only; nothing here or in the repo names it. Measured with c8 12.0.0 (task D9): with no command c8 refuses
   # every run ("Not enough non-option arguments", exit 1); `--check-coverage --lines=60 -- npm test` measures and fails below 60%.
+  # --all (E9, D9 review I1): every source file under the service folder counts, loaded or not; without it a test script that loads no
+  # code ("test": "true") gives an empty measurement that passes any --lines (measured live in E9: with --all it fails).
   # Source: npm c8@12.0.0 dist.integrity (tarball hashes to it), published 2026-07-14T13:51:32.917Z; npm provenance: no.
   - id: c8
     categories: ["coverage"]
@@ -1136,17 +1138,17 @@ tools:
     step:
       cli:
         install: { method: npm, package: "c8", version: "12.0.0" }
-        command: ["c8", "--check-coverage", "--lines={lines}"]
+        command: ["c8", "--check-coverage", "--all", "--lines={lines}"]
       output: { path: "", format: none }
     fixedInputs:
-      args: ["--check-coverage", "--lines={lines}"]
+      args: ["--check-coverage", "--all", "--lines={lines}"]
     choices:
       lines: ["60", "70", "80", "90"]
     # Config scope: nested (protected at any depth). c8 reads its rc file from the working folder; unsure about parents, so nested.
     configFiles: [".c8rc", ".c8rc.*", ".nycrc", ".nycrc.*"]
     configSections: ["package.json:c8"]
     reviewedBy: Claude delegated DECISIONS 105
-    reviewedAt: "2026-11-03"
+    reviewedAt: "2026-11-04"
     proofs: 0
 
   # Knip: unused files, exports and dependencies. Report-only on the first run; blocking only with the repo's own knip config (pipegen never writes one).

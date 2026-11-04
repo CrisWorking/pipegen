@@ -225,7 +225,7 @@ const STAGED = { ignoreFiles: SECRETS_IGNORE_FILES } as const;
 const GH = 'github-release' as const;
 const TRIVY_ASSET = 'trivy_0.76.0_Linux-64bit.tar.gz';
 const RUFF_ASSET = 'ruff-x86_64-unknown-linux-gnu.tar.gz';
-/** Coverage minimums the AI may choose (P24): never 0. */
+/** Coverage minimums (P24): never 0. pipegen's code fills the value (create/coverage.ts CODE_FILLED_CHOICES, ruling B5), never the AI. */
 export const COVERAGE_MINIMUMS = ['60', '70', '80', '90'] as const;
 
 /**
@@ -323,15 +323,17 @@ const POLICIES = {
   prettier: { method: 'npm', package: 'prettier', npmBin: 'bin/prettier.cjs', loadsRepoConfig: true, exe: 'prettier', dialect: 'long', sub: [], positionals: ['.'], flags: { check: 'bool', 'ignore-path': { values: ['.prettierignore'] } }, required: { check: 'true', 'ignore-path': '.prettierignore' },
     // the checkout's .prettierignore stays; the pinned (empty) ignore file is the second --ignore-path, so no .gitignore is read (C4 fix round 1; prettier 3.9.10 reads .gitignore and .prettierignore by default)
     config: { flag: '--ignore-path', content: "# pipegen's pinned prettier ignore file: nothing is ignored here, so a .gitignore in the checkout hides no file\n", fileName: 'prettierignore' } },
-  // Vitest 5.0.5: coverage on, with a minimum the AI chooses (P24)
+  // Vitest 5.0.5: coverage on, with a minimum pipegen's code fills (P24, ruling B5)
   'vitest-coverage': { method: 'npm', package: 'vitest', npmBin: 'vitest.mjs', runsRepoCode: true,
     exe: 'vitest', dialect: 'long', sub: ['run'], flags: { coverage: 'bool', 'coverage.thresholds.lines': { values: COVERAGE_MINIMUMS } },
     required: { coverage: 'true', 'coverage.thresholds.lines': null },
   },
   // c8 12.0.0: the service's tests (TEST_COMMANDS, after `--`) with a line minimum pipegen's code fills (D9, ruling B5); with no command c8 12.0.0
-  // refuses every run ("Not enough non-option arguments", measured), and without --lines its default minimum is 90
+  // refuses every run ("Not enough non-option arguments", measured), and without --lines its default minimum is 90.
+  // --all (E9, D9 review I1): every source file under the folder counts, loaded or not. Without it a test script that loads no code
+  // (`"test": "true"`) gives an empty measurement, which passes any --lines; with it the unloaded files count as 0% and the run fails.
   c8: { method: 'npm', package: 'c8', npmBin: 'bin/c8.js', runsRepoCode: true, testCommand: true, exe: 'c8', dialect: 'long', sub: [],
-    flags: { 'check-coverage': 'bool', lines: { values: COVERAGE_MINIMUMS } }, required: { 'check-coverage': 'true', lines: null } },
+    flags: { 'check-coverage': 'bool', all: 'bool', lines: { values: COVERAGE_MINIMUMS } }, required: { 'check-coverage': 'true', all: 'true', lines: null } },
   // Knip 6.42.1
   knip: { method: 'npm', package: 'knip', npmBin: 'bin/knip.js', loadsRepoConfig: true, exe: 'knip', dialect: 'long', sub: [], flags: { 'no-progress': 'bool', 'no-gitignore': 'bool' }, required: { 'no-gitignore': 'true' } },
   // jscpd 5.4.2 (the release binary): new copy-paste against the base only; no semantic mode (jscpdProblems)

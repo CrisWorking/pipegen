@@ -2154,7 +2154,7 @@ export default [js.configs.recommended, ...tseslint.configs.recommended, { ${ESL
     // the checkout's .prettierignore stays; the pinned (empty) ignore file is the second --ignore-path, so no .gitignore is read (C4 fix round 1; prettier 3.9.10 reads .gitignore and .prettierignore by default)
     config: { flag: "--ignore-path", content: "# pipegen's pinned prettier ignore file: nothing is ignored here, so a .gitignore in the checkout hides no file\n", fileName: "prettierignore" }
   },
-  // Vitest 5.0.5: coverage on, with a minimum the AI chooses (P24)
+  // Vitest 5.0.5: coverage on, with a minimum pipegen's code fills (P24, ruling B5)
   "vitest-coverage": {
     method: "npm",
     package: "vitest",
@@ -2167,7 +2167,9 @@ export default [js.configs.recommended, ...tseslint.configs.recommended, { ${ESL
     required: { coverage: "true", "coverage.thresholds.lines": null }
   },
   // c8 12.0.0: the service's tests (TEST_COMMANDS, after `--`) with a line minimum pipegen's code fills (D9, ruling B5); with no command c8 12.0.0
-  // refuses every run ("Not enough non-option arguments", measured), and without --lines its default minimum is 90
+  // refuses every run ("Not enough non-option arguments", measured), and without --lines its default minimum is 90.
+  // --all (E9, D9 review I1): every source file under the folder counts, loaded or not. Without it a test script that loads no code
+  // (`"test": "true"`) gives an empty measurement, which passes any --lines; with it the unloaded files count as 0% and the run fails.
   c8: {
     method: "npm",
     package: "c8",
@@ -2177,8 +2179,8 @@ export default [js.configs.recommended, ...tseslint.configs.recommended, { ${ESL
     exe: "c8",
     dialect: "long",
     sub: [],
-    flags: { "check-coverage": "bool", lines: { values: COVERAGE_MINIMUMS } },
-    required: { "check-coverage": "true", lines: null }
+    flags: { "check-coverage": "bool", all: "bool", lines: { values: COVERAGE_MINIMUMS } },
+    required: { "check-coverage": "true", all: "true", lines: null }
   },
   // Knip 6.42.1
   knip: { method: "npm", package: "knip", npmBin: "bin/knip.js", loadsRepoConfig: true, exe: "knip", dialect: "long", sub: [], flags: { "no-progress": "bool", "no-gitignore": "bool" }, required: { "no-gitignore": "true" } },
