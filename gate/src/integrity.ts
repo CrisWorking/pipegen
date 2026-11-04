@@ -12,6 +12,7 @@ import { parse as parseToml } from 'smol-toml';
 import type { Finding } from '../../src/types.js';
 import { WORKFLOW_PATH, type GateGithub } from './baseline.js';
 import type { PrDiff } from './decide.js';
+import { STRICT_LOGIN_SOURCE } from './login.js';
 
 // ---------- reading hostile data ----------
 
@@ -356,7 +357,8 @@ const MAX_RULES = 100_000;
 export const MAX_LINE = 4096;
 const TEAM_RE = /^@[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9._-]+$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-export const LOGIN_RE = /^@([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)$/;
+/** `@login` of a user, EMU logins included (E9, gate/src/login.ts); group 1 is the login. */
+export const LOGIN_RE = new RegExp(`^@(${STRICT_LOGIN_SOURCE})$`);
 
 /** Split a line into tokens on unescaped whitespace; `\ ` is a space inside a token. Stops at a token that starts with `#`. */
 function tokens(line: string): string[] {

@@ -12,13 +12,14 @@ import { NotGitHubRepoError, readProject } from '../read/project.js';
 import type { Auth, Capabilities, RepoProfile, Service } from '../types.js';
 import { knownValuesFrom, makeSafeOutput, OUTPUT_CAP } from '../util/safe-output.js';
 import type { CliIO } from './io.js';
+import { API_LOGIN_RE } from '../../gate/src/login.js';
 
 type LocalProfile = Awaited<ReturnType<typeof readProject>>;
 type GitHubContext = Pick<RepoProfile, 'private' | 'ownerType' | 'plan' | 'defaultBranch'>;
 
 const I = '  ';
 const MAX_LIST = 30;
-const LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+const LOGIN_RE = API_LOGIN_RE;   // E9: EMU logins too (gate/src/login.ts)
 
 /** Cleans one repo- or GitHub-derived string for the terminal (safeOutput with this run's known values). */
 type Clean = (s: string, max?: number) => string;

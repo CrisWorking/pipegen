@@ -7314,6 +7314,11 @@ function parse(toml, options = {}) {
 // node_modules/smol-toml/dist/stringify.js
 var HAS_WELLFORMED = !!"".isWellFormed;
 
+// gate/src/login.ts
+var STRICT_LOGIN_SOURCE = "(?=[A-Za-z0-9_-]{1,39}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?(?:_[A-Za-z0-9]+)?";
+var STRICT_LOGIN_RE = new RegExp(`^${STRICT_LOGIN_SOURCE}$`);
+var API_LOGIN_RE = /^(?=[A-Za-z0-9_-]{1,39}$)[A-Za-z0-9][A-Za-z0-9-]*(?:_[A-Za-z0-9]+)?$/;
+
 // gate/src/integrity.ts
 var isPlain4 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 var own3 = (o, k) => Object.hasOwn(o, k) ? o[k] : void 0;
@@ -7735,7 +7740,7 @@ var MAX_RULES = 1e5;
 var MAX_LINE = 4096;
 var TEAM_RE = /^@[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9._-]+$/;
 var EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-var LOGIN_RE = /^@([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)$/;
+var LOGIN_RE = new RegExp(`^@(${STRICT_LOGIN_SOURCE})$`);
 function tokens(line) {
   const out = [];
   let cur = "";
@@ -8733,7 +8738,7 @@ var fail2 = (what) => {
 var OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 var REPO_RE = /^[A-Za-z0-9._-]{1,100}$/;
 var SHA_RE7 = /^[0-9a-f]{40}$/;
-var LOGIN_RE2 = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+var LOGIN_RE2 = API_LOGIN_RE;
 var REF_PART_RE = /^[A-Za-z0-9._+@-]{1,255}$/;
 var ARTIFACT_NAME_RE = /^[A-Za-z0-9._-]{1,200}$/;
 var WORKFLOW_RE = /^[A-Za-z0-9._-]{1,100}\.ya?ml$/;

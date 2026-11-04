@@ -30,6 +30,7 @@ import type { Auth, Plan, RepoProfile } from '../types.js';
 import { isRateStop, newRateBudget, withRateLimit, type RateClock } from '../engine/github-rate.js';
 import { readBytes } from '../engine/http.js';
 import { safeText } from '../util/safe-text.js';
+import { API_LOGIN_RE } from '../../gate/src/login.js';
 
 /** Hard-coded: the only host that ever gets the token. */
 export const GITHUB_API = 'https://api.github.com';
@@ -765,7 +766,7 @@ export async function probePermissions(gh: Octokit, owner: string, repos: string
 
 // ---------- writers ----------
 
-const LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+const LOGIN_RE = API_LOGIN_RE;   // E9: EMU logins too (gate/src/login.ts)
 const WRITERS_PAGES = 50;
 
 /**

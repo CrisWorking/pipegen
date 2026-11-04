@@ -37,9 +37,9 @@ const MOUNT = /bind/;
 describe('E9 (E3-R7): no bind mount in a key-holding run script', () => {
   it('proof workflow: a run script that bind-mounts a host path into a container is refused (-v, --volume, --mount type=bind, --volumes-from, short-flag groups)', () => {
     const bad = [
-      'docker run --rm -v "$PWD:/src" img:1 scan',
+      'docker run --rm -v "$GITHUB_WORKSPACE:/src" img:1 scan',
       'docker run --rm -v/home/runner:/h img:1',
-      '/usr/bin/docker run --rm --volume "$PWD:/src" img:1',
+      '/usr/bin/docker run --rm --volume "$GITHUB_WORKSPACE:/src" img:1',
       'docker run --volume=/etc:/e img:1',
       'docker run --mount type=bind,source="$PWD",target=/src img:1',
       'docker run --mount=type=bind,src=/,dst=/h img:1',
@@ -49,7 +49,7 @@ describe('E9 (E3-R7): no bind mount in a key-holding run script', () => {
       'sudo docker run -v /:/h img:1',
       'docker run --volumes-from other img:1',
       'echo hi && docker run -v /:/h img:1 || true',
-      'docker run \\\n  -v "$PWD:/src" \\\n  img:1',
+      'docker run \\\n  -v "$GITHUB_WORKSPACE:/src" \\\n  img:1',
       'podman run -v /:/h img:1',
       'docker compose run -v /:/h app',
       // strict on purpose: a -v word in the container's own command counts too (the check does not parse where the image stands)
@@ -110,7 +110,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - run: docker run -v "$PWD:/src" img:1
+      - run: docker run -v "$GITHUB_WORKSPACE:/src" img:1
 `;
     expect(problems(compat, 'compat').join(' ')).not.toMatch(MOUNT);
   });

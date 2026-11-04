@@ -20,6 +20,7 @@ import type { GateGithub, RunQuery } from './baseline.js';
 import { MAX_ARTIFACT_BYTES } from './baseline.js';
 import { readZipEntry } from './artifacts.js';
 import type { NightlyGithub } from './nightly.js';
+import { API_LOGIN_RE } from './login.js';
 
 export const API_ROOT = 'https://api.github.com';
 const API_HOST = 'api.github.com';
@@ -77,7 +78,7 @@ const fail = (what: string): never => { throw new GitHubApiError(`pipegen will n
 const OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 const REPO_RE = /^[A-Za-z0-9._-]{1,100}$/;
 const SHA_RE = /^[0-9a-f]{40}$/;
-const LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+const LOGIN_RE = API_LOGIN_RE;   // E9: EMU logins too (gate/src/login.ts)
 const REF_PART_RE = /^[A-Za-z0-9._+@-]{1,255}$/;
 const ARTIFACT_NAME_RE = /^[A-Za-z0-9._-]{1,200}$/;
 const WORKFLOW_RE = /^[A-Za-z0-9._-]{1,100}\.ya?ml$/;

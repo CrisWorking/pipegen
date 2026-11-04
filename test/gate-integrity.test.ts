@@ -101,7 +101,8 @@ describe('codeowners: parsing', () => {
     expect(codeOwners('!x @a\n/y[ab] @a\n\\#z @a\n/ok @a\n')).toEqual([{ pattern: '/ok', owners: ['a'] }]);
   });
   it('a line with any owner token that is not a valid login, team or e-mail is skipped whole, as GitHub does (fix round 1, review 14)', () => {
-    for (const bad of ['@-bad', '@bad-', '@a_b', '@' + 'x'.repeat(40), 'plain', '@']) expect(codeOwners(`/a @ok ${bad} @fine-1\n`), bad).toEqual([]);
+    for (const bad of ['@-bad', '@bad-', '@_ab', '@ab_', '@a_b_c', '@' + 'x'.repeat(40), 'plain', '@'])   // E9: @a_b is an EMU login now (test/e9-login.test.ts)
+      expect(codeOwners(`/a @ok ${bad} @fine-1\n`), bad).toEqual([]);
     expect(codeOwners('/a @fine-1 @org/team user@example.com\n')).toEqual([{ pattern: '/a', owners: ['fine-1'] }]);
   });
   it('a hostile huge file is bounded: only the first 100,000 rules count and a line over 4096 characters is skipped', () => {

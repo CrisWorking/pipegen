@@ -41,6 +41,7 @@ import { execa, type ResultPromise } from 'execa';
 import { hideToken } from '../github/client.js';
 import { interrupting, onExit } from '../util/exit-hooks.js';
 import { safeText } from '../util/safe-text.js';
+import { API_LOGIN_RE } from '../../gate/src/login.js';
 
 /** Ruling B6: on every git call, before the command. Read last by git, so these win over every config file. */
 export const HARDENED_CONFIG: readonly string[] = Object.freeze([
@@ -223,7 +224,8 @@ const absolute = (dir: string, what: string): string => {
 
 // ---------- push URL and refs ----------
 
-const OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+// carry E0c (E9): an EMU user's own repos have the EMU login as owner (gate/src/login.ts)
+const OWNER_RE = API_LOGIN_RE;
 const REPO_RE = /^[A-Za-z0-9._-]{1,100}$/;
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\/-]/g, '\\$&');
 export type PushRepo = 'scratch' | 'central';
