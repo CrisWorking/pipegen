@@ -752,7 +752,15 @@ class FixLoop {
       s.aiDone = 'the AI found no change it is allowed to make';
       return 'exhausted';
     }
-    const res = ans.action === 'edit-file' ? await this.applyEdit(ans, paths) : ans.action === 'change-step' ? await this.applyStep(ans, cands) : await this.applyBase(ans, dockerfiles, baseIds);
+    let res: string | { draft: PipelineDraft; aiFiles: string[] };
+    try {
+      res = ans.action === 'edit-file' ? await this.applyEdit(ans, paths) : ans.action === 'change-step' ? await this.applyStep(ans, cands) : await this.applyBase(ans, dockerfiles, baseIds);
+    } catch (e) {
+      // createDockerfile (deps.dockerfileFor) calls the AI too: the cap stops the run; a refused or failed Dockerfile is a refused answer
+      if (isCostCap(e)) return (await this.capStop(e)) ?? this.finish('the AI cost cap was reached');
+      if (!(e instanceof AiError) && (e as { name?: unknown } | null)?.name !== 'DockerfileError') throw e;
+      res = `the Dockerfile could not be made from that base image (${st((e as Error).message, 300)})`;
+    }
     if (typeof res === 'string') return this.refuse(s, n, rec, explanation, res);
     this.draft = res.draft;
     this.version++;

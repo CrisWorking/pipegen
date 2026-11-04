@@ -8,6 +8,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { FIX_SYSTEM, UNTRUSTED_LOG_NOTE } from '../src/ai/prompts/fix.js';
 import { knownValueScrubber, bundleCode, type CodeBundle } from '../src/ai/redact.js';
 import { AiSpendMeter } from '../src/ai/spend-meter.js';
+import { AiError } from '../src/ai/errors.js';
 import { createDockerfile } from '../src/create/dockerfile.js';
 import { DOCKERIGNORE_LINES, dockerignoreText } from '../src/create/dockerfile-rules.js';
 import { SecretVault } from '../src/create/secrets.js';
@@ -25,7 +26,8 @@ import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
 import { DEFAULT_MODEL, type AiProvider, type AiRequest, type AiUsage, type CreatedFile, type Part, type PartResult, type PipelineDraft, type RepoProfile, type Service, type StepSpec } from '../src/types.js';
 import { betterleaksAt, CLEAN, gitleaksAt, makeStub, scanWith } from './helpers/gitleaks-stub.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
-import { draftOf, spec } from './helpers/proof-eval.js';
+import { ctxOf, draftOf, greenMain, PIPEGEN, plantedRuns, spec } from './helpers/proof-eval.js';
+import { evaluateProof } from '../src/proof/evaluate.js';
 import { world as ghWorld } from './helpers/proof-github.js';
 import { runsFake } from './helpers/proof-runs.js';
 import { repoFiles, root } from './helpers/repo-files.js';
@@ -435,7 +437,7 @@ describe('E7 fix loop', () => {
       prove: (n) => (n === 0 ? proof({ part: 'test-migration', log: errLog('alpha') }) : green()),
       answers: [
         edit(path, SPEC_JS.replace("  it('is empty', () => { expect(total([])).toBe(0); });\n", '')),
-        edit(path, SPEC_JS.replace("it('is empty'", "it.skip('is empty'")),
+        edit(path, SPEC_JS.replace("describe('cart', () => {\n", "describe('cart', () => {\n  it.skip('later', () => { expect(total([5])).toBe(5); });\n")),
         edit(path, SPEC_JS.replace('toBe(3)', 'toEqual(3)')),
       ],
       checkTests: (prev, next) => { checks.push(next.files.length); expect(prev?.files[0]?.path).toBe(path); return []; },
@@ -444,8 +446,8 @@ describe('E7 fix loop', () => {
     expect(out.aiAttempts).toEqual({ 'test-migration': 3 });
     expect(w.proves).toHaveLength(2);
     expect(checks.length).toBeGreaterThanOrEqual(1);
-    expect(w.reqs[1]?.user).toMatch(/fewer tests/);
-    expect(w.reqs[2]?.user).toMatch(/skip/);
+    expect(w.reqs[1]?.user).toMatch(/fewer tests than the 2 before/);
+    expect(w.reqs[2]?.user).toMatch(/skips, focuses or marks a test/);
     expect(fileOf(out.draft, path)?.content).toContain('toEqual(3)');
   });
 
@@ -639,6 +641,12 @@ describe('E7 fix loop', () => {
     expect(posts).toEqual([`/repos/${OWNER}/${SCRATCH}/actions/runs/777/rerun-failed-jobs`]);
     // only a run findRuns matched for this target, and only a finished attempt number
     await expect(rerunFailedJobs(g.gh, t, [{ handle: { ...(h as object) } as never, attempt: 1 }], { timeoutMs: 1, clock })).rejects.toThrow(/findRuns/);
+    expect(f.reruns).toHaveLength(1);   // refused before anything was sent
+    // GitHub shows the old (failed) attempt for a moment after the POST: pipegen waits for the new one
+    f.rerunLag = 2;
+    f.rerunConclusion = 'success';
+    const again = await rerunFailedJobs(g.gh, t, [{ handle: h as never, attempt: 2 }], { timeoutMs: 60_000, clock });
+    expect(again[0]?.attempt).toBe(3);
     await expect(rerunFailedJobs(g.gh, t, [{ handle: h as never, attempt: 0 }], { timeoutMs: 1, clock })).rejects.toThrow(/attempt/);
   });
 
@@ -712,6 +720,7 @@ describe('E7 boundaries (extra)', () => {
     expect(verdict(out, 'compose')?.status).toBe('not-proven');
     expect(verdict(out, 'compose')?.detail).toMatch(/only in a run that held your real test keys/);
     expect(out.keys).toBe('real');   // the last real run is the result; no third run
+    expect(out.attempts).toBe(1);   // the run again with placeholders counts toward the global cap
   });
 
   it('cap checks at every stage boundary: before the first push, after a proof, before an AI call, before a re-prove', async () => {
@@ -732,6 +741,7 @@ describe('E7 boundaries (extra)', () => {
     const outC = await c.run();
     expect(c.reqs).toHaveLength(0);
     expect(outC.stopped).toMatch(/AI cost reached the limit/);
+    expect(outC.notes.join('\n')).not.toMatch(/refused the answer/);   // a cost-cap refusal is the cap, not a refused answer
     // an accepted answer, then the minutes ran out: nothing more is pushed; onCap (Plan G's stopAtCap) is told
     const caps: string[] = [];
     const d = world({ minutesCap: 10, prove: (n) => (n === 0 ? proof({ part: 'docker', log: errLog('alpha') }) : green()), answers: [edit('api/Dockerfile', DF(REF24, '\n# x'))], referee: () => { d.minutes.restore(10); return { ok: true, issues: [] }; } });
@@ -804,6 +814,191 @@ describe('E7 boundaries (extra)', () => {
     expect(o2.result.ok).toBe(true);   // the pipeline is proven; docker is delivered warn-only
     const f = world({ prove: () => proof({ part: 'pipeline', needId: 'secrets', log: errLog('alpha') }) });
     expect((await f.run()).result.ok).toBe(false);
+  });
+
+  it('same error twice counts only after an answer of its own was applied', async () => {
+    // docker's first answer is refused while compose's is applied; docker's error in the next run is the same, and docker is asked again
+    const w = world({
+      prove: (n) => (n === 0 ? proof({ part: 'docker', log: errLog('alpha') }, { part: 'compose', log: errLog('beta') }) : n === 1 ? proof({ part: 'docker', log: errLog('alpha') }) : green()),
+      answers: [edit('api/Dockerfile', DF(REF24, '\n# one')), edit('docker-compose.pipegen.yml', `${COMPOSE}# y\n`), edit('api/Dockerfile', DF(REF24, '\n# two'))],
+      referee: (_d, n) => (n === 0 ? { ok: false, issues: [{ file: 'api/Dockerfile', check: 'secret-value', message: 'no' }] } : { ok: true, issues: [] }),
+    });
+    const out = await w.run();
+    expect(out.aiAttempts).toEqual({ docker: 2, compose: 1 });
+    expect(out.result.ok).toBe(true);
+  });
+
+  it("E5's evidence names each log's run id and attempt; a log of an older attempt is no source", async () => {
+    const d = draftOf();
+    const main = greenMain(d);
+    const pr = main.outcomes.find((o) => o.handle.workflow === PIPEGEN && o.handle.event === 'pull_request') as (typeof main.outcomes)[number];
+    const j = pr.jobs.find((x) => x.name === 'sast--api') as (typeof pr.jobs)[number];
+    Object.assign(j, { conclusion: 'failure', log: errLog('alpha') });
+    pr.conclusion = 'failure';
+    const ev = (await evaluateProof(d, [main, plantedRuns(d)], ctxOf())).evidence.get('pipeline:sast');
+    expect(ev?.sources).toEqual([{ runId: pr.handle.runId, attempt: 1, job: 'sast--api', log: errLog('alpha') }]);
+    pr.attempt = 2;   // the run was re-run since; this job's log belongs to attempt 1
+    const ev2 = (await evaluateProof(d, [main, plantedRuns(d)], ctxOf())).evidence.get('pipeline:sast');
+    expect(ev2?.log).toContain('alpha');
+    expect(ev2?.sources).toEqual([]);
+  });
+
+  it('a Dockerfile that could not be made from the chosen base is a refused answer, not a crash', async () => {
+    const w = world({
+      draft: baseDraft([...dockerFiles(REF22), composeFile()]),
+      prove: (n) => (n === 0 ? proof({ part: 'docker', needId: 'image-scan', detail: 'the base image has critical/high CVEs (x); another base image tag is needed' }) : green()),
+      answers: [answer({ action: 'change-base', baseId: 'node-24-bookworm-slim', explanation: 'x' }), answer({ action: 'change-base', baseId: 'node-26-bookworm-slim', explanation: 'y' })],
+      dockerfileFor: async (path, baseId) => {
+        if (baseId === 'node-24-bookworm-slim') throw Object.assign(new Error('The Dockerfile for "api" was refused twice: x'), { name: 'DockerfileError' });
+        return [file(path, DF(baseImageRef(baseId)), 'docker'), file('api/.dockerignore', DOCKERIGNORE, 'docker')];
+      },
+    });
+    const out = await w.run();
+    expect(out.aiAttempts).toEqual({ 'docker:image-scan': 2 });
+    expect(w.reqs[1]?.user).toMatch(/could not be made from that base image/);
+    expect(out.result.ok).toBe(true);
+  });
+
+  it('limits pinned: a re-run is capped and happens once; a refused answer still spends the part\'s count; a switch is capped', async () => {
+    // the global cap also stops a re-run
+    const a = world({ maxTotal: 1, prove: () => proof({ part: 'docker', log: log('The runner has received a shutdown signal.') }, { part: 'compose', log: log('API rate limit exceeded') }), rerun: () => green() });
+    const outA = await a.run();
+    expect(outA.stopped).toMatch(/global cap of 1 attempt/);
+    expect(a.reruns).toEqual([]);
+    // a runner error that comes back after its re-run ends the part (one re-run only)
+    const b = world({ prove: () => proof({ part: 'docker', log: log('The runner has received a shutdown signal.') }), rerun: () => proof({ part: 'docker', log: log('The runner has received a shutdown signal.') }) });
+    const outB = await b.run();
+    expect(b.reruns).toHaveLength(1);
+    expect(verdict(outB, 'docker')?.detail).toMatch(/again after a re-run/);
+    // every refused answer spends one of the part's 5
+    const c = world({ prove: () => proof({ part: 'docker', log: errLog('alpha') }), answers: Array.from({ length: 10 }, () => edit('api/Dockerfile', DF(REF24, '\n# x'))), referee: () => ({ ok: false, issues: [{ file: 'api/Dockerfile', check: 'secret-value', message: 'no' }] }) });
+    const outC = await c.run();
+    expect(c.reqs).toHaveLength(5);
+    expect(verdict(outC, 'docker')?.status).toBe('not-proven');
+    // the switch to the next candidate is an attempt of the global cap too
+    const d = world({
+      maxTotal: 5,
+      prove: (n) => proof({ part: 'docker', needId: 'image-build', log: errLog(WORDS[n] as string) }),
+      answers: Array.from({ length: 5 }, (_, i) => edit('api/Dockerfile', DF(REF24, `\n# ${WORDS[i]}`))),
+      nextCandidate: async () => spec('docker-build-push-action', 'image-build', 'api'),
+    });
+    const outD = await d.run();
+    expect(outD.stopped).toMatch(/global cap of 5 attempts/);
+    expect(outD.draft.steps.some((x) => x.needId === 'image-build')).toBe(false);
+    expect(d.proves).toHaveLength(6);
+  });
+
+  it('a tests part that covers a floor need never ends not-proven: it fails and stops the run', async () => {
+    const w = world({ prove: () => proof({ part: 'tests', log: errLog('alpha') }) });
+    const out = await w.run();
+    expect(verdict(out, 'tests')?.status).toBe('failed');
+    expect(out.stopped).toMatch(/^tests could not be proven/);
+    // the same part with no floor need ends not-proven, warn-only (spec §9)
+    const d = baseDraft(undefined);
+    const v = world({ draft: { ...d, needs: d.needs.map((n) => (n.id === 'unit-tests' ? { ...n, floor: false, category: 'unit-tests-x' } : n)) }, prove: () => proof({ part: 'tests', log: errLog('alpha') }) });
+    const o2 = await v.run();
+    expect(verdict(o2, 'tests')?.status).toBe('not-proven');
+    expect(o2.stopped).toBeUndefined();
+  });
+
+  it('a failure only with your keys ends at the placeholder run, even when another part changed meanwhile; a file an answer changed is AI-written', async () => {
+    const hooks = file('lefthook.yml', 'pre-commit:\n  commands: {}\n', 'precommit');
+    const w = world({
+      draft: baseDraft([composeFile(), hooks]), vault: { [STRIPE]: VALUE },
+      // 0 real: compose fails; 1 placeholders: compose passes, precommit fails; 2 placeholders: green; 3 real (after the yes): compose fails again
+      prove: (n) => (n === 0 || n === 3 ? proof({ part: 'compose', log: errLog('alpha') }) : n === 1 ? proof({ part: 'precommit', log: errLog('beta') }) : green()),
+      answers: [edit('lefthook.yml', 'pre-commit:\n  commands: { a: { run: "true" } }\n')],
+    });
+    const out = await w.run();
+    expect(w.proves.map((p) => p.keys)).toEqual(['real', 'placeholder', 'placeholder', 'real']);
+    expect(w.confirms).toHaveLength(1);
+    expect(w.confirms[0]?.map((f) => f.path)).toEqual(['lefthook.yml']);   // not an AI part, but an answer changed it
+    expect(verdict(out, 'compose')?.detail).toMatch(/only in a run that held your real test keys/);
+    expect(out.attempts).toBe(2);
+  });
+
+  it('aiWritten: the AI parts, every needsConfirm file, every file an answer changed', () => {
+    const d = baseDraft([...dockerFiles(), composeFile(), file('package.json', '{}\n', 'pipeline', { needsConfirm: true }), file('README.md', 'x\n', 'docs')]);
+    expect(aiWritten(d, new Set(['docker-compose.pipegen.yml'])).map((f) => f.path)).toEqual(['api/Dockerfile', 'api/.dockerignore', 'docker-compose.pipegen.yml', 'package.json']);
+    expect(aiWritten(d, new Set()).map((f) => f.path)).toEqual(['api/Dockerfile', 'api/.dockerignore', 'package.json']);
+  });
+
+  it('an answer the guard refuses (or does not accept) counts as an attempt and is never pushed', async () => {
+    let g = 0;
+    const w = world({
+      prove: (n) => (n === 0 ? proof({ part: 'docker', log: errLog('alpha') }) : green()),
+      answers: [edit('api/Dockerfile', DF(REF24, '\n# one')), edit('api/Dockerfile', DF(REF24, '\n# two')), edit('api/Dockerfile', DF(REF24, '\n# three'))],
+      guard: async (files) => {
+        g++;
+        if (g === 1) return { ok: [], refused: [{ path: 'api/Dockerfile', reason: 'the guard said no' }], notes: [] };
+        if (g === 2) return { ok: files.filter((f) => f.path !== 'api/Dockerfile'), refused: [], notes: ['kept'] };
+        return { ok: [...files], refused: [], notes: [] };
+      },
+    });
+    const out = await w.run();
+    expect(out.aiAttempts).toEqual({ docker: 3 });
+    expect(w.proves).toHaveLength(2);
+    expect(w.reqs[1]?.user).toContain('the guard said no');
+    expect(w.reqs[2]?.user).toContain('the guard did not accept api/Dockerfile');
+    expect(fileOf(out.draft, 'api/Dockerfile')?.content).toContain('# three');
+  });
+
+  it('the next candidate must be a reviewed tool for that need', async () => {
+    const good = spec('docker-build-push-action', 'image-build', 'api');
+    const bad = [{ ...good, tool: { ...good.tool, source: 'discovery', reviewed: false } }, { ...good, needId: 'sast' }] as StepSpec[];
+    let k = 0;
+    const w = world({ prove: () => proof({ part: 'docker', needId: 'image-build', log: errLog('alpha') }), answers: [giveUp()], nextCandidate: async () => bad[k++] ?? null });
+    const out = await w.run();
+    expect(out.draft.steps.some((x) => x.needId === 'image-build')).toBe(false);
+    expect(verdict(out, 'docker')?.status).toBe('not-proven');
+    expect(w.proves).toHaveLength(1);
+  });
+
+  it('a next candidate the referee refuses is skipped', async () => {
+    let k = 0;
+    const w = world({
+      prove: () => proof({ part: 'docker', needId: 'image-build', log: errLog('alpha') }), answers: [giveUp()],
+      nextCandidate: async () => (k++ === 0 ? spec('docker-build-push-action', 'image-build', 'api') : null),
+      referee: () => ({ ok: false, issues: [{ file: 'pipegen.yml', check: 'secret-value', message: 'no' }] }),
+    });
+    const out = await w.run();
+    expect(out.draft.steps.some((x) => x.needId === 'image-build')).toBe(false);
+    expect(w.proves).toHaveLength(1);
+    expect(verdict(out, 'docker')?.status).toBe('not-proven');
+  });
+
+  it('only the failing step goes to the excerpt (an error-like line of an earlier, passing step stays out)', async () => {
+    const raw = [`${TS}##[group]Run npm ci`, `${TS}npm warn deprecated: error OTHERSTEP happened before`, `${TS}##[endgroup]`, `${TS}##[group]Run npm run build`, `${TS}Error: cannot resolve module alpha`, `${TS}##[error]Process completed with exit code 1.`].join('\n');
+    const w = world({ prove: (n) => (n === 0 ? proof({ part: 'docker', log: raw }) : green()), answers: [edit('api/Dockerfile', DF(REF24, '\n# x'))] });
+    await w.run();
+    expect(w.reqs[0]?.user).toContain('cannot resolve module alpha');
+    expect(w.reqs[0]?.user).not.toContain('OTHERSTEP');
+  });
+
+  it('a cap reached in the last proof stops even when it was green; an ending never makes ok true while the pipeline is not proven', async () => {
+    const a = world({ minutesCap: 10, prove: () => { a.minutes.restore(10); return green(); } });
+    expect((await a.run()).stopped).toMatch(/Actions minutes/);
+    const b = world({ prove: () => proof({ part: 'pipeline', status: 'not-proven', detail: 'the gate blocked the main pull request because of image-build' }, { part: 'docker', log: errLog('alpha') }), answers: [giveUp()] });
+    const out = await b.run();
+    expect(verdict(out, 'docker')?.status).toBe('not-proven');
+    expect(out.result.ok).toBe(false);
+  });
+
+  it('the AI cost cap reached inside createDockerfile stops the run', async () => {
+    const w = world({
+      draft: baseDraft([...dockerFiles(REF22), composeFile()]),
+      prove: () => proof({ part: 'docker', needId: 'image-scan', detail: 'the base image has critical/high CVEs (x); another base image tag is needed' }),
+      answers: [answer({ action: 'change-base', baseId: 'node-24-bookworm-slim', explanation: 'x' }), giveUp()],
+      dockerfileFor: async () => { throw new AiError('cost-cap', 'the AI cost limit would be passed'); },
+    });
+    const out = await w.run();
+    expect(out.stopped).toMatch(/AI cost reached the limit/);
+    expect(w.reqs).toHaveLength(1);
+  });
+
+  it('an empty secret input is a missing secret', () => {
+    const ctx = Object.fromEntries([[MISSING, []], ['keys', 'placeholder']]) as unknown as Parameters<typeof classifyFailure>[2];
+    expect(classifyFailure({ part: 'docker', status: 'failed', detail: 'x' }, log('Error: Input required and not supplied: api-key'), ctx)).toBe('missing-secret');
   });
 
   it('the AI must be the metered provider', async () => {

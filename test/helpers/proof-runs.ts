@@ -41,6 +41,8 @@ export interface RunsFake {
   reruns: { id: number; body: string }[];
   /** E7: how the re-run failed jobs end (default success). */
   rerunConclusion?: string;
+  /** E7: GET …/runs/{id} still shows the old attempt this many times after the re-run POST (GitHub takes a moment). */
+  rerunLag?: number;
   /** event → workflow path → what it does (a function sees the sha and branch). Missing: no run for that workflow. */
   plans: { push: Record<string, Plan | ((sha: string, branch: string) => Plan | undefined)>; pull_request: Record<string, Plan | ((sha: string, branch: string) => Plan | undefined)> };
   /** Runs are listed only after this many list calls (default 0). */
@@ -66,6 +68,7 @@ export function runsFake(defaultBranch = 'main'): RunsFake {
     handler: () => undefined, transport: undefined as never, pushed: () => {},
   };
   let lists = 0;
+  const lagging = new Map<number, { left: number; old: unknown }>();
   const start = (event: 'push' | 'pull_request', sha: string, branch: string, pr?: number) => {
     if (f.actionsOff) return;
     for (const [path, p0] of Object.entries(f.plans[event])) {
@@ -124,6 +127,8 @@ export function runsFake(defaultBranch = 'main'): RunsFake {
     if (m && c.method === 'GET') {
       const r = f.runs.find((x) => x.id === Number(m?.[1]));
       if (r === undefined) return json(404, { message: 'Not Found' });
+      const lag = lagging.get(r.id);
+      if (lag !== undefined && lag.left > 0) { lag.left--; return json(200, lag.old); }
       r.polls++;
       if (r.status !== 'completed') {
         r.status = r.polls >= r.steps ? 'completed' : 'in_progress';
@@ -171,6 +176,7 @@ export function runsFake(defaultBranch = 'main'): RunsFake {
       const r = f.runs.find((x) => x.id === id);
       if (r === undefined) return json(404, { message: 'Not Found' });
       if (r.status !== 'completed') return json(403, { message: 'This workflow is already running' });
+      if ((f.rerunLag ?? 0) > 0) lagging.set(id, { left: f.rerunLag as number, old: runBody(r) });
       const next = r.run_attempt + 1;
       const ends = f.rerunConclusion ?? 'success';
       const last = r.jobs.filter((j) => (j.attempt ?? r.run_attempt) === r.run_attempt);
