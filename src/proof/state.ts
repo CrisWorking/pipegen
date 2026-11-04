@@ -65,10 +65,21 @@ export interface RunState {
   stage: Stage;
   /** interrupted / stopped: the stage the run had reached when it stopped (nextStage goes on from it). */
   interruptedAt?: WorkStage;
-  /** stopped: which cap stopped it. */
-  stoppedBy?: 'ai-cost' | 'actions-minutes';
-  /** The draft (CreatedFile.aiEdited kept: a resumed draft treats those files as AI-written; E7-R14). Plan G re-referees it. */
+  /** stopped: which cap stopped it, or 'proof-failed' (final review I-2: the proof ended without a pass). */
+  stoppedBy?: 'ai-cost' | 'actions-minutes' | 'proof-failed';
+  /**
+   * The draft (CreatedFile.aiEdited kept: a resumed draft treats those files as AI-written; E7-R14). Plan G re-referees it.
+   * begin() saves the draft the proof starts from; recordVerdict() replaces it with the proof's final (fixed) draft.
+   */
   draft?: PipelineDraft;
+  /**
+   * Final review I-2: the verdict of the proof of this run (FixOutcome: result.ok, and no stop or cap), saved with the final
+   * draft before the stage moves. Only `true` lets the stage reach proven, cleaned and delivered (setStage, nextStage);
+   * absent while a proof runs (setStage('proving') clears it) and in a state saved before this field existed.
+   */
+  proofOk?: boolean;
+  /** Why the proof stopped before it could pass (FixOutcome.stopped, plain text). */
+  proofStopped?: string;
   /** Branch names (no `refs/heads/`), recorded before each push. The scratch default branch is never one (it is emptied). */
   branches: RecordedBranch[];
   /** Scratch PRs by head branch, recorded before each is opened; the number once GitHub gave it. */
@@ -142,8 +153,10 @@ const stateSchema = z.strictObject({
   }),
   stage: z.enum(['consented', 'planned', 'debated', 'created', 'proving', 'proven', 'cleaned', 'delivered', 'interrupted', 'stopped']),
   interruptedAt: workStage.optional(),
-  stoppedBy: z.enum(['ai-cost', 'actions-minutes']).optional(),
+  stoppedBy: z.enum(['ai-cost', 'actions-minutes', 'proof-failed']).optional(),
   draft: draft.optional(),
+  proofOk: z.boolean().optional(),
+  proofStopped: text.optional(),
   branches: z.array(z.strictObject({ repo: z.enum(['scratch', 'central']), ref: branchName })).max(1000),
   prs: z.array(z.strictObject({ head: branchName, number: z.number().int().positive().optional() })).max(1000),
   secretNames: z.array(z.string().regex(SECRET_NAME_RE)).max(1000),
@@ -166,15 +179,21 @@ const stateSchema = z.strictObject({
 
 const isWork = (s: Stage | undefined): s is WorkStage => s !== undefined && (STAGE_ORDER as readonly string[]).includes(s);
 
+/** Final review I-2: the stages only a proof that passed (a saved proofOk true) reaches. */
+const PASSED_STAGES: ReadonlySet<Stage> = new Set<Stage>(['proven', 'cleaned', 'delivered']);
+
 /**
  * The stage a resumed run goes on with (S20: Plan G's `resume` uses it), or null when the run is done (delivered). The next
  * stage in order, except: `proving` → `proving` (the proof didn't finish: it runs again, after its leftovers are cleaned) and
  * `proven` → `cleaned` (the cleanup runs before anything is shown). interrupted / stopped go on from the stage they had reached.
+ * Final review I-2: `proven` and `cleaned` go on only with a saved passing verdict (proofOk true); without one (a proof that
+ * failed, or a state saved before the verdict was), the proof runs again: a resume never delivers what didn't pass.
  */
-export function nextStage(s: Pick<RunState, 'stage' | 'interruptedAt'>): WorkStage | null {
+export function nextStage(s: Pick<RunState, 'stage' | 'interruptedAt'> & { proofOk?: boolean }): WorkStage | null {
   const at: Stage | undefined = s.stage === 'interrupted' || s.stage === 'stopped' ? s.interruptedAt : s.stage;
   if (!isWork(at)) throw new StateError('The saved state was interrupted without the stage it had reached, so pipegen can\'t tell where to go on.');
   if (at === 'proving') return 'proving';
+  if ((at === 'proven' || at === 'cleaned') && s.proofOk !== true) return 'proving';
   const i = STAGE_ORDER.indexOf(at);
   return i === STAGE_ORDER.length - 1 ? null : STAGE_ORDER[i + 1] as WorkStage;
 }
@@ -381,6 +400,8 @@ export class StateStore {
     }
     const ok = (isWork(s.stage) && STAGE_ORDER.indexOf(to as WorkStage) === STAGE_ORDER.indexOf(s.stage) + 1) || nextStage(s) === to;
     if (!ok) throw new StateError(`The proof can't go from the stage ${s.stage} to ${to}.`);
+    // final review I-2: proven, cleaned and delivered only after a proof that passed, its verdict saved first (recordVerdict)
+    if (PASSED_STAGES.has(to) && s.proofOk !== true) throw new StateError(`The proof can't go to the stage ${to}: only a proof that passed (its verdict saved) does.`);
     this.update((n) => {
       n.stage = to;
       delete n.interruptedAt;
@@ -389,7 +410,31 @@ export class StateStore {
       if (to === 'proving') {
         n.cleanupDone = false;
         n.scratchDeleted = false;   // fix round 2 (N-1): the scratch repo is used again, so a "deleted" mark is stale
+        // final review I-2: a proof that runs again has no verdict until it ends
+        delete n.proofOk;
+        delete n.proofStopped;
       }
+    });
+  }
+
+  /**
+   * Final review I-2: the verdict of the proof that just ended and its final draft (CreatedFile.aiEdited kept), saved together
+   * before the stage moves (proveThenClean). The draft is checked against the state format first, and the write refuses any
+   * secret value (#write): a StateError, and nothing is written. Without a draft, the saved one stays and the verdict is
+   * not a pass.
+   */
+  recordVerdict(v: { ok: boolean; draft?: PipelineDraft; stopped?: string }): void {
+    let checked: PipelineDraft | undefined;
+    if (v.draft !== undefined) {
+      const parsed = draft.safeParse(structuredClone(v.draft));
+      if (!parsed.success) throw new StateError('pipegen didn\'t save the proof\'s draft: it doesn\'t match the state format.');
+      checked = parsed.data as unknown as PipelineDraft;
+    }
+    this.update((n) => {
+      n.proofOk = v.ok === true && checked !== undefined;   // a pass needs its draft saved (a resume delivers only that)
+      if (typeof v.stopped === 'string' && v.stopped !== '') n.proofStopped = safeText(v.stopped, TEXT_MAX);
+      else delete n.proofStopped;
+      if (checked !== undefined) n.draft = checked;
     });
   }
 

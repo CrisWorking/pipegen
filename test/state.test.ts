@@ -20,6 +20,7 @@ import {
 import { assertCentral, assertScratch, proofTarget } from '../src/proof/target.js';
 import { writesInFlight } from '../src/proof/inflight.js';
 import { DEFAULT_MODEL, type AiProvider, type AiRequest, type AiUsage, type PipelineDraft } from '../src/types.js';
+import { draftOf } from './helpers/proof-eval.js';
 import { world } from './helpers/proof-github.js';
 import { runsFake } from './helpers/proof-runs.js';
 import { app, OWNER, SCRATCH } from './helpers/scratch-secrets.js';
@@ -156,6 +157,7 @@ describe('E8 state file', () => {
     const store = await open();
     store.begin(RUN, app(), { cap: 10, aiCap: 1 });
     for (const s of STAGE_ORDER.slice(1)) {
+      if (s === 'proven') store.recordVerdict({ ok: true, draft: draftOf() });   // final review I-2: only a proof that passed is proven
       store.setStage(s);
       expect(store.load()?.stage).toBe(s);
     }
@@ -180,11 +182,13 @@ describe('E8 state file', () => {
       proven: 'cleaned',    // the cleanup runs before anything is shown
       cleaned: 'delivered', delivered: null, interrupted: null, stopped: null,
     };
-    for (const s of STAGE_ORDER) expect(nextStage({ stage: s }), s).toBe(want[s]);
+    // a saved passing verdict (final review I-2); without one, proven and cleaned go back to proving (test/proof-e-final.test.ts)
+    for (const s of STAGE_ORDER) expect(nextStage({ stage: s, proofOk: true }), s).toBe(want[s]);
     for (const stop of ['interrupted', 'stopped'] as const) {
-      for (const at of STAGE_ORDER) expect(nextStage({ stage: stop, interruptedAt: at }), `${stop} at ${at}`).toBe(want[at]);
+      for (const at of STAGE_ORDER) expect(nextStage({ stage: stop, interruptedAt: at, proofOk: true }), `${stop} at ${at}`).toBe(want[at]);
       expect(() => nextStage({ stage: stop })).toThrow(StateError);
     }
+    for (const s of ['proven', 'cleaned'] as const) expect(nextStage({ stage: s }), `${s} without a verdict`).toBe('proving');
   });
 
   it('state: branches and PRs recorded before they are created', async () => {

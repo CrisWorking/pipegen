@@ -16,6 +16,7 @@ import {
 } from '../src/proof/target.js';
 import { interrupting } from '../src/util/exit-hooks.js';
 import { cleanupWorld } from './helpers/cleanup-github.js';
+import { draftOf } from './helpers/proof-eval.js';
 import { app, OWNER, quietIo, SCRATCH } from './helpers/scratch-secrets.js';
 import { fake } from './helpers/secret-repo.js';
 
@@ -238,7 +239,8 @@ describe('E8 cleanup after the proof', () => {
     const e = await setup();
     const order: string[] = [];
     e.store.update((s) => { s.stage = 'proving'; });
-    const out = await proveThenClean(e.store, async () => { order.push('prove'); return 'outcome'; }, async () => { order.push(`cleanup (${e.store.state?.stage})`); return e.clean(false); });
+    // final review I-2: a proof that passed (its verdict and final draft saved) is proven; see test/proof-e-final.test.ts for the rest
+    const out = await proveThenClean(e.store, async () => { order.push('prove'); return 'outcome'; }, async () => { order.push(`cleanup (${e.store.state?.stage})`); return e.clean(false); }, () => ({ ok: true, draft: draftOf() }));
     order.push(`preview (${e.store.state?.stage})`);
     expect(order).toEqual(['prove', 'cleanup (proven)', 'preview (cleaned)']);
     expect(out.outcome).toBe('outcome');
