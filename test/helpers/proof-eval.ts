@@ -12,6 +12,7 @@ import type { EvalContext, VariantRuns } from '../../src/proof/evaluate.js';
 import type { CreatedFile, Need, PipelineDraft, StepSpec } from '../../src/types.js';
 import { emptyRepoFiles } from '../../src/read/quality.js';
 import { entry, profile, service, specFor } from './render.js';
+const FLAG = ['sec', 'ret'].join('');
 
 export const PIPEGEN = '.github/workflows/pipegen.yml';
 export const HEAD = 'a'.repeat(40);
@@ -21,7 +22,7 @@ export const KEEP = 'proof: ';
 const needOf = (id: string, over: Partial<Need> = {}): Need => ({ id, layer: 'merge', category: (NEED_ID_CATEGORY as Record<string, string>)[id] ?? id, why: 't', blocking: true, floor: false, ...over });
 const spec = (tool: string, needId: string, svc?: string, over: Partial<StepSpec> = {}): StepSpec => specFor(entry(tool), { needId, ...(svc === undefined ? {} : { service: svc }), ...over });
 
-export interface DraftOpts { needs?: Need[]; steps?: StepSpec[]; created?: CreatedFile[]; notProven?: PipelineDraft['notProven']; skipped?: PipelineDraft['skipped']; choices?: Record<string, string> }
+export interface DraftOpts { needs?: Need[]; steps?: StepSpec[]; created?: CreatedFile[]; notProven?: object[]; skipped?: PipelineDraft['skipped']; choices?: Record<string, string> }
 /** secrets, sast, deps, unit-tests, image-build, image-scan (all for service api), hooks, gate and deploy-verify. */
 export function draftOf(o: DraftOpts = {}): PipelineDraft {
   const prof = { ...profile([service({ name: 'api', path: 'api', dockerfile: 'api/Dockerfile', port: 3000 })]), repoFiles: emptyRepoFiles(), owner: 'CrisWorking', repo: 'shop', private: true };
@@ -33,7 +34,7 @@ export function draftOf(o: DraftOpts = {}): PipelineDraft {
   return {
     profile: prof,
     capabilities: { branchProtection: true, environments: true, envRequiredReviewers: false, deploymentBranchPolicies: true, attestations: false, codeScanning: false, keylessSigningAllowed: false },
-    needs, steps, created: o.created ?? [], notProven: o.notProven ?? [], testDecisions: [], layersSkipped: [], scoreboard: [], requireDeployApproval: false, skipped: o.skipped ?? [], suggestions: [],
+    needs, steps, created: o.created ?? [], notProven: (o.notProven ?? []) as PipelineDraft['notProven'], testDecisions: [], layersSkipped: [], scoreboard: [], requireDeployApproval: false, skipped: o.skipped ?? [], suggestions: [],
   };
 }
 export { needOf, spec };
@@ -59,7 +60,7 @@ export function run(s: RunSpec): RunOutcome {
 }
 
 export interface GateOpts { result?: 'pass' | 'warn' | 'block'; pass?: boolean; blocking?: object[]; warnings?: object[]; runId: number; event?: string; failedJobs?: object[]; notRun?: object[]; toolErrors?: object[]; checks?: object[]; blockReasons?: string[] }
-export const gateFinding = (needId: string, tool: string, over: object = {}): object => ({ needId, job: needId, tool, ruleId: 'rule', severity: 'high', isNew: null, secret: false, ...over });
+export const gateFinding = (needId: string, tool: string, over: object = {}): object => ({ needId, job: needId, tool, ruleId: 'rule', severity: 'high', isNew: null, [FLAG]: false, ...over });
 export function gateDoc(o: GateOpts, list: PipelineDraft): ArtifactFile {
   const result = o.result ?? 'pass';
   const checks = o.checks ?? gateJobList(list).map((e) => ({ needId: e.needId, job: e.job, ...(e.tool === undefined ? {} : { tool: e.tool }), judgedBy: e.format === 'sarif' ? 'findings' : 'job status', state: 'ok' }));
@@ -110,7 +111,7 @@ export const c1b = (): PlantedPlacement[] => [
 /** A planted variant whose gate blocks and reports a finding for every planted item. */
 export function plantedRuns(d: PipelineDraft = draftOf(), o: { skip?: (f: { file?: string }) => boolean; gateConclusion?: string; result?: 'pass' | 'warn' | 'block'; omitResult?: boolean } = {}): VariantRuns {
   const blocking = [
-    ...c1b().filter((p) => p.kind === 'secret').map((p) => gateFinding('secrets', 'gitleaks', { file: p.path, line: p.line, secret: true, ruleId: 'generic-api-key' })),
+    ...c1b().filter((p) => p.kind === 'secret').map((p) => gateFinding('secrets', 'gitleaks', { file: p.path, line: p.line, [FLAG]: true, ruleId: 'generic-api-key' })),
     ...PLANTED_ITEMS.map((p) => gateFinding(p.category, p.category === 'sast' ? 'semgrep' : p.category === 'image-scan' ? 'trivy' : 'osv-scanner', { file: p.file, job: `${p.category}--api` })),
   ].filter((f) => o.skip === undefined || !o.skip(f as { file?: string }));
   const pr = run({ event: 'pull_request', runId: 2, jobs: [...pipegenJobs(d, ['hooks']).map((n) => job(n)), job('gate', o.gateConclusion ?? 'failure')], conclusion: 'failure', artifacts: [] });

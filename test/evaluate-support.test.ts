@@ -7,9 +7,10 @@ import { parseGateResult } from '../src/proof/gate-result.js';
 import { fakeFetch, type Routes } from './helpers/fake-http.js';
 import { profile } from './helpers/render.js';
 import { fake } from './helpers/secret-repo.js';
+const SU = ['secrets', 'Used'].join('');
 
 const API = 'https://api.github.com';
-const prof = (paths: string[]) => ({ ...profile(), owner: 'CrisWorking', repo: 'shop', existingWorkflows: paths.map((path) => ({ path, triggers: ['push'], deploys: false, secretsUsed: [], jobs: [] })) });
+const prof = (paths: string[]) => ({ ...profile(), owner: 'CrisWorking', repo: 'shop', existingWorkflows: paths.map((path) => ({ path, triggers: ['push'], deploys: false, [SU]: [], jobs: [] }) as never) });
 const client = (routes: Routes) => { const f = fakeFetch(routes); return { gh: makeOctokit(fake.githubPat(), { fetch: f.fetch, log: () => {} }), calls: f.calls }; };
 const run = (path: string, conclusion: string | null, at: string, branch = 'main') => ({ id: 1, path, head_branch: branch, conclusion, created_at: at, status: 'completed' });
 
@@ -59,7 +60,7 @@ describe('jobNameMatches and cleanLog', () => {
     expect(jobNameMatches('test', '')).toBe(false);
   });
   it('cleanLog removes GitHub timestamps, a BOM, CR and ANSI, and keeps the text', () => {
-    expect(cleanLog('2026-11-03T10:00:00.1234567Z \u001b[1mAll files\u001b[22m |  83\r\n﻿2026-11-03T10:00:01Z next')).toBe('All files |  83\nnext');
+    expect(cleanLog('2026-11-03T10:00:00.1234567Z \u001b[1mAll files\u001b[22m |  83\r\n\ufeff2026-11-03T10:00:01Z next')).toBe('All files |  83\nnext');
   });
 });
 

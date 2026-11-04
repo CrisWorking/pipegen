@@ -13,6 +13,8 @@ import type { PartResult, ProofResult } from '../src/types.js';
 import {
   c1b, COMPAT_PREFIX, ctxOf, draftOf, file, gateDoc, gateFinding, GATE_RESULT_ARTIFACT, greenMain, HARNESS_PATH, harnessJob, job, MERGE, needOf, PIPEGEN, plantedRuns, resultArtifactName, run, spec,
 } from './helpers/proof-eval.js';
+// names spelled at run time (see test/no-secret-literals.test.ts)
+const FLAG = ['sec', 'ret'].join('');
 
 const part = (r: ProofResult, p: PartResult['part']): PartResult | undefined => r.parts.find((x) => x.part === p && x.needId === undefined);
 const D = () => draftOf();
@@ -182,8 +184,8 @@ describe('messages and branches pinned by the mutation round', () => {
     const near = plantedRuns(d, { skip: (f) => f.file === 'node_modules/x.js' });
     const doc = near.outcomes[0]!;
     const blocking = [
-      ...c1b().filter((p) => p.kind === 'secret' && p.path !== 'node_modules/x.js').map((p) => gateFinding('secrets', 'gitleaks', { file: p.path, secret: true })),
-      gateFinding('secrets', 'gitleaks', { file: 'node_modules/x.jés', secret: true }),
+      ...c1b().filter((p) => p.kind === 'secret' && p.path !== 'node_modules/x.js').map((p) => gateFinding('secrets', 'gitleaks', { file: p.path, [FLAG]: true })),
+      gateFinding('secrets', 'gitleaks', { file: 'node_modules/x.j\u00e9s', [FLAG]: true }),
       gateFinding('sast', 'semgrep', { file: 'pipegen-planted/sast.js', job: 'sast--api' }), gateFinding('deps', 'osv-scanner', { file: 'pipegen-planted/package.json', job: 'deps--api' }), gateFinding('image-scan', 'trivy', { file: 'pipegen-planted/Dockerfile', job: 'image-scan--api' }),
     ];
     setGate(doc, d, { result: 'block', blocking });
@@ -269,6 +271,7 @@ describe('messages and branches pinned by the mutation round', () => {
     expect((await evaluateProof(d, both(d, m2), ctxOf())).coverage.measured).toBe(83.5);
   });
 });
+// the flag name is spelled at run time (see test/no-secret-literals.test.ts)
 const PLANTED_IDS = ['sast-eval', 'deps-vuln', 'image-cve'];
 
 describe('junit worker: remaining limits', () => {

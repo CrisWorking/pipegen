@@ -114,7 +114,7 @@ export function cleanLog(log: string): string {
   const text = String(log).slice(-MAX_LOG_READ);
   return text.split('\n').map((l) => {
     let s = l.endsWith('\r') ? l.slice(0, -1) : l;
-    if (s.startsWith('﻿')) s = s.slice(1);
+    if (s.startsWith('\ufeff')) s = s.slice(1);
     return s.replace(TIMESTAMP, '').replace(ANSI, '');
   }).join('\n');
 }
