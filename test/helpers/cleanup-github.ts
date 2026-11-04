@@ -26,6 +26,8 @@ export interface CleanupFake {
   deleted: boolean;
   /** Status answers per "METHOD path-suffix" (after /repos/o/r), applied before the fake's own logic. */
   fail: Map<string, number>;
+  /** Runs whose DELETE answers OK but stay (GitHub didn't delete them). */
+  keepRuns: Set<number>;
   /** Runs a cancel leaves going (a force-cancel stops them). */
   ignoreCancel: Set<number>;
   /** Branches that come back in the list once after a delete (a push that landed late). */
@@ -49,7 +51,7 @@ export function cleanupFake(scratch = SCRATCH, keys?: KeysFake): CleanupFake {
   const C = `/repos/${OWNER}/pipelines`;
   const f: CleanupFake = {
     runs: [], prs: [], branches: new Set(), central: new Set(), caches: [], analyses: [], defaultHead: '1'.repeat(40), deleted: false,
-    fail: new Map(), ignoreCancel: new Set(), lateBranches: [], unreadable: new Set(), handler: () => undefined,
+    fail: new Map(), keepRuns: new Set(), ignoreCancel: new Set(), lateBranches: [], unreadable: new Set(), handler: () => undefined,
   };
   f.handler = (c) => {
     const path = decodeURIComponent(c.url.pathname);
@@ -107,7 +109,7 @@ export function cleanupFake(scratch = SCRATCH, keys?: KeysFake): CleanupFake {
       }
       if (c.method === 'DELETE' && m[2] === undefined) {
         if (r.status !== 'completed') return json(403, { message: 'Cannot delete a run in progress' });
-        f.runs = f.runs.filter((x) => x.id !== id);
+        if (!f.keepRuns.has(id)) f.runs = f.runs.filter((x) => x.id !== id);
         return json(200, {});
       }
     }

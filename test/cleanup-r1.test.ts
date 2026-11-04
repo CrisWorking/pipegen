@@ -16,6 +16,7 @@ import { ScratchKeys, workflowSecretNames } from '../src/proof/keys.js';
 import { MinutesMeter } from '../src/proof/minutes.js';
 import { StateError, StateStore } from '../src/proof/state.js';
 import { proofTarget, type ProofTarget } from '../src/proof/target.js';
+import { makeOctokit } from '../src/github/client.js';
 import { DEFAULT_MODEL, type AiProvider, type AiRequest, type AiUsage } from '../src/types.js';
 import { cleanupWorld } from './helpers/cleanup-github.js';
 import { app, OWNER, quietIo, SCRATCH } from './helpers/scratch-secrets.js';
@@ -115,17 +116,45 @@ describe('E8 fix round 1: secrets before any wait (I-2)', () => {
   });
 });
 
+describe('E8 fix round 1: secrets before ScratchKeys\' own stores (I-2)', () => {
+  it('cleanup: the first pass doesn\'t wait for a key store in flight; the second deletes what it stored', async () => {
+    const e = await setup();
+    // a client whose secret PUTs hang until released: a real-key store is in flight when the cleanup starts
+    let release!: () => void;
+    const gate = new Promise<void>((ok) => { release = ok; });
+    let putting = false;
+    const gated = (async (input: string | URL | Request, init?: RequestInit) => {
+      if ((init?.method ?? 'GET').toUpperCase() === 'PUT' && String(input instanceof Request ? input.url : input).includes(`/actions/${LIST}/`)) { putting = true; await gate; }
+      return e.w.g.fetch(input, init);
+    }) as typeof fetch;
+    const gh2 = makeOctokit(fake.githubPat(), { fetch: gated, log: () => {} });
+    const keys2 = new ScratchKeys(gh2, e.t, e.vault, { io: quietIo });
+    const storing = keys2.real(['STRIPE_SECRET_KEY']).catch(() => {});
+    for (let i = 0; i < 200 && !putting; i++) await new Promise((ok) => setTimeout(ok, 5));
+    expect(putting).toBe(true);
+    const before = e.w.g.calls.length;
+    const p = cleanupAfterProof(e.w.g.gh, e.t, e.store, keys2, { canDeleteRepo: false, clock: instant, settleMs: 0 });
+    await new Promise((ok) => setTimeout(ok, 150));
+    expect(e.w.g.calls.slice(before).some((c) => c.method === 'DELETE' && c.url.pathname.includes(`/actions/${LIST}/`))).toBe(true);
+    release();
+    await storing;
+    await p;
+    expect(e.w.s.values.size).toBe(0);
+  });
+});
+
 describe('E8 fix round 1: a per-item failure is a leftover, never an abort (I-3)', () => {
   it('cleanup: a listed branch name pipegen won\'t send is a leftover; the rest of the emptying still runs', async () => {
     const e = await setup();
     e.w.f.branches.add('proof/a+b');
     e.store.recordBranch('central', `proof/${RUN}`, 'main');
     e.w.f.central.add(`proof/${RUN}`);
-    e.w.s.variables = [{ name: 'PIPEGEN_BLOCK_FROM', value: '2026-11-04' }];
+    e.w.s.variables = [{ name: 'PIPEGEN_BLOCK_FROM', value: '2026-11-04' }, { name: 'bad-name', value: 'x' }];   // a listed name the guard won't send either
     const res = await clean(e, false);
     expect(res.leftovers.some((l) => l.includes('proof/a+b') && /won't send|delete it there/.test(l))).toBe(true);
+    expect(res.leftovers.some((l) => l.includes('bad-name'))).toBe(true);
     expect(e.w.f.runs).toEqual([]);
-    expect(e.w.s.variables).toEqual([]);
+    expect(e.w.s.variables).toEqual([{ name: 'bad-name', value: 'x' }]);
     expect(e.w.f.defaultHead).toBe('e'.repeat(40));
     expect(e.w.f.central.size).toBe(0);
     expect(e.store.load()?.leftovers).toEqual(res.leftovers);
@@ -251,6 +280,25 @@ describe('E8 fix round 1: the meters on every ending (I-6, M-4)', () => {
     expect(f.store.load()?.minutesUsed).toBe(100);   // unknown spend counts as the whole cap: a resume never gets a fresh budget
   });
 
+  it('cleanup: the meters are on disk before the first GitHub write of the cleanup; a cap stop saves them before its cleanup', async () => {
+    const e = await setup();
+    const minutes = new MinutesMeter(100, 1_000);
+    minutes.restore(9);
+    const ai = new AiSpendMeter(provider(), 5);
+    ai.restore(0.5);
+    let atFirstWrite: unknown = null;
+    const orig = e.w.f.handler;
+    e.w.f.handler = (c) => { if (atFirstWrite === null && c.method !== 'GET') atFirstWrite = e.store.load(); return orig(c); };
+    await clean(e, false, { meters: () => ({ minutes, ai, fromServer: true }) });
+    expect(atFirstWrite).toMatchObject({ minutesUsed: 9, aiCostUsd: 0.5, proofStart: { at: 1_000, fromServer: true } });
+    // stopAtCap's saveState: the meters, then the stage
+    const f = await setup();
+    const m2 = new MinutesMeter(100, 1_000);
+    m2.restore(9);
+    saveStopState(f.store, () => ({ minutes: m2, ai }))({ kind: 'actions-minutes', limit: 100 });
+    expect(f.store.load()).toMatchObject({ stage: 'stopped', stoppedBy: 'actions-minutes', minutesUsed: 9, aiCostUsd: 0.5 });
+  });
+
   it('state: saveMeters records a start as from GitHub only when told so (M-4)', async () => {
     const e = await setup();
     e.store.saveMeters({ minutes: { used: 0, since: 5 } });
@@ -304,7 +352,12 @@ describe('E8 fix round 1: minors', () => {
     const e = await setup();
     e.w.f.fail.set('DELETE /actions/runs/11', 409);
     const res = await clean(e, false);
-    expect(res.leftovers.some((l) => /run 11 .*(could not be deleted|still there)/.test(l))).toBe(true);
+    expect(res.leftovers).toContain(`run 11 of ${OWNER}/${SCRATCH} could not be deleted (HTTP 409); delete it there (its logs and artifacts go with it)`);
+    // a delete GitHub answers OK but doesn't do: found by the second list
+    const f = await setup();
+    f.w.f.keepRuns.add(11);
+    const r2 = await clean(f, false);
+    expect(r2.leftovers).toContain(`run 11 of ${OWNER}/${SCRATCH} is still there; delete it there (its logs and artifacts go with it)`);
   });
 
   it('cleanup: code scanning analyses deleted newest-first along next / confirm urls (M-6)', async () => {
