@@ -452,11 +452,18 @@ class FixLoop {
 
   // ----- stops -----
 
-  finish(stopped?: string, cap?: CapReached): FixOutcome {
+  finish(stopped0?: string, cap?: CapReached): FixOutcome {
     const aiAttempts: Record<string, number> = {};
     for (const [k, s] of this.states) if (s.ai > 0) aiAttempts[k] = s.ai;
+    let result = withEndings(this.proof?.result ?? EMPTY_RESULT, this.ended, this.floor({ key: 'tests', part: 'tests', entry: { part: 'tests', status: 'failed', detail: '' }, keysOnly: false }), this.draft.skipped.some((x) => x.part === 'tests'));
+    let stopped = stopped0;
+    // N1 (fix round 2): stopped before a full proof of the current draft ran: its result (a 'pr' one, or an older draft's) is never a pass
+    if (stopped !== undefined && this.fullVersion !== this.version) {
+      result = { ...result, ok: false };
+      stopped = `${stopped}; the last full proof (up to the merge and the deploy layer) does not cover the current draft, so this result is not a pass`;
+    }
     return {
-      draft: this.draft, result: withEndings(this.proof?.result ?? EMPTY_RESULT, this.ended, this.floor({ key: 'tests', part: 'tests', entry: { part: 'tests', status: 'failed', detail: '' }, keysOnly: false }), this.draft.skipped.some((x) => x.part === 'tests')),
+      draft: this.draft, result,
       ...(stopped === undefined ? {} : { stopped }), attempts: this.total, aiAttempts, aiChanged: [...this.fixed], toolErrors: [...this.toolErrors],
       keys: this.proof?.keys ?? (this.keysNow === 'real' ? 'real' : 'placeholder'), notes: [...this.notes], ...(cap === undefined ? {} : { cap }),
     };
@@ -613,6 +620,7 @@ class FixLoop {
       const units = all.filter((u) => !this.ended.has(u.key));
       let changed = false, full = false, reprove = false, again = false;
       const rerun = new Set<number>();
+      const rerunStates: UState[] = [];
       const deferred: Unit[] = [];
       for (const u of units) {
         if (this.ended.has(u.key)) continue;
@@ -639,7 +647,7 @@ class FixLoop {
           this.total++;
           s.reruns++;
           const ids = (ev?.sources ?? []).filter(okSource).map((x) => x.runId);
-          if (ids.length > 0) for (const id of ids) rerun.add(id); else reprove = true;
+          if (ids.length > 0) { for (const id of ids) rerun.add(id); rerunStates.push(s); } else reprove = true;   // no run id: the re-prove IS its re-run
           if (this.deployLayer(u)) full = true;
           this.say(`${u.key}: ${what}; re-run without the AI`);
           continue;
@@ -674,6 +682,8 @@ class FixLoop {
         if (n === 'changed') { changed = true; if (this.deployLayer(u)) full = true; }
       }
       if (changed || reprove) {
+        // a re-run this proof stands in for never ran as a re-run: the part keeps its one re-run (the global count stays spent, E7-R8)
+        for (const s of rerunStates) s.reruns--;
         next = await this.proveNow({ kind: 'prove', scope: full ? 'full' : 'pr' });
         if (!('ticket' in next)) return next;
         continue;
@@ -975,7 +985,9 @@ class FixLoop {
           if (!isRec(f0) || typeof f0.path !== 'string' || typeof f0.content !== 'string' || (f0.repo !== 'app' && f0.repo !== 'central')) continue;
           const old = draft.created.find((x) => x.repo === f0.repo && x.path === f0.path);
           // spec §9: any change to package.json scripts or dependencies gets its own preview section and its own yes
-          const f: CreatedFile = base(f0.path) === 'package.json' && scriptsOrDepsChanged(old?.content, f0.content) ? { ...f0, needsConfirm: true } : { ...f0 };
+          const f0b: CreatedFile = base(f0.path) === 'package.json' && scriptsOrDepsChanged(old?.content, f0.content) ? { ...f0, needsConfirm: true } : { ...f0 };
+          // N2 (fix round 2): a path an AI answer once wrote stays AI-written (the mark is carried to the file that replaces it)
+          const f: CreatedFile = old?.aiEdited === true || (f0.repo === 'app' && this.fixed.has(f0.path)) ? { ...f0b, aiEdited: true } : f0b;
           brought.push(f);
           draft = { ...draft, created: old === undefined ? [...draft.created, f] : draft.created.map((x) => (x === old ? f : x)) };
         }

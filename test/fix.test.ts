@@ -242,7 +242,7 @@ describe('E7 fix loop', () => {
     expect(ai).toEqual([...Array(5).fill('ai'), 'next:image-build', ...Array(5).fill('ai'), 'next:image-build']);
     expect(out.draft.steps.some((s) => s === swapped[0])).toBe(true);
     expect(out.attempts).toBe(12);
-    expect(verdict(out, 'docker')?.detail).toMatch(/^failed after 10 attempts/);   // every answer of the part, not the count since the switch   // 10 answers + the swap's re-prove
+    expect(verdict(out, 'docker')?.detail).toMatch(/^failed after 10 attempts/);   // every answer of the part, not the count since the switch
     expect(verdict(out, 'docker')?.status).toBe('not-proven');
     expect(out.stopped).toBeUndefined();
   });
@@ -1042,11 +1042,22 @@ describe('E7 boundaries (extra)', () => {
     const oc = await c.run();
     expect(c.proves.map((p) => p.scope)).toEqual(['full', 'pr']);
     expect(oc.stopped).toMatch(/global cap of 1 attempt/);
+    // N1 (fix round 2): the 'pr' result is green, but no full proof covers the fixed draft: never a pass
+    expect(oc.result.ok).toBe(false);
+    expect(oc.stopped).toMatch(/the last full proof .* does not cover the current draft/);
     // and behind the caps
     const m = world({ minutesCap: 10, prove: (n) => { if (n === 1) m.minutes.restore(10); return n === 0 ? proof({ part: 'docker', log: errLog('alpha') }) : green(); }, answers: [edit('api/Dockerfile', DF(REF24, '\n# fixed'))] });
     const om = await m.run();
     expect(m.proves).toHaveLength(2);
     expect(om.stopped).toMatch(/Actions minutes/);
+    expect(om.result.ok).toBe(false);   // N1: stopped before the final full proof
+    expect(om.stopped).toMatch(/does not cover the current draft/);
+    // a stop with a full proof of the current draft keeps that proof's ok (only a stale result is forced false)
+    const g = world({ minutesCap: 10, prove: () => { g.minutes.restore(10); return green(); } });
+    const og = await g.run();
+    expect(og.stopped).toMatch(/Actions minutes/);
+    expect(og.stopped).not.toMatch(/does not cover/);
+    expect(og.result.ok).toBe(true);
   });
 
   it('fix round 1 (E7-R13): after a no, a draft changed since the last full proof still gets its final full proof (placeholders)', async () => {
@@ -1075,21 +1086,48 @@ describe('E7 boundaries (extra)', () => {
   });
 
   it('fix round 1 (M1): a re-run of a run that held the real keys is recorded as real, whatever is stored now', async () => {
-    // 0 real: compose fails (runner error) and docker needs a fix → docker re-proven with placeholders; compose re-run of the REAL run
+    // 0 real (R): compose needs a fix, precommit had a runner error. compose runs again with placeholders (1), and that run also
+    // stands in for precommit's re-run (fix round 2: a re-run that never ran is not counted as done). In 1 both pass, so compose
+    // failed only with the keys, and R is the result again (reused). precommit's re-run of R happens now, while placeholders are
+    // stored: it is still a re-run of R's runs, so it is recorded real, and its failure goes to a placeholder run, never to the AI.
+    const hooks = file('lefthook.yml', 'pre-commit:\n  commands: {}\n', 'precommit');
     const w = world({
-      draft: baseDraft([composeFile()]), vault: { [STRIPE]: VALUE },
-      prove: (n) => (n === 0 ? proof({ part: 'compose', log: log('The runner has received a shutdown signal.') }) : green()),
-      rerun: () => proof({ part: 'compose', log: errLog('alpha') }),
+      draft: baseDraft([composeFile(), hooks]), vault: { [STRIPE]: VALUE },
+      prove: (n) => (n === 0 ? proof({ part: 'compose', log: errLog('alpha') }, { part: 'precommit', log: log('The runner has received a shutdown signal.') }) : green()),
+      rerun: () => proof({ part: 'precommit', log: errLog('beta') }),
+      answers: [edit('lefthook.yml', 'pre-commit:\n  commands: { a: { run: "true" } }\n')],
     });
-    w.keys.mode = 'real';
-    const ev = w.keys.evidence.bind(w.keys);
-    w.keys.evidence = async (t, ids) => { w.timeline.push('evidence-asked'); return ev(t, ids); };
-    await w.run();
-    // the re-run's failure was never excerpted (its run held the real keys): it went to a placeholder run first
-    expect(w.reqs.length).toBeLessThanOrEqual(1);
+    const out = await w.run();
+    expect(w.reruns).toEqual([[EVIDENCE_RUN]]);
+    expect(w.reqs).toHaveLength(0);   // the re-run's log is never excerpted
     const i = w.timeline.indexOf('rerun');
-    expect(i).toBeGreaterThan(-1);
-    expect(w.timeline.slice(i).indexOf('evidence-asked')).toBe(-1);
+    expect(w.timeline.slice(i)).not.toContain('ai');
+    expect(w.proves.map((p) => p.keys)).toEqual(['real', 'placeholder', 'placeholder']);   // R, then each part again with placeholders
+    expect(verdict(out, 'precommit')?.detail).toMatch(/only in a run that held your real test keys/);
+  });
+
+  it('fix round 2: a re-run with no run id to re-run is the re-prove itself, and it counts as the part\'s one re-run', async () => {
+    const noIds = (): ProofRun => { const r = proof({ part: 'docker', log: log('The runner has received a shutdown signal.') }); return { ...r, evidence: new Map([['docker', { jobs: ['build'], log: log('The runner has received a shutdown signal.'), sources: [] }]]) }; };
+    const w = world({ prove: () => noIds() });
+    const out = await w.run();
+    expect(w.proves).toHaveLength(2);   // the first proof and its one re-run (as a re-prove)
+    expect(w.reruns).toEqual([]);
+    expect(verdict(out, 'docker')?.detail).toMatch(/again after a re-run/);
+  });
+
+  it('fix round 2 (N2): a candidate switch that replaces an AI-edited file keeps its mark', async () => {
+    const hooks = file('lefthook.yml', 'pre-commit:\n  commands: {}\n', 'precommit');
+    const w = world({
+      draft: baseDraft([composeFile(), hooks]),
+      prove: (n) => (n <= 1 ? proof({ part: 'precommit', log: errLog('alpha') }) : green()),
+      answers: [edit('lefthook.yml', 'pre-commit:\n  commands: { a: { run: "true" } }\n')],
+      nextCandidate: async (needId) => (needId === 'hooks' ? { step: spec('lefthook', 'hooks'), files: [{ ...hooks, content: 'pre-commit:\n  commands: { b: { run: "true" } }\n' }] } : null),
+    });
+    const out = await w.run();
+    expect(out.aiChanged).toEqual(['lefthook.yml']);
+    expect(fileOf(out.draft, 'lefthook.yml')?.content).toContain('{ b:');
+    expect(fileOf(out.draft, 'lefthook.yml')?.aiEdited).toBe(true);
+    expect(aiWritten(out.draft).map((f) => f.path)).toEqual(['lefthook.yml']);
   });
 
   it('fix round 1 (M2): the caps are checked before the Dockerfile call, before the question and at the end', async () => {
