@@ -20,7 +20,7 @@ const onlyGate = (): string => {
   const doc = parse(readFileSync(DATA, 'utf8')) as { pinnedOn: string; tools: Record<string, any>[] };
   return stringify({ pinnedOn: doc.pinnedOn, tools: [doc.tools.find((t) => t.id === 'pipegen-gate')] });
 };
-/** The real entry's gate tag (gate-v<version>; gate-v0.2.1 since D9). */
+/** The real entry's gate tag (gate-v<version>; gate-v0.2.2 since E9). */
 const TAG = `gate-v${real().candidate.version}`;
 const stub = (routes: Record<string, unknown>, calls: string[]): typeof fetch => (async (url: string) => {
   calls.push(String(url));

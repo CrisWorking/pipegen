@@ -3,7 +3,7 @@
 import type { GateToolView } from '../settings.js';
 
 /** The version of this gate (nightly compares it with the newest gate-v<version> release). */
-export const GATE_VERSION = "0.2.1";
+export const GATE_VERSION = "0.2.2";
 
 export const GATE_VIEW: readonly GateToolView[] = [
   {

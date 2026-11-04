@@ -74,7 +74,7 @@ describe('C6: the pipegen-gate reviewed entry', () => {
   it('the renderer accepts the real entry exactly as it accepts the fixture (same uses path, no inputs)', () => {
     const a = renderScrub('pipegen-out-sast--app', '${{ runner.temp }}/pipegen-raw/pipegen-out-sast--app/semgrep.sarif', 'semgrep', 'sarif', real());
     const b = renderScrub('pipegen-out-sast--app', '${{ runner.temp }}/pipegen-raw/pipegen-out-sast--app/semgrep.sarif', 'semgrep', 'sarif', gateEntry());
-    // the uses comment names each entry's own tag (the fixture stays at gate-v0.2.0; the real entry is gate-v0.2.1 since D9)
+    // the uses comment names each entry's own tag (the fixture stays at gate-v0.2.0; the real entry is gate-v0.2.2 since E9)
     expect({ ...a, uses: a.uses?.split('@')[0], usesComment: '' }).toEqual({ ...b, uses: b.uses?.split('@')[0], usesComment: '' });
     expect(a.usesComment).toBe(`gate-v${real().candidate.version}`);
     expect(b.usesComment).toBe(`gate-v${gateEntry().candidate.version}`);
@@ -117,7 +117,7 @@ describe('C6 fix round 1: the cooldown skips the AGE rule for pipegen\'s own rep
     expect(PIPEGEN_GATE_USES.startsWith(`${PIPEGEN_OWN_REPO}/`)).toBe(true);
   });
   it('the entry\'s version is a bare semver (the tag is gate-v<version>)', () => {
-    expect(real().candidate.version).toBe('0.2.1');   // gate-v0.2.1 (D9); the version is bundle content (GATE_VERSION), so it changes before the tag
+    expect(real().candidate.version).toBe('0.2.2');   // gate-v0.2.2 (E9; gate-v0.2.1 was D9); the version is bundle content (GATE_VERSION), so it changes before the tag
   });
   it('tag == pin passes with no age check and no release lookup (pre-merge mode: no default-branch check)', async () => {
     const r = await run(onlyGate(), tagRoute());
@@ -133,7 +133,7 @@ describe('C6 fix round 1: the cooldown skips the AGE rule for pipegen\'s own rep
   it('an impostor or missing SHA fails: no tag (404), a tag on another commit, a tag that is not a commit', async () => {
     const impostor = onlyGate((e) => { e.candidate.pin.sha = 'f'.repeat(40); e.step.action.uses = `crisworking/pipegen/gate@${'f'.repeat(40)}`; });
     expect((await run(impostor, {})).ok).toBe(false);
-    expect((await run(impostor, tagRoute())).problems).toMatch(/not the commit of the tag gate-v0\.2\.1/);
+    expect((await run(impostor, tagRoute())).problems).toContain(`not the commit of the tag ${TAG}`);   // E9: the tag read from the version
     expect((await run(onlyGate(), tagRoute('a'.repeat(40)))).ok).toBe(false);
     expect((await run(onlyGate(), { [`${API}/git/ref/tags/${TAG}`]: { ref: `refs/tags/${TAG}`, object: { type: 'tree', sha: PIN } } })).ok).toBe(false);
     expect((await run(onlyGate(), {})).ok).toBe(false);
