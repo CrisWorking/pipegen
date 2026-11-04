@@ -63,7 +63,7 @@ export interface GateOpts { result?: 'pass' | 'warn' | 'block'; pass?: boolean; 
 export const gateFinding = (needId: string, tool: string, over: object = {}): object => ({ needId, job: needId, tool, ruleId: 'rule', severity: 'high', isNew: null, [FLAG]: false, ...over });
 export function gateDoc(o: GateOpts, list: PipelineDraft): ArtifactFile {
   const result = o.result ?? 'pass';
-  const checks = o.checks ?? gateJobList(list).map((e) => ({ needId: e.needId, job: e.job, ...(e.tool === undefined ? {} : { tool: e.tool }), judgedBy: e.format === 'sarif' ? 'findings' : 'job status', state: 'ok' }));
+  const checks = o.checks ?? gateJobList(list).map((e) => ({ needId: e.needId, job: e.job, ...(e.tool === undefined ? {} : { tool: e.tool }), judgedBy: e.format === 'sarif' ? 'findings' : 'job status', state: e.format === 'sarif' ? 'no findings' : 'passed' }));
   const doc = {
     pipegenGateResult: 1, result, pass: o.pass ?? result !== 'block', mode: 'warn', event: o.event ?? 'pull_request', sha: HEAD, runId: o.runId,
     blockReasons: o.blockReasons ?? [], warnReasons: [], counted: null, blocking: o.blocking ?? [], warnings: o.warnings ?? [], toolErrors: o.toolErrors ?? [],

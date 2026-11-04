@@ -3,8 +3,9 @@
 import { describe, expect, it } from 'vitest';
 import { evaluate, evaluateProof, type EvalContext, type VariantRuns } from '../src/proof/evaluate.js';
 import type { PartResult, ProofResult } from '../src/types.js';
+import { gateJobList } from '../src/engine/gate-job-list.js';
 import {
-  COMPAT_PREFIX, ctxOf, draftOf, gateDoc, GATE_RESULT_ARTIFACT, greenMain, job, needOf, PIPEGEN, PLANTED_ITEMS, plantedRuns, run, spec,
+  COMPAT_PREFIX, ctxOf, draftOf, gateDoc, GATE_RESULT_ARTIFACT, greenMain, job, needOf, PIPEGEN, PLANTED_ITEMS, plantedRuns, resultArtifactName, run, spec,
 } from './helpers/proof-eval.js';
 
 type O = VariantRuns['outcomes'][number];
@@ -161,5 +162,65 @@ describe('unreadable coverage log (round 2)', () => {
     expect(ent(r.result, 'tests', 'coverage')[0]?.status).toBe('failed');
     expect(part(r.result, 'tests')?.status).toBe('failed');
     expect(r.result.ok).toBe(false);
+  });
+});
+
+describe('exception round 3 (E5-R6): the scan state is an allow-list; each created Dockerfile is bound on its own', () => {
+  const CREATED = [{ part: 'docker' as const, path: 'api/Dockerfile', content: 'FROM x', reason: 'r', repo: 'app' as const }];
+  const withScanState = async (d: ReturnType<typeof draftOf>, state: string, judgedBy = 'findings', job = 'image-scan--api') => {
+    const m = greenMain(d);
+    const checks = gateJobList(d).map((e) => (e.job === job ? { needId: e.needId, job: e.job, tool: e.tool, judgedBy, state } : { needId: e.needId, job: e.job, ...(e.tool === undefined ? {} : { tool: e.tool }), judgedBy: e.format === 'sarif' ? 'findings' : 'job status', state: e.format === 'sarif' ? 'no findings' : 'passed' }));
+    prRun(m).artifacts.set(GATE_RESULT_ARTIFACT, gateDoc({ runId: prRun(m).handle.runId, checks }, d));
+    return evaluate(d, [m, plantedRuns(d)], ctxOf());
+  };
+  it.each([
+    ['tool error', 'findings'], ['failed (failure)', 'findings'], ['no coverage (completeness not provable)', 'findings'],
+    ['0 finding(s); no coverage for src/**', 'findings'], ['no findings; uncovered: foo', 'findings'], ['passed', 'job status'], ['no findings', 'job status'], ['ok', 'findings'], ['', 'findings'],
+  ])('state %j (judgedBy %s) is not a read scan: docker not proven', async (state, judgedBy) => {
+    const d = draftOf({ created: CREATED });
+    const r = await withScanState(d, state, judgedBy);
+    expect(part(r, 'docker')?.status).toBe('not-proven');
+    expect(part(r, 'docker')?.detail).toMatch(/image scan/);
+  });
+  it.each(['no findings', '2 finding(s)', '0 finding(s)'])('state %j is a read scan: docker proven', async (state) => {
+    const d = draftOf({ created: CREATED });
+    expect(part(await withScanState(d, state), 'docker')?.status).toBe('proven');
+  });
+
+  const two = (scanWorker: boolean) => {
+    const b = draftOf();
+    const services = [{ ...b.profile.services[0]! }, { ...b.profile.services[0]!, name: 'worker', path: 'worker', dockerfile: 'worker/Dockerfile' }];
+    const needs = [...b.needs, ...(scanWorker ? [{ ...b.needs.find((n) => n.id === 'image-scan')!, service: 'worker' }] : [])];
+    const steps = [...b.steps, ...(scanWorker ? [{ ...b.steps.find((x) => x.needId === 'image-scan')!, service: 'worker' }] : [])];
+    return { b, services, needs, steps };
+  };
+  const mk = (created: string[], scanWorker: boolean) => {
+    const { b, services, needs, steps } = two(scanWorker);
+    const d = draftOf({ needs, steps, created: created.map((path) => ({ part: 'docker' as const, path, content: 'FROM x', reason: 'r', repo: 'app' as const })) });
+    d.profile.services = services as typeof b.profile.services;
+    return d;
+  };
+  const run3 = (d: ReturnType<typeof draftOf>) => evaluate(d, [greenMain(d), plantedRuns(d)], ctxOf({ plantedItems: PLANTED_ITEMS.filter((i) => i.category !== 'image-scan') }));
+  it('two created Dockerfiles, one bound to no service: docker not proven, naming the unbound path', async () => {
+    const r = await run3(mk(['api/Dockerfile', 'tools/Dockerfile'], false));
+    expect(part(r, 'docker')?.status).toBe('not-proven');
+    expect(part(r, 'docker')?.detail).toContain('tools/Dockerfile');
+  });
+  it('both bound and both scans read: proven', async () => {
+    expect(part(await run3(mk(['api/Dockerfile', 'worker/Dockerfile'], true)), 'docker')?.status).toBe('proven');
+  });
+  it('both bound, the worker scan missing: not proven', async () => {
+    const r = await run3(mk(['api/Dockerfile', 'worker/Dockerfile'], false));
+    expect(part(r, 'docker')?.status).toBe('not-proven');
+    expect(part(r, 'docker')?.detail).toContain('worker');
+  });
+  it('an unread scan of an unrelated service does not affect the verdict when the Dockerfile\'s own scan is read', async () => {
+    const d = mk(['api/Dockerfile'], true);
+    const m = greenMain(d);
+    for (const j of prRun(m).jobs) if (j.name === 'image-scan--worker') j.conclusion = 'failure';
+    prRun(m).artifacts.delete(resultArtifactName('image-scan', 'worker'));
+    // the failed worker job fails the pipeline, never docker: docker itself stays proven
+    const r = await evaluate(d, [m, plantedRuns(d)], ctxOf({ plantedItems: PLANTED_ITEMS.filter((i) => i.category !== 'image-scan') }));
+    expect(part(r, 'docker')?.status).toBe('proven');
   });
 });

@@ -151,16 +151,18 @@ const DEFAULT_PIPEGEN = new Set(['.github/workflows/pipegen.yml']);
 const kindOf = (workflow: string): Kind => kindOfPath(workflow, DEFAULT_PIPEGEN);
 /** The kind of each outcome of one evaluation: built per evaluation and passed down (no shared module state). */
 type Kinds = ReadonlyMap<object, Kind>;
-/** The slugs of the services whose Dockerfile pipegen created (matched by the service's folder or its recorded Dockerfile path). */
-function boundServices(draft: PipelineDraft): Set<string> {
-  const out = new Set<string>();
+/** Each created Dockerfile's path → the slugs of the services it builds (matched by the service's folder or its recorded Dockerfile path); an empty list = bound to no service. */
+function boundServices(draft: PipelineDraft): Map<string, Set<string>> {
+  const out = new Map<string, Set<string>>();
   const norm = (p: string): string => p.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
   for (const f of draft.created) {
     if (f.part !== 'docker' || !/(^|\/)Dockerfile[^/]*$/.test(f.path)) continue;
+    const slugs = out.get(f.path) ?? new Set<string>();
+    out.set(f.path, slugs);
     const dir = norm(f.path.replace(/\/?[^/]*$/, ''));
     for (const sv of draft.profile.services) {
       if ((sv.dockerfile !== undefined && norm(sv.dockerfile) === norm(f.path)) || norm(sv.path === '.' ? '' : sv.path) === dir) {
-        try { out.add(slug(sv.name)); } catch { /* an unusable name binds nothing */ }
+        try { slugs.add(slug(sv.name)); } catch { /* an unusable name binds nothing */ }
       }
     }
   }
@@ -430,9 +432,11 @@ async function evaluateInner(draft: PipelineDraft, runs: readonly VariantRuns[],
       const g = gateMain;
       const allScans = jobList.filter((e) => e.category === 'image-scan' && e.range !== true);
       // the scan must be the one of the service the created Dockerfile builds (Service.path / Service.dockerfile); a Dockerfile of no known service has no bound evidence
-      const owners = boundServices(draft);
+      const bound = boundServices(draft);
+      const owners = new Set<string>([...bound.values()].flatMap((x) => [...x]));
       const scans = allScans.filter((e) => e.service !== undefined && owners.has(e.service));
-      if (owners.size === 0) sheet.notProven('docker', "the created Dockerfile belongs to no known service, so no image scan can be bound to it and its base image is not proven", { caps: true });
+      // every created Dockerfile is checked on its own: one bound to no service is never hidden by another that is bound
+      for (const [path, slugs] of bound) if (slugs.size === 0) sheet.notProven('docker', `the created Dockerfile ${st(path, 100)} belongs to no known service, so no image scan can be bound to it and its base image is not proven`, { caps: true });
       for (const o of owners) if (!scans.some((e) => e.service === o)) sheet.notProven('docker', `the draft has no image scan check for the created Dockerfile of ${st(o, 60)}, so its base image is not proven`, { caps: true });
       for (const e of scans) {
         const why: string[] = [];
@@ -443,7 +447,7 @@ async function evaluateInner(draft: PipelineDraft, runs: readonly VariantRuns[],
         else {
           const check = g.checks.find((c) => c.needId === e.needId && c.job === e.job);
           if (check === undefined) why.push("the gate's report has no check for it");
-          else if (/^(?:did not report|skipped|tampered|not run)/.test(check.state)) why.push(`the gate's check says it ${st(check.state, 60)}`);
+          else if (check.judgedBy !== 'findings' || !(check.state === 'no findings' || /^\d+ finding\(s\)$/.test(check.state))) why.push(`the gate's check is not a read scan result (${st(check.judgedBy, 20)}: ${st(check.state, 80)})`);
           if (g.toolErrors.some((t) => t.needId === e.needId && t.job === e.job)) why.push('the gate reports a tool error for it');
         }
         if (why.length > 0) sheet.notProven('docker', `the image scan ${st(e.job, 80)} was not read (${why.join('; ')}), so the created Dockerfile's base image is not proven`, { needId: e.needId, caps: true });
