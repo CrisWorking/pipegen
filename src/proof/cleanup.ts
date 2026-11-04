@@ -281,9 +281,17 @@ function applyMeters(n: RunState, m: ProofMeters | undefined): void {
  */
 async function measureMinutes(gh: Octokit, t: ProofTarget, st: RunState, m: ProofMeters | undefined, rate: RateClock, limit: { ms: number; signal?: AbortSignal }): Promise<number | null> {
   // fix round 2 (N-2): the read is bounded (its N+1 requests must not hold up the cleanup on the Ctrl-C path); a read that is
-  // cut gives the meter's last count, or (no meter) the whole cap
-  const bounded = async (read: Promise<unknown>): Promise<boolean> => {
+  // cut gives the meter's last count, or (no meter) the whole cap. Final review N2-a: a cleanup already cut (the signal
+  // aborted) never starts the read, and the read's outcome is handled the moment it starts: a rejection (a 401, a rate
+  // stop) that comes after the cut is caught, never an unhandled rejection; it counts as a read that failed.
+  const bounded = async (start: () => Promise<unknown>): Promise<boolean> => {
     if (limit.signal?.aborted === true) return false;
+    let settled: Promise<boolean>;
+    try {
+      settled = start().then(() => true, () => false);
+    } catch {
+      return false;
+    }
     let timer: ReturnType<typeof setTimeout> | undefined;
     let onAbort: (() => void) | undefined;
     const cut = new Promise<false>((done) => {
@@ -292,20 +300,21 @@ async function measureMinutes(gh: Octokit, t: ProofTarget, st: RunState, m: Proo
       limit.signal?.addEventListener('abort', onAbort, { once: true });
     });
     try {
-      return await Promise.race([read.then(() => true, () => false), cut]);
+      return await Promise.race([settled, cut]);
     } finally {
       clearTimeout(timer);
       if (onAbort !== undefined) limit.signal?.removeEventListener('abort', onAbort);
     }
   };
   if (m?.minutes !== undefined) {
-    await bounded(m.minutes.add(gh, t, { clock: rate }));
+    const meter = m.minutes;
+    await bounded(() => meter.add(gh, t, { clock: rate }));
     return m.minutes.used;
   }
   if (st.proofStart === undefined) return null;
   const meter = new MinutesMeter(st.cap, st.proofStart.at);
   if ((st.minutesBase ?? 0) > 0) meter.restore(st.minutesBase as number);   // fix round 2 (N-3): base + the runs since the start
-  if (!(await bounded(meter.add(gh, t, { clock: rate })))) return st.cap;
+  if (!(await bounded(() => meter.add(gh, t, { clock: rate })))) return st.cap;
   return meter.problem === null ? meter.used : Math.max(meter.used, st.cap);
 }
 

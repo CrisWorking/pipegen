@@ -6,14 +6,18 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { proveThenClean, proofVerdict, type CleanupResult } from '../src/proof/cleanup.js';
+import { cleanupAfterProof, proveThenClean, proofVerdict, type CleanupResult } from '../src/proof/cleanup.js';
+import { makeOctokit } from '../src/github/client.js';
+import { MinutesMeter } from '../src/proof/minutes.js';
 import { SecretVault } from '../src/create/secrets.js';
 import { isExcerptEvidence, PLACEHOLDER_PREFIX, ScratchKeys } from '../src/proof/keys.js';
 import { proofTarget } from '../src/proof/target.js';
 import { nextStage, StateError, StateStore } from '../src/proof/state.js';
 import type { CreatedFile, PipelineDraft } from '../src/types.js';
 import { draftOf } from './helpers/proof-eval.js';
+import { cleanupWorld } from './helpers/cleanup-github.js';
 import { app, EVIDENCE_RUN, keysWorld, quietIo } from './helpers/scratch-secrets.js';
+import { fake } from './helpers/secret-repo.js';
 
 const RUN = '20261104-090000-abc123';
 const dirs: string[] = [];
@@ -183,5 +187,68 @@ describe('final review I-3: the brand checks organisation secrets against the na
     await k2.placeholders([STRIPE]);
     expect(isExcerptEvidence(await k2.evidence(await k2.ticket({ readBy: [STRIPE] }), [EVIDENCE_RUN], { readBy: [STRIPE] }))).toBe(true);
     expect(await k2.evidence(await k2.ticket(), [EVIDENCE_RUN])).toBeNull();   // no names at all: every org secret counts (unchanged)
+  });
+});
+
+describe('final review N2-a (E8): a cleanup already cut never starts the minutes read; no rejection of it goes unhandled', () => {
+  /** A cleanup world whose run-jobs read answers 401 after a short wait; `jobs` counts the reads that started. */
+  function world401(id: number) {
+    const w = cleanupWorld({}, {}, id);
+    w.f.runs.push({ id: 11, status: 'completed', minutes: 4 });
+    const seen = { jobs: 0 };
+    const f401 = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input instanceof Request ? input.url : input).includes('/jobs')) {
+        seen.jobs++;
+        await new Promise((r) => setTimeout(r, 30));
+        return new Response(JSON.stringify({ message: 'Bad credentials' }), { status: 401, headers: { 'content-type': 'application/json' } });
+      }
+      return w.g.fetch(input, init);
+    }) as typeof fetch;
+    return { w, seen, gh: makeOctokit(fake.githubPat(), { fetch: f401, log: () => {} }) };
+  }
+  const instant = { now: () => 0, sleep: async () => {} };
+
+  it('signal already aborted + a 401 minutes read: no read starts, no unhandled rejection, the whole cap is counted (no meter) or the meter\'s last count', async () => {
+    const unhandled: unknown[] = [];
+    const on = (e: unknown): void => { unhandled.push(e); };
+    process.on('unhandledRejection', on);
+    try {
+      for (const withMeter of [false, true]) {
+        const { seen, gh } = world401(81_000 + (withMeter ? 1 : 0));
+        const t = (await import('../src/proof/target.js')).proofTarget(app(), { runId: RUN });
+        const store = await proving();
+        store.saveMeters({ minutes: { used: 2, since: Date.UTC(2026, 10, 4, 9, 0, 0), fromServer: true } });
+        const ctl = new AbortController();
+        ctl.abort();
+        const meter = new MinutesMeter(100, Date.UTC(2026, 10, 4, 9, 0, 0));
+        meter.restore(3);
+        const keys = new ScratchKeys(gh, t, new SecretVault(), { io: quietIo });
+        await cleanupAfterProof(gh, t, store, keys, { canDeleteRepo: false, clock: instant, settleMs: 0, signal: ctl.signal, ...(withMeter ? { meters: () => ({ minutes: meter }) } : {}) });
+        await new Promise((r) => setTimeout(r, 150));
+        expect(seen.jobs, `meter ${withMeter}`).toBe(0);
+        expect(store.load()?.minutesUsed, `meter ${withMeter}`).toBe(withMeter ? 3 : 100);
+      }
+      // not aborted: the read runs, its 401 is caught (the whole cap counted), never unhandled
+      const { seen, gh } = world401(81_002);
+      const t = (await import('../src/proof/target.js')).proofTarget(app(), { runId: RUN });
+      const store = await proving();
+      store.saveMeters({ minutes: { used: 2, since: Date.UTC(2026, 10, 4, 9, 0, 0), fromServer: true } });
+      const keys = new ScratchKeys(gh, t, new SecretVault(), { io: quietIo });
+      await cleanupAfterProof(gh, t, store, keys, { canDeleteRepo: false, clock: instant, settleMs: 0 });
+      await new Promise((r) => setTimeout(r, 150));
+      expect(seen.jobs).toBeGreaterThan(0);
+      expect(store.load()?.minutesUsed).toBe(100);
+      // cut by the deadline while the read is still going, which then rejects: still handled
+      const late = world401(81_003);
+      const s2 = await proving();
+      s2.saveMeters({ minutes: { used: 2, since: Date.UTC(2026, 10, 4, 9, 0, 0), fromServer: true } });
+      const k2 = new ScratchKeys(late.gh, t, new SecretVault(), { io: quietIo });
+      await cleanupAfterProof(late.gh, t, s2, k2, { canDeleteRepo: false, clock: instant, settleMs: 0, measureMs: 1 });
+      await new Promise((r) => setTimeout(r, 150));
+      expect(s2.load()?.minutesUsed).toBe(100);
+      expect(unhandled.map((e) => String((e as Error)?.message ?? e))).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', on);
+    }
   });
 });
