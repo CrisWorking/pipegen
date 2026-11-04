@@ -34,6 +34,8 @@ export interface RunsFake {
   ignoreCancel: Set<number>;
   /** POST …/force-cancel answers this status (default 202, the run ends cancelled). */
   forceStatus?: number;
+  /** POST …/cancel answers this status (default 202) and changes nothing. */
+  cancelStatus?: number;
   merges: { pr: number; sha: string }[];
   /** event → workflow path → what it does (a function sees the sha and branch). Missing: no run for that workflow. */
   plans: { push: Record<string, Plan | ((sha: string, branch: string) => Plan | undefined)>; pull_request: Record<string, Plan | ((sha: string, branch: string) => Plan | undefined)> };
@@ -150,6 +152,7 @@ export function runsFake(defaultBranch = 'main'): RunsFake {
     if (m && c.method === 'POST') {
       const id = Number(m[1]);
       f.cancels.push(id);
+      if (f.cancelStatus !== undefined) return json(f.cancelStatus, { message: 'Server Error' });
       const r = f.runs.find((x) => x.id === id);
       if (r !== undefined && r.status === 'completed') return json(409, { message: 'Cannot cancel a workflow run that is completed.' });
       if (r !== undefined && !f.ignoreCancel.has(id)) { r.status = 'completed'; r.conclusion = 'cancelled'; }

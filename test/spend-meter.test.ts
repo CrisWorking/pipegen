@@ -189,7 +189,18 @@ describe('E6 AI spend meter (B4)', () => {
     let release: () => void = () => {};
     const slow = new AiSpendMeter({ name: 'claude', model: DEFAULT_MODEL, complete: () => new Promise((ok) => { release = () => ok({ data: {}, usage: use(1_000, 100) }); }) }, 1.5 * worst);
     const a = slow.provider.complete(req());
+    expect(slow.spentUsd).toBe(0);
+    expect(slow.exceeded).toBe(false);
     await expect(slow.provider.complete(req())).rejects.toMatchObject({ kind: 'cost-cap' });
+    // exceeded counts what is reserved: a call in flight that holds the whole cap reaches it
+    let free: () => void = () => {};
+    const full = new AiSpendMeter({ name: 'claude', model: DEFAULT_MODEL, complete: () => new Promise((ok) => { free = () => ok({ data: {}, usage: use(1_000, 100) }); }) }, worst);
+    const b = full.provider.complete(req());
+    expect(full.spentUsd).toBe(0);
+    expect(full.exceeded).toBe(true);
+    free();
+    await b;
+    expect(full.exceeded).toBe(false);
     release();
     await a;
   });

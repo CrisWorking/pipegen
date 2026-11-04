@@ -67,6 +67,8 @@ describe('E6 minutes meter (S12)', () => {
     const w = minutesWorld({
       1: [done('10:00:00', '10:00:01'), done('10:01:00', '10:03:00'), done('10:04:00', '10:06:00.5'), queued],
       2: [done('10:10:00', '10:10:00')],   // a finished job that took no time still counts one minute
+      // not started on a runner: 0, whatever else GitHub lists (a queued job with a start time, a finished job without one)
+      3: [{ status: 'queued', started_at: at('10:00:00'), completed_at: null }, { status: 'completed', started_at: null, completed_at: at('10:20:00') }],
     });
     const m = new MinutesMeter(100, SINCE);
     await m.add(w.gh, target(), { now: ms('10:30:00') });
@@ -183,6 +185,15 @@ describe('E6 minutes meter (S12)', () => {
     clock.t = ms('10:05:00');
     expect(await stop()).toBe(true);
     expect(m.used).toBe(5);
+    // minutes it can't read, three times in a row, stop the proof too (fail closed)
+    const blindWorld = world({ repos: { pipelines: { private: true }, [SCRATCH]: { private: true } }, extra: (c) => (c.url.pathname === `${R}/actions/runs` ? { status: 500, body: {} } : undefined) });
+    const blind = new MinutesMeter(5, SINCE);
+    const c2 = fakeClock(ms('10:01:00'));
+    const stop2 = minutesStop(blindWorld.gh, target(), blind, { clock: c2, everyMs: 1 });
+    const said: boolean[] = [];
+    for (let i = 0; i < MINUTES_UNREAD_LIMIT; i++) { c2.t += 1; said.push(await stop2()); }
+    expect(said).toEqual([...Array.from({ length: MINUTES_UNREAD_LIMIT - 1 }, () => false), true]);
+    expect(blind.used).toBe(0);
   });
 });
 
@@ -228,8 +239,21 @@ describe('E6 force-cancel (S12)', () => {
     f3.ignoreCancel.add(id3);
     const c3 = fakeClock();
     c3.sleep = async (n: number) => { c3.sleeps.push(n); c3.t += n; vi.mocked(interrupting).mockReturnValue(true); };
+    const before3 = g3.calls.length;
     await cancelRuns(g3.gh, t, [id3], { clock: c3 });
     expect(f3.forceCancels).toEqual([]);
+    expect(g3.calls.slice(before3).map((c) => `${c.method} ${c.url.pathname}`)).toEqual([`POST ${R}/actions/runs/${id3}/cancel`]);   // nothing after the wait
+    vi.mocked(interrupting).mockReturnValue(false);
+    // a cancel GitHub refused is followed by the force-cancel all the same (the run may still be billed)
+    const f4 = runsFake();
+    f4.plans.push['.github/workflows/pipegen.yml'] = { steps: 1_000 };
+    const g4 = world({ repos: { pipelines: { private: true }, [SCRATCH]: { private: true } }, extra: f4.handler });
+    f4.pushed('proof/20261103-120000-abcdef/main', 'd'.repeat(40));
+    const id4 = f4.runs[0]?.id as number;
+    f4.cancelStatus = 500;
+    const out4 = await cancelRuns(g4.gh, t, [id4], { clock: fakeClock() });
+    expect(f4.forceCancels).toEqual([id4]);
+    expect(out4.get(id4)).toBeNull();
   });
 
   it('run: waitForRuns force-cancels a run its stop could not cancel', async () => {
@@ -300,6 +324,31 @@ describe('E6 a cap was reached (B4, S12)', () => {
     const b = capReached({ minutes: blind, ai: new AiSpendMeter(paid(), 10) });
     expect(b).toMatchObject({ kind: 'actions-minutes', limit: 120, unread: true });
     expect(capMessage(b as CapReached)).toBe(`pipegen stopped before the Actions minutes limit of 120: it couldn't read the minutes used in ${SCRATCH}`);
+  });
+
+  it('cap: cancelActiveRuns cancels only runs still going, and fails loudly on a run it can\'t stop', async () => {
+    const f = runsFake();
+    f.plans.push['.github/workflows/pipegen.yml'] = { steps: 1_000 };
+    f.plans.push['.github/workflows/done.yml'] = { steps: 1 };
+    const g = world({ repos: { pipelines: { private: true }, [SCRATCH]: { private: true } }, extra: f.handler });
+    const t = proofTarget(app(), { runId: '20261103-120000-abcdef' });
+    f.pushed('proof/20261103-120000-abcdef/main', 'a'.repeat(40));
+    const [going, finished] = f.runs;
+    if (going === undefined || finished === undefined) throw new Error('two runs expected');
+    finished.status = 'completed';
+    finished.conclusion = 'success';
+    expect(await cancelActiveRuns(g.gh, t, SINCE, { clock: fakeClock() })).toEqual([going.id]);
+    expect(f.cancels).toEqual([going.id]);   // a finished run is left alone
+    // a run that can't be stopped: a leftover, and an error stopAtCap names
+    const f2 = runsFake();
+    f2.plans.push['.github/workflows/pipegen.yml'] = { steps: 1_000 };
+    const g2 = world({ repos: { pipelines: { private: true }, [SCRATCH]: { private: true } }, extra: f2.handler });
+    f2.pushed('proof/20261103-120000-abcdef/main', 'b'.repeat(40));
+    f2.ignoreCancel.add(f2.runs[0]?.id as number);
+    f2.forceStatus = 500;
+    const left: string[] = [];
+    await expect(cancelActiveRuns(g2.gh, t, SINCE, { clock: fakeClock(), leftover: (x) => left.push(x) })).rejects.toThrow(/could not be cancelled/);
+    expect(left).toHaveLength(1);
   });
 
   it('cap: either cap → cleanup still runs', async () => {
