@@ -215,10 +215,10 @@ describe('E7 fix loop', () => {
     expect(out.result.ok).toBe(true);
     expect(verdict(out, 'docker')?.status).toBe('proven');
     expect(w.reqs).toHaveLength(2);
-    expect(out.attempts).toBe(2);
+    expect(out.attempts).toBe(3);   // 2 answers + the final full proof (E7-R13)
     expect(out.aiAttempts).toEqual({ docker: 2 });
     expect(fileOf(out.draft, 'api/Dockerfile')?.content).toContain('EXPOSE 8080');
-    expect(w.proves.map((p) => p.scope)).toEqual(['full', 'pr', 'pr']);
+    expect(w.proves.map((p) => p.scope)).toEqual(['full', 'pr', 'pr', 'full']);   // the last full proof covers the fixed draft (E7-R13)
   });
 
   it('fix: 5 failures → next candidate with new count', async () => {
@@ -241,7 +241,8 @@ describe('E7 fix loop', () => {
     const ai = w.timeline.filter((x) => x === 'ai' || x.startsWith('next:'));
     expect(ai).toEqual([...Array(5).fill('ai'), 'next:image-build', ...Array(5).fill('ai'), 'next:image-build']);
     expect(out.draft.steps.some((s) => s === swapped[0])).toBe(true);
-    expect(out.attempts).toBe(11);   // 10 answers + the swap's re-prove
+    expect(out.attempts).toBe(12);
+    expect(verdict(out, 'docker')?.detail).toMatch(/^failed after 10 attempts/);   // every answer of the part, not the count since the switch   // 10 answers + the swap's re-prove
     expect(verdict(out, 'docker')?.status).toBe('not-proven');
     expect(out.stopped).toBeUndefined();
   });
@@ -332,7 +333,7 @@ describe('E7 fix loop', () => {
     expect(w.reqs).toHaveLength(1);
     expect(verdict(out, 'docker')?.status).toBe('not-proven');
     expect(verdict(out, 'docker')?.detail).toMatch(/same error/);
-    expect(w.proves).toHaveLength(2);
+    expect(w.proves).toHaveLength(3);
   });
 
   it('fix: global cap of 20 attempts → stopped with explanation', async () => {
@@ -410,7 +411,7 @@ describe('E7 fix loop', () => {
     });
     const out = await w.run();
     expect(out.aiAttempts).toEqual({ docker: 2 });
-    expect(w.proves).toHaveLength(2);   // the refused answer was never pushed
+    expect(w.proves).toHaveLength(3);   // the first, the accepted answer (pr), the final full (E7-R13): the refused answer was never pushed
     expect(w.reqs[1]?.user).toContain('the referee found a broken rule');
     expect(fileOf(out.draft, 'api/Dockerfile')?.content).toContain('# two');
   });
@@ -424,7 +425,7 @@ describe('E7 fix loop', () => {
     const out = await w.run();
     expect(out.aiAttempts).toEqual({ docker: 2 });
     expect(w.reqs).toHaveLength(3);   // the schema's enum refused it twice (one retry inside completeValidated)
-    expect(w.proves).toHaveLength(2);
+    expect(w.proves).toHaveLength(3);
     expect(fileOf(out.draft, 'docker-compose.pipegen.yml')?.content).toBe(COMPOSE);
     expect(out.result.ok).toBe(true);
   });
@@ -444,7 +445,7 @@ describe('E7 fix loop', () => {
     });
     const out = await w.run();
     expect(out.aiAttempts).toEqual({ 'test-migration': 3 });
-    expect(w.proves).toHaveLength(2);
+    expect(w.proves).toHaveLength(3);
     expect(checks.length).toBeGreaterThanOrEqual(1);
     expect(w.reqs[1]?.user).toMatch(/fewer tests than the 2 before/);
     expect(w.reqs[2]?.user).toMatch(/skips, focuses or marks a test/);
@@ -772,7 +773,7 @@ describe('E7 boundaries (extra)', () => {
       answers: [edit('deploy/verify.json', '{"a":1}\n'), edit('api/Dockerfile', DF(REF24, '\n# x'))],
     });
     const out = await w.run();
-    expect(w.proves.map((p) => p.scope)).toEqual(['full', 'full', 'pr']);
+    expect(w.proves.map((p) => p.scope)).toEqual(['full', 'full', 'pr', 'full']);
     expect(out.result.ok).toBe(true);
   });
 
@@ -811,7 +812,10 @@ describe('E7 boundaries (extra)', () => {
     const v = world({ prove: () => proof({ part: 'docker', log: errLog('alpha') }), answers: [edit('api/Dockerfile', DF(REF24, '\n# x'))] });
     const o2 = await v.run();
     expect(verdict(o2, 'docker')?.status).toBe('not-proven');
-    expect(o2.result.ok).toBe(true);   // the pipeline is proven; docker is delivered warn-only
+    expect(o2.result.ok).toBe(true);   // the pipeline is proven; docker is delivered warn-only (E7-R12)...
+    // ...and its note says plainly that it failed, how often, and the last failure class (never a missing key or a host)
+    expect(verdict(o2, 'docker')?.detail).toMatch(/^failed after 1 attempt \(last failure: needs-fix\)/);
+    expect(verdict(o2, 'docker')?.detail).not.toMatch(/needs your real test key|could not reach|not given/);
     const f = world({ prove: () => proof({ part: 'pipeline', needId: 'secrets', log: errLog('alpha') }) });
     expect((await f.run()).result.ok).toBe(false);
   });
@@ -869,7 +873,8 @@ describe('E7 boundaries (extra)', () => {
     const b = world({ prove: () => proof({ part: 'docker', log: log('The runner has received a shutdown signal.') }), rerun: () => proof({ part: 'docker', log: log('The runner has received a shutdown signal.') }) });
     const outB = await b.run();
     expect(b.reruns).toHaveLength(1);
-    expect(verdict(outB, 'docker')?.detail).toMatch(/again after a re-run/);
+    expect(verdict(outB, 'docker')?.detail).toMatch(/^failed after a re-run \(last failure: runner-error\).*again after a re-run/);
+    expect(verdict(outB, 'docker')?.status).toBe('not-proven');   // E7-R12: only a tool error is forced to failed
     // every refused answer spends one of the part's 5
     const c = world({ prove: () => proof({ part: 'docker', log: errLog('alpha') }), answers: Array.from({ length: 10 }, () => edit('api/Dockerfile', DF(REF24, '\n# x'))), referee: () => ({ ok: false, issues: [{ file: 'api/Dockerfile', check: 'secret-value', message: 'no' }] }) });
     const outC = await c.run();
@@ -937,7 +942,7 @@ describe('E7 boundaries (extra)', () => {
     });
     const out = await w.run();
     expect(out.aiAttempts).toEqual({ docker: 3 });
-    expect(w.proves).toHaveLength(2);
+    expect(w.proves).toHaveLength(3);
     expect(w.reqs[1]?.user).toContain('the guard said no');
     expect(w.reqs[2]?.user).toContain('the guard did not accept api/Dockerfile');
     expect(fileOf(out.draft, 'api/Dockerfile')?.content).toContain('# three');
@@ -994,6 +999,139 @@ describe('E7 boundaries (extra)', () => {
     const out = await w.run();
     expect(out.stopped).toMatch(/AI cost reached the limit/);
     expect(w.reqs).toHaveLength(1);
+  });
+
+  it('fix round 1 (E7-R12): a warn-only part that runs out of attempts ends not-proven with an honest note; a tool error that comes back after its re-run ends failed', async () => {
+    let k = 0;
+    const w = world({
+      prove: (n) => proof({ part: 'compose', log: errLog(WORDS[n] as string) }),
+      answers: Array.from({ length: 5 }, (_, i) => edit('docker-compose.pipegen.yml', `${COMPOSE}# ${WORDS[i]}\n`)),
+      nextCandidate: async () => { k++; return null; },
+    });
+    const out = await w.run();
+    expect(verdict(out, 'compose')?.status).toBe('not-proven');
+    expect(verdict(out, 'compose')?.detail).toMatch(/^failed after 5 attempts \(last failure: needs-fix\)/);
+    expect(out.stopped).toBeUndefined();
+    // a tool error that comes back after its one re-run: failed (plan "re-run once, then failed"), ok false, the run stops
+    const t = world({
+      prove: () => proof({ part: 'docker', log: log('trivy: tool error: the database could not be downloaded') }),
+      rerun: () => proof({ part: 'docker', log: log('trivy: tool error: the database could not be downloaded') }),
+    });
+    const o2 = await t.run();
+    expect(verdict(o2, 'docker')?.status).toBe('failed');
+    expect(verdict(o2, 'docker')?.detail).toMatch(/^failed after a re-run \(last failure: tool-error\)/);
+    expect(o2.result.ok).toBe(false);
+    expect(o2.stopped).toMatch(/^docker could not be proven/);
+    expect(o2.toolErrors).toHaveLength(1);
+  });
+
+  it('fix round 1 (E7-R13): a fix proven on pr gets one final full proof, counted, and its deploy verdict is the one returned', async () => {
+    const dv = (detail: string): PartResult => ({ part: 'deploy-verify', status: 'proven', detail });
+    const withDeploy = (r: ProofRun, detail: string): ProofRun => ({ ...r, result: { ...r.result, parts: [...r.result.parts, dv(detail)] } });
+    const w = world({
+      prove: (n, _d, scope) => (n === 0 ? withDeploy(proof({ part: 'docker', log: errLog('alpha') }), 'deploy of the first draft') : scope === 'full' ? withDeploy(green(), 'deploy of the fixed draft') : green()),
+      answers: [edit('api/Dockerfile', DF(REF24, '\n# fixed'))],
+    });
+    const out = await w.run();
+    expect(w.proves.map((p) => p.scope)).toEqual(['full', 'pr', 'full']);
+    expect(w.proves[2]?.draft).toBe(out.draft);
+    expect(out.result.parts.find((p) => p.part === 'deploy-verify')?.detail).toBe('deploy of the fixed draft');
+    expect(out.attempts).toBe(2);   // the answer and the final full proof
+    // counted toward the global cap: with the cap spent, no final run, stopped
+    const c = world({ maxTotal: 1, prove: (n) => (n === 0 ? proof({ part: 'docker', log: errLog('alpha') }) : green()), answers: [edit('api/Dockerfile', DF(REF24, '\n# fixed'))] });
+    const oc = await c.run();
+    expect(c.proves.map((p) => p.scope)).toEqual(['full', 'pr']);
+    expect(oc.stopped).toMatch(/global cap of 1 attempt/);
+    // and behind the caps
+    const m = world({ minutesCap: 10, prove: (n) => { if (n === 1) m.minutes.restore(10); return n === 0 ? proof({ part: 'docker', log: errLog('alpha') }) : green(); }, answers: [edit('api/Dockerfile', DF(REF24, '\n# fixed'))] });
+    const om = await m.run();
+    expect(m.proves).toHaveLength(2);
+    expect(om.stopped).toMatch(/Actions minutes/);
+  });
+
+  it('fix round 1 (E7-R13): after a no, a draft changed since the last full proof still gets its final full proof (placeholders)', async () => {
+    const w = world({
+      vault: { [STRIPE]: VALUE }, confirm: false,
+      prove: (n) => (n === 0 ? proof({ part: 'docker', log: errLog('alpha') }) : green()),
+      answers: [edit('api/Dockerfile', DF(REF24, '\n# fixed'))],
+    });
+    const out = await w.run();
+    expect(w.proves.map((p) => `${p.scope}:${p.keys}`)).toEqual(['full:placeholder', 'pr:placeholder', 'full:placeholder']);
+    expect(w.confirms).toHaveLength(1);
+    expect(out.keys).toBe('placeholder');
+  });
+
+  it('fix round 1 (E7-R14): the AI-changed paths are returned and marked on the draft; a resumed draft asks before real keys', async () => {
+    const first = world({ draft: baseDraft([composeFile()]), prove: (n) => (n === 0 ? proof({ part: 'compose', log: errLog('alpha') }) : green()), answers: [edit('docker-compose.pipegen.yml', `${COMPOSE}# fixed\n`)] });
+    const out = await first.run();
+    expect(out.aiChanged).toEqual(['docker-compose.pipegen.yml']);
+    expect(fileOf(out.draft, 'docker-compose.pipegen.yml')?.aiEdited).toBe(true);
+    expect(aiWritten(out.draft).map((f) => f.path)).toEqual(['docker-compose.pipegen.yml']);
+    // a fresh loop on the returned draft (no in-memory state): placeholders first, then the question
+    const again = world({ draft: out.draft, vault: { [STRIPE]: VALUE }, prove: () => green() });
+    await again.run();
+    expect(again.timeline).toEqual(['ticket', 'prove:placeholder', 'confirm', `real:${STRIPE}`, 'ticket', 'prove:real']);
+    expect(again.confirms[0]?.map((f) => f.path)).toEqual(['docker-compose.pipegen.yml']);
+  });
+
+  it('fix round 1 (M1): a re-run of a run that held the real keys is recorded as real, whatever is stored now', async () => {
+    // 0 real: compose fails (runner error) and docker needs a fix → docker re-proven with placeholders; compose re-run of the REAL run
+    const w = world({
+      draft: baseDraft([composeFile()]), vault: { [STRIPE]: VALUE },
+      prove: (n) => (n === 0 ? proof({ part: 'compose', log: log('The runner has received a shutdown signal.') }) : green()),
+      rerun: () => proof({ part: 'compose', log: errLog('alpha') }),
+    });
+    w.keys.mode = 'real';
+    const ev = w.keys.evidence.bind(w.keys);
+    w.keys.evidence = async (t, ids) => { w.timeline.push('evidence-asked'); return ev(t, ids); };
+    await w.run();
+    // the re-run's failure was never excerpted (its run held the real keys): it went to a placeholder run first
+    expect(w.reqs.length).toBeLessThanOrEqual(1);
+    const i = w.timeline.indexOf('rerun');
+    expect(i).toBeGreaterThan(-1);
+    expect(w.timeline.slice(i).indexOf('evidence-asked')).toBe(-1);
+  });
+
+  it('fix round 1 (M2): the caps are checked before the Dockerfile call, before the question and at the end', async () => {
+    // before the createDockerfile call: the minutes run out while the AI answers
+    let made = 0;
+    const a = world({
+      draft: baseDraft([...dockerFiles(REF22), composeFile()]), minutesCap: 10,
+      prove: () => proof({ part: 'docker', needId: 'image-scan', detail: 'the base image has critical/high CVEs (x); another base image tag is needed' }),
+      answers: [answer({ action: 'change-base', baseId: 'node-24-bookworm-slim', explanation: 'x' })],
+      dockerfileFor: async () => { made++; return []; },
+    });
+    a.deps.log = (line) => { if (/The AI's answer/.test(line)) a.minutes.restore(10); };
+    const oa = await a.run();
+    expect(made).toBe(0);
+    expect(oa.stopped).toMatch(/Actions minutes/);
+    // before the confirm question: the minutes run out after the proof was checked (while a part ends)
+    const d = baseDraft(undefined, { notProven: [{ part: 'compose', reason: 'needs the key', [MISSING]: [STRIPE] } as never] });
+    const b = world({ draft: d, vault: { [STRIPE]: VALUE }, minutesCap: 10, prove: () => proof({ part: 'compose', log: log(`Error: ${STRIPE} is required to start`) }) });
+    b.deps.log = (line) => { if (/not proven/.test(line)) b.minutes.restore(10); };
+    const ob = await b.run();
+    expect(b.confirms).toHaveLength(0);
+    expect(ob.stopped).toMatch(/Actions minutes/);
+    // at the end: the AI meter's sticky refusal (here during the question, which the user answers no)
+    const c = world({ vault: { [STRIPE]: VALUE }, prove: () => green() });
+    c.deps.confirm = async () => {
+      await c.meter.provider.complete({ system: 's', user: 'u', schemaName: 'x', jsonSchema: {}, timeoutMs: 1 }).catch(() => {});   // no output limit: refused
+      return false;
+    };
+    const oc = await c.run();
+    expect(c.meter.refused).toBe(true);
+    expect(oc.stopped).toMatch(/AI cost|AI budget/);
+  });
+
+  it('fix round 1 (M5): nothing stored at the start → the placeholders (or the real values by the keys rules) are stored before the first proof', async () => {
+    const a = world({ vault: { [STRIPE]: VALUE }, prove: () => green(), confirm: false });
+    a.keys.mode = 'none';
+    await a.run();
+    expect(a.timeline.slice(0, 3)).toEqual([`setup:${STRIPE}`, 'ticket', 'prove:placeholder']);
+    const b = world({ draft: baseDraft([composeFile()]), vault: { [STRIPE]: VALUE }, prove: () => green() });
+    b.keys.mode = 'none';
+    await b.run();
+    expect(b.timeline.slice(0, 4)).toEqual([`setup:${STRIPE}`, `real:${STRIPE}`, 'ticket', 'prove:real']);
   });
 
   it('an empty secret input is a missing secret', () => {

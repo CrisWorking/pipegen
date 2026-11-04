@@ -135,7 +135,7 @@ export interface StepSpec {
 
 // ---------- created files, decisions ----------
 export type Part = 'pipeline' | 'precommit' | 'docker' | 'compose' | 'tests' | 'test-migration' | 'codeowners' | 'deploy-verify' | 'docs';
-export interface CreatedFile { path: string; content: string; part: Part; reason: string; repo: 'app' | 'central'; needsConfirm?: boolean; inserted?: PipegenInserted; edited?: CreatedEdit }   // needsConfirm: AI change to package.json scripts/dependencies → own preview section + own yes (Plan D Task 5, Plan E Task 5, Plan G)
+export interface CreatedFile { path: string; content: string; part: Part; reason: string; repo: 'app' | 'central'; needsConfirm?: boolean; inserted?: PipegenInserted; edited?: CreatedEdit; aiEdited?: true }   // needsConfirm: AI change to package.json scripts/dependencies → own preview section + own yes (Plan D Task 5, Plan E Task 5, Plan G). aiEdited (Plan E E7-R14): set by pipegen's fix loop (never read from the file) when an AI fix answer wrote this file; it is AI-written from then on (aiWritten: placeholders until the user confirms it; Plan G's preview lists it with the AI-written files)
 /**
  * The marker for an edit to an existing NON-workflow file (D0a, preflight S11): set by pipegen's own code, never read from the file
  * text. `original` is the file exactly as it was before the edit ('' for a new file whose rule works as an edit). It is valid only on

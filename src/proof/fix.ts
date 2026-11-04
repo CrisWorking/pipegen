@@ -173,9 +173,12 @@ export function fixPaths(draft: PipelineDraft, part: Part): string[] {
   return out;
 }
 
-/** Plan Task 5: the AI-written files: parts docker, tests and test-migration, every needsConfirm file, every file a fix answer changed. */
-export function aiWritten(draft: PipelineDraft, fixedPaths: ReadonlySet<string>): CreatedFile[] {
-  return draft.created.filter((f) => AI_PARTS.has(f.part) || f.needsConfirm === true || fixedPaths.has(f.path));
+/**
+ * Plan Task 5: the AI-written files: parts docker, tests and test-migration, every needsConfirm file, every file a fix answer changed
+ * (E7-R14: marked `aiEdited` on the draft, so a resumed draft and Plan G's preview see it too; `fixedPaths` adds paths not yet marked).
+ */
+export function aiWritten(draft: PipelineDraft, fixedPaths: ReadonlySet<string> = new Set()): CreatedFile[] {
+  return draft.created.filter((f) => AI_PARTS.has(f.part) || f.needsConfirm === true || f.aiEdited === true || fixedPaths.has(f.path));
 }
 
 /** Whether a package.json's scripts or dependencies differ (an unreadable text counts as a change). */
@@ -290,6 +293,8 @@ export interface FixOutcome {
   attempts: number;
   /** AI answers per failing part (part, or part:needId), over the whole run. */
   aiAttempts: Record<string, number>;
+  /** E7-R14: the paths an AI fix answer changed in this run (also marked `aiEdited` on the returned draft's files). */
+  aiChanged: string[];
   /** Tool errors (a scanner that failed to run), reported apart from findings. */
   toolErrors: string[];
   /** The keys of the run the result comes from. */
@@ -316,6 +321,8 @@ interface UState {
   aiDone: string | null;
   reproducedAt: number;
   reproduce: { unit: Unit } | null;
+  /** The class of the part's latest failure (E7-R12: an ending names it). */
+  lastClass: FailureClass | null;
 }
 interface Ended { part: Part; needId?: string; status: 'failed' | 'not-proven'; detail: string }
 
@@ -384,7 +391,10 @@ class FixLoop {
   version = 0;
   total = 0;
   seq = 0;
-  keysNow: 'placeholder' | 'real';
+  /** What the scratch repo holds now: 'none' only before the first store (M5). */
+  keysNow: 'none' | 'placeholder' | 'real';
+  /** The draft version the last 'full' proof ran on (E7-R13). */
+  fullVersion = -1;
   declined = false;
   reproduceNext = false;
   proof: Proof | null = null;
@@ -404,7 +414,7 @@ class FixLoop {
     this.draft = draft;
     this.max = opts.maxAttempts ?? FIX_MAX_ATTEMPTS;
     this.maxTotal = opts.maxTotalAttempts ?? FIX_MAX_TOTAL_ATTEMPTS;
-    this.keysNow = deps.keys.mode === 'real' ? 'real' : 'placeholder';
+    this.keysNow = deps.keys.mode === 'real' ? 'real' : deps.keys.mode === 'placeholder' ? 'placeholder' : 'none';
     this.realNames = [...new Set((deps.secretNames ?? []).filter((n) => typeof n === 'string' && !/^(?:PIPEGEN|GITHUB)_/i.test(n) && deps.vault.has(n)))];
     this.missing = [...new Set(draft.notProven.flatMap((n) => (Array.isArray(n.missingSecrets) ? n.missingSecrets : [])).filter((n) => typeof n === 'string' && n !== ''))];
   }
@@ -423,6 +433,12 @@ class FixLoop {
 
   async setKeys(want: 'placeholder' | 'real'): Promise<void> {
     if (want === this.keysNow) return;
+    if (this.keysNow === 'none') {
+      // M5: nothing stored yet is not "placeholders stored": every name gets its placeholder (and the throwaway key) first
+      await this.deps.keys.setup([...new Set(this.deps.secretNames)]);
+      this.keysNow = 'placeholder';
+      if (want === 'placeholder') return;
+    }
     if (want === 'real') {
       await this.deps.keys.real(this.realNames);
       this.keysNow = 'real';
@@ -441,8 +457,8 @@ class FixLoop {
     for (const [k, s] of this.states) if (s.ai > 0) aiAttempts[k] = s.ai;
     return {
       draft: this.draft, result: withEndings(this.proof?.result ?? EMPTY_RESULT, this.ended, this.floor({ key: 'tests', part: 'tests', entry: { part: 'tests', status: 'failed', detail: '' }, keysOnly: false }), this.draft.skipped.some((x) => x.part === 'tests')),
-      ...(stopped === undefined ? {} : { stopped }), attempts: this.total, aiAttempts, toolErrors: [...this.toolErrors],
-      keys: this.proof?.keys ?? this.keysNow, notes: [...this.notes], ...(cap === undefined ? {} : { cap }),
+      ...(stopped === undefined ? {} : { stopped }), attempts: this.total, aiAttempts, aiChanged: [...this.fixed], toolErrors: [...this.toolErrors],
+      keys: this.proof?.keys ?? (this.keysNow === 'real' ? 'real' : 'placeholder'), notes: [...this.notes], ...(cap === undefined ? {} : { cap }),
     };
   }
 
@@ -469,7 +485,7 @@ class FixLoop {
   stateOf(u: Unit): UState {
     let s = this.states.get(u.key);
     if (s === undefined) {
-      s = { attempts: 0, ai: 0, lastSig: null, appliedSinceSig: false, seenSeq: -1, excerpt: '', history: [], reruns: 0, aiDone: null, reproducedAt: -1, reproduce: null };
+      s = { attempts: 0, ai: 0, lastSig: null, appliedSinceSig: false, seenSeq: -1, excerpt: '', history: [], reruns: 0, aiDone: null, reproducedAt: -1, reproduce: null, lastClass: null };
       this.states.set(u.key, s);
     }
     return s;
@@ -504,8 +520,8 @@ class FixLoop {
    * The unit ends: not-proven where the spec allows it (§9: a created part that can't be proven is delivered warn-only; never a part
    * that covers a floor need, never the pipeline or deploy-verify), else failed, which stops the run (plan Task 5 "End").
    */
-  end(u: Unit, detail: string): FixOutcome | null {
-    const status = NOT_PROVEN_OK.has(u.part) && !this.floor(u) ? 'not-proven' : 'failed';
+  end(u: Unit, detail: string, failed = false): FixOutcome | null {
+    const status = !failed && NOT_PROVEN_OK.has(u.part) && !this.floor(u) ? 'not-proven' : 'failed';
     const text = st(detail, 1200);
     this.ended.set(u.key, { part: u.part, ...(u.needId === undefined ? {} : { needId: u.needId }), status, detail: text });
     if (status === 'not-proven') { this.say(`${u.key}: not proven: ${text}`); return null; }
@@ -527,14 +543,18 @@ class FixLoop {
   async proveNow(what: { kind: 'prove'; scope: 'pr' | 'full' } | { kind: 'rerun'; ids: number[] }): Promise<Proof | FixOutcome> {
     const before = await this.capStop();
     if (before !== null) return before;
-    if (what.kind === 'prove') await this.setKeys(this.desired());   // a re-run keeps the keys of the run it re-runs
+    if (what.kind === 'prove') await this.setKeys(this.desired());
     this.reproduceNext = false;
-    const keys = this.keysNow;
+    // M1: a re-run is a new attempt of the runs of the last proof, so it is recorded with THEIR keys (real if they or the repo held real values)
+    const keys: 'placeholder' | 'real' = what.kind === 'rerun'
+      ? (this.proof?.keys === 'real' || this.keysNow === 'real' ? 'real' : 'placeholder')
+      : this.keysNow === 'real' ? 'real' : 'placeholder';
     const ticket = await this.deps.keys.ticket();   // E4 protocol: BEFORE the push or re-run that starts the runs
     const run = what.kind === 'prove' ? await this.deps.prove(this.draft, what.scope) : await this.deps.rerun(what.ids);
     if (!isRec(run) || !isRec(run.result) || !Array.isArray(run.result.parts) || !(run.evidence instanceof Map)) throw new Error('The proof gave back no result pipegen can read.');
     const p: Proof = { result: run.result, evidence: run.evidence, ticket, keys, seq: ++this.seq };
     this.proof = p;
+    if (what.kind === 'prove' && what.scope === 'full') this.fullVersion = this.version;
     if (keys === 'real') this.lastReal = { proof: p, version: this.version };
     const after = await this.capStop();
     return after ?? p;
@@ -599,6 +619,7 @@ class FixLoop {
         const s = this.stateOf(u);
         const ev = this.evidenceOf(u, p);
         const cls: FailureClass = u.keysOnly ? 'needs-real-keys' : classifyFailure(u.entry, this.rawOf(ev), { missingSecrets: this.missing, keys: p.keys });
+        s.lastClass = cls;
         if (cls === 'missing-secret') {
           const stop = this.end(u, `${u.entry.detail}; a secret it needs is missing (or the value given was refused), so the AI was not asked`);
           if (stop !== null) return stop;
@@ -609,7 +630,8 @@ class FixLoop {
           const what = cls === 'tool-error' ? 'a tool error' : cls === 'rate-limit' ? 'a rate limit' : 'a runner error';
           if (cls === 'tool-error') { const t = st(`${u.key}: ${u.entry.detail}`, 400); if (!this.toolErrors.includes(t)) this.toolErrors.push(t); }
           if (s.reruns >= 1) {
-            const stop = this.end(u, `${u.entry.detail}; ${what} again after a re-run`);
+            // E7-R12: a tool error that comes back after its one re-run ends failed (plan "re-run once, then failed")
+            const stop = this.end(u, `failed after a re-run (last failure: ${cls}): ${u.entry.detail}; ${what} again after a re-run`, cls === 'tool-error');
             if (stop !== null) return stop;
             continue;
           }
@@ -666,6 +688,8 @@ class FixLoop {
       if (p.keys === 'placeholder' && this.realNames.length > 0 && !this.declined) {
         const ask = this.unconfirmed();
         if (ask.length > 0) {
+          const capped = await this.capStop();   // M2: never ask the user when the run must stop anyway
+          if (capped !== null) return capped;
           const yes = await this.deps.confirm(ask.map((f) => ({ ...f })));
           if (yes !== true) {
             this.declined = true;
@@ -674,6 +698,7 @@ class FixLoop {
               const stop = this.end(u, `${u.entry.detail}; ${DECLINED}`);
               if (stop !== null) return stop;
             }
+            if (this.fullVersion !== this.version) { const f = await this.finalFull(); if (f !== null) return f; continue; }
             break;
           }
           for (const f of ask) this.confirmed.set(fileKey(f), f.content);
@@ -692,9 +717,20 @@ class FixLoop {
         const stop = this.end(u, `${u.entry.detail}; ${why}`);
         if (stop !== null) return stop;
       }
+      // E7-R13: the result is returned only from a 'full' proof of the draft as it is now
+      if (this.fullVersion !== this.version) { const f = await this.finalFull(); if (f !== null) return f; continue; }
       break;
     }
-    return this.finish();
+    return (await this.capStop()) ?? this.finish();   // M2: at the end too (the AI meter's sticky refusal included)
+  }
+
+  /** E7-R13: one 'full' proof of the current draft (a fix proven on 'pr' never left the deploy layer on an older draft), counted. */
+  async finalFull(): Promise<FixOutcome | null> {
+    if (this.total >= this.maxTotal) return this.stopGlobal();
+    this.total++;
+    this.say('the draft changed since the last full proof, so it runs once more up to the merge and the deploy layer');
+    const next = await this.proveNow({ kind: 'prove', scope: 'full' });
+    return 'ticket' in next ? null : next;
   }
 
   // ----- one AI attempt -----
@@ -752,6 +788,10 @@ class FixLoop {
       s.aiDone = 'the AI found no change it is allowed to make';
       return 'exhausted';
     }
+    if (ans.action === 'change-base') {
+      const capped = await this.capStop();   // M2: createDockerfile calls the AI too
+      if (capped !== null) return capped;
+    }
     let res: string | { draft: PipelineDraft; aiFiles: string[] };
     try {
       res = ans.action === 'edit-file' ? await this.applyEdit(ans, paths) : ans.action === 'change-step' ? await this.applyStep(ans, cands) : await this.applyBase(ans, dockerfiles, baseIds);
@@ -762,7 +802,9 @@ class FixLoop {
       res = `the Dockerfile could not be made from that base image (${st((e as Error).message, 300)})`;
     }
     if (typeof res === 'string') return this.refuse(s, n, rec, explanation, res);
-    this.draft = res.draft;
+    // E7-R14: the files the answer wrote are marked on the draft (what E8 saves, what Plan G's preview reads)
+    const marked = new Set(res.aiFiles);
+    this.draft = { ...res.draft, created: res.draft.created.map((f) => (f.repo === 'app' && marked.has(f.path) ? { ...f, aiEdited: true as const } : f)) };
     this.version++;
     for (const pth of res.aiFiles) this.fixed.add(pth);
     s.appliedSinceSig = true;
@@ -952,7 +994,8 @@ class FixLoop {
         return 'changed';
       }
     }
-    const stop = this.end(u, `${u.entry.detail}; ${why}; no other reviewed tool is left`);
+    const n = s.ai;
+    const stop = this.end(u, `failed after ${n} attempt${n === 1 ? '' : 's'} (last failure: ${s.lastClass ?? 'needs-fix'}): ${u.entry.detail}; ${why}; no other reviewed tool is left`);
     return stop ?? 'ended';
   }
 }
