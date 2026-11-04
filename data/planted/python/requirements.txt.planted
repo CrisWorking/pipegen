@@ -1,0 +1,2 @@
+# pipegen planted problem, on a proof branch only: a dependency with known critical vulnerabilities. Never installed, never delivered.
+PyYAML==5.3

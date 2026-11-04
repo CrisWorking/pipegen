@@ -1,0 +1,9 @@
+{
+  "name": "pipegen-planted-deps",
+  "version": "0.0.0",
+  "private": true,
+  "description": "pipegen planted problem, on a proof branch only: a dependency with known critical vulnerabilities. Never installed, never delivered.",
+  "dependencies": {
+    "lodash": "4.17.11"
+  }
+}
