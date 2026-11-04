@@ -45,6 +45,8 @@ export const DOCKERIGNORE_LINES: readonly string[] = Object.freeze([
   '**/.git', '**/.ssh', '**/.aws', '**/.docker', '**/.git-credentials', '**/id_ed25519*', '**/id_ecdsa*', '**/id_dsa*', '**/*.p12', '**/*.pfx', '**/*.jks', '**/*.tfstate.backup', '**/*.tfvars.json',
   // fix round 2 (S6 amendment): kube config, the _netrc spelling, pip credentials, terraform working folders, nested virtualenvs
   '**/.kube', '**/_netrc', '**/.pypirc', '**/.terraform', '**/.venv',
+  // Plan E S10 (D3 r2 c3, the safe direction): cloud credential files a service folder may hold
+  '**/credentials.json', '**/service-account*.json',
 ]);
 
 /** The fixed .dockerignore text: no `!` line, no comment, no repo text; `dist` only when the Dockerfile builds inside. */

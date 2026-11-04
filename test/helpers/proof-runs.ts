@@ -37,6 +37,10 @@ export interface RunsFake {
   /** POST …/cancel answers this status (default 202) and changes nothing. */
   cancelStatus?: number;
   merges: { pr: number; sha: string }[];
+  /** E7: POST …/rerun-failed-jobs calls (run id and the raw body sent). */
+  reruns: { id: number; body: string }[];
+  /** E7: how the re-run failed jobs end (default success). */
+  rerunConclusion?: string;
   /** event → workflow path → what it does (a function sees the sha and branch). Missing: no run for that workflow. */
   plans: { push: Record<string, Plan | ((sha: string, branch: string) => Plan | undefined)>; pull_request: Record<string, Plan | ((sha: string, branch: string) => Plan | undefined)> };
   /** Runs are listed only after this many list calls (default 0). */
@@ -58,7 +62,7 @@ const json = (status: number, body: unknown): Reply => ({ status, body });
 
 export function runsFake(defaultBranch = 'main'): RunsFake {
   const f: RunsFake = {
-    runs: [], prs: [], pushes: [], cancels: [], forceCancels: [], ignoreCancel: new Set(), merges: [], plans: { push: {}, pull_request: {} }, listDelay: 0, actionsOff: false, noise: [],
+    runs: [], prs: [], pushes: [], cancels: [], forceCancels: [], ignoreCancel: new Set(), merges: [], reruns: [], plans: { push: {}, pull_request: {} }, listDelay: 0, actionsOff: false, noise: [],
     handler: () => undefined, transport: undefined as never, pushed: () => {},
   };
   let lists = 0;
@@ -157,6 +161,26 @@ export function runsFake(defaultBranch = 'main'): RunsFake {
       if (r !== undefined && r.status === 'completed') return json(409, { message: 'Cannot cancel a workflow run that is completed.' });
       if (r !== undefined && !f.ignoreCancel.has(id)) { r.status = 'completed'; r.conclusion = 'cancelled'; }
       return json(202, {});
+    }
+    // E7 (S16): re-run the failed jobs of a finished run: a new attempt with every job of the last one, the failed ones
+    // ending as rerunConclusion says (default success); a run still going answers 403 as GitHub does
+    m = /^\/actions\/runs\/(\d+)\/rerun-failed-jobs$/.exec(rest);
+    if (m && c.method === 'POST') {
+      const id = Number(m[1]);
+      f.reruns.push({ id, body: c.body ?? '' });
+      const r = f.runs.find((x) => x.id === id);
+      if (r === undefined) return json(404, { message: 'Not Found' });
+      if (r.status !== 'completed') return json(403, { message: 'This workflow is already running' });
+      const next = r.run_attempt + 1;
+      const ends = f.rerunConclusion ?? 'success';
+      const last = r.jobs.filter((j) => (j.attempt ?? r.run_attempt) === r.run_attempt);
+      r.jobs = [...r.jobs.map((j) => ({ ...j, attempt: j.attempt ?? r.run_attempt })), ...last.map((j) => ({ ...j, attempt: next, conclusion: j.conclusion === 'failure' ? ends : j.conclusion }))];
+      r.run_attempt = next;
+      r.status = 'queued';
+      r.conclusion = null;
+      r.polls = 0;
+      (r as unknown as { _final: string })._final = r.jobs.some((j) => j.attempt === next && j.conclusion === 'failure') ? 'failure' : 'success';
+      return json(201, {});
     }
     m = /^\/actions\/runs\/(\d+)\/force-cancel$/.exec(rest);
     if (m && c.method === 'POST') {

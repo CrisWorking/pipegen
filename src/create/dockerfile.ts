@@ -26,6 +26,14 @@ const MAX_OUTPUT_TOKENS = 8_000;
 /** What the creator can not know from the profile: the repo's file list (the reader's `fileSet`), to prove a file absent. Without it nothing is created. */
 export interface DockerfileFacts { repoPaths: ReadonlySet<string> | readonly string[] }
 export interface DockerfileResult { files: CreatedFile[]; notes: string[]; usage?: AiUsage }
+/**
+ * Plan E S10 (the fix loop, E7): `baseId` is a Node image id of pipegen's reviewed base-image list to build from instead of the one the
+ * service's Node version gives (the docker part failed on its base image's CVEs and the AI chose another id from an enum). pipegen still
+ * writes every FROM; any other id (another image, an id not in the list) creates nothing and asks the AI nothing.
+ */
+export interface DockerfileOptions { baseId?: string }
+/** The ids `baseId` may name: the list's Node images. */
+const NODE_ID_RE = /^node-\d+-bookworm-slim$/;
 
 /** The second answer was refused too. Plan E makes the docker part failed. `usage` is the AI cost of both attempts. */
 export class DockerfileError extends Error {
@@ -130,7 +138,7 @@ const show = (s: Service): string => `"${safeText(s.name, 80)}"`;
  * Creates `<service>/Dockerfile` and `<service>/.dockerignore` for an npm service, or says why not. See the file header for the rules.
  * `facts.repoPaths` is the repo's file list; without it every file is unproven absent and nothing is created.
  */
-export async function createDockerfile(svc: Service, _profile: RepoProfile, bundle: CodeBundle, ai: AiProvider, facts?: DockerfileFacts): Promise<DockerfileResult> {
+export async function createDockerfile(svc: Service, _profile: RepoProfile, bundle: CodeBundle, ai: AiProvider, facts?: DockerfileFacts, opts: DockerfileOptions = {}): Promise<DockerfileResult> {
   const code = bundleText(bundle);   // first: throws SecretScanRequiredError before anything else happens
   const dir = rootPrefix(svc.path);
   const at = (name: string): string => (dir === '' ? name : `${dir}/${name}`);
@@ -158,13 +166,25 @@ export async function createDockerfile(svc: Service, _profile: RepoProfile, bund
   }
 
   let nodeId: string;
-  try {
-    const m = nodeBaseImageId(svc.runtimeVersion);
-    if (m.note !== undefined) return notProven(`No Dockerfile for ${show(svc)}: ${safeText(m.note, 300)}`);
-    nodeId = m.id;
-  } catch (e) {
-    if (!(e instanceof BaseImageError)) throw e;
-    return notProven(`No Dockerfile for ${show(svc)}: pipegen's base-image list has no Node image it can use.`);
+  if (opts.baseId !== undefined) {
+    const id: unknown = opts.baseId;
+    let known = false;
+    try {
+      known = typeof id === 'string' && NODE_ID_RE.test(id) && loadBaseImages().some((e) => e.id === id);
+    } catch (e) {
+      if (!(e instanceof BaseImageError)) throw e;
+    }
+    if (!known) return notProven(`No Dockerfile for ${show(svc)}: "${safeText(String(id), 60)}" is not a Node image id of pipegen's reviewed base-image list.`);
+    nodeId = id as string;
+  } else {
+    try {
+      const m = nodeBaseImageId(svc.runtimeVersion);
+      if (m.note !== undefined) return notProven(`No Dockerfile for ${show(svc)}: ${safeText(m.note, 300)}`);
+      nodeId = m.id;
+    } catch (e) {
+      if (!(e instanceof BaseImageError)) throw e;
+      return notProven(`No Dockerfile for ${show(svc)}: pipegen's base-image list has no Node image it can use.`);
+    }
   }
   const list = loadBaseImages();
   const ref = baseImageRef(nodeId, list);

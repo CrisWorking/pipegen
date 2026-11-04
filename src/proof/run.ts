@@ -733,3 +733,47 @@ export async function redeployProof(gh: Octokit, t: ProofTarget, s: ProofSession
   const proof = await proveVariant(gh, t, { branch, merge: v.variant === 'main', workflows: v.workflows }, opts);
   return { ...proof, branch };
 }
+
+/**
+ * E7 (S16): a runner error or a rate limit is re-run with POST …/actions/runs/{run_id}/rerun-failed-jobs: a new attempt of a run
+ * pipegen already watched, with the same commit (nothing is pushed, nothing is dispatched; the body asks no debug logging). Each
+ * run must be one findRuns matched for `t`, given with the attempt that failed; every POST is guardedWrite and a tracked write.
+ * Then pipegen waits (NO_RUN_MS at most) until GitHub shows a later attempt of each run, and waits for them like any run
+ * (waitForRuns: the latest attempt's jobs, logs and artifacts). The fix loop counts each re-run toward its global cap.
+ */
+export async function rerunFailedJobs(gh: Octokit, t: ProofTarget, runs: readonly { handle: RunHandle; attempt: number }[], opts: WaitOptions): Promise<RunOutcome[]> {
+  checkTarget(t);
+  if (!Array.isArray(runs) || runs.length === 0) throw new ScratchGuardError('rerunFailedJobs needs at least one run.');
+  for (const r of runs) {
+    if (handles.get(r?.handle)?.target !== t) throw new ScratchGuardError('rerunFailedJobs takes only runs findRuns matched for this target.');
+    if (!posInt(r.attempt)) throw new ScratchGuardError('the attempt that failed is not a whole number above 0.');
+  }
+  const s = scratchOf(t);
+  const clock = opts.clock ?? realClock;
+  const rate = opts.rateClock ?? clockOf(gh);
+  const seen = new Set<number>();
+  for (const r of runs) {
+    const id = r.handle.runId;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    notStopping();
+    await trackWrite(`re-run of the failed jobs of run ${id} in ${s.fullName}`,
+      () => guardedWrite(gh, s, 'POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs', { run_id: id }, rate));
+  }
+  const deadline = clock.now() + NO_RUN_MS;
+  for (const r of runs) {
+    for (;;) {
+      if (interrupting()) break;   // waitForRuns returns at once; E8's cleanup cancels
+      let d: unknown = null;
+      try {
+        d = (await githubRead(gh, 'GET /repos/{owner}/{repo}/actions/runs/{run_id}', { owner: s.owner, repo: s.repo, run_id: r.handle.runId }, rate)).data;
+      } catch (e) {
+        hard(gh, e);
+      }
+      if (isPlain(d) && d.id === r.handle.runId && d.head_sha === r.handle.headSha && posInt(d.run_attempt) && d.run_attempt > r.attempt) break;
+      if (clock.now() >= deadline) throw new ProofStopError(`Run ${r.handle.runId} of ${s.fullName} did not start again within ${NO_RUN_MS / 1000} s after its failed jobs were re-run.`);
+      await clock.sleep(START_POLL_MS);
+    }
+  }
+  return waitForRuns(gh, t, runs.map((r) => r.handle), opts);
+}

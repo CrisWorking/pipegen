@@ -119,6 +119,8 @@ describe('.dockerignore: five more lines', () => {
       '.git', '.env*', '**/.env*', '**/*.pem', '**/*.key', '**/.npmrc', '**/.netrc', '**/*.tfstate', '**/*.tfvars', '**/id_rsa*', '**/node_modules', '.venv',
       '**/.git', '**/.ssh', '**/.aws', '**/.docker', '**/.git-credentials', '**/id_ed25519*', '**/id_ecdsa*', '**/id_dsa*', '**/*.p12', '**/*.pfx', '**/*.jks', '**/*.tfstate.backup', '**/*.tfvars.json',
       '**/.kube', '**/_netrc', '**/.pypirc', '**/.terraform', '**/.venv',
+      // Plan E S10 (E7): two more, appended
+      '**/credentials.json', '**/service-account*.json',
     ];
     expect([...DOCKERIGNORE_LINES]).toEqual(lines);
     expect(dockerignoreText(svc(), false)).toBe(`${lines.join('\n')}\n`);

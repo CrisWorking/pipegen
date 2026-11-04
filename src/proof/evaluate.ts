@@ -92,8 +92,17 @@ export interface Evaluation {
   /** The measured lines of the coverage job(s) (S11) and what coverageNotes makes of the lowest; null when it could not be read. */
   coverage: { measured: number | null; lowest: number | null; decision: CoverageDecision | null };
   /** The failed jobs behind a part (or part:needId): their names and raw logs, for E7's classifier and excerpt. */
-  evidence: Map<string, { jobs: string[]; log: string }>;
+  evidence: Map<string, PartEvidence>;
 }
+/**
+ * One failed job's log behind a part, with the run id and the attempt it belongs to (E7: the fix loop's AI copy of a log is built only
+ * for a run attempt the ScratchKeys brand names; E4 carry). Only a log of the run's LATEST attempt is a source: that is the attempt evidence() reads.
+ */
+export interface EvidenceSource { runId: number; attempt: number; job: string; log: string }
+/** The evidence of a part: the failed jobs' names, their raw logs joined (for the classifier, read locally), and each log with its run. */
+export interface PartEvidence { jobs: string[]; log: string; sources: EvidenceSource[] }
+/** The words E5 ends a not-proven note with when a placeholder key was refused (E7 waits for the key confirmation on them). */
+export const NEEDS_REAL_KEY = 'needs your real test key';
 
 // ---------- names, logs and signatures ----------
 
@@ -101,8 +110,10 @@ export const HARNESS_JOB_PREFIX = 'pipegen proof: ';
 /** The Bullfrog refusal of a bind mount (spike S8: the Docker daemon's own line while sudo is disabled). */
 export const BULLFROG_MOUNT_RE = /Error response from daemon: bullfrog: mounting the host path [^\r\n]{1,300} is not allowed while sudo is disabled/;
 export const E5_R1_NOTE = "its scanner step's bind mount was refused by Bullfrog (egress control with sudo off); pending gate-v0.2.2 (scanner steps without bind mounts), so it is not proven yet";
-const EMPTY_SECRET_RE = /Input required and not supplied|secret.*(?:empty|not set)/i;
-const KEY_REFUSED_RE = /\b(?:401|403)\b[^\n]{0,80}(?:unauthori[sz]ed|forbidden|invalid|denied)|invalid[ _-]?api[ _-]?key|incorrect api key|api key (?:is )?(?:invalid|incorrect)|authentication failed|invalid[_ ]?token/i;
+/** A step that read an empty secret (shared with E7's classifier, fix.ts). */
+export const EMPTY_SECRET_RE = /Input required and not supplied|secret.*(?:empty|not set)/i;
+/** An external host refused a key (shared with E7's classifier, fix.ts). */
+export const KEY_REFUSED_RE = /\b(?:401|403)\b[^\n]{0,80}(?:unauthori[sz]ed|forbidden|invalid|denied)|invalid[ _-]?api[ _-]?key|incorrect api key|api key (?:is )?(?:invalid|incorrect)|authentication failed|invalid[_ ]?token/i;
 const CONNECT_RE = /(?:getaddrinfo\s+(?:ENOTFOUND|EAI_AGAIN)|connect\s+(?:ECONNREFUSED|ETIMEDOUT|ECONNRESET|EHOSTUNREACH)|ENOTFOUND|EAI_AGAIN|Could not resolve host:?)\s+([A-Za-z0-9.-]{1,253})/g;
 /** Hosts pipegen's own plumbing depends on: a failure to reach one is not "an external dependency of the app". */
 const PLUMBING_HOST_RE = /(?:^|\.)(?:github\.com|githubusercontent\.com|npmjs\.org|npmjs\.com|pypi\.org|pythonhosted\.org|ghcr\.io|docker\.io|docker\.com|cloudflare\.docker\.com)$/i;
@@ -124,7 +135,7 @@ const st = (s: unknown, n = 120): string => safeText(String(s), n);
 const isRec = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null;
 
 /** Whether `name` (an exact secret name) appears in `text` as a whole word of the characters a name holds. */
-function mentionsName(text: string, name: string): boolean {
+export function mentionsName(text: string, name: string): boolean {
   if (name === '') return false;
   for (let at = text.indexOf(name); at >= 0; at = text.indexOf(name, at + 1)) {
     const before = text[at - 1], after = text[at + name.length];
@@ -234,7 +245,7 @@ interface Verdict { part: Part; needId?: string; status: 'failed' | 'not-proven'
 class Sheet {
   readonly verdicts: Verdict[] = [];
   readonly notes = new Map<Part, string[]>();
-  readonly evidence = new Map<string, { jobs: string[]; log: string }>();
+  readonly evidence = new Map<string, PartEvidence>();
   /** The gate job did not pass on the main pull request: ok can never be true. */
   gateMainFailed = false;
   private readonly seen = new Set<string>();
@@ -251,10 +262,14 @@ class Sheet {
     this.verdicts.push(v);
   }
   evidenceOf(key: string, hits: readonly Hit[]): void {
-    const have = this.evidence.get(key) ?? { jobs: [], log: '' };
+    const have = this.evidence.get(key) ?? { jobs: [], log: '', sources: [] };
     for (const h of hits.slice(0, 5)) {
       if (!have.jobs.includes(h.job.name)) have.jobs.push(st(h.job.name, 120));
       if (typeof h.job.log === 'string' && have.log.length < MAX_LOG_READ) have.log += `${have.log === '' ? '' : '\n'}${h.job.log}`;
+      // E7: the log with its run attempt, only when it is the run's latest attempt (the one ScratchKeys' evidence reads)
+      if (typeof h.job.log === 'string' && h.job.attempt === h.run.attempt && Number.isSafeInteger(h.run.handle.runId) && have.sources.length < 5) {
+        have.sources.push({ runId: h.run.handle.runId, attempt: h.run.attempt, job: st(h.job.name, 120), log: h.job.log });
+      }
     }
     this.evidence.set(key, have);
   }
@@ -275,7 +290,7 @@ class Judge {
       const text = cleanLog(failed.map((h) => (typeof h.job.log === 'string' ? h.job.log : '')).join('\n'));
       const named = this.missing.filter((n) => mentionsName(text, n));
       if (named.length > 0) return { status: 'not-proven', detail: `${what}: ${names}; its log names ${named.map((n) => st(n, 80)).join(', ')}, which was not given, so it is not proven` };
-      if (this.keys !== 'real' && KEY_REFUSED_RE.test(text)) return { status: 'not-proven', detail: `${what}: ${names}; an external host refused the placeholder key: needs your real test key` };
+      if (this.keys !== 'real' && KEY_REFUSED_RE.test(text)) return { status: 'not-proven', detail: `${what}: ${names}; an external host refused the placeholder key: ${NEEDS_REAL_KEY}` };
       const host = externalHost(text);
       if (host !== null) return { status: 'not-proven', detail: `${what}: ${names}; it could not reach ${st(host, 100)}, an external host, so it is not proven` };
     }
