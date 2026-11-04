@@ -82,7 +82,9 @@ describe('E8 cleanup after the proof', () => {
     await e.clean(false);
     const ws = writes(e);
     const keyDeletes = ws.filter((x) => x.startsWith(`DELETE /actions/${LIST}/`));
-    expect(keyDeletes.sort()).toEqual(['DELETE /actions/secrets/PIPEGEN_FP_KEY', 'DELETE /actions/secrets/STRIPE_SECRET_KEY']);
+    // two passes (fix round 1, I-2): the first right away, the second after the writes in flight settled (a recorded name
+    // the first pass already deleted is asked again: GitHub's 404 is "already gone")
+    expect([...new Set(keyDeletes)].sort()).toEqual(['DELETE /actions/secrets/PIPEGEN_FP_KEY', 'DELETE /actions/secrets/STRIPE_SECRET_KEY']);
     // every secret delete comes before any other write (cancel, close, delete, reset)
     expect(ws.slice(0, keyDeletes.length).every((x) => x.startsWith('DELETE /actions/secrets/'))).toBe(true);
     expect(e.w.s.values.size).toBe(0);
@@ -257,7 +259,7 @@ describe('E8 cleanup after the proof', () => {
     e.w.f.fail.set('POST /actions/runs/14/cancel', 500);
     e.w.f.fail.set('POST /actions/runs/15/cancel', 500);
     e.w.f.fail.set('POST /actions/runs/15/force-cancel', 500);
-    const res = await e.clean(true);
+    const res = await e.clean(false);   // emptied: the run stays there (a deleted repo takes it along: fix round 1, I-5)
     expect(writes(e)).toEqual(expect.arrayContaining(['POST /actions/runs/12/cancel', 'POST /actions/runs/14/force-cancel', 'POST /actions/runs/15/force-cancel']));
     expect(res.leftovers.some((l) => /run 15 .*could not be cancelled/.test(l))).toBe(true);
     expect(res.leftovers.some((l) => /run 14\b/.test(l))).toBe(false);
@@ -286,7 +288,8 @@ describe('E8 cleanup after the proof', () => {
     const inflight = trackWrite('store of LATE_KEY', () => new Promise<void>((ok) => { land = () => { e.w.s.values.set('LATE_KEY', 'x'); ok(); }; }));
     const p = cleanupAfterProof(e.w.g.gh, e.t, e.store, e.keys, { canDeleteRepo: false, clock: instant, settleMs: 5_000 });
     await new Promise((ok) => setTimeout(ok, 20));
-    expect(e.w.g.writes()).toEqual([]);   // nothing sent while the write is in flight
+    // fix round 1 (I-2): the secrets go first, without waiting for the write in flight; a second pass follows the settle
+    expect(e.w.g.writes().every((c) => c.method === 'DELETE' && c.url.pathname.includes(`/actions/${LIST}/`))).toBe(true);
     land();
     await inflight;
     await p;

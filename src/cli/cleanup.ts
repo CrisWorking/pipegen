@@ -46,6 +46,16 @@ export async function cleanupCommand(dir: string, io: CliIO, opts: { allowBroad:
     say(`Nothing to clean up: pipegen has no saved proof for ${owner}/${repo}.`);
     return 0;
   }
+  // review M-1: the saved state must be this origin's (the folder binds them by path only); never another repo's scratch repo
+  if (st.app.owner.toLowerCase() !== owner.toLowerCase() || st.app.repo.toLowerCase() !== repo.toLowerCase()) {
+    fail(`The saved proof state is for ${st.app.owner}/${st.app.repo}, not ${owner}/${repo}; pipegen won't clean another repo's scratch repo from here.`);
+    return 1;
+  }
+  // review I-5: a cleanup that already finished, with nothing left: nothing to send
+  if (st.cleanupDone === true && st.leftovers.length === 0) {
+    say('Nothing is left behind.');
+    return 0;
+  }
   const scratch = `pipegen-proof-${st.app.repo}`;
   try {
     const auth = await getAuth({ owner: st.app.owner, repos: [scratch, 'pipelines'], allowBroad: opts.allowBroad, mode: 'write' }, { env: io.env, ...(io.fetch === undefined ? {} : { fetch: io.fetch }) });
@@ -58,12 +68,27 @@ export async function cleanupCommand(dir: string, io: CliIO, opts: { allowBroad:
       ...(deps.settleMs === undefined ? {} : { settleMs: deps.settleMs }),
     });
     say(res.repoDeleted ? `Deleted ${st.app.owner}/${scratch}.` : (res.message ?? `Emptied ${st.app.owner}/${scratch}.`));
-    if (res.leftovers.length === 0) {
+    let left = res.leftovers;
+    if (res.scratchMissing === true) {
+      // review I-5: GitHub answers 404 for a scratch repo pipegen didn't delete. Only the user can say it is gone (a token that
+      // lost access answers 404 too), so pipegen asks (default No) before it forgets what it left there.
+      const full = `${st.app.owner}/${scratch}`;
+      if (await io.prompt.confirm(`Did you delete ${full}? pipegen can't see it. If it is deleted, pipegen forgets what it left there.`, false)) {
+        store.update((n) => {
+          n.scratchDeleted = true;
+          delete n.scratchRepoId;
+          n.leftovers = n.leftovers.filter((l) => !l.includes(full));
+          n.cleanupDone = n.leftovers.length === 0;
+        });
+        left = left.filter((l) => !l.includes(full));
+      }
+    }
+    if (left.length === 0) {
       say('Nothing is left behind.');
       return 0;
     }
-    fail(`Still left behind (${res.leftovers.length}):`);
-    for (const l of res.leftovers) fail(`  ${l}`);
+    fail(`Still left behind (${left.length}):`);
+    for (const l of left) fail(`  ${l}`);
     return 1;
   } catch (e) {
     if (e instanceof GitHubAccessError || e instanceof ProofStopError || e instanceof StateError || isRateStop(e)) {

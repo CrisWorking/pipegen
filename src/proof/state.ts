@@ -18,7 +18,8 @@
 // synchronously") is on disk before the process can stop. When a write fails, the leftover is printed to stderr instead
 // ("Left behind: …"), the registry's own fallback: it is never lost silently.
 // The lease (S20; E4-R4 R3): one pipegen process at a time per app repo on this machine. `lease.json` is made exclusively
-// next to the state; another live process's lease is a stop; a dead one's is taken over. Two machines are not covered (a
+// next to the state; another live process's lease is a stop; a dead one's (this host) is taken over; one from another host, or
+// one that can't be read, is a stop naming the file (never taken over). Two machines are not covered (a
 // recorded residual: the scratch repo's key state is shared per repo id inside one process only, E4).
 import { closeSync, constants, fstatSync, fsyncSync, openSync, readSync, renameSync, unlinkSync, writeSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
@@ -375,6 +376,8 @@ export class StateStore {
       n.stage = to;
       delete n.interruptedAt;
       delete n.stoppedBy;
+      // review I-4: a proof that starts (again) may leave things behind; only a finished cleanup sets it back
+      if (to === 'proving') n.cleanupDone = false;
     });
   }
 
@@ -387,41 +390,47 @@ export class StateStore {
     this.#armed = on;
   }
 
-  #requireArmed(what: string): void {
+  /** Throws unless armProofCleanup has run (Plan G passes `() => store.requireArmed('create a repo')` as checkProofRepos' beforeCreate). */
+  requireArmed(what: string): void {
     if (!this.#armed) throw new StateError(`pipegen won't ${what} before its cleanup is registered for Ctrl-C (armProofCleanup).`);
   }
 
   /** Records a branch before it is pushed (S20). The scratch default branch is not recorded (it is emptied, never deleted). */
   recordBranch(repo: 'scratch' | 'central', ref: string, defaultBranch: string): void {
-    this.#requireArmed('push a branch');
+    this.requireArmed('push a branch');
     if (!validBranchName(ref)) throw new StateError('The branch to record is not a branch name.');
     if (repo === 'scratch' && ref === defaultBranch) return;
-    if (this.#need().branches.some((b) => b.repo === repo && b.ref === ref)) return;
-    this.update((n) => { n.branches.push({ repo, ref }); });
+    if (this.#need().branches.some((b) => b.repo === repo && b.ref === ref) && this.#need().cleanupDone !== true) return;
+    this.update((n) => {
+      if (!n.branches.some((b) => b.repo === repo && b.ref === ref)) n.branches.push({ repo, ref });
+      n.cleanupDone = false;   // review I-4: something new may be left behind
+    });
   }
 
   /** Records a PR before it is opened (by its head branch), then its number. */
   recordPr(head: string, number?: number): void {
-    this.#requireArmed('open a PR');
+    this.requireArmed('open a PR');
     if (!validBranchName(head)) throw new StateError('The PR head to record is not a branch name.');
     this.update((n) => {
       const have = n.prs.find((p) => p.head === head && (p.number === undefined || p.number === number));
       if (have === undefined) n.prs.push(number === undefined ? { head } : { head, number });
       else if (number !== undefined) have.number = number;
+      n.cleanupDone = false;
     });
   }
 
   /** Records the secret names about to be stored in the scratch repo (names only). */
   recordSecretNames(names: readonly string[]): void {
+    this.requireArmed('store a secret');   // review M-3
     for (const n of names) if (typeof n !== 'string' || !SECRET_NAME_RE.test(n)) throw new StateError('A secret name to record is not a secret name.');
-    this.update((s) => { s.secretNames = [...new Set([...s.secretNames, ...names.map((n) => n.toUpperCase())])].sort(); });
+    this.update((s) => { s.secretNames = [...new Set([...s.secretNames, ...names.map((n) => n.toUpperCase())])].sort(); s.cleanupDone = false; });
   }
 
   /** The id GitHub gave the scratch repo pipegen just created (checkProofRepos' onCreated). */
   scratchCreated(id: number): void {
-    this.#requireArmed('create a repo');
+    this.requireArmed('create a repo');
     if (!Number.isSafeInteger(id) || id <= 0) throw new StateError('The repo id to record is not one.');
-    this.update((s) => { s.scratchRepoId = id; s.scratchDeleted = false; });
+    this.update((s) => { s.scratchRepoId = id; s.scratchDeleted = false; s.cleanupDone = false; });
   }
 
   /** The meters (minutes used, the proof start by GitHub's clock, AI spend) as they are now. */
@@ -429,7 +438,7 @@ export class StateStore {
     this.update((s) => {
       if (m.minutes !== undefined) {
         s.minutesUsed = Math.max(s.minutesUsed, m.minutes.used);
-        s.proofStart ??= { at: m.minutes.since, fromServer: m.minutes.fromServer ?? true };
+        s.proofStart ??= { at: m.minutes.since, fromServer: m.minutes.fromServer ?? false };   // review M-4: only what the caller says
       }
       if (m.aiUsedUsd !== undefined) s.aiCostUsd = Math.max(s.aiCostUsd, m.aiUsedUsd);
     });
@@ -500,6 +509,10 @@ export class StateStore {
         const which = this.#state === null ? 'this repo' : `${this.#state.app.owner}/${this.#state.app.repo}`;
         throw new ProofStopError(`Another pipegen (process ${held.pid}) is working on ${which} on this machine. Wait for it to finish, or stop it, then run pipegen again.`);
       }
+      // an unreadable lease (review M-2): never taken over (it can't be shown to be this machine's, or dead), a stop naming it
+      if (held !== null && held.host === '') {
+        throw new ProofStopError(`The lease ${file} can't be read, so pipegen can't tell whether another pipegen works on this repo. If none runs, remove that file and run pipegen again.`);
+      }
       if (held !== null && held.host !== hostname()) {
         throw new ProofStopError(`The lease ${file} was taken on another machine (${safeText(held.host, 80)}); pipegen won't share the scratch repo with it. Remove that file only if no pipegen runs there.`);
       }
@@ -532,7 +545,7 @@ export class StateStore {
       if (typeof d.pid !== 'number' || !Number.isSafeInteger(d.pid) || d.pid <= 0 || typeof d.host !== 'string' || typeof d.token !== 'string') return { pid: 0, host: '', token: '' };
       return { pid: d.pid, host: d.host, token: d.token };
     } catch {
-      return { pid: 0, host: '', token: '' };   // unreadable: an empty lease (a crash while it was written) is taken over
+      return { pid: 0, host: '', token: '' };   // unreadable (a crash while it was written, or edited): acquireLease stops on it
     } finally {
       closeSync(fd);
     }

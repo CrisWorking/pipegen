@@ -64,6 +64,12 @@ export interface ProofRepoOptions {
    * write synchronously; if it throws, the proof stops (the repo stays, pipegen won't delete what it didn't record).
    */
   onCreated?: (repo: string, id: number) => void;
+  /**
+   * E8 fix round 1 (review M-3): called right before pipegen creates a helper repo (App mode). Plan G passes
+   * `() => store.requireArmed('create a repo')`, so no repo is made before the Ctrl-C cleanup is registered. Without it,
+   * pipegen never creates a repo (a stop, before any create call); a throw stops the proof the same way.
+   */
+  beforeCreate?: (repo: string) => void;
 }
 
 export interface ProofRepos {
@@ -644,6 +650,8 @@ export async function checkProofRepos(gh: Octokit, app: ProofApp, opts: ProofRep
     if (t.ownerType === 'Organization' || (login !== null && login.toLowerCase() === t.owner.toLowerCase())) {
       toPrint = [];
       for (const r of missing) {
+        if (opts.beforeCreate === undefined) throw new ProofStopError(`pipegen won't create ${r.fullName} before its cleanup is registered for Ctrl-C.`);
+        opts.beforeCreate(r.repo);
         let made: Record<string, unknown>;
         try {
           made = await createHelperRepo(gh, r, login, clock);

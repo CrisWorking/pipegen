@@ -50,7 +50,7 @@ const by = (a: Access) => ({ [AU]: a }) as Pick<ProofRepoOptions, 'auth'>;
 const fgMode: Access = { kind: 'fine-grained', canCreateRepos: false };
 const appMode: Access = { kind: 'app', canCreateRepos: true };
 const SN_KEY = ['sec', 'ret_name'].join('');
-const opts = (o: Partial<ProofRepoOptions> = {}): ProofRepoOptions => ({ ...by(fgMode), actions: ALL_PINS, runId: '20261103-120000-abcdef', ...o });
+const opts = (o: Partial<ProofRepoOptions> = {}): ProofRepoOptions => ({ ...by(fgMode), actions: ALL_PINS, runId: '20261103-120000-abcdef', beforeCreate: () => {}, ...o });
 const run = (w: WorldOptions, a: ProofApp = app(), o: Partial<ProofRepoOptions> = {}, answer = true) => {
   const g = world(w);
   const i = io(answer);
@@ -282,6 +282,17 @@ describe('E1 repos (plan Task 1, preflight S1/S13/S19)', () => {
     const stop = run({ repos: { pipelines: { private: true } } }, app(), { ...by(appMode), onCreated: () => { throw new Error('state not saved'); } });
     await expect(stop.result).rejects.toThrow('state not saved');
     expect(stop.g.seen().slice(stop.g.seen().indexOf('POST /user/repos') + 1)).toEqual([]);
+  });
+
+  it('repos: no repo is created before the cleanup is armed (beforeCreate; E8 fix round 1, M-3)', async () => {
+    // without the hook: refused before POST /user/repos
+    const none = run({ repos: { pipelines: { private: true } } }, app(), { ...by(appMode), beforeCreate: undefined });
+    await expect(none.result).rejects.toThrow(/cleanup/);
+    expect(none.g.seen()).not.toContain('POST /user/repos');
+    // a hook that refuses (the state store not armed): refused before the POST too
+    const refused = run({ repos: { pipelines: { private: true } } }, app(), { ...by(appMode), beforeCreate: () => { throw new Error('not armed'); } });
+    await expect(refused.result).rejects.toThrow('not armed');
+    expect(refused.g.seen()).not.toContain('POST /user/repos');
   });
 
   it('repos: exists but 404 for the app → prints add-to-installation steps', async () => {

@@ -72,7 +72,7 @@ describe('E8 state file', () => {
     expect(saved).toMatchObject({
       runId: RUN, stage: 'consented', branches: [{ repo: 'scratch', ref: `proof/${RUN}/main` }, { repo: 'central', ref: `proof/${RUN}` }],
       prs: [{ head: `proof/${RUN}/main`, number: 7 }], scratchRepoId: 4242, minutesUsed: 12, aiCostUsd: 0.25,
-      proofStart: { at: Date.UTC(2026, 10, 4, 9, 0, 0), fromServer: true },
+      proofStart: { at: Date.UTC(2026, 10, 4, 9, 0, 0), fromServer: false },   // not said to be GitHub's clock (fix round 1, M-4)
     });
     expect(saved?.secretNames).toEqual(['DATABASE_URL', 'STRIPE_SECRET_KEY']);
     const text = readFileSync(store.path, 'utf8');

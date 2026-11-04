@@ -27,14 +27,14 @@ import { SecretVault } from '../create/secrets.js';
 import type { AiSpendMeter } from '../ai/spend-meter.js';
 import { onInterrupt, type InterruptContext } from '../util/exit-hooks.js';
 import { safeText } from '../util/safe-text.js';
-import { CapReachedError } from './caps.js';
+import { CapReachedError, type CapReached } from './caps.js';
 import { settleWrites } from './inflight.js';
 import { ScratchKeys, ScratchKeysError } from './keys.js';
 import { MinutesMeter, proofStart } from './minutes.js';
 import type { PollClock } from './run.js';
 import { StateError, StateStore, type RunState } from './state.js';
 import {
-  assertCentral, assertScratch, cleanupWrite, deleteScratchRepo, githubRead, isProofTarget, proofTarget, ScratchGuardError,
+  assertCentral, assertScratch, cleanupWrite, deleteScratchRepo, githubRead, isProofTarget, proofTarget, ScratchGuardError, validBranchName,
   type CleanupOp, type GuardedRepo, type ProofTarget,
 } from './target.js';
 
@@ -58,12 +58,16 @@ export interface CleanupOptions {
   rateClock?: RateClock;
   settleMs?: number;
   cancelWaitMs?: number;
+  /** The proof's meters (fix round 1, I-6): saved before anything else and again, read, before any run is deleted. */
+  meters?: () => ProofMeters | undefined;
 }
 export interface CleanupResult {
   repoDeleted: boolean;
   leftovers: string[];
   /** For the user: why the repo was emptied and not deleted, and the command that deletes it. */
   message?: string;
+  /** GitHub answered 404 for the scratch repo, which pipegen didn't delete: gone by hand, or the token can't reach it. */
+  scratchMissing?: true;
 }
 
 const realClock: PollClock = { now: () => Date.now(), sleep: (ms) => new Promise((ok) => setTimeout(ok, ms)) };
@@ -72,6 +76,8 @@ const posInt = (v: unknown): v is number => typeof v === 'number' && Number.isSa
 const statusOf = (e: unknown): unknown => (e as { status?: unknown } | null)?.status;
 /** GitHub's answers for something already gone (or already in the asked state). */
 const GONE = new Set([404, 409, 410, 422]);
+/** A run delete: only "not there" is gone (review M-5: a 409 or 422 may mean the run is still going). */
+const RUN_GONE = new Set([404, 410]);
 const said = (e: unknown): string => {
   const st = statusOf(e);
   return typeof st === 'number' && Number.isInteger(st) ? `HTTP ${st}` : 'no answer';
@@ -108,7 +114,8 @@ async function clean(gh: Octokit, t: ProofTarget, store: StateStore, keys: Scrat
   const clock = opts.clock ?? realClock;
   const st = store.state as RunState;
   const before = new Set(st.leftovers);
-  const left: string[] = [];
+  let left: string[] = [];
+  const dropped = new Set<string>();
   const leftover = (item: string): void => {
     const line = safeText(hideToken(String(item)), 500);
     if (left.includes(line)) return;
@@ -116,8 +123,9 @@ async function clean(gh: Octokit, t: ProofTarget, store: StateStore, keys: Scrat
     store.record(line);
     try { opts.leftover?.(line); } catch { /* a reporter that throws doesn't stop the cleanup */ }
   };
+  // fix round 1 (review I-1): a state write never stops the cleanup; each one is best-effort (record falls back to stderr)
+  const save = (change: (n: RunState) => void): void => { try { store.update(change); } catch { /* the cleanup goes on */ } };
   const hard = (e: unknown): void => {
-    if (e instanceof ScratchGuardError) throw e;
     if (statusOf(e) === 401 && !isAnonymousClient(gh)) throw githubTokenRejected();
   };
   const write = async (r: GuardedRepo, op: CleanupOp): Promise<'done' | 'gone' | string> => {
@@ -125,60 +133,102 @@ async function clean(gh: Octokit, t: ProofTarget, store: StateStore, keys: Scrat
       await cleanupWrite(gh, r, op, rate);
       return 'done';
     } catch (e) {
+      // review I-3: a value the guard won't send (a name GitHub listed) is this item's leftover, never an abort of the rest
+      if (e instanceof ScratchGuardError) return 'pipegen won\'t send that name or id';
       hard(e);
       if (isRateStop(e)) return 'GitHub\'s rate limit';
       const code = statusOf(e);
-      return typeof code === 'number' && GONE.has(code) ? 'gone' : said(e);
+      return typeof code === 'number' && (op.op === 'delete-run' ? RUN_GONE : GONE).has(code) ? 'gone' : said(e);
+    }
+  };
+  /** The secrets: listed and recorded names deleted, then listed again (keys.ts deleteAll). `quiet`: the first pass, reported by the second. */
+  const secrets = async (quiet: boolean): Promise<boolean> => {
+    try {
+      await keys.deleteAll({ ...(quiet ? { waitMs: 0, leftover: () => {} } : { leftover }), alsoNames: [...((store.state as RunState).secretNames), ...Object.keys(keys.stored())] });
+      return true;
+    } catch (e) {
+      if (statusOf(e) === 401 && !isAnonymousClient(gh)) {
+        // review M-7: said before the stop goes on, so the user knows the keys may be there
+        leftover(`the secrets of ${s.fullName} may still be there (GitHub refused pipegen's token while deleting them); delete them in ${s.fullName} → Settings → Secrets and variables → Actions`);
+        throw githubTokenRejected();
+      }
+      if (quiet) return false;
+      if (e instanceof ScratchKeysError) leftover(e.message);
+      else leftover(`pipegen couldn't confirm every secret of ${s.fullName} is deleted (${isRateStop(e) ? 'GitHub\'s rate limit' : said(e)}); check ${s.fullName} → Settings → Secrets and variables → Actions`);
+      return false;
     }
   };
 
-  // 1. the writes in flight land (or are named) before anything is listed
+  // 0. the meters as they are now (review I-6; nothing read yet)
+  save((n) => { applyMeters(n, opts.meters?.()); });
+
+  // a scratch repo pipegen deleted before (pipegen cleanup again): when GitHub says it is gone, nothing of it is left (review I-5)
+  let skipScratch = st.scratchDeleted === true && await repoSeen(gh, s, rate) === 'missing';
+  let scratchMissing = false;
+
+  // 1. the secrets first, without waiting for anything (review I-2: a second Ctrl-C may come at any moment)
+  if (!skipScratch && !(await secrets(true)) && await repoSeen(gh, s, rate) === 'missing') {
+    // gone, or the token can't reach it: nothing pipegen can list there, so one leftover instead of a false list of them
+    skipScratch = true;
+    scratchMissing = true;
+    leftover(`pipegen can't see ${s.fullName} (it was deleted, or your token can't reach it); if it still exists, delete it: ${deleteCommand(s)}`);
+  }
+
+  // 2. the writes in flight land (or are named), then the secrets once more: a store that landed late is deleted too
   const settled = await settleWrites({ timeoutMs: opts.settleMs ?? CLEANUP_SETTLE_MS, ...(opts.signal === undefined ? {} : { signal: opts.signal }) });
   for (const w of settled.pending) leftover(`a GitHub write was still in flight when the cleanup started (${w}); it may have landed after it`);
+  if (!skipScratch) await secrets(false);
 
-  // 2. the secrets, first, always
-  try {
-    await keys.deleteAll({ leftover, alsoNames: [...st.secretNames, ...Object.keys(keys.stored())] });
-  } catch (e) {
-    hard(e);
-    if (e instanceof ScratchKeysError) leftover(e.message);
-    else leftover(`pipegen couldn't confirm every secret of ${s.fullName} is deleted (${isRateStop(e) ? 'GitHub\'s rate limit' : said(e)}); check ${s.fullName} → Settings → Secrets and variables → Actions`);
-  }
-
-  // 3. every run still going is stopped
-  const runs = await listRuns(gh, s, rate).catch((e: unknown) => { hard(e); leftover(`the runs of ${s.fullName} could not be listed; cancel any still running there`); return null; });
-  const active = (runs ?? []).filter((r) => r.status !== 'completed').map((r) => r.id);
-  const cancelled: number[] = [];
-  for (const id of active) {
-    const res = await write(s, { op: 'cancel-run', runId: id });
-    if (res === 'done') { cancelled.push(id); continue; }
-    if (res === 'gone') continue;
-    const force = await write(s, { op: 'force-cancel-run', runId: id });
-    if (force !== 'done' && force !== 'gone') leftover(`run ${id} of ${s.fullName} could not be cancelled (${force}); cancel it there`);
-  }
-
-  // 4. the repo deleted, when the token may and it is provably the one pipegen created
   let repoDeleted = false;
-  let why = 'your token can\'t delete repos';
-  if (opts.canDeleteRepo) {
-    try {
-      const res = await deleteScratchRepo(gh, s, st.scratchRepoId, rate);
-      repoDeleted = res.deleted;
-      if (!res.deleted) why = res.why ?? 'GitHub didn\'t delete it';
-    } catch (e) {
-      hard(e);
-      why = isRateStop(e) ? 'GitHub\'s rate limit stopped the delete' : `the delete failed (${said(e)})`;
-    }
-  }
-  let runsDeleted = repoDeleted;
   let message: string | undefined;
-  if (repoDeleted) {
-    store.update((n) => { n.scratchDeleted = true; n.runsDeleted = true; delete n.scratchRepoId; });
+  if (!skipScratch) {
+    // 3. every run still going is stopped
+    const runs = await listRuns(gh, s, rate).catch((e: unknown) => { hard(e); leftover(`the runs of ${s.fullName} could not be listed; cancel any still running there`); return null; });
+    const active = (runs ?? []).filter((r) => r.status !== 'completed').map((r) => r.id);
+    const cancelled: number[] = [];
+    for (const id of active) {
+      const res = await write(s, { op: 'cancel-run', runId: id });
+      if (res === 'done') { cancelled.push(id); continue; }
+      if (res === 'gone') continue;
+      const force = await write(s, { op: 'force-cancel-run', runId: id });
+      if (force !== 'done' && force !== 'gone') leftover(`run ${id} of ${s.fullName} could not be cancelled (${force}); cancel it there`);
+    }
+
+    // the minutes used, measured before any run is deleted (review I-6: a resume restores them, never a fresh budget)
+    const measured = await measureMinutes(gh, t, st, opts.meters?.(), rate);
+    save((n) => {
+      applyMeters(n, opts.meters?.());
+      if (measured !== null) n.minutesUsed = Math.max(n.minutesUsed, measured);
+    });
+
+    // 4. the repo deleted, when the token may and it is provably the one pipegen created
+    let why = 'your token can\'t delete repos';
+    if (opts.canDeleteRepo) {
+      try {
+        const res = await deleteScratchRepo(gh, s, st.scratchRepoId, rate);
+        repoDeleted = res.deleted;
+        if (!res.deleted) why = res.why ?? 'GitHub didn\'t delete it';
+      } catch (e) {
+        if (e instanceof ScratchGuardError) throw e;
+        hard(e);
+        why = isRateStop(e) ? 'GitHub\'s rate limit stopped the delete' : `the delete failed (${said(e)})`;
+      }
+    }
+    if (repoDeleted) {
+      // review I-5: what this cleanup couldn't remove in the scratch repo went with it
+      for (const l of left) if (l.includes(s.fullName)) dropped.add(l);
+      left = left.filter((l) => !dropped.has(l));
+      save((n) => { n.scratchDeleted = true; n.runsDeleted = true; delete n.scratchRepoId; });
+    } else {
+      // 5. emptied instead
+      const runsDeleted = await empty(gh, t, s, store, { write, leftover, hard, rate, clock, cancelled, opts });
+      message = `pipegen emptied ${s.fullName} but didn't delete it: ${why}. To delete it: ${deleteCommand(s)}`;
+      if (runsDeleted) save((n) => { n.runsDeleted = true; });
+    }
+  } else if (scratchMissing) {
+    message = `pipegen can't see ${s.fullName}. If it still exists, delete it: ${deleteCommand(s)}`;
   } else {
-    // 5. emptied instead
-    runsDeleted = await empty(gh, t, s, store, { write, leftover, hard, rate, clock, cancelled, opts });
-    message = `pipegen emptied ${s.fullName} but didn't delete it: ${why}. To delete it: ${deleteCommand(s)}`;
-    if (runsDeleted) store.update((n) => { n.runsDeleted = true; });
+    message = `${s.fullName} was already deleted.`;
   }
 
   // 6. the central proof/<runId> branch (as recorded now: a push in flight at the start was recorded before it began)
@@ -195,12 +245,55 @@ async function clean(gh: Octokit, t: ProofTarget, store: StateStore, keys: Scrat
 
   // the leftovers of this cleanup replace those an earlier cleanup of this run recorded (each was looked for again above);
   // anything recorded meanwhile by someone else (the interrupt registry: a hook cut by its deadline) stays
-  store.update((n) => {
-    n.leftovers = [...new Set([...left, ...n.leftovers.filter((l) => !before.has(l))])];
+  save((n) => {
+    n.leftovers = [...new Set([...left, ...n.leftovers.filter((l) => !before.has(l) && !dropped.has(l))])];
     n.cleanupDone = n.leftovers.length === 0;
     if (n.stage === 'proven') n.stage = 'cleaned';
   });
-  return { repoDeleted, leftovers: [...left], ...(message === undefined ? {} : { message }) };
+  return { repoDeleted, leftovers: [...left], ...(message === undefined ? {} : { message }), ...(scratchMissing ? { scratchMissing: true as const } : {}) };
+}
+
+/** What a meter getter gives (Plan G's meters; `fromServer`: the proof start came from GitHub's clock, minutes.ts proofStart). */
+export interface ProofMeters { minutes?: MinutesMeter; ai?: AiSpendMeter; fromServer?: boolean }
+
+/** The meters into the state (the higher of saved and now; the proof start once, with its source). */
+function applyMeters(n: RunState, m: ProofMeters | undefined): void {
+  if (m === undefined) return;
+  if (m.minutes !== undefined) {
+    n.minutesUsed = Math.max(n.minutesUsed, m.minutes.used);
+    n.proofStart ??= { at: m.minutes.since, fromServer: m.fromServer ?? false };
+  }
+  if (m.ai !== undefined) n.aiCostUsd = Math.max(n.aiCostUsd, m.ai.usedUsd);
+}
+
+/**
+ * The minutes used, read from GitHub before the runs are deleted (review I-6): the meter's own read when there is one;
+ * without one (`pipegen cleanup` after a kill), a meter over the saved proof start. A read that fails counts as the whole
+ * cap (an unknown spend never gives a resume a fresh budget). null: nothing to measure (no meter, no saved start).
+ */
+async function measureMinutes(gh: Octokit, t: ProofTarget, st: RunState, m: ProofMeters | undefined, rate: RateClock): Promise<number | null> {
+  if (m?.minutes !== undefined) {
+    try { await m.minutes.add(gh, t, { clock: rate }); } catch { /* the meter keeps its last count */ }
+    return m.minutes.used;
+  }
+  if (st.proofStart === undefined) return null;
+  const meter = new MinutesMeter(st.cap, st.proofStart.at);
+  try {
+    await meter.add(gh, t, { clock: rate });
+  } catch {
+    return st.cap;
+  }
+  return meter.problem === null ? meter.used : Math.max(meter.used, st.cap);
+}
+
+/** GitHub's answer for the scratch repo: there, gone (404), or unknown (anything else). */
+async function repoSeen(gh: Octokit, s: GuardedRepo, rate: RateClock): Promise<'present' | 'missing' | 'unknown'> {
+  try {
+    await githubRead(gh, 'GET /repos/{owner}/{repo}', { owner: s.owner, repo: s.repo }, rate);
+    return 'present';
+  } catch (e) {
+    return statusOf(e) === 404 ? 'missing' : 'unknown';
+  }
 }
 
 interface EmptyCtx {
@@ -254,12 +347,17 @@ async function empty(gh: Octokit, t: ProofTarget, s: GuardedRepo, store: StateSt
       if (names.size === 0) break;
     }
     for (const b of names) {
+      if (!validBranchName(b)) {
+        // review I-3: a name GitHub listed that pipegen won't send (git allows it, pipegen's guard doesn't)
+        c.leftover(`the branch ${safeText(b, 120)} of ${s.fullName} has a name pipegen won't send; delete it there`);
+        continue;
+      }
       const res = await c.write(s, { op: 'delete-branch', branch: b });
       if (res !== 'done' && res !== 'gone') c.leftover(`the branch ${b} of ${s.fullName} could not be deleted (${res}); delete it there`);
     }
     if (round === 1) {
       const again = await listProofBranches(gh, s, c.rate).catch(() => null);
-      for (const b of again ?? [...names]) c.leftover(`the branch ${b} of ${s.fullName} is still there; delete it there`);
+      for (const b of again ?? [...names]) c.leftover(`the branch ${safeText(b, 120)} of ${s.fullName} is still there; delete it there`);
     }
   }
 
@@ -271,13 +369,20 @@ async function empty(gh: Octokit, t: ProofTarget, s: GuardedRepo, store: StateSt
     if (res === 'done') deletedRuns = true;
     else if (res !== 'gone') c.leftover(`run ${r.id} of ${s.fullName} could not be deleted (${res}); delete it there (its logs and artifacts go with it)`);
   }
+  // listed again (review M-5): a run GitHub didn't delete is a leftover
+  if (runs !== null && runs.length > 0) {
+    const again = await listRuns(gh, s, c.rate).catch(() => null);
+    if (again === null) c.leftover(`the workflow runs of ${s.fullName} could not be listed again after the delete; check them there`);
+    else for (const r of again) c.leftover(`run ${r.id} of ${s.fullName} is still there; delete it there (its logs and artifacts go with it)`);
+  }
 
   // Actions caches, code scanning analyses (S18), Actions variables (S14)
   for (const kind of ['cache', 'analysis', 'variable'] as const) {
     const items = await listOf(gh, s, kind, c.rate).catch(unread(KIND_TEXT[kind]));
     if (items === null) continue;
-    for (const id of items) {
-      const op: CleanupOp = kind === 'cache' ? { op: 'delete-cache', cacheId: id as number } : kind === 'analysis' ? { op: 'delete-analysis', analysisId: id as number } : { op: 'delete-variable', name: id as string };
+    if (kind === 'analysis') await deleteAnalyses(gh, s, items as number[], c);
+    else for (const id of items) {
+      const op: CleanupOp = kind === 'cache' ? { op: 'delete-cache', cacheId: id as number } : { op: 'delete-variable', name: id as string };
       const res = await c.write(s, op);
       if (res !== 'done' && res !== 'gone') c.leftover(`the ${KIND_ONE[kind]} ${safeText(String(id), 120)} of ${s.fullName} could not be deleted (${res}); delete it there`);
     }
@@ -297,6 +402,45 @@ async function empty(gh: Octokit, t: ProofTarget, s: GuardedRepo, store: StateSt
   }
   if (!reset) c.leftover(`the default branch ${t.defaultBranch} of ${s.fullName} still holds a copy of your code; delete the repo: ${deleteCommand(s)}`);
   return deletedRuns;
+}
+
+/**
+ * Code scanning analyses (S18; review M-6): GitHub deletes only the most recent analysis of a set, and its answer names the
+ * next one (next_analysis_url, or confirm_delete_url for the last). So: newest first (highest id), following those links
+ * (only to an analysis of this scratch repo), with confirm_delete. What is still listed afterwards is a leftover.
+ */
+async function deleteAnalyses(gh: Octokit, s: GuardedRepo, ids: readonly number[], c: EmptyCtx): Promise<void> {
+  const done = new Set<number>();
+  for (const start of [...ids].sort((a, b) => b - a)) {
+    let id: number | null = start;
+    for (let hops = 0; id !== null && !done.has(id) && hops < 1_000; hops++) {
+      done.add(id);
+      let data: unknown;
+      try {
+        data = (await cleanupWrite(gh, s, { op: 'delete-analysis', analysisId: id }, c.rate)).data;
+      } catch (e) {
+        if (!(e instanceof ScratchGuardError)) c.hard(e);
+        if (statusOf(e) === 404) break;
+        c.leftover(`the code scanning analysis ${id} of ${s.fullName} could not be deleted (${isRateStop(e) ? 'GitHub\'s rate limit' : said(e)}); delete it there`);
+        break;
+      }
+      id = nextAnalysis(data, s);
+    }
+  }
+}
+
+/** The analysis id GitHub's delete answer names next, when it is one of this scratch repo's. */
+function nextAnalysis(data: unknown, s: GuardedRepo): number | null {
+  if (!isPlain(data)) return null;
+  for (const key of ['next_analysis_url', 'confirm_delete_url']) {
+    const u = data[key];
+    if (typeof u !== 'string' || u.length > 500) continue;
+    let url: URL;
+    try { url = new URL(u); } catch { continue; }
+    const m = /^\/repos\/([^/]+)\/([^/]+)\/code-scanning\/analyses\/(\d{1,15})$/.exec(url.pathname);
+    if (url.origin === 'https://api.github.com' && m !== null && m[1]?.toLowerCase() === s.owner.toLowerCase() && m[2]?.toLowerCase() === s.repo.toLowerCase()) return Number(m[3]);
+  }
+  return null;
 }
 
 const KIND_TEXT = { cache: 'Actions caches', analysis: 'code scanning analyses', variable: 'Actions variables' } as const;
@@ -398,19 +542,11 @@ async function listOf(gh: Octokit, s: GuardedRepo, kind: 'cache' | 'analysis' | 
  * Plan G calls it before the proof's first GitHub write: until then the store refuses to record (so to make) a branch, a PR
  * or a repo. Returns the unregister function (both hooks).
  */
-export function armProofCleanup(store: StateStore, cleanup: (ctx: InterruptContext) => Promise<unknown>, opts: { deadlineMs?: number; meters?: () => { minutes?: MinutesMeter; ai?: AiSpendMeter } } = {}): () => void {
+export function armProofCleanup(store: StateStore, cleanup: (ctx: InterruptContext) => Promise<unknown>, opts: { deadlineMs?: number; meters?: () => ProofMeters | undefined } = {}): () => void {
   if (store.state === null) throw new StateError('The proof state must be started before its cleanup is registered.');
   const record = (item: string): void => store.record(item);
   const offSave = onInterrupt(async () => {
-    const m = opts.meters?.();
-    if (m !== undefined) {
-      try {
-        store.saveMeters({
-          ...(m.minutes === undefined ? {} : { minutes: { used: m.minutes.used, since: m.minutes.since } }),
-          ...(m.ai === undefined ? {} : { aiUsedUsd: m.ai.usedUsd }),
-        });
-      } catch { /* the stage below is what matters; a refused write records itself */ }
-    }
+    try { store.update((n) => { applyMeters(n, opts.meters?.()); }); } catch { /* the stage below is what matters */ }
     store.setStage('interrupted');
   }, { label: 'saving the proof state', deadlineMs: 5_000, record });
   const offClean = onInterrupt(async (ctx) => { await cleanup(ctx); }, { label: 'removing your keys and the proof from the scratch repo', deadlineMs: opts.deadlineMs ?? CLEANUP_DEADLINE_MS, record });
@@ -424,24 +560,47 @@ export function armProofCleanup(store: StateStore, cleanup: (ctx: InterruptConte
 
 /**
  * The proof stage with its cleanup right after it, before anything is shown (spec §19): `prove` runs, then `cleanup` runs
- * whatever happened (proven, failed, a cap stop, an error), then the stage moves (proving → proven → cleaned; a cap stop:
- * stopped). An error of `prove` is thrown again after the cleanup. Plan G shows the preview only after this returns.
+ * on EVERY path (proven, failed, a cap stop that throws or returns, an error), and no state write can skip it (review I-1:
+ * the stage moves are best-effort). Stages: proving → proven → cleaned; a CapReachedError → stopped. An error of `prove` is
+ * thrown again after the cleanup. Plan G shows the preview only after this returns.
  */
 export async function proveThenClean<T>(store: StateStore, prove: () => Promise<T>, cleanup: () => Promise<CleanupResult>): Promise<{ outcome: T; cleanup: CleanupResult }> {
-  let outcome: T;
+  const best = (f: () => void): void => { try { f(); } catch { /* a state write never skips the cleanup */ } };
+  let outcome!: T;
+  let failed = false;
+  let failure: unknown;
   try {
     outcome = await prove();
   } catch (e) {
-    if (e instanceof CapReachedError && store.state?.stage !== 'stopped') {
-      try { store.setStage('stopped', { stoppedBy: e.cap.kind }); } catch { /* recorded below by the cleanup */ }
-    }
-    await cleanup();
+    failed = true;
+    failure = e;
+  }
+  if (failed) {
+    if (failure instanceof CapReachedError && store.state?.stage !== 'stopped') { const kind = failure.cap.kind; best(() => store.setStage('stopped', { stoppedBy: kind })); }
+  } else if (store.state?.stage === 'proving') {
+    best(() => store.setStage('proven'));
+  }
+  let done: CleanupResult;
+  try {
+    done = await cleanup();
+  } catch (e) {
+    if (failed) throw failure;
     throw e;
   }
-  store.setStage('proven');
-  const done = await cleanup();
-  if (store.state?.stage === 'proven') store.setStage('cleaned');
+  if (failed) throw failure;
+  if (store.state?.stage === 'proven') best(() => store.setStage('cleaned'));
   return { outcome, cleanup: done };
+}
+
+/**
+ * stopAtCap's `saveState` (fix round 1, I-6): the meters first (a resume restores them), then the stage `stopped` with the
+ * cap that stopped it.
+ */
+export function saveStopState(store: StateStore, meters?: () => ProofMeters | undefined): (cap: CapReached) => void {
+  return (cap) => {
+    try { store.update((n) => { applyMeters(n, meters?.()); }); } catch { /* the stage below still moves, or stopAtCap names the problem */ }
+    store.setStage('stopped', { stoppedBy: cap.kind });
+  };
 }
 
 // ---------- resume (S20; carries E6) ----------

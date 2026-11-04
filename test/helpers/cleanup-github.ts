@@ -8,13 +8,18 @@ import type { World, WorldOptions } from './proof-github.js';
 import { keysWorld, OWNER, SCRATCH, type KeysFake } from './scratch-secrets.js';
 
 export interface CleanupFake {
-  runs: { id: number; status: string }[];
+  /** `minutes`: how long its one job ran (default 1), for a minutes meter reading the runs (fix round 1, I-6). */
+  runs: { id: number; status: string; minutes?: number }[];
   prs: { number: number; head: string; state: 'open' | 'closed' }[];
   /** Scratch branch names (no refs/heads/). The default branch is `main`. */
   branches: Set<string>;
   central: Set<string>;
   caches: number[];
-  /** null: code scanning is off (the list answers 403). */
+  /**
+   * null: code scanning is off (the list answers 403). Listed oldest first. As GitHub: only the most recent analysis (the
+   * highest id here) is deletable, the last one only with confirm_delete; the answer names the next one (next_analysis_url,
+   * or confirm_delete_url when it is the last).
+   */
   analyses: number[] | null;
   /** The default branch head. */
   defaultHead: string;
@@ -70,11 +75,19 @@ export function cleanupFake(scratch = SCRATCH, keys?: KeysFake): CleanupFake {
     if (failed !== undefined) return json(failed, { message: 'Server Error' });
     const q = c.url.searchParams;
     // runs
+    const date = { date: new Date(Date.UTC(2026, 10, 4, 10, 0, 0)).toUTCString() };
     if (rest === '/actions/runs' && c.method === 'GET') {
       if (f.unreadable.has('runs')) return json(403, { message: 'Resource not accessible' });
       const per = Number(q.get('per_page') ?? '30');
       const n = Number(q.get('page') ?? '1');
-      return json(200, { total_count: f.runs.length, workflow_runs: f.runs.slice((n - 1) * per, n * per).map((r) => ({ ...r, conclusion: r.status === 'completed' ? 'cancelled' : null })) });
+      return { status: 200, headers: date, body: { total_count: f.runs.length, workflow_runs: f.runs.slice((n - 1) * per, n * per).map((r) => ({ id: r.id, status: r.status, conclusion: r.status === 'completed' ? 'cancelled' : null, created_at: '2026-11-04T09:00:00Z' })) } };
+    }
+    const jobsM = /^\/actions\/runs\/(\d+)\/jobs$/.exec(rest);
+    if (jobsM && c.method === 'GET') {
+      const r = f.runs.find((x) => x.id === Number(jobsM[1]));
+      if (r === undefined) return notFound();
+      const end = Date.UTC(2026, 10, 4, 9, 1, 0) + ((r.minutes ?? 1) - 1) * 60_000;
+      return { status: 200, headers: date, body: { total_count: 1, jobs: [{ id: r.id * 10, run_id: r.id, status: 'completed', conclusion: 'success', started_at: '2026-11-04T09:00:00Z', completed_at: new Date(end).toISOString().replace('.000', '') }] } };
     }
     let m = /^\/actions\/runs\/(\d+)(\/cancel|\/force-cancel)?$/.exec(rest);
     if (m) {
@@ -151,9 +164,13 @@ export function cleanupFake(scratch = SCRATCH, keys?: KeysFake): CleanupFake {
     m = /^\/code-scanning\/analyses\/(\d+)$/.exec(rest);
     if (m && c.method === 'DELETE' && f.analyses !== null) {
       const id = Number(m[1]);
-      if (q.get('confirm_delete') === null) return json(400, { message: 'confirm_delete needed for the last analysis' });
+      if (!f.analyses.includes(id)) return notFound();
+      if (id !== Math.max(...f.analyses)) return json(400, { message: 'Analysis specified is not deletable.' });
+      if (f.analyses.length === 1 && q.get('confirm_delete') === null) return json(400, { message: 'confirm_delete needed for the last analysis' });
       f.analyses = f.analyses.filter((x) => x !== id);
-      return json(200, { next_analysis_url: null, confirm_delete_url: null });
+      const url = (n: number) => `https://api.github.com${R}/code-scanning/analyses/${n}`;
+      const top = f.analyses.length === 0 ? null : Math.max(...f.analyses);
+      return json(200, { next_analysis_url: top !== null && f.analyses.length > 1 ? url(top) : null, confirm_delete_url: top !== null && f.analyses.length === 1 ? `${url(top)}?confirm_delete` : null });
     }
     m = /^\/actions\/variables\/([A-Za-z0-9_]+)$/.exec(rest);
     if (m && c.method === 'DELETE' && keys !== undefined && keys.variables !== null) {

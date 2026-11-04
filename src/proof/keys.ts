@@ -671,7 +671,8 @@ const isTokenRejected = (gh: Octokit, e: unknown): boolean => (e as { status?: u
 
 /**
  * E8 (carry E4-R4 R7): the secret names the proof's workflows read, for ScratchKeysDeps.readByWorkflows: every
- * `secrets.NAME` and `secrets['NAME']` / `secrets["NAME"]` in the given workflow texts, upper-cased, sorted. null when a
+ * `secrets.NAME` and `secrets['NAME']` / `secrets["NAME"]` in the given workflow texts, `secrets` in any letter case (fix
+ * round 1, I-7), names upper-cased, sorted. null when a
  * workflow reads the secrets in a way no name can be taken from (`secrets[expr]`, `toJSON(secrets)`, `secrets` alone):
  * then every organisation secret counts as read (the fail-closed default of ScratchKeys).
  */
@@ -679,7 +680,8 @@ export function workflowSecretNames(workflows: readonly { content: string | Uint
   const names = new Set<string>();
   for (const w of workflows) {
     const text = typeof w.content === 'string' ? w.content : Buffer.from(w.content).toString('utf8');
-    for (const m of text.matchAll(/\bsecrets\b/g)) {
+    // review I-7: Actions expression context names are case-insensitive (`SECRETS.X`, `Secrets['x']`)
+    for (const m of text.matchAll(/\bsecrets\b/gi)) {
       const rest = text.slice((m.index ?? 0) + m[0].length);
       const dot = /^\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)/.exec(rest);
       const idx = /^\s*\[\s*(['"])([A-Za-z_][A-Za-z0-9_]*)\1\s*\]/.exec(rest);
