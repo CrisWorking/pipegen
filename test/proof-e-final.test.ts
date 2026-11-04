@@ -118,9 +118,18 @@ describe('final review I-2: the saved stage follows the verdict, and the state h
     store.recordVerdict({ ok: true });   // a pass without its draft saved is not one: a resume would deliver the old draft
     expect(store.load()?.proofOk).toBe(false);
     expect(() => store.setStage('proven')).toThrow(/passed/);
+    store.recordVerdict({ ok: false, stopped: 'the first try failed', draft: FIXED });
     store.recordVerdict({ ok: true, draft: FIXED });
+    expect(store.load()?.proofStopped).toBeUndefined();   // a later verdict without a stop drops the old reason
     store.setStage('proven');
+    // every stage past proving needs the passing verdict, not only proven
+    store.update((n) => { n.proofOk = false; });
+    expect(() => store.setStage('cleaned')).toThrow(/passed/);
+    store.update((n) => { n.proofOk = true; });
     store.setStage('cleaned');
+    store.update((n) => { n.proofOk = false; });
+    expect(() => store.setStage('delivered')).toThrow(/passed/);
+    store.update((n) => { n.proofOk = true; });
     expect(nextStage(store.load()!)).toBe('delivered');
     // a state written before this fix (no verdict) at proven or cleaned: a resume proves again, never delivers
     for (const stage of ['proven', 'cleaned'] as const) {

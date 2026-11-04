@@ -237,6 +237,8 @@ describe('final review I-1: the scratch guard takes only the writes pipegen make
       ['POST /repos/{owner}/{repo}/pulls', { title: 't', head: 'other', base: 'main', body: 'b' }],
       ['POST /repos/{owner}/{repo}/pulls', { title: 't', head: `proof/${RUN_ID}/main`, base: 'other', body: 'b' }],
       ['POST /repos/{owner}/{repo}/pulls', { title: 't', head: 'proof/20261103-120000-ffffff/main', base: 'main', body: 'b' }],
+      ['POST /repos/{owner}/{repo}/pulls', { title: 't', head: `proof/${RUN_ID}/main`, base: 'main', body: 'b', maintainer_can_modify: true }],
+      ['DELETE /repos/{owner}/{repo}/actions/variables/{name}', { name: 'MY_KEY', extra: 1 }],
       ['PATCH /repos/{owner}/{repo}/pulls/{pull_number}', { pull_number: 3, base: 'other' }],
       ['PATCH /repos/{owner}/{repo}/pulls/{pull_number}', { pull_number: 3, state: 'open' }],
       ['PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge', { pull_number: 3, sha, merge_method: 'merge', commit_message: 'x' }],

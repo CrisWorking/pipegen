@@ -1216,7 +1216,7 @@ describe('final review I-3: the read secret names follow the workflows of each p
   /** The workflows Plan G would push for `d`: every step's tool; the switched-to tool reads REGISTRY_TOKEN. */
   const render = (d: PipelineDraft): { path: string; content: string }[] => [{
     path: '.github/workflows/pipegen.yml',
-    content: `on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    env:\n      K: \${{ secrets.${STRIPE} }}\n    steps:\n${d.steps.map((x) => `      - run: echo ${x.tool.id}${x.tool.id === SWITCHED ? `\n        env:\n          T: \${{ secrets.${REGISTRY} }}` : ''}`).join('\n')}\n`,
+    content: `on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    env:\n      K: \${{ secrets.${STRIPE} }}\n      G: \${{ secrets.GITHUB_TOKEN }}\n    steps:\n${d.steps.map((x) => `      - run: echo ${x.tool.id}${x.tool.id === SWITCHED ? `\n        env:\n          T: \${{ secrets.${REGISTRY} }}` : ''}`).join('\n')}\n`,
   }];
   const changeStep = (): Answer => answer({ action: 'change-step', needId: 'image-build', candidateId: SWITCHED, explanation: 'Use the reviewed build action.' });
   const failing = (word: string) => proof({ part: 'docker', needId: 'image-build', log: errLog(word) });
@@ -1236,12 +1236,12 @@ describe('final review I-3: the read secret names follow the workflows of each p
     // stored after the answer and BEFORE the ticket and the push of the proof that runs the new tool
     expect(t.slice(placed + 1, placed + 3)).toEqual(['ticket', 'prove:placeholder']);
     expect(t.filter((x) => x.startsWith('placeholders:'))).toEqual([`placeholders:${REGISTRY}`]);   // once
-    expect(w.keys.ticketReadBy[0]).toEqual([STRIPE]);
-    expect(w.keys.ticketReadBy[1]).toEqual([REGISTRY, STRIPE]);
+    expect(w.keys.ticketReadBy[0]).toEqual(['GITHUB_TOKEN', STRIPE]);
+    expect(w.keys.ticketReadBy[1]).toEqual(['GITHUB_TOKEN', REGISTRY, STRIPE]);
     // the excerpt of the second run: its brand is checked with the names its workflows read
-    expect(w.keys.evidenceReadBy[0]).toEqual([STRIPE]);
-    expect(w.keys.evidenceReadBy[1]).toEqual([REGISTRY, STRIPE]);
-    expect(w.reqs).toHaveLength(2);
+    expect(w.keys.evidenceReadBy[0]).toEqual(['GITHUB_TOKEN', STRIPE]);
+    expect(w.keys.evidenceReadBy[1]).toEqual(['GITHUB_TOKEN', REGISTRY, STRIPE]);
+    expect(w.reqs).toHaveLength(2);   // GITHUB_TOKEN (GitHub's own) never needs a placeholder
   });
 
   it('a read name that got no placeholder before the run (unknown before, or the store failed): no excerpt of that run goes to the AI', async () => {
@@ -1282,6 +1282,25 @@ describe('final review I-3: the read secret names follow the workflows of each p
     expect(own.timeline.some((x) => x.startsWith('placeholders:'))).toBe(false);
   });
 
+  it('a name found before the keys are first stored is in that setup, and in the setup after a switch back from real keys', async () => {
+    const w = world({
+      draft: baseDraft([], { steps: [...baseDraft().steps, spec(SWITCHED, 'image-build', 'api')] }),   // no AI-written file: real keys first
+      vault: { [STRIPE]: VALUE },
+      keys: (tl) => { const k = new FakeKeys(tl); k.mode = 'none'; return k; },
+      workflowsOf: (d) => render(d),
+      prove: (n, d) => ({ ...(n <= 1 ? failing('alpha') : green()), workflows: render(d) }),
+      answers: [giveUp()],
+    });
+    await w.run();
+    const t = w.timeline;
+    expect(t[0]).toBe(`setup:${STRIPE},${REGISTRY}`);
+    expect(t).toContain(`real:${STRIPE}`);
+    const del = t.indexOf('deleteAll');
+    expect(del, t.join(' ')).toBeGreaterThan(0);   // the run again with placeholders (E7-R1)
+    expect(t[del + 1]).toBe(`setup:${STRIPE},${REGISTRY}`);
+    expect(t.some((x) => x.startsWith('placeholders:'))).toBe(false);
+  });
+
   it('unknown names (no workflows given back, or a workflow workflowSecretNames can\'t read) → every organisation secret counts as read (null)', async () => {
     const w = world({ stored: [STRIPE], prove: (n) => (n === 0 ? failing('alpha') : green()), answers: [giveUp()] });
     await w.run();
@@ -1300,7 +1319,7 @@ describe('final review I-3: the read secret names follow the workflows of each p
     });
     await r.run();
     expect(r.reruns).toHaveLength(1);
-    expect(r.keys.ticketReadBy[1]).toEqual([STRIPE]);     // the re-run's ticket
-    expect(r.keys.evidenceReadBy[0]).toEqual([STRIPE]);   // the re-run's excerpt
+    expect(r.keys.ticketReadBy[1]).toEqual(['GITHUB_TOKEN', STRIPE]);     // the re-run's ticket
+    expect(r.keys.evidenceReadBy[0]).toEqual(['GITHUB_TOKEN', STRIPE]);   // the re-run's excerpt
   });
 });
