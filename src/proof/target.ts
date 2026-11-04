@@ -23,7 +23,8 @@
 //   The stop gate is checked again inside the call withRateLimit retries (review I1), so a stop that begins during a
 //   rate-limit wait sends nothing more.
 // - githubRead is the one generic read (GET routes only, review M3).
-// - createHelperRepo(gh, repo, login) is the one repo create (App mode only, decided by the caller; ruling S19): the
+// - createHelperRepo(gh, repo, login, permit) is the one repo create (App mode only, decided by the caller; ruling S19; the
+//   permit only an armed StateStore issues, E8 fix round 2): the
 //   name is the guarded one, a personal account's create needs the token's login to be the owner (POST /user/repos
 //   makes the repo under the login), and GitHub's answer must name that repo and say private.
 // - Secrets (E4; threat T12; carries G1 and E1-R5): guardedWrite refuses every secret write (any non-DELETE route with a
@@ -382,16 +383,43 @@ const DESCRIPTIONS: Record<GuardedRepo['kind'], string> = {
 };
 export const helperDescription = (kind: GuardedRepo['kind']): string => DESCRIPTIONS[kind];
 
+// ---------- the create permit (E8 fix round 2, review O-2) ----------
+
+/** Only an armed StateStore (state.ts, its cleanup registered for Ctrl-C) gets one: no repo is made before that. Single use. */
+export interface CreatePermit { readonly createPermit: true }
+interface PermitRecord { owner: string; appRepo: string; used: boolean }
+const permits = new WeakMap<object, PermitRecord>();
+type PermitIssuer = (app: AppRef) => CreatePermit;
+let permitIssuer: PermitIssuer | null = (app) => {
+  const p: CreatePermit = Object.freeze({ createPermit: true as const });
+  permits.set(p, { owner: String(app.owner), appRepo: String(app.repo), used: false });
+  return p;
+};
+
+/** The permit maker, handed out ONCE: state.ts takes it when it loads (StateStore.createPermit, armed only). Later calls throw. */
+export function takeCreatePermitIssuer(): PermitIssuer {
+  const f = permitIssuer;
+  if (f === null) throw new ScratchGuardError('the create-permit issuer was already taken.');
+  permitIssuer = null;
+  return f;
+}
+
 /**
  * Creates the guarded helper repo, private, with a first commit (plan Task 1: `private: true`, `auto_init: true`):
  * POST /orgs/{org}/repos for an organisation, POST /user/repos for a personal account, only when `login` (the token's
  * user) is the owner. The caller decides App mode (ruling S19: never in token mode). GitHub's answer must name that
  * repo and say private, else ProofStopError. GitHub's errors pass through (a 422 "name already exists" included).
  */
-export async function createHelperRepo(gh: Octokit, r: GuardedRepo, login: string | null, clock: RateClock = clockOf(gh)): Promise<Record<string, unknown>> {
+export async function createHelperRepo(gh: Octokit, r: GuardedRepo, login: string | null, permit: CreatePermit, clock: RateClock = clockOf(gh)): Promise<Record<string, unknown>> {
   requireGuarded(r);
   const t = r.target;
   checkTarget(t, { owner: t.owner, repo: t.appRepo });
+  // E8 fix round 2 (O-2): a permit from an armed StateStore, for this app, not used before; spent here, before anything is sent
+  const rec = typeof permit === 'object' && permit !== null ? permits.get(permit) : undefined;
+  if (rec === undefined || rec.used || rec.owner.toLowerCase() !== t.owner.toLowerCase() || rec.appRepo.toLowerCase() !== t.appRepo.toLowerCase()) {
+    refuse(`a helper repo is created only with an unused create permit for ${t.owner}/${t.appRepo} (its cleanup registered for Ctrl-C).`);
+  }
+  rec.used = true;
   notStopping();
   const org = t.ownerType === 'Organization';
   if (!org && (login === null || login.toLowerCase() !== t.owner.toLowerCase())) {

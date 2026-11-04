@@ -55,6 +55,7 @@ import { knownValueScrubber } from '../ai/redact.js';
 import type { CliIO } from '../cli/io.js';
 import { SecretVault, storeRepoSecretsVia, storeSecretsVia, type SecretSink } from '../create/secrets.js';
 import { validDate } from '../../gate/src/date.js';
+import { parseYaml } from '../engine/yaml-parse.js';
 import { isRateStop, type RateClock } from '../engine/github-rate.js';
 import { clockOf, githubTokenRejected, isAnonymousClient } from '../github/client.js';
 import { interrupting } from '../util/exit-hooks.js';
@@ -670,36 +671,46 @@ export class ScratchKeys {
 const isTokenRejected = (gh: Octokit, e: unknown): boolean => (e as { status?: unknown } | null)?.status === 401 && !isAnonymousClient(gh);
 
 /**
- * E8 (carry E4-R4 R7): the secret names the proof's workflows read, for ScratchKeysDeps.readByWorkflows: every
- * `secrets.NAME` and `secrets['NAME']` / `secrets["NAME"]` in the given workflow texts, `secrets` in any letter case (fix
- * round 1, I-7), names upper-cased, sorted. null when a
- * workflow reads the secrets in a way no name can be taken from (`secrets[expr]`, `toJSON(secrets)`, `secrets` alone):
- * then every organisation secret counts as read (the fail-closed default of ScratchKeys).
+ * E8 (carry E4-R4 R7): the secret names the proof's workflows read, for ScratchKeysDeps.readByWorkflows, upper-cased, sorted.
+ * Fix round 2 (review O-1): read from the DECODED YAML, never the raw text. Each workflow is parsed by the referee's own
+ * parser (engine/yaml-parse.ts, user mode); then every string scalar, keys included (escapes, quoting, block and flow styles
+ * already decoded), is searched for `secrets` in any letter case (Unicode case folding: `ſecrets` counts too), each followed
+ * by `.NAME` or `['NAME']` / `["NAME"]`. null (every organisation secret counts as read: ScratchKeys' fail-closed default)
+ * when a workflow can't be parsed, when `secrets` appears without a name (`secrets[expr]`, `toJSON(secrets)`, the word in a
+ * name or a script), or when a `secrets:` key passes anything but a map (`secrets: inherit` passes them all). The key
+ * `secrets:` of a reusable-workflow call itself reads nothing: its values are scanned like any scalar.
  */
 export function workflowSecretNames(workflows: readonly { content: string | Uint8Array }[]): string[] | null {
   const names = new Set<string>();
   for (const w of workflows) {
     const text = typeof w.content === 'string' ? w.content : Buffer.from(w.content).toString('utf8');
-    // review I-7: Actions expression context names are case-insensitive (`SECRETS.X`, `Secrets['x']`)
-    for (const m of text.matchAll(/\bsecrets\b/gi)) {
-      const rest = text.slice((m.index ?? 0) + m[0].length);
-      const dot = /^\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)/.exec(rest);
-      const idx = /^\s*\[\s*(['"])([A-Za-z_][A-Za-z0-9_]*)\1\s*\]/.exec(rest);
-      const name = dot?.[1] ?? idx?.[2];
-      if (name === undefined) {
-        // the word outside an expression (a key `secrets: inherit`, a comment, a step name) reads nothing by itself;
-        // `secrets: inherit` passes every secret to a called workflow, so it counts as unknown
-        const at = m.index ?? 0;
-        const end = text.indexOf('\n', at);
-        const line = text.slice(text.lastIndexOf('\n', at) + 1, end === -1 ? undefined : end);
-        if (/^\s*#/.test(line)) continue;
-        if (/^\s*secrets\s*:\s*(?:#.*)?$/.test(line)) continue;   // a `secrets:` map of a called workflow: its values are expressions read above
-        return null;
+    const r = parseYaml(text, 'user');
+    if (!('parsed' in r)) return null;
+    if (passesAllSecrets(r.parsed.js)) return null;
+    for (const scalar of r.parsed.scalars) {
+      if (scalar === 'secrets') continue;   // the reusable-workflow call's key (its map's values are scalars of their own)
+      for (const m of scalar.matchAll(/\bsecrets\b/giu)) {
+        const rest = scalar.slice((m.index ?? 0) + m[0].length);
+        const dot = /^\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)/.exec(rest);
+        const idx = /^\s*\[\s*(['"])([A-Za-z_][A-Za-z0-9_]*)\1\s*\]/.exec(rest);
+        const name = dot?.[1] ?? idx?.[2];
+        if (name === undefined) return null;
+        names.add(name.toUpperCase());
       }
-      names.add(name.toUpperCase());
     }
   }
   return [...names].sort();
+}
+
+/** Any `secrets:` key whose value isn't a map (`secrets: inherit`): every secret is passed on, so no name list is known. */
+function passesAllSecrets(v: unknown): boolean {
+  if (Array.isArray(v)) return v.some(passesAllSecrets);
+  if (typeof v !== 'object' || v === null) return false;
+  for (const [k, x] of Object.entries(v)) {
+    if (k === 'secrets' && (typeof x !== 'object' || x === null || Array.isArray(x))) return true;
+    if (passesAllSecrets(x)) return true;
+  }
+  return false;
 }
 
 /**

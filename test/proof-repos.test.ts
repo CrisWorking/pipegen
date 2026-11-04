@@ -14,6 +14,7 @@ import {
   assertCentral, assertScratch, createHelperRepo, githubRead, guardedWrite, makeRepoPrivate, proofTarget, ProofStopError, ScratchGuardError,
   type GuardedRepo, type ProofApp,
 } from '../src/proof/target.js';
+import { armedStore } from './helpers/armed-store.js';
 import { world, SHA_MAIN, type WorldOptions } from './helpers/proof-github.js';
 
 const OWNER = 'CrisWorking';
@@ -50,11 +51,14 @@ const by = (a: Access) => ({ [AU]: a }) as Pick<ProofRepoOptions, 'auth'>;
 const fgMode: Access = { kind: 'fine-grained', canCreateRepos: false };
 const appMode: Access = { kind: 'app', canCreateRepos: true };
 const SN_KEY = ['sec', 'ret_name'].join('');
-const opts = (o: Partial<ProofRepoOptions> = {}): ProofRepoOptions => ({ ...by(fgMode), actions: ALL_PINS, runId: '20261103-120000-abcdef', beforeCreate: () => {}, ...o });
+const opts = (o: Partial<ProofRepoOptions> = {}): ProofRepoOptions => ({ ...by(fgMode), actions: ALL_PINS, runId: '20261103-120000-abcdef', ...o });
+// E8 fix round 2 (O-2): a repo is created only with a permit from an armed StateStore (Plan G's), one per app
+const ARMED = { user: await armedStore(app()), org: await armedStore(app({ owner: 'AcmeOrg', ownerType: 'Organization' })) };
+const permitFor = (a: ProofApp) => () => (a.owner === 'AcmeOrg' ? ARMED.org : ARMED.user).createPermit();
 const run = (w: WorldOptions, a: ProofApp = app(), o: Partial<ProofRepoOptions> = {}, answer = true) => {
   const g = world(w);
   const i = io(answer);
-  return { g, i, result: checkProofRepos(g.gh, a, opts(o), i) };
+  return { g, i, result: checkProofRepos(g.gh, a, opts({ createPermit: permitFor(a), ...o }), i) };
 };
 const writePaths = (g: ReturnType<typeof world>) => g.writes().map((c) => `${c.method} ${decodeURIComponent(c.url.pathname)}`);
 
@@ -284,13 +288,13 @@ describe('E1 repos (plan Task 1, preflight S1/S13/S19)', () => {
     expect(stop.g.seen().slice(stop.g.seen().indexOf('POST /user/repos') + 1)).toEqual([]);
   });
 
-  it('repos: no repo is created before the cleanup is armed (beforeCreate; E8 fix round 1, M-3)', async () => {
-    // without the hook: refused before POST /user/repos
-    const none = run({ repos: { pipelines: { private: true } } }, app(), { ...by(appMode), beforeCreate: undefined });
+  it('repos: no repo is created before the cleanup is armed (createPermit; E8 fix rounds 1-2, M-3, O-2)', async () => {
+    // without the permit source: refused before POST /user/repos
+    const none = run({ repos: { pipelines: { private: true } } }, app(), { ...by(appMode), createPermit: undefined });
     await expect(none.result).rejects.toThrow(/cleanup/);
     expect(none.g.seen()).not.toContain('POST /user/repos');
     // a hook that refuses (the state store not armed): refused before the POST too
-    const refused = run({ repos: { pipelines: { private: true } } }, app(), { ...by(appMode), beforeCreate: () => { throw new Error('not armed'); } });
+    const refused = run({ repos: { pipelines: { private: true } } }, app(), { ...by(appMode), createPermit: () => { throw new Error('not armed'); } });
     await expect(refused.result).rejects.toThrow('not armed');
     expect(refused.g.seen()).not.toContain('POST /user/repos');
   });
@@ -446,7 +450,7 @@ describe('E1 repos (plan Task 1, preflight S1/S13/S19)', () => {
       ['guardedWrite POST ref', (r) => guardedWrite(g.gh, r, 'POST /repos/{owner}/{repo}/git/refs', { ref: `refs/heads/proof/${t.runId}`, sha: SHA_MAIN })],
       ['guardedWrite PUT access', (r) => guardedWrite(g.gh, r, 'PUT /repos/{owner}/{repo}/actions/permissions/access', { access_level: 'user' })],
       ['guardedWrite DELETE ref', (r) => guardedWrite(g.gh, r, 'DELETE /repos/{owner}/{repo}/git/refs/{ref}', { ref: `heads/proof/${t.runId}` })],
-      ['createHelperRepo', (r) => createHelperRepo(g.gh, r, OWNER)],
+      ['createHelperRepo', (r) => createHelperRepo(g.gh, r, OWNER, ARMED.user.createPermit())],
       ['makeRepoPrivate', (r) => makeRepoPrivate(g.gh, r, 'public')],
       ['setScratchDefaultBranch', (r) => setScratchDefaultBranch(g.gh, r)],
     ];

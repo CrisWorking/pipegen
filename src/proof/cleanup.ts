@@ -41,6 +41,8 @@ import {
 /** How long the cleanup waits for writes in flight, and for cancelled runs to end, by default. */
 export const CLEANUP_SETTLE_MS = 30_000;
 export const CLEANUP_CANCEL_WAIT_MS = 30_000;
+/** The minutes read before the run deletes: at most this long (fix round 2, N-2). */
+export const CLEANUP_MEASURE_MS = 15_000;
 const CANCEL_POLL_MS = 5_000;
 /** List pages the cleanup reads at most (100 items each). */
 export const CLEANUP_LIST_PAGES = 10;
@@ -58,6 +60,8 @@ export interface CleanupOptions {
   rateClock?: RateClock;
   settleMs?: number;
   cancelWaitMs?: number;
+  /** How long the minutes read before the run deletes may take (default CLEANUP_MEASURE_MS; fix round 2, N-2). */
+  measureMs?: number;
   /** The proof's meters (fix round 1, I-6): saved before anything else and again, read, before any run is deleted. */
   meters?: () => ProofMeters | undefined;
 }
@@ -195,7 +199,7 @@ async function clean(gh: Octokit, t: ProofTarget, store: StateStore, keys: Scrat
     }
 
     // the minutes used, measured before any run is deleted (review I-6: a resume restores them, never a fresh budget)
-    const measured = await measureMinutes(gh, t, st, opts.meters?.(), rate);
+    const measured = await measureMinutes(gh, t, st, opts.meters?.(), rate, { ms: opts.measureMs ?? CLEANUP_MEASURE_MS, ...(opts.signal === undefined ? {} : { signal: opts.signal }) });
     save((n) => {
       applyMeters(n, opts.meters?.());
       if (measured !== null) n.minutesUsed = Math.max(n.minutesUsed, measured);
@@ -246,7 +250,8 @@ async function clean(gh: Octokit, t: ProofTarget, store: StateStore, keys: Scrat
   // the leftovers of this cleanup replace those an earlier cleanup of this run recorded (each was looked for again above);
   // anything recorded meanwhile by someone else (the interrupt registry: a hook cut by its deadline) stays
   save((n) => {
-    n.leftovers = [...new Set([...left, ...n.leftovers.filter((l) => !before.has(l) && !dropped.has(l))])];
+    // fix round 2 (N-1): a repo pipegen can't see wasn't looked at again, so what earlier cleanups recorded there stays
+    n.leftovers = [...new Set([...left, ...n.leftovers.filter((l) => !dropped.has(l) && (scratchMissing || !before.has(l)))])];
     n.cleanupDone = n.leftovers.length === 0;
     if (n.stage === 'proven') n.stage = 'cleaned';
   });
@@ -271,18 +276,33 @@ function applyMeters(n: RunState, m: ProofMeters | undefined): void {
  * without one (`pipegen cleanup` after a kill), a meter over the saved proof start. A read that fails counts as the whole
  * cap (an unknown spend never gives a resume a fresh budget). null: nothing to measure (no meter, no saved start).
  */
-async function measureMinutes(gh: Octokit, t: ProofTarget, st: RunState, m: ProofMeters | undefined, rate: RateClock): Promise<number | null> {
+async function measureMinutes(gh: Octokit, t: ProofTarget, st: RunState, m: ProofMeters | undefined, rate: RateClock, limit: { ms: number; signal?: AbortSignal }): Promise<number | null> {
+  // fix round 2 (N-2): the read is bounded (its N+1 requests must not hold up the cleanup on the Ctrl-C path); a read that is
+  // cut gives the meter's last count, or (no meter) the whole cap
+  const bounded = async (read: Promise<unknown>): Promise<boolean> => {
+    if (limit.signal?.aborted === true) return false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    const cut = new Promise<false>((done) => {
+      timer = setTimeout(() => done(false), Math.max(0, limit.ms));
+      onAbort = () => done(false);
+      limit.signal?.addEventListener('abort', onAbort, { once: true });
+    });
+    try {
+      return await Promise.race([read.then(() => true, () => false), cut]);
+    } finally {
+      clearTimeout(timer);
+      if (onAbort !== undefined) limit.signal?.removeEventListener('abort', onAbort);
+    }
+  };
   if (m?.minutes !== undefined) {
-    try { await m.minutes.add(gh, t, { clock: rate }); } catch { /* the meter keeps its last count */ }
+    await bounded(m.minutes.add(gh, t, { clock: rate }));
     return m.minutes.used;
   }
   if (st.proofStart === undefined) return null;
   const meter = new MinutesMeter(st.cap, st.proofStart.at);
-  try {
-    await meter.add(gh, t, { clock: rate });
-  } catch {
-    return st.cap;
-  }
+  if ((st.minutesBase ?? 0) > 0) meter.restore(st.minutesBase as number);   // fix round 2 (N-3): base + the runs since the start
+  if (!(await bounded(meter.add(gh, t, { clock: rate })))) return st.cap;
   return meter.problem === null ? meter.used : Math.max(meter.used, st.cap);
 }
 
@@ -611,11 +631,23 @@ export function saveStopState(store: StateStore, meters?: () => ProofMeters | un
  * runs (or the repo) can they no longer be listed: then the meter starts at a new proof start by GitHub's clock
  * (minutes.ts proofStart) and the saved minutes are restored, so each minute counts once either way.
  */
-export async function minutesForResume(gh: Octokit, t: ProofTarget, s: Pick<RunState, 'cap' | 'minutesUsed' | 'proofStart' | 'runsDeleted'>, opts: { clock?: RateClock } = {}): Promise<MinutesMeter> {
-  if (s.proofStart !== undefined && s.runsDeleted !== true) return new MinutesMeter(s.cap, s.proofStart.at);
-  const start = await proofStart(gh, t, opts);
+export async function minutesForResume(gh: Octokit, t: ProofTarget, s: Pick<RunState, 'cap' | 'minutesUsed' | 'proofStart' | 'runsDeleted' | 'minutesBase'>, opts: { clock?: RateClock; store?: StateStore } = {}): Promise<MinutesMeter> {
+  if (s.proofStart !== undefined && s.runsDeleted !== true) {
+    // the runs since the start are listed again; what came before it (fix round 2, N-3) is restored
+    const kept = new MinutesMeter(s.cap, s.proofStart.at);
+    if ((s.minutesBase ?? 0) > 0) kept.restore(s.minutesBase as number);
+    return kept;
+  }
+  const start = await proofStart(gh, t, opts.clock === undefined ? {} : { clock: opts.clock });
   const m = new MinutesMeter(s.cap, start.at);
   if (s.minutesUsed > 0) m.restore(s.minutesUsed);
+  // fix round 2 (N-3): the new window and its base are saved, so a later count (a cleanup with no meter, after a kill) is
+  // base + the runs since the new start, never just the new runs
+  opts.store?.update((n) => {
+    n.proofStart = { at: start.at, fromServer: start.fromServer };
+    n.minutesBase = s.minutesUsed;
+    n.runsDeleted = false;
+  });
   return m;
 }
 

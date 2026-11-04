@@ -32,7 +32,10 @@ import { safeText } from '../util/safe-text.js';
 import { prepareTrustedDir, type TrustedDirKind } from '../util/trusted-dir.js';
 import { trackedTransport } from './inflight.js';
 import { PLACEHOLDER_PREFIX } from './keys.js';
-import { ProofStopError, validBranchName, type GuardedRepo, type ProofApp } from './target.js';
+import { ProofStopError, takeCreatePermitIssuer, validBranchName, type CreatePermit, type GuardedRepo, type ProofApp } from './target.js';
+
+/** The create-permit maker, taken once when this module loads (target.ts hands it out once). */
+const issuePermit = takeCreatePermitIssuer();
 import type { ProofTransport } from './snapshot.js';
 
 export type Stage = 'consented' | 'planned' | 'debated' | 'created' | 'proving' | 'proven' | 'cleaned' | 'delivered' | 'interrupted' | 'stopped';
@@ -77,6 +80,11 @@ export interface RunState {
   cap: number;
   /** When the proof started, by GitHub's clock (minutes.ts proofStart), in ms; `fromServer` false: this machine's minus the margin. */
   proofStart?: { at: number; fromServer: boolean };
+  /**
+   * Fix round 2 (N-3): the minutes used before `proofStart`, by runs that no longer exist (a resume after the cleanup deleted
+   * them restores them and starts a new window). The count is `minutesBase` + the runs since `proofStart`.
+   */
+  minutesBase?: number;
   /** The cleanup deleted scratch runs (or the whole repo): a resumed meter can't count them again and restores minutesUsed. */
   runsDeleted?: boolean;
   /** The AI spend (AiSpendMeter.usedUsd: spent plus reserved), and the cap (null: Ollama, no cap). */
@@ -143,6 +151,7 @@ const stateSchema = z.strictObject({
   cap: nonNeg,
   proofStart: z.strictObject({ at: finite, fromServer: z.boolean() }).optional(),
   runsDeleted: z.boolean().optional(),
+  minutesBase: nonNeg.optional(),
   aiCostUsd: nonNeg,
   aiCap: nonNeg.nullable(),
   scratchRepoId: z.number().int().positive().optional(),
@@ -377,7 +386,10 @@ export class StateStore {
       delete n.interruptedAt;
       delete n.stoppedBy;
       // review I-4: a proof that starts (again) may leave things behind; only a finished cleanup sets it back
-      if (to === 'proving') n.cleanupDone = false;
+      if (to === 'proving') {
+        n.cleanupDone = false;
+        n.scratchDeleted = false;   // fix round 2 (N-1): the scratch repo is used again, so a "deleted" mark is stale
+      }
     });
   }
 
@@ -400,10 +412,12 @@ export class StateStore {
     this.requireArmed('push a branch');
     if (!validBranchName(ref)) throw new StateError('The branch to record is not a branch name.');
     if (repo === 'scratch' && ref === defaultBranch) return;
-    if (this.#need().branches.some((b) => b.repo === repo && b.ref === ref) && this.#need().cleanupDone !== true) return;
+    const cur = this.#need();
+    if (cur.branches.some((b) => b.repo === repo && b.ref === ref) && cur.cleanupDone !== true && !(repo === 'scratch' && cur.scratchDeleted === true)) return;
     this.update((n) => {
       if (!n.branches.some((b) => b.repo === repo && b.ref === ref)) n.branches.push({ repo, ref });
       n.cleanupDone = false;   // review I-4: something new may be left behind
+      if (repo === 'scratch') n.scratchDeleted = false;   // fix round 2 (N-1)
     });
   }
 
@@ -416,6 +430,7 @@ export class StateStore {
       if (have === undefined) n.prs.push(number === undefined ? { head } : { head, number });
       else if (number !== undefined) have.number = number;
       n.cleanupDone = false;
+      n.scratchDeleted = false;   // fix round 2 (N-1): PRs live in the scratch repo
     });
   }
 
@@ -423,7 +438,17 @@ export class StateStore {
   recordSecretNames(names: readonly string[]): void {
     this.requireArmed('store a secret');   // review M-3
     for (const n of names) if (typeof n !== 'string' || !SECRET_NAME_RE.test(n)) throw new StateError('A secret name to record is not a secret name.');
-    this.update((s) => { s.secretNames = [...new Set([...s.secretNames, ...names.map((n) => n.toUpperCase())])].sort(); s.cleanupDone = false; });
+    this.update((s) => { s.secretNames = [...new Set([...s.secretNames, ...names.map((n) => n.toUpperCase())])].sort(); s.cleanupDone = false; s.scratchDeleted = false; });
+  }
+
+  /**
+   * Fix round 2 (O-2): a single-use permit to create a helper repo of this app (checkProofRepos' createPermit), only while
+   * the cleanup is armed. createHelperRepo refuses to send anything without one.
+   */
+  createPermit(): CreatePermit {
+    this.requireArmed('create a repo');
+    const s = this.#need();
+    return issuePermit({ owner: s.app.owner, repo: s.app.repo });
   }
 
   /** The id GitHub gave the scratch repo pipegen just created (checkProofRepos' onCreated). */

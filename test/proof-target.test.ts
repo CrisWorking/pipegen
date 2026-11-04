@@ -10,6 +10,7 @@ import {
 } from '../src/proof/target.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { interrupting } from '../src/util/exit-hooks.js';
+import { armedStore } from './helpers/armed-store.js';
 import { world, SHA_MAIN } from './helpers/proof-github.js';
 
 vi.mock(import('../src/util/exit-hooks.js'), async (orig) => ({ ...(await orig()), interrupting: vi.fn(() => false) }));
@@ -18,6 +19,7 @@ afterEach(() => { vi.mocked(interrupting).mockReturnValue(false); });
 const OWNER = 'CrisWorking';
 const SCRATCH = 'pipegen-proof-shop';
 const app = (o: Partial<ProofApp> = {}): ProofApp => ({ owner: OWNER, repo: 'shop', private: true, ownerType: 'User', defaultBranch: 'main', ...o });
+const ARMED = await armedStore(app());   // E8 fix round 2 (O-2): createHelperRepo needs a permit from an armed store
 const both = { pipelines: { private: true }, [SCRATCH]: { private: true }, shop: { private: true } };
 
 describe('E1 proof target and runId', () => {
@@ -149,7 +151,7 @@ describe('E1 guardedWrite (S3)', () => {
     const t = proofTarget(app());
     vi.mocked(interrupting).mockReturnValue(true);
     await expect(guardedWrite(g.gh, assertScratch(t, app()), 'PATCH /repos/{owner}/{repo}', { private: true })).rejects.toThrow(/stopping/);
-    await expect(createHelperRepo(g.gh, assertScratch(t, app()), OWNER)).rejects.toThrow(/stopping/);
+    await expect(createHelperRepo(g.gh, assertScratch(t, app()), OWNER, ARMED.createPermit())).rejects.toThrow(/stopping/);
     expect(g.calls).toEqual([]);
   });
 
@@ -161,7 +163,7 @@ describe('E1 guardedWrite (S3)', () => {
     expect(g.seen()).toEqual([`PATCH /repos/${OWNER}/${SCRATCH}`]);
     vi.mocked(interrupting).mockReturnValue(false);
     const c = world({ repos: {}, rateLimitOnce: 'POST /user/repos' });
-    await expect(createHelperRepo(c.gh, assertScratch(t, app()), OWNER, clock())).rejects.toThrow(ScratchGuardError);
+    await expect(createHelperRepo(c.gh, assertScratch(t, app()), OWNER, ARMED.createPermit(), clock())).rejects.toThrow(ScratchGuardError);
     expect(c.seen()).toEqual(['POST /user/repos']);
     // without the stop, the same wait retries once and the write goes through
     vi.mocked(interrupting).mockReturnValue(false);
@@ -173,15 +175,15 @@ describe('E1 guardedWrite (S3)', () => {
   it('createHelperRepo: only the two helper names, under the owner, checked private in GitHub\'s answer', async () => {
     const g = world({ repos: {} });
     const t = proofTarget(app());
-    const made = await createHelperRepo(g.gh, assertScratch(t, app()), OWNER);
+    const made = await createHelperRepo(g.gh, assertScratch(t, app()), OWNER, ARMED.createPermit());
     expect(made).toMatchObject({ full_name: `${OWNER}/${SCRATCH}`, private: true });
     // a personal account: /user/repos makes the repo under the token's login, so it must be the owner
-    await expect(createHelperRepo(g.gh, assertCentral(t, app()), 'someone-else')).rejects.toThrow(ScratchGuardError);
-    await expect(createHelperRepo(g.gh, assertCentral(t, app()), null)).rejects.toThrow(ScratchGuardError);
+    await expect(createHelperRepo(g.gh, assertCentral(t, app()), 'someone-else', ARMED.createPermit())).rejects.toThrow(ScratchGuardError);
+    await expect(createHelperRepo(g.gh, assertCentral(t, app()), null, ARMED.createPermit())).rejects.toThrow(ScratchGuardError);
     expect(g.seen()).toEqual(['POST /user/repos']);
     // GitHub's answer names another repo or says public: a stop
     const pub = world({ repos: {}, createPrivate: false });
-    await expect(createHelperRepo(pub.gh, assertScratch(t, app()), OWNER)).rejects.toThrow(ProofStopError);
+    await expect(createHelperRepo(pub.gh, assertScratch(t, app()), OWNER, ARMED.createPermit())).rejects.toThrow(ProofStopError);
   });
 
   it('a renamed repo GitHub answers for (another full_name) is never used', async () => {

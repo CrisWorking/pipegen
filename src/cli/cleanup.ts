@@ -73,14 +73,15 @@ export async function cleanupCommand(dir: string, io: CliIO, opts: { allowBroad:
       // review I-5: GitHub answers 404 for a scratch repo pipegen didn't delete. Only the user can say it is gone (a token that
       // lost access answers 404 too), so pipegen asks (default No) before it forgets what it left there.
       const full = `${st.app.owner}/${scratch}`;
-      if (await io.prompt.confirm(`Did you delete ${full}? pipegen can't see it. If it is deleted, pipegen forgets what it left there.`, false)) {
+      if (await io.prompt.confirm(`Did you delete ${full}? pipegen can't see it (a token that can't reach it looks the same). If it is deleted, pipegen forgets what it left there.`, false)) {
         store.update((n) => {
           n.scratchDeleted = true;
           delete n.scratchRepoId;
-          n.leftovers = n.leftovers.filter((l) => !l.includes(full));
+          // fix round 2 (N-1): earlier leftovers about the scratch repo (or a cut cleanup of it) go with it; the central repo's stay
+          n.leftovers = n.leftovers.filter((l) => l.includes(`${st.app.owner}/pipelines`));
           n.cleanupDone = n.leftovers.length === 0;
         });
-        left = left.filter((l) => !l.includes(full));
+        left = left.filter((l) => l.includes(`${st.app.owner}/pipelines`));
       }
     }
     if (left.length === 0) {

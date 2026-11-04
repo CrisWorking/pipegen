@@ -39,7 +39,7 @@ import { checkRepoNames, clockOf, GitHubAccessError, githubTokenRejected, hideTo
 import type { Auth } from '../types.js';
 import { safeText } from '../util/safe-text.js';
 import {
-  assertCentral, assertScratch, CENTRAL_REPO, createHelperRepo, githubRead, guardedWrite, helperDescription, makeRepoPrivate, proofTarget, ProofStopError,
+  assertCentral, assertScratch, CENTRAL_REPO, createHelperRepo, type CreatePermit, githubRead, guardedWrite, helperDescription, makeRepoPrivate, proofTarget, ProofStopError,
   requireGuarded, SCRATCH_MARKER, ScratchGuardError, takeAccessIssuer, type GuardedRepo, type ProofApp, type ProofTarget,
 } from './target.js';
 
@@ -65,11 +65,11 @@ export interface ProofRepoOptions {
    */
   onCreated?: (repo: string, id: number) => void;
   /**
-   * E8 fix round 1 (review M-3): called right before pipegen creates a helper repo (App mode). Plan G passes
-   * `() => store.requireArmed('create a repo')`, so no repo is made before the Ctrl-C cleanup is registered. Without it,
-   * pipegen never creates a repo (a stop, before any create call); a throw stops the proof the same way.
+   * E8 fix rounds 1-2 (review M-3, O-2): gives the create permit right before pipegen creates a helper repo (App mode). Plan G
+   * passes `() => store.createPermit()`, which only an armed StateStore gives, so no repo is made before the Ctrl-C cleanup is
+   * registered. Without it, pipegen never creates a repo (a stop, before any create call); a throw stops the proof the same way.
    */
-  beforeCreate?: (repo: string) => void;
+  createPermit?: (repo: string) => CreatePermit;
 }
 
 export interface ProofRepos {
@@ -650,11 +650,11 @@ export async function checkProofRepos(gh: Octokit, app: ProofApp, opts: ProofRep
     if (t.ownerType === 'Organization' || (login !== null && login.toLowerCase() === t.owner.toLowerCase())) {
       toPrint = [];
       for (const r of missing) {
-        if (opts.beforeCreate === undefined) throw new ProofStopError(`pipegen won't create ${r.fullName} before its cleanup is registered for Ctrl-C.`);
-        opts.beforeCreate(r.repo);
+        if (opts.createPermit === undefined) throw new ProofStopError(`pipegen won't create ${r.fullName} before its cleanup is registered for Ctrl-C.`);
+        const permit = opts.createPermit(r.repo);
         let made: Record<string, unknown>;
         try {
-          made = await createHelperRepo(gh, r, login, clock);
+          made = await createHelperRepo(gh, r, login, permit, clock);
         } catch (e) {
           if (e instanceof ScratchGuardError || e instanceof ProofStopError) throw e;
           rethrowHard(gh, e);

@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import type { Prompter } from '../src/cli/io.js';
 import { checkProofRepos, checkScratchAccess, LIST_PAGE_SIZE, MAX_LIST_PAGES, pushUnsurePrompt, type ProofRepoOptions } from '../src/proof/repos.js';
 import { helperDescription, proofTarget, ProofStopError, type ProofApp } from '../src/proof/target.js';
+import { armedStore } from './helpers/armed-store.js';
 import { person, world, type FakeRepo, type WorldOptions } from './helpers/proof-github.js';
 
 const OWNER = 'CrisWorking';
@@ -13,6 +14,7 @@ const ORG = 'AcmeOrg';
 const SCRATCH = 'pipegen-proof-shop';
 const app = (o: Partial<ProofApp> = {}): ProofApp => ({ owner: OWNER, repo: 'shop', private: true, ownerType: 'User', defaultBranch: 'main', ...o });
 const orgApp = (o: Partial<ProofApp> = {}) => app({ owner: ORG, ownerType: 'Organization', ...o });
+const ARMED = await armedStore(app());   // E8 fix round 2 (O-2): repo creation needs a permit from an armed store
 const AU = 'au' + 'th';
 
 function answers(...replies: boolean[]): Prompter & { asked: { msg: string; def: boolean }[] } {
@@ -270,7 +272,7 @@ describe('checkScratchAccess (E1 fix round 1, I2)', () => {
     const reused = world({ repos: { pipelines: { private: true }, [SCRATCH]: { private: true, collaborators: [person(OWNER, 1, 'admin'), person('x', 2, 'write')] } }, access: 'user' });
     await expect(checkProofRepos(reused.gh, app(), { ...({ [AU]: { kind: 'fine-grained', canCreateRepos: false } } as Pick<ProofRepoOptions, 'auth'>), actions: [] }, ioWith())).rejects.toThrow(/These people can push to CrisWorking\/pipegen-proof-shop: x\./);
     const created = world({ repos: {}, access: 'user' });
-    const r = await checkProofRepos(created.gh, app(), { ...({ [AU]: { kind: 'app', canCreateRepos: true } } as Pick<ProofRepoOptions, 'auth'>), actions: [], beforeCreate: () => {} }, ioWith());   // beforeCreate: E8 M-3 (the cleanup armed)
+    const r = await checkProofRepos(created.gh, app(), { ...({ [AU]: { kind: 'app', canCreateRepos: true } } as Pick<ProofRepoOptions, 'auth'>), actions: [], createPermit: () => ARMED.createPermit() }, ioWith());   // E8 M-3 / O-2: a permit from an armed store
     expect(r.ready).toBe(true);
     expect(created.seen()).toContain(`GET /repos/${OWNER}/${SCRATCH}/collaborators`);
     expect(r.access?.scratch.repo).toBe(SCRATCH);
@@ -301,7 +303,7 @@ describe('checkScratchAccess (E1 fix round 1, I2)', () => {
     expect(io.prompt.asked).toEqual([{ msg: `${SCRATCH} exists but pipegen didn't create it. pipegen will overwrite its branches and secrets. Use it?`, def: false }]);
     const made = world({ repos: { pipelines: { private: true } }, access: 'user', createStoredDescription: '' });
     const io2 = ioWith();
-    expect((await checkProofRepos(made.gh, app(), { ...({ [AU]: { kind: 'app', canCreateRepos: true } } as Pick<ProofRepoOptions, 'auth'>), actions: [], beforeCreate: () => {} }, io2)).ready).toBe(true);   // beforeCreate: E8 M-3
+    expect((await checkProofRepos(made.gh, app(), { ...({ [AU]: { kind: 'app', canCreateRepos: true } } as Pick<ProofRepoOptions, 'auth'>), actions: [], createPermit: () => ARMED.createPermit() }, io2)).ready).toBe(true);   // E8 M-3 / O-2
     expect(io2.prompt.asked).toEqual([]);
   });
 
