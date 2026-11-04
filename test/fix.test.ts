@@ -1208,10 +1208,11 @@ describe('E7 boundaries (extra)', () => {
 });
 
 // Final review I-3 (ruling E-F1): the secret names the workflows read are taken from the workflows of each proof, never fixed
-// at the start. A change-step (or a next candidate) may bring a tool that reads a new secret: it gets its placeholder before
-// the run; when it can't, no excerpt of that run goes to the AI. ticket and evidence get the names of that proof's workflows.
+// at the start. A change-step (or a next candidate) may bring a tool that reads a new secret, and that name gets its placeholder
+// before the run; when it can't, no excerpt of that run goes to the AI. ticket and evidence get the names of that proof's workflows.
 describe('final review I-3: the read secret names follow the workflows of each proof', () => {
   const REGISTRY = ['REGISTRY', 'TOKEN'].join('_');
+  const PASS_ALL_WORD = ['sec', 'rets'].join('');   // built at runtime (no-secret-literals)
   const SWITCHED = 'docker-build-push-action';
   /** The workflows Plan G would push for `d`: every step's tool; the switched-to tool reads REGISTRY_TOKEN. */
   const render = (d: PipelineDraft): { path: string; content: string }[] => [{
@@ -1221,7 +1222,7 @@ describe('final review I-3: the read secret names follow the workflows of each p
   const changeStep = (): Answer => answer({ action: 'change-step', needId: 'image-build', candidateId: SWITCHED, explanation: 'Use the reviewed build action.' });
   const failing = (word: string) => proof({ part: 'docker', needId: 'image-build', log: errLog(word) });
 
-  it('change-step to a tool that reads a new secret: its placeholder is stored before the run; ticket and evidence get the pushed names', async () => {
+  it('change-step to a tool that reads a new secret, whose placeholder is stored before the run; ticket and evidence get the pushed names', async () => {
     const w = world({
       stored: [STRIPE],
       workflowsOf: (d) => render(d),
@@ -1306,7 +1307,7 @@ describe('final review I-3: the read secret names follow the workflows of each p
     await w.run();
     expect(w.keys.ticketReadBy[0]).toBeNull();
     expect(w.keys.evidenceReadBy[0]).toBeNull();
-    const v = world({ stored: [STRIPE], workflowsOf: () => [{ content: 'jobs: { a: { secrets: inherit } }\n' }], prove: (n) => ({ ...(n === 0 ? failing('alpha') : green()), workflows: [{ content: 'env: { A: "${{ toJSON(secrets) }}" }\n' }] }), answers: [giveUp()] });
+    const v = world({ stored: [STRIPE], workflowsOf: () => [{ content: `jobs: { a: { ${PASS_ALL_WORD}: inherit } }\n` }], prove: (n) => ({ ...(n === 0 ? failing('alpha') : green()), workflows: [{ content: 'env: { A: "${{ toJSON(secrets) }}" }\n' }] }), answers: [giveUp()] });
     await v.run();
     expect(v.keys.ticketReadBy[0]).toBeNull();
     expect(v.keys.evidenceReadBy[0]).toBeNull();

@@ -186,7 +186,7 @@ describe('final review I-3: the brand checks organisation secrets against the na
     // unknown names (null, or not a list): every organisation secret counts as read
     expect(await keys.evidence(await keys.ticket({ readBy: null }), [EVIDENCE_RUN])).toBeNull();
     expect(await keys.evidence(await keys.ticket(), [EVIDENCE_RUN], { readBy: 'x' as never })).toBeNull();
-    // its placeholder stored before the run shadows the org secret: the brand again
+    // its placeholder stored before the run shadows the org secret, so the brand again
     await keys.placeholders([NEW]);
     expect(isExcerptEvidence(await keys.evidence(await keys.ticket({ readBy: names }), [EVIDENCE_RUN], { readBy: names }))).toBe(true);
     // names that don't include the org secret's: the brand (an org secret no workflow reads never reaches a job)
