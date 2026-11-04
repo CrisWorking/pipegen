@@ -17,7 +17,7 @@
 //   tests      existing suites by job result (JUnit only for created tests, S8); created tests: the JUnit of the run and of the
 //              harness repeat are read in a worker, executed == the static count, skipped == 0, all pass, same results twice.
 //   docker     image build jobs and the harness app-start; for a created Dockerfile also the image scan's critical/high findings
-//              from the gate's warnings (S10).
+//              from the gate's warnings (S10): fixable (or unknown) ones fail it, unfixable ones alone make it not-proven (E9, E5-R3).
 //   compose    the harness app-start.
 //   precommit  the hooks job.
 //   deploy-verify  the harness verify-lookup on the push run of the MERGE commit, and sign-roundtrip when it was rendered.
@@ -475,9 +475,15 @@ async function evaluateInner(draft: PipelineDraft, runs: readonly VariantRuns[],
       }
       if (g !== null) {
         const severe = [...g.blocking, ...g.warnings].filter((f) => (f.needId === 'image-scan' || categoryOf(f.needId) === 'image-scan') && SEVERE.has(f.severity));
-        if (severe.length > 0) {
-          const ids = [...new Set(severe.map((f) => st(f.ruleId, 60)))].slice(0, 8).join(', ');
-          sheet.fail('docker', `the base image has critical/high (fix info unknown until gate-v0.2.2) CVEs (${ids}); another base image tag is needed`, 'image-scan');
+        // E9 (carry E5-R3): the gate's report says per image finding whether trivy names a fixed version. A fixable one, or one with no
+        // flag (an older gate, a message in another shape), fails docker: another base image tag is asked for. When every severe one has
+        // no fixed version, no tag can fix it: docker is not-proven with a note (never proven), and the fix loop is not sent after it.
+        const idsOf = (fs: readonly GateFinding[]): string => [...new Set(fs.map((f) => st(f.ruleId, 60)))].slice(0, 8).join(', ');
+        const fixableOrUnknown = severe.filter((f) => f.fixable !== false);
+        if (fixableOrUnknown.length > 0) {
+          sheet.fail('docker', `the base image has critical/high CVEs with a fixed version or no fix info (${idsOf(fixableOrUnknown)}); another base image tag is needed`, 'image-scan');
+        } else if (severe.length > 0) {
+          sheet.notProven('docker', `the base image has critical/high CVEs with no fixed version yet (${idsOf(severe)}): another base image tag would not fix them, so the created Dockerfile's base image is not proven`, { needId: 'image-scan', caps: true });
         }
       }
     }

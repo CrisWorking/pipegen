@@ -4032,6 +4032,12 @@ var SARIF_TOOLS = Object.freeze(Object.assign(/* @__PURE__ */ Object.create(null
   gosec: tool("gosec", "tag-word"),
   bandit: tool("Bandit", "issue-severity")
 }));
+var TRIVY_VULN_MESSAGE = /^Package: [^\n]*\nInstalled Version: [^\n]*\nVulnerability [^\n]*\nSeverity: [^\n]*\nFixed Version: ([^\n]*)(?:\n|$)/;
+function trivyFixable(message) {
+  if (typeof message !== "string" || message.split("\nFixed Version: ").length !== 2) return void 0;
+  const m = TRIVY_VULN_MESSAGE.exec(message);
+  return m === null ? void 0 : m[1].trim() !== "";
+}
 var SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/;
 var CONTROL2 = /[\u0000-\u001f\u007f]/;
 function decodeOnce(s) {
@@ -11014,17 +11020,22 @@ async function saveTrusted(step, dir, g, r, key, runId) {
   }
   return { baseline, marker, lines };
 }
-var ref = (f) => ({
-  needId: f.needId,
-  job: f.job,
-  tool: safeText(f.tool, 64),
-  ruleId: safeText(f.ruleId, 200),
-  severity: f.severity,
-  ...f.file === void 0 ? {} : { file: safeText(f.file, 300) },
-  ...f.line === void 0 ? {} : { line: f.line },
-  isNew: f.isNew ?? null,
-  secret: f.secret
-});
+function findingRef(f) {
+  const fixable = f.tool === "trivy-image" && !f.secret ? trivyFixable(f.message) : void 0;
+  return {
+    needId: f.needId,
+    job: f.job,
+    tool: safeText(f.tool, 64),
+    ruleId: safeText(f.ruleId, 200),
+    severity: f.severity,
+    ...f.file === void 0 ? {} : { file: safeText(f.file, 300) },
+    ...f.line === void 0 ? {} : { line: f.line },
+    isNew: f.isNew ?? null,
+    secret: f.secret,
+    ...fixable === void 0 ? {} : { fixable }
+  };
+}
+var ref = findingRef;
 function resultDoc(d, verdict, ev, saved) {
   const r = d.result;
   const text = (xs, max = 400) => xs.map((x) => safeText(x, max));

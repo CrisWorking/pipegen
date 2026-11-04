@@ -476,7 +476,7 @@ describe('E7 fix loop', () => {
     const calls: { path: string; baseId: string }[] = [];
     const w = world({
       draft: baseDraft([...dockerFiles(REF22), composeFile()]),
-      prove: (n) => (n === 0 ? proof({ part: 'docker', needId: 'image-scan', detail: 'the base image has critical/high (fix info unknown until gate-v0.2.2) CVEs (CVE-2026-1234); another base image tag is needed' }) : green()),
+      prove: (n) => (n === 0 ? proof({ part: 'docker', needId: 'image-scan', detail: 'the base image has critical/high CVEs with a fixed version or no fix info (CVE-2026-1234); another base image tag is needed' }) : green()),
       answers: [answer({ action: 'change-base', baseId: 'node-24-bookworm-slim', path: 'api/Dockerfile', explanation: 'Use the newer base.' })],
       dockerfileFor: async (path, baseId) => { calls.push({ path, baseId }); return [file('api/Dockerfile', DF(baseImageRef(baseId)), 'docker'), file('api/.dockerignore', DOCKERIGNORE, 'docker')]; },
     });

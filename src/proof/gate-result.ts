@@ -13,7 +13,11 @@ const SEVERITIES: ReadonlySet<string> = new Set<Severity>(['critical', 'high', '
 const VERDICTS: ReadonlySet<string> = new Set(['pass', 'warn', 'block']);
 const MAX_ITEMS = 500;
 
-export interface GateFinding { needId: string; job: string; tool: string; ruleId: string; severity: Severity; file?: string; line?: number; isNew: boolean | null; secret: boolean }
+export interface GateFinding {
+  needId: string; job: string; tool: string; ruleId: string; severity: Severity; file?: string; line?: number; isNew: boolean | null; secret: boolean;
+  /** E9 (carry E5-R3): an image finding with (true) or without (false) a fixed version; absent = unknown (older gate, other shape). */
+  fixable?: boolean;
+}
 export interface GateCheck { needId: string; job: string; tool?: string; judgedBy: string; state: string }
 export interface GateResultDoc {
   result: 'pass' | 'warn' | 'block';
@@ -48,9 +52,10 @@ function findings(x: unknown): GateFinding[] | undefined {
     const file = f.file === undefined ? undefined : str(f.file, 300);
     if (f.file !== undefined && file === undefined) return undefined;
     if (f.line !== undefined && (typeof f.line !== 'number' || !Number.isSafeInteger(f.line) || f.line < 0)) return undefined;
+    if (f.fixable !== undefined && typeof f.fixable !== 'boolean') return undefined;
     out.push({
       needId, job, tool, ruleId, severity: f.severity as Severity, ...(file === undefined ? {} : { file }), ...(f.line === undefined ? {} : { line: f.line as number }),
-      isNew: typeof f.isNew === 'boolean' ? f.isNew : null, secret: f.secret === true,
+      isNew: typeof f.isNew === 'boolean' ? f.isNew : null, secret: f.secret === true, ...(typeof f.fixable === 'boolean' ? { fixable: f.fixable } : {}),
     });
   }
   return out;

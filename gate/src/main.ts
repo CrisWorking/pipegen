@@ -38,6 +38,7 @@ import { scrubFile, type ScrubFileResult } from './scrub.js';
 import { GATE_VIEW } from './generated/gate-view.js';
 import { GATE_INPUTS, type GateToolView } from './settings.js';
 import { stageWorkspace } from './stage.js';
+import { trivyFixable } from './sarif.js';
 
 /** The inputs of each mode (the RENDERER_INPUTS gate row split by mode; a test keeps them equal). Any other input is refused. */
 export const MODE_INPUTS = {
@@ -460,10 +461,19 @@ async function saveTrusted(step: Step, dir: string, g: GateInput, r: GateResult,
   return { baseline, marker, lines };
 }
 
-const ref = (f: DecidedFinding): Record<string, unknown> => ({
-  needId: f.needId, job: f.job, tool: safeText(f.tool, 64), ruleId: safeText(f.ruleId, 200), severity: f.severity,
-  ...(f.file === undefined ? {} : { file: safeText(f.file, 300) }), ...(f.line === undefined ? {} : { line: f.line }), isNew: f.isNew ?? null, secret: f.secret,
-});
+/**
+ * One finding of result.json. E9 (carry E5-R3): an image finding (trivy-image, not a secret) also says whether trivy names a fixed version
+ * (`fixable`), when its message is in trivy's own shape; otherwise there is no flag (unknown). Exported for its test.
+ */
+export function findingRef(f: DecidedFinding): Record<string, unknown> {
+  const fixable = f.tool === 'trivy-image' && !f.secret ? trivyFixable(f.message) : undefined;
+  return {
+    needId: f.needId, job: f.job, tool: safeText(f.tool, 64), ruleId: safeText(f.ruleId, 200), severity: f.severity,
+    ...(f.file === undefined ? {} : { file: safeText(f.file, 300) }), ...(f.line === undefined ? {} : { line: f.line }), isNew: f.isNew ?? null, secret: f.secret,
+    ...(fixable === undefined ? {} : { fixable }),
+  };
+}
+const ref = findingRef;
 /** result.json: the decision and the summary data, built from structure. No SARIF message text, and every repo string as safe text. */
 function resultDoc(d: Decided, verdict: Verdict, ev: { name: string; sha: string; runId: number }, saved: { baseline: string; marker: string }): string {
   const r = d.result;

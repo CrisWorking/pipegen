@@ -108,6 +108,21 @@ export const SARIF_TOOLS: Readonly<Record<string, SarifToolInfo>> = Object.freez
   bandit: tool('Bandit', 'issue-severity'),
 }));
 
+// ---------- E9 (carry E5-R3): fix information of an image finding ----------
+
+/** trivy's SARIF message for a vulnerability (pkg/report/sarif.go, test/fixtures/sarif/trivy-image.sarif), anchored at the start. */
+const TRIVY_VULN_MESSAGE = /^Package: [^\n]*\nInstalled Version: [^\n]*\nVulnerability [^\n]*\nSeverity: [^\n]*\nFixed Version: ([^\n]*)(?:\n|$)/;
+/**
+ * Whether trivy names a fixed version for a vulnerability finding: true for a non-blank `Fixed Version:`, false for a blank one,
+ * undefined (unknown) for a message in any other shape or with the line more than once (a package name with its own line breaks
+ * can not pose as the field). Only a report: the gate decides nothing on it.
+ */
+export function trivyFixable(message: string): boolean | undefined {
+  if (typeof message !== 'string' || message.split('\nFixed Version: ').length !== 2) return undefined;
+  const m = TRIVY_VULN_MESSAGE.exec(message);
+  return m === null ? undefined : (m[1] as string).trim() !== '';
+}
+
 // ---------- uri ----------
 
 const SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/;

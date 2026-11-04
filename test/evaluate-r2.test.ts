@@ -157,7 +157,8 @@ describe('I3: a created Dockerfile needs its image-scan result', () => {
     prRun(m).artifacts.set(GATE_RESULT_ARTIFACT, gateDoc({ runId: prRun(m).handle.runId, result: 'warn', warnings: [gateFinding('image-scan', 'trivy', { severity: 'high', job: 'image-scan--api', ruleId: 'CVE-1' })] }, d));
     const r = await evaluate(d, [m, plantedRuns(d)], ctxOf());
     expect(part(r, 'docker')?.status).toBe('failed');
-    expect(part(r, 'docker')?.detail).toContain('critical/high (fix info unknown until gate-v0.2.2)');
+    // E9: a finding with no fixable flag (an older gate) is still a failure, said as "no fix info", never claimed fixable
+    expect(part(r, 'docker')?.detail).toContain('with a fixed version or no fix info');
     expect(part(r, 'docker')?.detail).not.toMatch(/fixable/);
   });
 });

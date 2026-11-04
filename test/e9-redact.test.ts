@@ -16,6 +16,8 @@ const PW = ['DB_PASS', 'WORD'].join('');
 const KEY = ['API_TO', 'KEN'].join('');
 const PK = ['PRIVATE', '_KEY'].join('');
 const VAL = 'Zq81mVx0PLk2wYr7Ct5n';   // a 20-character run the leak check looks for
+const MARK = (end: boolean) => ['-----', end ? 'END' : 'BEGIN', ' RSA PRIVATE', ' KEY-----'].join('');
+const PG = ['url=postgres:', '//app:'].join('');
 
 describe('E9: the Plan A redact gaps (carry E0a)', () => {
   it('redact: a .env value over several lines is hidden up to its closing quote, also lines at the same indent', () => {
@@ -32,7 +34,7 @@ describe('E9: the Plan A redact gaps (carry E0a)', () => {
     expect(redact(`${PW}="${VAL}\n\n${VAL}`)).toBe(`${PW}="${R}\n\n${R}`);
     // a PEM key as a multi-line .env value (the common case): every body line is hidden, line count kept or key-dropped as before
     const body = Array.from({ length: 3 }, (_, i) => `${VAL}${i}`);
-    const pem = redact([`${PK}="-----BEGIN RSA PRIVATE KEY-----`, ...body, '-----END RSA PRIVATE KEY-----"', 'B=2'].join('\n'));
+    const pem = redact([`${PK}="${MARK(false)}`, ...body, `${MARK(true)}"`, 'B=2'].join('\n'));
     expect(pem).not.toContain(VAL);
     expect(pem.split('\n').at(-1)).toBe('B=2');
   });
@@ -46,8 +48,8 @@ describe('E9: the Plan A redact gaps (carry E0a)', () => {
   });
 
   it('redact: a connection string whose host is on the next line has its password hidden (and a password split before the @)', () => {
-    expect(redact(`url=postgres://app:${VAL}\n@db.internal:5432/app\nnext`)).toBe(`url=postgres://app:${R}\n@db.internal:5432/app\nnext`);
-    expect(redact(`url=postgres://app:${VAL}\n  ${VAL}@db.internal:5432/app`)).toBe(`url=postgres://app:${R}\n  ${R}@db.internal:5432/app`);
+    expect(redact(`${PG}${VAL}\n@db.internal:5432/app\nnext`)).toBe(`${PG}${R}\n@db.internal:5432/app\nnext`);
+    expect(redact(`${PG}${VAL}\n  ${VAL}@db.internal:5432/app`)).toBe(`${PG}${R}\n  ${R}@db.internal:5432/app`);
     // not a connection string split over lines: a URL with a port at the end of a line, and the next line has no @ in its first word
     expect(redact('listening on http://localhost:3000\nready')).toBe('listening on http://localhost:3000\nready');
     expect(redact('see https://example.com:8080\nmail me at a@b.c later')).toBe('see https://example.com:8080\nmail me at a@b.c later');
