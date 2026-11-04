@@ -72,6 +72,10 @@ describe('E9 (E3-R7): no bind mount in a key-holding run script', () => {
       'docker volume create -d local-persist v1',
       'docker run --volume=named:/h img:1',
       'docker run -v named:/h img:1',
+      // mutation round (E9): a repeated type, a quoted field docker's CSV reader would read as another key, a key in upper case
+      'docker run --mount type=volume,type=tmpfs,dst=/h img:1',
+      `docker run --mount 'type=volume,"type=bind",src=/,dst=/h' img:1`,
+      'docker run --mount type=volume,TYPE=bind,src=/,dst=/h img:1',
     ];
     for (const b of bad) expect(problems(wf(run(b))).join(' '), b).toMatch(MOUNT);
   });

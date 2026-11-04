@@ -158,6 +158,20 @@ describe('CF2: every action of a listed check sits in its listed job', () => {
   });
 });
 
+describe('E9 (ruling B5): the referee reads the bullfrog step\'s allowed-domains with the bundled rule', () => {
+  it('the rendered host union passes; a label, a raw domain or part of a set as the value is a template issue', async () => {
+    const dd = draftOf([specFor(entry('bullfrog'), { needId: 'egress' })], [needOf('egress')]);
+    const withDomains = (v: string): RenderedStep[] => harden().map((s) => (s.uses?.startsWith('bullfrogsec/bullfrog@') ? { ...s, with: { ...s.with, 'allowed-domains': v } } : s));
+    const file = (steps: RenderedStep[]) => workflow({ egress: job([...steps, ...prelude()]), gate: gateJ(dd) });
+    expect(show(await run([file(harden())], dd))).toBe('');
+    const good = harden().find((s) => s.uses?.startsWith('bullfrogsec/bullfrog@'))?.with?.['allowed-domains'] as string;
+    for (const bad of ['github-core', 'example.com', `${good}\nzz.example.com`, good.split('\n').slice(1).join('\n')]) {
+      const r = await run([file(withDomains(bad))], dd);
+      expect(has(r, 'template', /allowed-domains/), `${bad}\n${show(r)}`).toBe(true);
+    }
+  });
+});
+
 describe('CF3a: one event-switched base form', () => {
   const ZERO = '0'.repeat(40);
   // C5a fix round 1 (I1): pull_request_review, the approval re-run, has the same base as pull_request

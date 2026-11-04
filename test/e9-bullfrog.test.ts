@@ -37,7 +37,9 @@ describe('E9: the bullfrog allowed-domains policy', () => {
     expect(allowedDomainsProblem(union('npm'), LABELS)).toMatch(/github-core/);
     expect(allowedDomainsProblem('', LABELS)).not.toBeNull();
     // only the labels the entry offers: a set it does not offer is not allowed
-    expect(allowedDomainsProblem(union('github-core', 'osv'), ['github-core', 'npm'])).not.toBeNull();
+    expect(allowedDomainsProblem(union('github-core', 'osv'), ['github-core', 'npm'])).toMatch(/no reviewed egress set offered/);
+    // github-core is always among the offered sets, even when the entry's labels leave it out (mutant B4)
+    expect(allowedDomainsProblem(union('github-core', 'npm'), ['npm'])).toBeNull();
     expect(allowedDomainsProblem(union('github-core', 'npm'), ['github-core', 'npm', 'not-a-set'])).toMatch(/not-a-set/);
   });
 

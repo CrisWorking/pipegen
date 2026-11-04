@@ -3354,22 +3354,37 @@ function hideSectionValue(line) {
   return v >= line.length ? key + line.slice(sep3) : key + line.slice(sep3, v) + R;
 }
 function quoteCloseAt(line, quote) {
-  if (quote.length > 1) return line.indexOf(quote);
+  if (quote.length > 1) {
+    for (let i = line.indexOf(quote); i >= 0; i = line.indexOf(quote, i + 1)) {
+      let slashes = 0;
+      for (let j = i - 1; j >= 0 && line[j] === "\\"; j--) slashes++;
+      if (slashes % 2 === 0) return i;
+    }
+    return -1;
+  }
+  let escaped = -1;
   for (let i = 0; i < line.length; i++) {
-    const c = line[i];
-    if (c === "\\") {
+    if (line[i] === "\\") {
       i++;
       continue;
     }
-    if (c === quote) {
-      if (quote !== "`" && line[i + 1] === quote) {
-        i++;
-        continue;
-      }
-      return i;
+    if (line[i] === quote) {
+      escaped = i;
+      break;
     }
   }
-  return -1;
+  if (quote === "`" || escaped < 0) return escaped;
+  let doubled = -1;
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] !== quote) continue;
+    if (line[i + 1] === quote) {
+      i++;
+      continue;
+    }
+    doubled = i;
+    break;
+  }
+  return doubled < 0 ? -1 : Math.max(escaped, doubled);
 }
 var isHostStart = (c) => isLetter(c) || isDigit(c) || c === 91;
 function nextLineHostSpans(lines) {
@@ -3389,7 +3404,7 @@ function nextLineHostSpans(lines) {
     let open = true;
     for (let p = sep3 + 3; p < line.length; p++) {
       const c = code(line, p);
-      if (c === 47 || c === 63 || c === 35 || c === 64 || isSpace(c)) {
+      if (c === 47 || c === 63 || c === 35 || c === 64 || c === 10 || c === 12 || c === 11) {
         open = false;
         break;
       }
@@ -3413,21 +3428,45 @@ function nextLineHostSpans(lines) {
   return out;
 }
 function redact(text, hint) {
+  const now = redactLines(text, hint, true);
+  if (!now.used) return now.map((l) => l.out).join("\n");
+  const before = redactLines(text, hint, false);
+  if (before.length !== now.length || before.some((b, i) => b.raw !== now[i].raw)) return now.map((l) => wholeHidden(l.raw)).join("\n");
+  return now.map((n, i) => {
+    const b = before[i];
+    if (n.out === b.out || b.out === n.raw) return n.out;
+    if (n.out === n.raw) return b.out;
+    return wholeHidden(n.raw);
+  }).join("\n");
+}
+function wholeHidden(raw) {
+  let e = raw.length;
+  while (e > 0 && raw.charCodeAt(e - 1) === 13) e--;
+  const line = raw.slice(0, e);
+  return (line.trim() === "" ? line : line.slice(0, indentOf(line).chars) + R) + raw.slice(e);
+}
+function redactLines(text, hint, e9) {
   const blockRule = hint?.path === void 0 || !isCodePath(hint.path);
   const workflow = hint?.path !== void 0 && isWorkflowPath(hint.path);
-  const out = [];
+  const out = Object.assign([], { used: false });
   let inKey = false;
   let blockCols = -1;
   let secretSection = false;
   let quote = null;
   const all = text.split("\n");
-  for (const [i, spans] of nextLineHostSpans(all)) {
+  const raws = [...all];
+  for (const [i, spans] of e9 ? nextLineHostSpans(all) : []) {
+    out.used = true;
     const raw = all[i];
     let e = raw.length;
     while (e > 0 && raw.charCodeAt(e - 1) === 13) e--;
     all[i] = replaceSpans(raw.slice(0, e), spans) + raw.slice(e);
   }
-  for (const raw of all) {
+  for (let li = 0; li < all.length; li++) {
+    const raw = all[li];
+    const push = (o) => {
+      out.push({ raw: raws[li], out: o });
+    };
     let lineEnd = raw.length;
     while (lineEnd > 0 && raw.charCodeAt(lineEnd - 1) === 13) lineEnd--;
     const cr = raw.slice(lineEnd);
@@ -3456,23 +3495,33 @@ function redact(text, hint) {
     const startsBlock = pieces.includes(R);
     if (startedInKey && !startsBlock && plain.every((p) => p === "")) continue;
     if (quote !== null) {
+      if (!regexSafe(line)) {
+        push(LONG_LINE + cr);
+        blockCols = indentOf(line).cols;
+        continue;
+      }
+      if (blockRule && !startedInKey && !startsBlock && !secretSection) {
+        const section = sectionName(line);
+        if (section !== null) secretSection = isSecretSection(section);
+      }
       const close = quoteCloseAt(line, quote);
-      if (close < 0 || startedInKey || startsBlock || !regexSafe(line)) {
+      const blockHides = blockCols >= 0 && line.trim() !== "" && indentOf(line).cols > blockCols;
+      if (close < 0 || startedInKey || startsBlock || blockHides || secretSection) {
         if (close >= 0) quote = null;
-        out.push((line.trim() === "" ? line : line.slice(0, indentOf(line).chars) + R) + cr);
+        push(wholeHidden(line) + cr);
         continue;
       }
       quote = null;
-      const before = line.slice(0, close);
+      const lead = line.slice(0, close);
       const r = redactSegment(line.slice(close), workflow);
       quote = r.quote;
-      out.push((before.trim() === "" ? before : before.slice(0, indentOf(before).chars) + R) + r.text + cr);
+      push((lead.trim() === "" ? lead : lead.slice(0, indentOf(lead).chars) + R) + r.text + cr);
       if (r.block && blockRule) blockCols = indentOf(line).cols;
       continue;
     }
     if (blockCols >= 0) {
       if (line.trim() === "") {
-        out.push(raw);
+        push(raw);
         continue;
       }
       const ind = indentOf(line);
@@ -3481,7 +3530,7 @@ function redact(text, hint) {
           const section = sectionName(line);
           if (section !== null) secretSection = isSecretSection(section);
         }
-        out.push(line.slice(0, ind.chars) + R + cr);
+        push(line.slice(0, ind.chars) + R + cr);
         continue;
       }
       blockCols = -1;
@@ -3490,27 +3539,30 @@ function redact(text, hint) {
       const section = sectionName(line);
       if (section !== null) secretSection = isSecretSection(section);
       else if (secretSection && line.trim() !== "") {
-        out.push(hideSectionValue(line) + cr);
+        push(hideSectionValue(line) + cr);
         if (!regexSafe(line) || redactSegment(line, workflow).block) blockCols = indentOf(line).cols;
         continue;
       }
     }
     if (!regexSafe(line)) {
-      out.push(LONG_LINE + cr);
+      push(LONG_LINE + cr);
       blockCols = indentOf(line).cols;
       continue;
     }
     let block = false;
-    out.push(pieces.map((p) => {
+    push(pieces.map((p) => {
       if (p === R) return R;
       const r = redactSegment(p, workflow);
       block ||= r.block;
-      if (r.quote !== null) quote = r.quote;
+      if (e9 && r.quote !== null) {
+        quote = r.quote;
+        out.used = true;
+      }
       return r.text;
     }).join("") + cr);
     if (block && blockRule) blockCols = indentOf(line).cols;
   }
-  return out.join("\n");
+  return out;
 }
 function findSecretLike(text) {
   const found = /* @__PURE__ */ new Set();

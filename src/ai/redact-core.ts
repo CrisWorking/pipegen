@@ -735,30 +735,50 @@ function hideSectionValue(line: string): string {
 // ----- E9: values over lines (carry E0a, DECISIONS #112) -----
 
 /**
- * Where a quoted value left open on an earlier line closes in `line`: the index of its closing quote, or -1. A triple quote closes at the
- * next triple; a single quote character at the first one that is neither after a backslash nor doubled (`''`, `""`): both readings only
- * ever hide more. Linear.
+ * Where a quoted value left open on an earlier line closes in `line`: the index of its closing quote, or -1. The FARTHEST reading wins
+ * (security scan r2: a reading may only ever hide more): a triple quote closes at the first triple not after an odd run of backslashes;
+ * one quote character at the later of two readings, the first one not escaped by a backslash and the first one not doubled ('' or "");
+ * when either reading finds none, the value does not close here. A backtick has only the backslash reading. `line` is at most 4 KB.
  */
 function quoteCloseAt(line: string, quote: string): number {
-  if (quote.length > 1) return line.indexOf(quote);
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i];
-    if (c === '\\') { i++; continue; }
-    if (c === quote) {
-      if (quote !== '`' && line[i + 1] === quote) { i++; continue; }
-      return i;
+  if (quote.length > 1) {
+    for (let i = line.indexOf(quote); i >= 0; i = line.indexOf(quote, i + 1)) {
+      let slashes = 0;
+      for (let j = i - 1; j >= 0 && line[j] === '\\'; j--) slashes++;
+      if (slashes % 2 === 0) return i;
     }
+    return -1;
   }
-  return -1;
+  let escaped = -1;
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] === '\\') { i++; continue; }
+    if (line[i] === quote) { escaped = i; break; }
+  }
+  if (quote === '`' || escaped < 0) return escaped;
+  let doubled = -1;
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] !== quote) continue;
+    if (line[i + 1] === quote) { i++; continue; }
+    doubled = i;
+    break;
+  }
+  return doubled < 0 ? -1 : Math.max(escaped, doubled);
 }
 
 const isHostStart = (c: number) => isLetter(c) || isDigit(c) || c === 91 /* [ */;
 /**
  * E9 (carry E0a): a connection string cut after its password. When a line (at most 4 KB) ends with `scheme://` and an authority that
- * holds a `:` but no `/`, `?`, `#`, `@` or blank, and the next line's first word holds an `@` followed by a host-like character, the
+ * holds a `:` but no `/`, `?`, `#` or `@` (blanks allowed: a tab or a space inside a wrapped password), and the next line's first word holds an `@` followed by a host-like character, the
  * text after that `:` (the password) and the next line's word up to its last such `@` (the rest of a split password) are hidden. Spans
  * by line index; each line is read a bounded number of times.
  */
+/** The indexes of the lines whose password nextLineHostSpans hides (the line after each is its host line). For excerpt.ts (E9). */
+export function crossLineHostLines(lines: readonly string[]): number[] {
+  const out: number[] = [];
+  for (let i = 0; i + 1 < lines.length; i++) if (nextLineHostSpans([lines[i] as string, lines[i + 1] as string]).has(0)) out.push(i);
+  return out;
+}
+
 function nextLineHostSpans(lines: readonly string[]): Map<number, Span[]> {
   const out = new Map<number, Span[]>();
   const add = (i: number, sp: Span) => out.set(i, [...(out.get(i) ?? []), sp]);
@@ -772,7 +792,8 @@ function nextLineHostSpans(lines: readonly string[]): Map<number, Span[]> {
     let open = true;
     for (let p = sep + 3; p < line.length; p++) {
       const c = code(line, p);
-      if (c === 47 || c === 63 || c === 35 || c === 64 || isSpace(c)) { open = false; break; }
+      // blanks are allowed (a tab or a space inside a wrapped password, E9 fuzz seed 57505 case 29110): hiding more is the safe side
+      if (c === 47 || c === 63 || c === 35 || c === 64 || c === 10 || c === 12 || c === 11) { open = false; break; }
       if (c === 58 && colon < 0) colon = p;
     }
     if (!open || colon < 0 || colon + 1 >= line.length) continue;
@@ -813,22 +834,58 @@ function nextLineHostSpans(lines: readonly string[]): Map<number, Span[]> {
  *   nested `secrets:` mapping is still hidden whole (its key has an empty value).
  */
 export function redact(text: string, hint?: { path?: string }): string {
+  // Security scan r2 (E9): the E9 rules may only ever hide MORE than the pre-E9 rules. Both run; per line, where they disagree, the one
+  // that left the line as it was loses, and two different changes hide the whole line. Both keep the same lines (the key-drop rule is
+  // shared), so they line up; if they ever did not, every line is hidden (fail closed).
+  // Without an E9 rule taking effect (no quote left open, no next-line host) the two passes are the same code path, so only one runs.
+  const now = redactLines(text, hint, true);
+  if (!now.used) return now.map((l) => l.out).join('\n');
+  const before = redactLines(text, hint, false);
+  if (before.length !== now.length || before.some((b, i) => b.raw !== (now[i] as RedactedLine).raw)) return now.map((l) => wholeHidden(l.raw)).join('\n');
+  return now.map((n, i) => {
+    const b = before[i] as RedactedLine;
+    if (n.out === b.out || b.out === n.raw) return n.out;
+    if (n.out === n.raw) return b.out;
+    return wholeHidden(n.raw);
+  }).join('\n');
+}
+
+/** The pre-E9 rules alone (no quote mode, no next-line host): for the differential test of the "only ever hide more" rule. */
+export function redactPreE9(text: string, hint?: { path?: string }): string {
+  return redactLines(text, hint, false).map((l) => l.out).join('\n');
+}
+
+interface RedactedLine { raw: string; out: string }
+/** A line hidden whole: its indentation and [REDACTED] (a blank line stays blank), its trailing CRs kept. */
+function wholeHidden(raw: string): string {
+  let e = raw.length;
+  while (e > 0 && raw.charCodeAt(e - 1) === 13) e--;
+  const line = raw.slice(0, e);
+  return (line.trim() === '' ? line : line.slice(0, indentOf(line).chars) + R) + raw.slice(e);
+}
+
+/** The line loop of redact(); `e9` turns on the E9 rules (a quoted value over lines, a connection string's host on the next line). */
+function redactLines(text: string, hint: { path?: string } | undefined, e9: boolean): RedactedLine[] & { used: boolean } {
   const blockRule = hint?.path === undefined || !isCodePath(hint.path);
   const workflow = hint?.path !== undefined && isWorkflowPath(hint.path);
-  const out: string[] = [];
+  const out = Object.assign([] as RedactedLine[], { used: false });   // used: an E9 rule took effect
   let inKey = false;
   let blockCols = -1; // >= 0 while hiding an indented value block
   let secretSection = false; // inside a TOML/INI [section] named after a secret
   let quote: string | null = null; // E9: a quoted value left open on an earlier line, hidden up to its closing quote
   const all = text.split('\n');
+  const raws = [...all];
   // E9: a connection string's password before a line break, with the host on the next line (hidden before any other rule reads it)
-  for (const [i, spans] of nextLineHostSpans(all)) {
+  for (const [i, spans] of e9 ? nextLineHostSpans(all) : []) {
+    out.used = true;
     const raw = all[i] as string;
     let e = raw.length;
     while (e > 0 && raw.charCodeAt(e - 1) === 13) e--;
     all[i] = replaceSpans(raw.slice(0, e), spans) + raw.slice(e);
   }
-  for (const raw of all) {
+  for (let li = 0; li < all.length; li++) {
+    const raw = all[li] as string;
+    const push = (o: string): void => { out.push({ raw: raws[li] as string, out: o }); };
     let lineEnd = raw.length;
     while (lineEnd > 0 && raw.charCodeAt(lineEnd - 1) === 13) lineEnd--;
     const cr = raw.slice(lineEnd); // every trailing '\r', put back on output
@@ -860,23 +917,36 @@ export function redact(text: string, hint?: { path?: string }): string {
     // E9: inside a quoted value left open (a .env value over lines, a YAML quoted scalar, triple quotes), whatever the indentation: the
     // line is hidden up to the closing quote; what follows the quote is read as usual. A line with a key marker is hidden whole.
     if (quote !== null) {
+      // security scan r2: a long line is the long-line marker, it may re-open anything (the quote stays open, the lines more indented
+      // than it are hidden as after any long line); a section header inside the value still starts a secret section (never ends one);
+      // a line the block or section rule would hide, or with a key marker, is hidden whole even when the quote closes on it
+      if (!regexSafe(line)) {
+        push(LONG_LINE + cr);
+        blockCols = indentOf(line).cols;
+        continue;
+      }
+      if (blockRule && !startedInKey && !startsBlock && !secretSection) {
+        const section = sectionName(line);
+        if (section !== null) secretSection = isSecretSection(section);
+      }
       const close = quoteCloseAt(line, quote);
-      if (close < 0 || startedInKey || startsBlock || !regexSafe(line)) {
+      const blockHides = blockCols >= 0 && line.trim() !== '' && indentOf(line).cols > blockCols;
+      if (close < 0 || startedInKey || startsBlock || blockHides || secretSection) {
         if (close >= 0) quote = null;
-        out.push((line.trim() === '' ? line : line.slice(0, indentOf(line).chars) + R) + cr);
+        push(wholeHidden(line) + cr);
         continue;
       }
       quote = null;
-      const before = line.slice(0, close);
+      const lead = line.slice(0, close);
       const r = redactSegment(line.slice(close), workflow);
       quote = r.quote;
-      out.push((before.trim() === '' ? before : before.slice(0, indentOf(before).chars) + R) + r.text + cr);
+      push((lead.trim() === '' ? lead : lead.slice(0, indentOf(lead).chars) + R) + r.text + cr);
       if (r.block && blockRule) blockCols = indentOf(line).cols;
       continue;
     }
     if (blockCols >= 0) {
       if (line.trim() === '') {
-        out.push(raw); // blank: nothing to hide
+        push(raw); // blank: nothing to hide
         continue;
       }
       const ind = indentOf(line);
@@ -887,7 +957,7 @@ export function redact(text: string, hint?: { path?: string }): string {
           const section = sectionName(line);
           if (section !== null) secretSection = isSecretSection(section);
         }
-        out.push(line.slice(0, ind.chars) + R + cr);
+        push(line.slice(0, ind.chars) + R + cr);
         continue;
       }
       blockCols = -1;
@@ -899,7 +969,7 @@ export function redact(text: string, hint?: { path?: string }): string {
       const section = sectionName(line);
       if (section !== null) secretSection = isSecretSection(section);
       else if (secretSection && line.trim() !== '') {
-        out.push(hideSectionValue(line) + cr);
+        push(hideSectionValue(line) + cr);
         // A block the line would start outside a section (after a plain or empty value, or a line over 4 KB) starts here
         // too, so a section never shows a line that the same text outside a section would hide.
         if (!regexSafe(line) || redactSegment(line, workflow).block) blockCols = indentOf(line).cols;
@@ -908,21 +978,21 @@ export function redact(text: string, hint?: { path?: string }): string {
     }
     if (!regexSafe(line)) {
       // Not scanned, so it may have started an indented value block: hide the more-indented lines after it too.
-      out.push(LONG_LINE + cr);
+      push(LONG_LINE + cr);
       blockCols = indentOf(line).cols;
       continue;
     }
     let block = false;
-    out.push(pieces.map((p) => {
+    push(pieces.map((p) => {
       if (p === R) return R;
       const r = redactSegment(p, workflow);
       block ||= r.block;
-      if (r.quote !== null) quote = r.quote;
+      if (e9 && r.quote !== null) { quote = r.quote; out.used = true; }
       return r.text;
     }).join('') + cr);
     if (block && blockRule) blockCols = indentOf(line).cols;
   }
-  return out.join('\n');
+  return out;
 }
 
 /**

@@ -29,6 +29,7 @@ describe('E9 (E5-R3): the fixable flag for image findings', () => {
     expect(trivyFixable(msg('1.2').replace('Package: openssl', 'Package: x\nFixed Version: \nInstalled Version: 1'))).toBeUndefined();
     expect(trivyFixable(`${msg('')}\nFixed Version: 9`)).toBeUndefined();
     expect(trivyFixable('a secret finding')).toBeUndefined();
+    expect(trivyFixable(`note\n${msg('')}`)).toBeUndefined();   // the shape starts the message (mutant F8)
     expect(trivyFixable(msg('1').replace('\nLink:', '\nLinks:'))).toBe(true);   // the Link line is not needed (a cut message)
   });
 

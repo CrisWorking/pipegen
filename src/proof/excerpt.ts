@@ -24,7 +24,7 @@
 // run held only placeholders or throwaway keys (ScratchKeys' brand, E4), so no typed value is in the log at all; the rules below are defence in depth, and the
 // shapes they still miss are recorded limits.
 import { createHash, randomBytes } from 'node:crypto';
-import { findKeyMarker, indentOf, MAX_REGEX_LINE_BYTES } from '../ai/redact-core.js';
+import { crossLineHostLines, findKeyMarker, indentOf, MAX_REGEX_LINE_BYTES } from '../ai/redact-core.js';
 import { redact, secretScanText, type SecretScanner } from '../ai/redact.js';
 import { LATE_MAGIC, SCAN_PREFIX, scannersWouldSkip } from '../ai/scan-staging.js';
 import { holdsEscape, scrubForDisplay, stripChars } from '../util/known-values.js';
@@ -522,16 +522,21 @@ const MAX_PREFIX_TOKENS = 3;
 /**
  * Fix round 2 (q1, q5): the canonical passes. Every line as shown (a dropped line as its first reading), with every non-printable taken
  * out (tabs, invisibles, LS/PS), is scrubbed over the whole log across lines, as it is and with its first 1 to MAX_PREFIX_TOKENS tokens
- * dropped (a container or monorepo tool's per-line prefix between two pieces of a wrapped value). Every line of a merged group is hidden.
+ * dropped (a container or monorepo tool's per-line prefix between two pieces of a wrapped value). Every line of a merged group is hidden,
+ * and (E9) both lines of a connection string whose host is on the next line in that form.
  * Null when a pass can't map its output (fail closed).
  */
 function canonicalPasses(lines0: Read[], scrub: (text: string) => string): Uint8Array | null {
   const hide = new Uint8Array(lines0.length);
   const canon = lines0.map((r) => stripChars(r.shown ?? r.rep).replace(LINE_SEPS, ''));
   for (let n = 0; n <= MAX_PREFIX_TOKENS; n++) {
-    const res = scrubLines(n === 0 ? canon : canon.map((l) => dropTokens(l, n)), scrub);
+    const variant = n === 0 ? canon : canon.map((l) => dropTokens(l, n));
+    const res = scrubLines(variant, scrub);
     if (res === null) return null;
     for (const group of res.from) if (group.length > 1) for (const i of group) hide[i] = 1;
+    // E9: a connection string's password before a line break with its host on the next line, read on the canonical forms (a tab or an
+    // escape sequence inside `://` hides the URL from the shown line; fuzz seed 57505 case 179782): both lines are hidden
+    for (const i of crossLineHostLines(variant)) { hide[i] = 1; if (i + 1 < hide.length) hide[i + 1] = 1; }
   }
   return hide;
 }
