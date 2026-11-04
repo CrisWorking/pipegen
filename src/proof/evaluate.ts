@@ -149,12 +149,27 @@ type Kind = 'pipegen' | 'harness' | 'compat' | 'other';
 const kindOfPath = (workflow: string, trusted: ReadonlySet<string>): Kind => (workflow === HARNESS_PATH ? 'harness' : workflow.startsWith(COMPAT_PREFIX) ? 'compat' : trusted.has(workflow) ? 'pipegen' : 'other');
 const DEFAULT_PIPEGEN = new Set(['.github/workflows/pipegen.yml']);
 const kindOf = (workflow: string): Kind => kindOfPath(workflow, DEFAULT_PIPEGEN);
-/** The kind of each outcome of the evaluation under way (set synchronously at its start, before any await). */
-const KINDS = new WeakMap<object, Kind>();
+/** The kind of each outcome of one evaluation: built per evaluation and passed down (no shared module state). */
+type Kinds = ReadonlyMap<object, Kind>;
+/** The slugs of the services whose Dockerfile pipegen created (matched by the service's folder or its recorded Dockerfile path). */
+function boundServices(draft: PipelineDraft): Set<string> {
+  const out = new Set<string>();
+  const norm = (p: string): string => p.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+  for (const f of draft.created) {
+    if (f.part !== 'docker' || !/(^|\/)Dockerfile[^/]*$/.test(f.path)) continue;
+    const dir = norm(f.path.replace(/\/?[^/]*$/, ''));
+    for (const sv of draft.profile.services) {
+      if ((sv.dockerfile !== undefined && norm(sv.dockerfile) === norm(f.path)) || norm(sv.path === '.' ? '' : sv.path) === dir) {
+        try { out.add(slug(sv.name)); } catch { /* an unusable name binds nothing */ }
+      }
+    }
+  }
+  return out;
+}
 const TOP_WORKFLOW_RE = /^\.github\/workflows\/[^/]+\.ya?ml$/;
 function trustedWorkflows(draft: PipelineDraft, ctx: EvalContext): Set<string> {
   const out = new Set<string>(ctx.pipegenWorkflows ?? []);
-  for (const f of draft.created) if (TOP_WORKFLOW_RE.test(f.path) && f.path !== HARNESS_PATH && !f.path.startsWith(COMPAT_PREFIX)) out.add(f.path);
+  for (const f of draft.created) if (f.repo === 'app' && f.inserted === undefined && TOP_WORKFLOW_RE.test(f.path) && f.path !== HARNESS_PATH && !f.path.startsWith(COMPAT_PREFIX)) out.add(f.path);
   return out.size > 0 ? out : new Set(DEFAULT_PIPEGEN);
 }
 /** `caller / callee (matrix)` → `callee`, and the id with its matrix suffix stripped. A name equal to the id, or the id plus ` (…)`, matches it. */
@@ -192,14 +207,14 @@ const describeJob = (h: Hit): string => {
 
 /** A check another part owns: failed when it failed in ANY pipegen layer (push, pull request, merge); proven only when it also ran green in `required`. */
 function ownedState(layers: Layers, required: readonly RunOutcome[], id: string): { state: State; hits: Hit[] } {
-  const all = hitsIn(ofKind([...layers.push, ...layers.pr, ...layers.merge], 'pipegen'), (n) => jobNameMatches(n, id));
+  const all = hitsIn(ofKind(layers.kinds, [...layers.push, ...layers.pr, ...layers.merge], 'pipegen'), (n) => jobNameMatches(n, id));
   if (failing(all).length > 0) return { state: 'failed', hits: all };
   return { state: stateOf(hitsIn(required, (n) => jobNameMatches(n, id))), hits: all };
 }
 
-interface Layers { push: RunOutcome[]; pr: RunOutcome[]; merge: RunOutcome[] }
-function layersOf(v: VariantRuns): Layers {
-  const out: Layers = { push: [], pr: [], merge: [] };
+interface Layers { push: RunOutcome[]; pr: RunOutcome[]; merge: RunOutcome[]; kinds: Kinds }
+function layersOf(v: VariantRuns, kinds: Kinds): Layers {
+  const out: Layers = { push: [], pr: [], merge: [], kinds };
   for (const o of v.outcomes) {
     if (!isRec(o) || !isRec(o.handle) || !Array.isArray(o.jobs) || !(o.artifacts instanceof Map) || !(o.artifactProblems instanceof Map)) throw new Error('a run outcome is malformed');
     const e: RunEvent = o.handle.event;
@@ -209,7 +224,7 @@ function layersOf(v: VariantRuns): Layers {
   }
   return out;
 }
-const ofKind = (runs: readonly RunOutcome[], k: Kind): RunOutcome[] => runs.filter((r) => (KINDS.get(r) ?? kindOf(r.handle.workflow)) === k);
+const ofKind = (kinds: Kinds, runs: readonly RunOutcome[], k: Kind): RunOutcome[] => runs.filter((r) => (kinds.get(r) ?? kindOf(r.handle.workflow)) === k);
 
 // ---------- the verdict collector ----------
 
@@ -228,7 +243,7 @@ class Sheet {
   proven(part: Part, needId: string, detail: string): void { this.add({ part, needId, status: 'proven', detail, caps: false }); }
   note(part: Part, text: string): void { const l = this.notes.get(part) ?? []; if (!l.includes(text)) l.push(text); this.notes.set(part, l); }
   private add(v: Verdict): void {
-    const key = v.status === 'not-proven' && !v.caps ? `${v.part}|${v.needId ?? ''}|np` : `${v.part}|${v.needId ?? ''}|${v.status}|${v.detail}`;
+    const key = `${v.part}|${v.needId ?? ''}|${v.status}|${v.caps ? 'caps' : ''}|${v.detail}`;
     if (this.seen.has(key)) return;
     this.seen.add(key);
     this.verdicts.push(v);
@@ -309,10 +324,11 @@ async function evaluateInner(draft: PipelineDraft, runs: readonly VariantRuns[],
   const planted = runs.find((v) => v.variant === 'planted');
   const jobList = gateJobList(draft);
   const skipped = new Map<string, string>(draft.skipped.map((s) => [s.part, s.reason]));
-  const mainLayers = main === undefined ? { push: [], pr: [], merge: [] } : layersOf(main);
-  const plantedLayers = planted === undefined ? { push: [], pr: [], merge: [] } : layersOf(planted);
   const trusted = trustedWorkflows(draft, ctx);
-  for (const v of runs) for (const o of v.outcomes) if (isRec(o) && isRec(o.handle) && typeof o.handle.workflow === 'string') KINDS.set(o, kindOfPath(o.handle.workflow, trusted));
+  const kinds = new Map<object, Kind>();
+  for (const v of runs) for (const o of v.outcomes) if (isRec(o) && isRec(o.handle) && typeof o.handle.workflow === 'string') kinds.set(o, kindOfPath(o.handle.workflow, trusted));
+  const mainLayers = main === undefined ? { push: [], pr: [], merge: [], kinds } : layersOf(main, kinds);
+  const plantedLayers = planted === undefined ? { push: [], pr: [], merge: [], kinds } : layersOf(planted, kinds);
   const allUrls = new Set<string>();
   for (const v of runs) for (const o of v.outcomes) if (isRec(o) && isRec(o.handle) && typeof o.handle.url === 'string') allUrls.add(o.handle.url);
 
@@ -331,7 +347,7 @@ async function evaluateInner(draft: PipelineDraft, runs: readonly VariantRuns[],
   const refusedIn = (runsOf: readonly RunOutcome[]): Map<string, Hit[]> => {
     const out = new Map<string, Hit[]>();
     for (const [job, needId] of scannerJobs) {
-      const hits = failing(hitsIn(ofKind(runsOf, 'pipegen'), (n) => jobNameMatches(n, job))).filter((h) => typeof h.job.log === 'string' && BULLFROG_MOUNT_RE.test(cleanLog(h.job.log)));
+      const hits = failing(hitsIn(ofKind(kinds, runsOf, 'pipegen'), (n) => jobNameMatches(n, job))).filter((h) => typeof h.job.log === 'string' && BULLFROG_MOUNT_RE.test(cleanLog(h.job.log)));
       if (hits.length > 0) out.set(needId, [...(out.get(needId) ?? []), ...hits]);
     }
     return out;
@@ -352,10 +368,10 @@ async function evaluateInner(draft: PipelineDraft, runs: readonly VariantRuns[],
   else plantedChecks(draft, planted, plantedLayers, ctx, sheet, jobList, scannerJobs, refusedIn, refusedNote);
 
   // ===== the harness jobs and the other parts =====
-  const harnessPr = ofKind(mainLayers.pr, 'harness');
-  const harnessMerge = ofKind(mainLayers.merge, 'harness');
-  const pipegenPr = ofKind(mainLayers.pr, 'pipegen');
-  const pipegenMerge = ofKind(mainLayers.merge, 'pipegen');
+  const harnessPr = ofKind(kinds, mainLayers.pr, 'harness');
+  const harnessMerge = ofKind(kinds, mainLayers.merge, 'harness');
+  const pipegenPr = ofKind(kinds, mainLayers.pr, 'pipegen');
+  const pipegenMerge = ofKind(kinds, mainLayers.merge, 'pipegen');
   const harnessId = (id: HarnessJobId) => (name: string): boolean => name === `${HARNESS_JOB_PREFIX}${id}`;
   const rendered = (id: HarnessJobId): boolean => ctx.harnessJobs.includes(id);
 
@@ -412,8 +428,12 @@ async function evaluateInner(draft: PipelineDraft, runs: readonly VariantRuns[],
       // a created Dockerfile's base image is proven only by an image-scan result READ from the trusted run (I3): the scan's check, its
       // artifact from the run of its job, no tool error, and no critical/high finding. Without it: not-proven (docker covers no floor need).
       const g = gateMain;
-      const scans = jobList.filter((e) => e.category === 'image-scan' && e.range !== true);
-      if (scans.length === 0) sheet.notProven('docker', 'the draft has no image scan check for the created Dockerfile, so its base image is not proven', { caps: true });
+      const allScans = jobList.filter((e) => e.category === 'image-scan' && e.range !== true);
+      // the scan must be the one of the service the created Dockerfile builds (Service.path / Service.dockerfile); a Dockerfile of no known service has no bound evidence
+      const owners = boundServices(draft);
+      const scans = allScans.filter((e) => e.service !== undefined && owners.has(e.service));
+      if (owners.size === 0) sheet.notProven('docker', "the created Dockerfile belongs to no known service, so no image scan can be bound to it and its base image is not proven", { caps: true });
+      for (const o of owners) if (!scans.some((e) => e.service === o)) sheet.notProven('docker', `the draft has no image scan check for the created Dockerfile of ${st(o, 60)}, so its base image is not proven`, { caps: true });
       for (const e of scans) {
         const why: string[] = [];
         const hits = hitsIn(pipegenPr, (name) => jobNameMatches(name, e.job));
@@ -421,7 +441,9 @@ async function evaluateInner(draft: PipelineDraft, runs: readonly VariantRuns[],
         if (e.artifact === undefined || !hits.some((h) => h.run.artifacts.has(e.artifact as string))) why.push('its result artifact is missing');
         if (g === null) why.push("the gate's report is unreadable");
         else {
-          if (!g.checks.some((c) => c.needId === e.needId && c.job === e.job)) why.push("the gate's report has no check for it");
+          const check = g.checks.find((c) => c.needId === e.needId && c.job === e.job);
+          if (check === undefined) why.push("the gate's report has no check for it");
+          else if (/^(?:did not report|skipped|tampered|not run)/.test(check.state)) why.push(`the gate's check says it ${st(check.state, 60)}`);
           if (g.toolErrors.some((t) => t.needId === e.needId && t.job === e.job)) why.push('the gate reports a tool error for it');
         }
         if (why.length > 0) sheet.notProven('docker', `the image scan ${st(e.job, 80)} was not read (${why.join('; ')}), so the created Dockerfile's base image is not proven`, { needId: e.needId, caps: true });
@@ -534,9 +556,9 @@ function pipelineMain(
   scannerJobs: ReadonlyMap<string, string>, ownedJobs: ReadonlyMap<string, Part>, refusedIn: RefusedIn, refusedNote: (needId: string, hits: readonly Hit[]) => void,
   judge: Judge, floorOf: (p: Part) => boolean,
 ): GateResultDoc | null {
-  const prP = ofKind(layers.pr, 'pipegen');
-  const mergeP = ofKind(layers.merge, 'pipegen');
-  const pushP = ofKind(layers.push, 'pipegen');
+  const prP = ofKind(layers.kinds, layers.pr, 'pipegen');
+  const mergeP = ofKind(layers.kinds, layers.merge, 'pipegen');
+  const pushP = ofKind(layers.kinds, layers.push, 'pipegen');
   unreadableRuns(layers, sheet);
   // layers that must have run
   if (main.stopped === true || [...layers.push, ...layers.pr, ...layers.merge].some((o) => o.stopped === true)) sheet.fail('pipeline', 'the proof was stopped before every run finished, so the pipeline is not proven');
@@ -547,7 +569,7 @@ function pipelineMain(
   if (prP.length === 0) sheet.fail('pipeline', "pipegen's workflow did not run on the pull request");
   if (main.mergeSha === undefined) sheet.fail('pipeline', main.notMerged !== undefined ? `the pull request was not merged, so the deploy layer did not run (${st(main.notMerged, 300)})` : 'the pull request was not merged, so the deploy layer did not run');
   else if (mergeP.length === 0) sheet.fail('pipeline', "pipegen's workflow did not run on the merge to the default branch");
-  if (ofKind(layers.pr, 'harness').length === 0 && !(main.missing ?? []).some((m) => m.workflow === HARNESS_PATH)) sheet.fail('pipeline', 'the proof harness did not run on the pull request');
+  if (ofKind(layers.kinds, layers.pr, 'harness').length === 0 && !(main.missing ?? []).some((m) => m.workflow === HARNESS_PATH)) sheet.fail('pipeline', 'the proof harness did not run on the pull request');
 
   // refused scanner mounts (E5-R1) and the jobs they explain
   const refused = new Map<string, Hit[]>();
@@ -654,7 +676,7 @@ function zapAndNuclei(draft: PipelineDraft, sheet: Sheet, jobList: readonly JobL
 /** m4: a pipegen or harness run whose jobs or artifact list could not be read is unreadable, never green. */
 function unreadableRuns(layers: Layers, sheet: Sheet): void {
   const all = [...layers.push, ...layers.pr, ...layers.merge];
-  for (const run of ofKind(all, 'pipegen').concat(ofKind(all, 'harness'))) {
+  for (const run of ofKind(layers.kinds, all, 'pipegen').concat(ofKind(layers.kinds, all, 'harness'))) {
     for (const key of ['(jobs)', '(listing)']) {
       const why = run.artifactProblems.get(key);
       if (why !== undefined) sheet.fail('pipeline', `report unreadable: ${key === '(jobs)' ? 'the jobs' : 'the artifact list'} of the run of ${st(run.handle.workflow.replace('.github/workflows/', ''), 60)} (${run.handle.event}): ${st(why, 200)}`, undefined, run.handle.url);
@@ -664,7 +686,7 @@ function unreadableRuns(layers: Layers, sheet: Sheet): void {
 
 /** A compat copy is the user's own workflow: it never legitimately holds a pipegen result. Its artifacts are never a source of proof, and holding one is a failure. */
 function compatSpoof(layers: Layers, sheet: Sheet): void {
-  for (const run of [...ofKind([...layers.push, ...layers.pr, ...layers.merge], 'compat'), ...ofKind([...layers.push, ...layers.pr, ...layers.merge], 'other')]) {
+  for (const run of [...ofKind(layers.kinds, [...layers.push, ...layers.pr, ...layers.merge], 'compat'), ...ofKind(layers.kinds, [...layers.push, ...layers.pr, ...layers.merge], 'other')]) {
     const spoof = [...run.artifacts.keys(), ...run.artifactProblems.keys()].filter((n) => n === GATE_RESULT_ARTIFACT || n.startsWith('pipegen-out-'));
     if (spoof.length > 0) sheet.fail('pipeline', `the ${kindOf(run.handle.workflow) === 'compat' ? 'compat copy' : 'untrusted workflow'} ${st(run.handle.workflow.replace(COMPAT_PREFIX, '.github/workflows/'), 100)} carries a pipegen result artifact (${spoof.slice(0, 3).map((n) => st(n, 80)).join(', ')}); it is ignored as a source of proof`, undefined, run.handle.url);
   }
@@ -673,7 +695,7 @@ function compatSpoof(layers: Layers, sheet: Sheet): void {
 
 function compat(main: VariantRuns, layers: Layers, ctx: EvalContext, sheet: Sheet): void {
   compatSpoof(layers, sheet);
-  for (const run of ofKind(layers.pr, 'compat')) {
+  for (const run of ofKind(layers.kinds, layers.pr, 'compat')) {
     const user = run.handle.workflow.replace(COMPAT_PREFIX, '.github/workflows/');
     const jobs = latest(run.jobs);
     const bad = jobs.filter((j) => !ok(j) && !jobSkipped(j));
@@ -698,7 +720,7 @@ function plantedChecks(
   draft: PipelineDraft, planted: VariantRuns, layers: Layers, ctx: EvalContext, sheet: Sheet, jobList: readonly JobListEntry[],
   scannerJobs: ReadonlyMap<string, string>, refusedIn: RefusedIn, refusedNote: (needId: string, hits: readonly Hit[]) => void,
 ): void {
-  const prP = ofKind(layers.pr, 'pipegen');
+  const prP = ofKind(layers.kinds, layers.pr, 'pipegen');
   if (planted.stopped === true || layers.pr.some((o) => o.stopped === true)) { sheet.fail('pipeline', 'the proof was stopped before the planted pull request finished, so the scanners are not shown to catch anything'); return; }
   if (prP.length === 0) { sheet.fail('pipeline', "pipegen's workflow did not run on the planted pull request, so the gate is not shown to block planted problems"); return; }
   compatSpoof(layers, sheet);
@@ -803,7 +825,7 @@ async function testsPart(
   const floorTests = needsTests(draft);
   if (skipped.has('tests')) { sheet.notProven('tests', `skipped by you (--skip): ${st(skipped.get('tests'), 200)}`, { caps: true }); return none; }
   if (main === undefined) { sheet.fail('tests', 'the main variant was not proven, so the tests are not proven'); return none; }
-  const prP = ofKind(layers.pr, 'pipegen');
+  const prP = ofKind(layers.kinds, layers.pr, 'pipegen');
   const needs = draft.needs.filter((n) => TESTS_CATEGORIES.has(categoryOf(n.id, n.category)));
   const created = ctx.createdTests ?? [];
   if (needs.length === 0 && created.length === 0) sheet.notProven('tests', 'there are no tests to prove: the draft has no test check and no created tests', { caps: true });
@@ -881,9 +903,18 @@ async function testsPart(
       continue;
     }
     if (s !== 'success') { sheet.fail('tests', `the coverage job ${st(id, 80)} did not run on the pull request, so no coverage was measured`, n.id); unreadable = true; continue; }
-    const legs = hits.filter((h) => ok(h.job)).map((h) => coverageRows(typeof h.job.log === 'string' ? h.job.log : ''));
+    const reads = hits.filter((h) => ok(h.job)).map((h) => readCoverageRows(typeof h.job.log === 'string' ? h.job.log : ''));
+    if (reads.some((r) => r.capped)) {
+      // rows were left unread: a fake flood could hide the real summary, so the need fails (never proven, never silently cut)
+      sheet.fail('tests', `coverage ${st(id, 80)}: the job log holds more than ${MAX_COVERAGE_ROWS} 'All files' rows, so the real summary cannot be told from fakes; the coverage check is not proven`, n.id);
+      unreadable = true;
+      continue;
+    }
+    const legs = reads.map((r) => r.rows);
     if (legs.length === 0 || legs.some((r) => r.length === 0)) {
-      sheet.notProven('tests', `coverage ${st(id, 80)}: the measured lines could not be read from the job log, so the coverage check is not proven`, { needId: n.id });
+      // the tests part covers a floor need: an unreadable log caps it. A floor coverage need is failed, never not-proven.
+      const text = `coverage ${st(id, 80)}: the measured lines could not be read from the job log, so the coverage check is not proven`;
+      if (n.floor === true || FLOOR.has(n.id)) sheet.fail('tests', text, n.id); else sheet.notProven('tests', text, { needId: n.id, caps: true });
       unreadable = true;
       continue;
     }
@@ -903,22 +934,30 @@ async function testsPart(
   return { measured, lowest, decision: coverageNotes(measured, ctx.existingMinimum ?? null) };
 }
 
-/** Every "All files" percentage-of-lines row of a log (timestamps, ANSI and CR progress stripped, the tail kept), invalid rows ignored. */
-export function coverageRows(log: string): number[] {
+const MAX_COVERAGE_ROWS = 10_000;
+/**
+ * Every "All files" percentage-of-lines row of a log (timestamps, ANSI and CR progress stripped, invalid rows ignored), read from the
+ * tail (the real summary is printed last). `capped` is true when the log holds more rows than the cap: the caller must then fail
+ * closed, because rows were left unread (a hostile test can print thousands of fake rows).
+ */
+export function readCoverageRows(log: string): { rows: number[]; capped: boolean } {
   const out: number[] = [];
-  for (const raw of String(log).slice(-MAX_LOG_READ).split('\n')) {
-    let line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
+  const lines = String(log).slice(-MAX_LOG_READ).split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let line = (lines[i] as string).endsWith('\r') ? (lines[i] as string).slice(0, -1) : (lines[i] as string);
     const cr = line.lastIndexOf('\r');
     if (cr >= 0) line = line.slice(cr + 1);
     if (line.startsWith('\ufeff')) line = line.slice(1);
     line = line.replace(TIMESTAMP, '').replace(ANSI, '');
     if (!/^\s*All files\s*\|/.test(line)) continue;
     const v = measuredLines(line);
-    if (v !== null) out.push(v);
-    if (out.length >= 10_000) break;
+    if (v === null) continue;
+    if (out.length >= MAX_COVERAGE_ROWS) return { rows: out, capped: true };
+    out.push(v);
   }
-  return out;
+  return { rows: out, capped: false };
 }
+export const coverageRows = (log: string): number[] => readCoverageRows(log).rows;
 
 // ---------- assemble the parts ----------
 

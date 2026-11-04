@@ -757,7 +757,9 @@ describe('coverage', () => {
       const full = await evaluateProof(d, both(d, m), ctxOf());
       expect(full.coverage.measured, String(log)).toBeNull();
       expect(need(full.result, 'tests', 'coverage')?.status, String(log)).toBe('not-proven');
-      expect(full.result.ok).toBe(true);
+      // E5-R5 (fix round 2): an unreadable coverage log caps the floor tests part; it is never left proven
+      expect(part(full.result, 'tests')?.status, String(log)).toBe('not-proven');
+      expect(full.result.ok, String(log)).toBe(false);
     }
     // a failed coverage job is not read for a number
     const bad = withLog(table('90'), 'failure');
