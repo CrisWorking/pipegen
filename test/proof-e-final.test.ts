@@ -7,11 +7,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { proveThenClean, proofVerdict, type CleanupResult } from '../src/proof/cleanup.js';
-import { PLACEHOLDER_PREFIX } from '../src/proof/keys.js';
+import { SecretVault } from '../src/create/secrets.js';
+import { isExcerptEvidence, PLACEHOLDER_PREFIX, ScratchKeys } from '../src/proof/keys.js';
+import { proofTarget } from '../src/proof/target.js';
 import { nextStage, StateError, StateStore } from '../src/proof/state.js';
 import type { CreatedFile, PipelineDraft } from '../src/types.js';
 import { draftOf } from './helpers/proof-eval.js';
-import { app } from './helpers/scratch-secrets.js';
+import { app, EVIDENCE_RUN, keysWorld, quietIo } from './helpers/scratch-secrets.js';
 
 const RUN = '20261104-090000-abc123';
 const dirs: string[] = [];
@@ -147,5 +149,39 @@ describe('final review I-2: the saved stage follows the verdict, and the state h
     // a draft that doesn't match the state format is refused before anything is written
     expect(() => store.recordVerdict({ ok: true, draft: { created: 'x' } as never })).toThrow(StateError);
     expect(store.load()?.proofOk).toBe(false);
+  });
+});
+
+describe('final review I-3: the brand checks organisation secrets against the names the proof\'s workflows read', () => {
+  const STRIPE = ['STRIPE', 'SECRET', 'KEY'].join('_');
+  const NEW = ['REGISTRY', 'TOKEN'].join('_');
+
+  it('a switched tool reads a new secret that an organisation secret answers: no brand with that proof\'s names (the start-time names would have given one)', async () => {
+    const w = keysWorld();
+    w.s.orgShared = [NEW];
+    // Plan G built ScratchKeys with the names the workflows read at the start
+    const keys = new ScratchKeys(w.g.gh, proofTarget(app()), new SecretVault(), { io: quietIo, readByWorkflows: [STRIPE] });
+    await keys.placeholders([STRIPE]);
+    // the stale start-time names: the org secret is not seen as read (the hole the review found)
+    expect(isExcerptEvidence(await keys.evidence(await keys.ticket(), [EVIDENCE_RUN]))).toBe(true);
+    // the names of the workflows this proof pushed: refused, at the ticket or at the evidence
+    const names = [NEW, STRIPE];
+    expect(await keys.evidence(await keys.ticket({ readBy: names }), [EVIDENCE_RUN])).toBeNull();
+    expect(keys.lastRefusal).toMatch(/organisation secret REGISTRY_TOKEN/);
+    expect(await keys.evidence(await keys.ticket(), [EVIDENCE_RUN], { readBy: names })).toBeNull();
+    expect(await keys.evidence(await keys.ticket({ readBy: names.map((n) => n.toLowerCase()) }), [EVIDENCE_RUN])).toBeNull();
+    // unknown names (null, or not a list): every organisation secret counts as read
+    expect(await keys.evidence(await keys.ticket({ readBy: null }), [EVIDENCE_RUN])).toBeNull();
+    expect(await keys.evidence(await keys.ticket(), [EVIDENCE_RUN], { readBy: 'x' as never })).toBeNull();
+    // its placeholder stored before the run shadows the org secret: the brand again
+    await keys.placeholders([NEW]);
+    expect(isExcerptEvidence(await keys.evidence(await keys.ticket({ readBy: names }), [EVIDENCE_RUN], { readBy: names }))).toBe(true);
+    // names that don't include the org secret's: the brand (an org secret no workflow reads never reaches a job)
+    const v = keysWorld();
+    v.s.orgShared = [NEW];
+    const k2 = new ScratchKeys(v.g.gh, proofTarget(app()), new SecretVault(), { io: quietIo });
+    await k2.placeholders([STRIPE]);
+    expect(isExcerptEvidence(await k2.evidence(await k2.ticket({ readBy: [STRIPE] }), [EVIDENCE_RUN], { readBy: [STRIPE] }))).toBe(true);
+    expect(await k2.evidence(await k2.ticket(), [EVIDENCE_RUN])).toBeNull();   // no names at all: every org secret counts (unchanged)
   });
 });

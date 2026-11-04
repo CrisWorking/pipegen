@@ -105,13 +105,22 @@ class FakeKeys implements FixKeys {
   mode: 'none' | 'placeholder' | 'real' = 'placeholder';
   lastRefusal: string | undefined;
   refuseEvidence = false;
+  /** Final review I-3: the read names each ticket and evidence call was given (undefined: none given). */
+  readonly ticketReadBy: (readonly string[] | null | undefined)[] = [];
+  readonly evidenceReadBy: (readonly string[] | null | undefined)[] = [];
+  failPlaceholders: Error | null = null;
   constructor(private readonly timeline: string[]) {}
   async setup(names: readonly string[]): Promise<void> { this.timeline.push(`setup:${names.join(',')}`); this.mode = 'placeholder'; }
+  async placeholders(names: readonly string[]): Promise<void> {
+    this.timeline.push(`placeholders:${names.join(',')}`);
+    if (this.failPlaceholders !== null) throw this.failPlaceholders;
+  }
   async real(names: readonly string[]): Promise<void> { this.timeline.push(`real:${names.join(',')}`); this.mode = 'real'; }
   async deleteAll(): Promise<string[]> { this.timeline.push('deleteAll'); this.mode = 'none'; return []; }
-  async ticket(): Promise<{ readonly ticket: true }> { this.timeline.push('ticket'); return Object.freeze({ ticket: true as const, mode: this.mode }) as never; }
-  async evidence(t: { readonly ticket: true }, ids: readonly number[]): Promise<ExcerptEvidence | null> {
+  async ticket(opts?: { readBy?: readonly string[] | null }): Promise<{ readonly ticket: true }> { this.timeline.push('ticket'); this.ticketReadBy.push(opts?.readBy); return Object.freeze({ ticket: true as const, mode: this.mode }) as never; }
+  async evidence(t: { readonly ticket: true }, ids: readonly number[], opts?: { readBy?: readonly string[] | null }): Promise<ExcerptEvidence | null> {
     this.timeline.push(`evidence:${ids.join(',')}`);
+    this.evidenceReadBy.push(opts?.readBy);
     if (this.refuseEvidence || (t as unknown as { mode: string }).mode === 'real') { this.lastRefusal = 'a value you typed was stored'; return null; }
     return BRAND;
   }
@@ -137,6 +146,7 @@ interface WorldOpts {
   minutesCap?: number;
   scanner?: FixDeps['scanner'];
   keys?: (timeline: string[]) => FakeKeys;
+  workflowsOf?: FixDeps['workflowsOf'];
 }
 interface World { deps: FixDeps; timeline: string[]; reqs: AiRequest[]; proves: { scope: string; keys: string; draft: PipelineDraft }[]; confirms: CreatedFile[][]; reruns: number[][]; guarded: string[][]; keys: FakeKeys; minutes: MinutesMeter; meter: AiSpendMeter; run: () => Promise<FixOutcome> }
 
@@ -177,6 +187,7 @@ function world(o: WorldOpts): World {
     ...(o.candidates === undefined ? {} : { candidates: o.candidates }),
     ...(o.dockerfileFor === undefined ? {} : { dockerfileFor: o.dockerfileFor }),
     ...(o.checkTests === undefined ? {} : { checkTests: o.checkTests }),
+    ...(o.workflowsOf === undefined ? {} : { workflowsOf: o.workflowsOf }),
     referee: async (d) => { const rep = o.referee?.(d, refs++) ?? { ok: true, issues: [] }; return { ...rep, demoted: [], notes: [] }; },
     guard: o.guard ?? (async (files) => { guarded.push(files.map((f) => f.path)); return { ok: [...files], refused: [], notes: [] }; }),
     keys, vault, scanner: o.scanner ?? scanner,
@@ -1193,5 +1204,103 @@ describe('E7 boundaries (extra)', () => {
     const big = failingSection(`${'x'.repeat(100)}\n`.repeat(20_000));
     expect(big.length).toBeLessThanOrEqual(1024 * 1024);
     expect(big.startsWith('x')).toBe(true);
+  });
+});
+
+// Final review I-3 (ruling E-F1): the secret names the workflows read are taken from the workflows of each proof, never fixed
+// at the start. A change-step (or a next candidate) may bring a tool that reads a new secret: it gets its placeholder before
+// the run; when it can't, no excerpt of that run goes to the AI. ticket and evidence get the names of that proof's workflows.
+describe('final review I-3: the read secret names follow the workflows of each proof', () => {
+  const REGISTRY = ['REGISTRY', 'TOKEN'].join('_');
+  const SWITCHED = 'docker-build-push-action';
+  /** The workflows Plan G would push for `d`: every step's tool; the switched-to tool reads REGISTRY_TOKEN. */
+  const render = (d: PipelineDraft): { path: string; content: string }[] => [{
+    path: '.github/workflows/pipegen.yml',
+    content: `on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    env:\n      K: \${{ secrets.${STRIPE} }}\n    steps:\n${d.steps.map((x) => `      - run: echo ${x.tool.id}${x.tool.id === SWITCHED ? `\n        env:\n          T: \${{ secrets.${REGISTRY} }}` : ''}`).join('\n')}\n`,
+  }];
+  const changeStep = (): Answer => answer({ action: 'change-step', needId: 'image-build', candidateId: SWITCHED, explanation: 'Use the reviewed build action.' });
+  const failing = (word: string) => proof({ part: 'docker', needId: 'image-build', log: errLog(word) });
+
+  it('change-step to a tool that reads a new secret: its placeholder is stored before the run; ticket and evidence get the pushed names', async () => {
+    const w = world({
+      stored: [STRIPE],
+      workflowsOf: (d) => render(d),
+      prove: (n, d) => ({ ...(n <= 1 ? failing(n === 0 ? 'alpha' : 'beta') : green()), workflows: render(d) }),
+      candidates: () => [spec(SWITCHED, 'image-build', 'api')],
+      answers: [changeStep(), giveUp()],
+    });
+    await w.run();
+    const t = w.timeline;
+    const placed = t.indexOf(`placeholders:${REGISTRY}`);
+    expect(placed, t.join(' ')).toBeGreaterThan(t.indexOf('ai'));
+    // stored after the answer and BEFORE the ticket and the push of the proof that runs the new tool
+    expect(t.slice(placed + 1, placed + 3)).toEqual(['ticket', 'prove:placeholder']);
+    expect(t.filter((x) => x.startsWith('placeholders:'))).toEqual([`placeholders:${REGISTRY}`]);   // once
+    expect(w.keys.ticketReadBy[0]).toEqual([STRIPE]);
+    expect(w.keys.ticketReadBy[1]).toEqual([REGISTRY, STRIPE]);
+    // the excerpt of the second run: its brand is checked with the names its workflows read
+    expect(w.keys.evidenceReadBy[0]).toEqual([STRIPE]);
+    expect(w.keys.evidenceReadBy[1]).toEqual([REGISTRY, STRIPE]);
+    expect(w.reqs).toHaveLength(2);
+  });
+
+  it('a read name that got no placeholder before the run (unknown before, or the store failed): no excerpt of that run goes to the AI', async () => {
+    // no workflowsOf: the new name is seen only in the pushed workflows
+    const unknown = world({
+      stored: [STRIPE],
+      prove: (n, d) => ({ ...(n <= 1 ? failing(n === 0 ? 'alpha' : 'beta') : green()), workflows: render(d) }),
+      candidates: () => [spec(SWITCHED, 'image-build', 'api')],
+      answers: [changeStep(), edit('api/Dockerfile', DF(REF24, '\n# never'))],
+    });
+    const out = await unknown.run();
+    expect(unknown.reqs).toHaveLength(1);   // the first run's excerpt only; the second run read REGISTRY_TOKEN with no placeholder
+    expect(unknown.keys.evidenceReadBy).toHaveLength(1);   // no brand was even asked for
+    expect(out.notes.join('\n')).toMatch(/REGISTRY_TOKEN/);
+    // the placeholder store fails: the same, the run still goes on
+    const failed = world({
+      stored: [STRIPE],
+      workflowsOf: (d) => render(d),
+      prove: (n, d) => ({ ...(n <= 1 ? failing(n === 0 ? 'alpha' : 'beta') : green()), workflows: render(d) }),
+      candidates: () => [spec(SWITCHED, 'image-build', 'api')],
+      answers: [changeStep(), edit('api/Dockerfile', DF(REF24, '\n# never'))],
+    });
+    const { ScratchKeysError } = await import('../src/proof/keys.js');
+    failed.keys.failPlaceholders = new ScratchKeysError('the store failed');
+    await failed.run();
+    expect(failed.timeline).toContain(`placeholders:${REGISTRY}`);
+    expect(failed.proves.length).toBeGreaterThanOrEqual(2);
+    expect(failed.reqs).toHaveLength(1);
+    // a name pipegen never gives a placeholder (PIPEGEN_*): no excerpt either
+    const own = world({
+      stored: [STRIPE],
+      workflowsOf: (d) => [{ path: 'x.yml', content: `on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \${{ secrets.PIPEGEN_OTHER }} ${d.steps.length}\n` }],
+      prove: (n) => ({ ...(n === 0 ? failing('alpha') : green()), workflows: [{ path: 'x.yml', content: 'on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ${{ secrets.PIPEGEN_OTHER }}\n' }] }),
+      answers: [],
+    });
+    await own.run();
+    expect(own.reqs).toHaveLength(0);
+    expect(own.timeline.some((x) => x.startsWith('placeholders:'))).toBe(false);
+  });
+
+  it('unknown names (no workflows given back, or a workflow workflowSecretNames can\'t read) → every organisation secret counts as read (null)', async () => {
+    const w = world({ stored: [STRIPE], prove: (n) => (n === 0 ? failing('alpha') : green()), answers: [giveUp()] });
+    await w.run();
+    expect(w.keys.ticketReadBy[0]).toBeNull();
+    expect(w.keys.evidenceReadBy[0]).toBeNull();
+    const v = world({ stored: [STRIPE], workflowsOf: () => [{ content: 'jobs: { a: { secrets: inherit } }\n' }], prove: (n) => ({ ...(n === 0 ? failing('alpha') : green()), workflows: [{ content: 'env: { A: "${{ toJSON(secrets) }}" }\n' }] }), answers: [giveUp()] });
+    await v.run();
+    expect(v.keys.ticketReadBy[0]).toBeNull();
+    expect(v.keys.evidenceReadBy[0]).toBeNull();
+    // a re-run runs the same workflows: it keeps the names of the proof it re-runs
+    const r = world({
+      stored: [STRIPE], workflowsOf: (d) => render(d),
+      prove: (n, d) => ({ ...(n === 0 ? proof({ part: 'docker', needId: 'image-build', log: log('The runner has received a shutdown signal.') }) : green()), workflows: render(d) }),
+      rerun: () => failing('gamma'),
+      answers: [giveUp()],
+    });
+    await r.run();
+    expect(r.reruns).toHaveLength(1);
+    expect(r.keys.ticketReadBy[1]).toEqual([STRIPE]);     // the re-run's ticket
+    expect(r.keys.evidenceReadBy[0]).toEqual([STRIPE]);   // the re-run's excerpt
   });
 });

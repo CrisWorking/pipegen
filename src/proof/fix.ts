@@ -19,6 +19,10 @@
 // the run id AND attempt of each log. A failure seen in a run that held the real keys is classified locally; when it needs a fix it
 // is run once more with placeholders (ruling E7-R1 in the E7 report) and only that run's log may go to the AI. If it doesn't fail
 // with placeholders, it failed only with the user's keys and ends with that reason, never sent to the AI.
+// Final review I-3: the secret names the workflows read are taken again for every proof, from the workflows themselves
+// (workflowSecretNames of deps.workflowsOf(draft) before the push, and of ProofRun.workflows, what was pushed). A changed step
+// or candidate that reads a new secret gets its placeholder before the run; ticket and evidence check the organisation secrets
+// against the names of that proof (unknown: every one counts); a run that read a name with no placeholder sends no log.
 // Logs: each failing job's log is bounded to its last 16 MiB, then only the failing step's section (the step that holds the first
 // ##[error] line) cut to its last 1 MiB goes to errorExcerpt. Any throw from errorExcerpt (the secret scan included) = nothing is sent.
 //
@@ -56,7 +60,7 @@ import { safeText } from '../util/safe-text.js';
 import { capMessage, capReached, type CapReached } from './caps.js';
 import { cleanLog, EMPTY_SECRET_RE, KEY_REFUSED_RE, mentionsName, NEEDS_REAL_KEY, type EvidenceSource, type PartEvidence } from './evaluate.js';
 import { errorExcerpt, errorSignature } from './excerpt.js';
-import type { ExcerptEvidence, RunTicket, ScratchKeys } from './keys.js';
+import { SCRATCH_FP_KEY, ScratchKeysError, workflowSecretNames, type ExcerptEvidence, type RunTicket, type ScratchKeys } from './keys.js';
 import type { MinutesMeter } from './minutes.js';
 
 export type FailureClass = 'missing-secret' | 'needs-real-keys' | 'runner-error' | 'rate-limit' | 'tool-error' | 'needs-fix';
@@ -246,9 +250,16 @@ export function makeFixGuard(ctx: GuardCtx & { vault: KnownValueCheck; closure: 
 // ---------- the deps ----------
 
 /** What the fix loop uses of ScratchKeys (E4). */
-export type FixKeys = Pick<ScratchKeys, 'mode' | 'setup' | 'real' | 'deleteAll' | 'ticket' | 'evidence' | 'scrubber' | 'lastRefusal'>;
-/** S15: what one proof (or re-run) gives back: the evaluation and, per part (or part:needId), the failed jobs' logs with their runs. */
-export interface ProofRun { result: ProofResult; evidence: ReadonlyMap<string, PartEvidence> }
+export type FixKeys = Pick<ScratchKeys, 'mode' | 'setup' | 'placeholders' | 'real' | 'deleteAll' | 'ticket' | 'evidence' | 'scrubber' | 'lastRefusal'>;
+/** A workflow file as it was (or will be) pushed: its content is what workflowSecretNames reads. */
+export interface PushedWorkflow { path?: string; content: string | Uint8Array }
+/**
+ * S15: what one proof (or re-run) gives back: the evaluation and, per part (or part:needId), the failed jobs' logs with their runs.
+ * `workflows` (final review I-3): the workflow files of the commit the proof pushed (what buildProofBranch checked); the loop
+ * reads the secret names they read from them (workflowSecretNames). Absent (or unreadable): the names are unknown, and every
+ * organisation secret counts as read for the excerpt brand. A re-run without it keeps the names of the proof it re-runs.
+ */
+export interface ProofRun { result: ProofResult; evidence: ReadonlyMap<string, PartEvidence>; workflows?: readonly PushedWorkflow[] }
 
 export interface FixDeps {
   /** The run's AI, already wrapped by meteredProvider (E6): it must be meters.ai.provider. */
@@ -275,6 +286,12 @@ export interface FixDeps {
   scanner: SecretScanner;
   /** The secret names the proof stores (placeholders for every one); the real values are the vault's for these names. */
   secretNames: readonly string[];
+  /**
+   * Final review I-3: the workflow files Plan G will push for `d` (assembled, before the push), read BEFORE each proof so a
+   * secret a changed step now reads gets its placeholder before the run. Absent: a new name is seen only in the pushed
+   * workflows (ProofRun.workflows), too late for a placeholder, and that run's log never goes to the AI.
+   */
+  workflowsOf?: (d: PipelineDraft) => readonly PushedWorkflow[] | Promise<readonly PushedWorkflow[]>;
   /** The mid-run screen "Run these AI-written files with your test keys?" (Plan G). */
   confirm: (aiFiles: CreatedFile[]) => Promise<boolean>;
   meters: { minutes: MinutesMeter; ai: AiSpendMeter };
@@ -306,7 +323,8 @@ export interface FixOutcome {
 
 // ---------- the loop ----------
 
-interface Proof extends ProofRun { ticket: RunTicket; keys: 'placeholder' | 'real'; seq: number }
+/** `readNames`: the secret names the run's workflows read (null: unknown); `unplaced`: those of them no placeholder was stored for. */
+interface Proof extends ProofRun { ticket: RunTicket; keys: 'placeholder' | 'real'; seq: number; readNames: string[] | null; unplaced: string[] }
 interface Unit { key: string; part: Part; needId?: string; entry: PartResult; keysOnly: boolean }
 interface Earlier { n: number; action: string; target: string; explanation: string; outcome: string; error: string }
 interface UState {
@@ -336,6 +354,17 @@ const DECLINED = 'you chose not to run AI-written code with your keys';
 const st = (s: unknown, n = 300): string => safeText(String(s ?? ''), n);
 const isRec = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null;
 const EMPTY_RESULT: ProofResult = { ok: false, parts: [], findings: [], minutesUsed: 0, runUrls: [] };
+/** A secret name ScratchKeys gives a placeholder (GITHUB_* is GitHub's, PIPEGEN_* pipegen's own: never one). */
+const placeable = (n: string): boolean => /^[A-Z_][A-Z0-9_]{0,199}$/.test(n) && !/^(?:GITHUB|PIPEGEN)_/.test(n);
+/** The secret names `workflows` read (upper-cased, sorted), or null when unknown (none given, or one can't be read). */
+function readNamesOf(workflows: unknown): string[] | null {
+  if (!Array.isArray(workflows)) return null;
+  try {
+    return workflowSecretNames(workflows as PushedWorkflow[]);
+  } catch {
+    return null;
+  }
+}
 const okSource = (s: unknown): s is EvidenceSource => isRec(s) && Number.isSafeInteger(s.runId) && (s.runId as number) > 0
   && Number.isSafeInteger(s.attempt) && (s.attempt as number) > 0 && typeof s.log === 'string';
 
@@ -407,6 +436,10 @@ class FixLoop {
   readonly notes: string[] = [];
   readonly realNames: string[];
   readonly missing: string[];
+  /** Final review I-3: every name that gets a placeholder at a setup (the given secretNames, plus names a changed workflow reads). */
+  readonly names: Set<string>;
+  /** The upper-cased names the scratch repo holds a pipegen value for now (a placeholder, the throwaway key or a real value). */
+  readonly placed = new Set<string>();
   readonly max: number;
   readonly maxTotal: number;
 
@@ -417,6 +450,13 @@ class FixLoop {
     this.keysNow = deps.keys.mode === 'real' ? 'real' : deps.keys.mode === 'placeholder' ? 'placeholder' : 'none';
     this.realNames = [...new Set((deps.secretNames ?? []).filter((n) => typeof n === 'string' && !/^(?:PIPEGEN|GITHUB)_/i.test(n) && deps.vault.has(n)))];
     this.missing = [...new Set(draft.notProven.flatMap((n) => (Array.isArray(n.missingSecrets) ? n.missingSecrets : [])).filter((n) => typeof n === 'string' && n !== ''))];
+    this.names = new Set(deps.secretNames ?? []);
+    // keys already stored (pushProofSetup's scratchSecretStore): the placeholders of secretNames and the throwaway key
+    if (this.keysNow !== 'none') this.markPlaced([...this.names, SCRATCH_FP_KEY]);
+  }
+
+  markPlaced(names: readonly string[]): void {
+    for (const n of names) if (typeof n === 'string') this.placed.add(n.toUpperCase());
   }
 
   // ----- keys -----
@@ -435,7 +475,8 @@ class FixLoop {
     if (want === this.keysNow) return;
     if (this.keysNow === 'none') {
       // M5: nothing stored yet is not "placeholders stored": every name gets its placeholder (and the throwaway key) first
-      await this.deps.keys.setup([...new Set(this.deps.secretNames)]);
+      await this.deps.keys.setup([...this.names]);
+      this.markPlaced([...this.names, SCRATCH_FP_KEY]);
       this.keysNow = 'placeholder';
       if (want === 'placeholder') return;
     }
@@ -446,8 +487,38 @@ class FixLoop {
     }
     // E4 carry: after a real store the brand comes back only after a full deleteAll, then placeholders (and the throwaway key)
     this.keysNow = 'placeholder';
+    this.placed.clear();
     await this.deps.keys.deleteAll();
-    await this.deps.keys.setup([...new Set(this.deps.secretNames)]);
+    await this.deps.keys.setup([...this.names]);
+    this.markPlaced([...this.names, SCRATCH_FP_KEY]);
+  }
+
+  /** Final review I-3: the secret names the workflows of `d` will read (deps.workflowsOf), or null when unknown. */
+  async namesBefore(d: PipelineDraft): Promise<string[] | null> {
+    if (this.deps.workflowsOf === undefined) return null;
+    try {
+      return readNamesOf(await this.deps.workflowsOf(d));
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Final review I-3: a placeholder, before the run, for each name the workflows now read that the scratch repo holds no
+   * pipegen value for. A store that fails (ScratchKeysError) leaves the name unplaced: that run's log never goes to the AI.
+   */
+  async placeNew(names: readonly string[] | null): Promise<void> {
+    const fresh = (names ?? []).filter((n) => placeable(n) && !this.placed.has(n));
+    if (fresh.length === 0) return;
+    try {
+      await this.deps.keys.placeholders(fresh);
+    } catch (e) {
+      if (!(e instanceof ScratchKeysError)) throw e;
+      this.say(`pipegen couldn't store a placeholder for ${fresh.join(', ')} (${st(e.message, 200)}), so no log of the next run goes to the AI`);
+      return;
+    }
+    this.markPlaced(fresh);
+    this.say(`the workflows now read ${fresh.join(', ')}: ${fresh.length === 1 ? 'its placeholder was' : 'their placeholders were'} stored before the run`);
   }
 
   // ----- stops -----
@@ -550,16 +621,25 @@ class FixLoop {
   async proveNow(what: { kind: 'prove'; scope: 'pr' | 'full' } | { kind: 'rerun'; ids: number[] }): Promise<Proof | FixOutcome> {
     const before = await this.capStop();
     if (before !== null) return before;
-    if (what.kind === 'prove') await this.setKeys(this.desired());
+    // final review I-3: the names the workflows of this proof read, from the workflows themselves (a re-run: the proof's own)
+    const pre = what.kind === 'prove' ? await this.namesBefore(this.draft) : this.proof?.readNames ?? null;
+    if (what.kind === 'prove') {
+      for (const n of pre ?? []) if (placeable(n)) this.names.add(n);
+      await this.setKeys(this.desired());
+      await this.placeNew(pre);
+    }
     this.reproduceNext = false;
     // M1: a re-run is a new attempt of the runs of the last proof, so it is recorded with THEIR keys (real if they or the repo held real values)
     const keys: 'placeholder' | 'real' = what.kind === 'rerun'
       ? (this.proof?.keys === 'real' || this.keysNow === 'real' ? 'real' : 'placeholder')
       : this.keysNow === 'real' ? 'real' : 'placeholder';
-    const ticket = await this.deps.keys.ticket();   // E4 protocol: BEFORE the push or re-run that starts the runs
+    const ticket = await this.deps.keys.ticket({ readBy: pre });   // E4 protocol: BEFORE the push or re-run that starts the runs
     const run = what.kind === 'prove' ? await this.deps.prove(this.draft, what.scope) : await this.deps.rerun(what.ids);
     if (!isRec(run) || !isRec(run.result) || !Array.isArray(run.result.parts) || !(run.evidence instanceof Map)) throw new Error('The proof gave back no result pipegen can read.');
-    const p: Proof = { result: run.result, evidence: run.evidence, ticket, keys, seq: ++this.seq };
+    // the names the pushed workflows read (a re-run without them: the same runs, so the proof's own names)
+    const readNames = run.workflows !== undefined ? readNamesOf(run.workflows) : what.kind === 'rerun' ? this.proof?.readNames ?? null : null;
+    const unplaced = (readNames ?? []).filter((n) => !/^GITHUB_/.test(n) && !this.placed.has(n));
+    const p: Proof = { result: run.result, evidence: run.evidence, ticket, keys, seq: ++this.seq, readNames, unplaced };
     this.proof = p;
     if (what.kind === 'prove' && what.scope === 'full') this.fullVersion = this.version;
     if (keys === 'real') this.lastReal = { proof: p, version: this.version };
@@ -574,8 +654,11 @@ class FixLoop {
     if (p.keys !== 'placeholder') return { none: 'the run held your real test keys, and pipegen never sends the log of such a run to the AI' };
     const sources = (this.evidenceOf(u, p)?.sources ?? []).filter(okSource).slice(0, MAX_SOURCES);
     if (sources.length === 0) return { none: 'pipegen read no log of the failing job, so it had nothing to show the AI' };
-    // DECISIONS #113: the brand for these runs (finished, started after the ticket, the repo held only placeholders)
-    const brand: ExcerptEvidence | null = await this.deps.keys.evidence(p.ticket, [...new Set(sources.map((s) => s.runId))]);
+    // final review I-3: a secret the run's workflows read with no placeholder stored before it (an organisation secret may answer it)
+    if (p.unplaced.length > 0) return { none: `the run's workflows read ${p.unplaced.map((n) => st(n, 80)).join(', ')}, which got no placeholder before the run, so nothing was sent to the AI` };
+    // DECISIONS #113: the brand for these runs (finished, started after the ticket, the repo held only placeholders), checked
+    // against the organisation secrets the workflows of these runs read
+    const brand: ExcerptEvidence | null = await this.deps.keys.evidence(p.ticket, [...new Set(sources.map((s) => s.runId))], { readBy: p.readNames });
     if (brand === null) return { none: `pipegen could not show that the run held only placeholders (${st(this.deps.keys.lastRefusal ?? 'no reason given', 200)}), so nothing was sent to the AI` };
     const vaultScrub = this.deps.vault.scrubber();
     const keysScrub = this.deps.keys.scrubber();

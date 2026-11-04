@@ -34,8 +34,10 @@
 //     since the last verified deleteAll; at evidence(), also when one was written since the ticket;
 //   - the repo's Actions secrets (listed whole, every page) hold a name pipegen didn't write in this state, a value the user
 //     typed, or a secret whose updated_at differs from pipegen's own record (changed by hand);
-//   - an organisation secret visible to the repo, whose name a proof workflow reads (case-insensitive; every name when
-//     `readByWorkflows` isn't given), isn't shadowed by a placeholder or throwaway pipegen wrote under that name;
+//   - an organisation secret visible to the repo, whose name a proof workflow reads (case-insensitive), isn't shadowed by a
+//     placeholder or throwaway pipegen wrote under that name. The names are those given to ticket() / evidence() for that
+//     proof (`readBy`: the workflows it pushed, final review I-3; null: unknown), else `readByWorkflows`; every name when
+//     neither is known;
 //   - a repo Actions variable isn't one of the declared non-secret names (target.ts SCRATCH_VARIABLES) holding its config;
 //   - an environment of the repo holds any secret (they override repo secrets for a job that names the environment, and
 //     pipegen never writes one), or an environment variable that isn't a declared name holding its config (fix round 2, R2);
@@ -358,15 +360,19 @@ export class ScratchKeys {
     return this.#scrub.fn;
   }
 
-  /** Take BEFORE the push or re-run that starts the runs (see the file comment). Reads the repo's secrets, org secrets and variables. */
-  async ticket(): Promise<RunTicket> {
+  /**
+   * Take BEFORE the push or re-run that starts the runs (see the file comment). Reads the repo's secrets, org secrets and
+   * variables. `readBy` (final review I-3): the secret names the workflows of this proof read (keys.ts workflowSecretNames);
+   * null = unknown, every organisation secret counts as read; absent = the `readByWorkflows` this ScratchKeys was made with.
+   */
+  async ticket(opts: { readBy?: readonly string[] | null } = {}): Promise<RunTicket> {
     const t = Object.freeze({ ticket: true as const });
     let rec: TicketRec;
     try {
       const st = await this.#state();
       const seq = st.realSeq;
       const meta: { date?: string } = {};
-      const refusal = await this.#verify(st, meta);
+      const refusal = await this.#verify(st, meta, this.#readSet(opts.readBy));
       rec = { state: st, seq, refusal, serverTime: typeof meta.date === 'string' ? Date.parse(meta.date) : Number.NaN };
     } catch (e) {
       if (isTokenRejected(this.#gh, e)) throw githubTokenRejected();
@@ -380,9 +386,9 @@ export class ScratchKeys {
   /**
    * The excerpt evidence for `runIds`, the runs `ticket` brackets, taken AFTER they finished: the brand when the scratch repo
    * held only placeholders and throwaway keys for the whole window (read from the API again now), else null; `lastRefusal`
-   * says why (DECISIONS #113, E4-R1, E4-R2).
+   * says why (DECISIONS #113, E4-R1, E4-R2). `readBy`: as ticket()'s, the names the workflows of these runs read (I-3).
    */
-  async evidence(ticket: RunTicket, runIds: readonly number[]): Promise<ExcerptEvidence | null> {
+  async evidence(ticket: RunTicket, runIds: readonly number[], opts: { readBy?: readonly string[] | null } = {}): Promise<ExcerptEvidence | null> {
     const refuse = (why: string): null => { this.#why = why; return null; };
     const rec = typeof ticket === 'object' && ticket !== null ? tickets.get(ticket) : undefined;
     if (rec === undefined) return refuse('the ticket was not taken by ScratchKeys');
@@ -419,7 +425,7 @@ export class ScratchKeys {
       if (!(started > rec.serverTime)) return refuse(`run ${id} started before the ticket (or in the same second), so it may have held a value you typed`);
       pairs.add(pairKey(id, d.run_attempt));
     }
-    const now = await this.#verify(st);
+    const now = await this.#verify(st, undefined, this.#readSet(opts.readBy));
     if (now !== null) return refuse(now);
     // a store that began during the reads above
     if (rec.seq !== st.realSeq) return refuse(`a value you typed was stored in ${this.#scratch.fullName} after the ticket`);
@@ -456,8 +462,15 @@ export class ScratchKeys {
     return st;
   }
 
+  /** The names whose organisation secrets count as read (I-3): `readBy` when given (null or not a list: every name), else the construction's. */
+  #readSet(readBy: readonly string[] | null | undefined): ReadonlySet<string> | null {
+    if (readBy === undefined) return this.#readByWorkflows;
+    if (!Array.isArray(readBy)) return null;
+    return new Set(readBy.map((n) => String(n).toUpperCase()));
+  }
+
   /** null when the repo's real state allows the brand, else why not (see the file comment). Never throws but for a rejected token. */
-  async #verify(st: KeyState, meta?: { date?: string }): Promise<string | null> {
+  async #verify(st: KeyState, meta?: { date?: string }, readBy: ReadonlySet<string> | null = this.#readByWorkflows): Promise<string | null> {
     const repo = this.#scratch.fullName;
     if (!st.clean) return `${repo} has not been listed empty by pipegen's deleteAll since its last change it can't account for`;
     if (st.busy.size > 0) return `a store to ${repo} is in flight`;
@@ -486,7 +499,7 @@ export class ScratchKeys {
     }
     for (const o of org) {
       const up = o.name.toUpperCase();
-      const read = this.#readByWorkflows === null || this.#readByWorkflows.has(up);
+      const read = readBy === null || readBy.has(up);
       if (read && !shadowing.has(up)) return `the organisation secret ${safeText(o.name, 80)} reaches the proof's workflows in ${repo}`;
     }
     let vars: { name: string; value?: unknown }[];
