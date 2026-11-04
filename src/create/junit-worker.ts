@@ -32,6 +32,17 @@ export interface JunitReadOptions {
   workerUrl?: URL;
 }
 
+/** A caller may only LOWER a limit: each is min(default, requested); keys it does not know are dropped. */
+function clampLimits(asked: ResourceLimits | undefined): ResourceLimits {
+  const out: ResourceLimits = { ...JUNIT_RESOURCE_LIMITS };
+  for (const k of Object.keys(JUNIT_RESOURCE_LIMITS) as (keyof ResourceLimits)[]) {
+    const want = asked?.[k];
+    const have = JUNIT_RESOURCE_LIMITS[k] as number;
+    if (typeof want === 'number' && Number.isFinite(want) && want > 0) out[k] = Math.min(have, want);
+  }
+  return out;
+}
+
 const PREFIX = 'report unreadable: ';
 const unreadable = (why: string): JunitRead => ({ ok: false, reason: `${PREFIX}${safeText(why, 300)}` });
 const STATUS = new Set(['pass', 'fail', 'skip']);
@@ -77,7 +88,7 @@ function run(bytes: Uint8Array, opts: JunitReadOptions): Promise<JunitRead> {
     const timer = setTimeout(() => finish(unreadable(`reading it took longer than ${Math.round(timeoutMs / 1000)} s`)), timeoutMs);
     try {
       // a copy: the caller's buffer is never handed over (or detached) by the worker
-      worker = new Worker(url, { workerData: { bytes: Uint8Array.from(bytes) }, resourceLimits: { ...JUNIT_RESOURCE_LIMITS, ...opts.resourceLimits }, stdout: false, stderr: false });
+      worker = new Worker(url, { workerData: { bytes: Uint8Array.from(bytes) }, resourceLimits: clampLimits(opts.resourceLimits), stdout: false, stderr: false });
     } catch (e) {
       finish(unreadable(`the parser could not start (${e instanceof Error ? e.message : 'unknown'})`));
       return;

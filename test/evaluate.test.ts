@@ -109,7 +109,7 @@ describe('evaluate', () => {
     setGate(prRun(main), d, { result: 'warn', warnings: [gateFinding('image-scan', 'trivy', { severity: 'critical', job: 'image-scan--api', ruleId: 'CVE-2025-1', isNew: null })] });
     const r = await evaluate(d, both(d, main, plantedRuns(d)), ctxOf());
     expect(part(r, 'docker')?.status).toBe('failed');
-    expect(part(r, 'docker')?.detail).toMatch(/the base image has fixable critical\/high CVEs/);
+    expect(part(r, 'docker')?.detail).toMatch(/the base image has critical\/high \(fix info unknown until gate-v0\.2\.2\) CVEs/);
     expect(part(r, 'docker')?.detail).toContain('CVE-2025-1');
     // the same finding on an existing (not created) Dockerfile is not docker's to judge
     const existing = draftOf();
@@ -931,7 +931,7 @@ describe('gate block attribution is exact (no substring matching)', () => {
     setGate(prRun(red), d, { result: 'block', toolErrors: [toolErr], blockReasons: [reason] });
     const r = await evaluate(d, both(d, red), ctxOf());
     expect(part(r, 'tests')?.status).toBe('failed');
-    expect(part(r, 'pipeline')?.status).toBe('proven');
+    expect(part(r, 'pipeline')?.status).toBe('not-proven');   // the explained block is never a proven gate (fix round 1, C1)
     expect(r.ok).toBe(false);
   });
 });

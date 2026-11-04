@@ -80,6 +80,8 @@ export interface EvalContext {
   createdTests?: readonly CreatedTestRun[];
   /** Reads a JUnit report (default: readJunitBytes, the worker). Never trusted to throw nothing: a throw is "report unreadable". */
   readJunit?: (bytes: Uint8Array) => Promise<JunitRead>;
+  /** Pipegen's own workflow files (default: the workflow files the draft creates, else .github/workflows/pipegen.yml). Runs of any other file are untrusted. */
+  pipegenWorkflows?: readonly string[];
   /** The repo's own coverage minimum (readExistingMinimum), for the coverage notes. */
   existingMinimum?: number | null;
   /** The minutes meter's total (E6). */
@@ -88,7 +90,7 @@ export interface EvalContext {
 export interface Evaluation {
   result: ProofResult;
   /** The measured lines of the coverage job(s) (S11) and what coverageNotes makes of the lowest; null when it could not be read. */
-  coverage: { measured: number | null; decision: CoverageDecision | null };
+  coverage: { measured: number | null; lowest: number | null; decision: CoverageDecision | null };
   /** The failed jobs behind a part (or part:needId): their names and raw logs, for E7's classifier and excerpt. */
   evidence: Map<string, { jobs: string[]; log: string }>;
 }
@@ -142,8 +144,19 @@ function externalHost(text: string): string | null {
 
 // ---------- jobs and runs ----------
 
-type Kind = 'pipegen' | 'harness' | 'compat';
-const kindOf = (workflow: string): Kind => (workflow === HARNESS_PATH ? 'harness' : workflow.startsWith(COMPAT_PREFIX) ? 'compat' : 'pipegen');
+type Kind = 'pipegen' | 'harness' | 'compat' | 'other';
+/** Only the draft's own pipegen workflow files and the harness are trusted sources of proof (m7); a compat copy is the user's; anything else is untrusted. */
+const kindOfPath = (workflow: string, trusted: ReadonlySet<string>): Kind => (workflow === HARNESS_PATH ? 'harness' : workflow.startsWith(COMPAT_PREFIX) ? 'compat' : trusted.has(workflow) ? 'pipegen' : 'other');
+const DEFAULT_PIPEGEN = new Set(['.github/workflows/pipegen.yml']);
+const kindOf = (workflow: string): Kind => kindOfPath(workflow, DEFAULT_PIPEGEN);
+/** The kind of each outcome of the evaluation under way (set synchronously at its start, before any await). */
+const KINDS = new WeakMap<object, Kind>();
+const TOP_WORKFLOW_RE = /^\.github\/workflows\/[^/]+\.ya?ml$/;
+function trustedWorkflows(draft: PipelineDraft, ctx: EvalContext): Set<string> {
+  const out = new Set<string>(ctx.pipegenWorkflows ?? []);
+  for (const f of draft.created) if (TOP_WORKFLOW_RE.test(f.path) && f.path !== HARNESS_PATH && !f.path.startsWith(COMPAT_PREFIX)) out.add(f.path);
+  return out.size > 0 ? out : new Set(DEFAULT_PIPEGEN);
+}
 /** `caller / callee (matrix)` → `callee`, and the id with its matrix suffix stripped. A name equal to the id, or the id plus ` (…)`, matches it. */
 export function jobNameMatches(name: string, id: string): boolean {
   if (typeof name !== 'string' || id === '') return false;
@@ -196,7 +209,7 @@ function layersOf(v: VariantRuns): Layers {
   }
   return out;
 }
-const ofKind = (runs: readonly RunOutcome[], k: Kind): RunOutcome[] => runs.filter((r) => kindOf(r.handle.workflow) === k);
+const ofKind = (runs: readonly RunOutcome[], k: Kind): RunOutcome[] => runs.filter((r) => (KINDS.get(r) ?? kindOf(r.handle.workflow)) === k);
 
 // ---------- the verdict collector ----------
 
@@ -205,6 +218,8 @@ class Sheet {
   readonly verdicts: Verdict[] = [];
   readonly notes = new Map<Part, string[]>();
   readonly evidence = new Map<string, { jobs: string[]; log: string }>();
+  /** The gate job did not pass on the main pull request: ok can never be true. */
+  gateMainFailed = false;
   private readonly seen = new Set<string>();
   fail(part: Part, detail: string, needId?: string, url?: string): void { this.add({ part, ...(needId === undefined ? {} : { needId }), status: 'failed', detail, caps: false, ...(url === undefined ? {} : { url }) }); }
   notProven(part: Part, detail: string, opts: { needId?: string; caps?: boolean; url?: string } = {}): void {
@@ -213,7 +228,7 @@ class Sheet {
   proven(part: Part, needId: string, detail: string): void { this.add({ part, needId, status: 'proven', detail, caps: false }); }
   note(part: Part, text: string): void { const l = this.notes.get(part) ?? []; if (!l.includes(text)) l.push(text); this.notes.set(part, l); }
   private add(v: Verdict): void {
-    const key = `${v.part}|${v.needId ?? ''}|${v.status}|${v.detail}`;
+    const key = v.status === 'not-proven' && !v.caps ? `${v.part}|${v.needId ?? ''}|np` : `${v.part}|${v.needId ?? ''}|${v.status}|${v.detail}`;
     if (this.seen.has(key)) return;
     this.seen.add(key);
     this.verdicts.push(v);
@@ -254,10 +269,14 @@ class Judge {
 // ---------- the evaluation ----------
 
 /** The checks another part reports (category → the --skip part name that switches that part off). */
-const OWNER_PART: Readonly<Record<string, string>> = Object.freeze({ 'image-build': 'docker', hooks: 'precommit', 'hooks-ci': 'precommit', 'unit-tests': 'tests', 'full-tests': 'tests', coverage: 'tests', 'deploy-verify': 'deploy' });
+const OWNER_PART: Readonly<Record<string, { part: Part; skip: string }>> = Object.freeze({
+  'image-build': { part: 'docker', skip: 'docker' }, hooks: { part: 'precommit', skip: 'precommit' }, 'hooks-ci': { part: 'precommit', skip: 'precommit' },
+  'unit-tests': { part: 'tests', skip: 'tests' }, 'full-tests': { part: 'tests', skip: 'tests' }, coverage: { part: 'tests', skip: 'tests' }, 'deploy-verify': { part: 'deploy-verify', skip: 'deploy' },
+});
 const TESTS_CATEGORIES: ReadonlySet<string> = new Set(['unit-tests', 'full-tests']);
 const FLOOR: ReadonlySet<string> = new Set(FLOOR_NEEDS);
 const categoryOf = (needId: string, declared?: string): string => (declared !== undefined && declared !== '' ? declared : (Object.hasOwn(NEED_ID_CATEGORY, needId) ? (NEED_ID_CATEGORY as Readonly<Record<string, string>>)[needId] as string : needId));
+const needsTests = (draft: PipelineDraft): boolean => draft.needs.some((n) => TESTS_CATEGORIES.has(categoryOf(n.id, n.category)));
 const SEVERE: ReadonlySet<string> = new Set(['critical', 'high']);
 const MAX_DETAIL = 1500;
 
@@ -272,7 +291,7 @@ export async function evaluateProof(draft: PipelineDraft, runs: readonly Variant
     const why = e instanceof GateJobListError ? `the gate's job list could not be computed (${st(e.message, 200)})` : `the proof's results could not be read (${st(e instanceof Error ? e.message : 'unknown', 200)})`;
     return {
       result: { ok: false, parts: [{ part: 'pipeline', status: 'failed', detail: `report unreadable: ${why}` }], findings: [], minutesUsed: ctx?.minutesUsed ?? 0, runUrls: [] },
-      coverage: { measured: null, decision: null }, evidence: new Map(),
+      coverage: { measured: null, lowest: null, decision: null }, evidence: new Map(),
     };
   }
 }
@@ -292,19 +311,23 @@ async function evaluateInner(draft: PipelineDraft, runs: readonly VariantRuns[],
   const skipped = new Map<string, string>(draft.skipped.map((s) => [s.part, s.reason]));
   const mainLayers = main === undefined ? { push: [], pr: [], merge: [] } : layersOf(main);
   const plantedLayers = planted === undefined ? { push: [], pr: [], merge: [] } : layersOf(planted);
+  const trusted = trustedWorkflows(draft, ctx);
+  for (const v of runs) for (const o of v.outcomes) if (isRec(o) && isRec(o.handle) && typeof o.handle.workflow === 'string') KINDS.set(o, kindOfPath(o.handle.workflow, trusted));
   const allUrls = new Set<string>();
   for (const v of runs) for (const o of v.outcomes) if (isRec(o) && isRec(o.handle) && typeof o.handle.url === 'string') allUrls.add(o.handle.url);
 
   // which jobs belong to which need (for the refused-mount signature and the ownership of the other parts)
   const scannerJobs = new Map<string, string>();   // job id → need id
-  const ownedJobs = new Set<string>();
+  const ownedJobs = new Map<string, Part>();
   for (const n of draft.needs) {
     const cat = categoryOf(n.id, n.category);
     if (FINDINGS_CATEGORIES.has(cat)) scannerJobs.set(inFolderNeed(n), n.id);
     // a job another part reports is that part's, unless the user skipped the part (then nobody else would see it fail)
     const owner = OWNER_PART[cat];
-    if (owner !== undefined && !skipped.has(owner)) ownedJobs.add(inFolderNeed(n));
+    if (owner !== undefined && !skipped.has(owner.skip)) ownedJobs.set(inFolderNeed(n), owner.part);
   }
+  // a part covers a floor need: the pipeline always; tests only when the draft has a unit-tests or full-tests need (m2)
+  const floorOf = (part: Part): boolean => part === 'pipeline' || (part === 'tests' && needsTests(draft));
   const refusedIn = (runsOf: readonly RunOutcome[]): Map<string, Hit[]> => {
     const out = new Map<string, Hit[]>();
     for (const [job, needId] of scannerJobs) {
@@ -322,7 +345,7 @@ async function evaluateInner(draft: PipelineDraft, runs: readonly VariantRuns[],
   let gateMain: GateResultDoc | null = null;
   if (main === undefined) sheet.fail('pipeline', 'the main variant was not proven, so the pipeline is not shown to work');
   else {
-    gateMain = pipelineMain(draft, main, mainLayers, ctx, sheet, jobList, scannerJobs, ownedJobs, refusedIn, refusedNote);
+    gateMain = pipelineMain(draft, main, mainLayers, ctx, sheet, jobList, scannerJobs, ownedJobs, refusedIn, refusedNote, judge, floorOf);
   }
   // ===== pipeline: planted =====
   if (planted === undefined) sheet.fail('pipeline', "the planted variant was not proven, so the scanners are not shown to catch anything and the gate is not shown to block planted problems");
@@ -335,7 +358,6 @@ async function evaluateInner(draft: PipelineDraft, runs: readonly VariantRuns[],
   const pipegenMerge = ofKind(mainLayers.merge, 'pipegen');
   const harnessId = (id: HarnessJobId) => (name: string): boolean => name === `${HARNESS_JOB_PREFIX}${id}`;
   const rendered = (id: HarnessJobId): boolean => ctx.harnessJobs.includes(id);
-  const floorOf = (part: Part): boolean => part === 'pipeline' || (part === 'tests' && draft.needs.some((n) => TESTS_CATEGORIES.has(categoryOf(n.id, n.category)) || FLOOR.has(n.id)));
 
   // egress-check (pipeline): both events
   if (main !== undefined) {
@@ -355,6 +377,7 @@ async function evaluateInner(draft: PipelineDraft, runs: readonly VariantRuns[],
   const app: AppState = !rendered('app-start') ? { state: 'not-rendered', hits: [] } : { state: stateOf(appHits), hits: appHits };
   const appNote = (): string => (ctx.harnessNotes ?? []).filter((n) => /app-start/.test(n)).map((n) => st(n, 300)).join(' ') || 'the harness has no app-start job';
   const appVerdict = (part: Part): void => {
+    if (main === undefined) { sheet.notProven(part, 'the main variant was not proven, so the app start is not proven', { caps: true }); return; }
     if (app.state === 'not-rendered') sheet.notProven(part, `app start: ${appNote()}`, { caps: true });
     else if (app.state === 'absent' || app.state === 'skipped') sheet.fail(part, 'the harness app-start did not run, so the app is not shown to start');
     else if (app.state === 'failed') {
@@ -374,7 +397,8 @@ async function evaluateInner(draft: PipelineDraft, runs: readonly VariantRuns[],
   const carriedDocker = (ctx.carried ?? []).some((n) => n.part === 'docker');
   if (skipped.has('docker')) sheet.notProven('docker', `skipped by you (--skip): ${st(skipped.get('docker'), 200)}`, { caps: true });
   else if (imageBuilds.length > 0 || createdDockerfile || carriedDocker) {
-    for (const n of imageBuilds) {
+    if (main === undefined) sheet.notProven('docker', 'the main variant was not proven, so docker is not proven', { caps: true });
+    for (const n of (main === undefined ? [] : imageBuilds)) {
       const id = inFolderNeed(n);
       const { state: s, hits } = ownedState(mainLayers, pipegenPr, id);
       if (s === 'failed') {
@@ -384,26 +408,42 @@ async function evaluateInner(draft: PipelineDraft, runs: readonly VariantRuns[],
       } else if (s !== 'success') sheet.fail('docker', `the image build job ${st(id, 80)} did not run on the pull request`, n.id);
     }
     if (imageBuilds.length > 0 || createdDockerfile) appVerdict('docker');
-    if (createdDockerfile) {
+    if (createdDockerfile && main !== undefined) {
+      // a created Dockerfile's base image is proven only by an image-scan result READ from the trusted run (I3): the scan's check, its
+      // artifact from the run of its job, no tool error, and no critical/high finding. Without it: not-proven (docker covers no floor need).
       const g = gateMain;
-      if (g === null) sheet.notProven('docker', "the image scan's findings could not be read (the gate's report is unreadable), so the created Dockerfile's base image is not proven", { caps: true });
-      else {
+      const scans = jobList.filter((e) => e.category === 'image-scan' && e.range !== true);
+      if (scans.length === 0) sheet.notProven('docker', 'the draft has no image scan check for the created Dockerfile, so its base image is not proven', { caps: true });
+      for (const e of scans) {
+        const why: string[] = [];
+        const hits = hitsIn(pipegenPr, (name) => jobNameMatches(name, e.job));
+        if (stateOf(hits) !== 'success') why.push('its job did not finish green on the pull request');
+        if (e.artifact === undefined || !hits.some((h) => h.run.artifacts.has(e.artifact as string))) why.push('its result artifact is missing');
+        if (g === null) why.push("the gate's report is unreadable");
+        else {
+          if (!g.checks.some((c) => c.needId === e.needId && c.job === e.job)) why.push("the gate's report has no check for it");
+          if (g.toolErrors.some((t) => t.needId === e.needId && t.job === e.job)) why.push('the gate reports a tool error for it');
+        }
+        if (why.length > 0) sheet.notProven('docker', `the image scan ${st(e.job, 80)} was not read (${why.join('; ')}), so the created Dockerfile's base image is not proven`, { needId: e.needId, caps: true });
+      }
+      if (g !== null) {
         const severe = [...g.blocking, ...g.warnings].filter((f) => (f.needId === 'image-scan' || categoryOf(f.needId) === 'image-scan') && SEVERE.has(f.severity));
         if (severe.length > 0) {
           const ids = [...new Set(severe.map((f) => st(f.ruleId, 60)))].slice(0, 8).join(', ');
-          sheet.fail('docker', `the base image has fixable critical/high CVEs (${ids}); another base image tag is needed`, 'image-scan');
+          sheet.fail('docker', `the base image has critical/high (fix info unknown until gate-v0.2.2) CVEs (${ids}); another base image tag is needed`, 'image-scan');
         }
       }
     }
   }
   for (const n of ctx.carried ?? []) {
     if (n.part === 'docker') sheet.notProven('docker', st(n.reason, 400), { caps: true });
-    else sheet.notProven(n.part, st(n.reason, 400), { ...(n.needId === undefined ? {} : { needId: n.needId }), caps: n.part !== 'pipeline' && !floorOf(n.part) });
+    else sheet.notProven(n.part, st(n.reason, 400), { ...(n.needId === undefined ? {} : { needId: n.needId }), caps: n.part !== 'pipeline' });
   }
 
   // precommit
   const hooks = draft.needs.filter((n) => ['hooks', 'hooks-ci'].includes(categoryOf(n.id, n.category)));
   if (skipped.has('precommit')) sheet.notProven('precommit', `skipped by you (--skip): ${st(skipped.get('precommit'), 200)}`, { caps: true });
+  else if (hooks.length > 0 && main === undefined) sheet.notProven('precommit', 'the main variant was not proven, so the hooks are not proven', { caps: true });
   else for (const n of hooks) {
     const id = inFolderNeed(n);
     const { state: s, hits } = ownedState(mainLayers, pipegenPr, id);
@@ -418,6 +458,7 @@ async function evaluateInner(draft: PipelineDraft, runs: readonly VariantRuns[],
   if (skipped.has('deploy')) sheet.notProven('deploy-verify', `skipped by you (--skip): ${st(skipped.get('deploy'), 200)}`, { caps: true });
   else {
     if (main !== undefined && main.mergeSha === undefined) sheet.fail('deploy-verify', main.notMerged !== undefined ? `the pull request was not merged, so verify-lookup did not run (${st(main.notMerged, 300)})` : 'the pull request was not merged, so verify-lookup did not run');
+    else if (main === undefined) sheet.fail('deploy-verify', 'the main variant was not proven, so verify-lookup is not proven');
     else if (main !== undefined) {
       if (!rendered('verify-lookup')) sheet.notProven('deploy-verify', `verify-lookup is not rendered in the harness (${(ctx.harnessNotes ?? []).map((n) => st(n, 200)).join(' ') || 'no reason given'})`, { caps: true });
       else {
@@ -449,7 +490,7 @@ async function evaluateInner(draft: PipelineDraft, runs: readonly VariantRuns[],
   const findings = gateMain === null ? [] : asFindings([...gateMain.blocking, ...gateMain.warnings]);
   const partOk = (p: PartResult): boolean => p.status === 'proven';
   const overall = PART_ORDER.map((pt) => parts.find((p) => p.part === pt && p.needId === undefined)).filter((p): p is PartResult => p !== undefined);
-  const okAll = !parts.some((p) => p.status === 'failed')
+  const okAll = !sheet.gateMainFailed && !parts.some((p) => p.status === 'failed')
     && overall.every((p) => partOk(p) || !(p.part === 'pipeline' || (p.part === 'tests' && floorOf('tests') && !skipped.has('tests'))));
   return {
     result: { ok: okAll, parts, findings, minutesUsed: typeof ctx.minutesUsed === 'number' && Number.isFinite(ctx.minutesUsed) ? ctx.minutesUsed : 0, runUrls: [...allUrls] },
@@ -490,11 +531,13 @@ export function blockExplained(d: GateResultDoc, jobList: readonly JobListEntry[
 type RefusedIn = (runs: readonly RunOutcome[]) => Map<string, Hit[]>;
 function pipelineMain(
   draft: PipelineDraft, main: VariantRuns, layers: Layers, ctx: EvalContext, sheet: Sheet, jobList: readonly JobListEntry[],
-  scannerJobs: ReadonlyMap<string, string>, ownedJobs: ReadonlySet<string>, refusedIn: RefusedIn, refusedNote: (needId: string, hits: readonly Hit[]) => void,
+  scannerJobs: ReadonlyMap<string, string>, ownedJobs: ReadonlyMap<string, Part>, refusedIn: RefusedIn, refusedNote: (needId: string, hits: readonly Hit[]) => void,
+  judge: Judge, floorOf: (p: Part) => boolean,
 ): GateResultDoc | null {
   const prP = ofKind(layers.pr, 'pipegen');
   const mergeP = ofKind(layers.merge, 'pipegen');
   const pushP = ofKind(layers.push, 'pipegen');
+  unreadableRuns(layers, sheet);
   // layers that must have run
   if (main.stopped === true || [...layers.push, ...layers.pr, ...layers.merge].some((o) => o.stopped === true)) sheet.fail('pipeline', 'the proof was stopped before every run finished, so the pipeline is not proven');
   for (const m of main.missing ?? []) {
@@ -513,7 +556,12 @@ function pipelineMain(
   const refusedJobs = new Set([...refused.values()].flat().map((h) => h.job));
   // jobs whose failure is reported elsewhere: a refused scanner (E5-R1), or an owned job that really failed in some layer (its part then
   // fails or is not-proven for it, because ownedState says failed and the part runs classify on it)
-  const failedOwned = [...ownedJobs].filter((id) => ownedState(layers, prP, id).state === 'failed');
+  // An owned job explains a block only when its part FAILS for it: a failure the evaluator can only call not-proven (an external host, a
+  // missing secret in its log) is ambiguous, so it never explains a gate block on the main PR (C1).
+  const failedOwned = [...ownedJobs].filter(([id, owner]) => {
+    const o = ownedState(layers, prP, id);
+    return o.state === 'failed' && judge.classify(floorOf(owner), failing(o.hits), id).status === 'failed';
+  }).map(([id]) => id);
   const explainedIds = new Set<string>([...failedOwned, ...[...scannerJobs].filter(([, n]) => refused.has(n)).map(([j]) => j)]);
   const isExplained = (jobId: string): boolean => explainedIds.has(jobId);
 
@@ -524,7 +572,7 @@ function pipelineMain(
       let anyFailed = false;
       for (const j of latest(run.jobs)) {
         if (ok(j) || jobSkipped(j) || gateName(j.name) || refusedJobs.has(j)) continue;
-        if ([...ownedJobs].some((id) => jobNameMatches(j.name, id))) continue;
+        if ([...ownedJobs.keys()].some((id) => jobNameMatches(j.name, id))) continue;
         anyFailed = true;
         const need = [...scannerJobs].find(([id]) => jobNameMatches(j.name, id));
         sheet.fail('pipeline', `${label}: ${describeJob({ job: j, run })} in ${st(run.handle.workflow.replace('.github/workflows/', ''), 60)}`, need?.[1], run.handle.url);
@@ -553,6 +601,7 @@ function pipelineMain(
   const read = gateResultOf(gateRun);
   if (read.ok) doc = read.doc;
   const gateState = stateOf(gateHits);
+  if (gateState !== 'success') sheet.gateMainFailed = true;
   if (gateState === 'success') {
     if (!read.ok) sheet.fail('pipeline', `the gate passed but its result.json is not usable: ${read.reason}`, undefined, gateRun.handle.url);
     else if (!read.doc.pass || read.doc.blocking.length > 0) sheet.fail('pipeline', 'the gate job passed but its report says it blocked (or lists blocking findings): the two disagree, so neither is trusted', undefined, gateRun.handle.url);
@@ -564,7 +613,7 @@ function pipelineMain(
       const why = d === null ? read.ok ? '' : ` (${(read as { reason: string }).reason})` : d.blocking.length > 0 ? `: ${d.blocking.slice(0, 5).map((f) => `${st(f.tool, 40)} ${st(f.ruleId, 60)}${f.file === undefined ? '' : ` in ${st(f.file, 80)}`}`).join(', ')}` : d.blockReasons.length > 0 ? `: ${d.blockReasons.slice(0, 3).map((r) => st(r, 160)).join(' | ')}` : '';
       sheet.fail('pipeline', `the gate blocked the pull request${why}`, undefined, gateRun.handle.url);
       sheet.evidenceOf('pipeline', failing(gateHits));
-    } else sheet.note('pipeline', `the gate blocked the main pull request only because of ${[...new Set([...d.failedJobs.map((f) => f.job), ...d.notRun.map((f) => f.job)])].map((j) => st(j, 60)).join(', ')} (reported by their own parts)`);
+    } else sheet.notProven('pipeline', `the gate blocked the main pull request because of ${[...new Set([...d.failedJobs.map((f) => f.job), ...d.toolErrors.filter((t) => t.blocks).map((t) => t.job)])].map((j) => st(j, 60)).join(', ')} (reported by their own parts), so the gate is not shown to pass`, { caps: true, url: gateRun.handle.url });
   } else sheet.fail('pipeline', 'the gate job did not run to a result on the pull request', undefined, gateRun.handle.url);
 
   // each blocking need: its result artifact and its check in the report
@@ -601,11 +650,23 @@ function zapAndNuclei(draft: PipelineDraft, sheet: Sheet, jobList: readonly JobL
 }
 
 // ---------- compat copies ----------
+
+/** m4: a pipegen or harness run whose jobs or artifact list could not be read is unreadable, never green. */
+function unreadableRuns(layers: Layers, sheet: Sheet): void {
+  const all = [...layers.push, ...layers.pr, ...layers.merge];
+  for (const run of ofKind(all, 'pipegen').concat(ofKind(all, 'harness'))) {
+    for (const key of ['(jobs)', '(listing)']) {
+      const why = run.artifactProblems.get(key);
+      if (why !== undefined) sheet.fail('pipeline', `report unreadable: ${key === '(jobs)' ? 'the jobs' : 'the artifact list'} of the run of ${st(run.handle.workflow.replace('.github/workflows/', ''), 60)} (${run.handle.event}): ${st(why, 200)}`, undefined, run.handle.url);
+    }
+  }
+}
+
 /** A compat copy is the user's own workflow: it never legitimately holds a pipegen result. Its artifacts are never a source of proof, and holding one is a failure. */
 function compatSpoof(layers: Layers, sheet: Sheet): void {
-  for (const run of ofKind([...layers.push, ...layers.pr, ...layers.merge], 'compat')) {
+  for (const run of [...ofKind([...layers.push, ...layers.pr, ...layers.merge], 'compat'), ...ofKind([...layers.push, ...layers.pr, ...layers.merge], 'other')]) {
     const spoof = [...run.artifacts.keys(), ...run.artifactProblems.keys()].filter((n) => n === GATE_RESULT_ARTIFACT || n.startsWith('pipegen-out-'));
-    if (spoof.length > 0) sheet.fail('pipeline', `the compat copy ${st(run.handle.workflow.replace(COMPAT_PREFIX, '.github/workflows/'), 100)} carries a pipegen result artifact (${spoof.slice(0, 3).map((n) => st(n, 80)).join(', ')}); it is ignored as a source of proof`, undefined, run.handle.url);
+    if (spoof.length > 0) sheet.fail('pipeline', `the ${kindOf(run.handle.workflow) === 'compat' ? 'compat copy' : 'untrusted workflow'} ${st(run.handle.workflow.replace(COMPAT_PREFIX, '.github/workflows/'), 100)} carries a pipegen result artifact (${spoof.slice(0, 3).map((n) => st(n, 80)).join(', ')}); it is ignored as a source of proof`, undefined, run.handle.url);
   }
 }
 
@@ -641,6 +702,7 @@ function plantedChecks(
   if (planted.stopped === true || layers.pr.some((o) => o.stopped === true)) { sheet.fail('pipeline', 'the proof was stopped before the planted pull request finished, so the scanners are not shown to catch anything'); return; }
   if (prP.length === 0) { sheet.fail('pipeline', "pipegen's workflow did not run on the planted pull request, so the gate is not shown to block planted problems"); return; }
   compatSpoof(layers, sheet);
+  unreadableRuns(layers, sheet);
   const refused = refusedIn(prP);
   for (const [needId, hits] of refused) refusedNote(needId, hits);
   const gateHits = hitsIn(prP, (n) => jobNameMatches(n, 'gate'));
@@ -663,9 +725,17 @@ function plantedChecks(
   const blocking = doc.blocking;
   const items = ctx.plantedItems ?? [];
 
-  // secrets: every C1b placement, by file
+  // the floor scanners come from the draft's floor needs, not only from the filtered job list: one with no result to read is failed
+  for (const n of draft.needs) {
+    const cat = categoryOf(n.id, n.category);
+    if ((FLOOR.has(n.id) || FLOOR.has(cat)) && FINDINGS_CATEGORIES.has(cat) && !toolsByCategory.has(cat) && !refusedNeeds.has(n.id)) {
+      sheet.fail('pipeline', `${st(n.id, 60)}: no scanner result for it is read from the planted run, so it is not shown to catch anything`, n.id, gateRun.handle.url);
+    }
+  }
+  // secrets: every C1b placement, by file; at least one placement must be expected (an empty list proves nothing)
   const secretsTool = toolsByCategory.get('secrets');
   if (secretsTool !== undefined && !refusedNeeds.has('secrets')) {
+    if (!ctx.planted.some((p) => p.kind === 'secret')) sheet.fail('pipeline', `${st(secretsTool, 60)}: no planted secret was expected, so secrets is not shown to catch anything`, 'secrets', gateRun.handle.url);
     const secretFindings = blocking.filter((f) => f.needId === 'secrets' || f.secret);
     for (const p of ctx.planted) {
       if (p.kind !== 'secret') continue;
@@ -696,7 +766,7 @@ function plantedChecks(
   // blocking scanners with no planted item at all: not shown to catch anything (a floor need is failed, never not-proven)
   for (const [category, tool] of toolsByCategory) {
     const needId = needOfCategory.get(category) as string;
-    if (category === 'secrets' || refusedNeeds.has(needId)) continue;
+    if (category === 'secrets' || refusedNeeds.has(needId) || tool === 'nuclei') continue;
     if (items.some((i) => i.category === category)) continue;
     const floor = FLOOR.has(needId) || FLOOR.has(category);
     const text = `${st(tool, 60)}: no planted item for ${st(needId, 60)}, so it is not shown to catch anything`;
@@ -728,10 +798,11 @@ export const junitArtifactNames = (service: string): { first: string; repeat: st
 async function testsPart(
   draft: PipelineDraft, main: VariantRuns | undefined, layers: Layers, ctx: EvalContext, sheet: Sheet, judge: Judge, skipped: ReadonlyMap<string, string>,
   harnessPr: readonly RunOutcome[], harnessId: (id: HarnessJobId) => (name: string) => boolean, rendered: (id: HarnessJobId) => boolean,
-): Promise<{ measured: number | null; decision: CoverageDecision | null }> {
-  const none = { measured: null, decision: null };
+): Promise<{ measured: number | null; lowest: number | null; decision: CoverageDecision | null }> {
+  const none = { measured: null, lowest: null, decision: null };
+  const floorTests = needsTests(draft);
   if (skipped.has('tests')) { sheet.notProven('tests', `skipped by you (--skip): ${st(skipped.get('tests'), 200)}`, { caps: true }); return none; }
-  if (main === undefined) return none;
+  if (main === undefined) { sheet.fail('tests', 'the main variant was not proven, so the tests are not proven'); return none; }
   const prP = ofKind(layers.pr, 'pipegen');
   const needs = draft.needs.filter((n) => TESTS_CATEGORIES.has(categoryOf(n.id, n.category)));
   const created = ctx.createdTests ?? [];
@@ -741,7 +812,7 @@ async function testsPart(
     const id = inFolderNeed(n);
     const { state: s, hits } = ownedState(layers, prP, id);
     if (s === 'failed') {
-      const f = judge.classify(true, failing(hits), `test job`);
+      const f = judge.classify(floorTests, failing(hits), `test job`);
       if (f.status === 'failed') sheet.fail('tests', f.detail, n.id, hits[0]?.run.handle.url); else sheet.notProven('tests', f.detail, { needId: n.id, caps: true });
       sheet.evidenceOf('tests', failing(hits));
     } else if (s !== 'success') sheet.fail('tests', `the test job ${st(id, 80)} did not run on the pull request (${s === 'skipped' ? 'skipped' : 'missing'}), so the tests are not proven`, n.id);
@@ -790,8 +861,11 @@ async function testsPart(
     }
   }
 
-  // coverage (S11): the green coverage job's log
+  // coverage (S11): the green coverage job's log. A hostile log may only make things STRICTER: every "All files" row is read;
+  // the HIGHEST per job chooses the minimum (a fake low row can't lower it or switch the check off; a fake high one only raises it)
+  // and the LOWEST decides whether this proof's check passes (a fake low row can only make it fail).
   const covNeeds = draft.needs.filter((n) => categoryOf(n.id, n.category) === 'coverage');
+  let measured: number | null = null;
   let lowest: number | null = null;
   let unreadable = false;
   for (const n of covNeeds) {
@@ -799,24 +873,51 @@ async function testsPart(
     const { state: s, hits: allHits } = ownedState(layers, prP, id);
     const hits = hitsIn(prP, (name) => jobNameMatches(name, id));
     if (s === 'failed') {
-      const f = judge.classify(false, failing(allHits), `coverage job`);
-      if (f.status === 'failed') sheet.fail('tests', f.detail, n.id, allHits[0]?.run.handle.url); else sheet.notProven('tests', f.detail, { needId: n.id });
+      // the tests part covers floor needs: a failed coverage job is failed, whatever its log says (C1)
+      const f = judge.classify(floorTests, failing(allHits), `coverage job`);
+      if (f.status === 'failed') sheet.fail('tests', f.detail, n.id, allHits[0]?.run.handle.url); else sheet.notProven('tests', f.detail, { needId: n.id, caps: true });
       sheet.evidenceOf('tests', failing(allHits));
       unreadable = true;
       continue;
     }
-    if (s !== 'success') { sheet.notProven('tests', `the coverage job ${st(id, 80)} did not run on the pull request, so no coverage was measured`, { needId: n.id }); unreadable = true; continue; }
-    const logs = hits.filter((h) => ok(h.job)).map((h) => (typeof h.job.log === 'string' ? h.job.log : ''));
-    const values = logs.map((l) => measuredLines(cleanLog(l)));
-    const v = values.length > 0 && values.every((x) => x !== null) ? Math.min(...(values as number[])) : null;
-    if (v === null) { sheet.notProven('tests', `coverage ${st(id, 80)}: the measured lines could not be read from the job log, so the coverage check is not proven`, { needId: n.id }); unreadable = true; continue; }
-    lowest = lowest === null ? v : Math.min(lowest, v);
-    const own = coverageNotes(v, ctx.existingMinimum ?? null);
-    sheet.proven('tests', n.id, `coverage ${st(id, 80)}: ${v}% of lines measured${own.notes.length > 0 ? `; ${own.notes.map((x) => st(x, 200)).join('; ')}` : ''}`);
+    if (s !== 'success') { sheet.fail('tests', `the coverage job ${st(id, 80)} did not run on the pull request, so no coverage was measured`, n.id); unreadable = true; continue; }
+    const legs = hits.filter((h) => ok(h.job)).map((h) => coverageRows(typeof h.job.log === 'string' ? h.job.log : ''));
+    if (legs.length === 0 || legs.some((r) => r.length === 0)) {
+      sheet.notProven('tests', `coverage ${st(id, 80)}: the measured lines could not be read from the job log, so the coverage check is not proven`, { needId: n.id });
+      unreadable = true;
+      continue;
+    }
+    const high = Math.min(...legs.map((r) => Math.max(...r)));
+    const low = Math.min(...legs.map((r) => Math.min(...r)));
+    measured = measured === null ? high : Math.min(measured, high);
+    lowest = lowest === null ? low : Math.min(lowest, low);
+    const own = coverageNotes(high, ctx.existingMinimum ?? null);
+    const rows = [...new Set(legs.flat())].sort((x, y) => x - y);
+    const conflict = legs.some((r) => new Set(r).size > 1);
+    const strict = own.choice !== null && low < Number(own.choice);
+    const text = `coverage ${st(id, 80)}: ${high}% of lines measured${own.notes.length > 0 ? `; ${own.notes.map((x) => st(x, 200)).join('; ')}` : ''}`;
+    if (strict) sheet.fail('tests', `${text}; ${conflict ? `several 'All files' rows (${rows.map((r) => `${r}%`).join(', ')}): the highest sets the minimum (${own.choice}%) and the lowest (${low}%) decides, so the check fails` : `the lowest leg (${low}%) is under the minimum ${own.choice}%`}`, n.id);
+    else sheet.proven('tests', n.id, conflict ? `${text}; several 'All files' rows (${rows.map((r) => `${r}%`).join(', ')}): the highest sets the minimum and the lowest decides` : text);
   }
-  if (covNeeds.length === 0 || lowest === null || unreadable) return { measured: unreadable ? null : lowest, decision: null };
-  const decision = coverageNotes(lowest, ctx.existingMinimum ?? null);
-  return { measured: lowest, decision };
+  if (covNeeds.length === 0 || measured === null || unreadable) return { measured: unreadable ? null : measured, lowest: unreadable ? null : lowest, decision: null };
+  return { measured, lowest, decision: coverageNotes(measured, ctx.existingMinimum ?? null) };
+}
+
+/** Every "All files" percentage-of-lines row of a log (timestamps, ANSI and CR progress stripped, the tail kept), invalid rows ignored. */
+export function coverageRows(log: string): number[] {
+  const out: number[] = [];
+  for (const raw of String(log).slice(-MAX_LOG_READ).split('\n')) {
+    let line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
+    const cr = line.lastIndexOf('\r');
+    if (cr >= 0) line = line.slice(cr + 1);
+    if (line.startsWith('\ufeff')) line = line.slice(1);
+    line = line.replace(TIMESTAMP, '').replace(ANSI, '');
+    if (!/^\s*All files\s*\|/.test(line)) continue;
+    const v = measuredLines(line);
+    if (v !== null) out.push(v);
+    if (out.length >= 10_000) break;
+  }
+  return out;
 }
 
 // ---------- assemble the parts ----------
@@ -838,7 +939,10 @@ function assemble(sheet: Sheet, draft: PipelineDraft, ctx: EvalContext, _o: { ma
     emitted.add(part);
     if (overallFailed.length > 0) parts.push({ part, status: 'failed', detail: joined(overallFailed.map((v) => v.detail)), ...urlOf(overallFailed) });
     else if (capping.length > 0) parts.push({ part, status: 'not-proven', detail: joined(capping.map((v) => v.detail)), ...urlOf(capping) });
-    else parts.push({ part, status: 'proven', detail: joined([POSITIVE[part], ...notes]) });
+    else {
+      const np = [...new Set(vs.filter((v) => v.status === 'not-proven' && v.needId !== undefined).map((v) => st(v.needId, 60)))];
+      parts.push({ part, status: 'proven', detail: joined([POSITIVE[part] as string, ...notes, ...(np.length > 0 ? [`not proven: ${np.join(', ')}`] : [])]) });
+    }
     // details: every verdict with a need, and the not-proven notes that do not cap the part (the part's verdict is its FIRST entry)
     for (const v of vs) {
       if (v.needId === undefined && v.status !== 'not-proven') continue;
@@ -849,7 +953,7 @@ function assemble(sheet: Sheet, draft: PipelineDraft, ctx: EvalContext, _o: { ma
   return parts;
 }
 const POSITIVE: Readonly<Record<string, string>> = {
-  pipeline: 'pipegen\'s jobs finished green on the pull request and the merge, the gate passed on the main pull request and blocked the planted one, and every blocking scanner caught its planted item',
+  pipeline: 'pipegen\'s jobs finished green on the pull request and the merge, the gate passed on the main pull request and blocked the planted one, and the scanners with a planted item caught it',
   tests: 'the tests passed', docker: 'the image build and the app start passed', compose: 'the app started', precommit: 'the hooks passed', 'deploy-verify': 'the gated run was found on the merge to the default branch',
 };
 /** A part with nothing wrong and nothing to prove is left out, except the ones every proof has. */
