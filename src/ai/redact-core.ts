@@ -277,10 +277,11 @@ const skipBlanks = (s: string, i: number) => {
  * With `workflow` (a GitHub workflow or action file, see isWorkflowPath), a `name SEP value` whose value is
  * exactly one allowed expression is kept (see isAllowedWorkflowValue); every other rule is unchanged.
  */
-function assignmentSpans(s: string, workflow = false): { spans: Span[]; block: boolean } {
+function assignmentSpans(s: string, workflow = false): { spans: Span[]; block: boolean; quote: string | null } {
   const spans: Span[] = [];
   const n = s.length;
   let block = false;
+  let quote: string | null = null;   // E9: the quote a value opened and left open at the end of the line
   const tags = tagTables(s);
   let handledTag = -1; // tags are reached in order of their '<', so one number marks those already handled
   let handledBlockable = false;
@@ -424,7 +425,7 @@ function assignmentSpans(s: string, workflow = false): { spans: Span[]; block: b
         const close = isQuote(c) ? closingQuote(s, v) : -1;
         const end = close < 0 ? n : close;
         if (end > credStart) spans.push([credStart, end]);
-        if (close < 0) { block = true; break; } // unquoted (or unclosed): the rest of the line, and it may go on like a plain value
+        if (close < 0) { block = true; if (isQuote(c)) quote = s[v] as string; break; } // unquoted (or unclosed): the rest of the line, and it may go on like a plain value
         i = close + 1;
         continue;
       }
@@ -435,7 +436,7 @@ function assignmentSpans(s: string, workflow = false): { spans: Span[]; block: b
         const close = s.indexOf(s[v].repeat(3), v + 3);
         const end = close < 0 ? n : close;
         if (end > v + 3) spans.push([v + 3, end]);
-        if (close < 0) { block = true; break; } // the string goes on over the next lines
+        if (close < 0) { block = true; quote = s[v].repeat(3); break; } // the string goes on over the next lines
         i = close + 3;
         continue;
       }
@@ -447,7 +448,7 @@ function assignmentSpans(s: string, workflow = false): { spans: Span[]; block: b
       const end = far < 0 ? n : far;
       if (end > v + 1) spans.push([v + 1, end]);
       // Unclosed: a YAML double- (or single-) quoted value goes on over the next lines; hide the more-indented ones.
-      if (far < 0) { block = true; break; }
+      if (far < 0) { block = true; quote = s[v] as string; break; }
       i = close + 1;
       continue;
     }
@@ -457,7 +458,7 @@ function assignmentSpans(s: string, workflow = false): { spans: Span[]; block: b
     block = true;
     break;
   }
-  return { spans, block };
+  return { spans, block, quote };
 }
 
 const skipBlanksBack = (s: string, i: number) => {
@@ -591,7 +592,7 @@ const MARK_START = '-----';
 const KEY_TAILS = ['PRIVATE KEY', 'PRIVATE KEY BLOCK'];
 
 /** Finds `-----BEGIN [A-Z ]*PRIVATE KEY-----` or `... PRIVATE KEY BLOCK-----` (PGP), or END, in `line` from `from`. Linear time. */
-function findKeyMarker(line: string, kind: 'BEGIN' | 'END', from: number): { start: number; end: number } | null {
+export function findKeyMarker(line: string, kind: 'BEGIN' | 'END', from: number): { start: number; end: number } | null {
   const head = `${MARK_START}${kind} `;
   for (let i = line.indexOf(head, from); i >= 0; i = line.indexOf(head, i + 1)) {
     let j = i + head.length;
@@ -647,18 +648,18 @@ function isAllowedWorkflowValue(name: string, s: string, v: number): boolean {
   return false;
 }
 
-/** One plain piece of a line (no key markers, at most 4 KB) with every rule applied, in order. */
-function redactSegment(s: string, workflow = false): { text: string; block: boolean } {
+/** One plain piece of a line (no key markers, at most 4 KB) with every rule applied, in order. `quote`: a value's quote left open (E9). */
+function redactSegment(s: string, workflow = false): { text: string; block: boolean; quote: string | null } {
   let out = s;
   for (const [, re] of TOKEN_RULES) out = replaceSpans(out, regexSpans(out, re));
   out = replaceSpans(out, jwtSpans(out));
   out = replaceSpans(out, connectionSpans(out));
   const a = assignmentSpans(out, workflow);
-  return { text: replaceSpans(out, a.spans), block: a.block };
+  return { text: replaceSpans(out, a.spans), block: a.block, quote: a.quote };
 }
 
-/** Leading blanks of a line: their length and their width in columns (a tab advances to the next multiple of 8). */
-const indentOf = (line: string): { chars: number; cols: number } => {
+/** Leading blanks of a line: their length and their width in columns (a tab advances to the next multiple of 8). Exported for excerpt.ts (E9). */
+export const indentOf = (line: string): { chars: number; cols: number } => {
   let i = 0;
   let cols = 0;
   for (; i < line.length; i++) {
@@ -731,6 +732,64 @@ function hideSectionValue(line: string): string {
   return v >= line.length ? key + line.slice(sep) : key + line.slice(sep, v) + R; // an empty value (a list on the next lines) is hidden there
 }
 
+// ----- E9: values over lines (carry E0a, DECISIONS #112) -----
+
+/**
+ * Where a quoted value left open on an earlier line closes in `line`: the index of its closing quote, or -1. A triple quote closes at the
+ * next triple; a single quote character at the first one that is neither after a backslash nor doubled (`''`, `""`): both readings only
+ * ever hide more. Linear.
+ */
+function quoteCloseAt(line: string, quote: string): number {
+  if (quote.length > 1) return line.indexOf(quote);
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '\\') { i++; continue; }
+    if (c === quote) {
+      if (quote !== '`' && line[i + 1] === quote) { i++; continue; }
+      return i;
+    }
+  }
+  return -1;
+}
+
+const isHostStart = (c: number) => isLetter(c) || isDigit(c) || c === 91 /* [ */;
+/**
+ * E9 (carry E0a): a connection string cut after its password. When a line (at most 4 KB) ends with `scheme://` and an authority that
+ * holds a `:` but no `/`, `?`, `#`, `@` or blank, and the next line's first word holds an `@` followed by a host-like character, the
+ * text after that `:` (the password) and the next line's word up to its last such `@` (the rest of a split password) are hidden. Spans
+ * by line index; each line is read a bounded number of times.
+ */
+function nextLineHostSpans(lines: readonly string[]): Map<number, Span[]> {
+  const out = new Map<number, Span[]>();
+  const add = (i: number, sp: Span) => out.set(i, [...(out.get(i) ?? []), sp]);
+  const bare = (raw: string) => { let e = raw.length; while (e > 0 && raw.charCodeAt(e - 1) === 13) e--; return raw.slice(0, e); };
+  for (let i = 0; i + 1 < lines.length; i++) {
+    const line = bare(lines[i] as string);
+    if (!regexSafe(line)) continue;
+    const sep = line.lastIndexOf('://');
+    if (sep <= 0 || !isSchemeChar(code(line, sep - 1))) continue;
+    let colon = -1;
+    let open = true;
+    for (let p = sep + 3; p < line.length; p++) {
+      const c = code(line, p);
+      if (c === 47 || c === 63 || c === 35 || c === 64 || isSpace(c)) { open = false; break; }
+      if (c === 58 && colon < 0) colon = p;
+    }
+    if (!open || colon < 0 || colon + 1 >= line.length) continue;
+    const next = bare(lines[i + 1] as string);
+    if (!regexSafe(next)) continue;
+    const start = skipBlanks(next, 0);
+    let end = start;
+    while (end < next.length && !isSpace(code(next, end))) end++;
+    let at = -1;
+    for (let p = end - 1; p >= start; p--) if (code(next, p) === 64 && p + 1 < end && isHostStart(code(next, p + 1))) { at = p; break; }
+    if (at < 0) continue;
+    add(i, [colon + 1, line.length]);
+    if (at > start) add(i + 1, [start, at]);
+  }
+  return out;
+}
+
 /**
  * Replaces secret-like text with [REDACTED]. Works line by line (the `\r`s at the end of a line count as
  * part of the line end, so CRLF text behaves like LF text), with a little state:
@@ -760,7 +819,16 @@ export function redact(text: string, hint?: { path?: string }): string {
   let inKey = false;
   let blockCols = -1; // >= 0 while hiding an indented value block
   let secretSection = false; // inside a TOML/INI [section] named after a secret
-  for (const raw of text.split('\n')) {
+  let quote: string | null = null; // E9: a quoted value left open on an earlier line, hidden up to its closing quote
+  const all = text.split('\n');
+  // E9: a connection string's password before a line break, with the host on the next line (hidden before any other rule reads it)
+  for (const [i, spans] of nextLineHostSpans(all)) {
+    const raw = all[i] as string;
+    let e = raw.length;
+    while (e > 0 && raw.charCodeAt(e - 1) === 13) e--;
+    all[i] = replaceSpans(raw.slice(0, e), spans) + raw.slice(e);
+  }
+  for (const raw of all) {
     let lineEnd = raw.length;
     while (lineEnd > 0 && raw.charCodeAt(lineEnd - 1) === 13) lineEnd--;
     const cr = raw.slice(lineEnd); // every trailing '\r', put back on output
@@ -789,6 +857,23 @@ export function redact(text: string, hint?: { path?: string }): string {
     const startsBlock = pieces.includes(R);
     // A line that only continues (or closes) a key block already shown as [REDACTED] is dropped.
     if (startedInKey && !startsBlock && plain.every((p) => p === '')) continue;
+    // E9: inside a quoted value left open (a .env value over lines, a YAML quoted scalar, triple quotes), whatever the indentation: the
+    // line is hidden up to the closing quote; what follows the quote is read as usual. A line with a key marker is hidden whole.
+    if (quote !== null) {
+      const close = quoteCloseAt(line, quote);
+      if (close < 0 || startedInKey || startsBlock || !regexSafe(line)) {
+        if (close >= 0) quote = null;
+        out.push((line.trim() === '' ? line : line.slice(0, indentOf(line).chars) + R) + cr);
+        continue;
+      }
+      quote = null;
+      const before = line.slice(0, close);
+      const r = redactSegment(line.slice(close), workflow);
+      quote = r.quote;
+      out.push((before.trim() === '' ? before : before.slice(0, indentOf(before).chars) + R) + r.text + cr);
+      if (r.block && blockRule) blockCols = indentOf(line).cols;
+      continue;
+    }
     if (blockCols >= 0) {
       if (line.trim() === '') {
         out.push(raw); // blank: nothing to hide
@@ -832,6 +917,7 @@ export function redact(text: string, hint?: { path?: string }): string {
       if (p === R) return R;
       const r = redactSegment(p, workflow);
       block ||= r.block;
+      if (r.quote !== null) quote = r.quote;
       return r.text;
     }).join('') + cr);
     if (block && blockRule) blockCols = indentOf(line).cols;

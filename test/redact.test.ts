@@ -2006,6 +2006,7 @@ describe('T0b fix round 1: continuation lines and quotes', () => {
   });
 
   it('redact: an unclosed double-quoted value goes on over the next, more-indented lines', () => {
-    expect(redact(`${P}: "abc\n  ${X}"\nuser: u`, { path: 'a.yml' })).toBe(`${P}: "${R}\n  ${R}\nuser: u`);
+    // E9: hidden up to its closing quote, which stays (test/e9-redact.test.ts); before E9 the whole indented line was hidden
+    expect(redact(`${P}: "abc\n  ${X}"\nuser: u`, { path: 'a.yml' })).toBe(`${P}: "${R}\n  ${R}"\nuser: u`);
   });
 });

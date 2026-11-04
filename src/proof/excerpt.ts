@@ -24,7 +24,7 @@
 // run held only placeholders or throwaway keys (ScratchKeys' brand, E4), so no typed value is in the log at all; the rules below are defence in depth, and the
 // shapes they still miss are recorded limits.
 import { createHash, randomBytes } from 'node:crypto';
-import { MAX_REGEX_LINE_BYTES } from '../ai/redact-core.js';
+import { findKeyMarker, indentOf, MAX_REGEX_LINE_BYTES } from '../ai/redact-core.js';
 import { redact, secretScanText, type SecretScanner } from '../ai/redact.js';
 import { LATE_MAGIC, SCAN_PREFIX, scannersWouldSkip } from '../ai/scan-staging.js';
 import { holdsEscape, scrubForDisplay, stripChars } from '../util/known-values.js';
@@ -101,20 +101,10 @@ function cleanLine(raw: string): { line: string; drop: boolean; before: string |
   return { line, drop: glued || holdsEscape(line), before: line === before ? null : before };
 }
 
-// Private key markers as Plan A redact finds them (redact-core.ts findKeyMarker: `-----BEGIN [A-Z ]*PRIVATE KEY-----`, or `PRIVATE KEY
-// BLOCK`, or END). A copy: that function is not exported, and redact-core.ts is in the gate bundle, so it is left untouched until E9
-// exports it. test/excerpt-r1.test.ts checks the copy decides like redact.
+// Private key markers as Plan A redact finds them: redact-core.ts findKeyMarker itself (exported by E9; E0a had a copy here, because
+// redact-core.ts is in the gate bundle and E0a left it untouched). Re-exported under the old name for the differential test.
 const KEY_TAILS = ['PRIVATE KEY', 'PRIVATE KEY BLOCK'];
-/** findKeyMarker itself (copied): the first `kind` key marker in `line` from `from`, or null. Exported for the differential test only. */
-export function keyMarkerFrom(line: string, kind: 'BEGIN' | 'END', from: number): { start: number; end: number } | null {
-  const head = `-----${kind} `;
-  for (let i = line.indexOf(head, from); i >= 0; i = line.indexOf(head, i + 1)) {
-    let j = i + head.length;
-    while (j < line.length && (line[j] === ' ' || (line[j] as string >= 'A' && line[j] as string <= 'Z'))) j++;
-    if (KEY_TAILS.some((t) => line.slice(i + head.length, j).endsWith(t)) && line.startsWith('-----', j)) return { start: i, end: j + 5 };
-  }
-  return null;
-}
+export const keyMarkerFrom = findKeyMarker;
 /** The start of the last `kind` key marker in `line`, or -1. */
 function lastKeyMarker(line: string, kind: 'BEGIN' | 'END'): number {
   let last = -1;
@@ -343,15 +333,9 @@ interface Read {
   bracket: boolean;
 }
 
-/** redact-core's indentOf columns (a tab goes to the next multiple of 8). A copy (see KEY_TAILS); exported for the differential test only. */
+/** redact-core's indentOf columns (a tab goes to the next multiple of 8): the core's own helper since E9. Exported for the differential test. */
 export function indentCols(line: string): number {
-  let cols = 0;
-  for (const ch of line) {
-    if (ch === ' ') cols++;
-    else if (ch === '\t') cols = (Math.floor(cols / 8) + 1) * 8;
-    else break;
-  }
-  return cols;
+  return indentOf(line).cols;
 }
 
 // an SGR colour code: the one sequence step 2 removes that changes no text (unless glued, which step 2 drops)
@@ -403,7 +387,9 @@ interface Probe { hit: boolean; block: boolean; section: boolean; key: boolean }
 function probeReadings(jobs: string[]): Probe[] {
   if (jobs.length === 0) return [];
   const nonce = randomBytes(6).toString('hex');
-  const reset = `-----END RSA ${KEY_TAILS[0]}-----\n[pgreset${nonce}]`;
+  // E9: a reading may leave a quoted value open (redact then hides up to its closing quote): the line after the END marker closes every
+  // kind of quote redact tracks (" ' ` and their triples), so one reading never hides the groups after it
+  const reset = `-----END RSA ${KEY_TAILS[0]}-----\n"""'''\`\n[pgreset${nonce}]`;
   const lineB = (g: number, r: string) => `${' '.repeat(indentCols(r))}  zz${nonce}p${g}b`;
   const lineC = (g: number) => `zz${nonce}p${g}c = v`;
   const text = jobs.map((r, g) => `zz${nonce}p${g}a\n${r}\n${lineB(g, r)}\n${lineC(g)}\n${reset}`).join('\n');

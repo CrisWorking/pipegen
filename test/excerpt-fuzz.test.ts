@@ -176,8 +176,8 @@ describe('excerpt fuzz (E0a, scans 4 and 5, fix round 1)', () => {
     }
     const report = [...stats].map(([k, v]) => `${k}: ${v.cases} cases, ${v.checked} checked, ${v.notCoveredClean} not covered by redact even clean, ${v.cuts} cut`).join('\n');
     if (process.env.PIPEGEN_E0A_FUZZ_REPORT !== undefined) writeFileSync(process.env.PIPEGEN_E0A_FUZZ_REPORT, `${report}\n`);
-    // the shapes redact covers must be checked in every case
-    for (const shape of ['pem', 'yaml-block', 'yaml-literal', 'toml-section', 'json-block']) {
+    // the shapes redact covers must be checked in every case (E9: the multi-line .env value and the next-line-host connection string too)
+    for (const shape of ['pem', 'yaml-block', 'yaml-literal', 'toml-section', 'json-block', 'env-multiline', 'conn-across-lines']) {
       const st = stats.get(shape);
       expect(st, report).toBeDefined();
       expect((st as { checked: number }).checked, report).toBe((st as { cases: number }).cases);
