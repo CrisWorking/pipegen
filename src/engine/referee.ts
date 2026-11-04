@@ -51,7 +51,7 @@ import { loadBaseImages } from './base-images.js';
 import { centralWorkflowPath } from './central-path.js';
 import { projectScriptFor } from './reviewed.js';
 import { slotProblem, type SlotKind } from './slots.js';
-import { ARGV_POLICIES, CACHE_LOCKS, GATE_OPTIONAL_UPLOADS, PLAIN_REL_RE, PLATFORM_USES, RANGE_TOOL, RENDERER_INPUTS, rendererInputProblems, SCRUB_SECRET, uploadIfNoFiles } from './tool-flags.js';
+import { allowedDomainsProblem, ARGV_POLICIES, BULLFROG_USES, CACHE_LOCKS, GATE_OPTIONAL_UPLOADS, PLAIN_REL_RE, PLATFORM_USES, RANGE_TOOL, RENDERER_INPUTS, rendererInputProblems, SCRUB_SECRET, uploadIfNoFiles } from './tool-flags.js';
 
 // ---------- the report ----------
 
@@ -1213,7 +1213,11 @@ function judgeTemplate(fc: FileCtx, at: (m: string) => string, t: ReviewedTool, 
   for (const [k, values] of Object.entries(t.choices)) {
     const v = withs[k];
     if (v === undefined) bad('template', at(`${t.id} must set its choice ${show(k)} (left out, the action's own default would run, which nobody reviewed).`));
-    else if (typeof v !== 'string' || !values.includes(v)) bad('template', at(`${t.id}'s ${safeText(k, 40)} must be one of ${values.join(', ')}.`));
+    // E9 (ruling B5): Bullfrog's allowed-domains carries the hosts of whole reviewed sets, never a label (the bundled rule)
+    else if (path.toLowerCase() === BULLFROG_USES && k === 'allowed-domains') {
+      const p = allowedDomainsProblem(v, values);
+      if (p !== null) bad('template', at(`${t.id}'s allowed-domains: ${safeText(p, 160)}.`));
+    } else if (typeof v !== 'string' || !values.includes(v)) bad('template', at(`${t.id}'s ${safeText(k, 40)} must be one of ${values.join(', ')}.`));
   }
   for (const [k, v] of Object.entries(withs)) {
     if (Object.hasOwn(fixed, k) || Object.hasOwn(t.choices, k)) continue;

@@ -30,7 +30,7 @@ import { own, RenderError, show } from './render-error.js';
 import { BASE_CHECKOUT_ID, checkExpressions, checkJobOrder, isDangerousName, isReviewed, STEP_KEYS, type JobContext, type RenderedStep, type ScanFact } from './job-rules.js';
 import { GateJobListError } from './gate-job-list.js';
 import { gateStepInputs, nightlyStepInputs } from './gate-inputs.js';
-import { BASE_CHECKOUT_REF, DOCKER_ACTION_USES, GATE_UPLOAD_FILES, gateUploadPath, uploadIfNoFiles, IMAGE_BUILT_ACTION_USES, isStagedTool, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath, scrubStepId, stagePath, stageStepId } from './tool-flags.js';
+import { allowedDomainsProblem, BULLFROG_USES, egressDomains, BASE_CHECKOUT_REF, DOCKER_ACTION_USES, GATE_UPLOAD_FILES, gateUploadPath, uploadIfNoFiles, IMAGE_BUILT_ACTION_USES, isStagedTool, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath, scrubStepId, stagePath, stageStepId } from './tool-flags.js';
 
 export { RenderError };
 // the job rules live in job-rules.ts (one copy for the renderer, the emitter, the referee and the linters); re-exported for the callers that import them here
@@ -244,12 +244,21 @@ function actionStep(tool: ReviewedTool, name: string, choices: Readonly<Record<s
     if (own(fixed, input) !== locked || Object.hasOwn(tool.choices, input)) throw new RenderError(`The reviewed entry ${show(tool.id)} no longer fixes ${input} to ${locked}.`);
   }
   const chosen = chosenInputs(tool, choices);
+  // E9 (ruling B5): Bullfrog reads allowed-domains as literal hosts, so the chosen LABEL becomes its reviewed hosts (github-core added),
+  // checked by the same bundled rule the referee and the proof check use
+  let hostList: string | null = null;
+  if (path.toLowerCase() === BULLFROG_USES && Object.hasOwn(chosen, 'allowed-domains')) {
+    hostList = egressDomains([chosen['allowed-domains'] as string]);
+    const p = allowedDomainsProblem(hostList, tool.choices['allowed-domains'] ?? []);
+    if (p !== null) throw new RenderError(`The egress step of ${show(tool.id)} can not be written: ${p}.`);
+  }
   const fill = rendererInputProblems(path, filled, { ...fixed, ...chosen, ...filled });
   if (fill.length > 0) throw new RenderError(fill.join(' '));
   const withs: Record<string, string> = {};
   for (const [group, values, checked] of [['fixed', fixed, true], ['chosen', chosen, true], ['filled', filled, false]] as const) {
     for (const [key, value] of Object.entries(values)) {
       if (Object.hasOwn(withs, key)) throw new RenderError(`The input ${show(key)} of ${show(tool.id)} would be set twice (${group}).`);
+      if (group === 'chosen' && key === 'allowed-domains' && hostList !== null) { withs[key] = hostList; continue; }   // checked above
       if (checked && !WITH_VALUE_RE.test(value)) throw new RenderError(`The input ${show(key)} of ${show(tool.id)} has a value pipegen won't write into a workflow.`);
       withs[key] = value;
     }

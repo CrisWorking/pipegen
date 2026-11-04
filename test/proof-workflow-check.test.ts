@@ -63,8 +63,9 @@ describe('proof workflow check (I1)', () => {
     expect(problems(wf({ first: egress().replace(BULLFROG.candidate.pin.sha!, SHA) })).join(' ')).toMatch(/egress step/);
     expect(problems(wf({ first: egress().replace('registry.npmjs.org', 'registry.npmjs.org\n            example.com') })).join(' ')).toMatch(/example\.com/);
     expect(problems(wf({ first: egress([], true).replace('172.16.0.0/12', '0.0.0.0/0') })).join(' ')).toMatch(/allowed-ips/);
-    // every listed host is in a reviewed set
-    for (const h of Object.values(EGRESS_DOMAIN_SETS).flat()) expect(problems(wf({ first: egress().replace('registry.npmjs.org', h) })), h).toEqual([]);
+    // E9 (ruling B5): the list is a union of WHOLE reviewed sets: every set passes, a single host of a larger set does not
+    for (const set of Object.keys(EGRESS_DOMAIN_SETS) as (keyof typeof EGRESS_DOMAIN_SETS)[]) expect(problems(wf({ first: egress([set]) })), set).toEqual([]);
+    expect(problems(wf({ first: egress(['dockerhub']).replace(/\n\s*auth\.docker\.io/, '') })).join(' ')).toMatch(/whole/);
   });
 
   it('proof workflow: no workflow_dispatch, schedule, workflow_run, repository_dispatch or issue_comment trigger', () => {

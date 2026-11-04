@@ -34,6 +34,7 @@
 import type { ReviewedTool } from '../types.js';
 import { EGRESS_DOMAIN_SETS } from '../engine/egress.js';
 import { loadReviewed } from '../engine/reviewed.js';
+import { allowedDomainsProblem } from '../engine/tool-flags.js';
 import { isObj, parseYaml, type Obj } from '../engine/yaml-parse.js';
 import { safeText } from '../util/safe-text.js';
 import { ProofStopError } from './target.js';
@@ -248,8 +249,9 @@ function egressProblem(steps: readonly unknown[], r: Reviewed): string | null {
   for (const [k, v] of Object.entries(fixed)) if (w[k] !== v) return `the egress step's ${k} is not ${v}`;
   for (const k of Object.keys(w)) if (!Object.hasOwn(fixed, k) && k !== 'allowed-domains' && k !== 'allowed-ips') return `the egress step has the input ${safeText(k, 40)}`;
   if (typeof w['allowed-domains'] !== 'string') return 'the egress step has no allowed-domains list';
-  const known = new Set(Object.values(EGRESS_DOMAIN_SETS).flat());
-  for (const h of w['allowed-domains'].split('\n')) if (!known.has(h)) return `the egress step allows ${safeText(h, 80)}, which is in no reviewed egress set`;
+  // E9 (ruling B5): the bundled rule, against every reviewed set (whole sets only, sorted, each host once, github-core among them)
+  const domains = allowedDomainsProblem(w['allowed-domains'], Object.keys(EGRESS_DOMAIN_SETS));
+  if (domains !== null) return `the egress step's ${domains}`;
   if ('allowed-ips' in w && w['allowed-ips'] !== DOCKER_RANGE) return `the egress step's allowed-ips is not ${DOCKER_RANGE}`;
   const bullfrogPath = usesPath(uses ?? '');
   if (steps.filter((s) => isObj(s) && typeof s.uses === 'string' && usesPath(s.uses) === bullfrogPath).length !== 1) return 'it has more than one bullfrog step (exactly one bullfrog step per job)';

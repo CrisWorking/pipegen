@@ -1946,6 +1946,31 @@ function validDate(text) {
   return t.getUTCFullYear() === y && t.getUTCMonth() === m - 1 && t.getUTCDate() === d ? text : void 0;
 }
 
+// src/engine/egress-sets.ts
+var REVIEWED_EGRESS_LABELS = Object.freeze(["github-core", "npm", "pypi", "dockerhub", "ghcr"]);
+var E3_EGRESS_SETS = Object.freeze(["github-releases", "trivy-db", "osv"]);
+var EGRESS_DOMAIN_SETS = Object.freeze({
+  "github-core": Object.freeze([
+    "github.com",
+    "api.github.com",
+    "codeload.github.com",
+    "objects.githubusercontent.com"
+  ]),
+  npm: Object.freeze(["registry.npmjs.org"]),
+  pypi: Object.freeze(["pypi.org", "files.pythonhosted.org"]),
+  dockerhub: Object.freeze([
+    "registry-1.docker.io",
+    "auth.docker.io",
+    "production.cloudfront.docker.com",
+    "production.cloudflare.docker.com",
+    "docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com"
+  ]),
+  ghcr: Object.freeze(["ghcr.io", "pkg-containers.githubusercontent.com"]),
+  "github-releases": Object.freeze(["release-assets.githubusercontent.com"]),
+  "trivy-db": Object.freeze(["mirror.gcr.io"]),
+  osv: Object.freeze(["api.osv.dev"])
+});
+
 // src/engine/tool-flags.ts
 var OXLINT_EXTENSIONS = ["js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx", "vue", "astro", "svelte"];
 var TRIVY_PINNED_CONFIG = `# pipegen's pinned trivy config: no cache kept between runs, and no repository trivy-secret.yaml (an empty path loads none)
@@ -2412,7 +2437,8 @@ var ACTION_POLICIES = Object.freeze({
     "egress-policy": { values: ["block"], as: "fixed", required: true },
     "dns-policy": { values: ["allowed-domains-only"], as: "fixed", required: true },
     "enable-sudo": { values: ["false"], as: "fixed", required: true },
-    "allowed-domains": { values: ["github-core", "npm", "pypi", "dockerhub", "ghcr"], as: "choice" },
+    // E9 (ruling B5, E3-R1): the choices are the labels of the reviewed sets; the value a step carries is their host union (allowedDomainsProblem)
+    "allowed-domains": { values: Object.keys(EGRESS_DOMAIN_SETS), as: "choice" },
     "allowed-ips": { values: ["172.16.0.0/12"], as: "choice" }
   },
   // dependency review checks vulnerabilities (never off), blocks on low, moderate or high, never only warns, and never

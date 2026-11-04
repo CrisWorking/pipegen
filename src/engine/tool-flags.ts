@@ -11,6 +11,8 @@ import { isLockfileKind, TRIVY_LICENCE_LOCKFILES } from './licence-lockfiles.js'
 // the gate's policy rule (C2): a leaf that imports only types.ts, so the engine and the gate check a policy with one function
 import { policyProblem as gatePolicyProblem } from '../../gate/src/policy-default.js';
 import { validDate } from '../../gate/src/date.js';
+// E9 (ruling B5): the reviewed egress host sets, a leaf with no imports
+import { EGRESS_DOMAIN_SETS } from './egress-sets.js';
 
 /**
  * betterleaks flags pipegen never passes (catalogue §3 PC2: no egress, no config from the scanned repo). Taken from
@@ -554,7 +556,8 @@ export const ACTION_POLICIES: Readonly<Record<string, Readonly<Record<string, In
     'egress-policy': { values: ['block'], as: 'fixed', required: true },
     'dns-policy': { values: ['allowed-domains-only'], as: 'fixed', required: true },
     'enable-sudo': { values: ['false'], as: 'fixed', required: true },
-    'allowed-domains': { values: ['github-core', 'npm', 'pypi', 'dockerhub', 'ghcr'], as: 'choice' },
+    // E9 (ruling B5, E3-R1): the choices are the labels of the reviewed sets; the value a step carries is their host union (allowedDomainsProblem)
+    'allowed-domains': { values: Object.keys(EGRESS_DOMAIN_SETS), as: 'choice' },
     'allowed-ips': { values: ['172.16.0.0/12'], as: 'choice' },
   },
   // dependency review checks vulnerabilities (never off), blocks on low, moderate or high, never only warns, and never
@@ -580,6 +583,50 @@ export const ACTION_POLICIES: Readonly<Record<string, Readonly<Record<string, In
     verbose: { values: ['true', 'false'], as: 'fixed' },
   },
 } satisfies Record<string, Record<string, InputSpec>>);
+
+// ---------- the Bullfrog allowed-domains value (E9, ruling B5) ----------
+
+/** The bullfrog action's `uses` path (lower case), whose allowed-domains value follows allowedDomainsProblem. */
+export const BULLFROG_USES = 'bullfrogsec/bullfrog';
+/** The label every egress value holds: each job checks out or talks to GitHub (ruling E0d-1). */
+export const EGRESS_BASE_SET = 'github-core';
+/**
+ * The `allowed-domains` value for some reviewed labels: github-core plus their hosts, sorted, each once, one per line (Bullfrog reads
+ * each line as a literal host). Throws for a label that is no reviewed set (a raw domain is never a label).
+ */
+export function egressDomains(labels: readonly string[]): string {
+  const hosts = new Set<string>(EGRESS_DOMAIN_SETS[EGRESS_BASE_SET]);
+  for (const l of labels) {
+    if (typeof l !== 'string' || !Object.hasOwn(EGRESS_DOMAIN_SETS, l)) throw new Error(`${JSON.stringify(String(l)).slice(0, 80)} is not a reviewed egress set`);
+    for (const h of EGRESS_DOMAIN_SETS[l as keyof typeof EGRESS_DOMAIN_SETS]) hosts.add(h);
+  }
+  return [...hosts].sort().join('\n');
+}
+/**
+ * Why `value` is not a Bullfrog `allowed-domains` value pipegen writes, or null. It must be exactly egressDomains(S) for some set S
+ * of `labels` (the entry's offered choices, each a reviewed set): one host per line, sorted, each once, no empty line, every host in a
+ * set offered, and every set it touches there WHOLE (a part of a set is not a reviewed list), github-core among them.
+ */
+export function allowedDomainsProblem(value: unknown, labels: readonly string[]): string | null {
+  if (typeof value !== 'string' || value === '') return 'allowed-domains is not a list of hosts';
+  for (const l of labels) if (!Object.hasOwn(EGRESS_DOMAIN_SETS, l)) return `the label ${JSON.stringify(l).slice(0, 60)} is not a reviewed egress set`;
+  const lines = value.split('\n');
+  const offered = new Set(labels);
+  offered.add(EGRESS_BASE_SET);
+  for (const h of lines) {
+    if (![...offered].some((l) => EGRESS_DOMAIN_SETS[l as keyof typeof EGRESS_DOMAIN_SETS].includes(h))) return `allowed-domains holds ${JSON.stringify(h).slice(0, 80)}, which is in no reviewed egress set offered`;
+  }
+  for (let i = 1; i < lines.length; i++) if (!((lines[i - 1] as string) < (lines[i] as string))) return 'allowed-domains is not sorted with each host once';
+  const hosts = new Set(lines);
+  const whole: string[] = [];
+  for (const l of offered) {
+    const set = EGRESS_DOMAIN_SETS[l as keyof typeof EGRESS_DOMAIN_SETS];
+    if (set.every((h) => hosts.has(h))) whole.push(l);
+  }
+  const covered = new Set(whole.flatMap((l) => EGRESS_DOMAIN_SETS[l as keyof typeof EGRESS_DOMAIN_SETS]));
+  for (const h of lines) if (!covered.has(h)) return `allowed-domains holds ${JSON.stringify(h).slice(0, 80)} without the whole reviewed set it belongs to`;
+  return whole.includes(EGRESS_BASE_SET) ? null : `allowed-domains does not hold the ${EGRESS_BASE_SET} set`;
+}
 
 // ---------- inputs the renderer fills (ruling S15) ----------
 

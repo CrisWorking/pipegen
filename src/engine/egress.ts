@@ -4,80 +4,23 @@
 // - The reviewed `bullfrog` entry offers only labels as `allowed-domains` choices, one per input. Bullfrog would read a label
 //   as a literal domain and block checkout, so this leaf expands the labels into reviewed host lists (EGRESS_DOMAIN_SETS).
 // - The pin and the fixed inputs are read from the reviewed registry (loadReviewed), never written a second time here.
-// - NOT YET ACCEPTED BY THE GATE: the bullfrog policy checker in tool-flags.ts (bundled into gate/dist) still accepts one
-//   label per input. Until sub-task E9 changes it to accept the sorted union, a step rendered here would not pass today's
-//   checker. That is deliberate: tool-flags.ts and the gate bundle do not change in E0d. Do not import this file from the gate entry.
+// - Since E9 the bullfrog policy (tool-flags.ts allowedDomainsProblem, bundled into gate/dist) accepts exactly this form: the sorted,
+//   de-duplicated union of whole reviewed sets, github-core among them. The sets live in the leaf egress-sets.ts for that reason.
+//   Do not import this file from the gate entry.
 // - Compat copies get no egress step (S17): the user's own hosts are unknown.
 // - E3 (ruling E3-R1): proof jobs that scan or sign need hosts beyond the five reviewed sets. Each such host is a new
-//   named set here, exact hosts only (no wildcard), with its source. The bullfrog choices in the reviewed YAML still list
-//   the five labels (REVIEWED_EGRESS_LABELS); E9 adds the new labels there with the policy change. egressSetsForTool
+//   named set (egress-sets.ts), exact hosts only (no wildcard), with its source. Since E9 the bullfrog choices in the reviewed YAML
+//   list all eight labels. egressSetsForTool
 //   says which sets a reviewed tool's step needs, so a job's egress step lists exactly those.
 import type { ReviewedTool } from '../types.js';
 import { parseImageRef } from './names.js';
 import { RenderError, refuse, show } from './render-error.js';
 import type { RenderedStep } from './job-rules.js';
 import { loadReviewed } from './reviewed.js';
+import { egressDomains } from './tool-flags.js';
 
-/** The five labels the reviewed bullfrog entry offers as `allowed-domains` choices today (a test compares them). */
-export const REVIEWED_EGRESS_LABELS = Object.freeze(['github-core', 'npm', 'pypi', 'dockerhub', 'ghcr'] as const);
-/** The exact-host sets added by ruling E3-R1 (E9 adds their labels to the reviewed bullfrog choices). */
-export const E3_EGRESS_SETS = Object.freeze(['github-releases', 'trivy-db', 'osv'] as const);
-/** A set name: one of the reviewed labels or an E3-R1 set. */
-export type EgressSet = typeof REVIEWED_EGRESS_LABELS[number] | typeof E3_EGRESS_SETS[number];
-
-/**
- * Reviewed by Claude (delegated by Cristiano, DECISIONS #105). Every host is an exact lowercase hostname: no wildcard, scheme,
- * port, path or trailing dot. Spike files are in ~/Code/pipegen-internal/spikes/.
- * Source per host (S8 = S8-egress.md; wf/ = spikes/scripts/S8/wf/; S5 = spikes/scripts/S5/wf-egress/jobs.yml):
- * - github-core: github.com, api.github.com, codeload.github.com: the Bullfrog allowlist sketch S8 l. 183-185. By workflow:
- *   github.com and api.github.com are in wf/egress.yml l. 56-57, 80-81, wf/egress2.yml l. 29-30, wf/egress3.yml l. 32-33 and
- *   S5 jobs.yml l. 12-13; codeload.github.com is in wf/egress.yml l. 58, 82, wf/egress2.yml l. 31 and S5 jobs.yml l. 14 (NOT in
- *   wf/egress3.yml, which only pulled images). The S5 run passed checkout, setup-node and `npm ci` (S8 l. 147).
- *   objects.githubusercontent.com: S5 jobs.yml l. 15 only (the same run).
- *   Left out on purpose (least privilege, controller ruling M1): pipelines.actions.githubusercontent.com and
- *   results-receiver.actions.githubusercontent.com. No spike run needed them (S4 and S8 name no artifact or results host), and
- *   artifacts can not work without the per-account blob host, which is excluded anyway. The live checklist decides.
- *   Also left out (ruling M3): raw.githubusercontent.com (S5 l. 16); setup-node/setup-python with a version not in the runner
- *   cache is a live-checklist item.
- * - npm: registry.npmjs.org: S8 l. 8, 75, 131 (reachable under Bullfrog block); in every spike list.
- * - pypi: pypi.org, files.pythonhosted.org: not measured in S8 (the registry's index and file hosts).
- * - dockerhub: registry-1.docker.io, auth.docker.io: wf/egress3.yml l. 35-36 and every S8 list; in the pull that passed (S8 l. 128-133).
- *   production.cloudfront.docker.com and the R2 host: S8 l. 127-128, 166, 204 (the first pull failed without them).
- *   production.cloudflare.docker.com: in every spike allowlist (wf/egress.yml l. 62 and 86, wf/egress2.yml l. 35, wf/egress3.yml l. 37,
- *   S5 jobs.yml l. 22), and the blob redirect target varies by run (S8 l. 127 went to cloudfront while it was listed), so it stays.
- * - ghcr: ghcr.io, pkg-containers.githubusercontent.com: wf/egress.yml l. 63-64, S5 jobs.yml l. 18-19; the ghcr gitleaks pull
- *   passed under that list (S8 l. 151).
- * Ruling E3-R1 (sub-task E3), each with NO spike evidence (no spike ran these tools under Bullfrog; the live checklist verifies):
- * - github-releases: release-assets.githubusercontent.com: where github.com/<repo>/releases/download/... redirects today
- *   (src/engine/pin.ts DOWNLOAD_HOSTS; the older target objects.githubusercontent.com is already in github-core). Needed by
- *   every github-release install (render-cli.ts releaseInstall: trivy, osv-scanner, nuclei, syft, zizmor, ...) and the
- *   harness's cosign. Left out: github-releases.githubusercontent.com (also in DOWNLOAD_HOSTS, an older name; live checklist).
- * - trivy-db: mirror.gcr.io: Trivy's default vulnerability DB repository (mirror.gcr.io/aquasec/trivy-db:2, falling back to
- *   ghcr.io/aquasecurity/trivy-db:2; tool catalogue l. 288, raw/runtime-security.md l. 57). Only trivy-image downloads
- *   the DB (trivy-config and trivy-licence run --skip-check-update and need no DB). The blob host behind mirror.gcr.io is
- *   not known without a live run: if it differs, the GHCR fallback (the ghcr set) carries the download.
- * - osv: api.osv.dev: osv-scanner sends package names and versions there (tool catalogue l. 176, 272;
- *   raw/code-security.md l. 74).
- * Not added: Sigstore hosts (the harness signs key-based with --tlog-upload=false, so none is needed); actions/attest
- * (its OIDC token URL is a per-run actions.githubusercontent.com host that can't be listed exactly: attestation stays
- * not-proven under Bullfrog); semgrep, nuclei and ZAP need none beyond github-core and their image registry (their rules
- * come from github.com archives; -duc/-ni/-silent/--metrics=off turn the other calls off).
- */
-export const EGRESS_DOMAIN_SETS: Readonly<Record<EgressSet, readonly string[]>> = Object.freeze({
-  'github-core': Object.freeze([
-    'github.com', 'api.github.com', 'codeload.github.com', 'objects.githubusercontent.com',
-  ]),
-  npm: Object.freeze(['registry.npmjs.org']),
-  pypi: Object.freeze(['pypi.org', 'files.pythonhosted.org']),
-  dockerhub: Object.freeze([
-    'registry-1.docker.io', 'auth.docker.io', 'production.cloudfront.docker.com', 'production.cloudflare.docker.com',
-    'docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com',
-  ]),
-  ghcr: Object.freeze(['ghcr.io', 'pkg-containers.githubusercontent.com']),
-  'github-releases': Object.freeze(['release-assets.githubusercontent.com']),
-  'trivy-db': Object.freeze(['mirror.gcr.io']),
-  osv: Object.freeze(['api.osv.dev']),
-});
+export { E3_EGRESS_SETS, EGRESS_DOMAIN_SETS, REVIEWED_EGRESS_LABELS, type EgressSet } from './egress-sets.js';
+import { EGRESS_DOMAIN_SETS, type EgressSet } from './egress-sets.js';
 
 /**
  * Sets a tool needs at run time beyond its install (ruling E3-R1), by reviewed id. Reviewed data: a new entry that talks to
@@ -153,16 +96,14 @@ const DOCKER_RANGE = '172.16.0.0/12';
 export function renderEgressStep(sets: readonly EgressSet[], opts: { dockerNetworks: boolean }): RenderedStep {
   if (!Array.isArray(sets)) return refuse('The egress sets must be a list.');
   if (opts === null || typeof opts !== 'object' || typeof opts.dockerNetworks !== 'boolean') return refuse('dockerNetworks must be true or false.');
-  const hosts = new Set<string>(EGRESS_DOMAIN_SETS['github-core']);
   for (const name of sets) {
-    const list = typeof name === 'string' && Object.hasOwn(EGRESS_DOMAIN_SETS, name) ? EGRESS_DOMAIN_SETS[name as EgressSet] : undefined;
-    if (list === undefined) return refuse(`${show(name)} is not a reviewed egress set (${Object.keys(EGRESS_DOMAIN_SETS).join(', ')}). A raw domain is never accepted.`);
-    for (const h of list) hosts.add(h);
+    if (typeof name !== 'string' || !Object.hasOwn(EGRESS_DOMAIN_SETS, name)) return refuse(`${show(name)} is not a reviewed egress set (${Object.keys(EGRESS_DOMAIN_SETS).join(', ')}). A raw domain is never accepted.`);
   }
   const tool = loadReviewed().find((t) => t.id === 'bullfrog');
   const uses = tool?.step.action?.uses;
   if (tool === undefined || uses === undefined) throw new RenderError('The reviewed list has no bullfrog entry.');
-  const withs: Record<string, string> = { ...(tool.fixedInputs.with ?? {}), 'allowed-domains': [...hosts].sort().join('\n') };
+  // E9: the one rule (tool-flags.ts, bundled): github-core plus the sets, sorted, each host once
+  const withs: Record<string, string> = { ...(tool.fixedInputs.with ?? {}), 'allowed-domains': egressDomains(sets as string[]) };
   if (opts.dockerNetworks) withs['allowed-ips'] = DOCKER_RANGE;
   return { name: 'Limit network egress', uses, usesComment: tool.candidate.version, with: withs };
 }
