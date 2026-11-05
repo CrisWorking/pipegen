@@ -43,12 +43,16 @@ import { APP_RUNNING_CATEGORIES, renderRangeScan, TRIVY_LAUNCH_RE } from './rend
 import { EXPR, own, show } from './render-error.js';
 import { isObj, parseYaml, uniq, type Obj, type Parsed } from './yaml-parse.js';
 import { createdFileProblems, duplicatePathProblems, type CreatedInputs, type CreatedRule } from './created-files.js';
-import { ACTION_PATH_RE, checkExpressions, createdPathProblem, checkJobOrder, gateResultUploadProblems, IF_VALUES, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, SECRET_REF_RE, STEP_KEYS as STEP_KEY_LIST, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact } from './job-rules.js';
+import {
+  ACTION_PATH_RE, CALLER_WORKFLOW, checkExpressions, createdPathProblem, checkJobOrder, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, gateResultUploadProblems, IF_VALUES,
+  isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, PR_CHECK_IF, PR_CHECK_JOB, PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, SECRET_REF_RE,
+  STEP_KEYS as STEP_KEY_LIST, WORKFLOW_CONCURRENCY, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact,
+} from './job-rules.js';
 import { containerRefusal, RenderError, renderComposeUp, renderProjectScript, renderRuntimeEnv, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
 import { COMPOSE_PATH, planCompose } from '../create/compose.js';
 import { dockerfilesOf } from './created-judges/compose.js';
 import { loadBaseImages } from './base-images.js';
-import { centralWorkflowPath } from './central-path.js';
+import { centralWorkflowFile, centralWorkflowPath } from './central-path.js';
 import { projectScriptFor } from './reviewed.js';
 import { slotProblem, type SlotKind } from './slots.js';
 import { allowedDomainsProblem, ARGV_POLICIES, BULLFROG_USES, CACHE_LOCKS, GATE_OPTIONAL_UPLOADS, PLAIN_REL_RE, PLATFORM_USES, RANGE_TOOL, RENDERER_INPUTS, rendererInputProblems, SCRUB_SECRET, uploadIfNoFiles } from './tool-flags.js';
@@ -113,7 +117,9 @@ export { FINDINGS_CATEGORIES };   // defined in gate-job-list.ts (the job list n
  * scripts, the repo's npm ci); `central`: an action from the central pipelines repo; `unrecognised`: anything else.
  */
 export type StepKind = 'checkout' | 'setup' | 'harden' | 'upload-artifact' | 'download-artifact' | 'upload-sarif' | 'attest' | 'docker-login' | 'setup-buildx' | 'build-push'
-  | 'gate' | 'watcher' | 'tool' | 'scrub' | 'stage' | 'central' | 'repo-code' | 'unrecognised';
+  | 'gate' | 'watcher' | 'tool' | 'scrub' | 'stage' | 'central' | 'repo-code' | 'unrecognised'
+  /** G1 (BP-6): the pr-check lookup step, recognised by its exact content (renderPrCheckStep); only in the job pr-check */
+  | 'pr-check';
 /** pipegen's own actions by reviewed-entry id (Plan C adds the gate entry, Plan H the watcher entry, under these ids). */
 export const PIPEGEN_ACTION_IDS = { gate: 'pipegen-gate', watcher: 'pipegen-watcher' } as const;
 /** The step kind of each reviewed action entry that is not an ordinary tool, by entry id. The gate entry is kind `gate`, except a recognised scrub step of it (isScrubStep: judgeUses). */
@@ -133,7 +139,7 @@ const ENTRY_KIND: Readonly<Record<string, StepKind>> = Object.freeze({
  * job's purpose (the image is then signed and verified by digest).
  */
 export const JOB_STEP_POLICY: Readonly<Record<string, readonly StepKind[]>> = Object.freeze({
-  'pr-check': ['harden', 'checkout'],
+  'pr-check': ['harden', 'checkout', 'pr-check'],
   'pipegen-verify': ['harden', 'checkout', 'download-artifact', 'gate'],
   'code-scanning': ['harden', 'download-artifact', 'upload-sarif'],
   // no checkout: the gate never reads the workspace (Plan C ruling S21); it reads the event, the job outputs and the API
@@ -475,6 +481,8 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
       }
     }
   }
+  // G1 (BP-6): the pr-check lookup step, one exact form for every draft (it reads the API with the job's token, never the workspace)
+  record(PR_CHECK_SOURCE, ctxs.map(() => [renderPrCheckStep()]), false, true, false, undefined, undefined);
   // D4 (rulings B6, I1): the runtime-env and compose-up steps, only when pipegen computes a compose file, that file is among the files judged together and
   // it passed the compose judge (composeEnv is that plan's runtime env, else null). The runtime-env step is the exact re-render of it. Without the file
   // compose-up would run a compose file pipegen did not judge (an unowned one, S3), so neither step is recognised.
@@ -495,6 +503,8 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
 
 interface FileCtx {
   file: CreatedFile; add: Add; ex: Expectations; draft: PipelineDraft;
+  /** the file's own parsed top level (its triggers and jobs: the layout rules of G1 read them) */
+  js: Obj;
   /** every parsed workflow and action file, by `<repo>:<path>` */
   others: Map<string, Parsed>;
   /** how many times the name PIPEGEN_DB_PASSWORD sits inside runtime-env steps recognised by content (D4): the only place it may be */
@@ -532,11 +542,23 @@ function judgeTop(fc: FileCtx, js: Obj): void {
   for (const k of Object.keys(js)) if (!TOP_KEYS.has(k)) bad('template', `The top-level key ${show(k)} is not one pipegen writes (defaults, for one, would change every run step).`);
   const p = js.permissions;
   if (!isObj(p) || Object.keys(p).length > 0) bad('permissions', 'The workflow must start from `permissions: {}`, so a job gets only what it declares.');
-  for (const k of ['name', 'run-name', 'concurrency']) if (hasExpr(js[k])) bad('injection', `The workflow's ${k} holds an expression (\${{), which pipegen never writes there.`);
+  for (const k of ['name', 'run-name']) if (hasExpr(js[k])) bad('injection', `The workflow's ${k} holds an expression (\${{), which pipegen never writes there.`);
   const triggers = triggersOf(js.on);
+  // G1 (ruling B1): an expression in the workflow's concurrency only as the one per-ref form, at the top of the two app callers (never a called workflow)
+  if (hasExpr(js.concurrency) && !concurrencyFormOk(fc, js, triggers ?? [])) {
+    bad('injection', `The workflow's concurrency holds an expression (\${{), which pipegen writes only as its one per-ref form (group ${WORKFLOW_CONCURRENCY.group}, cancel-in-progress except on the default branch), at the top of ${CALLER_WORKFLOW} or ${PUSH_WORKFLOW}, never in a called workflow.`);
+  }
   if (triggers === null || triggers.length === 0) bad('template', 'The workflow has no triggers pipegen can read.');
-  else for (const t of triggers) if (!TRIGGERS.has(t)) bad('template', `The trigger ${show(t)} is not one pipegen writes (only ${[...TRIGGERS].join(', ')}).`);
+  else for (const t of triggers) {
+    // G1 (rulings B1, B2): the approval re-run, exactly its form, only in pipegen.yml
+    if (t === 'pull_request_review') {
+      if (!prReviewFormOk(fc, js)) bad('template', `The trigger pull_request_review is written only in ${CALLER_WORKFLOW} of the app, exactly as { types: [${PR_REVIEW_TRIGGER.types.join(', ')}] } (the approval re-run).`);
+      continue;
+    }
+    if (!TRIGGERS.has(t)) bad('template', `The trigger ${show(t)} is not one pipegen writes (only ${[...TRIGGERS].join(', ')}, and pull_request_review in ${CALLER_WORKFLOW}).`);
+  }
   judgeEnv(fc, js.env, 'the workflow');
+  judgeLayout(fc, js, triggers);
 }
 
 /** A workflow- or job-level env: plain values only (no expression, no secret) and no name that changes how code runs. */
@@ -549,6 +571,152 @@ function judgeEnv(fc: FileCtx, env: unknown, where: string): void {
     if (typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') bad('template', `The env value ${show(k)} of ${where} is not plain text.`);
     if (hasExpr(v)) bad('injection', `The env value ${show(k)} of ${where} holds an expression; secrets and values reach only the steps that need them.`);
   }
+}
+
+// ---------- Plan G's layout (G1: rulings B1, B2 referee side; carries C3, C5a, C7s, BP-6) ----------
+// Each form is the job-rules.ts constant or builder the renderer uses, compared by equality. A file's role comes from its path and its exact
+// triggers, never from what it claims to be: pipegen.yml (the caller: push on the default branch only), the push file (every other branch, no
+// gate) and the rest.
+
+/** The source name of the pr-check lookup step among the expected run steps. */
+const PR_CHECK_SOURCE = 'pr-check';
+/** The gate job's own name (the second half of GATE_CHECK_NAME). */
+const GATE_JOB_NAME = GATE_CHECK_NAME.split(' / ')[1] as string;
+/** How deep the layout rules follow reusable-workflow calls; a deeper chain is read as holding what they look for (fail closed). */
+const MAX_CALL_DEPTH = 10;
+
+const isCallerFile = (fc: FileCtx): boolean => fc.file.repo === 'app' && fc.file.path === CALLER_WORKFLOW;
+/** Whether a push trigger's value is exactly CALLER_WORKFLOW's form for this draft's default branch (a default branch with no exact form: never). */
+function isDefaultOnlyPush(v: unknown, defaultBranch: string): boolean {
+  try { return isDeepStrictEqual(v, defaultPushTrigger(defaultBranch)); } catch (e) { if (e instanceof RenderError) return false; throw e; }
+}
+function isFeaturePush(v: unknown, defaultBranch: string): boolean {
+  try { return isDeepStrictEqual(v, featurePushTrigger(defaultBranch)); } catch (e) { if (e instanceof RenderError) return false; throw e; }
+}
+/** Whether a workflow's push may run on a branch other than the default, or on a tag: any push trigger but the exact default-only form (unreadable triggers: yes). */
+function pushOffDefault(on: unknown, triggers: readonly string[] | null, defaultBranch: string): boolean {
+  if (triggers === null) return true;
+  return triggers.includes('push') && !(isObj(on) && isDefaultOnlyPush(on.push, defaultBranch));
+}
+/** The exact per-ref concurrency, at the top of one of the two app callers, in a file nothing calls (a called workflow sharing its caller's group deadlocks). */
+function concurrencyFormOk(fc: FileCtx, js: Obj, triggers: readonly string[]): boolean {
+  return fc.file.repo === 'app' && (fc.file.path === CALLER_WORKFLOW || fc.file.path === PUSH_WORKFLOW) && !triggers.includes('workflow_call')
+    && isDeepStrictEqual(js.concurrency, { ...WORKFLOW_CONCURRENCY });
+}
+/** pull_request_review exactly in its form, and only in CALLER_WORKFLOW (B1, B2). */
+function prReviewFormOk(fc: FileCtx, js: Obj): boolean {
+  return isCallerFile(fc) && isObj(js.on) && isDeepStrictEqual(js.on.pull_request_review, { types: [...PR_REVIEW_TRIGGER.types] });
+}
+/**
+ * The push file (ruling B2), the one file a pr-check skip may sit in: the app's PUSH_WORKFLOW whose only trigger is exactly the
+ * every-branch-but-the-default push, or the central `<project>--push.yml` whose only trigger is workflow_call. Neither may hold or call the
+ * gate (prCheckIfProblem checks that too).
+ */
+function isPushFile(fc: FileCtx): boolean {
+  const on = fc.js.on;
+  if (fc.file.repo === 'app' && fc.file.path === PUSH_WORKFLOW) return isObj(on) && Object.keys(on).length === 1 && isFeaturePush(on.push, fc.draft.profile.defaultBranch);
+  if (fc.file.repo === 'central' && typeof fc.draft.profile.repo === 'string' && fc.file.path === centralWorkflowFile(fc.draft.profile.repo, 'push')) {
+    const t = triggersOf(on);
+    return t !== null && t.length === 1 && t[0] === 'workflow_call';
+  }
+  return false;
+}
+
+/** The workflow file a caller job's `uses` names, when pipegen is writing it (the same resolution as judgeCaller, without issues: those are its). */
+function calledFileOf(fc: FileCtx, repo: CreatedFile['repo'], uses: unknown): { parsed: Parsed; repo: CreatedFile['repo']; key: string } | undefined {
+  if (typeof uses !== 'string') return undefined;
+  if (uses.startsWith('./')) {
+    const rel = uses.slice(2);
+    const key = `${repo}:${rel}`;
+    const parsed = WORKFLOW_PATH_RE.test(rel) && PLAIN_REL_RE.test(rel) ? fc.others.get(key) : undefined;
+    return parsed === undefined ? undefined : { parsed, repo, key };
+  }
+  const k = usesKey(uses);
+  const central = centralOf(fc.draft);
+  if (k === null || central === null || !k.path.startsWith(central.prefix) || k.ref !== central.sha) return undefined;
+  const rel = k.path.slice(central.prefix.length);
+  const key = `central:${rel}`;
+  const parsed = WORKFLOW_PATH_RE.test(rel) ? fc.others.get(key) : undefined;
+  return parsed === undefined ? undefined : { parsed, repo: 'central', key };
+}
+const stepsOf = (j: Obj): Obj[] => (Array.isArray(j.steps) ? j.steps.filter(isObj) : []);
+/** The gate, by any sign: the job id gate, a job named like the gate's check, or a step in gate mode (whatever action it names). */
+const holdsGate = (id: string, j: Obj): boolean => id === 'gate' || j.name === GATE_JOB_NAME || j.name === GATE_CHECK_NAME || stepsOf(j).some((s) => isObj(s.with) && s.with.mode === 'gate');
+/** What a scheduled run never holds (C7s): baseline-check and find-run read the event's repository payload, which schedule has not; and the gate (B2). */
+const SCHEDULE_FORBIDDEN_MODES: ReadonlySet<string> = new Set(['baseline-check', 'find-run', 'gate']);
+const scheduleForbidden = (id: string, j: Obj): boolean => id === 'baseline-check' || id === 'gate' || stepsOf(j).some((s) => isObj(s.with) && SCHEDULE_FORBIDDEN_MODES.has(String(s.with.mode)));
+/** Whether jobs (and the workflows their caller jobs call, transitively) hold what `hit` looks for. A call that can not be resolved is judgeCaller's issue. */
+function reaches(fc: FileCtx, repo: CreatedFile['repo'], jobs: unknown, hit: (id: string, j: Obj) => boolean, depth = 0, seen: Set<string> = new Set()): boolean {
+  if (!isObj(jobs)) return false;
+  for (const [id, j] of Object.entries(jobs)) {
+    if (!isObj(j)) continue;
+    if (hit(id, j)) return true;
+    const c = j.uses === undefined ? undefined : calledFileOf(fc, repo, j.uses);
+    if (c === undefined || seen.has(c.key)) continue;
+    if (depth >= MAX_CALL_DEPTH) return true;
+    seen.add(c.key);
+    if (reaches(fc, c.repo, c.parsed.js.jobs, hit, depth + 1, seen)) return true;
+  }
+  return false;
+}
+
+/** A file pipegen writes whole: C3 (pipegen.yml's push trigger), then the job rules of the layout. */
+function judgeLayout(fc: FileCtx, js: Obj, triggers: readonly string[] | null): void {
+  const defaultBranch = fc.draft.profile.defaultBranch;
+  if (isCallerFile(fc) && (triggers ?? []).includes('push') && !(isObj(js.on) && isDefaultOnlyPush(js.on.push, defaultBranch))) {
+    fc.add(fc.file.path, 'template', `${CALLER_WORKFLOW}'s push trigger must be exactly branches: [${safeText(String(defaultBranch), 100)}] (the default branch, written as a plain name), with no tags, no other branch, no pattern and no path filter (C3): a tag or another branch named like the default would start a run whose head looks trusted.`, undefined, fc.file.repo);
+  }
+  judgeLayoutJobs(fc, js.on, triggers, js.jobs);
+}
+
+/**
+ * C5a: a workflow whose push may run on another branch than the default (or a tag) holds no gate job, no job named like the gate and calls no
+ * workflow that holds one: a push has no pull request, so its gate result would mean nothing (the gate action refuses to pass there too).
+ * C7s (and B2): a workflow with schedule holds no baseline-check, find-run or gate, and calls none. `only`: the jobs pipegen inserted in a user's file.
+ */
+function judgeLayoutJobs(fc: FileCtx, on: unknown, triggers: readonly string[] | null, jobs: unknown, only?: readonly string[]): void {
+  const picked = !isObj(jobs) ? {} : only === undefined ? jobs : Object.fromEntries(Object.entries(jobs).filter(([id]) => only.includes(id)));
+  if (pushOffDefault(on, triggers, fc.draft.profile.defaultBranch) && reaches(fc, fc.file.repo, picked, holdsGate)) {
+    fc.add(fc.file.path, 'not-gate-readable', `The workflow runs on pushes to a branch other than the default (or to tags), so it may hold no gate job, no job named like the gate (${GATE_CHECK_NAME}) and call no workflow that holds one (C5a): a push has no pull request, so a gate there decides nothing that can be trusted. The gate runs from ${CALLER_WORKFLOW}, whose push runs on the default branch only, and on pull requests.`, undefined, fc.file.repo);
+  }
+  if ((triggers ?? []).includes('schedule') && reaches(fc, fc.file.repo, picked, scheduleForbidden)) {
+    fc.add(fc.file.path, 'template', 'The workflow runs on schedule, whose event carries no repository payload, so it holds no baseline-check or find-run step, no gate (mode gate), no job baseline-check or gate, and calls no workflow that holds one (C7s); the nightly job is the one gate mode a scheduled run has.', undefined, fc.file.repo);
+  }
+}
+
+/**
+ * A job's `if:` (ruling 4, and G1's two forms). A job that feeds the gate is never skipped on a condition (a skipped job counts as passed);
+ * only the gate itself runs always(). Two exact forms besides, each only where it can hide no gate-feeding job: the pr-check skip on a
+ * push-layer job of the push file, and the deploy condition on a deploy job of pipegen.yml that needs the gate. Anything else: refused.
+ */
+function judgeJobIf(fc: FileCtx, id: string, j: Obj, where: string): void {
+  if (j.if === undefined) return;
+  const bad = issueFor(fc);
+  if (j.if === PR_CHECK_IF) { const p = prCheckIfProblem(fc, id, j); if (p !== null) bad('template', `${where}: ${p}`); return; }
+  if (j.if === DEPLOY_PUSH_IF) { const p = deployIfProblem(fc, id, j); if (p !== null) bad('template', `${where}: ${p}`); return; }
+  if (typeof j.if !== 'string' || !IF_VALUES.has(j.if)) bad('injection', `${where} has an if: pipegen does not write.`);
+  else if (!(id === 'gate' && j.if === 'always()')) bad('template', `${where} has if: ${safeText(j.if, 20)}; a job that feeds the gate runs whenever its workflow does (a skipped job counts as passed).`);
+}
+
+function prCheckIfProblem(fc: FileCtx, id: string, j: Obj): string | null {
+  const what = `the pr-check skip (if: ${PR_CHECK_IF}) is written only on a push-layer job of the push file`;
+  if (j.uses !== undefined || id === PR_CHECK_JOB) return `${what}, never on the job ${PR_CHECK_JOB} itself or on a caller job.`;
+  if (!isPushFile(fc)) return `${what} (${PUSH_WORKFLOW} whose only trigger is the push to every branch but the default, or the central <project>--push.yml), never in another file.`;
+  if (reaches(fc, fc.file.repo, fc.js.jobs, holdsGate)) return `${what}, and this file holds or calls the gate: the skip could hide a job the gate reads (a skipped job counts as passed).`;
+  const jobs = isObj(fc.js.jobs) ? fc.js.jobs : {};
+  if (!needsList(j.needs).includes(PR_CHECK_JOB) || !isObj(jobs[PR_CHECK_JOB])) return `${what}, on a job that needs the job ${PR_CHECK_JOB} of the same file.`;
+  return null;
+}
+
+function deployIfProblem(fc: FileCtx, id: string, j: Obj): string | null {
+  const what = `the deploy condition (if: ${DEPLOY_PUSH_IF}) is written only on a deploy job of ${CALLER_WORKFLOW}`;
+  if (!isCallerFile(fc)) return `${what}, never in another file.`;
+  if (!(isObj(fc.js.on) && isDefaultOnlyPush(fc.js.on.push, fc.draft.profile.defaultBranch))) return `${what}, whose push trigger is exactly branches: [<default>] (here it is not), so the job runs on a push to the default branch only.`;
+  const jobs = isObj(fc.js.jobs) ? fc.js.jobs : {};
+  const holders = Object.entries(jobs).filter(([hid, hj]) => isObj(hj) && reaches(fc, fc.file.repo, { [hid]: hj }, holdsGate)).map(([hid]) => hid);
+  if (holders.includes(id)) return `${what}, never on the gate or the job that calls it (the required check would be skipped on every pull request).`;
+  if (!needsList(j.needs).some((n) => typeof n === 'string' && holders.includes(n))) return `${what}, on a job that needs the job holding the gate (${holders.length === 0 ? 'none in this file' : holders.join(', ')}), so it deploys only what passed it.`;
+  return null;
 }
 
 function judgeJobs(fc: FileCtx, jobs: unknown, only?: readonly string[]): void {
@@ -588,12 +756,7 @@ function judgeJob(fc: FileCtx, id: string, j: unknown): void {
   for (const k of Object.keys(j)) if (!keys.has(k)) bad('template', `${where} has the key ${show(k)}, which pipegen never writes on a job${k === 'container' || k === 'strategy' || k === 'continue-on-error' || k === 'defaults' ? ' (it changes what runs or whether a failure counts)' : ''}.`);
   // expressions: nowhere on a job except the forms below (a caller's explicit secrets) and the job outputs, which jobOutputsProblems judges (ruling B3)
   for (const k of ['name', 'runs-on', 'needs', 'environment', 'concurrency', 'timeout-minutes', 'with']) if (hasExpr(j[k])) bad('injection', `${where} has an expression (\${{) in ${k}, which pipegen does not write there.`);
-  // a job that feeds the gate is never skipped on a condition (ruling 4); only the gate itself may run always(). Plan G's
-  // pr-check form (`needs.pr-check.outputs.has-pr != 'true'`) comes with Plan G, through a checker shared with the renderer
-  if (j.if !== undefined) {
-    if (typeof j.if !== 'string' || !IF_VALUES.has(j.if)) bad('injection', `${where} has an if: pipegen does not write.`);
-    else if (!(id === 'gate' && j.if === 'always()')) bad('template', `${where} has if: ${safeText(j.if, 20)}; a job that feeds the gate runs whenever its workflow does (a skipped job counts as passed).`);
-  }
+  judgeJobIf(fc, id, j, where);
   if (j['timeout-minutes'] !== undefined && !(typeof j['timeout-minutes'] === 'number' && Number.isInteger(j['timeout-minutes']) && j['timeout-minutes'] >= 1 && j['timeout-minutes'] <= 360)) bad('template', `${where} has a timeout-minutes that is not 1 to 360.`);
   judgeEnv(fc, j.env, where);
   judgeGateName(fc, id, j);
@@ -871,7 +1034,10 @@ function judgeStepPolicy(fc: FileCtx, id: string, where: string, j: Obj, judged:
       if (!row.includes(x.kind)) bad('permissions', `${where}, step ${i + 1}, is ${x.kind === 'repo-code' ? 'code from the repository' : x.kind === 'unrecognised' ? 'a step pipegen does not recognise' : `a ${x.kind} step`}; the job ${id} may run only ${row.join(', ')} steps.`);
     });
   } else {
-    judged.forEach((x, i) => { if (x.kind === 'gate' || x.kind === 'watcher') bad('permissions', `${where}, step ${i + 1}: pipegen's ${x.kind} action runs only in its own job.`); });
+    judged.forEach((x, i) => {
+      if (x.kind === 'gate' || x.kind === 'watcher') bad('permissions', `${where}, step ${i + 1}: pipegen's ${x.kind} action runs only in its own job.`);
+      else if (x.kind === 'pr-check') bad('permissions', `${where}, step ${i + 1}: pipegen's pr-check lookup runs only in the job ${PR_CHECK_JOB}.`);
+    });
   }
   const firstRepo = judged.findIndex((x) => x.kind === 'repo-code' || x.kind === 'unrecognised' || x.kind === 'central');
   if (firstRepo >= 0) judged.slice(firstRepo + 1).forEach((x) => { if (x.kind === 'gate' || x.kind === 'watcher') bad('injection', `In ${where}: pipegen's ${x.kind} action comes after a step that runs code pipegen did not render.`); });
@@ -1084,7 +1250,8 @@ function judgeStep(fc: FileCtx, where: string, raw: unknown): Judged {
       if (r.final) fc.ex.matched.add(r.source);
       appRunning = r.appRunning;
       const id = r.step.id ?? '';
-      kind = r.source.startsWith('script:') || appRunning ? 'repo-code' : /^(?:checker-run|tool-run|tool-install|tool-pull)-/.test(id) ? 'tool' : 'repo-code';
+      kind = r.source === PR_CHECK_SOURCE ? 'pr-check'
+        : r.source.startsWith('script:') || appRunning ? 'repo-code' : /^(?:checker-run|tool-run|tool-install|tool-pull)-/.test(id) ? 'tool' : 'repo-code';
       reads = kind === 'tool' && r.readsWorkspace;
     }
     // trivy keeps a cache between runs unless it runs with pipegen's pinned config (cache.backend: memory, ruling S3), whether
@@ -1305,6 +1472,8 @@ function judgeEdited(fc: FileCtx, parsed: Parsed, mark: PipegenInserted): void {
     else j.needs = kept;
   }
   if (!isDeepStrictEqual(rest, orig.parsed.js)) bad('template', 'The edit changes the user\'s workflow beyond the job and needs pipegen inserted.');
+  // G1 (C5a, C7s): the jobs pipegen inserts follow the same layout rules under the user's triggers (no gate on a push to another branch, no find-run on schedule)
+  judgeLayoutJobs(fc, parsed.js.on, triggersOf(parsed.js.on), jobs, mark.jobs);
   judgeJobs(fc, jobs, mark.jobs);
 }
 
@@ -1507,7 +1676,7 @@ async function judgeFiles(allFiles: CreatedFile[], draft: PipelineDraft, platfor
   for (const f of files) {
     const p = parsed.get(`${f.repo}:${f.path}`);
     if (p === undefined) continue;
-    const fc: FileCtx = { file: f, add, ex, draft, others: parsed, dbPwOk: 0 };
+    const fc: FileCtx = { file: f, add, ex, draft, others: parsed, dbPwOk: 0, js: p.js };
     if (fileKind(f) === 'action') judgeAction(fc, p.js);
     else if (f.inserted !== undefined) judgeEdited(fc, p, f.inserted);
     else {

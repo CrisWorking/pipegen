@@ -141,6 +141,7 @@ export function isGateDecideStep(s: RenderedStep): boolean {
  * a scrub id the pinned gate action in scrub mode (isScrubStep).
  */
 export function isKnownHarmless(s: RenderedStep): boolean {
+  if (isPrCheckStep(s)) return true;   // G1 (BP-6): the exact pr-check lookup reads the API with the job's token, never the workspace
   const pinnedAction = s.uses !== undefined && s.run === undefined && TRUSTED_ACTION_RE.test(s.uses);
   if (s.id === undefined) return pinnedAction || isGateDecideStep(s);
   if (SETUP_STEP_ID_RE.test(s.id)) {
@@ -404,6 +405,101 @@ export function gateResultUploadProblems(steps: readonly RenderedStep[], gateInd
   return out;
 }
 
+// ---------- Plan G's workflow shapes (v0.2 Plan G, G1: ruling B1, the referee side of B2; carries C3, C5a, BP-6) ----------
+// One exact form each. The renderer writes these values and the referee compares by string (or deep) equality, never by a pattern,
+// so neither can accept a near miss the other did not mean. Everything that is not one of them stays refused.
+
+/** The app's caller workflow (ruling B2): push on the default branch only, pull_request, pull_request_review; the merge layer and the deploy jobs. */
+export const CALLER_WORKFLOW = '.github/workflows/pipegen.yml';
+/** The app's push-layer workflow (ruling B2): push on every branch but the default, pr-check and the push-layer scanners, never a gate. */
+export const PUSH_WORKFLOW = '.github/workflows/pipegen-push.yml';
+/** The approval re-run (Plan G l. 40): `pull_request_review` with exactly these types, and only in CALLER_WORKFLOW. */
+export const PR_REVIEW_TRIGGER: Readonly<{ types: readonly string[] }> = Object.freeze({ types: Object.freeze(['submitted', 'dismissed']) });
+/**
+ * The workflow-level `concurrency` of the two app callers (Plan G l. 42): one group per ref, and an in-progress run is cancelled except on the
+ * default branch (its baseline, signing and deploy runs always finish, design §19). Never in a called workflow (it would share the group with
+ * its caller and deadlock).
+ */
+export const WORKFLOW_CONCURRENCY: Readonly<{ group: string; 'cancel-in-progress': string }> = Object.freeze({
+  group: 'pipegen-${{ github.ref }}',
+  'cancel-in-progress': "${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}",
+});
+/** The job that looks for an open pull request of the pushed branch, and its one output. */
+export const PR_CHECK_JOB = 'pr-check';
+export const HAS_PR_OUTPUT = 'has-pr';
+/** The push-layer skip (Plan G l. 43): a push-layer job of the push file skips when its branch has an open pull request (the merge layer covers it). */
+export const PR_CHECK_IF = "needs.pr-check.outputs.has-pr != 'true'";
+/** The deploy jobs of CALLER_WORKFLOW run on its push (the default branch only), never on a pull request or a review. */
+export const DEPLOY_PUSH_IF = "github.event_name == 'push'";
+
+/** Characters GitHub's branch filters read as a pattern (or an escape); a default branch holding one has no exact filter, so pipegen writes none. */
+const BRANCH_PATTERN_RE = /[*?+[\]!\\]/;
+/** The default branch as a filter value: a plain git branch name (printable ASCII, no space, no pattern character, no expression), else a RenderError. */
+function branchFilterValue(defaultBranch: string): string {
+  if (typeof defaultBranch !== 'string' || defaultBranch.length === 0 || defaultBranch.length > 255 || !/^[\x21-\x7e]+$/.test(defaultBranch)
+    || BRANCH_PATTERN_RE.test(defaultBranch) || defaultBranch.includes(EXPR) || defaultBranch.startsWith('-') || /[~^:]|\.\.|@\{|\.lock$|\/$|^\/|\/\/|\.$/.test(defaultBranch)) {
+    throw new RenderError(`The default branch ${show(String(defaultBranch))} is not a plain branch name pipegen can write as an exact branch filter (no pattern characters * ? + [ ] ! or \\).`);
+  }
+  return defaultBranch;
+}
+/** CALLER_WORKFLOW's push trigger (carry C3): exactly `branches: [<default>]`, so no tag and no other branch starts a run whose head looks trusted. */
+export function defaultPushTrigger(defaultBranch: string): { branches: [string] } {
+  return { branches: [branchFilterValue(defaultBranch)] };
+}
+/** PUSH_WORKFLOW's push trigger (ruling B2): every branch but the default (tags never run the pipeline: a push filter on branches alone runs on no tag). */
+export function featurePushTrigger(defaultBranch: string): { 'branches-ignore': [string] } {
+  return { 'branches-ignore': [branchFilterValue(defaultBranch)] };
+}
+
+/** The pr-check lookup step (BP-6): its id, and its one env entry, the job's own token (pull-requests: read, by the pr-check row of the permission table). */
+export const PR_CHECK_STEP_ID = 'pipegen-pr-check';
+export const PR_CHECK_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_PR_TOKEN: '${{ github.token }}' });
+/**
+ * The script: the pushed branch and the owner come from the runner's own variables (never an expression), URL-encoded by jq; the API answer
+ * must be a list (anything else fails the step); `has-pr` is `true` exactly when the list holds an open pull request of this branch. Any failure
+ * (curl, jq, an odd answer) fails the job, so the push-layer jobs that need it do not run and the run is red, never silently green.
+ */
+const PR_CHECK_RUN = [
+  'set -euo pipefail',
+  'branch="$(jq -rn --arg v "$GITHUB_REF_NAME" \'$v | @uri\')"',
+  'owner="$(jq -rn --arg v "$GITHUB_REPOSITORY_OWNER" \'$v | @uri\')"',
+  'count="$(curl -fsS --proto \'=https\' --max-time 60 -H "Authorization: Bearer $PIPEGEN_PR_TOKEN" -H \'Accept: application/vnd.github+json\' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=1&head=$owner:$branch" | jq -e \'if type == "array" then length else error("not a list") end\')"',
+  'if [ "$count" -gt 0 ]; then echo \'has-pr=true\' >> "$GITHUB_OUTPUT"; else echo \'has-pr=false\' >> "$GITHUB_OUTPUT"; fi',
+  '',
+].join('\n');
+/** The one pr-check lookup step pipegen renders (BP-6: a shared renderer, so the referee recognises it by its exact content). */
+export function renderPrCheckStep(): RenderedStep {
+  return { id: PR_CHECK_STEP_ID, name: 'pipegen: does this branch have an open pull request', run: PR_CHECK_RUN, shell: 'bash', env: { ...PR_CHECK_STEP_ENV } };
+}
+/** Whether a step is exactly the pr-check lookup step (every field that runs; the name aside). */
+export function isPrCheckStep(s: RenderedStep): boolean {
+  const want = renderPrCheckStep();
+  const runs = (x: RenderedStep): unknown[] => [x.id, x.uses, x.with, x.run, x.shell, x.env, x['working-directory'], x.if, x['continue-on-error'], x['timeout-minutes']];
+  return JSON.stringify(runs(s)) === JSON.stringify(runs(want));
+}
+
+/** The baseline-check step's id (G22): its `found` output is the job output of the job baseline-check. The renderer (renderBaselineCheckStep) gives it. */
+export const BASELINE_CHECK_STEP_ID = 'pipegen-baseline-check';
+/** The baseline-check step's shape (the gate action pinned by a commit, in mode baseline-check, with its id); the referee holds the pin. */
+export const isBaselineCheckStep = (s: RenderedStep): boolean =>
+  s.id === BASELINE_CHECK_STEP_ID && s.run === undefined && s.uses !== undefined && GATE_USES_RE.test(s.uses) && s.with?.mode === 'baseline-check';
+/**
+ * The verify job's digest step id (G22, B3 a): the run step that reads the trusted run's digest artifact and checks it. Its renderer and its
+ * step kind come with the deploy layer (G7); here only its shape: a run step with this id (until G7 the referee does not recognise its content, so
+ * the pipegen-verify row refuses it).
+ */
+export const DIGEST_STEP_ID = 'pipegen-digest';
+const isDigestStep = (s: RenderedStep): boolean => s.id === DIGEST_STEP_ID && typeof s.run === 'string' && s.uses === undefined;
+
+/** The one form of a job output taken from a step's output. */
+export const stepOutputForm = (stepId: string, output: string): string => `\${{ steps.${stepId}.outputs.${output} }}`;
+/** Plan G's job outputs (G22, three of four; the nested not-proven output is Plan H's): each on its own job only, from its own step only. */
+const G_OUTPUTS: Readonly<Record<string, { job: string; step: string; is: (s: RenderedStep) => boolean }>> = Object.freeze({
+  found: { job: 'baseline-check', step: BASELINE_CHECK_STEP_ID, is: isBaselineCheckStep },
+  [HAS_PR_OUTPUT]: { job: PR_CHECK_JOB, step: PR_CHECK_STEP_ID, is: isPrCheckStep },
+  digest: { job: 'pipegen-verify', step: DIGEST_STEP_ID, is: isDigestStep },
+});
+
 // ---------- job outputs (Plan C ruling B3) ----------
 
 /** The scrub step's declared outputs the job outputs reference (gate/action.yml declares them; a test keeps them in it). */
@@ -423,6 +519,8 @@ const baseCheckouts = (steps: readonly RenderedStep[]): RenderedStep[] => steps.
 export function jobOutputsFor(steps: readonly RenderedStep[]): Record<string, string> {
   const out: Record<string, string> = {};
   if (baseCheckouts(steps).length === 1) out[BASE_SHA_OUTPUT] = BASE_SHA_VALUE;
+  // G22: found, has-pr and digest, each from its own step (the renderer puts that step in its own job only; jobOutputsProblems holds the job)
+  for (const [name, o] of Object.entries(G_OUTPUTS)) if (steps.filter(o.is).length === 1) out[name] = stepOutputForm(o.step, name);
   for (const s of steps) {
     if (!isScrubStep(s) || typeof s.with?.artifact !== 'string' || s.id === undefined) continue;
     for (const n of OUTPUT_NAMES) out[`${s.with.artifact}-${n}`] = `\${{ steps.${s.id}.outputs.${n} }}`;
@@ -434,8 +532,9 @@ export function jobOutputsFor(steps: readonly RenderedStep[]): Record<string, st
  * Why a job's `outputs` are not allowed (Plan C ruling B3), as plain-English problems: only `<artifact>-sha256`, `-status` and
  * `-error`, for an artifact whose scrub step is in this job, each exactly `${{ steps.<that scrub's id>.outputs.<same> }}`; and on the
  * base-scan job `base-sha`, exactly `${{ steps.pipegen-checkout.outputs.commit }}` of its one base checkout (C5a CF3b).
- * Nothing else is an output of a job that feeds the gate (no `has-pr`, no `digest`: Plan G extends this function when it adds
- * one). The emitter and the referee both call this, so they allow the same forms.
+ * Plan G (G1, G22): `found` only on the job baseline-check, `has-pr` only on pr-check and `digest` only on pipegen-verify, each exactly
+ * `${{ steps.<its step's id>.outputs.<name> }}` of the one step of its kind in that job (G_OUTPUTS). Nothing else is an output of a job.
+ * The emitter and the referee both call this, so they allow the same forms.
  */
 export function jobOutputsProblems(jobId: string, outputs: unknown, steps: readonly RenderedStep[]): string[] {
   if (outputs === undefined) return [];
@@ -447,6 +546,14 @@ export function jobOutputsProblems(jobId: string, outputs: unknown, steps: reado
   }
   const problems: string[] = [];
   for (const [key, value] of Object.entries(outputs)) {
+    // G22 (ruling B1): found (baseline-check), has-pr (pr-check), digest (pipegen-verify): on that job only, exactly from that job's one step of its kind
+    const g = Object.hasOwn(G_OUTPUTS, key) ? G_OUTPUTS[key] : undefined;
+    if (g !== undefined) {
+      if (jobId !== g.job) problems.push(`${where} include ${show(key)}, which is not one of the outputs of this job: only the job ${g.job} hands on ${key}, from its own step.`);
+      else if (steps.filter(g.is).length !== 1 || steps.filter((s) => s.id === g.step).length !== 1) problems.push(`${where} include ${show(key)}, but the job does not hold exactly one ${g.step} step of its kind: ${key} comes only from its own step.`);
+      else if (value !== stepOutputForm(g.step, key)) problems.push(`${where}: ${show(key)} must be exactly ${stepOutputForm(g.step, key)} (the output of its own step), nothing else.`);
+      continue;
+    }
     if (key === BASE_SHA_OUTPUT) {
       // C5a CF3b: the commit the base-scan job checked out, from its one base checkout, and nowhere else
       if (jobId !== BASE_SCAN_JOB) problems.push(`${where} include ${show(key)}, which only the ${BASE_SCAN_JOB} job hands the gate (the commit its base checkout checked out).`);
@@ -525,6 +632,8 @@ export function checkExpressions(step: RenderedStep): void {
       if (group === 'env') {
         // C9: the commit-range scan step (its id, a run step) carries this event's base and head commits, each exactly its form
         if (step.id === rangeScanStepId && step.run !== undefined && step.uses === undefined && Object.hasOwn(RANGE_STEP_ENV, k) && RANGE_STEP_ENV[k] === v) continue;
+        // G1 (BP-6): the pr-check lookup step, exactly as renderPrCheckStep writes it (every field that runs), carries the job's own token
+        if (Object.hasOwn(PR_CHECK_STEP_ENV, k) && PR_CHECK_STEP_ENV[k] === v && isPrCheckStep(step)) continue;
         const m = SECRET_REF_RE.exec(v);
         if (m === null || m[1] !== k || isDangerousName(k)) bad(`env value ${show(k)}`);
       } else if (usesPath === undefined || table === undefined || own(table, k) === undefined || rendererInputProblems(usesPath, { [k]: v }, step.with ?? {}).length > 0) {

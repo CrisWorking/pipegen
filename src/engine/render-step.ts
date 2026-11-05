@@ -27,7 +27,7 @@ import { APP_RUNNING_CATEGORIES, projectScriptSteps, renderCliTool, renderRangeS
 import { ArtifactNameError, resultArtifactName, SECRETS_RANGE_ARTIFACT } from './artifact-names.js';
 import type { ProjectScriptStep } from './reviewed.js';
 import { own, RenderError, show } from './render-error.js';
-import { BASE_CHECKOUT_ID, checkExpressions, checkJobOrder, isDangerousName, isReviewed, STEP_KEYS, type JobContext, type RenderedStep, type ScanFact } from './job-rules.js';
+import { BASE_CHECKOUT_ID, BASELINE_CHECK_STEP_ID, checkExpressions, checkJobOrder, isDangerousName, isReviewed, STEP_KEYS, type JobContext, type RenderedStep, type ScanFact } from './job-rules.js';
 import { GateJobListError } from './gate-job-list.js';
 import { gateStepInputs, nightlyStepInputs } from './gate-inputs.js';
 import { allowedDomainsProblem, BULLFROG_USES, egressDomains, BASE_CHECKOUT_REF, DOCKER_ACTION_USES, GATE_UPLOAD_FILES, gateUploadPath, uploadIfNoFiles, IMAGE_BUILT_ACTION_USES, isStagedTool, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath, scrubStepId, stagePath, stageStepId } from './tool-flags.js';
@@ -638,9 +638,10 @@ export function renderFindRunStep(gate: ReviewedTool, opts: { central?: { repo: 
  */
 export function renderBaselineCheckStep(gate: ReviewedTool): RenderedStep {
   checkGateEntry(gate);
-  return actionStep(gate, 'pipegen: check the stored baseline', {}, {
+  // G1 (G22): the step's id is BASELINE_CHECK_STEP_ID, so the job's `found` output is its output (jobOutputsFor / jobOutputsProblems)
+  return { id: BASELINE_CHECK_STEP_ID, ...actionStep(gate, 'pipegen: check the stored baseline', {}, {
     mode: 'baseline-check', 'github-token': '${{ secrets.GITHUB_TOKEN }}', 'fp-key': '${{ secrets.PIPEGEN_FP_KEY }}',
-  });
+  }) };
 }
 
 /**

@@ -10,17 +10,21 @@
 //
 // Each sub-task that fills in a judge also RE-CHECKS its matcher: a matcher claims only the files of its own kind and never a
 // protected path or a tool config. No rule claims anything under `.github/`, `.husky/`, `.zap/` or `node_modules/`, or any path with a
-// segment that starts with `.` (the exceptions: the CODEOWNERS and dependabot rules, which match only their exact paths, and
-// `.dockerignore` at a service root, which is the one dot-name a Docker rule needs). A test probes every protected path and config name.
+// segment that starts with `.` (the exceptions: the CODEOWNERS and dependabot rules, which match only their exact paths; the hook rules
+// of Plan G G1, ruling B4, which match only `.pre-commit-config.yaml`, `.husky/pre-commit` and `lefthook.yml` exactly, at the root, as
+// edits judged byte for byte (the hidden() exception is named for these three paths and no other); and `.dockerignore` at a service
+// root, which is the one dot-name a Docker rule needs). A test probes every protected path and config name.
 //
-// Deliberately NO rule (B4, #108): biome/eslint/hadolint/c8/vitest/knip/prettier configs, `.gitleaksignore`, `.semgrepignore`,
-// `.trivyignore`, `.prettierignore`, `lefthook.yml`, `.pre-commit-config.yaml`, `.husky/*`. Those are protected paths; a created copy
-// could only shadow or weaken the pinned one. Plan G registers its hook, central and install-record files as it builds them.
+// Deliberately NO rule (#108): biome/eslint/hadolint/c8/vitest/knip/prettier configs, `.gitleaksignore`, `.semgrepignore`,
+// `.trivyignore`, `.prettierignore`, any other lefthook or husky file. Those are protected paths; a created copy could only shadow or
+// weaken the pinned one. Plan G registers its central and install-record files as it builds them.
 import type { CreatedFile, Part, PipelineDraft, ReviewedTool } from '../types.js';
 import { codeownersCentralJudge, codeownersJudge } from './created-judges/codeowners.js';
 import { composeJudge } from './created-judges/compose.js';
 import { dependabotJudge } from './created-judges/dependabot.js';
 import { dockerfileJudge, dockerignoreJudge } from './created-judges/dockerfile.js';
+import { hooksJudge } from './created-judges/hooks.js';
+import { HOOK_FILES } from './created-builders.js';
 import { packageJsonJudge, packageLockJudge } from './created-judges/package.js';
 import { pipegenDocJudge } from './created-judges/pipegen-doc.js';
 import { createdPathProblem } from './job-rules.js';
@@ -112,6 +116,10 @@ export const CREATED_RULES: readonly CreatedRule[] = [
   { id: 'starter-tests', repo: 'app', parts: ['tests'], mode: 'new', match: (p, d) => isStarterTest(p, d), judge: starterTestsJudge },
   { id: 'package-json', repo: 'app', parts: ['tests'], mode: 'edit', needsConfirm: true, match: (p, d) => claimable(p, d, 'package.json'), judge: packageJsonJudge },
   { id: 'package-lock', repo: 'app', parts: ['tests'], mode: 'edit', needsConfirm: true, match: (p, d) => claimable(p, d, 'package-lock.json'), judge: packageLockJudge },
+  // G1 (ruling B4): the hook managers' files, each at its one exact root path (the named hidden() exception), appended to byte for byte
+  { id: 'hooks-pre-commit', repo: 'app', parts: ['precommit'], mode: 'edit', match: (p) => p === HOOK_FILES['pre-commit'], judge: hooksJudge },
+  { id: 'hooks-husky', repo: 'app', parts: ['precommit'], mode: 'edit', match: (p) => p === HOOK_FILES.husky, judge: hooksJudge },
+  { id: 'hooks-lefthook', repo: 'app', parts: ['precommit'], mode: 'edit', match: (p) => p === HOOK_FILES.lefthook, judge: hooksJudge },
 ];
 
 /** The verdict on one file: `claimed` false means no rule matched; `problems` are the reasons to refuse it. */

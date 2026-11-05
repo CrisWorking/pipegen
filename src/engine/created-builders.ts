@@ -177,3 +177,113 @@ export function dependabotFile(original: string, draft: PipelineDraft): { conten
   if (!(body[0] ?? '').startsWith('  - ') || body.some((l) => !l.startsWith('  '))) return by('the items of `updates` are not a block sequence at the standard indentation');
   return { content: `${nl}${entry}` };
 }
+
+// ---------- git hooks (v0.2 Plan G, G1: ruling B4) ----------
+
+/** The three hook managers pipegen extends, and the one file of each it appends to (pipegen sets up lefthook when the repository has none). */
+export type HookManager = 'pre-commit' | 'husky' | 'lefthook';
+export const HOOK_FILES: Readonly<Record<HookManager, string>> = Object.freeze({ 'pre-commit': '.pre-commit-config.yaml', husky: '.husky/pre-commit', lefthook: 'lefthook.yml' });
+/** The marker on the first line of pipegen's block (a comment in every manager's syntax): a re-run finds it and adds nothing twice. */
+export const HOOKS_MARKER = 'pipegen:hooks';
+const HOOKS_NOTE = "pipegen's reviewed hooks; the install record holds this text";
+/**
+ * The reviewed local hook commands, by reviewed entry id (B4: a hook runs only a reviewed, pinned command, never a hook repo URL): the tool's
+ * argv on the developer's machine. The tool runs from the repository's own install (`npx --no` never downloads anything: the version is the
+ * one the lockfile pins, which pipegen's devDependency edit adds with its integrity, Plan D D6). One row per tool whose hook form is
+ * reviewed; G6 adds rows here (and only here) under review, and the judge follows, since it calls the same builder.
+ */
+export const HOOK_COMMANDS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  // biome checks format and lint of the staged files only (PC3), and passes when none of them is one it reads
+  biome: Object.freeze(['biome', 'check', '--staged', '--no-errors-on-unmatched']),
+});
+/** One hook pipegen appends: its id (`pipegen-<tool>`) and its command line. */
+export interface HookCommand { id: string; run: string }
+const HOOK_RUN_RE = /^[A-Za-z0-9 ._@=:/-]{1,300}$/;
+const HOOK_ID_RE = /^pipegen-[a-z0-9][a-z0-9-]{0,60}$/;
+const isRootPath = (path: string): boolean => path === '' || path === '.' || path === './';
+const sameReviewed = (a: unknown, t: ReviewedTool): boolean => {
+  if (typeof a !== 'object' || a === null) return false;
+  const c = a as Record<string, unknown>;
+  const b = t.candidate;
+  return c.source === 'reviewed' && c.reviewed === true && c.id === b.id && c.kind === b.kind && c.repo === b.repo && c.version === b.version && JSON.stringify(c.pin) === JSON.stringify(b.pin);
+};
+
+/**
+ * The hooks pipegen appends for this draft (B4), in need order: for each pre-commit `format-lint` need of the ROOT service (an npm service:
+ * the hook runs from the repository root, where every manager starts it), each reviewed tool of its steps (the entry at its reviewed pin,
+ * installed by npm) that has a reviewed hook command. Empty: no hook to append (the builder then gives a note, the judge refuses any file).
+ */
+export function hookCommands(draft: PipelineDraft, reviewed: readonly ReviewedTool[]): HookCommand[] {
+  const out: HookCommand[] = [];
+  for (const need of draft.needs) {
+    if (need.layer !== 'pre-commit' || need.id !== 'format-lint') continue;
+    const svc = draft.profile.services.find((s) => s.name === need.service);
+    if (svc === undefined || !isRootPath(svc.path) || svc.language !== 'node' || svc.packageManager !== 'npm') continue;
+    for (const spec of draft.steps) {
+      if (spec?.needId !== need.id || spec.service !== need.service) continue;
+      const t = reviewed.find((r) => r.id === spec.tool?.id);
+      const argv = t === undefined || !Object.hasOwn(HOOK_COMMANDS, t.id) ? undefined : HOOK_COMMANDS[t.id];
+      if (t === undefined || argv === undefined || !sameReviewed(spec.tool, t) || t.step.cli?.install.method !== 'npm') continue;
+      const hook: HookCommand = { id: `pipegen-${t.id}`, run: ['npx', '--no', '--', ...argv].join(' ') };
+      if (!HOOK_ID_RE.test(hook.id) || !HOOK_RUN_RE.test(hook.run)) throw new Error(`the hook command of ${t.id} is not plain text pipegen can write`);
+      if (!out.some((h) => h.id === hook.id)) out.push(hook);
+    }
+  }
+  return out;
+}
+
+/** pipegen's block for one manager: pre-commit a `repo: local` item at `indent` (no rev: it fetches nothing), husky plain lines, lefthook a `pre-commit` key. */
+export function hookBlock(manager: HookManager, commands: readonly HookCommand[], indent = ''): string {
+  const q = JSON.stringify;
+  if (manager === 'husky') return [`# ${HOOKS_MARKER} begin: ${HOOKS_NOTE}`, ...commands.map((c) => c.run), `# ${HOOKS_MARKER} end`, ''].join('\n');
+  if (manager === 'lefthook') return [`# ${HOOKS_MARKER}: ${HOOKS_NOTE}`, 'pre-commit:', '  commands:', ...commands.flatMap((c) => [`    ${c.id}:`, `      run: ${q(c.run)}`]), ''].join('\n');
+  const i = indent;
+  return [`${i}# ${HOOKS_MARKER}: ${HOOKS_NOTE}`, `${i}- repo: local`, `${i}  hooks:`,
+    ...commands.flatMap((c) => [`${i}    - id: ${q(c.id)}`, `${i}      name: ${q(c.id)}`, `${i}      entry: ${q(c.run)}`, `${i}      language: system`, `${i}      pass_filenames: false`, `${i}      always_run: true`]), ''].join('\n');
+}
+
+/**
+ * The whole hook file (B4, the D0a append pattern): the user's bytes untouched, then pipegen's block appended (a newline first when the file
+ * does not end with one). `inserted` is everything after the original (the install record's EditKind 'hooks' text). Only shapes pipegen can
+ * append to safely; any other, a file that already holds pipegen's block, CR line ends or tabs, or no hook command at all give no file and a note.
+ * - pre-commit: `repos:` is the last top-level key, written as a plain key line, its items a block sequence at indentation 0 or 2 (a new file: `repos:` then the block);
+ * - husky: plain shell lines; no line continuation at the end and no here-document (either would swallow pipegen's lines);
+ * - lefthook: no `pre-commit` key yet (pipegen adds the whole key; it never edits the user's hooks).
+ */
+export function hookFile(manager: HookManager, original: string, draft: PipelineDraft, reviewed: readonly ReviewedTool[]): { content: string; inserted: string } | { note: string } {
+  if (typeof original !== 'string') return { note: 'the original text of the hook file is missing' };
+  let commands: HookCommand[];
+  try { commands = hookCommands(draft, reviewed); } catch (e) { return { note: e instanceof Error ? e.message : 'the hook commands can not be built' }; }
+  if (commands.length === 0) return { note: 'pipegen has no reviewed hook command for this repository (a format and lint check of the root npm service with a tool whose hook form is reviewed), so it adds no hook' };
+  if (original.includes(HOOKS_MARKER)) return { note: `the ${HOOK_FILES[manager]} file already holds pipegen's hooks, so pipegen adds them no second time` };
+  const by = (why: string): { note: string } => ({ note: `pipegen can not add its hooks to ${HOOK_FILES[manager]} safely (${why}); add them by hand:\n${hookBlock(manager, commands)}` });
+  if (/[\r\t]/.test(original)) return by('it uses CRLF line ends or tabs');
+  const nl = original === '' || original.endsWith('\n') ? original : `${original}\n`;
+  const done = (block: string): { content: string; inserted: string } => ({ content: nl + block, inserted: (nl + block).slice(original.length) });
+  if (manager === 'husky') {
+    const lines = original.split('\n').filter((l) => l.trim() !== '');
+    if (/\\\s*$/.test(lines[lines.length - 1] ?? '')) return by('its last line continues onto the next');
+    if (/<<-?\s*['"]?[A-Za-z_]/.test(original)) return by('it has a here-document');
+    return done(hookBlock('husky', commands));
+  }
+  if (manager === 'lefthook') {
+    if (original !== '') {
+      const r = parseYaml(original, 'strict');
+      if ('problems' in r) return by(`it does not parse strictly: ${r.problems.join('; ')}`);
+      if (Object.hasOwn(r.parsed.js, 'pre-commit')) return by('it already has a pre-commit key, which pipegen does not edit');
+    }
+    return done(hookBlock('lefthook', commands));
+  }
+  if (original === '') return done(`repos:\n${hookBlock('pre-commit', commands)}`);
+  const r = parseYaml(original, 'strict');
+  if ('problems' in r) return by(`it does not parse strictly: ${r.problems.join('; ')}`);
+  const keys = Object.keys(r.parsed.js);
+  if (keys[keys.length - 1] !== 'repos' || !Array.isArray(r.parsed.js.repos) || r.parsed.js.repos.length === 0) return by('`repos` is not the last top-level key with a list of repos');
+  const lines = original.split('\n');
+  const at = lines.map((l, i) => (/^repos:[ ]*(?:#.*)?$/.test(l) ? i : -1)).filter((i) => i >= 0);
+  if (at.length !== 1) return by('`repos:` is not written as a plain key line');
+  const body = lines.slice((at[0] as number) + 1).filter((l) => l.trim() !== '' && !/^\s*#/.test(l));
+  const indent = /^( *)- /.exec(body[0] ?? '')?.[1];
+  if (indent === undefined || (indent !== '' && indent !== '  ') || body.some((l) => !l.startsWith(`${indent}- `) && !l.startsWith(`${indent} `))) return by('the repos are not a block sequence at indentation 0 or 2');
+  return done(hookBlock('pre-commit', commands, indent));
+}

@@ -948,8 +948,9 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
     for (const on of [{ pull_request_target: null }, { workflow_run: { workflows: ['x'], types: ['completed'] } }, 'issue_comment', ['push', 'pull_request_target']]) {
       expect((await run([wf({ scan: job(g.steps) }, { on })], draftOf([g.spec]))).ok, JSON.stringify(on)).toBe(false);
     }
+    // G1 (carry C3): pipegen.yml's own push is exactly branches: [<default>], so the allowed bare triggers are shown in another workflow file
     for (const on of ['push', ['push', 'pull_request'], { merge_group: null, schedule: [{ cron: '0 3 * * *' }], workflow_dispatch: null }]) {
-      expect(show(await run([wf({ scan: job(g.steps) }, { on })], draftOf([g.spec]))), JSON.stringify(on)).toBe('');
+      expect(show(await run([wf({ scan: job(g.steps) }, { on }, '.github/workflows/scan.yml')], draftOf([g.spec]))), JSON.stringify(on)).toBe('');
     }
   });
   it('A15: shell on an action step → refused', async () => {

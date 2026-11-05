@@ -93,9 +93,12 @@ describe('registry: each registered rule runs its judge', () => {
     expect((await run([file('PIPEGEN.md', 'x', { repo: 'central' })])).issues.some((i) => /no file of this kind/.test(i.message))).toBe(true);
   });
   it('the default registry has no rule for a tool config or an ignore file', () => {
-    for (const path of ['biome.json', 'eslint.config.js', '.hadolint.yaml', '.c8rc.json', 'vitest.config.ts', 'knip.json', '.prettierrc', '.prettierignore', '.gitleaksignore', '.semgrepignore', '.trivyignore', 'lefthook.yml', '.pre-commit-config.yaml']) {
+    // G1 (ruling B4): lefthook.yml and .pre-commit-config.yaml now have their edit-mode hook rules (byte-exact appends, test/referee-g1.test.ts)
+    for (const path of ['biome.json', 'eslint.config.js', '.hadolint.yaml', '.c8rc.json', 'vitest.config.ts', 'knip.json', '.prettierrc', '.prettierignore', '.gitleaksignore', '.semgrepignore', '.trivyignore']) {
       expect(CREATED_RULES.filter((r) => r.match(path, draft)).map((r) => r.id), path).toEqual([]);
     }
+    expect(CREATED_RULES.filter((r) => r.match('lefthook.yml', draft)).map((r) => r.id)).toEqual(['hooks-lefthook']);
+    expect(CREATED_RULES.filter((r) => r.match('.pre-commit-config.yaml', draft)).map((r) => r.id)).toEqual(['hooks-pre-commit']);
   });
   it('rule ids are unique', () => {
     const ids = CREATED_RULES.map((r) => r.id);
@@ -234,7 +237,9 @@ describe('parity: what the engine produces today still passes', () => {
 
 describe('fix round 1: matchers claim only their own files', () => {
   const claim = (path: string, repo: 'app' | 'central' = 'app') => CREATED_RULES.filter((r) => r.repo === repo && r.match(path, draft)).map((r) => r.id);
-  const ALLOWED: Record<string, string[]> = { CODEOWNERS: ['codeowners', 'codeowners-central'], 'docs/CODEOWNERS': ['codeowners', 'codeowners-central'], '.github/CODEOWNERS': ['codeowners', 'codeowners-central'], '.github/dependabot.yml': ['dependabot'], 'docker-compose.pipegen.yml': ['compose'] };
+  const ALLOWED: Record<string, string[]> = { CODEOWNERS: ['codeowners', 'codeowners-central'], 'docs/CODEOWNERS': ['codeowners', 'codeowners-central'], '.github/CODEOWNERS': ['codeowners', 'codeowners-central'], '.github/dependabot.yml': ['dependabot'], 'docker-compose.pipegen.yml': ['compose'],
+    // G1 (ruling B4): the three hook files, at their exact root paths only, in the app repo
+    '.pre-commit-config.yaml': ['hooks-pre-commit'], '.husky/pre-commit': ['hooks-husky'], 'lefthook.yml': ['hooks-lefthook'] };
   const configNames = [...new Set([...reviewedList().flatMap((t) => t.configFiles), 'biome.json', 'biome.jsonc', 'eslint.config.js', 'eslint.config.mjs', '.hadolint.yaml', '.c8rc.json', '.c8rc', 'vitest.config.ts', 'vite.config.ts', 'knip.json', '.prettierrc', '.prettierignore', '.gitleaksignore', '.semgrepignore', '.trivyignore', 'lefthook.yml', '.pre-commit-config.yaml', '.husky/pre-commit', '.zap/rules.tsv', 'renovate.json', '.renovaterc', 'CODEOWNERS', 'dependabot.yml', 'docker-compose.pipegen.yml'])];
   const protectedNames = PROTECTED_PATHS_BASE.map((x) => x.replace(/\/\*\*$/, '/x'));
   const FOLDERS = ['', 'test/', 'tests/', '__tests__/', 'api/', 'api/test/', 'api/tests/', 'api/__tests__/', '.github/', '.github/workflows/', '.github/actions/x/', '.github/actions/x/tests/', '.husky/', '.husky/test/', '.zap/', 'node_modules/x/', 'test/.github/'];
