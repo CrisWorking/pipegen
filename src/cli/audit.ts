@@ -111,18 +111,19 @@ export const TYPE_CANCELLED = 'Cancelled: nothing was read from GitHub and no re
 
 /**
  * Plan J J5 (DECISIONS #124, ruling S8): the swap-risk stop, run by main.ts before `audit` and `inspect` do anything
- * else (before the --ai checks, any read of the repo or any GitHub call). When the current folder is the audited folder
- * or inside it and swapRiskWhy finds something, it prints what it found, SWAP_TEXT and the safe-mode command on stderr
- * and returns EXIT_UNSAFE_FOLDER; else null (from outside the repo the audit only warns, as before).
+ * else (before the --ai checks, any read of the repo or any GitHub call). When swapRiskWhy finds something in the
+ * folders npm read for this start (the current folder up to the audited repo when it is inside it, and up to the
+ * current folder's own repo whatever --dir says), it prints what it found, SWAP_TEXT and the safe-mode command on
+ * stderr and returns EXIT_UNSAFE_FOLDER; else null (a risk only in the audited repo, run from outside, stays a warning).
  */
 export async function unsafeFolderStop(io: CliIO, dir: string): Promise<number | null> {
   const why = await swapRiskWhy(io.cwd ?? process.cwd(), dir);
   if (why === null) return null;
   const command = safeRunCommand(packageVersion());
-  io.err(`pipegen stopped before reading anything: this folder has ${safeText(why, 500)}.`);
+  io.err(`pipegen stopped before reading the repo: it found ${safeText(why, 500)}.`);
   io.err(command === null ? SWAP_TEXT_NO_COMMAND : SWAP_TEXT);
   if (command !== null) io.err(`  ${command}`);
-  io.err(`If this is your own repo, remove what was found and run npx pipegen again; otherwise run the command above from the folder that holds the repo (./repo is its folder). exit code ${EXIT_UNSAFE_FOLDER}.`);
+  io.err(`If this is your own repo, remove what was found and start pipegen again; otherwise run the command above from a folder you trust, outside the repo (replace ./repo with the repo's folder). exit code ${EXIT_UNSAFE_FOLDER}.`);
   return EXIT_UNSAFE_FOLDER;
 }
 interface AiReady { provider: AiProvider; secretScanner: Pick<SecretScanner, 'name' | 'version'>; bar: QualityBar }

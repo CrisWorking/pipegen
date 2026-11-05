@@ -557,8 +557,14 @@ describe('pipegen audit (flags and help)', () => {
     expect(npx.length).toBeGreaterThan(0);
     const safe = `npx --registry=https://registry\\.npmjs\\.org pipegen@(?:${VERSION.replace(/\./g, '\\.')}|x\\.y\\.z) audit `;
     for (const line of npx) expect(line, line).toMatch(new RegExp(`^(?:npx pipegen(?: |$)|${safe})`));
-    // the Commands section shows the plain form first and the safe mode second
+    // the npm name isn't published yet: the Commands section opens with the warning, before any command (J5 review I1)
     const commands = readme.slice(readme.indexOf('## Commands'));
+    const NOT_YET = "> **Not on npm yet: don't run these until the first release.** The npm name isn't published yet, so until then `npx pipegen` would run whatever package holds the name";
+    expect(commands.split('\n')[2]).toContain(NOT_YET);
+    expect(commands.indexOf(NOT_YET)).toBeLessThan(commands.indexOf('```')); // before the first command block
+    expect(readme).not.toMatch(/don't work until the first release|no other pipegen command is safe/);
+    expect(readme).toContain("would run someone else's package: don't run them until the first release");
+    // the plain form first and the safe mode second
     const first = [...commands.matchAll(/npx[^\n`]*/g)].map((m) => m[0]);
     expect(first[0]).toMatch(/^npx pipegen(?: |$)/);
     expect(first.findIndex((l) => new RegExp(`^${safe}`).test(l))).toBeGreaterThan(0);
@@ -1255,6 +1261,15 @@ function staticSite(): string {
   });
 }
 
+/** A second static shape: a Vite single-page app named `spa`. */
+function viteSpa(): string {
+  return repo({
+    'package.json': JSON.stringify({ name: 'spa', scripts: { dev: 'vite', build: 'vite build' }, devDependencies: { vite: '7.0.0' } }),
+    'index.html': '<div id="app"></div><script type="module" src="/src/main.js"></script>\n',
+    'src/main.js': 'document.getElementById("app").textContent = "hi";\n',
+  });
+}
+
 /** A prompter for the type question: `typeOk` answers "Is this right?", `picks` the selects; it records each question and how many GitHub calls had been made when it was asked. */
 function typePrompter(typeOk: boolean | Error, picks: (string | Error)[] = [], calls: () => number = () => 0) {
   const asked: { msg: string; githubCalls: number }[] = [];
@@ -1304,8 +1319,11 @@ const profileOf = (call: number) => (vi.mocked(renderTerminal).mock.calls[call]?
 
 describe('npx pipegen inside the folder: the safe-mode stop (J5, #124, S8, S15)', () => {
   it('inside + unsafe .npmrc → exit 4, no prompt, no GitHub call', async () => {
-    const dir = repo({ '.npmrc': UNSAFE_NPMRC });
-    for (const argv of [[], ['audit'], ['audit', '--dir', '.'], ['--dir', dir]]) {
+    // three .npmrc shapes (a registry, node-options, a script shell), each with four ways to start
+    for (const [npmrc, argv] of ['registry=https://registry.example.invalid/\n', 'node-options=--require=./x.js\n', '; comment\nscript-shell = ./x.sh\n']
+      .flatMap((n) => [[], ['audit'], ['audit', '--dir', '.'], ['--dir', '<dir>']].map((a) => [n, a] as const))) {
+      const dir = repo({ '.npmrc': npmrc });
+      argv.splice(0, argv.length, ...argv.map((a) => (a === '<dir>' ? dir : a)));
       vi.mocked(buildAudit).mockClear();
       const prompt = noPrompt();
       const r = await audit(argv, { cwd: dir, interactive: true, prompt });
@@ -1414,6 +1432,83 @@ describe('npx pipegen inside the folder: the safe-mode stop (J5, #124, S8, S15)'
     // a safe .npmrc alone is fine
     const safe = repo({ '.npmrc': 'save-exact=true\n' });
     expect(await swapRisk(safe, safe)).toBe(false);
+  });
+
+  it('committed Node_Modules in another letter case → exit 4 (macOS and Windows read it as node_modules)', async () => {
+    for (const entry of ['Node_Modules/x.js', 'NODE_MODULES/x/package.json']) {
+      const dir = repo();
+      writeIndex(dir, ['index.js', entry, 'package.json']);
+      const r = await audit([], { cwd: dir });
+      expect(r.code, entry).toBe(EXIT_UNSAFE_FOLDER);
+      expect(r.err).toContain('a committed node_modules folder');
+      expect(r.calls).toEqual([]);
+    }
+    // in a sub-folder on the way too
+    const sub = repo({ 'packages/a/package.json': '{}' });
+    writeIndex(sub, ['package.json', 'packages/a/package.json', 'packages/A/Node_Modules/y.js']);
+    expect((await audit(['--dir', sub], { cwd: join(sub, 'packages/a') })).code).toBe(EXIT_UNSAFE_FOLDER);
+  });
+
+  it('the folder pipegen was started in is checked whatever --dir says (npx already obeyed it)', async () => {
+    const target = repo();
+    // an untrusted clone (its own .git) started from, with --dir pointing at another repo: its .npmrc, or a sub-folder's
+    const clone = repo({ '.npmrc': 'node-options=--require=./x.js\n', 'src/a.js': '\n' });
+    for (const cwd of [clone, join(clone, 'src')]) {
+      const r = await audit(['--dir', target], { cwd });
+      expect(r.code, cwd).toBe(EXIT_UNSAFE_FOLDER);
+      expect(r.err).toContain('.npmrc');
+      expect(r.calls).toEqual([]);
+    }
+    // a local pipegen in the clone (index known, node_modules not committed)
+    const bin = repo({ 'node_modules/.bin/pipegen': '#!/bin/sh\n' });
+    writeIndex(bin, ['package.json']);
+    expect((await audit(['inspect', '--dir', target], { cwd: bin })).code).toBe(EXIT_UNSAFE_FOLDER);
+    // no git: npm's project folder is the nearest one with a package.json or a node_modules, and its .npmrc is read
+    const plain = makeTempDir();
+    writeIn(plain, 'package.json', '{}');
+    writeIn(plain, '.npmrc', UNSAFE_NPMRC);
+    writeIn(plain, 'deep/er/x.txt', '\n');
+    const deep = await audit(['--dir', target], { cwd: join(plain, 'deep/er') });
+    expect(deep.code).toBe(EXIT_UNSAFE_FOLDER);
+    expect(deep.err).toContain(plain);
+    // a clean start folder: the audit runs
+    expect((await audit(['--dir', target], { cwd: makeTempDir() })).code).toBe(0);
+    expect((await audit(['--dir', target], { cwd: repo() })).code).toBe(0);
+  });
+
+  it('the home folder and the folders above it are never checked (~/.npmrc is the user\'s own npm config)', async () => {
+    const target = repo();
+    const home = makeTempDir();
+    writeIn(home, '.npmrc', UNSAFE_NPMRC);
+    writeIn(home, 'work/x.txt', '\n');
+    const before = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      expect((await audit(['--dir', target], { cwd: home })).code).toBe(0);
+      expect((await audit(['--dir', target], { cwd: join(home, 'work') })).code).toBe(0);
+      // a folder below home that is npm's project folder still counts
+      writeIn(home, 'work/.npmrc', UNSAFE_NPMRC);
+      writeIn(home, 'work/package.json', '{}');
+      expect((await audit(['--dir', target], { cwd: join(home, 'work') })).code).toBe(EXIT_UNSAFE_FOLDER);
+    } finally {
+      process.env.HOME = before;
+    }
+  });
+
+  it('swapRisk: a symlinked current folder is read by its real path; a worktree\'s .git file is named in the answer', async () => {
+    const dir = repo({ 'sub/.npmrc': UNSAFE_NPMRC, 'sub/package.json': '{}' });
+    const link = join(makeTempDir(), 'into-sub');
+    symlinkSync(join(dir, 'sub'), link);
+    expect(await swapRiskWhy(link, dir)).toContain('in sub');
+    const linkToRepo = join(makeTempDir(), 'repo-link');
+    symlinkSync(dir, linkToRepo);
+    expect(await swapRisk(join(linkToRepo, 'sub'), dir)).toBe(true);
+    expect(await swapRisk(join(linkToRepo, 'sub'), linkToRepo)).toBe(true);
+    // a git worktree or submodule (.git is a file): no index pipegen can read, and the answer says why
+    const wt = makeTempDir();
+    writeIn(wt, '.git', 'gitdir: /elsewhere/.git/worktrees/wt\n');
+    writeIn(wt, 'node_modules/a/index.js', '\n');
+    expect(await swapRiskWhy(wt, wt)).toContain('a git worktree or submodule');
   });
 
   it('stop comes before the --ai checks (no Ollama call)', async () => {
@@ -1527,6 +1622,14 @@ describe('npx pipegen: no command, --help, --type, --verbose and the type questi
   });
 
   it('user says No and picks server → overrides applied, report says "set by you"', async () => {
+    // a second static shape (a Vite single-page app): the same question and override
+    const spa = viteSpa();
+    const spaAsk = typePrompter(false, ['server']);
+    expect((await audit([], { cwd: spa, prompt: spaAsk.p, interactive: true })).code).toBe(0);
+    expect(spaAsk.asked[0]?.msg).toContain('spa: static-site');
+    expect(profileOf(0).services[0]?.projectType?.evidence).toContain('set to server by you');
+    vi.mocked(buildAudit).mockClear();
+    vi.mocked(renderTerminal).mockClear();
     const dir = staticSite();
     const f = fakeFetch(publicRoutes());
     const ask = typePrompter(false, ['server'], () => f.calls.length);

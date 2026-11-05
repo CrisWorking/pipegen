@@ -4,7 +4,7 @@
 For small teams with nobody dedicated to security, DevOps or code quality.
 It opens one pull request. You review it. It never touches your app code or your `main` branch.
 
-> **Status: early, not published yet.** `pipegen audit` (read-only) is built and tested on real public repos; it is not on npm yet, so the install commands below don't work until the first release. The full run (one PR) comes later. See the [roadmap](docs/roadmap.md).
+> **Status: early, not published yet.** `pipegen audit` (read-only) is built and tested on real public repos; it is not on npm yet, so the commands below would run someone else's package: don't run them until the first release. The full run (one PR) comes later. See the [roadmap](docs/roadmap.md).
 
 ## What the audit shows you *(excerpt of a real run on a public repo, expressjs/express; "..." marks cut parts)*
 
@@ -83,6 +83,8 @@ It protects four stages: **pre-commit → push → merge → deploy**.
 
 ## Commands *(planned)*
 
+> **Not on npm yet: don't run these until the first release.** The npm name isn't published yet, so until then `npx pipegen` would run whatever package holds the name (see [Install safely](#install-safely-and-check-what-you-installed)).
+
 Inside your project folder:
 
 ```bash
@@ -109,19 +111,17 @@ npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./my-repo
 ```
 
 Why: inside a folder, npm reads that folder's `.npmrc` and prefers a local `node_modules/.bin/pipegen`, so a repo
-can make `npx pipegen` run something else. When pipegen starts inside a folder whose `.npmrc` has settings that can
-change what npm runs, or that has a local pipegen or a committed `node_modules`, it stops before reading anything and
-prints the safe-mode command (exit code `4`). It can't stop a fake pipegen that runs instead of it, or code a hostile
+can make `npx pipegen` run something else. When pipegen starts in a folder (or under one, up to that repo's top) whose
+`.npmrc` has settings that can change what npm runs, or that has a local pipegen or a committed `node_modules`, it stops
+before reading the repo and prints the safe-mode command (exit code `4`). It can't stop a fake pipegen that runs instead of it, or code a hostile
 `.npmrc` makes npm load before pipegen starts: only safe mode avoids those.
 
 Exit codes of `pipegen audit`:
 
-- `0`: the report was printed (and written, with `--out`).
+- `0`: the report was printed (and written, with `--out`); also when you cancel the type question (Ctrl+C or Esc):
+  then nothing is read from GitHub and no report is printed.
 - `1`: a refusal or an error, including GitHub not readable at all (a private repo without access, a refused token, no
   answer): only what is on disk is printed, and no `--out` file is written.
-- `0` also when you cancel the type question (Ctrl+C or Esc): nothing is read from GitHub and no report is printed.
-- `4`: pipegen stopped before reading anything, because the folder it was started in could change which pipegen runs
-  (see safe mode above).
 - `3`: the report was printed (and written, with `--out`), but GitHub's rate limit stopped pipegen reading some GitHub
   facts. Every check that needs them shows as unknown ("couldn't check"), never as covered or missing; the warning at
   the top says when the limit resets. In `--json`, `githubIncomplete` lists what wasn't read (`unread`), the reset time
@@ -129,6 +129,8 @@ Exit codes of `pipegen audit`:
   60 requests an hour; a read-only fine-grained token with the permissions above allows 5,000. One case still exits `1`
   without a report: the limit hit while pipegen checks a GitHub App login set in `GITHUB_TOKEN` (pipegen can't confirm
   which repos that login reaches without GitHub).
+- `4`: pipegen stopped before reading the repo, because a folder npm read when pipegen started could change which
+  pipegen runs (see safe mode above).
 
 `audit --ai` needs Linux or macOS for now (WSL works): it checks your code for secrets with a pinned betterleaks binary
 before anything is sent (or gitleaks, the fallback, when `PIPEGEN_SECRET_SCANNER` is set to `gitleaks`), and those
@@ -136,7 +138,8 @@ binaries exist for those systems only.
 
 Later versions add the full job (one PR), then `finish` (after you merge: merge rules, signing key and dates), `verify`
 (read-only: checks nobody weakened the pipeline files) and `uninstall`. Their exact commands will be shown here when
-they exist; until then no other pipegen command is safe to copy, because the npm name isn't published yet.
+they exist. No pipegen command, these included, is safe to run before the first release, because the npm name isn't
+published yet.
 
 ## Install safely, and check what you installed
 
