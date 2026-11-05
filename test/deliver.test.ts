@@ -825,7 +825,7 @@ describe('G10 fix round 1 (review-G10, ruling G10-R2)', () => {
   it('fix 1: an entry the question can\'t show exactly refuses the typed path (G10-R-sec8)', async () => {
     const base = (await (async () => { const w = world(); await firstRun(w); return record(w); })()) as Rec;
     const cleaned = structuredClone(base);
-    cleaned.secrets.push({ name: 'X‮Y', scope: 'repo', created: true } as Rec['secrets'][number]);
+    cleaned.secrets.push({ name: 'X\u202eY', scope: 'repo', created: true } as Rec['secrets'][number]);
     expect(confirmView(cleaned)).toEqual({ refused: expect.stringMatching(/can't be shown exactly/) });
     const long = structuredClone(base);
     long.files.push({ repo: 'app', path: `${'d/'.repeat(160)}f.txt`, part: 'docs', shas: [gitBlobSha('x\n')] });
