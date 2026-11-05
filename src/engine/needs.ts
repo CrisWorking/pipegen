@@ -255,7 +255,10 @@ function mainDeployTargets(p: RepoProfile): (string | undefined)[] | null {
   const names = p.services.map((s) => s.name);
   const runnable = p.services.filter(isRunnable).map((s) => s.name);
   if (runnable.length === 0 && !deploysExist(p)) return null;
-  return runnable.length > 0 ? runnable : names.length > 0 ? names : [undefined];
+  // Final review I3: with a deploy workflow, a static site is a target next to the services that run (it is deployed, and sbom,
+  // deploy-verify, signing and egress apply to its files); with no deploy workflow it stays out, and a lone static site keeps no layer.
+  if (runnable.length > 0) return deploysExist(p) ? p.services.filter((s) => isRunnable(s) || isStaticSite(s)).map((s) => s.name) : runnable;
+  return names.length > 0 ? names : [undefined];
 }
 
 /** PS7: the service a publishing workflow publishes (publishedPackage), else repo-wide. */
