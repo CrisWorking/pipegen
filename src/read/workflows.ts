@@ -118,7 +118,7 @@ function publishesOf(doc: Record<string, unknown>): ('npm' | 'pypi')[] {
  * count covers only the file's own top-level jobs. Only a number leaves this file.
  */
 const COMMIT_REF = /^[0-9a-f]{40}$/i;
-function tagPinnedOf(doc: Record<string, unknown>): { n: number; unchecked: boolean } {
+export function tagPinnedOf(doc: Record<string, unknown>): { n: number; unchecked: boolean } {
   let n = 0;
   let unchecked = false;
   const check = (u: string) => {
