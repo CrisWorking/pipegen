@@ -328,7 +328,7 @@ const ROW_NOTE = {
 const starterTests = (service: string) => `No tests found for ${service}: pipegen would create starter tests.`;
 const NO_SERVICE_TO_TEST = 'No service found to test.';
 
-const LIMIT = {
+export const LIMIT = {
   noLock: 'No merge lock: anyone with write access can merge without checks (GitHub Pro for personal accounts, GitHub Team for organisations, adds it).',
   fakeGate: 'Without a merge lock, a pull request could replace the gate with a fake one; only code-owner review stops it.',
   noApprovals: 'No deploy approvals: GitHub does not let this repo require a reviewer before a deploy.',

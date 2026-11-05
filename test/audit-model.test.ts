@@ -274,11 +274,11 @@ describe('buildAudit (brief, Task 2a)', () => {
     ];
     for (const r of reports) {
       expect(r.support.nextCommand).toBeNull();
-      for (const text of [renderTerminal(r, { knownValues: [] }), renderMarkdown(r, { knownValues: [] }), renderJson(r, { knownValues: [] })]) {
+      for (const text of [renderTerminal(r, { knownValues: [], verbose: true }), renderMarkdown(r, { knownValues: [] }), renderJson(r, { knownValues: [] })]) {
         expect(text).not.toMatch(/npx\s+pipegen/);
       }
     }
-    const t = renderTerminal(reports[0] as AuditReport, { knownValues: [] });
+    const t = renderTerminal(reports[0] as AuditReport, { knownValues: [], verbose: true });
     expect(t.split('\n')).toContain(`    ${SWAP_WARNING.command}`);
   });
 
@@ -676,7 +676,7 @@ describe('buildAudit (Plan U final review)', () => {
     'package.json': JSON.stringify({ name: 'lib', version: '1.0.0', scripts: { test: 'vitest run' }, devDependencies: { vitest: '1.0.0' } }),
     'package-lock.json': '{}\n', 'index.js': 'module.exports = 1;\n', '.github/workflows/release.yml': RELEASE,
   });
-  const flatTerm = (r: AuditReport) => renderTerminal(r, { knownValues: [] }).replace(/\s+/g, ' ');
+  const flatTerm = (r: AuditReport) => renderTerminal(r, { knownValues: [], verbose: true }).replace(/\s+/g, ' ');
 
   it('M4: a package with nothing runnable gets release wording for signing and attestation, never image wording', async () => {
     const r = await buildAudit(repo(pkgFiles()), deps());
@@ -706,7 +706,7 @@ describe('buildAudit (Plan U final review)', () => {
     expect(r.aiBundle.files).toBe(3);
     expect(r.aiBundle.topFolders).toEqual(['src']);
     for (const p of ['**/.env*', '**/*.tfstate', '**/.npmrc']) expect(r.aiBundle.excludedPatterns).toContain(p);
-    const term = renderTerminal(r, { knownValues: [] });
+    const term = renderTerminal(r, { knownValues: [], verbose: true });
     const md = renderMarkdown(r, { knownValues: [] });
     const json = renderJson(r, { knownValues: [] });
     for (const out of [term, md, json]) {
@@ -818,7 +818,7 @@ describe('buildAudit: Plan P final review I1 (ruling P33)', () => {
     for (const c of rows) expect(c.status, c.need.layer).not.toBe('covered');
     const why = "this action is on pipegen's never-use list (proprietary licence, needs a licence key and phones home); pin a reviewed alternative.";
     expect(rows.some((c) => c.status === 'partial' && c.why?.endsWith(why))).toBe(true);
-    for (const out of [renderTerminal(r, { knownValues: [] }), renderMarkdown(r, { knownValues: [] }), renderJson(r, { knownValues: [] })]) {
+    for (const out of [renderTerminal(r, { knownValues: [], verbose: true }), renderMarkdown(r, { knownValues: [] }), renderJson(r, { knownValues: [] })]) {
       expect(out.replace(/\s+/g, ' ')).toContain("never-use list (proprietary licence, needs a licence key and phones home); pin a reviewed alternative");
     }
   });
@@ -1025,11 +1025,11 @@ describe('buildAudit: the audited commit (hand checks fix 10, P55)', () => {
 
   it('all three outputs print the commit (short SHA and branch), and say so when it could not be read', async () => {
     const r = await buildAudit(repo({ ...nodeApp(), '.git/HEAD': 'ref: refs/heads/main\n', '.git/refs/heads/main': `${SHA}\n` }), deps());
-    expect(renderTerminal(r, { knownValues: [] })).toContain('Audited commit: 3541888 on branch main');
+    expect(renderTerminal(r, { knownValues: [], verbose: true })).toContain('Audited commit: 3541888 on branch main');
     expect(renderMarkdown(r, { knownValues: [] })).toContain('Audited commit: 3541888 on branch main');
     expect((JSON.parse(renderJson(r, { knownValues: [] })) as { commit: unknown }).commit).toEqual({ sha: SHA, short: '3541888', branch: 'main' });
     const none = await buildAudit(repo(nodeApp()), deps());
-    expect(renderTerminal(none, { knownValues: [] })).toContain("Audited commit: pipegen couldn't read it from .git");
+    expect(renderTerminal(none, { knownValues: [], verbose: true })).toContain("Audited commit: pipegen couldn't read it from .git");
     expect((JSON.parse(renderJson(none, { knownValues: [] })) as { commit: unknown }).commit).toBeNull();
   });
 });

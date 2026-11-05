@@ -220,6 +220,8 @@ Never sent (every pattern; one that starts with ! keeps a file):
 - \*\*/build/\*\*
 - \*\*/vendor/\*\*
 - \*\*/target/\*\*
+- files your .gitignore lists
+- files that aren't committed, when pipegen can read git's file list (.git/index)
 
 These are counts only, never file contents. They were made without the secret scan; before anything is sent, a secret scan (betterleaks, or gitleaks as the fallback) checks every file and secret-looking values are hidden, so the real bundle can differ slightly.
 
@@ -245,27 +247,16 @@ These are counts only, never file contents. They were made without the secret sc
 - Reusable workflows from other repos, and actions from your own account, can't be looked inside: those checks show as unknown.
 - Shell tricks such as `trap … EXIT`, `alias`, or a function named like the test tool aren't modelled, so a repo built to fool the audit could make a check look covered.
 - A local action or reusable workflow that calls another local one isn't followed past the first level, so those checks show as unknown.
-- `tox` counts as your own test run whatever environments its config lists: pipegen doesn't read tox's env_list.
-- A tox or nox run whose environments a TOX… or NOX… variable in the job picks (like TOXENV from a matrix) shows as partial: pipegen doesn't read the variable's value, so it can't tell if the tests run.
-- Variables that change what runs (SKIP for pre-commit, TOX… and NOX… for tox and nox, NPM_CONFIG_DRY_RUN) aren't seen when an action from another repo sets them, or when a step writes them under a name built while it runs.
-- Dockerfile RUN lines count only when a `docker build`, docker/build-push-action or `docker compose build` step names the Dockerfile with plain paths, and only for the stages the final stage (or the target) needs. Build arguments and ENV count only as variables the RUN lines see; a Compose `extends`, `include`, `--env-file` or COMPOSE_FILE, and a custom Dockerfile frontend, show as unknown.
 - Commands given through a variable aren't read.
-- A folder with more than one language (like a Python app with a package.json for its assets) is one service: a check run in either language counts for it, so pipegen can't tell if each language is checked.
-- A Dockerfile `ENTRYPOINT` in shell form, or a compose `entrypoint:`, can ignore the command `docker compose run` or `docker run` passes, so a check run that way may not run at all: pipegen doesn't read the entrypoint.
 - A tool counts only for services in the languages pipegen lists for it (mypy and Ruff for Python, ESLint and tsc for JavaScript and TypeScript); a tool set up to check other languages as well isn't credited for them.
-- A pre-commit hook pinned to a commit SHA (`rev:`) isn't checked to be a commit of the hook's own repo, so it could come from a fork.
-- pipegen knows the PyPI publish action up to v1.14.3: a newer release pinned by its commit SHA shows as partial until pipegen is updated.
 - A test or lint script whose runner pipegen doesn't know (like `node test.js`) is trusted by its name: pipegen only lowers it when the script clearly does nothing or can't fail.
 - Coverage minimums in JS or TS config files (like jest.config.js or vitest.config.ts) are read as text: pipegen finds the setting but can't run the file, so it can't confirm the minimum.
-- Renovate presets (`extends`) aren't followed, so a setting that comes from a shared preset isn't seen.
 - Repo settings on GitHub (required checks, secret scanning, the default token permissions) aren't read, so pipegen can't say whether they are already on.
 - A workflow without a `permissions:` block gets the repo's default token permissions, a setting pipegen can't see.
 - A deploy workflow that uses no secret and no write grant isn't seen as a release.
 - Network egress control (blocking unexpected traffic from release jobs) is only partly read on larger runners.
 - Environment variables set by third-party actions aren't seen, so a check one of them turns off can show as covered.
-- pipegen can't check yet that an ESLint config reads .vue, .svelte and .astro files (the parsers and plugins come in v0.2): such a repo never shows a clean pass for ESLint.
 - The quick secret check on the files on disk looks only for a few secret formats (private keys, some token formats, JWTs, passwords in connection strings); it doesn't read `name = value` lines, such as an API key or a password set in code or in a .env file, so it is not a secret scan.
-- Kubernetes manifests are looked for only in YAML under folders named k8s, kubernetes, manifests, deploy, helm or charts (and a Chart.yaml anywhere), so manifests kept elsewhere, like infra/, aren't seen.
 
 ## Next step
 

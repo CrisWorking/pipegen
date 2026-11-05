@@ -38,6 +38,12 @@ vi.mock('node:child_process', async (importOriginal) => {
 });
 vi.mock('execa', () => ({ execa: vi.fn(), execaSync: vi.fn(), execaNode: vi.fn(), execaCommand: vi.fn(), execaCommandSync: vi.fn(), $: vi.fn() }));
 // The AI: the real makeProvider runs (its key and flag checks), then a test's fake provider stands in for it.
+// J4: the terminal report is the short one unless `verbose`. These tests are about the full report; the CLI's `--verbose`
+// flag arrives with J5 (merge: delete this mock and pass `--verbose` in the args of the tests that read the full report).
+vi.mock('../src/audit/render.js', async (importOriginal) => {
+  const a = await importOriginal<typeof import('../src/audit/render.js')>();
+  return { ...a, renderTerminal: (r: Parameters<typeof a.renderTerminal>[0], o: Parameters<typeof a.renderTerminal>[1]) => a.renderTerminal(r, { ...o, verbose: true }) };
+});
 vi.mock('../src/ai/provider.js', async (importOriginal) => {
   const a = await importOriginal<typeof import('../src/ai/provider.js')>();
   return { ...a, makeProvider: vi.fn((opts: Parameters<typeof a.makeProvider>[0]) => { const real = a.makeProvider(opts); return hooks.ai ?? real; }) };
@@ -946,7 +952,11 @@ describe('pipegen audit (Plan U final review)', () => {
   it('M7: --json carries the "what this audit can\'t see" list', async () => {
     const dir = repo();
     const r = await audit(['audit', '--json'], { cwd: dir });
-    expect((JSON.parse(r.out) as { cantSee: string[] }).cantSee).toEqual([...CANT_SEE]);
+    // J4: only the limits that apply to the repo; a repo with no workflows is not told about workflow limits
+    const cantSee = (JSON.parse(r.out) as { cantSee: string[] }).cantSee;
+    const all = CANT_SEE.map((x) => x.text);
+    expect(cantSee.length).toBeGreaterThan(0);
+    for (const t of cantSee) expect(all).toContain(t);
   });
 });
 
