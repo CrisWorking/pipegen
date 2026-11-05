@@ -3,7 +3,8 @@
 // the merge locks, the environments, the signing environment's key and PIPEGEN_COSIGN_PUB, PIPEGEN_BLOCK_FROM, sha pinning, then the central
 // ruleset and CODEOWNERS last, and updates the install record; `pipegen verify` reports drift between the repos and the record. Every GitHub
 // call goes to an in-memory GitHub (test/helpers/finish-github.ts); cosign is a fake exec; no network.
-import { mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -14,7 +15,7 @@ import { newRateBudget } from '../src/engine/github-rate.js';
 import { pubKeySha256 } from '../src/engine/signing.js';
 import { ensureSigningEnvironment, plannedOfLocks, SETUP_BRANCH } from '../src/deliver/deliver.js';
 import { finish, FinishError, FINISH_WRITE_ROUTES, type FinishDeps, type FinishProbe } from '../src/deliver/finish.js';
-import { localFinishPendingPath, readLocalRecord, readRecord, recordHash, recordMarkerOf, writeLocalRecord, writeRecord } from '../src/deliver/record.js';
+import { checkRecord, localFinishPendingPath, readLocalRecord, readRecord, recordHash, recordMarkerOf, writeFinishPending, writeLocalRecord, writeRecord } from '../src/deliver/record.js';
 import { SettingsApi } from '../src/deliver/settings-api.js';
 import { verify } from '../src/deliver/verify.js';
 import { planLocks, type LockPlan } from '../src/layers/locks.js';
@@ -783,6 +784,35 @@ describe('G11 fix round 1: a failed or stopped finish, the block date (I1, I2)',
     expect(r.variables.find((v) => v.name === 'PIPEGEN_BLOCK_FROM')).toMatchObject({ created: false, previous: '2026-12-31' });
     expect(r.repoSettings).toMatchObject({ shaPinningRequired: { previous: false }, vulnerabilityAlerts: { previous: false } });
     expect(r.central?.actionsAccess).toEqual({ previous: 'none' });
+    // the record holds them now: the pending file is gone
+    expect(existsSync(pending)).toBe(false);
+    // a public repo: secret scanning and push protection were off before, and stay recorded so
+    const t = await seed({ private: false });
+    let tArmed = true;
+    t.g.hooks.push((c) => (tArmed && !c.route.startsWith('GET ') && c.params.repo === 'pipelines' && /\/git\//.test(c.route) ? { status: 500, data: { message: 'boom' } } : undefined));
+    await expect(finish(t.g.octokit(), app, {}, t.deps())).rejects.toThrow(FinishError);
+    tArmed = false;
+    await finish(t.g.octokit(), app, {}, t.deps());
+    expect((await recordOn(t, 'pipegen/update-r')).repoSettings).toMatchObject({ [SS]: { previous: false }, pushProtection: { previous: false } });
+  });
+
+  it('finish: a value that can\'t be saved locally first is not changed; a pending file of another repo id is not used (I1)', async () => {
+    const s = await seed();
+    userEnv(s);
+    const dir = dirname(localFinishPendingPath(app, { home: s.home, env: {} }));
+    let locked = false;
+    s.g.hooks.push((c) => { if (!locked && !c.route.startsWith('GET ')) { locked = true; chmodSync(dir, 0o500); } return undefined; });
+    try {
+      await finish(s.g.octokit(), app, {}, s.deps()).catch(() => undefined);
+    } finally { chmodSync(dir, 0o700); }
+    expect(s.g.repo('o/r').envs.get('production')).toMatchObject({ wait_timer: 5, reviewers: [] });
+    expect(s.lines.join('\n')).toMatch(/environment production: pipegen couldn't save locally what it was before/);
+    // a pending file left by another repo of the same name (another id) says nothing about this one
+    const t = await seed();
+    t.g.x('o/r').variables.set('PIPEGEN_BLOCK_FROM', { value: BLOCK_FROM, created_at: '2026-02-02T00:00:00Z' });
+    await writeFinishPending(app, 999_999, { environments: [], variables: [{ name: 'PIPEGEN_BLOCK_FROM', scope: 'repo', created: false, previous: '1999-01-01', githubCreatedAt: '2026-02-02T00:00:00Z' }], repoSettings: {} }, new Date(), { home: t.home, env: {} });
+    await finish(t.g.octokit(), app, {}, t.deps());
+    expect((await recordOn(t)).variables.find((v) => v.name === 'PIPEGEN_BLOCK_FROM')?.previous).toBeUndefined();
   });
 
   it('finish: classic protection\'s earlier body survives a failed record write (I1)', async () => {
@@ -850,6 +880,12 @@ describe('G11 fix round 1: a failed or stopped finish, the block date (I1, I2)',
     await finish(w.g.octokit(), app, {}, w.deps({ io, interactive: true }));
     expect(varOf(w, 'PIPEGEN_BLOCK_FROM')?.value).toBe('2026-11-09');
     expect((await recordOn(w)).blockFrom).toBe('2026-11-09');
+    // a value that is not a real day is not a date to keep
+    const y = await seed();
+    rmSync(join(y.home, '.config'), { recursive: true, force: true });
+    y.g.x('o/r').variables.set('PIPEGEN_BLOCK_FROM', { value: '2026-02-30', created_at: '2026-11-06T10:00:00Z' });
+    await finish(y.g.octokit(), app, {}, y.deps({ io, interactive: true }));
+    expect(varOf(y, 'PIPEGEN_BLOCK_FROM')?.value).toBe(BLOCK_FROM);
   });
 });
 
@@ -868,6 +904,14 @@ describe('G11 fix round 1: verify compares the locks (I3)', () => {
     t.g.hooks.push((c) => (c.route === 'POST /repos/{owner}/{repo}/rulesets' && c.params.repo === 'pipelines' ? { status: 500, data: { message: 'boom' } } : undefined));
     await finish(t.g.octokit(), app, {}, t.deps());
     expect((await vfy(t)).drift).toEqual([{ what: CENTRAL, expected: 'applied by finish', actual: null }]);
+    // and the org required workflow rule
+    const u = await seed({ org: true });
+    u.g.hooks.push((c) => (c.route === 'POST /orgs/{org}/rulesets' ? { status: 500, data: { message: 'boom' } } : undefined));
+    await finish(u.g.octokit(), app, {}, u.deps());
+    expect((await vfy(u)).drift).toEqual([{ what: 'the org required workflow rule (pipegen-required--r)', expected: 'applied by finish', actual: null }]);
+    // before finish ran, nothing planned is missing yet
+    const w = await seed();
+    expect((await vfy(w)).drift.filter((x) => x.expected === 'applied by finish')).toEqual([]);
   });
 
   it('verify: a ruleset emptied, given a bypass actor, switched to evaluate, or with weaker check or review settings is drift', async () => {
@@ -882,6 +926,7 @@ describe('G11 fix round 1: verify compares the locks (I3)', () => {
       ['ruleset pipegen', () => bodyOf('o/r', 'pipegen'), (b) => { b.rules = []; }, /pipegen's rules/],
       ['ruleset pipegen', () => bodyOf('o/r', 'pipegen'), (b) => { b.bypass_actors = [{ actor_id: 5, actor_type: 'RepositoryRole', bypass_mode: 'always' }]; }, /no bypass actors/],
       ['ruleset pipegen', () => bodyOf('o/r', 'pipegen'), (b) => { b.enforcement = 'evaluate'; }, /active/],
+      ['ruleset pipegen', () => bodyOf('o/r', 'pipegen'), (b) => { b.conditions = { ref_name: { include: ['refs/heads/other'], exclude: [] } }; }, /pipegen's rules/],
       ['ruleset pipegen', () => bodyOf('o/r', 'pipegen'), (b) => { rule(b, 'required_status_checks').parameters.required_status_checks = [{ context: 'pipegen / gate', integration_id: 1 }]; }, /15368/],
       ['ruleset pipegen', () => bodyOf('o/r', 'pipegen'), (b) => { rule(b, 'required_status_checks').parameters.required_status_checks = [{ context: 'other', integration_id: 15368 }]; }, /pipegen \/ gate/],
       ['ruleset pipegen-reviews', () => bodyOf('o/r', 'pipegen-reviews'), (b) => { rule(b, 'pull_request').parameters.dismiss_stale_reviews_on_push = false; }, /dismiss/],
@@ -1013,6 +1058,11 @@ describe('G11 fix round 1: minor findings (m1-m9)', () => {
     expect(r.central?.rulesetId).toBe(c?.id);
     expect(r.central?.rulesetCreatedAt).toBeUndefined();
     expect(c?.enforcement).toBe('active');
+    // the record carries one of the two for each ruleset, never neither nor both
+    const { githubCreatedAt: _g, ...bare } = { ...(r.rulesets[0] as InstallRecord['rulesets'][number]), githubCreatedAt: undefined };
+    expect(() => checkRecord({ ...r, rulesets: [{ ...bare, unconfirmed: undefined }] })).toThrow(/rulesets/);
+    expect(() => checkRecord({ ...r, rulesets: [{ ...bare, unconfirmed: true, githubCreatedAt: '2026-11-07T10:00:00Z' }] })).toThrow(/rulesets/);
+    expect(checkRecord({ ...r, rulesets: [{ ...bare, unconfirmed: true }] }).rulesets[0]?.unconfirmed).toBe(true);
   });
 
   it('finish: a weakened request planted in a vouched record\'s planned is never sent (m7)', async () => {
