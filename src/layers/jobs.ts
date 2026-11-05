@@ -95,7 +95,7 @@ const GATE_JOB_NAME = 'gate';
 /** v0.2 limits: categories pipegen does not render yet, each with the line the notes (and PIPEGEN.md) carry. */
 export const NOT_RENDERED_V02: Readonly<Partial<Record<NeedCategory, string>>> = Object.freeze({
   'api-dast': 'API testing against the API spec is not available yet: its tool (schemathesis) needs a reviewed hash-locked closure of its Python dependencies, planned for v0.4 (S31).',
-  dast: 'The scan of the running app (ZAP, nuclei) is not run yet: starting the app runs the repository\'s code, which no job that holds the result fingerprint key may run, and the app image can not be a job service yet. It comes with the image hand-off as a service (v0.3).',
+  dast: 'The scan of the running app (ZAP, nuclei) is not run yet: starting the app runs the repository\'s code, which no job that holds the result fingerprint key may run, and the app image can not be a job service yet; it needs the image hand-off as a job service first.',
   scorecard: 'OpenSSF Scorecard is not run yet: its action runs a tag-pinned container image, and pipegen runs only images pinned by digest (PF-3).',
   fuzzing: 'Fuzzing is built in v0.3.',
 });

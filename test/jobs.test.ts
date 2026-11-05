@@ -180,8 +180,8 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
     const other = "needs.baseline-check.outputs.found == 'missing'";
     expect((await judge([editJob(f, 'base-scan', (j) => { for (const s of j.steps) if (s.if === BASELINE_MISSING_IF) s.if = other; })], a.draft)).ok).toBe(false);
     // the always() form on a run step, or the plain form on a scrub: refused
-    expect((await judge([editJob(f, 'base-scan', (j) => { for (const s of j.steps) if (s.if === BASELINE_MISSING_IF && String(s.id).startsWith('tool-run-')) s.if = BASELINE_MISSING_ALWAYS_IF; })], a.draft)).ok).toBe(false);
-    expect((await judge([editJob(f, 'base-scan', (j) => { for (const s of j.steps) if (s.if === BASELINE_MISSING_ALWAYS_IF && s.with?.mode === 'scrub') s.if = BASELINE_MISSING_IF; })], a.draft)).ok).toBe(false);
+    expect((await judge([editJob(f, 'base-scan', (j) => { for (const s of j.steps) if (s.if === BASELINE_MISSING_IF && String(s.id).startsWith('tool-run-')) s.if = BASELINE_MISSING_ALWAYS_IF; })], a.draft)).issues.some((i) => /could skip this step while the job passes/.test(i.message))).toBe(true);
+    expect((await judge([editJob(f, 'base-scan', (j) => { for (const s of j.steps) if (s.if === BASELINE_MISSING_ALWAYS_IF && s.with?.mode === 'scrub') s.if = BASELINE_MISSING_IF; })], a.draft)).issues.some((i) => /could skip this step while the job passes/.test(i.message))).toBe(true);
     // and on the shared base checkout: refused
     expect((await judge([editJob(f, 'base-scan', (j) => { (j.steps as Obj[])[1].if = BASELINE_MISSING_IF; })], a.draft)).ok).toBe(false);
   });
@@ -318,6 +318,10 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
     // delivery in the same repository signs (keyless here)
     const delivered = assemble(x, 'keyless');
     expect(delivered.sign?.steps.some((s) => /^pipegen-sign-/.test(s.id ?? ''))).toBe(true);
+    // a skipped deploy part signs nothing either
+    const skipped = assemble({ ...x, draft: { ...x.draft, skipped: [{ part: 'deploy', reason: 't' }] } }, 'keyless');
+    expect(skipped.sign).toBeNull();
+    expect(skipped.draft.signing).toBeUndefined();
     // attest: not signed yet (G15), a note, never another mode
     const att = planned(profileOf([node({ dockerfile: 'Dockerfile' })], { private: true }), {
       caps: { ...CAPS, attestations: true, environments: true }, over: { centralPin: { repo: 'o/pipelines', sha: 'a'.repeat(40) }, signing: { mode: 'attest', images: [{ service: 'app', repo: 'ghcr.io/o/r-app' }] } },
@@ -352,6 +356,9 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
   });
 
   it('assemble: a blocking uncovered need stops assembly with its reason', () => {
+    // a blocking check pipegen can not render (a pnpm service's project scripts: npm only in v0.2) stops too, never a silent drop
+    const pnpm = planned(profileOf([node({ packageManager: 'pnpm', npmLockfileVersion: undefined })]));
+    expect(() => assemble(pnpm)).toThrow(/The blocking check "unit-tests" for "app" can not be written: pnpm is not supported yet/);
     // a TypeScript service: no reviewed type checker fits it (mypy is Python's), so type-check is uncovered and blocking
     const ts = planned(profileOf([node({ quality: { ...emptyServiceQuality(), tsconfig: true } })]));
     expect(ts.plan.uncovered.some((u) => u.needId === 'type-check' && u.blocking)).toBe(true);
@@ -386,6 +393,12 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
     expect(() => egressStepFor(['github-releases'], opts)).toThrow(AssembleError);
     expect(egressStepFor(['npm'], opts).with?.['allowed-domains']).not.toMatch(/osv|release-assets|mirror\.gcr/);
     expect(shown(await judge(files(a), a.draft))).toBe('');
+    // the egress step's allowed IPs: none, or exactly the reviewed Docker range (a job with containers); any other range is refused
+    const f = files(a)[0] as CreatedFile;
+    const wide = editJob(f, 'sast--app', (j) => { (j.steps as Obj[])[0].with['allowed-ips'] = '0.0.0.0/0'; });
+    expect((await judge([wide], a.draft)).issues.some((i) => /allowed-ips must be one of/.test(i.message))).toBe(true);
+    const docker = editJob(f, 'sast--app', (j) => { (j.steps as Obj[])[0].with['allowed-ips'] = '172.16.0.0/12'; });
+    expect((await judge([docker], a.draft)).issues.filter((i) => /allowed-ips/.test(i.message))).toEqual([]);
   });
 
   it('assemble: secrets job adds the commit-range block; pre-push head fetched by a pipegen-only step', async () => {
