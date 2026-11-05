@@ -653,8 +653,12 @@ export async function proveThenClean<T>(store: StateStore, prove: () => Promise<
   } else {
     let v: ProofVerdict;
     try { v = stricterVerdict(proofVerdict(outcome), verdict === undefined ? undefined : verdict(outcome)); } catch { v = { ok: false }; }
-    // G0 (E-F2 m1): a verdict is recorded only while the stage is proving (a cap stop that already saved stopped records none)
-    if (store.state?.stage === 'proving') {
+    // G0 (E-F2 m1, G0-R1 I2): a verdict is recorded while proving; after a cap stop that already saved `stopped` (from proving) the
+    // verdict is recorded as failed with the final draft, so a resume starts from the AI-fixed draft and never passes
+    const st0 = store.state;
+    const stoppedFromProving = st0?.stage === 'stopped' && st0.interruptedAt === 'proving';
+    if (stoppedFromProving) v = { ...v, ok: false };
+    if (st0?.stage === 'proving' || stoppedFromProving) {
       let saved = false;
       best(() => { store.recordVerdict(v); saved = true; });
       // the draft couldn't be saved (a secret value in it, the state format, the disk): never a pass a resume could deliver

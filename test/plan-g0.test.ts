@@ -328,6 +328,7 @@ describe('G0 (F-2, F-3): planted items judged per job; coverage without a plante
     expect(pipeline(rr)?.detail).toContain(`semgrep didn't catch the planted ${PLANTED_ITEM_TEXT['sast-node']}`);
     expect(pipeline(rr)?.detail).not.toContain(`bandit didn't catch`);
     expect(pipeline(rr)?.detail).toMatch(/bullfrog/i);
+    expect(pipeline(rr)?.detail).not.toContain('no scanner of the pipeline ran');   // the refusal reports it, once (G0-R1 m1)
   });
 
   it('evaluate: service with no planted template → its sast/deps floor need not-proven with a plain reason', async () => {
@@ -382,7 +383,7 @@ describe('G0 (F-2, F-3): planted items judged per job; coverage without a plante
       needs: [needOf('secrets', { floor: true }), needOf('sast', { service: 'api', floor: true }), needOf('deps', { service: 'api', floor: true }), needOf('unit-tests', { service: 'api', floor: true }), needOf('dast', { service: 'api' }), needOf('gate', { floor: true })],
       steps: [spec('gitleaks', 'secrets'), spec('semgrep', 'sast', 'api'), spec('osv-scanner', 'deps', 'api'), spec('nuclei', 'dast', 'api')],
     });
-    const rn = await evaluate(n, [greenMain(n), plantedRuns(n)], ctxOf());
+    const rn = await evaluate(n, [greenMain(n), plantedRuns(n)], ctxOf({ plantedItems: items }));   // no image scan here: no image item (G0-R1 m1)
     expect(need(rn, 'dast')).toEqual([]);
     expect(pipeline(rn)?.detail).toMatch(/nuclei[^;]*not shown to catch anything/);
     expect(rn.ok).toBe(true);
@@ -482,5 +483,117 @@ describe('G0 (F-12, ruling F-F2): the AI estimate scales with the need keys', ()
     // a count that is not a whole positive number is never read as more than measured, and never fewer
     for (const bad of [Number.NaN, -3, Number.POSITIVE_INFINITY, 2.5]) expect(debateOf(row(one, bad)).input, String(bad)).toBeGreaterThanOrEqual(261_000);
     expect(debateOf(row(one, Number.POSITIVE_INFINITY)).input).toBe(261_000);
+  });
+});
+
+describe('G0 fix round 1 (ruling G0-R1)', () => {
+  it('I1: a blocking DAST need run by ZAP stays blocking: a note "not shown to catch anything", never warn-only, never a not-proven need', async () => {
+    const { evaluate } = await import('../src/proof/evaluate.js');
+    const { gateJobList } = await import('../src/engine/gate-job-list.js');
+    const { ctxOf: ctx0, greenMain, needOf, plantedRuns, spec, PLANTED_ITEMS } = await import('./helpers/proof-eval.js');
+    const ctxOf = () => ctx0({ plantedItems: PLANTED_ITEMS.filter((i) => i.category !== 'image-scan') });   // no image scan here (G0-R1 m1)
+    const d = draftOf({
+      needs: [needOf('secrets', { floor: true }), needOf('sast', { service: 'api', floor: true }), needOf('deps', { service: 'api', floor: true }), needOf('unit-tests', { service: 'api', floor: true }), needOf('dast', { service: 'api' }), needOf('gate', { floor: true })],
+      steps: [spec('gitleaks', 'secrets'), spec('semgrep', 'sast', 'api'), spec('osv-scanner', 'deps', 'api'), spec('zap-baseline', 'dast', 'api')],
+    });
+    expect(gateJobList(d).find((e) => e.needId === 'dast')?.blocking).toBe(true);
+    const r = await evaluate(d, [greenMain(d), plantedRuns(d)], ctxOf());
+    expect(r.parts.filter((p) => p.needId === 'dast')).toEqual([]);
+    const pipe = r.parts.find((p) => p.part === 'pipeline' && p.needId === undefined);
+    expect(pipe?.status).toBe('proven');
+    expect(pipe?.detail).toMatch(/dast--api \(ZAP\) has no planted item and its report format is not yet proven \(no -J fixture\), so it is not shown to catch anything; it stays blocking/);
+    expect(pipe?.detail).not.toMatch(/warn only/);
+    // blocking like any scanner: its result artifact on the main pull request is required
+    const m = greenMain(d);
+    for (const o of m.outcomes) for (const k of [...o.artifacts.keys()]) if (/dast/.test(k)) o.artifacts.delete(k);
+    const missing = await evaluate(d, [m, plantedRuns(d)], ctxOf());
+    expect(missing.parts.some((p) => p.status === 'failed' && p.needId === 'dast')).toBe(true);
+    expect(missing.ok).toBe(false);
+  });
+
+  it('I2: a cap stop after a fix saves the AI-fixed draft as a failed verdict; the resume starts from it', async () => {
+    // the stage is stopped (saveStopState) before prove returns: recordVerdict takes ok false there, with the draft
+    const store = await at('proving');
+    await proveThenClean(store, async () => { store.setStage('stopped', { stoppedBy: 'ai-cost' }); return { draft: FIXED, result: { ok: true }, cap: { kind: 'ai-cost' } }; }, cleaned);
+    const saved = store.load()!;
+    expect(saved).toMatchObject({ stage: 'stopped', interruptedAt: 'proving', stoppedBy: 'ai-cost', proofOk: false });
+    expect(saved.draft?.created).toEqual(FIXED.created);
+    expect(saved.draft?.created[0]?.aiEdited).toBe(true);
+    expect(nextStage(saved)).toBe('proving');
+    store.setStage('proving');   // the resume: proves again, from the fixed draft
+    // a stop saved before the proof returned, whose outcome reads as passing: still a failed verdict, with its draft kept
+    const late = await at('proving');
+    await proveThenClean(late, async () => { late.setStage('stopped', { stoppedBy: 'actions-minutes' }); return { draft: FIXED, result: { ok: true } }; }, cleaned);
+    expect(late.load()).toMatchObject({ stage: 'stopped', proofOk: false });
+    expect(late.load()?.draft?.created).toEqual(FIXED.created);
+    expect(store.load()?.draft?.created).toEqual(FIXED.created);
+    // directly: ok false with a draft at stopped-from-proving is saved; ok true there is refused; nothing passes
+    const s = await at('proving');
+    s.setStage('stopped', { stoppedBy: 'actions-minutes' });
+    s.recordVerdict({ ok: false, stopped: 'cap', draft: FIXED });
+    expect(s.load()).toMatchObject({ stage: 'stopped', proofOk: false, proofStopped: 'cap' });
+    expect(s.load()?.draft?.created).toEqual(FIXED.created);
+    expect(() => s.recordVerdict({ ok: true, draft: OTHER })).toThrow(StateError);
+    expect(s.load()?.draft?.created).toEqual(FIXED.created);
+    expect(() => s.setStage('proven')).toThrow(StateError);
+    // stopped reached from another stage, interrupted, cleaned: refused even for ok false
+    const early = await at('created');
+    early.setStage('stopped', { stoppedBy: 'ai-cost' });
+    expect(() => early.recordVerdict({ ok: false, draft: OTHER })).toThrow(StateError);
+    const intr = await at('proving');
+    intr.setStage('interrupted');
+    expect(() => intr.recordVerdict({ ok: false, draft: OTHER })).toThrow(StateError);
+    expect(intr.load()?.draft?.created).toEqual(PRE_FIX.created);
+  });
+
+  it('I3: assertBootstrapAllowed refuses PIPEGEN_BOOTSTRAP_PROOFS in a release build (for the check before consent)', async () => {
+    const { vi } = await import('vitest');
+    const { assertBootstrapAllowed, BootstrapProofsError } = await import('../src/engine/reviewed.js');
+    expect(() => assertBootstrapAllowed({})).not.toThrow();
+    expect(() => assertBootstrapAllowed({ PIPEGEN_BOOTSTRAP_PROOFS: '1' })).not.toThrow();
+    expect(() => assertBootstrapAllowed({ PIPEGEN_BOOTSTRAP_PROOFS: '0' })).not.toThrow();
+    vi.stubEnv('PIPEGEN_RELEASE', '1');
+    try {
+      for (const v of ['1', '0', 'yes']) expect(() => assertBootstrapAllowed({ PIPEGEN_BOOTSTRAP_PROOFS: v }), v).toThrow(BootstrapProofsError);
+      expect(() => assertBootstrapAllowed({})).not.toThrow();
+      expect(() => assertBootstrapAllowed({ PIPEGEN_BOOTSTRAP_PROOFS: '' })).not.toThrow();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    vi.stubEnv('NODE_ENV', 'production');
+    try {
+      expect(() => assertBootstrapAllowed({ PIPEGEN_BOOTSTRAP_PROOFS: '1' })).toThrow(/release/);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('m1: an expected planted item whose job is not a scanner of the draft is missed; one for a need the user skipped is not expected', async () => {
+    const { evaluate } = await import('../src/proof/evaluate.js');
+    const { ctxOf, greenMain, needOf, plantedRuns, spec, PLANTED_ITEMS } = await import('./helpers/proof-eval.js');
+    const d = draftOf();
+    const pipe = (r: Awaited<ReturnType<typeof evaluate>>) => r.parts.find((p) => p.part === 'pipeline' && p.needId === undefined);
+    // the review's probe: an item for a job the draft has no scanner for → failed, named
+    const ghost = { id: 'sast-ghost', category: 'sast', item: 'SQL query built from request input', file: 'ghost/pipegen-planted/x.js', needKey: 'sast--ghost' };
+    const r = await evaluate(d, [greenMain(d), plantedRuns(d)], ctxOf({ plantedItems: [...PLANTED_ITEMS, ghost] }));
+    expect(pipe(r)?.status).toBe('failed');
+    expect(pipe(r)?.detail).toMatch(/no scanner of the pipeline ran for the planted SQL query built from request input/);
+    // an image item while the draft has no image scan: missed too
+    const noImage = draftOf({
+      needs: [needOf('secrets', { floor: true }), needOf('sast', { service: 'api', floor: true }), needOf('deps', { service: 'api', floor: true }), needOf('gate', { floor: true })],
+      steps: [spec('gitleaks', 'secrets'), spec('semgrep', 'sast', 'api'), spec('osv-scanner', 'deps', 'api')],
+    });
+    const ri = await evaluate(noImage, [greenMain(noImage), plantedRuns(noImage)], ctxOf({ plantedItems: PLANTED_ITEMS, harnessJobs: ['egress-check', 'verify-lookup'] }));
+    expect(pipe(ri)?.detail).toMatch(/no scanner of the pipeline ran for the planted vulnerable base image/);
+    // the user skipped docker (--skip docker): the image item is not expected at all
+    const skipped = { ...noImage, skipped: [{ part: 'docker' as const, reason: 'no images' }] };
+    const rs = await evaluate(skipped, [greenMain(skipped), plantedRuns(skipped)], ctxOf({ plantedItems: PLANTED_ITEMS, harnessJobs: ['egress-check', 'verify-lookup'] }));
+    expect(pipe(rs)?.detail ?? '').not.toMatch(/vulnerable base image/);
+    expect(pipe(rs)?.status).toBe('proven');
+  });
+
+  it('m2: pushProofSetup\'s stop names a branch at a commit pipegen didn\'t build', () => {
+    const src = readFileSync(join(ROOT, 'src/proof/snapshot.ts'), 'utf8');
+    expect(src).toMatch(/still shows no branch after the base push, or the branch is at a commit pipegen didn't build/);
   });
 });

@@ -232,7 +232,8 @@ describe('minor findings', () => {
       needs: [needOf('secrets', { floor: true }), needOf('sast', { service: 'api', floor: true }), needOf('deps', { service: 'api', floor: true }), needOf('unit-tests', { service: 'api', floor: true }), needOf('dast', { service: 'api' }), needOf('gate', { floor: true })],
       steps: [spec('gitleaks', 'secrets'), spec('semgrep', 'sast', 'api'), spec('osv-scanner', 'deps', 'api'), spec('zap-baseline', 'dast', 'api')],
     });
-    const r = await evaluate(d, [greenMain(d), plantedRuns(d)], ctxOf());
+    // G0-R1 I1: ZAP is no longer a not-proven need; the not-proven dast need here is a carried note (E2's kind), as the m3 rule needs one
+    const r = await evaluate(d, [greenMain(d), plantedRuns(d)], ctxOf({ ...noImage(), harnessJobs: ['egress-check', 'app-start', 'verify-lookup'], carried: [{ part: 'pipeline', needId: 'dast', [MS]: [], reason: 'the app could not be started for DAST' }] as never }));
     expect(part(r, 'pipeline')?.status).toBe('proven');
     expect(part(r, 'pipeline')?.detail).toMatch(/not proven: .*dast/);
     expect(part(r, 'pipeline')?.detail).not.toMatch(/every blocking scanner/);
@@ -269,11 +270,12 @@ describe('minor findings', () => {
     expect(part(await evaluate(d, [x, plantedRuns(d)], ctxOf()), 'pipeline')?.status).toBe('failed');
   });
   it('m9: nuclei gets one not-proven entry for its need', async () => {
+    // name kept (Plan E); it now asserts (G0, F-3): no not-proven entry for its need, one note in the pipeline's detail
     const d = draftOf({
       needs: [needOf('secrets', { floor: true }), needOf('sast', { service: 'api', floor: true }), needOf('deps', { service: 'api', floor: true }), needOf('unit-tests', { service: 'api', floor: true }), needOf('dast', { service: 'api' }), needOf('gate', { floor: true })],
       steps: [spec('gitleaks', 'secrets'), spec('semgrep', 'sast', 'api'), spec('osv-scanner', 'deps', 'api'), spec('nuclei', 'dast', 'api')],
     });
-    const r = await evaluate(d, [greenMain(d), plantedRuns(d)], ctxOf());
+    const r = await evaluate(d, [greenMain(d), plantedRuns(d)], ctxOf(noImage()));
     // Plan G G0 (F-3): a blocking scanner with no planted item stays blocking and is shown in the pipeline's detail, once; it is
     // never a not-proven need entry (which would reach draft.notProven)
     expect(ent(r, 'pipeline', 'dast')).toHaveLength(0);

@@ -436,6 +436,7 @@ describe('planted', () => {
   });
 
   it('planted: a blocking floor scanner with no planted item is failed, a non-floor one is not-proven', async () => {
+    // name kept (Plan E); it now asserts (G0, F-3): floor sast/deps failed, a non-floor scanner a note that stays blocking
     const d = D();
     // no Plan F items at all: sast and deps (floor) are not shown to catch anything
     const r = await evaluate(d, both(d), ctxOf({ plantedItems: [] }));
@@ -452,27 +453,31 @@ describe('planted', () => {
   });
 
   it('evaluate: DAST on ZAP not-proven (warn) until the -J fixture exists', async () => {
+    // name kept (Plan E); it now asserts (G0-R1 I1, F-3): ZAP stays blocking, shown as a note, never warn-only or a not-proven need
     const d = draftOf({
       needs: [needOf('secrets', { floor: true }), needOf('sast', { service: 'api', floor: true }), needOf('deps', { service: 'api', floor: true }), needOf('unit-tests', { service: 'api', floor: true }), needOf('dast', { service: 'api' }), needOf('gate', { floor: true })],
       steps: [spec('gitleaks', 'secrets'), spec('semgrep', 'sast', 'api'), spec('osv-scanner', 'deps', 'api'), spec('zap-baseline', 'dast', 'api')],
     });
-    const r = await evaluate(d, both(d), ctxOf());
-    expect(need(r, 'pipeline', 'dast')).toMatchObject({ status: 'not-proven' });
-    expect(need(r, 'pipeline', 'dast')?.detail).toMatch(/ZAP/);
-    // it is warn-only: the pipeline is still proven and the proof is ok
+    const items = PLANTED_ITEMS.filter((i) => i.category !== 'image-scan');   // this draft has no image scan (G0-R1 m1)
+    const r = await evaluate(d, both(d), ctxOf({ plantedItems: items }));
+    expect(need(r, 'pipeline', 'dast')).toBeUndefined();
+    expect(part(r, 'pipeline')?.detail).toMatch(/\(ZAP\) has no planted item[^;]*not shown to catch anything; it stays blocking/);
+    expect(part(r, 'pipeline')?.detail).not.toMatch(/warn only/);
     expect(part(r, 'pipeline')?.status).toBe('proven');
     expect(r.ok).toBe(true);
-    // even with a planted dast item and a finding for it, ZAP stays not-proven
-    const withItem = await evaluate(d, both(d), ctxOf({ plantedItems: [...PLANTED_ITEMS, { id: 'dast-x', category: 'dast', item: 'x', file: 'pipegen-planted/dast.js' }] }));
-    expect(need(withItem, 'pipeline', 'dast')?.status).toBe('not-proven');
+    // even with a planted dast item: ZAP is no scanner pipegen reads planted items from, so the item is missed, never a pass
+    const withItem = await evaluate(d, both(d), ctxOf({ plantedItems: [...items, { id: 'dast-x', category: 'dast', item: 'x', file: 'pipegen-planted/dast.js', needKey: 'dast--api' }] }));
+    expect(need(withItem, 'pipeline', 'dast')).toBeUndefined();
+    expect(part(withItem, 'pipeline')?.status).toBe('failed');
   });
 
   it('evaluate: nuclei need without a planted item → not-proven note', async () => {
+    // name kept (Plan E); it now asserts (G0, F-3): a note in the pipeline's detail, never a not-proven need entry
     const d = draftOf({
       needs: [needOf('secrets', { floor: true }), needOf('sast', { service: 'api', floor: true }), needOf('deps', { service: 'api', floor: true }), needOf('unit-tests', { service: 'api', floor: true }), needOf('dast', { service: 'api' }), needOf('gate', { floor: true })],
       steps: [spec('gitleaks', 'secrets'), spec('semgrep', 'sast', 'api'), spec('osv-scanner', 'deps', 'api'), spec('nuclei', 'dast', 'api')],
     });
-    const r = await evaluate(d, both(d), ctxOf());
+    const r = await evaluate(d, both(d), ctxOf({ plantedItems: PLANTED_ITEMS.filter((i) => i.category !== 'image-scan') }));   // no image scan here (G0-R1 m1)
     // Plan G G0 (F-3): a note in the pipeline's detail (it stays blocking), never a not-proven need entry
     expect(need(r, 'pipeline', 'dast')).toBeUndefined();
     expect(part(r, 'pipeline')?.detail).toMatch(/nuclei.*no planted item/);

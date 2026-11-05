@@ -676,8 +676,8 @@ function pipelineMain(
   // each blocking need: its result artifact and its check in the report
   if (doc !== null || !read.ok) {
     for (const e of jobList) {
+      // a blocking ZAP need too (G0-R1 I1): its result and its gate check are required like any blocking scanner's
       if (!e.blocking || e.range === true || isExplained(e.job)) continue;
-      if (e.tool !== undefined && /^zap/.test(e.tool)) continue;
       if (e.artifact !== undefined) {
         // the artifact must come from the run of the job that produced it, a pipegen workflow run (never a compat copy's)
         const producers = hitsIn(prP, (n) => jobNameMatches(n, e.job)).map((h) => h.run);
@@ -695,15 +695,18 @@ function pipelineMain(
 
   compat(main, layers, ctx, sheet);
   for (const n of ctx.notCompared) sheet.note('pipeline', `not compared: ${st(n.workflow, 100)}/${st(n.job, 80)} (${st(n.why, 200)})`);
-  zapAndNuclei(draft, sheet, jobList);
+  zapAndNuclei(sheet, jobList);
   return doc;
 }
 
-function zapAndNuclei(draft: PipelineDraft, sheet: Sheet, jobList: readonly JobListEntry[]): void {
+/**
+ * Plan G G0 fix round 1 (ruling G0-R1, I1; F-3, Plan F S18): DAST on ZAP has no planted item and its report format has no real -J
+ * fixture yet. Like nuclei it stays blocking and is shown as a note: never warn-only, never a not-proven need (draft.notProven).
+ */
+function zapAndNuclei(sheet: Sheet, jobList: readonly JobListEntry[]): void {
   for (const e of jobList) {
-    if (e.tool !== undefined && /^zap/.test(e.tool)) sheet.notProven('pipeline', `${st(e.needId, 60)}: DAST on ZAP is not proven (warn only) until a real ZAP -J fixture exists`, { needId: e.needId });
+    if (e.tool !== undefined && /^zap/.test(e.tool)) sheet.note('pipeline', `${st(e.job, 80)} (ZAP) has no planted item and its report format is not yet proven (no -J fixture), so it is not shown to catch anything; it stays blocking`);
   }
-  void draft;
 }
 
 // ---------- compat copies ----------
@@ -751,6 +754,8 @@ function compat(main: VariantRuns, layers: Layers, ctx: EvalContext, sheet: Shee
 // ---------- the planted variant ----------
 
 const normFile = (s: string): string => s.replace(/[^\x20-\x7e]/g, '');
+/** The --skip part that switches off the check of a category (G0-R1 m1): a planted item of a skipped part is not expected. */
+const SKIP_PART_OF: Readonly<Record<string, string>> = Object.freeze({ 'image-build': 'docker', 'image-scan': 'docker', hooks: 'precommit', 'hooks-ci': 'precommit', 'unit-tests': 'tests', 'full-tests': 'tests', coverage: 'tests', 'deploy-verify': 'deploy' });
 function plantedChecks(
   draft: PipelineDraft, planted: VariantRuns, layers: Layers, ctx: EvalContext, sheet: Sheet, jobList: readonly JobListEntry[],
   scannerJobs: ReadonlyMap<string, string>, refusedIn: RefusedIn, refusedNote: (needId: string, hits: readonly Hit[]) => void,
@@ -813,6 +818,16 @@ function plantedChecks(
   // Plan F's items, each by its own job (needKey): that job's tool, and skipped only when that job was refused
   const keyless = items.filter((i) => keyOf(i) === undefined);
   if (keyless.length > 0) sheet.fail('pipeline', "a planted item names no check it belongs to, so pipegen can't tell which scanner must catch it");
+  // G0-R1 m1: an item whose job is no blocking scanner of the draft can't be caught: missed (never skipped silently), unless the
+  // user switched its part off (--skip), then it is not expected at all; an item of a refused job is reported by the refusal
+  const userSkipped = new Set<string>(draft.skipped.map((x) => x.part));
+  for (const i of items) {
+    const k = keyOf(i);
+    if (k === undefined || byJob.has(k) || refusedJobs.has(k)) continue;
+    const part = Object.hasOwn(SKIP_PART_OF, i.category) ? SKIP_PART_OF[i.category] : undefined;
+    if (part !== undefined && userSkipped.has(part)) continue;
+    sheet.fail('pipeline', `no scanner of the pipeline ran for the planted ${st(i.item, 120)}, so nothing is shown to catch it`, undefined, gateRun.handle.url);
+  }
   const wanted = items.filter((i) => { const k = keyOf(i); return k !== undefined && byJob.has(k) && !refusedJobs.has(k); });
   if (wanted.length > 0) {
     if (ctx.matchPlanted === undefined) sheet.fail('pipeline', 'planted items were given but no matcher, so no scanner is shown to catch its item');
@@ -866,7 +881,6 @@ function plantedChecks(
   for (const e of jobList) if (e.tool === 'nuclei' && !items.some((i) => keyOf(i) === e.job || i.category === e.category)) {
     sheet.note('pipeline', `${st(e.job, 80)} (nuclei) has no planted item yet (deferred), so it is not shown to catch anything; it stays blocking`);
   }
-  void draft;
 }
 
 // ---------- tests and coverage ----------

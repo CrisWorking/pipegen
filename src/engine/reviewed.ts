@@ -1325,6 +1325,14 @@ export function bootstrapProofs(env: Env = process.env): boolean {
   return v === '1';
 }
 
+/**
+ * G0-R1 I3: the early check of the switch (G13 calls it at run start, before consent): throws BootstrapProofsError in a release
+ * build when PIPEGEN_BOOTSTRAP_PROOFS is set to anything; otherwise returns without effect.
+ */
+export function assertBootstrapAllowed(env: Env = process.env): void {
+  bootstrapProofs(env);
+}
+
 /** BOOTSTRAP_PROOFS_NOTE when the bootstrap is on (bootstrapProofs; throws the same refusal in a release build), else null. */
 export function bootstrapProofsNote(env: Env = process.env): string | null {
   return bootstrapProofs(env) ? BOOTSTRAP_PROOFS_NOTE : null;

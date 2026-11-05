@@ -203,10 +203,12 @@ describe('messages and branches pinned by the mutation round', () => {
     const z = mk('zap-baseline');
     const m = greenMain(z);
     prRun(m).artifacts.delete(resultArtifactName('dast', 'api'));
-    const r = await evaluate(z, [m, plantedRuns(z)], ctxOf());
-    expect(r.parts.some((p) => p.status === 'failed' && p.needId === 'dast')).toBe(false);
+    const items = { plantedItems: (ctxOf().plantedItems ?? []).filter((i) => i.category !== 'image-scan') };   // no image scan here (G0-R1 m1)
+    // G0-R1 I1: a blocking ZAP need is no longer warn-only, so its missing result fails like any blocking scanner's
+    const r = await evaluate(z, [m, plantedRuns(z)], ctxOf(items));
+    expect(r.parts.some((p) => p.status === 'failed' && p.needId === 'dast')).toBe(true);
     const n = mk('nuclei');
-    const rn = await evaluate(n, [greenMain(n), plantedRuns(n)], ctxOf());
+    const rn = await evaluate(n, [greenMain(n), plantedRuns(n)], ctxOf(items));
     // Plan G G0 (F-3): shown in the pipeline's detail, never a not-proven need entry
     expect(rn.parts.some((p) => p.needId === 'dast' && p.status === 'not-proven')).toBe(false);
     expect(rn.parts.some((p) => p.part === 'pipeline' && p.needId === undefined && /nuclei[^;]*deferred/.test(p.detail))).toBe(true);

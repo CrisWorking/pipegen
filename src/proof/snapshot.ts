@@ -1187,7 +1187,7 @@ export async function pushProofSetup(input: ProofSetupInput, deps: ProofSetupDep
       notStopping();
       // Plan G G0 (E-F2 m3): set only to the commit pipegen built and just pushed
       defaultBranchState = await setScratchDefaultBranch(deps.gh, scratch, clock, base.sha);
-      if (defaultBranchState === 'pending') throw new ProofStopError(`${scratch.fullName} still shows no branch after the base push; check it on GitHub, then run pipegen again.`);
+      if (defaultBranchState === 'pending') throw new ProofStopError(`${scratch.fullName} still shows no branch after the base push, or the branch is at a commit pipegen didn't build (something else pushed to it); check it on GitHub, then run pipegen again.`);
     }
     notStopping();
     const disabled = await disableUserWorkflows(deps.gh, scratch, prepared.workflows, clock, warn);

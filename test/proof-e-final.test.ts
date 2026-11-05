@@ -97,14 +97,12 @@ describe('final review I-2: the saved stage follows the verdict, and the state h
       expect(saved, name).toMatchObject({ stage: 'stopped', interruptedAt: 'proving', stoppedBy: by, proofOk: false });
       expect(nextStage(saved!), name).toBe('proving');
     }
-    // a cap stop that already moved the stage (onCap → saveStopState) keeps it. Plan G G0 (E-F2 m1): recordVerdict is refused
-    // outside proving, so no verdict and no new draft are saved there; the resume proves again (from the saved draft)
+    // a cap stop that already moved the stage (onCap → saveStopState) keeps it; the verdict and draft are still saved
+    // (Plan G G0-R1 I2: recordVerdict takes a failed verdict at `stopped` reached from proving)
     const store = await proving();
     await proveThenClean(store, async () => { store.setStage('stopped', { stoppedBy: 'actions-minutes' }); return { draft: FIXED, result: { ok: false }, cap: { kind: 'actions-minutes' } }; }, cleaned);
-    expect(store.load()).toMatchObject({ stage: 'stopped', stoppedBy: 'actions-minutes' });
-    expect(store.load()?.proofOk).not.toBe(true);
-    expect(nextStage(store.load()!)).toBe('proving');
-    expect(store.load()?.draft?.created).toEqual(PRE_FIX.created);
+    expect(store.load()).toMatchObject({ stage: 'stopped', stoppedBy: 'actions-minutes', proofOk: false });
+    expect(store.load()?.draft?.created).toEqual(FIXED.created);
   });
 
   it('proofVerdict reads a FixOutcome; anything else is not a pass', () => {

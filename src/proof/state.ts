@@ -421,13 +421,19 @@ export class StateStore {
    * Final review I-2: the verdict of the proof that just ended and its final draft (CreatedFile.aiEdited kept), saved together
    * before the stage moves (proveThenClean). The draft is checked against the state format first, and the write refuses any
    * secret value (#write): a StateError, and nothing is written. Without a draft, the saved one stays and the verdict is
-   * not a pass. Plan G G0 (E-F2 m1): accepted only at the stage `proving`, the one moment proveThenClean (its only caller,
-   * test/plan-g0.test.ts scans src for it) records the proof that just ended; at any other stage (a proven or cleaned proof,
-   * stopped, interrupted, delivered) it is a StateError and nothing is written.
+   * not a pass. Plan G G0 (E-F2 m1, G0-R1 I2): accepted at the stage `proving`, the moment proveThenClean (its only caller,
+   * test/plan-g0.test.ts scans src for it) records the proof that just ended, and, for a verdict that is NOT a pass, at `stopped`
+   * reached from `proving` (a cap stop saved before the proof returned). Anywhere else (proven, cleaned, interrupted, delivered,
+   * stopped before the proof) it is a StateError and nothing is written.
    */
   recordVerdict(v: { ok: boolean; draft?: PipelineDraft; stopped?: string }): void {
-    const stage = this.#need().stage;
-    if (stage !== 'proving') throw new StateError(`pipegen records a proof's verdict only while it proves (the stage is ${stage}).`);
+    const cur = this.#need();
+    // G0-R1 I2: a cap stop saves `stopped` (from proving) before the proof returns; its FAILED verdict and its AI-fixed draft are
+    // still saved there, so a resume starts from that draft. A pass is accepted only at proving.
+    const stoppedFromProving = cur.stage === 'stopped' && cur.interruptedAt === 'proving';
+    if (cur.stage !== 'proving' && !(stoppedFromProving && v.ok !== true)) {
+      throw new StateError(`pipegen records a proof's verdict only while it proves, or a failed one when it stopped while proving (the stage is ${cur.stage}).`);
+    }
     let checked: PipelineDraft | undefined;
     if (v.draft !== undefined) {
       const parsed = draft.safeParse(structuredClone(v.draft));
