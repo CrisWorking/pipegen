@@ -5,13 +5,13 @@
 // - readOrgAdmin: null (unknown). planLocks then plans no org required workflow and says it couldn't check.
 // - readShaPinning: { state: 'unknown' }. planLocks then leaves the setting as it is and says so.
 // - readRepoId: null. planLocks then plans no org required workflow (GitHub's rule names repositories by id).
-// - readWriters: an error (listWriters'). Who can approve is never guessed.
+// - readWriters: an error (listWriters', or a list with nobody who can write). Who can approve is never guessed.
 // A rate stop is thrown, and so is a 401 on a client that sent a token (the token was rejected).
 import type { Octokit } from '@octokit/rest';
 import { isRateStop, withRateLimit, type RateClock } from '../engine/github-rate.js';
 import type { RepoProfile } from '../types.js';
 import { safeText } from '../util/safe-text.js';
-import { checkRepoNames, clockOf, githubTokenRejected, isAnonymousClient, isNoAnswer, listWriters } from './client.js';
+import { checkRepoNames, clockOf, GitHubAccessError, githubTokenRejected, isAnonymousClient, isNoAnswer, listWriters } from './client.js';
 
 /**
  * The repo's Actions setting "Require actions to be pinned to a full-length commit SHA" (GET /repos/{o}/{r}/actions/permissions):
@@ -90,7 +90,11 @@ export async function readRepoId(gh: Octokit, owner: string, repo: string, notes
  * effective permission). Throws listWriters' error when either list can't be read.
  */
 export async function readWriters(gh: Octokit, owner: string, app: string, central: string, clock: RateClock = clockOf(gh)): Promise<{ app: string[]; central: string[] }> {
+  // G8-R2 I1: an answer with nobody who can write (empty, or only bots and read-only users) is a stop, never "one writer"
+  const nobody = (repo: string) => new GitHubAccessError(`pipegen found nobody who can write to ${safeText(`${owner}/${repo}`, 140)} in GitHub's collaborator list (it held no user with write access), so it can't plan who approves changes. Check that the token can read the repo's collaborators, then run pipegen again.`);
   const a = await listWriters(gh, owner, app, clock);
+  if (a.length === 0) throw nobody(app);
   const c = await listWriters(gh, owner, central, clock);
+  if (c.length === 0) throw nobody(central);
   return { app: a, central: c };
 }

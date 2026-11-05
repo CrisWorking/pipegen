@@ -66,6 +66,21 @@ describe('G8 probes', () => {
     expect(await readWriters(g.gh, 'o', 'r', 'pipelines', clock())).toEqual({ app: ['alice', 'bob'], central: ['alice', 'dana'] });
     expect(g.calls.every((c) => c.url.searchParams.get('affiliation') === 'all')).toBe(true);
     // a list GitHub won't give is an error (the locks are never planned on a guess)
-    await expect(readWriters(gh({ [`GET ${API}/repos/o/r/collaborators`]: collab([]) }).gh, 'o', 'r', 'pipelines', clock())).rejects.toBeInstanceOf(GitHubAccessError);
+    await expect(readWriters(gh({ [`GET ${API}/repos/o/r/collaborators`]: collab([{ login: 'alice', admin: true }]) }).gh, 'o', 'r', 'pipelines', clock())).rejects.toBeInstanceOf(GitHubAccessError);
+    // G8-R2 I1: both lists answer, but one holds nobody who can write (empty, or bots and read-only users only): a stop with a plain reason,
+    // never a lock planned as if one person could write
+    const ok = collab([{ login: 'alice', admin: true }]);
+    for (const [what, appList, centralList] of [
+      ['empty app list', collab([]), ok], ['empty central list', ok, collab([])],
+      ['bots only', collab([{ login: 'ci', push: true, type: 'Bot' }]), ok], ['read-only users only', ok, collab([{ login: 'carol' }])],
+    ] as const) {
+      const g2 = gh({ [`GET ${API}/repos/o/r/collaborators`]: appList, [`GET ${API}/repos/o/pipelines/collaborators`]: centralList });
+      const e = await readWriters(g2.gh, 'o', 'r', 'pipelines', clock()).catch((x: unknown) => x);
+      expect(e, what).toBeInstanceOf(GitHubAccessError);
+      expect((e as Error).message, what).toMatch(/found nobody who can write/);
+      // both repos were asked: the stop comes from the empty answer, not from an unrouted 404
+      expect(g2.calls.every((c) => c.url.pathname.endsWith('/collaborators')), what).toBe(true);
+      expect(g2.calls.length, what).toBe(appList === ok ? 2 : 1);
+    }
   });
 });

@@ -48,7 +48,7 @@ export interface CreatedInputs {
   codeownersFacts?: Partial<Record<'app' | 'central', { isSymlink: boolean; inserted: string | null }>>;
   /**
    * G8 (D1-r2): the central repo's file list (repo-relative paths), for the central CODEOWNERS re-run check: a rule after pipegen's block that
-   * names one of these files and takes it back from the block is refused. Absent: the central files of this delivery only.
+   * names one of these files and takes it back from the block is refused. Required for a central re-run (G8-R2 m3): without it that file is refused.
    */
   centralFiles?: readonly string[];
   /** D7: the package.json `type` of each service ('module' or 'commonjs'; same keys). A missing service is read as commonjs, which checks a .js file both ways. */

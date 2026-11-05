@@ -46,7 +46,7 @@ import { createdFileProblems, duplicatePathProblems, type CreatedInputs, type Cr
 import {
   ACTION_PATH_RE, CALLER_WORKFLOW, checkExpressions, createdPathProblem, checkJobOrder, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, gateResultUploadProblems, IF_VALUES,
   CALLER_TRIGGERS, IMAGE_ARCHIVE_STEP_ID, IMAGE_BUILD_NEED, imageBuildJobId, imageBuildSlugOf, imageCheckStepId, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, LOCAL_MERGE_WORKFLOW, narrowingChoiceProblem, NIGHTLY_CONCURRENCY, NIGHTLY_WORKFLOW, PR_CHECK_IF, PR_CHECK_JOB,
-  PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, renderRangeFetchStep, SECRET_REF_RE, SIGN_STEP_ID_RE, BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, DAST_HANDOFF_STEP_ID, dastAppStepId, dastCheckStepId, dastRunJobId, dastRunSlugOf, DAST_CHECK_ID_RE, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, BASELINE_STEP_IFS,
+  PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, REQUIRED_JOB, REQUIRED_NAME, requiredWorkflowForm, renderRangeFetchStep, SECRET_REF_RE, SIGN_STEP_ID_RE, BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, DAST_HANDOFF_STEP_ID, dastAppStepId, dastCheckStepId, dastRunJobId, dastRunSlugOf, DAST_CHECK_ID_RE, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, BASELINE_STEP_IFS,
   STEP_KEYS as STEP_KEY_LIST, WORKFLOW_CONCURRENCY, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact,
 } from './job-rules.js';
 import { signingMode } from '../github/signing-mode.js';
@@ -762,6 +762,8 @@ const GATE_JOB_NAME = GATE_CHECK_NAME.split(' / ')[1] as string;
 /** How deep the layout rules follow reusable-workflow calls; a deeper chain is read as holding what they look for (fail closed). */
 const MAX_CALL_DEPTH = 10;
 
+/** The merge caller job of pipegen.yml: the first half of GATE_CHECK_NAME (job `pipegen`, name `pipegen`). */
+const MERGE_CALLER_ID = GATE_CHECK_NAME.split(' / ')[0] as string;
 const isCallerFile = (fc: FileCtx): boolean => fc.file.repo === 'app' && fc.file.path === CALLER_WORKFLOW;
 /** G8: the project's central org required workflow (`<name>--required.yml`). */
 const isRequiredFile = (fc: FileCtx): boolean => fc.file.repo === 'central' && typeof fc.draft.profile.repo === 'string' && fc.file.path === centralWorkflowFile(fc.draft.profile.repo, 'required');
@@ -906,11 +908,13 @@ function judgeTriggerSet(fc: FileCtx, js: Obj, triggers: readonly string[] | nul
   if (isRequiredFile(fc)) {
     // G8: the org required workflow, in its one form (requiredWorkflow, src/layers/locks.ts): pull_request (bare) only, one job that calls the
     // project's central merge workflow at the recorded commit; GitHub runs it from the central repo, so it holds nothing else
+    // (review m1) the whole file deep-equals requiredWorkflowForm built from pipegen.yml's merge caller judged in the same call
     const pin = centralOf(fc.draft);
-    const jobs = isObj(js.jobs) ? Object.values(js.jobs) : [];
     const want = pin === null ? null : `${centralWorkflowPath(pin.repo, fc.draft.profile.repo)}@${pin.sha}`;
-    const ok = isObj(on) && Object.keys(on).length === 1 && on.pull_request === null && jobs.length === 1 && isObj(jobs[0]) && want !== null && jobs[0].uses === want;
-    if (!ok) bad(`The org required workflow runs only on pull_request (with no filter) and holds one job, the caller of the project's central merge workflow at the recorded commit, nothing else.`);
+    const callerJobs = fc.others.get(`app:${CALLER_WORKFLOW}`)?.js.jobs;
+    const caller = isObj(callerJobs) ? callerJobs[MERGE_CALLER_ID] : undefined;
+    const ok = want !== null && isObj(caller) && caller.uses === want && isDeepStrictEqual(js, requiredWorkflowForm(want, { permissions: caller.permissions, secrets: caller.secrets }));
+    if (!ok) bad(`The org required workflow runs only on pull_request (with no filter) and holds one job, ${REQUIRED_JOB} named ${REQUIRED_NAME}, that calls the project's central merge workflow at the recorded commit with exactly the permissions and secrets of the merge caller in ${CALLER_WORKFLOW} (judged in the same call), nothing else.`);
     return;
   }
   if (!app || fc.file.path === LOCAL_MERGE_WORKFLOW || triggers.includes('workflow_call')) {

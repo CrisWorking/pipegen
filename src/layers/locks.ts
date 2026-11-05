@@ -30,7 +30,7 @@
 import { Document, parse } from 'yaml';
 import { centralProjectName, centralWorkflowFile } from '../engine/central-path.js';
 import { CENTRAL_PROTECTED_PATHS, codeownersBlock, codeownersFile, codeownersOwnerProblem, codeownersReplace } from '../engine/created-builders.js';
-import { CALLER_WORKFLOW } from '../engine/job-rules.js';
+import { CALLER_WORKFLOW, REQUIRED_JOB, requiredWorkflowForm } from '../engine/job-rules.js';
 import { COMMIT_SHA_RE, isGitHubRepo } from '../engine/names.js';
 import type { ShaPinningRead } from '../github/lock-probes.js';
 import { GATE_CHECK_INTEGRATION_ID, GATE_CHECK_NAME, type Capabilities, type CreatedFile, type InstallRecord, type RepoProfile } from '../types.js';
@@ -48,9 +48,8 @@ export const REVIEWS_RULESET = 'pipegen-reviews';
 export const CENTRAL_RULESET = 'pipegen';
 /** The org ruleset that requires the project's central required workflow. */
 export const requiredRulesetName = (project: string): string => `pipegen-required--${centralProjectName(project)}`;
-/** The job of the required workflow: named apart from the gate's check (its own check is `pipegen required / gate`). */
-export const REQUIRED_JOB = 'pipegen-required';
-const REQUIRED_NAME = 'pipegen required';
+/** The job of the required workflow (job-rules.ts, the one form the referee compares with): named apart from the gate's check. */
+export { REQUIRED_JOB };
 /** GitHub's name for the default branch in a ruleset condition: the rule follows a renamed default branch. */
 const DEFAULT_BRANCH = '~DEFAULT_BRANCH';
 const CO_PLACES: readonly string[] = ['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS'];
@@ -60,7 +59,10 @@ const MARKER_RE = /pipegen:(?:begin|end)/;
 
 /** One GitHub API call: `gh.request(\`${method} ${route}\`, { ...params, ...body })`. */
 export interface ApiRequest { method: 'POST' | 'PUT'; route: string; params: Readonly<Record<string, string>>; body: Record<string, unknown> }
-/** An existing CODEOWNERS file's text (`original`, '' when there is none), whether it is a symbolic link, and the block the install record owns in it. */
+/**
+ * An existing CODEOWNERS file's text (`original`, '' when there is none), whether it is a symbolic link or anything but a regular file
+ * (`isSymlink`), and the block the install record owns in it.
+ */
 export interface ExistingCodeowners { original: string; isSymlink: boolean; inserted: string | null }
 export type CodeownersEdit = InstallRecord['edits'][number];
 
@@ -158,7 +160,8 @@ function codeownersPlan(repo: CreatedFile['repo'], found: string | null, existin
   if (found === null && existing.original !== '') throw new LockError(`${where} has no CODEOWNERS file, but an original text was given.`);
   const path = found ?? NEW_CODEOWNERS;
   if (existing.isSymlink) {
-    notes.push(`The CODEOWNERS file of ${where} (${path}) is a symbolic link, which pipegen won't write through, so it adds no code owners there. Replace the link with a plain file and run pipegen again.`);
+    // G8-R2 m6: no block, so no code-owner rule on this repo either (planLocks), and the note names the risk that leaves
+    notes.push(`The CODEOWNERS file of ${where} (${path}) is a symbolic link or not a plain file, which pipegen won't write through, so it adds no code owners there and sets no code-owner review: one approval from any writer then lets a pull request change the pipeline files, even add a job that reports under the gate's name (${GATE_CHECK_NAME}). Replace it with a plain file and run pipegen again.`);
     return undefined;
   }
   let block: string;
@@ -195,10 +198,7 @@ function requiredWorkflow(i: LockInputs, ids: { app: number; central: number }):
   }
   const path = centralWorkflowFile(p.repo, 'required');
   const doc = new Document();
-  doc.contents = doc.createNode({
-    name: REQUIRED_NAME, on: { pull_request: null }, permissions: {},
-    jobs: { [REQUIRED_JOB]: { name: REQUIRED_NAME, uses, permissions: caller.permissions, ...(caller.secrets === undefined ? {} : { secrets: caller.secrets }) } },
-  });
+  doc.contents = doc.createNode(requiredWorkflowForm(uses, { permissions: caller.permissions, secrets: caller.secrets }));
   doc.commentBefore = ` pipegen: the org required workflow of ${p.repo}; GitHub runs it from this repo on every pull request to the default branch, so a pull request can't change it. It calls the merge workflow at the same commit: every check and the gate run again on their own results. Written by pipegen.`;
   const file: CreatedFile = { path, content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: 'The org required workflow: the checks and the gate, run from the central repo on every pull request.', repo: 'central' };
   const rule: ApiRequest = {
@@ -240,6 +240,10 @@ export function planLocks(i: LockInputs): LockPlan {
   }
   const appW = loginSet(i.writers.app, app);
   const centralW = loginSet(i.writers.central, centralName);
+  // G8-R2 I1: nobody who can write is a probe anomaly (an App token, a hidden list), never a one-person repo: stop, never a weaker lock
+  for (const [set, where] of [[appW, app], [centralW, centralName]] as const) {
+    if (set.size === 0) throw new LockError(`pipegen found nobody who can write to ${show(where)}, so it can't plan who approves changes. Check that the token can read the repo's collaborators, then run pipegen again.`);
+  }
   for (const o of owners) {
     const login = o.slice(1).toLowerCase();
     if (!appW.has(login)) throw new LockError(`${show(o)} can't write to ${show(app)}, so GitHub would ignore their approval as a code owner. Pick code owners who can write to both ${show(app)} and ${show(centralName)}.`);
@@ -261,12 +265,30 @@ export function planLocks(i: LockInputs): LockPlan {
     notes.push(`Only one person can write to ${show(app)}, so pull requests need no approval: the required check must still pass, but whoever merges can also change the pipeline that judges them, and pipegen can't prevent that on a one-person repo. Run \`npx pipegen verify\` to see whether the pipeline still matches what pipegen set up.`);
   }
   if (owners.length === 0 && (writers < 2 || qualified >= 2)) notes.push('No code owner was picked, so pipegen writes no CODEOWNERS block.');
+  // G8-R2 m5: a block an earlier run wrote is left as it is (the gate still reads its owners); say so
+  if (!blocks) {
+    for (const [where, ex] of [[app, i.appCodeowners], [centralName, i.central.codeowners]] as const) {
+      if (typeof ex.inserted === 'string' && ex.inserted !== '') notes.push(`The CODEOWNERS block pipegen wrote before in ${show(where)} stays as it is, with its old code owners, and the gate still reads it: pipegen doesn't change it while fewer than two people can be code owners. Remove it by hand if those owners shouldn't approve pipeline changes anymore.`);
+    }
+  }
 
-  // 2. the app's locks
-  const appParams = { owner: p.owner, repo: p.repo };
-  const appReviews: Reviews = { approvals: writers >= 2 ? 1 : 0, codeOwners: codeOwnerRule, lastPush: writers >= 2 };
   const plan: LockPlan = { owners: { app: blocks ? owners : [], central: blocks ? owners : [] }, writers: { app: [...i.writers.app], central: [...i.writers.central] }, notes };
-  if (i.caps.branchProtection === true) {
+
+  // 2. CODEOWNERS (D0b builders; the judges re-check them). A repo whose block can't be written gets no code-owner rule (G8-R2 m6)
+  if (blocks) {
+    plan.codeOwners = { owners, writers };
+    const appCo = codeownersPlan('app', p.repoFiles.codeowners, i.appCodeowners, i.protectedPaths, owners, show(app), notes);
+    if (appCo !== undefined) plan.codeowners = appCo;
+    const cCo = codeownersPlan('central', i.central.codeowners.path, i.central.codeowners, CENTRAL_PROTECTED_PATHS, owners, show(centralName), notes);
+    if (cCo !== undefined) plan.centralCodeowners = cCo;
+  }
+
+  // 3. the app's locks. An unknown plan whose branch rules weren't confirmed (G8-R2 m2): planned anyway; finish re-probes and reports a refused write
+  const unconfirmed = (offered: boolean): boolean => offered !== true && p.plan === 'unknown';
+  const appParams = { owner: p.owner, repo: p.repo };
+  const appReviews: Reviews = { approvals: writers >= 2 ? 1 : 0, codeOwners: codeOwnerRule && plan.codeowners !== undefined, lastPush: writers >= 2 };
+  if (unconfirmed(i.caps.branchProtection)) notes.push(`pipegen couldn't confirm that GitHub offers branch rules on ${show(app)} (your plan isn't known), so it plans the locks anyway: \`finish\` checks again and tells you if GitHub refuses them.`);
+  if (i.caps.branchProtection === true || unconfirmed(i.caps.branchProtection)) {
     plan.rulesets = {
       gate: ruleset(appParams, GATE_RULESET, [...NO_DELETE, gateCheckRule()]),
       reviews: ruleset(appParams, REVIEWS_RULESET, [prRule(appReviews)]),
@@ -278,21 +300,13 @@ export function planLocks(i: LockInputs): LockPlan {
       : `GitHub didn't offer branch rules on ${show(app)}, so pipegen can't lock merges there. Checks still run and show as failed, but nothing stops a merge.`);
   }
 
-  // 3. the central repo's locks: its own writers set the approvals; the code-owner rule follows the owners
+  // 4. the central repo's locks: its own writers set the approvals; the code-owner rule follows the owners and its own block
   const centralCount = centralW.size;
-  const centralReviews: Reviews = { approvals: centralCount >= 2 ? 1 : 0, codeOwners: codeOwnerRule, lastPush: centralCount >= 2 };
-  if (i.central.branchProtection === true) plan.centralRuleset = ruleset({ owner: p.owner, repo: centralRepo }, CENTRAL_RULESET, [...NO_DELETE, prRule(centralReviews)]);
+  const centralReviews: Reviews = { approvals: centralCount >= 2 ? 1 : 0, codeOwners: codeOwnerRule && plan.centralCodeowners !== undefined, lastPush: centralCount >= 2 };
+  if (unconfirmed(i.central.branchProtection)) notes.push(`pipegen couldn't confirm that GitHub offers branch rules on ${show(centralName)} (your plan isn't known), so it plans its lock anyway: \`finish\` checks again and tells you if GitHub refuses it.`);
+  if (i.central.branchProtection === true || unconfirmed(i.central.branchProtection)) plan.centralRuleset = ruleset({ owner: p.owner, repo: centralRepo }, CENTRAL_RULESET, [...NO_DELETE, prRule(centralReviews)]);
   else notes.push(`Your GitHub plan can't lock merges on the private ${show(centralName)} repo, which holds the central workflows and the install records, so pipegen can't require a review there. GitHub Pro (personal) or Team (organisation) adds the real lock.`);
   if (centralCount >= 2 && !codeOwnerRule && writers < 2) notes.push(`${centralCount} people can write to ${show(centralName)}: a change there needs an approval from another of them, without code-owner review (one code owner couldn't approve their own pull request).`);
-
-  // 4. CODEOWNERS (D0b builders; the judges re-check them)
-  if (blocks) {
-    plan.codeOwners = { owners, writers };
-    const appCo = codeownersPlan('app', p.repoFiles.codeowners, i.appCodeowners, i.protectedPaths, owners, show(app), notes);
-    if (appCo !== undefined) plan.codeowners = appCo;
-    const cCo = codeownersPlan('central', i.central.codeowners.path, i.central.codeowners, CENTRAL_PROTECTED_PATHS, owners, show(centralName), notes);
-    if (cCo !== undefined) plan.centralCodeowners = cCo;
-  }
 
   // 5. the org required workflow: a private app of a Team or Enterprise organisation, planned by one of its owners
   const allowed = p.private === true && p.ownerType === 'Organization' && (p.plan === 'team' || p.plan === 'enterprise');
@@ -300,7 +314,12 @@ export function planLocks(i: LockInputs): LockPlan {
   else if (i.orgAdmin === null) notes.push('pipegen couldn\'t check whether you\'re an owner of the organisation, so it plans no org required workflow (the checks and the gate run from the central repo); the code-owner review is the guard.');
   else if (i.orgAdmin !== true) notes.push('Only an owner of the organisation can add an org required workflow (the checks and the gate run from the central repo), so pipegen plans none; an owner can run pipegen again to add it.');
   else if (i.ids === undefined || !Number.isSafeInteger(i.ids.app) || !Number.isSafeInteger(i.ids.central) || i.ids.app <= 0 || i.ids.central <= 0) notes.push('pipegen couldn\'t read the repository ids GitHub\'s org rule names, so it plans no org required workflow this time; run pipegen again to add it.');
-  else plan.orgRequiredWorkflow = requiredWorkflow(i, i.ids);
+  else {
+    plan.orgRequiredWorkflow = requiredWorkflow(i, i.ids);
+    // G8-R2 I2: GitHub starts it only when a pull request is opened or pushed to, so an approval doesn't re-run its gate; m7: its minutes
+    notes.push('With the org required workflow, a pull request that changes the pipeline files needs one more step: after a code owner approves, re-run the `pipegen required` run on that pull request (GitHub starts it only when the pull request is opened or pushed to, so the approval alone doesn\'t re-run its gate).');
+    notes.push('The org required workflow runs every check again on each pull request, so it roughly doubles the Actions minutes each pull request uses on this private repo.');
+  }
 
   // 6. sha pinning (S10): where the read answered, the user's own workflows pin by sha, and the other values are known
   const SETTING = '"Require actions to be pinned to a full-length commit SHA"';

@@ -74,8 +74,9 @@ function alignedCandidates(pattern: string, protectedPaths: readonly string[]): 
  * The user rules AFTER pipegen's block (`after` is the text following it) that own a protected path differently from the block's owners:
  * the last matching rule wins, so such a rule silently takes the path back. Each rule line is tried on the concrete paths its pattern names
  * (the pattern itself, something under it, and at depth for a slashless name); a path counts when the gate treats it as protected and the
- * owners it reads, with the block in front of the rule, are not exactly `owners`. `names` are real file paths that must stay owned (pipegen's own
- * workflow, PIPEGEN.md, the created files, the workflows that exist): a rule, bare names included, that owns one of them is listed too. Returns the rule lines (for the refusal and for Plan G's note).
+ * owners it reads, with the block in front of the rule, are not exactly `owners`. `names` are real file paths the block owns (ownedNames: in the app,
+ * pipegen's caller workflow, the plain protected paths, the created files and the existing workflows that are protected; in the central repo, its own
+ * files): a rule, bare names included, that owns one of them differently is listed too. Returns the rule lines (for the refusal and for Plan G's note).
  */
 export function codeownersLaterOverrides(after: string, protectedPaths: readonly string[], owners: readonly string[], names: readonly string[] = []): string[] {
   if (after.trim() === '') return [];
@@ -121,7 +122,7 @@ export function codeownersSemanticProblems(text: string, protectedPaths: readonl
  * D1-r2: the real files of `repo` that the block owns, for the re-run check of the rules after it. Only names the block owns count (a rule that
  * assigns PIPEGEN.md, a created Dockerfile or a source folder takes nothing from it). The app: pipegen's caller workflow, the protected paths
  * that are plain names, the created app files, the existing workflows. The central repo: its own files only (the central created files of this
- * delivery and, when given, the central repo's file list), never the app's.
+ * delivery and the central repo's file list, which a central re-run requires), never the app's.
  */
 function ownedNames(repo: 'app' | 'central', paths: readonly string[], ctx: CreatedCtx): string[] {
   const owned = protectedMatcher(paths);
@@ -174,6 +175,8 @@ function judge(repo: 'app' | 'central') {
       const replaced = typeof ins === 'string' && ins.startsWith(`${CODEOWNERS_BEGIN}\n`) && ins.endsWith(`${CODEOWNERS_END}\n`) ? codeownersReplace(original, ins, block) : null;
       if (typeof ins !== 'string' || replaced === null || MARKER_RE.test(original.replace(ins, ''))) return ['the original CODEOWNERS already holds a pipegen:begin or pipegen:end marker that the install record does not own as one whole block; a second block would be ambiguous'];
       expected = replaced;
+      // G8-R2 m3: the central re-run is checked against the central repo's own file list, which must be given (never a shorter list)
+      if (repo === 'central' && ctx.inputs.centralFiles === undefined) return ['the central repository\'s file list was not given to the referee, so a re-run of the central CODEOWNERS can not be checked against the files its block owns'];
       const at = expected.indexOf(block);
       if (at >= 0) {
         const later = codeownersLaterOverrides(expected.slice(at + block.length), paths, co.owners, ownedNames(repo, paths, ctx));

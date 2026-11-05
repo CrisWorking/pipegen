@@ -106,7 +106,7 @@ describe('G8: merge locks, central locks, required workflow, CODEOWNERS', () => 
     expect(note).toContain('o/pipelines');
     expect(note).toMatch(/3 people can write/);
     // nobody qualifies with the app's two writers either
-    expect(prRule(planLocks(inputs({ writers: { app: ['alice', 'bob'], central: [] }, owners: [] })).rulesets?.reviews).require_code_owner_review).toBe(false);
+    expect(prRule(planLocks(inputs({ writers: { app: ['alice', 'bob'], central: ['carol'] }, owners: [] })).rulesets?.reviews).require_code_owner_review).toBe(false);
     // two qualify: the user must pick both (one owner could not approve their own pull request)
     expect(() => planLocks(inputs({ owners: ['@alice'] }))).toThrow(LockError);
     expect(() => planLocks(inputs({ owners: ['@alice'] }))).toThrow(/at least two/);
@@ -132,7 +132,7 @@ describe('G8: merge locks, central locks, required workflow, CODEOWNERS', () => 
       ['two writers, two owners', {}],
       ['one writer', { writers: { app: ['alice'], central: ['alice'] }, owners: ['@alice'] }],
       ['three writers, one qualified owner', { writers: { app: ['alice', 'bob', 'carol'], central: ['alice'] }, owners: ['@alice'] }],
-      ['no owner qualifies', { writers: { app: ['alice', 'bob'], central: [] }, owners: [] }],
+      ['no owner qualifies', { writers: { app: ['alice', 'bob'], central: ['carol'] }, owners: [] }],
       ['solo app, two central writers', { writers: { app: ['alice'], central: ['alice', 'bob'] }, owners: ['@alice'] }],
       ['org admin, required workflow', { orgAdmin: true, ids: { app: 1, central: 2 }, files: a.files }],
       ['public app', { profile: profileOf([node()], { ownerType: 'Organization', plan: 'team' }) }],
@@ -434,12 +434,108 @@ describe('G8: merge locks, central locks, required workflow, CODEOWNERS', () => 
       const f: CreatedFile = { path: '.github/CODEOWNERS', content: codeownersReplace(original, cOLD, cblock) as string, part: 'codeowners', reason: 't', repo: 'central', edited: { original } };
       return codeownersCentralJudge(f, { draft: d, files, ...envOf({ codeownersFacts: facts('central', cOLD), centralCodeowners: '.github/CODEOWNERS', ...(centralTree === undefined ? {} : { centralFiles: centralTree }) }) }).join(' | ');
     };
-    expect(centralRun('r--merge.yml @dev')).toMatch(/after the pipegen block/);
+    expect(centralRun('r--merge.yml @dev', centralFiles, [])).toMatch(/after the pipegen block/);
+    // G8-R2 m3: a central re-run needs the central repo's file list; without it the file is refused, never judged on a shorter list
+    expect(centralRun('README.md @docs')).toMatch(/central repository's file list/);
+    expect(centralRun('README.md @docs', centralFiles, ['README.md'])).toBe('');
     expect(centralRun('other--nightly.yml @dev', [], ['.github/workflows/other--nightly.yml', 'installs/other.json', 'README.md'])).toMatch(/after the pipegen block/);
     expect(centralRun('other.json @dev', [], ['installs/other.json'])).toMatch(/after the pipegen block/);
     // the app's names mean nothing in the central repo: an app workflow's or PIPEGEN.md's name there is not refused
     // (the app's own delivered files, judged in the same referee call, are not the central repo's)
     const withApp: CreatedFile[] = [...centralFiles, { path: '.github/workflows/pipegen.yml', content: 'x', part: 'pipeline', reason: 't', repo: 'app' }];
     for (const line of ['pipegen.yml @dev', 'PIPEGEN.md @docs', 'README.md @docs']) expect(centralRun(line, withApp, ['README.md']), line).toBe('');
+  });
+
+  describe('G8 fix round 1 (controller ruling G8-R2)', () => {
+    it('I1: an empty writer list (either repo) stops with a plain reason, never a weaker lock or a one-writer note', () => {
+      for (const writers of [{ app: [], central: ['alice'] }, { app: ['alice'], central: [] }, { app: [], central: [] }]) {
+        expect(() => planLocks(inputs({ writers, owners: [] })), JSON.stringify(writers)).toThrow(LockError);
+        expect(() => planLocks(inputs({ writers, owners: [] })), JSON.stringify(writers)).toThrow(/found nobody who can write/);
+      }
+    });
+
+    it('I2 + m7: a planned org required workflow comes with the re-run note and the minutes note', () => {
+      const { a } = assembledPrivate();
+      const plan = planLocks(inputs({ orgAdmin: true, ids: { app: 11, central: 22 }, files: a.files }));
+      expect(plan.orgRequiredWorkflow).toBeDefined();
+      const note = plan.notes.join('\n');
+      expect(note).toMatch(/after a code owner approves/);
+      expect(note).toContain('re-run the `pipegen required` run');
+      expect(note).toMatch(/roughly doubles/);
+      expect(note).toMatch(/minutes/);
+      // without it, neither note
+      const none = planLocks(inputs()).notes.join('\n');
+      expect(none).not.toMatch(/roughly doubles|re-run the `pipegen required`/);
+    });
+
+    it('m1: the referee holds the required workflow to its exact form (with, needs, the name pipegen, missing or other secrets, other permissions refused)', async () => {
+      const { a } = assembledPrivate();
+      const lp = planLocks(inputs({ orgAdmin: true, ids: { app: 11, central: 22 }, files: a.files }));
+      const rf = lp.orgRequiredWorkflow?.file as CreatedFile;
+      const JD = { platform: p, reviewed: REVIEWED, linters: LINTERS, [['gh', 'Tok' + 'en'].join('')]: null, refereeDeps: { runLinters: async () => [] } } as unknown as Parameters<typeof judgeAssembled>[1];
+      const SEC_KEY = ['sec', 'rets'].join('');
+      const MAPPING_BLOCK = new RegExp(`\\n {4}${SEC_KEY}:\\n(?: {6}.*\\n)+`);
+      expect(rf.content).toMatch(MAPPING_BLOCK);
+      const job = '  pipegen-required:\n';
+      for (const [what, content] of [
+        ['a literal with', rf.content.replace(job, `${job}    with:\n      mode: none\n`)],
+        ['needs', rf.content.replace(job, `${job}    needs: [x]\n`)],
+        ['named pipegen', rf.content.replace('    name: pipegen required\n', '    name: pipegen\n')],
+        ['no secrets', rf.content.replace(MAPPING_BLOCK, '\n')],
+        ['another secret', rf.content.replace(new RegExp(`(\\n {4}${SEC_KEY}:\\n)`), `$1      OTHER: \${{ ${SEC_KEY}.OTHER }}\n`)],
+        ['fewer permissions', rf.content.replace('      actions: read\n', '')],
+        ['a run-name', rf.content.replace('on:\n', 'run-name: x\non:\n')],
+      ] as const) {
+        expect(content, what).not.toBe(rf.content);
+        expect(shown(await judgeAssembled(a, { ...JD, extra: [{ ...rf, content }] })), what).toMatch(/org required workflow/);
+      }
+      // without the app's pipegen.yml in the same call there is nothing to compare with: refused
+      const { judge } = await import('./helpers/assemble.js');
+      const central = a.files.filter((f) => f.repo === 'central');
+      expect(shown(await judge([...central, rf], (await import('./helpers/assemble.js')).planned(orgPriv(), { over: { centralPin: { repo: 'o/pipelines', sha: SHA } } }).draft))).toMatch(/org required workflow/);
+    });
+
+    it('m2: an unknown plan and branch rules not confirmed → the locks are planned anyway (finish re-probes), never "no lock"', () => {
+      const plan = planLocks(inputs({ profile: orgPriv({ plan: 'unknown' }), caps: { ...CAPS, branchProtection: false }, central: { repo: 'o/pipelines', sha: SHA, branchProtection: false, codeowners: noCo } }));
+      expect(plan.rulesets?.gate).toBeDefined();
+      expect(plan.classic).toBeDefined();
+      expect(plan.centralRuleset).toBeDefined();
+      const note = plan.notes.join('\n');
+      expect(note).toMatch(/couldn't confirm/);
+      expect(note).not.toMatch(/can't lock merges/);
+      expect(note).not.toMatch(/public/i);
+      // a known Free plan stays "no lock" (GitHub offers no branch rules there)
+      expect(planLocks(inputs({ profile: orgPriv({ plan: 'free' }), caps: { ...CAPS, branchProtection: false } })).rulesets).toBeUndefined();
+    });
+
+    it('m5: a re-run with fewer than two qualifying owners says the old block stays', () => {
+      const OLD = codeownersBlock(['lefthook.yml'], OWNERS);
+      const prof = orgPriv({ repoFiles: { ...emptyRepoFiles(), codeowners: '.github/CODEOWNERS' } });
+      const plan = planLocks(inputs({ profile: prof, writers: { app: ['alice', 'bob'], central: ['alice'] }, owners: ['@alice'], appCodeowners: { original: OLD, isSymlink: false, inserted: OLD } }));
+      expect(plan.codeowners).toBeUndefined();
+      expect(plan.notes.join('\n')).toMatch(/block pipegen wrote before .*stays/);
+      expect(plan.notes.join('\n')).toContain('o/r');
+      // the same for the central repo's recorded block
+      const c = planLocks(inputs({ writers: { app: ['alice', 'bob'], central: ['alice'] }, owners: ['@alice'], central: { repo: 'o/pipelines', sha: SHA, branchProtection: true, codeowners: { path: '.github/CODEOWNERS', original: OLD, isSymlink: false, inserted: OLD } } }));
+      expect(c.notes.join('\n')).toMatch(/block pipegen wrote before in o\/pipelines .*stays/);
+      // no recorded block: no such note
+      expect(planLocks(inputs({ writers: { app: ['alice', 'bob'], central: ['alice'] }, owners: ['@alice'] })).notes.join('\n')).not.toMatch(/wrote before/);
+    });
+
+    it('m6: a CODEOWNERS that is a symbolic link (or not a plain file) → no code-owner rule on that repo, the note names the fake-gate risk', () => {
+      const prof = orgPriv({ repoFiles: { ...emptyRepoFiles(), codeowners: '.github/CODEOWNERS' } });
+      const app = planLocks(inputs({ profile: prof, appCodeowners: { original: '* @x\n', isSymlink: true, inserted: null } }));
+      expect(app.codeowners).toBeUndefined();
+      expect(prRule(app.rulesets?.reviews).require_code_owner_review).toBe(false);
+      expect((app.classic?.body.required_pull_request_reviews as Obj).require_code_owner_reviews).toBe(false);
+      expect(prRule(app.rulesets?.reviews).required_approving_review_count).toBe(1);
+      expect(prRule(app.centralRuleset).require_code_owner_review).toBe(true);
+      expect(app.notes.join('\n')).toMatch(/not a plain file/);
+      expect(app.notes.join('\n')).toContain(GATE_CHECK_NAME);
+      const central = planLocks(inputs({ central: { repo: 'o/pipelines', sha: SHA, branchProtection: true, codeowners: { path: '.github/CODEOWNERS', original: '* @x\n', isSymlink: true, inserted: null } } }));
+      expect(central.centralCodeowners).toBeUndefined();
+      expect(prRule(central.centralRuleset).require_code_owner_review).toBe(false);
+      expect(prRule(central.rulesets?.reviews).require_code_owner_review).toBe(true);
+    });
   });
 });

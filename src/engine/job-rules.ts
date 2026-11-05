@@ -422,6 +422,18 @@ export function gateResultUploadProblems(steps: readonly RenderedStep[], gateInd
 
 /** The app's caller workflow (ruling B2): push on the default branch only, pull_request, pull_request_review; the merge layer and the deploy jobs. */
 export const CALLER_WORKFLOW = '.github/workflows/pipegen.yml';
+/** G8: the org required workflow's job id and name, named apart from the gate's check (its own check is `pipegen required / gate`). */
+export const REQUIRED_JOB = 'pipegen-required';
+export const REQUIRED_NAME = 'pipegen required';
+/**
+ * G8 (review m1): the org required workflow (central `<name>--required.yml`) as a plain object, the one form src/layers/locks.ts writes and the
+ * referee compares deep-equal: pull_request (bare) only, `permissions: {}`, one job that calls `uses` (the project's merge workflow at the recorded
+ * commit) with exactly the permissions and secrets of pipegen.yml's merge caller. No `with`, `needs`, `if` or anything else.
+ */
+export function requiredWorkflowForm(uses: string, caller: { permissions: unknown; secrets?: unknown }): Record<string, unknown> {
+  const job = { name: REQUIRED_NAME, uses, permissions: caller.permissions, ...(caller.secrets === undefined ? {} : { secrets: caller.secrets }) };
+  return { name: REQUIRED_NAME, on: { pull_request: null }, permissions: {}, jobs: { [REQUIRED_JOB]: job } };
+}
 /** The app's push-layer workflow (ruling B2): push on every branch but the default, pr-check and the push-layer scanners, never a gate. */
 export const PUSH_WORKFLOW = '.github/workflows/pipegen-push.yml';
 /** The approval re-run (Plan G l. 40): `pull_request_review` with exactly these types, and only in CALLER_WORKFLOW. */

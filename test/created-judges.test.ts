@@ -338,7 +338,7 @@ describe('codeowners judge: the central repo', () => {
 
 describe('D0b fix round 1: CODEOWNERS re-run, symlink, overrides', () => {
   const OLD = codeownersBlock(['lefthook.yml'], ['@alice', '@bob']);   // an earlier pipegen block (an older, shorter list)
-  const withFacts = (inserted: string | null, isSymlink = false, repo: 'app' | 'central' = 'app') => env({ codeownersFacts: { ...FACTS, [repo]: { isSymlink, inserted } }, centralCodeowners: '.github/CODEOWNERS' });
+  const withFacts = (inserted: string | null, isSymlink = false, repo: 'app' | 'central' = 'app') => env({ codeownersFacts: { ...FACTS, [repo]: { isSymlink, inserted } }, centralCodeowners: '.github/CODEOWNERS', centralFiles: [] });
   it('a second edit form: the install record owns the old block, which is replaced in place; the bytes outside it stay equal', () => {
     for (const [before, after] of [['* @carol\n\n', ''], ['# top\n', '\n/src/ @carol\n'], ['', ''], ['x @a\n', 'y @b\n']]) {
       const original = `${before}${OLD}${after}`;
