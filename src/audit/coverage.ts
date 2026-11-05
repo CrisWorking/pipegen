@@ -30,7 +30,9 @@
 //   again (or that readWorkflows skipped: opts.skippedWorkflows), or more workflow text than the budget. A per-service
 //   row that would be missing is unknown when the repo has more services (MAX_SERVICES) or more distinct run dirs
 //   (MAX_HIT_DIRS) than pipegen matches; a cap only drops runs, so it never makes a row covered.
-// - missing: nothing matches. `gate` and `deploy-verify` are always missing: they are pipegen's own checks.
+// - missing: nothing matches. `gate` and `deploy-verify` are pipegen's own checks: missing, except that deploy-verify
+//   is covered when every deploying workflow already has a deploy gate pipegen accepts (J3b, ruling B3,
+//   coverage/deploy-gate.ts).
 // DoD G11 (fix round 1, P50 I1 I2): a Trivy licence scan is covered only with no severity filter or one holding
 //   UNKNOWN, HIGH and CRITICAL (partialWithFlagValue, read with Trivy's flag grammar), and only when every service in
 //   scope is npm (package-lock.json); otherwise it is at most partial.
@@ -132,7 +134,7 @@
 //
 // Layout (Plan P Task 0): this file keeps the public API (Coverage, MapCoverageOptions, mapCoverage, and the re-exported
 // loadToolSignatures, ToolSignature and COVERAGE_LIMITS). The rest lives in ./coverage/: signatures, bounds, tokenize
-// (a leaf), settings, shell, triggers, scripts, walk, hooks, decide, helpers, and types (types only). test/module-graph
+// (a leaf), settings, shell, triggers, scripts, walk, hooks, decide, helpers, equivalents and deploy-gate (J3), and types (types only). test/module-graph
 // checks that there is no runtime import cycle among them.
 import { regexSafe } from '../read/limits.js';
 import { SUPPORTED_STACKS, unsupportedStackWhy } from '../read/support.js';
@@ -141,6 +143,7 @@ import type { Capabilities, ExistingWorkflow, Need, RepoProfile } from '../types
 import { safeText } from '../util/safe-text.js';
 import { coverageMinimumRow, frameworkAdjust, publishingCoverage, updateConfigCoverage, versionAdjust } from './config-checks.js';
 import { DEPLOY_VERIFY_WHY, Dirs, Firsts, GATE_WHY, Scope, ciCoverage, firstPartialHit, hookCoverage, type Decide } from './coverage/decide.js';
+import { deployGates } from './coverage/deploy-gate.js';
 import { creditEquivalents } from './coverage/equivalents.js';
 import { hookRunHits, readHooks } from './coverage/hooks.js';
 import { compile, loadToolSignatures } from './coverage/signatures.js';
@@ -170,7 +173,7 @@ export interface Coverage {
    * Always with `creditKind`. Dropped again when a later step makes the row partial (applyLastRuns).
    */
   credit?: string;
-  creditKind?: 'push-default' | 'hooks-ci' | 'signing';
+  creditKind?: 'push-default' | 'hooks-ci' | 'signing' | 'deploy-gate';
   /** Internal (J3a, S5): set by ciCoverage on a push row that is partial only for want of an every-push trigger; `why` is that row's own text. Not for output. */
   trigger?: { kind: 'not-every-push'; why: string };
 }
@@ -299,7 +302,9 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
   // PS22: the last steps, so the chooser reads the adjusted row
   // DECISIONS #122 (J3a): after every adjuster, so a credit reads each row's final status
   const adjusted = unsupportedStack(licenceInstall(noLockfile(frameworkAdjust(versionAdjust(rows, p), p), p), p), p);
-  return creditEquivalents(adjusted, d, ctx, p, hooks, opts.branchGuess === undefined ? {} : { branchGuess: opts.branchGuess });
+  // J3b (ruling B3): the deploy gate is read once, after every run is known (a CI workflow must run a check that blocks)
+  const gates = needs.some((n) => n.category === 'deploy-verify') ? await deployGates(ctx, p, opts.branchGuess) : null;
+  return creditEquivalents(adjusted, d, ctx, p, hooks, { ...(opts.branchGuess === undefined ? {} : { branchGuess: opts.branchGuess }), deployGates: gates });
 }
 
 /**
