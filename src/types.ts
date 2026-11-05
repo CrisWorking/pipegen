@@ -36,7 +36,8 @@ export interface RuntimeEnv {
 export type NotStandalone = 'one-shot' | 'built-in-image' | 'email-templates';
 /**
  * Plan J J2 (DECISIONS #121): what a service is. `static-site` drops the image, Dockerfile and DAST checks (isRunnable) unless the service is
- * also a `container`; `library` and `cli` change no check in v0.2 (F10); `server` = the runnable test of today (baseRunnable) and not static.
+ * also a `container`; `library` and `cli` change no check in v0.2 (F10); `server` = the runnable test of today (baseRunnable) and not static, or an
+ * unsure static site (it is then runnable even with no run script), except a folder that isn't standalone or has library evidence.
  */
 export type ServiceType = 'static-site' | 'library' | 'cli' | 'server' | 'container';
 /**

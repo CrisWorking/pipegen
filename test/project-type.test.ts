@@ -616,3 +616,60 @@ describe('project type: an unsure static site is a server (controller ruling, re
     }
   });
 });
+
+// ---------- fix round 2 (review J2 r1: N1; controller ruling on library evidence) ----------
+
+const LONG_LINE = `/*${'x'.repeat(6000)}*/ export const y = 1;\n`;
+
+describe('project type: the unsure → server rule keeps the older guards (review J2 r1)', () => {
+  it('an unsure static folder that is not standalone (built into another image, one-shot) → no server type, not runnable', async () => {
+    const shapes: [Record<string, string>, string][] = [
+      [{
+        'package.json': pkg({ private: true, workspaces: ['web', 'api'] }),
+        'web/package.json': pkg({ name: 'web', scripts: { dev: 'vite', build: 'vite build' }, devDependencies: { vite: '7.0.0' } }),
+        'web/src/main.js': LONG_LINE,
+        'api/package.json': pkg({ name: 'api', scripts: { start: 'node server.js' }, dependencies: { express: '5.0.0' } }),
+        'api/server.js': SERVER_JS,
+        'api/Dockerfile': 'FROM node:24\nWORKDIR /app\nCOPY web ./web\nCOPY api ./api\nCMD ["node", "api/server.js"]\n',
+      }, 'web'],
+      [{
+        'package.json': pkg({ scripts: { start: 'node tools/info.js', build: 'vite build' }, devDependencies: { vite: '7.0.0' } }),
+        'tools/info.js': "console.log('built at', new Date().toISOString());\n",
+        'src/main.js': 'export {};\n',
+      }, 'site'],
+    ];
+    for (const [files, name] of shapes) {
+      const p = await profileOf(files);
+      const s = p.services.find((x) => x.name === name) as Service;
+      expect(s.notStandalone, name).toBeDefined();
+      expect(s.projectType?.unsure, name).toBe(true);
+      expect(s.projectType?.types, name).not.toContain('server');
+      expect(isRunnable(s), name).toBe(false);
+      const mine = floorNeeds({ ...p, private: false, ownerType: 'User', plan: 'free' }, CAPS).filter((n) => n.service === name).map((n) => n.id);
+      for (const id of ['image-build', 'image-scan', 'dast']) expect(mine, `${name} ${id}`).not.toContain(id);
+      expect(s.projectType?.evidence.join('\n')).not.toMatch(/treats it as a server|treated as a server/);
+      // isRunnable keeps the P55 guard whatever the type says (a hand-built or overridden server type)
+      expect(isRunnable({ ...s, projectType: { types: ['server'], evidence: [], unsure: false, overridden: true } }), name).toBe(false);
+    }
+  });
+
+  it('an unsure static build with library evidence (exports or main and no run script, or a published package) → library, not a server, not runnable', async () => {
+    const publish = `on:\n  push:\n    tags: ['v*']\njobs:\n  release:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm publish\n`;
+    const shapes: Record<string, string>[] = [
+      { 'package.json': pkg({ type: 'module', exports: { '.': './dist/index.js' }, scripts: { build: 'vite build' }, devDependencies: { vite: '7.0.0' } }), 'src/index.js': LONG_LINE },
+      { 'package.json': pkg({ main: './lib/index.cjs', scripts: { build: 'vite build' }, devDependencies: { vite: '7.0.0' } }), 'functions/x.ts': 'export const onRequest = () => new Response("");\n' },
+      { 'package.json': pkg({ scripts: { build: 'vite build' }, devDependencies: { vite: '7.0.0' } }), 'src/index.js': LONG_LINE, '.github/workflows/release.yml': publish },
+    ];
+    for (const files of shapes) {
+      const p = await profileOf(files);
+      const s = p.services[0] as Service;
+      expect(s.projectType?.unsure, Object.keys(files).join()).toBe(true);
+      expect(s.projectType?.types).toEqual(['library']);
+      expect(isRunnable(s)).toBe(false);
+      const text = s.projectType?.evidence.join('\n') ?? '';
+      expect(text).toMatch(/looks like a static site/);
+      expect(text).toMatch(/--type static-site/);
+      expect(text).not.toMatch(/treats it as a server|treated as a server/);
+    }
+  });
+});

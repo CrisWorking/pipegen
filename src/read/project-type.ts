@@ -2,8 +2,9 @@
 // never by the AI. Two phases (ruling B2):
 //   - projectTypeOf, in readService next to notStandaloneOf: the local facts (the static decision, library by its manifest, cli, container);
 //   - finishProjectTypes, after readWorkflows: `library` for a published package, `server` by baseRunnable on the finished service (ruling S1:
-//     publishedPackage, known only after the workflow pass, changes it), and for a static site one evidence line per workflow that deploys to a
-//     static host. A static host never changes a type.
+//     publishedPackage, known only after the workflow pass, changes it) or for an unsure static site (controller ruling, fix round 1; not for a
+//     folder that isn't standalone or has library evidence, fix round 2), and for a static site one evidence line per workflow that deploys to
+//     a static host. A static host never changes a type.
 //
 // Only a static site changes the checks (isRunnable drops image build and scan, DAST, API DAST and the created Dockerfile), so the static
 // decision is the one that must never be wrong toward static (#121: when unsure, the stricter type wins). It is stated as properties, for any
@@ -139,6 +140,8 @@ const GATSBY_SSR_RE = /\bgetServerData\b/;
 
 const shown = (rel: string, fallback: string) => (PLAIN_PATH_RE.test(rel) ? rel : fallback);
 const UNSURE_TAIL = 'so pipegen treats it as a server (use --type static-site if it is)';
+/** Fix round 2: the same tail where the unsure → server rule doesn't apply (a library, or a folder that isn't standalone). */
+const UNSURE_TAIL_NOT_SERVER = "so pipegen doesn't treat it as a static site (use --type static-site if it is)";
 
 // ---------- parsing a config ----------
 
@@ -526,8 +529,9 @@ function serverLine(s: Service): string {
 
 /**
  * Phase 2 (ruling B2), after readWorkflows and publishedPackage: `library` for a published package; `server` when baseRunnable holds and the
- * service isn't static (ruling S1); for each static site, one evidence line per workflow that deploys to a static host. Changes the services in
- * place; a service without projectType gets one.
+ * service isn't static (ruling S1), or when the static decision ended unsure (an unsure static site is a server, even with no run script),
+ * except for a folder that isn't standalone (notStandalone) or has library evidence, which stays as it was before J2; for each static site,
+ * one evidence line per workflow that deploys to a static host. Changes the services in place; a service without projectType gets one.
  */
 export function finishProjectTypes(services: Service[], workflows: readonly ExistingWorkflow[]): void {
   const hostLines = workflows.filter((w) => (w.staticHosts?.length ?? 0) > 0)
@@ -545,9 +549,15 @@ export function finishProjectTypes(services: Service[], workflows: readonly Exis
       if (!types.has('server')) evidence.push(serverLine(s));
       types.add('server');
     } else if (!types.has('static-site') && t.unsure && !types.has('server')) {
-      // controller ruling (review J2 ⚠️1): an unsure static site is a server, even with no run script (#121: the stricter type wins)
-      types.add('server');
-      evidence.push("treated as a server: pipegen isn't sure it is a static site");
+      if (s.notStandalone === undefined && !types.has('library')) {
+        // controller ruling (review J2 ⚠️1): an unsure static site is a server, even with no run script (#121: the stricter type wins)
+        types.add('server');
+        evidence.push("treated as a server: pipegen isn't sure it is a static site");
+      } else {
+        // fix round 2 (review J2 r1 N1; controller ruling): a folder that isn't standalone (P55) or that has library evidence keeps what it
+        // was before J2 (not runnable); only the unsure line's wording changes, so it doesn't claim a server
+        for (let i = 0; i < evidence.length; i++) evidence[i] = (evidence[i] as string).replace(UNSURE_TAIL, UNSURE_TAIL_NOT_SERVER);
+      }
     }
     if (types.has('static-site')) evidence.push(...hostLines);
     s.projectType = { types: ordered(types), evidence: [...new Set(evidence)], unsure: t.unsure, ...(t.overridden === true ? { overridden: true as const } : {}) };

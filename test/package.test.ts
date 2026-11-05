@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { readdirSync, readFileSync } from 'node:fs';
 import { isBuiltin } from 'node:module';
-import { join, posix, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { build } from 'tsup';
 import { afterEach, describe, expect, it } from 'vitest';
 import { tsupOptions } from '../tsup.config.js';
@@ -128,11 +128,8 @@ describe('build', () => {
     const meta = JSON.parse(readFileSync(resolve(root, '.build/meta.json'), 'utf8')) as { inputs: Record<string, { imports: { path: string; external?: boolean }[] }> };
     const left = Object.entries(meta.inputs).filter(([f]) => TEXT_TEMPLATE_PACKAGES.some((p) => f.startsWith(`node_modules/${p}/`)));
     expect(left.length).toBeGreaterThan(0);
-    // every input of the bundle (not only the left-out ones): an import esbuild marks external is a Node built-in, or a relative path to a
-    // module that is itself an input of the bundle (esbuild marks one such import external in the metafile, src/audit/model.ts -> ../ai/errors.js,
-    // while the module is inlined: dist/cli/main.js holds `// src/ai/errors.ts` and imports nothing but node: built-ins, which the scan above checks)
-    const bundled = (from: string, rel: string) => rel.startsWith('.') && Object.hasOwn(meta.inputs, posix.join(posix.dirname(from), rel).replace(/\.js$/, '.ts'));
-    for (const [f, input] of Object.entries(meta.inputs)) for (const i of input.imports) expect(i.external !== true || isBuiltin(i.path) || bundled(f, i.path), `${f} imports ${i.path}`).toBe(true);
+    // every input of the bundle (not only the left-out ones): an import esbuild marks external is a Node built-in
+    for (const [f, input] of Object.entries(meta.inputs)) for (const i of input.imports) expect(i.external !== true || isBuiltin(i.path), `${f} imports ${i.path}`).toBe(true);
     expect(readdirSync(resolve(root, 'dist'))).toEqual(['cli']); // no chunk next to main.js
     // Plan G G0 (carry E-b12, ruling S20): the JUnit worker entry is the one other file, next to main.js
     expect(readdirSync(resolve(root, 'dist/cli')).sort()).toEqual(['junit-thread.js', 'main.js']);

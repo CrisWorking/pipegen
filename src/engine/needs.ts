@@ -111,7 +111,8 @@ export function isRunnable(s: Service): boolean {
   const types = s.projectType?.types;
   if (types !== undefined && types.includes('static-site') && !types.includes('container')) return false;
   // fix round 1 (controller ruling, review J2 ⚠️1): the `server` type runs, also an unsure static site with no run script
-  return (types?.includes('server') ?? false) || baseRunnable(s);
+  // fix round 2 (review J2 r1 N1): never for a folder that isn't standalone (P55), whatever its type says
+  return ((types?.includes('server') ?? false) && s.notStandalone === undefined) || baseRunnable(s);
 }
 export { baseRunnable };
 

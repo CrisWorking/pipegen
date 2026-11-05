@@ -26,7 +26,6 @@
 import { lstat, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Octokit } from '@octokit/rest';
-import { count, outputLimit } from '../ai/errors.js';
 import { ollamaHostOf } from '../ai/ollama.js';
 import { AiError, COST_CAP_MESSAGE, refusalFallbackNoteFor, type AiErrorKind } from '../ai/provider.js';
 import { AiSpendMeter, type AiAttempt } from '../ai/spend-meter.js';
