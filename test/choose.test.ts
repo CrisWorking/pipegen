@@ -182,16 +182,17 @@ describe('choose: a note names only `also` tools the list has (m6)', () => {
   it('choose: workflow-lint without poutine or zizmor → no note names them', () => {
     const p = profile([svc()], { existingWorkflows: [risky] });
     const all = choose('workflow-lint', p);
-    expect(all.note).toContain('actionlint and zizmor');
+    expect([idOf(all.tool), ...alsoIds(all)]).toEqual(['zizmor', 'poutine']);
     expect(all.note).toContain('poutine too');
     const noPoutine = choose('workflow-lint', p, without('poutine'));
-    expect(alsoIds(noPoutine)).toEqual(['zizmor']);
-    expect(noPoutine.note).toContain('actionlint and zizmor');
+    expect(idOf(noPoutine.tool)).toBe('zizmor');
+    expect(alsoIds(noPoutine)).toEqual([]);
     expect(noPoutine.note).not.toContain('poutine');
+    // no zizmor on the list: actionlint is not a stand-in, the rule gives a suggestion only
     const bare = choose('workflow-lint', p, without('poutine', 'zizmor'));
-    expect(alsoIds(bare)).toEqual([]);
-    expect(bare.note).not.toMatch(/zizmor|poutine/);
-    expect(bare.note).toContain('actionlint');
+    expect(bare.tool).toBeNull();
+    expect(bare.also).toEqual([]);
+    expect(bare.note).not.toMatch(/poutine|actionlint/);
   });
   it('choose: iac on Kubernetes without kube-linter → no "plus kube-linter"', () => {
     expect(choose('iac', k8s).note).toContain('plus kube-linter');
@@ -283,19 +284,22 @@ describe('choose: workflows, dependencies, licences', () => {
   const wf = (triggers: string[]): ExistingWorkflow => ({ path: '.github/workflows/a.yml', triggers, deploys: false, [USED]: [], jobs: ['a'] });
   it('choose: pull_request_target → workflow-lint also poutine; plain triggers → zizmor only', () => {
     const risky = choose('workflow-lint', profile([svc()], { existingWorkflows: [wf(['pull_request_target'])] }));
-    expect(idOf(risky.tool)).toBe('actionlint');
-    expect(alsoIds(risky)).toEqual(['zizmor', 'poutine']);
-    expect(alsoIds(choose('workflow-lint', profile([svc()], { existingWorkflows: [wf(['push'])] })))).toEqual(['zizmor']);
-    expect(alsoIds(choose('workflow-lint', profile([svc()], { existingWorkflows: [wf(['issue_comment'])] })))).toContain('poutine');
+    expect(idOf(risky.tool)).toBe('zizmor');
+    expect(alsoIds(risky)).toEqual(['poutine']);
+    const plain = choose('workflow-lint', profile([svc()], { existingWorkflows: [wf(['push'])] }));
+    expect([idOf(plain.tool), ...alsoIds(plain)]).toEqual(['zizmor']);
+    const comment = choose('workflow-lint', profile([svc()], { existingWorkflows: [wf(['issue_comment'])] }));
+    expect([idOf(comment.tool), ...alsoIds(comment)]).toEqual(['zizmor', 'poutine']);
   });
   it('choose: workflow_run only → zizmor alone', () => {
     const c = choose('workflow-lint', profile([svc()], { existingWorkflows: [wf(['workflow_run'])] }));
-    expect(alsoIds(c)).toEqual(['zizmor']);
+    expect([idOf(c.tool), ...alsoIds(c)]).toEqual(['zizmor']);
     expect(c.note).not.toContain('poutine');
+    expect(c.note).not.toContain('actionlint');
   });
   it('choose: pull_request_target → zizmor + poutine, and the note names the trigger', () => {
     const c = choose('workflow-lint', profile([svc()], { existingWorkflows: [wf(['push']), wf(['pull_request_target'])] }));
-    expect(alsoIds(c)).toEqual(['zizmor', 'poutine']);
+    expect([idOf(c.tool), ...alsoIds(c)]).toEqual(['zizmor', 'poutine']);
     expect(c.note).toContain('pull_request_target');
     const both = choose('workflow-lint', profile([svc()], { existingWorkflows: [wf(['issue_comment', 'pull_request_target'])] }));
     expect(both.note).toContain('pull_request_target and issue_comment');
@@ -401,7 +405,7 @@ describe('choose: the reviewed list', () => {
     const ts = profile([svc({}, { tsconfig: true })]);
     const py = profile([svc({ language: 'python' })]);
     const picks: [string, RepoProfile, string, string[]][] = [
-      ['workflow-lint', ts, 'actionlint', ['zizmor']], ['workflow-pin-check', ts, 'pinact', []], ['duplication', ts, 'jscpd', []],
+      ['workflow-lint', ts, 'zizmor', []], ['workflow-pin-check', ts, 'pinact', []], ['duplication', ts, 'jscpd', []],
       ['dead-code', ts, 'knip', []], ['dead-code', py, 'creosote', ['vulture']], ['coverage', py, 'coverage-py', []],
       ['type-check', py, 'mypy', []], ['dependency-review', ts, 'osv-scanner', ['dependency-review-action']],
       ['licences', ts, 'trivy-licence', []], ['egress', ts, 'bullfrog', []], ['scorecard', ts, 'scorecard-action', []],
@@ -434,7 +438,8 @@ describe('choose: the reviewed list', () => {
       fixtureTool('actionlint', ['workflow-lint'])];
     expect(choose('iac', profile(), listed).tool).toBeNull();
     const wl = choose('workflow-lint', profile(), listed);
-    expect(idOf(wl.tool)).toBe('actionlint');
+    // the look-alike zizmor entry is refused, and actionlint is not picked in its place
+    expect(wl.tool).toBeNull();
     expect(wl.also).toEqual([]);
     // an image on the never-list
     const image = fixtureTool('trivy-config', ['iac'], ['any'], 'aquasec/trivy');

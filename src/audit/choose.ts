@@ -261,10 +261,10 @@ const RULES: Readonly<Record<string, Rule>> = {
   'workflow-lint': (c) => {
     const riskyOn = RISKY_TRIGGERS.filter((t) => c.p.existingWorkflows.some((w) => w.triggers.includes(t)));
     const risky = riskyOn.length > 0;
+    // owner choice 3 / #122: zizmor alone; poutine only for triggers that take untrusted input; actionlint is not picked
     return reviewed(
-      c, T.actionlint,
-      (found) => (found.has(T.zizmor) ? 'actionlint and zizmor: check the workflows for mistakes and risky patterns' : 'actionlint: checks the workflows for mistakes'),
-      risky ? [T.zizmor, T.poutine] : [T.zizmor],
+      c, T.zizmor, 'zizmor: checks the workflows for mistakes and risky patterns',
+      risky ? [T.poutine] : [],
       (found) => (risky && found.has(T.poutine) ? `; poutine too, because a workflow runs on ${riskyOn.join(' and ')}, which takes untrusted input` : ''),
     );
   },
