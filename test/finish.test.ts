@@ -373,7 +373,7 @@ describe('G11 finish: print, rotate, the signing key', () => {
     expect(s.lines.join('\n')).toMatch(/signed with the old key won't verify/);
     expect(res.applied.join('\n')).toMatch(/PIPEGEN_COSIGN_PUB/);
     // only in key-env mode
-    const t = await seed();
+    const t = await seed({ merge: false });
     await expect(finish(t.g.octokit(), { owner: 'o', repo: 'r' }, { rotateKey: true }, t.deps())).rejects.toThrow(/key-env/);
   });
 
@@ -483,6 +483,12 @@ describe('G11 finish: what it records (Plan V §5)', () => {
     const ures = await finish(u.g.octokit(), { owner: 'o', repo: 'r' }, {}, u.deps());
     expect(u.g.calls.some((c) => c.route === 'PUT /repos/{owner}/{repo}/branches/{branch}/protection')).toBe(false);
     expect(ures.skipped.map((x) => x.what)).toEqual(expect.arrayContaining(['ruleset pipegen', 'ruleset pipegen-reviews']));
+    // a token without the permission (403 too): the same, never a weaker stand-in
+    const w = await seed();
+    w.g.hooks.push((c) => (c.route === 'POST /repos/{owner}/{repo}/rulesets' && c.params.repo === 'r' ? { status: 403, data: { message: 'Resource not accessible by personal access token' } } : undefined));
+    const wres = await finish(w.g.octokit(), { owner: 'o', repo: 'r' }, {}, w.deps());
+    expect(w.g.calls.some((c) => c.route === 'PUT /repos/{owner}/{repo}/branches/{branch}/protection')).toBe(false);
+    expect(wres.skipped.find((x) => x.what === 'ruleset pipegen')?.why).toMatch(/HTTP 403/);
   });
 
   it('finish: every created object records its id and GitHub created_at', async () => {
@@ -586,6 +592,16 @@ describe('G11 finish: carries (G8, G10)', () => {
     const r = await recordOn(s);
     expect(r.rulesets.map((x) => x.name)).toEqual(['pipegen']);
     expect(r.repoSettings?.shaPinningRequired).toBeUndefined();
+    // GitHub takes the ruleset but reads it back without the app binding of the check: named, not recorded
+    const t = await seed();
+    t.g.hooks.push((c) => {
+      if (c.route !== 'GET /repos/{owner}/{repo}/rulesets/{ruleset_id}' || c.params.repo !== 'r') return undefined;
+      const rs = t.g.repo('o/r').rulesets.get(Number(c.params.ruleset_id));
+      return rs?.name === 'pipegen' ? { status: 200, data: JSON.parse(JSON.stringify({ id: Number(c.params.ruleset_id), ...rs }).replace('"integration_id":15368', '"integration_id":1')) } : undefined;
+    });
+    const tres = await finish(t.g.octokit(), { owner: 'o', repo: 'r' }, {}, t.deps());
+    expect(tres.skipped.find((x) => x.what === 'ruleset pipegen')?.why).toMatch(/doesn't read back/);
+    expect((await recordOn(t)).rulesets.map((x) => x.name)).toEqual(['pipegen-reviews']);
   });
 
   it('finish: the settings calls name only the app, its central repo and its organisation, and only the listed writes', async () => {
@@ -623,6 +639,12 @@ describe('G11 finish: carries (G8, G10)', () => {
     // not proven pipegen's (no earlier record of it): updated, but not recorded, so uninstall leaves it
     expect((await recordOn(s)).rulesets.map((x) => x.name)).toEqual(['pipegen-reviews']);
     expect(res.notes.join('\n')).toMatch(/ruleset pipegen.*not recorded/i);
+    // the same rules, but with a bypass actor added: not "already in place", the bypass is removed
+    const t = await seed();
+    const body = structuredClone((await recordOn(t)).planned.rulesets?.gate.body) as Record<string, unknown>;
+    t.g.repo('o/r').rulesets.set(6, { ...body, bypass_actors: [{ actor_id: 5, actor_type: 'RepositoryRole', bypass_mode: 'always' }], created_at: '2026-03-03T00:00:00Z' });
+    await finish(t.g.octokit(), { owner: 'o', repo: 'r' }, {}, t.deps());
+    expect(t.g.repo('o/r').rulesets.get(6)?.bypass_actors).toEqual([]);
   });
 
   it('finish: a record trusted by typing: re-derives what it needs from GitHub and says what it couldn\'t (G10-R5)', async () => {

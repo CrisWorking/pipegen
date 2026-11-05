@@ -5,12 +5,14 @@ import { mkdtempSync, readFileSync, statSync, symlinkSync, mkdirSync, rmSync } f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
 import { gitBlobSha } from '../src/create/guard.js';
 import {
   canonicalRecordJson, guardRecordOf, InstallRecordSchema, MAX_RECORD_BYTES, parseRecord, readLocalRecord, recordHash, recordMarker,
   recordMarkerOf, recordPath, RecordError, withRecordMarker, writeLocalRecord,
 } from '../src/deliver/record.js';
 import type { InstallRecord } from '../src/types.js';
+import { cosignPub } from './helpers/cosign-keys.js';
 
 const SHA = (c: string): string => c.repeat(40).slice(0, 40);
 /** The record's secrets field, spelled at run time (test/no-secret-literals.test.ts). */
@@ -145,5 +147,16 @@ describe('install record schema, fix round 1 (m1-m3)', () => {
     expect(parseRecord(JSON.stringify(adopted)).files[0]?.adopted).toBe(true);
     expect(() => parseRecord(JSON.stringify({ ...r, files: [{ ...r.files[0], adopted: false }, ...r.files.slice(1)] }))).toThrow(RecordError);
     expect(parseRecord(JSON.stringify({ ...r, serviceRoots: ['.', 'api', 'svc/web'], protectedPaths: ['.github/workflows/**', '**/x.yml'] })).serviceRoots).toEqual(['.', 'api', 'svc/web']);
+  });
+
+  it('G11: the public key text is in cosign\'s form and is the key cosignPubSha256 names', () => {
+    const r = sampleRecord();
+    const pub = cosignPub(5);
+    const sha = createHash('sha256').update(pub, 'utf8').digest('hex');
+    expect(parseRecord(JSON.stringify({ ...r, cosignPub: pub, cosignPubSha256: sha })).cosignPub).toBe(pub);
+    expect(() => parseRecord(JSON.stringify({ ...r, cosignPub: pub }))).toThrow(RecordError);
+    expect(() => parseRecord(JSON.stringify({ ...r, cosignPub: cosignPub(6), cosignPubSha256: sha }))).toThrow(RecordError);
+    const odd = 'not a key';
+    expect(() => parseRecord(JSON.stringify({ ...r, cosignPub: odd, cosignPubSha256: createHash('sha256').update(odd, 'utf8').digest('hex') }))).toThrow(RecordError);
   });
 });

@@ -63,6 +63,9 @@ describe('G11 cosign key shapes (G10-R1)', () => {
     }
     expect(g.calls).toEqual([]);
     expect(cosignPubProblem(good)).not.toBeNull();
+    // base64 PEM writes canonically: stray bits in the last character before the padding are not cosign's text
+    expect(pub().includes('Bw==')).toBe(true);
+    expect(cosignPubProblem(pub().replace('Bw==', 'Bx=='))).not.toBeNull();
     expect(cosignPubProblem(`${pub()}x`)).not.toBeNull();
     expect(cosignPubProblem(['-----BEGIN PUBLIC KEY-----', 'AAAA', '-----END PUBLIC KEY-----'].join('\n'))).not.toBeNull();   // too short to be a key
   });
