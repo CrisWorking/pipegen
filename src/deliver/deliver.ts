@@ -48,7 +48,7 @@ import { safeText } from '../util/safe-text.js';
 import {
   commitFiles, compareStatus, DeliverError, ghRead, ghWrite, ISO_RE, openOrUpdatePr, readHead, readRepo, readTree, refusedMove, setBranch, statusOf, type RepoRef, type TreeEntry,
 } from './git-data.js';
-import { addLocalLeftovers, centralPrBase, centralUpdateBranch, readLocalRecord, recordPath, RecordError, writeRecord, type Leftover, type LocalRecordDeps } from './record.js';
+import { addLocalLeftovers, centralPrBase, centralUpdateBranch, RecordError, writeRecord, type Leftover, type LocalRecordDeps } from './record.js';
 import { trustedPrevious } from './trust.js';
 
 export { DeliverError };
@@ -347,12 +347,10 @@ export async function deliverCentral(gh: Octokit, p: RepoProfile, files: readonl
       if (!refusedMove(e)) throw e;
     }
   }
-  // m8: an unmerged commit on the pull request branch (a record) is kept: the new commit goes on top of it, the branch is never force-moved over it
-  const ownPaths = new Set([recordPath(p.repo), ...files.map((f) => f.path), ...(prev.record?.files ?? []).filter((f) => f.repo === 'central').map((f) => f.path), ...(prev.record?.edits ?? []).filter((e) => e.repo === 'central').map((e) => e.path)]);
-  const local = await readLocalRecord({ owner: p.owner, repo: p.repo }, deps.local ?? {}).catch(() => null);
-  const b = await centralPrBase(gh, c, p.repo, branch, defaultBranch, head, { own: ownPaths, trustedHash: local?.recordHash ?? null }, clock);
+  // G10-R-sec5: the branch is always rebuilt from the default head (never carried), and a replaced branch is named in the message
+  const b = await centralPrBase(gh, c, p.repo, branch, defaultBranch, head, clock);
   const commit = await commitOn(b.parent, b.tree);
-  await setBranch(gh, c, branch, commit, b.force, clock);
+  await setBranch(gh, c, branch, commit, true, clock);
   const pr = await openOrUpdatePr(gh, c, { head: branch, base: defaultBranch, title: `pipegen: central workflows and install record for ${p.repo}`, body: `pipegen's central files for ${show(`${p.owner}/${p.repo}`)}. The setup pull request in that repo pins a commit on this repo's default branch only, so merge this pull request first, then run pipegen again.` }, clock);
   return { kind: 'central-pr', url: pr.url, message: `pipegen ${pr.opened ? 'opened' : 'updated'} the central pull request ${pr.url}. Merge the central PR, then run pipegen again: the setup pull request pins only a central commit on the default branch.${b.note === undefined ? '' : ` ${b.note}`}` };
 }

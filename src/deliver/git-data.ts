@@ -190,10 +190,3 @@ export async function openOrUpdatePr(gh: Octokit, r: RepoRef, pr: { head: string
 }
 
 
-/** The paths `head` changes against `base` (GitHub's compare), or null when GitHub can't list them all (300 or more files). */
-export async function compareFiles(gh: Octokit, r: RepoRef, base: string, head: string, clock: RateClock): Promise<{ status: string; files: string[] | null }> {
-  const d = obj(await ghRead(gh, 'GET /repos/{owner}/{repo}/compare/{basehead}', r, { basehead: `${checkBranch(base)}...${head}`, per_page: 100 }, clock));
-  if (typeof d.status !== 'string') throw new DeliverError('GitHub\'s compare answer could not be read.');
-  const list = Array.isArray(d.files) ? d.files.map(obj).map((f) => f.filename).filter((x): x is string => typeof x === 'string') : null;
-  return { status: d.status, files: list === null || list.length >= 300 ? null : list };
-}
