@@ -49,9 +49,10 @@ export const MAX_CONFIRM_TEXT = 200;
 
 /**
  * The typed question's entries and the view of the record that typing grants, made by ONE function so they can't drift (G10-R-sec7, sec8).
- * The lines list every entry pipegen's ownership checks act on, nothing filtered or cut: all files (adopted ones tagged), the edits, the
- * secrets and variables (created or not), the environments (created or not) and the rulesets (with their ids). The view holds exactly those
- * entries and the record's plain facts (app, name, roots, planned, protected paths, hashes); every other ownership-bearing field (central
+ * The lines list every entry the view keeps, nothing filtered or cut: all files (adopted ones tagged), the secrets and variables (created or
+ * not), the environments (created or not) and the rulesets (with their ids). The view holds exactly those names and the record's plain facts
+ * (app, name, roots, protected paths, hashes). G10-R4: no edits, no variable `previous` values and no `planned` requests (payloads the
+ * question never showed; pipegen re-derives its edits and re-plans this run). Every other ownership-bearing field (central
  * and scratch repo ids and createdByPipegen, the central ruleset/CODEOWNERS/actions access, the org ruleset, classic protection, repo
  * settings, an environment's previous settings, changes and branch policy ids) is dropped: typing proves nothing about them.
  * Refused (never a partial or altered list): more than MAX_CONFIRM_ENTRIES entries, or an entry safeText would change or that is longer than
@@ -61,7 +62,6 @@ export function confirmView(r: InstallRecord): { lines: string[]; view: InstallR
   const repo = (x: { repo: string }): string => (x.repo === 'central' ? 'central ' : '');
   const groups: [string, string[]][] = [
     ['files', r.files.map((f) => `${repo(f)}${f.path}${f.adopted === true ? ' (adopted)' : ''}`)],
-    ['edits', r.edits.map((e) => `${repo(e)}${e.path} (${e.kind})`)],
     ['secrets', r.secrets.map((x) => `${x.name} (${x.scope}${x.created ? ', created' : ', not created'})`)],
     ['variables', r.variables.map((x) => `${x.name} (${x.scope}${x.created ? ', created' : ', not created'})`)],
     ['environments', r.environments.map((x) => `${x.name}${x.created ? ' (created)' : ' (not created)'}`)],
@@ -74,10 +74,13 @@ export function confirmView(r: InstallRecord): { lines: string[]; view: InstallR
   const view: InstallRecord = {
     schema: r.schema, pipegenVersion: r.pipegenVersion, createdAt: r.createdAt, ...(r.mergedAt === undefined ? {} : { mergedAt: r.mergedAt }),
     centralSha: r.centralSha, app: { ...r.app }, name: r.name, serviceRoots: [...r.serviceRoots],
-    files: r.files.map((f) => ({ ...f, shas: [...f.shas] })), edits: structuredClone(r.edits), secrets: r.secrets.map((x) => ({ ...x })), variables: r.variables.map((x) => ({ ...x })),
+    // G10-R4: no edits (their payloads, the text to cut, the scripts and jobs to restore, the originals, were never shown; pipegen re-derives
+    // its own edits this run), no variable `previous` values, no `planned` requests (re-planned this run)
+    files: r.files.map((f) => ({ ...f, shas: [...f.shas] })), edits: [], secrets: r.secrets.map((x) => ({ ...x })),
+    variables: r.variables.map((x) => ({ name: x.name, scope: x.scope, created: x.created, ...(x.githubCreatedAt === undefined ? {} : { githubCreatedAt: x.githubCreatedAt }), ...(x.unconfirmed === true ? { unconfirmed: true as const } : {}) })),
     environments: r.environments.map((e) => ({ name: e.name, created: e.created, ...(e.githubCreatedAt === undefined ? {} : { githubCreatedAt: e.githubCreatedAt }), ...(e.unconfirmed === true ? { unconfirmed: true as const } : {}), changed: [], branchPolicyIds: [] })),
     rulesets: r.rulesets.map((x) => ({ ...x })),
-    planned: structuredClone(r.planned), protectedPaths: [...r.protectedPaths],
+    planned: { signingMode: 'none', environments: [], owners: { app: [], central: [] }, codeOwners: [] }, protectedPaths: [...r.protectedPaths],
     ...(r.cosignPubSha256 === undefined ? {} : { cosignPubSha256: r.cosignPubSha256 }), ...(r.blockFrom === undefined ? {} : { blockFrom: r.blockFrom }),
   };
   return { lines, view };

