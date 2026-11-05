@@ -102,6 +102,9 @@ describe('G1: the triggers of Plan G\'s layout (B1, B2, C3)', () => {
         expect(has(r, 'not-gate-readable', /pushes to a branch other than the default/), `${path} ${JSON.stringify(on)}: ${show(r)}`).toBe(true);
       }
     }
+    // triggers pipegen can not read count as a push that may run anywhere (fail closed)
+    const unreadable = await run([gateFile({ on: 5 })], d);
+    expect(has(unreadable, 'not-gate-readable', /pushes to a branch other than the default/), show(unreadable)).toBe(true);
     // a job named like the gate (its id need not be gate) is refused there too, and so is a caller of a workflow that holds the gate
     const named = pushFile({}, {}, { lookalike: job(renderJobPrelude({}, p).steps, { name: 'gate' }) });
     expect(has(await run([named], d), 'not-gate-readable', /pushes to a branch other than the default/)).toBe(true);
@@ -114,6 +117,10 @@ describe('G1: the triggers of Plan G\'s layout (B1, B2, C3)', () => {
     // the control: the same caller in pipegen.yml, whose push runs only on the default branch, may call it
     const good = await run([merge, caller({ push: defaultPushTrigger('main'), pull_request: null }, CALLER_WORKFLOW)], d);
     expect(has(good, 'not-gate-readable', /pushes to a branch other than the default/), show(good)).toBe(false);
+    // a call chain deeper than GitHub runs is read as holding the gate (fail closed)
+    const chain = Array.from({ length: 12 }, (_, i) => at(workflow({ next: { uses: `./.github/workflows/c${i + 1}.yml`, permissions: { contents: 'read' } } }, { on: { workflow_call: null } }), `.github/workflows/c${i}.yml`));
+    const deep = await run([...chain, at(workflow({ c: { uses: './.github/workflows/c0.yml', permissions: { contents: 'read' } } }, { on: { push: featurePushTrigger('main') } }), '.github/workflows/deep.yml')], d);
+    expect(has(deep, 'not-gate-readable', /pushes to a branch other than the default/), show(deep)).toBe(true);
     // and a push-layer file without a gate passes
     expect(show(await run([gateFile(), pushFile()], d))).toBe('');
     // a job pipegen inserts into a user's workflow that pushes on any branch may not be named like the gate either
@@ -139,6 +146,11 @@ describe('G1: the triggers of Plan G\'s layout (B1, B2, C3)', () => {
         expect(has(r, 'template', /runs on schedule/), `${name} ${JSON.stringify(on)}: ${show(r)}`).toBe(true);
       }
     }
+    // each sign alone: a job id baseline-check with no gate step, and a baseline-check step under another job id
+    const idOnly = await run([gateFile(), nightlyFile({ nightly, 'baseline-check': job(renderJobPrelude({}, p).steps) })], d);
+    expect(has(idOnly, 'template', /runs on schedule/), show(idOnly)).toBe(true);
+    const modeOnly = await run([gateFile(), nightlyFile({ nightly, other: job([renderBaselineCheckStep(GATE)], { permissions: { contents: 'read', actions: 'read' } }) })], d);
+    expect(has(modeOnly, 'template', /runs on schedule/), show(modeOnly)).toBe(true);
     // the same jobs without schedule: no schedule issue (baseline-check in the merge file is how it is meant to run)
     const plain = await run([workflow({ ...jobsOf(d), 'baseline-check': bc })], d);
     expect(has(plain, 'template', /runs on schedule/), show(plain)).toBe(false);
@@ -204,6 +216,10 @@ describe('G1: workflow concurrency, job conditions and job outputs (B1, G22, BP-
     expect(has(await run([gateFile(), pushFile({ needs: [] })], d), 'template', /pr-check skip/)).toBe(true);
     const self = pushFile({}, {}, { 'pr-check': prCheckJob({ if: PR_CHECK_IF, needs: ['sast--app'] }) });
     expect(has(await run([gateFile(), self], d), 'template', /pr-check skip/)).toBe(true);
+    const selfNeed = pushFile({}, {}, { 'pr-check': prCheckJob({ if: PR_CHECK_IF, needs: ['pr-check'] }) });
+    expect(has(await run([gateFile(), selfNeed], d), 'template', /pr-check skip.*never on the job pr-check/)).toBe(true);
+    const alsoPr = pushFile({}, { on: { push: featurePushTrigger('main'), pull_request: null } });
+    expect(has(await run([gateFile(), alsoPr], d), 'template', /pr-check skip/)).toBe(true);
     const wrongPush = pushFile({}, { on: { push: { branches: ['main'] } } });
     expect(has(await run([gateFile(), wrongPush], d), 'template', /pr-check skip/)).toBe(true);
     expect(has(await run([gateFile(), at(pushFile(), '.github/workflows/ci.yml')], d), 'template', /pr-check skip/)).toBe(true);
@@ -251,6 +267,9 @@ describe('G1: workflow concurrency, job conditions and job outputs (B1, G22, BP-
       ['a gate-feeding job', [workflow({ ...jobsOf(d), 'sast--app': { ...(jobsOf(d)['sast--app'] as Job), if: DEPLOY_PUSH_IF } }, { on })]],
       ['the gate caller', [merge, workflow({ ...callerJobs(deploy({ needs: ['pipegen'] })), pipegen: { ...(callerJobs(deploy()).pipegen as Job), if: DEPLOY_PUSH_IF } }, { on })]],
     ] as const;
+    // the gate itself, even when it lists itself among its needs
+    const selfGate = await run([workflow({ ...jobsOf(d), gate: { ...(jobsOf(d).gate as Job), if: DEPLOY_PUSH_IF, needs: [...((jobsOf(d).gate as Job).needs as string[]), 'gate'] } }, { on })], d);
+    expect(has(selfGate, 'template', /deploy condition.*never on the gate/), show(selfGate)).toBe(true);
     for (const [name, files] of elsewhere) {
       const r = await run([...files], d);
       expect(r.ok, `${name}: ${show(r)}`).toBe(false);
@@ -312,6 +331,62 @@ describe('G1: workflow concurrency, job conditions and job outputs (B1, G22, BP-
   });
 });
 
+// ---------- controller ruling G1-R-sec: the push workflow is called only by the push caller ----------
+
+const CSHA = 'c'.repeat(40);
+const cd = draftOf({ centralPin: { repo: 'o/pipelines', sha: CSHA } });
+const CENTRAL_PUSH = '.github/workflows/r--push.yml';
+const CALL_PERMS = { contents: 'read', actions: 'read', 'pull-requests': 'read' };
+/** The central push workflow (pr-check and a scanner with the skip), called by workflow_call only. */
+const centralPush = (extra: Record<string, Job> = {}): CreatedFile => at(pushFile({}, { on: { workflow_call: null } }, extra), CENTRAL_PUSH, 'central');
+const callerOf = (uses: string, on: unknown, path: string, repo: CreatedFile['repo'] = 'app', extra: Record<string, Job> = {}): CreatedFile =>
+  at(workflow({ push: { uses, permissions: CALL_PERMS }, ...extra }, { on }), path, repo);
+const CENTRAL_PUSH_USES = `o/pipelines/${CENTRAL_PUSH}@${CSHA}`;
+
+describe('G1-R-sec: the pr-check skip never runs under a gate', () => {
+  it('referee: only the push caller may call the push workflow; pipegen.yml calling it → refused', async () => {
+    const onPush = { push: featurePushTrigger('main') };
+    const onCaller = { push: defaultPushTrigger('main'), pull_request: null };
+    // the push caller may call it
+    const ok = await run([gateFile(), centralPush(), callerOf(CENTRAL_PUSH_USES, onPush, PUSH_WORKFLOW)], cd);
+    expect(has(ok, 'not-gate-readable', /push workflow/), show(ok)).toBe(false);
+    // pipegen.yml (it holds or calls the gate, and runs on pull requests) calling it: refused, alone or next to the gate
+    for (const extra of [{}, jobsOf(cd)]) {
+      const r = await run([centralPush(), callerOf(CENTRAL_PUSH_USES, onCaller, CALLER_WORKFLOW, 'app', extra)], cd);
+      expect(has(r, 'not-gate-readable', /only the push caller .* may call the push workflow/), show(r)).toBe(true);
+    }
+    // the central merge workflow calling it; the push file under another path or with other triggers calling it; another app file
+    const merge = at(workflow({ ...jobsOf(cd), push: { uses: `./${CENTRAL_PUSH}`, permissions: CALL_PERMS } }, { on: { workflow_call: null } }), '.github/workflows/r--merge.yml', 'central');
+    expect(has(await run([centralPush(), merge], cd), 'not-gate-readable', /only the push caller/)).toBe(true);
+    for (const [on, path] of [[{ push: featurePushTrigger('main'), pull_request: null }, PUSH_WORKFLOW], [onPush, '.github/workflows/ci.yml'], [{ pull_request: null }, PUSH_WORKFLOW], [onPush, PUSH_WORKFLOW]] as const) {
+      const repo = path === PUSH_WORKFLOW && on === onPush ? 'central' : 'app';
+      const r = await run([centralPush(), callerOf(CENTRAL_PUSH_USES, on, path, repo)], cd);
+      expect(has(r, 'not-gate-readable', /only the push caller/), `${repo}:${path} ${JSON.stringify(on)}: ${show(r)}`).toBe(true);
+    }
+    // the push file that holds the gate is no push caller either
+    const gated = await run([centralPush(), callerOf(CENTRAL_PUSH_USES, onPush, PUSH_WORKFLOW, 'app', { gate: jobsOf(cd).gate as Job })], cd);
+    expect(has(gated, 'not-gate-readable', /only the push caller/), show(gated)).toBe(true);
+    // the app push file itself (the public form) called from pipegen.yml: refused too
+    const r2 = await run([gateFile(), pushFile({}, { on: { workflow_call: null } }), callerOf('./.github/workflows/pipegen-push.yml', onCaller, CALLER_WORKFLOW)], d);
+    expect(has(r2, 'not-gate-readable', /only the push caller/), show(r2)).toBe(true);
+  });
+
+  it('referee: a pr-check skip job in a workflow that holds or calls the gate → refused', async () => {
+    const merge = at(gateFile({ on: { workflow_call: null } }), '.github/workflows/pipegen-merge.yml');
+    const callMerge = { pipegen: { name: 'pipegen', uses: './.github/workflows/pipegen-merge.yml', permissions: CALL_PERMS } };
+    // the push file holding the gate, calling the merge workflow, or the central push file holding the gate
+    for (const [name, files, draft] of [
+      ['holds', [pushFile({}, {}, { gate: jobsOf(d).gate as Job })], d],
+      ['calls', [merge, pushFile({}, {}, callMerge as unknown as Record<string, Job>)], d],
+      ['central holds', [gateFile(), centralPush({ gate: jobsOf(cd).gate as Job }), callerOf(CENTRAL_PUSH_USES, { push: featurePushTrigger('main') }, PUSH_WORKFLOW)], cd],
+      ['central calls', [at(merge, '.github/workflows/r--merge.yml', 'central'), centralPush({ pipegen: { name: 'pipegen', uses: './.github/workflows/r--merge.yml', permissions: CALL_PERMS } } as unknown as Record<string, Job>)], cd],
+    ] as const) {
+      const r = await run([...files], draft);
+      expect(has(r, 'template', /pr-check skip.*holds or calls the gate/), `${name}: ${show(r)}`).toBe(true);
+    }
+  });
+});
+
 // ---------- B4: the hook managers' files ----------
 
 const fmtNeed: Need = { id: 'format-lint', layer: 'pre-commit', category: 'format-lint', service: 'app', why: 't', blocking: true, floor: false };
@@ -360,7 +435,8 @@ describe('G1: pre-commit, husky and lefthook appends (B4)', () => {
     const precommitFile = hookCreated(HOOK_FILES['pre-commit'], PRE_COMMIT, built('pre-commit', PRE_COMMIT, hookDraft('pre-commit')));
     // the wrong manager, a skipped part, the wrong part, no edited marker, an empty original for an existing config: refused
     expect(judge(precommitFile, hookDraft('husky')).join('\n')).toMatch(/hook manager is husky/);
-    expect(judge(precommitFile, hookDraft(null)).join('\n')).toMatch(/no hook manager/);
+    expect(judge(precommitFile, hookDraft(null)).join('\n')).toMatch(/sets up only lefthook/);
+    expect(judge(hookCreated(HOOK_FILES.husky, '', built('husky', '', hookDraft('husky'))), hookDraft(null)).join('\n')).toMatch(/sets up only lefthook/);
     expect(judge(precommitFile, hookDraft('pre-commit', { skipped: [{ part: 'precommit', reason: 'x' }] })).join('\n')).toMatch(/skipped/);
     expect(judge({ ...precommitFile, part: 'pipeline' }, hookDraft('pre-commit')).join('\n')).toMatch(/does not belong to the part/);
     expect(judge({ ...precommitFile, edited: undefined }, hookDraft('pre-commit')).join('\n')).toMatch(/edited marker/);
@@ -377,6 +453,8 @@ describe('G1: pre-commit, husky and lefthook appends (B4)', () => {
     expect(hookCommands(sub, reviewedList())).toEqual([]);
     expect(hookCommands(hookDraft('husky', { needs: [...d.needs, { ...fmtNeed, layer: 'merge' }] }), reviewedList())).toEqual([]);
     const biome = entry('biome');
+    const notNpm = reviewedList().map((t) => (t.id !== 'biome' || t.step.cli === undefined ? t : { ...t, step: { ...t.step, cli: { ...t.step.cli, install: { ...t.step.cli.install, method: 'github-release' as const } } } }));
+    expect(hookCommands(hookDraft('husky'), notNpm)).toEqual([]);
     const otherPin = specFor(biome, { needId: 'format-lint', service: 'app', tool: { ...biome.candidate, version: '0.0.1' } });
     expect(hookCommands(hookDraft('husky', { steps: [...d.steps, otherPin] }), reviewedList())).toEqual([]);
     // no reviewed hook command for the repository (no biome spec for the root service): no block at all

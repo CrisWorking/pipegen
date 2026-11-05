@@ -622,6 +622,34 @@ function isPushFile(fc: FileCtx): boolean {
   return false;
 }
 
+/**
+ * Controller ruling G1-R-sec: the push caller, the one workflow allowed to call a push file. The app's PUSH_WORKFLOW whose only trigger is the
+ * every-branch-but-the-default push and that holds or calls no gate (C5a refuses one there anyway).
+ */
+function isPushCaller(fc: FileCtx): boolean {
+  const on = fc.js.on;
+  return fc.file.repo === 'app' && fc.file.path === PUSH_WORKFLOW && isObj(on) && Object.keys(on).length === 1 && isFeaturePush(on.push, fc.draft.profile.defaultBranch)
+    && !reaches(fc, fc.file.repo, fc.js.jobs, holdsGate);
+}
+/**
+ * Whether a caller job's `uses` names a push file (the central `<project>--push.yml`, or the app's PUSH_WORKFLOW), by the path alone: whether
+ * pipegen writes that file or not, so a call can not slip past while the file is missing (judgeCaller refuses that call on its own).
+ */
+function callsPushFile(fc: FileCtx, repo: CreatedFile['repo'], uses: unknown): boolean {
+  if (typeof uses !== 'string') return false;
+  const project = fc.draft.profile.repo;
+  const centralPush = typeof project === 'string' ? centralWorkflowFile(project, 'push').toLowerCase() : null;
+  if (uses.startsWith('./')) {
+    const rel = uses.slice(2).toLowerCase();
+    return (repo === 'app' && rel === PUSH_WORKFLOW.toLowerCase()) || (repo === 'central' && rel === centralPush);
+  }
+  const k = usesKey(uses);
+  if (k === null || centralPush === null) return false;
+  // any owner's pipelines repo, at any commit: the call is refused whatever the pin (the pin itself is judgeCaller's)
+  const m = /^[^/]+\/pipelines\/(.+)$/.exec(k.path);
+  return m !== null && m[1] === centralPush;
+}
+
 /** The workflow file a caller job's `uses` names, when pipegen is writing it (the same resolution as judgeCaller, without issues: those are its). */
 function calledFileOf(fc: FileCtx, repo: CreatedFile['repo'], uses: unknown): { parsed: Parsed; repo: CreatedFile['repo']; key: string } | undefined {
   if (typeof uses !== 'string') return undefined;
@@ -676,6 +704,15 @@ function judgeLayout(fc: FileCtx, js: Obj, triggers: readonly string[] | null): 
  */
 function judgeLayoutJobs(fc: FileCtx, on: unknown, triggers: readonly string[] | null, jobs: unknown, only?: readonly string[]): void {
   const picked = !isObj(jobs) ? {} : only === undefined ? jobs : Object.fromEntries(Object.entries(jobs).filter(([id]) => only.includes(id)));
+  // controller ruling G1-R-sec: the push file's jobs carry the pr-check skip, so only the push caller (no gate, no pull request) may call it; called
+  // from a workflow that holds or calls the gate, or runs on pull requests, the skip would hide scanners the gate reads (a skipped job counts as passed)
+  if (!isPushCaller(fc)) {
+    for (const [id, j] of Object.entries(picked)) {
+      if (isObj(j) && callsPushFile(fc, fc.file.repo, j.uses)) {
+        fc.add(fc.file.path, 'not-gate-readable', `The job ${show(id)} calls the push workflow, but only the push caller (${PUSH_WORKFLOW}, whose only trigger is the push to every branch but the default and which holds or calls no gate) may call the push workflow: its jobs skip when the branch has a pull request, which in any other run could hide a check the gate reads (G1-R-sec).`, undefined, fc.file.repo);
+      }
+    }
+  }
   if (pushOffDefault(on, triggers, fc.draft.profile.defaultBranch) && reaches(fc, fc.file.repo, picked, holdsGate)) {
     fc.add(fc.file.path, 'not-gate-readable', `The workflow runs on pushes to a branch other than the default (or to tags), so it may hold no gate job, no job named like the gate (${GATE_CHECK_NAME}) and call no workflow that holds one (C5a): a push has no pull request, so a gate there decides nothing that can be trusted. The gate runs from ${CALLER_WORKFLOW}, whose push runs on the default branch only, and on pull requests.`, undefined, fc.file.repo);
   }
