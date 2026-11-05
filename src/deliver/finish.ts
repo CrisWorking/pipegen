@@ -154,7 +154,9 @@ const noteAbout = (l: LockPlan, re: RegExp): string | undefined => l.notes.find(
  * Unknown on either side: it is not adopted (its `created` mark never moves to an object pipegen can't show it made, so uninstall never
  * deletes a same-name object of the user's), but its `previous` value is kept (see `priorOf`), never replaced by pipegen's own settings.
  */
-const sameObject = (priorAt: string | undefined, at: string | null): boolean => priorAt !== undefined && at !== null && priorAt === at;
+const sameObject = (priorAt: string | undefined, at: string | null): boolean => priorAt !== undefined && at !== null && sameInstant(priorAt, at);
+/** G11-R3 (R2-4): two created_at strings name the same instant (GitHub may write `…00Z` or `…00.000Z`); an unparsable one names none. */
+const sameInstant = (a: string, b: string): boolean => { const x = Date.parse(a); return Number.isFinite(x) && x === Date.parse(b); };
 /**
  * A ruleset is found by its id, which GitHub never reuses: the same object unless both created_at are known and differ (an unconfirmed
  * ruleset pipegen made stays recorded on a re-run).
@@ -169,6 +171,8 @@ function priorOf<T extends { githubCreatedAt?: string; previous?: unknown }>(lis
   for (const l of lists) { const e = l.find((p) => match(p) && (p.githubCreatedAt === undefined || at === null) && p.previous !== undefined); if (e !== undefined) return { kind: 'maybe', entry: e }; }
   return undefined;
 }
+/** A real calendar day written YYYY-MM-DD (2026-02-30 is not one). */
+const realDay = (d: string): boolean => /^\d{4}-\d{2}-\d{2}$/.test(d) && !Number.isNaN(Date.parse(`${d}T00:00:00Z`)) && new Date(`${d}T00:00:00Z`).toISOString().slice(0, 10) === d;
 const atOf = (at: string | null): { githubCreatedAt: string } | { unconfirmed: true } => (at !== null && ISO_RE.test(at) ? { githubCreatedAt: at } : { unconfirmed: true as const });
 const pendingPath = (x: Ctx): string => localFinishPendingPath(x.app, x.deps.local ?? {});
 /** I1: the pending file saved with `change` applied, BEFORE the write it guards; a file that can't be saved: that write isn't made. */
@@ -533,7 +537,8 @@ async function environments(x: Ctx): Promise<void> {
       const changed = cur === null ? [] : keys.filter((k) => JSON.stringify(want[k]) !== JSON.stringify(s?.[k]));
       // captured once: an earlier entry for this environment (the record's, else one an earlier run saved before it stopped, I1), adopted
       // only when it is the same object; a maybe-same one gives only its previous value (G11-R2 d)
-      const curAt = cur?.createdAt ?? null;
+      // G11-R3 (R2-4): an ISO-Z created_at, else unknown (as setVariable reads it): an empty or offset one never hides the earlier entry
+      const curAt = cur !== null && cur.createdAt !== null && ISO_RE.test(cur.createdAt) ? cur.createdAt : null;
       const m = cur === null ? undefined : priorOf([x.rec.environments, x.pending.environments], (p) => p.name === e.name, curAt);
       const prior = m?.kind === 'same' ? m.entry : undefined;
       const kept = m?.kind === 'maybe' ? m.entry : undefined;
@@ -930,9 +935,12 @@ export async function finish(gh: Octokit, app: RepoRef, opts: FinishOpts, deps: 
     const mergeDay = new Date(Date.parse(`${p.mergedAt.slice(0, 10)}T00:00:00Z`) + 7 * DAY_MS).toISOString().slice(0, 10);
     blockFrom = mergeDay;
     if (rec.blockFrom !== undefined && rec.blockFrom < blockFrom) blockFrom = rec.blockFrom;
+    // G11-R3 (R2-6): a typed run also counts the blockFrom of the record behind the typed view (unvouched: it can only make the date earlier)
+    const unvouched = typed ? trusted.unvouchedBlockFrom ?? '' : '';
+    if (realDay(unvouched) && unvouched < blockFrom) blockFrom = unvouched;
     const v = await api.readOr404('GET /repos/{owner}/{repo}/actions/variables/{name}', { owner: app.owner, repo: app.repo, name: BLOCK_FROM_VAR });
     const varDay = isObj(v) && typeof v.value === 'string' ? v.value : '';
-    if (/^\d{4}-\d{2}-\d{2}$/.test(varDay) && !Number.isNaN(Date.parse(`${varDay}T00:00:00Z`)) && new Date(`${varDay}T00:00:00Z`).toISOString().slice(0, 10) === varDay && varDay < blockFrom) blockFrom = varDay;
+    if (realDay(varDay) && varDay < blockFrom) blockFrom = varDay;
     if (blockFrom !== mergeDay) notes.push(`${BLOCK_FROM_VAR} stays ${blockFrom}, the earlier date: a later merge never moves the end of the warn period later.`);
     x = {
       gh, api, app, central, clock, deps, print: opts.print === true, rotate: opts.rotateKey === true,

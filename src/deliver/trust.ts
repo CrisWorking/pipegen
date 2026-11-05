@@ -28,6 +28,11 @@ export interface TrustedRecord {
   exists: boolean;
   /** Why a record that exists isn't trusted: no local record file, or one that matches neither record (N5: then removing it is the way on). */
   why?: 'no-local' | 'mismatch';
+  /**
+   * G11-R3 (R2-6): for a record trusted by typing, the blockFrom of the full record behind the view (the view drops it: typing never
+   * vouched it). finish may only take it as an earlier date, never a later one.
+   */
+  unvouchedBlockFrom?: string;
 }
 
 /** The question step 2 asks (G10-R-sec6): only when `interactive`; never in a --yes or CI run. */
@@ -138,6 +143,8 @@ async function askToTrust(confirm: RecordConfirm | undefined, app: RepoRef, cent
   return typeof typed === 'string' && typed.trim().toLowerCase() === name.toLowerCase() ? cv.view : null;
 }
 
+const unvouched = (r: InstallRecord): { unvouchedBlockFrom?: string } => (r.blockFrom === undefined ? {} : { unvouchedBlockFrom: r.blockFrom });
+
 /** The earlier record, in the trust order of the header. `notes` gets a plain line when a record exists that pipegen doesn't trust. */
 export async function trustedPrevious(gh: Octokit, app: RepoRef, central: RepoRef, centralBranch: string, updateBranch: string | null, local: LocalRecordDeps, clock: RateClock, notes: string[], confirm?: RecordConfirm): Promise<TrustedRecord> {
   const onDefault = await readFor(gh, central, app.repo, centralBranch, clock);
@@ -151,13 +158,13 @@ export async function trustedPrevious(gh: Octokit, app: RepoRef, central: RepoRe
     // a hash the user vouched for by typing grants only the view they were shown (G10-R-sec8)
     if (file.typed !== true) return { record: r.record, exists };
     const cv = confirmView(r.record);
-    if ('view' in cv) return { record: cv.view, exists };
+    if ('view' in cv) return { record: cv.view, exists, ...unvouched(r.record) };
   }
   // 2. no local file: the user confirms the default branch's record by typing the repo name; it is then vouched into the local file
   const typed = file === null && onDefault !== null && onDefault !== 'unreadable' ? await askToTrust(confirm, app, central, centralBranch, onDefault.record, notes) : null;
   if (typed !== null && onDefault !== null && onDefault !== 'unreadable') {
     await writeLocalRecord(app, { recordHash: onDefault.hash, typed: true, updatedAt: new Date().toISOString() }, local);
-    return { record: typed, exists };
+    return { record: typed, exists, ...unvouched(onDefault.record) };
   }
   // 3. nothing: say which record, and why
   const where = [onDefault === null ? null : `the default branch ${safeText(centralBranch, 100)}`, onBranch === null || updateBranch === null ? null : `the central pull request branch ${safeText(updateBranch, 100)}`].filter((x) => x !== null).join(' and ');

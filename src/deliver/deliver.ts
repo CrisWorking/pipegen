@@ -400,7 +400,8 @@ export async function readEnv(gh: Octokit, app: RepoRef, clock: RateClock, name:
     if (list === null || !isObj(pd) || (typeof pd.total_count === 'number' && pd.total_count > list.length)) throw new DeliverError(`pipegen couldn't read all branch rules of the environment ${show(name, 100)}${then}.`);
     policies = list.map((x) => ({ id: Number.isSafeInteger(x.id) ? x.id as number : 0, name: typeof x.name === 'string' ? x.name : '', type: x.type === 'tag' ? 'tag' as const : 'branch' as const }));
   }
-  return { createdAt: typeof env.created_at === 'string' ? env.created_at : null, settings, policies };
+  // G11-R3 (R2-4): normalised as setVariable does: an ISO-Z created_at, else null (unknown)
+  return { createdAt: typeof env.created_at === 'string' && ISO_RE.test(env.created_at) ? env.created_at : null, settings, policies };
 }
 
 const defaultOnly = (e: EnvRead, branch: string): boolean => e.settings.deployment_branch_policy?.protected_branches === false && e.settings.deployment_branch_policy.custom_branch_policies === true

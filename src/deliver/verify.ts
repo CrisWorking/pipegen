@@ -140,6 +140,8 @@ type Lock = 'gate' | 'reviews' | 'central' | 'org';
 const onDefaultBranch = (status: string | null): boolean => status === 'identical' || status === 'behind';
 /** A sha GitHub's compare may be asked about (40 hex), as the org rule names it. */
 const SHA_RE = /^[0-9a-f]{40}$/;
+/** G11-R3 (R2-5): the keys of an org rule's workflow entry, sorted and joined. */
+const ENTRY_KEYS = 'path,repository_id,sha';
 const REPO_ONE = 'GET /repos/{owner}/{repo}/rulesets/{ruleset_id}';
 const ORG_ONE = 'GET /orgs/{org}/rulesets/{ruleset_id}';
 
@@ -200,7 +202,8 @@ interface LockDiff { drift: VerifyDrift[]; stricter: string[] }
  * plans: the gate's one required check from the GitHub Actions app, and the review settings never weaker. A review setting stricter than
  * planned is not drift: it comes back in `stricter` (G11-R2 e). The org rule (G11-R-sec1): its planned workflow entries are held to
  * `pinnedSha` (the commit finish pinned and recorded), and every live entry must name it; with no recorded pin (a same-name rule found by
- * name) the sha is left out of the comparison and each live entry's commit is checked on the central default branch by the caller.
+ * name) the sha is left out of the comparison, an entry naming no commit (a branch ref) is drift, and each live entry's commit is checked
+ * on the central default branch by the caller. Either way each entry holds only path, repository_id and sha (G11-R3).
  */
 function rulesetDrift(what: string, kind: Lock, want: Obj | undefined, got: Obj | null, pinnedSha?: string): LockDiff {
   if (got === null) return { drift: [{ what, expected: 'there, as pipegen set it', actual: null }], stricter: [] };
@@ -224,11 +227,26 @@ function rulesetDrift(what: string, kind: Lock, want: Obj | undefined, got: Obj 
     });
   }
   if (w !== undefined && (!holdsWanted(w.target, got.target) || !holdsWanted(w.rules, gotRules) || !holdsWanted(w.conditions, got.conditions))) out.push({ what, expected: 'pipegen\'s rules', actual: 'changed' });
-  if (kind === 'org' && pinnedSha !== undefined) {
-    // G11-R-sec1: every workflow the rule runs is pinned to the commit finish recorded (a repointed or added entry is drift)
+  if (kind === 'org') {
     const entries = workflowEntries(got.rules);
-    if (entries.length === 0) out.push({ what, expected: `the required workflow pinned to ${pinnedSha}`, actual: null });
-    for (const e of entries) if (e.sha !== pinnedSha) out.push({ what, expected: `every required workflow pinned to ${pinnedSha}`, actual: typeof e.sha === 'string' ? show(e.sha, 64) : null });
+    // G11-R3 (R2-5): an entry names its workflow by path, repository_id and sha only (an added ref is drift, whichever GitHub would run)
+    for (const e of entries) {
+      const keys = Object.keys(e).sort();
+      if (keys.join(',') !== ENTRY_KEYS) out.push({ what, expected: 'each required workflow named by path, repository_id and sha only', actual: show(keys.join(', '), 160) });
+    }
+    if (pinnedSha !== undefined) {
+      // G11-R-sec1: every workflow the rule runs is pinned to the commit finish recorded (a repointed or added entry is drift)
+      if (entries.length === 0) out.push({ what, expected: `the required workflow pinned to ${pinnedSha}`, actual: null });
+      for (const e of entries) if (e.sha !== pinnedSha) out.push({ what, expected: `every required workflow pinned to ${pinnedSha}`, actual: typeof e.sha === 'string' ? show(e.sha, 64) : null });
+    } else {
+      // G11-R3 (R2-1): no recorded pin; an entry that names no commit (a branch ref, or a sha that is no commit id) is drift; the commits
+      // the entries do name are checked on the central default branch by the caller
+      for (const e of entries) {
+        if (typeof e.sha === 'string' && SHA_RE.test(e.sha)) continue;
+        const named = typeof e.sha === 'string' ? e.sha : typeof e.ref === 'string' ? e.ref : null;
+        out.push({ what, expected: 'every required workflow pinned to a commit', actual: named === null ? null : show(named, 64) });
+      }
+    }
   }
   if (kind === 'gate') {
     const checks = ruleOf(got.rules, 'required_status_checks')?.parameters;

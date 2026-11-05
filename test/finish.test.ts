@@ -13,7 +13,7 @@ import { storeCosignKey, storeEnvSecret } from '../src/create/secrets.js';
 import { centralWorkflowFile } from '../src/engine/central-path.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { pubKeySha256 } from '../src/engine/signing.js';
-import { ensureSigningEnvironment, plannedOfLocks, SETUP_BRANCH } from '../src/deliver/deliver.js';
+import { ensureSigningEnvironment, plannedOfLocks, readEnv, SETUP_BRANCH } from '../src/deliver/deliver.js';
 import { finish, FinishError, FINISH_WRITE_ROUTES, type FinishDeps, type FinishProbe } from '../src/deliver/finish.js';
 import { checkRecord, localFinishPendingPath, readLocalRecord, readRecord, recordHash, recordMarkerOf, writeFinishPending, writeLocalRecord, writeRecord } from '../src/deliver/record.js';
 import { SettingsApi } from '../src/deliver/settings-api.js';
@@ -1301,6 +1301,174 @@ describe('G11 fix round 2 (G11-R2, G11-R-sec1)', () => {
     const from = u.g.calls.length;
     await expect(finish(u.g.octokit(), app, {}, u.deps())).rejects.toThrow(FinishError);
     expect(writeRoutes(u, from)).toEqual([]);
+  });
+});
+
+describe('G11 exception round 3 (G11-R3)', () => {
+  const app = { owner: 'o', repo: 'r' };
+  const vfy = (s: Seed) => verify(s.g.octokit(), app, { local: { home: s.home, env: {} }, clock: clock() });
+  type B = Record<string, any>;
+  const orgWf = (s: Seed): B[] => (([...s.g.orgRulesets.values()][0] as { body: B }).body.rules as B[])[0]?.parameters.workflows as B[];
+  const ORG = 'the org required workflow rule (pipegen-required--r)';
+  const io = { confirm: async () => false, select: async () => { throw new Error('no'); }, text: async () => 'o/r' } as never;
+  const typedRun = async (s: Seed) => {
+    rmSync(join(s.home, '.config'), { recursive: true, force: true });
+    const res = await finish(s.g.octokit(), app, {}, s.deps({ io, interactive: true }));
+    try { s.g.merge('o/pipelines', 'pipegen/update-r'); } catch { /* recorded directly */ }
+    return res;
+  };
+  const refOnly = (s: Seed, ref: string) => { const wf = orgWf(s)[0] as B; delete wf.sha; wf.ref = ref; };
+  const unpinned = (ref: string) => ({ what: ORG, expected: 'every required workflow pinned to a commit', actual: ref });
+  const prod = (s: Seed) => s.g.repo('o/r').envs.get('production') as B;
+  const PROD_WAS = { wait_timer: 5, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: null, branch_policies: [] };
+  const userProd = (s: Seed) => s.g.repo('o/r').envs.set('production', { id: 77, created_at: '2026-01-01T00:00:00Z', wait_timer: 5, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: null, policies: [], stored: new Map() } as never);
+  const latest = async (s: Seed) => { try { const r = await recordOn(s, 'pipegen/update-r'); if (r) return r; } catch { /* none */ } return recordOn(s); };
+
+  it('verify: with no recorded pin (after a typed trust), an org rule entry that names a branch instead of a commit is drift (R2-1: O6)', async () => {
+    const s = await seed({ org: true });
+    await finish(s.g.octokit(), app, {}, s.deps());
+    expect((await recordOn(s)).orgRuleset?.pinnedSha).toMatch(/^[0-9a-f]{40}$/);
+    await typedRun(s);
+    expect((await recordOn(s)).orgRuleset).toBeUndefined();
+    expect((await vfy(s)).drift).toEqual([]);
+    s.g.repo('o/pipelines').refs.set('heads/evil', s.g.head('o/pipelines'));
+    refOnly(s, 'refs/heads/evil');
+    expect((await vfy(s)).drift).toContainEqual(unpinned('refs/heads/evil'));
+    // a sha that is not a commit id (already off the default branch check) gets the same line
+    const wf = orgWf(s)[0] as B;
+    delete wf.ref; wf.sha = 'main';
+    expect((await vfy(s)).drift).toContainEqual(unpinned('main'));
+  });
+
+  it('verify: the unrecorded org rule stays checked after a later normal run (R2-1: O6b)', async () => {
+    const s = await seed({ org: true });
+    await finish(s.g.octokit(), app, {}, s.deps());
+    await typedRun(s);
+    await finish(s.g.octokit(), app, {}, s.deps());
+    try { s.g.merge('o/pipelines', 'pipegen/update-r'); } catch { /* recorded directly */ }
+    expect((await recordOn(s)).orgRuleset).toBeUndefined();
+    expect((await vfy(s)).drift).toEqual([]);
+    refOnly(s, 'refs/heads/main');
+    expect((await vfy(s)).drift).toContainEqual(unpinned('refs/heads/main'));
+  });
+
+  it('verify: a same-name org rule found and updated (unrecorded) with a branch entry is drift (R2-1: O8)', async () => {
+    const s = await seed({ org: true });
+    const body = structuredClone((await recordOn(s)).planned.orgRequiredWorkflow?.rule.body) as B;
+    body.enforcement = 'disabled';
+    s.g.orgRulesets.set(4242, { id: 4242, org: 'o', body: { ...body }, created_at: '2026-01-01T00:00:00Z' } as never);
+    await finish(s.g.octokit(), app, {}, s.deps());
+    expect((await recordOn(s)).orgRuleset).toBeUndefined();
+    expect((await vfy(s)).drift).toEqual([]);
+    refOnly(s, 'refs/heads/main');
+    expect((await vfy(s)).drift).toContainEqual(unpinned('refs/heads/main'));
+  });
+
+  it('verify: an org rule entry with a key beside path, repository_id and sha (a ref) is drift (R2-5: O4)', async () => {
+    const s = await seed({ org: true });
+    await finish(s.g.octokit(), app, {}, s.deps());
+    expect((await vfy(s)).drift).toEqual([]);
+    (orgWf(s)[0] as B).ref = 'refs/heads/evil';
+    expect((await vfy(s)).drift).toEqual([{ what: ORG, expected: 'each required workflow named by path, repository_id and sha only', actual: 'path, ref, repository_id, sha' }]);
+    // the same with no recorded pin
+    delete (orgWf(s)[0] as B).ref;
+    await typedRun(s);
+    expect((await vfy(s)).drift).toEqual([]);
+    (orgWf(s)[0] as B).ref = 'refs/heads/evil';
+    expect((await vfy(s)).drift).toContainEqual({ what: ORG, expected: 'each required workflow named by path, repository_id and sha only', actual: 'path, ref, repository_id, sha' });
+  });
+
+  it('finish: a typed run also counts the default-branch record\'s blockFrom, so a deleted variable never moves the date later (R2-6: I2-e)', async () => {
+    const s = await seed();
+    await finish(s.g.octokit(), app, {}, s.deps());
+    expect((await recordOn(s)).blockFrom).toBe(BLOCK_FROM);
+    s.g.commitOn('o/r', SETUP_BRANCH, { 'PIPEGEN.md': '# pipegen v2\n' }, 'pipegen: setup again');
+    await s.g.request('POST /repos/{owner}/{repo}/pulls', { owner: 'o', repo: 'r', head: SETUP_BRANCH, base: 'main', title: 'pipegen', body: 'again' });
+    s.g.merge('o/r', SETUP_BRANCH, '2027-01-10T09:00:00Z');
+    s.g.x('o/r').variables.delete('PIPEGEN_BLOCK_FROM');
+    const res = await typedRun(s);
+    expect(varOf(s, 'PIPEGEN_BLOCK_FROM')?.value).toBe(BLOCK_FROM);
+    expect(res.applied.join('\n')).not.toMatch(/2027-01-17/);
+    expect((await latest(s)).blockFrom).toBe(BLOCK_FROM);
+  });
+
+  it('finish: an unvouched date later than the merge day + 7, or no real day, never sets a typed run\'s date (R2-6)', async () => {
+    for (const day of ['2027-06-01', '2026-02-30']) {
+      const s = await seed();
+      await finish(s.g.octokit(), app, {}, s.deps());
+      // the default-branch record now names that day (the central PR merged)
+      const r = await recordOn(s);
+      await writeRecord(s.g.octokit(), { record: { ...r, blockFrom: day }, setupPr: s.pr, via: 'direct', files: [], base: s.g.head('o/pipelines'), clock: clock(), now: () => new Date('2026-11-08T12:00:00Z'), local: { home: s.home, env: {} } });
+      try { s.g.merge('o/pipelines', 'pipegen/update-r'); } catch { /* recorded directly */ }
+      expect((await recordOn(s)).blockFrom).toBe(day);
+      s.g.x('o/r').variables.delete('PIPEGEN_BLOCK_FROM');
+      await typedRun(s);
+      expect(varOf(s, 'PIPEGEN_BLOCK_FROM')?.value, day).toBe(BLOCK_FROM);
+    }
+  });
+
+  it('finish: a re-run vouched by an earlier typed confirmation also counts the unvouched blockFrom (R2-6)', async () => {
+    const s = await seed();
+    await finish(s.g.octokit(), app, {}, s.deps());
+    s.g.commitOn('o/r', SETUP_BRANCH, { 'PIPEGEN.md': '# pipegen v2\n' }, 'pipegen: setup again');
+    await s.g.request('POST /repos/{owner}/{repo}/pulls', { owner: 'o', repo: 'r', head: SETUP_BRANCH, base: 'main', title: 'pipegen', body: 'again' });
+    s.g.merge('o/r', SETUP_BRANCH, '2027-01-10T09:00:00Z');
+    // a typed run that stops before its record is written: the local file vouches the default-branch record by typing
+    rmSync(join(s.home, '.config'), { recursive: true, force: true });
+    let armed = true;
+    s.g.hooks.push((c) => (armed && !c.route.startsWith('GET ') && c.params.repo === 'pipelines' && /\/git\//.test(c.route) ? { status: 500, data: { message: 'boom' } } : undefined));
+    await expect(finish(s.g.octokit(), app, {}, s.deps({ io, interactive: true }))).rejects.toThrow();
+    armed = false;
+    expect((await readLocalRecord(app, { home: s.home, env: {} }))?.typed).toBe(true);
+    s.g.x('o/r').variables.delete('PIPEGEN_BLOCK_FROM');
+    await finish(s.g.octokit(), app, {}, s.deps());
+    expect(varOf(s, 'PIPEGEN_BLOCK_FROM')?.value).toBe(BLOCK_FROM);
+  });
+
+  it('finish: an environment whose created_at is empty or carries an offset keeps its previous value, from the record and from the pending file (R2-4: P1, P2, P4)', async () => {
+    for (const at of ['', '2026-01-01T01:00:00+01:00']) {
+      const s = await seed();
+      userProd(s);
+      await finish(s.g.octokit(), app, {}, s.deps());
+      expect((await recordOn(s)).environments.find((e) => e.name === 'production')?.previous).toEqual(PROD_WAS);
+      prod(s).created_at = at;
+      prod(s).wait_timer = 9;
+      await finish(s.g.octokit(), app, {}, s.deps());
+      const e = (await latest(s)).environments.find((x) => x.name === 'production');
+      expect(e, at).toMatchObject({ created: false, previous: PROD_WAS, unconfirmed: true });
+    }
+    // P2: saved in the pending file by a stopped run, the created_at empty now
+    const s = await seed();
+    userProd(s);
+    let armed = true;
+    s.g.hooks.push((c) => (armed && !c.route.startsWith('GET ') && c.params.repo === 'pipelines' && /\/git\//.test(c.route) ? { status: 500, data: { message: 'boom' } } : undefined));
+    await expect(finish(s.g.octokit(), app, {}, s.deps())).rejects.toThrow();
+    armed = false;
+    prod(s).created_at = '';
+    await finish(s.g.octokit(), app, {}, s.deps());
+    expect((await latest(s)).environments.find((x) => x.name === 'production')).toMatchObject({ created: false, previous: PROD_WAS });
+  });
+
+  it('readEnv: an environment\'s created_at is ISO-Z or null, as setVariable reads a variable\'s (R2-4)', async () => {
+    const s = await seed();
+    userProd(s);
+    for (const [at, want] of [['', null], ['2026-01-01T01:00:00+01:00', null], ['soon', null], ['2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'], ['2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z']] as const) {
+      prod(s).created_at = at;
+      expect((await readEnv(s.g.octokit(), app, clock(), 'production'))?.createdAt, at).toBe(want);
+    }
+  });
+
+  it('finish: the same created_at instant written another way is the same object (R2-4: P4 ms, P5)', async () => {
+    const s = await seed();
+    userProd(s);
+    s.g.x('o/r').variables.set('PIPEGEN_BLOCK_FROM', { value: '2026-12-31', created_at: '2026-02-02T00:00:00Z' } as never);
+    await finish(s.g.octokit(), app, {}, s.deps());
+    prod(s).created_at = '2026-01-01T00:00:00.000Z';
+    (varOf(s, 'PIPEGEN_BLOCK_FROM') as B).created_at = '2026-02-02T00:00:00.000Z';
+    await finish(s.g.octokit(), app, {}, s.deps());
+    const r = await latest(s);
+    expect(r.environments.find((x) => x.name === 'production')).toMatchObject({ created: false, previous: PROD_WAS, githubCreatedAt: '2026-01-01T00:00:00Z' });
+    expect(r.variables.find((v) => v.name === 'PIPEGEN_BLOCK_FROM')).toMatchObject({ created: false, previous: '2026-12-31', githubCreatedAt: '2026-02-02T00:00:00Z' });
   });
 });
 
