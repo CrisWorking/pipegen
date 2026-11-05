@@ -409,8 +409,9 @@ describe('D0b fix round 1: CODEOWNERS re-run, symlink, overrides', () => {
       const original = `${OLD}${line}\n`;
       return text(coFile(replaceBlock(original, OLD, block), original), d, withFacts(OLD));
     };
-    for (const line of ['pipegen.yml @dev', 'ci.yml @dev', 'PIPEGEN.md @dev', 'CODEOWNERS @dev', 'docker-compose.pipegen.yml @dev', 'Dockerfile @dev', 'dependabot.yml @dev', 'ci.* @dev', '*.yml @dev']) expect(run(line), line).toMatch(/after the pipegen block/);
-    for (const line of ['README.md @docs', 'deploy.yml @dev', 'package.json @dev', 'ci.yml @alice @bob']) expect(run(line), line).toBe('');
+    for (const line of ['pipegen.yml @dev', 'ci.yml @dev', 'CODEOWNERS @dev', 'docker-compose.pipegen.yml @dev', 'dependabot.yml @dev', 'ci.* @dev', '*.yml @dev']) expect(run(line), line).toMatch(/after the pipegen block/);
+    // G8 (D1-r2): PIPEGEN.md and a created Dockerfile are not paths the block owns, so a rule naming them takes nothing back
+    for (const line of ['README.md @docs', 'deploy.yml @dev', 'package.json @dev', 'ci.yml @alice @bob', 'PIPEGEN.md @dev', 'Dockerfile @dev']) expect(run(line), line).toBe('');
     const names = ['.github/workflows/pipegen.yml', 'PIPEGEN.md'];
     expect(codeownersLaterOverrides('pipegen.yml @dev\nREADME.md @docs\n', ['.github/workflows/**'], ['@alice', '@bob'], names)).toEqual(['pipegen.yml @dev']);
     expect(codeownersLaterOverrides('pipegen.yml @dev\n', ['.github/workflows/**'], ['@alice', '@bob'])).toEqual([]);

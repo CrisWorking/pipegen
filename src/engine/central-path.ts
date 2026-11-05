@@ -3,9 +3,10 @@ import { createHash } from 'node:crypto';
 /**
  * The central workflows of a project. `sign` (v0.2 Plan G G3, ruling S21) is the project's sign workflow: its content is the draft's own
  * signing plan (the image names and the mode are literals of the file, never workflow_call inputs), so it is one file per project, never
- * one file shared by every project of the owner (a second project's install would rewrite the first one's signing file).
+ * one file shared by every project of the owner (a second project's install would rewrite the first one's signing file). `required` (G8) is
+ * the org required workflow of a private Team or Enterprise project (src/layers/locks.ts).
  */
-export type CentralLayer = 'merge' | 'push' | 'nightly' | 'sign';
+export type CentralLayer = 'merge' | 'push' | 'nightly' | 'sign' | 'required';
 
 /** The longest project name kept as it is: `<name>--nightly.yml` stays inside the 100-character path segment the path rule allows. */
 const MAX_PLAIN = 80;

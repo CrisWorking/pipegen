@@ -763,6 +763,8 @@ const GATE_JOB_NAME = GATE_CHECK_NAME.split(' / ')[1] as string;
 const MAX_CALL_DEPTH = 10;
 
 const isCallerFile = (fc: FileCtx): boolean => fc.file.repo === 'app' && fc.file.path === CALLER_WORKFLOW;
+/** G8: the project's central org required workflow (`<name>--required.yml`). */
+const isRequiredFile = (fc: FileCtx): boolean => fc.file.repo === 'central' && typeof fc.draft.profile.repo === 'string' && fc.file.path === centralWorkflowFile(fc.draft.profile.repo, 'required');
 /** Whether a push trigger's value is exactly CALLER_WORKFLOW's form for this draft's default branch (a default branch with no exact form: never). */
 function isDefaultOnlyPush(v: unknown, defaultBranch: string): boolean {
   try { return isDeepStrictEqual(v, defaultPushTrigger(defaultBranch)); } catch (e) { if (e instanceof RenderError) return false; throw e; }
@@ -899,6 +901,16 @@ function judgeTriggerSet(fc: FileCtx, js: Obj, triggers: readonly string[] | nul
     const crons = isObj(on) ? on.schedule : undefined;
     const ok = isObj(on) && Object.keys(on).length === 1 && Array.isArray(crons) && crons.length > 0 && crons.every((c) => isObj(c) && Object.keys(c).length === 1 && typeof c.cron === 'string');
     if (!ok) bad(`${NIGHTLY_WORKFLOW} runs only on schedule (its cron entries), nothing else.`);
+    return;
+  }
+  if (isRequiredFile(fc)) {
+    // G8: the org required workflow, in its one form (requiredWorkflow, src/layers/locks.ts): pull_request (bare) only, one job that calls the
+    // project's central merge workflow at the recorded commit; GitHub runs it from the central repo, so it holds nothing else
+    const pin = centralOf(fc.draft);
+    const jobs = isObj(js.jobs) ? Object.values(js.jobs) : [];
+    const want = pin === null ? null : `${centralWorkflowPath(pin.repo, fc.draft.profile.repo)}@${pin.sha}`;
+    const ok = isObj(on) && Object.keys(on).length === 1 && on.pull_request === null && jobs.length === 1 && isObj(jobs[0]) && want !== null && jobs[0].uses === want;
+    if (!ok) bad(`The org required workflow runs only on pull_request (with no filter) and holds one job, the caller of the project's central merge workflow at the recorded commit, nothing else.`);
     return;
   }
   if (!app || fc.file.path === LOCAL_MERGE_WORKFLOW || triggers.includes('workflow_call')) {

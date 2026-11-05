@@ -117,6 +117,22 @@ export function codeownersSemanticProblems(text: string, protectedPaths: readonl
   return problems;
 }
 
+/**
+ * D1-r2: the real files of `repo` that the block owns, for the re-run check of the rules after it. Only names the block owns count (a rule that
+ * assigns PIPEGEN.md, a created Dockerfile or a source folder takes nothing from it). The app: pipegen's caller workflow, the protected paths
+ * that are plain names, the created app files, the existing workflows. The central repo: its own files only (the central created files of this
+ * delivery and, when given, the central repo's file list), never the app's.
+ */
+function ownedNames(repo: 'app' | 'central', paths: readonly string[], ctx: CreatedCtx): string[] {
+  const owned = protectedMatcher(paths);
+  const plain = paths.filter((x) => !/[*?]/.test(x)).map((x) => x.replace(/^\//, ''));
+  const created = [...ctx.draft.created, ...(ctx.files ?? [])].filter((c) => c.repo === repo).map((c) => c.path);
+  const names = repo === 'app'
+    ? [WORKFLOW_PATH, ...plain, ...created, ...ctx.draft.profile.existingWorkflows.map((w) => w.path)]
+    : [...plain, ...created, ...(ctx.inputs.centralFiles ?? [])];
+  return [...new Set(names.filter((n) => typeof n === 'string' && owned(n)))];
+}
+
 /** The judge for one repo: the app repo's file owns the gate's protected paths, the central repo's the workflows and install records. */
 function judge(repo: 'app' | 'central') {
   return (file: CreatedFile, ctx: CreatedCtx): string[] => {
@@ -160,8 +176,8 @@ function judge(repo: 'app' | 'central') {
       expected = replaced;
       const at = expected.indexOf(block);
       if (at >= 0) {
-        const later = codeownersLaterOverrides(expected.slice(at + block.length), paths, co.owners, [WORKFLOW_PATH, 'PIPEGEN.md', ...paths.filter((x) => !/[*?]/.test(x)).map((x) => x.replace(/^\//, '')), ...draft.created.map((c) => c.path), ...draft.profile.existingWorkflows.map((w) => w.path)]);
-        if (later.length > 0) out.push(`${later.length} rule${later.length === 1 ? '' : 's'} after the pipegen block take${later.length === 1 ? 's' : ''} a protected path back from the code owners (${later.slice(0, 3).join(' | ')}); the last matching rule wins, so the block would not own it`);
+        const later = codeownersLaterOverrides(expected.slice(at + block.length), paths, co.owners, ownedNames(repo, paths, ctx));
+        if (later.length > 0) out.push(`${later.length} rule${later.length === 1 ? '' : 's'} after the pipegen block take${later.length === 1 ? 's' : ''} back a path the block owns (${later.slice(0, 3).join(' | ')}); the last matching rule wins, so the code owners would no longer own it`);
       }
     } else expected = codeownersFile(original, block);
     if (file.content !== expected) {

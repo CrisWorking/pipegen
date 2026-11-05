@@ -46,6 +46,11 @@ export interface CreatedInputs {
    * and `inserted`, the block text the install record says pipegen wrote there before (EditKind 'codeowners'), which a re-run may replace in place.
    */
   codeownersFacts?: Partial<Record<'app' | 'central', { isSymlink: boolean; inserted: string | null }>>;
+  /**
+   * G8 (D1-r2): the central repo's file list (repo-relative paths), for the central CODEOWNERS re-run check: a rule after pipegen's block that
+   * names one of these files and takes it back from the block is refused. Absent: the central files of this delivery only.
+   */
+  centralFiles?: readonly string[];
   /** D7: the package.json `type` of each service ('module' or 'commonjs'; same keys). A missing service is read as commonjs, which checks a .js file both ways. */
   serviceTypes?: Readonly<Record<string, 'module' | 'commonjs'>>;
   /** The vault's check: does the text hold a value the user typed, or its base64 or URL form (preflight S8)? */
