@@ -59,10 +59,10 @@ export const MAX_OFFERED_SUGGESTIONS = 20;
 export const SUGGESTION_WHY_MAX = 200;
 /** The cap of the cleaned "because" in a reason. */
 export const BECAUSE_MAX = 300;
-/** The most characters of AI text the schema accepts per free-text field (the cleaner cuts further). */
-const AI_TEXT_MAX = 2_000;
-/** The most problem lines one repair request carries. */
-const MAX_REPAIR_PROBLEMS = 40;
+/** The most characters of AI text the schema accepts per free-text field (the cleaner cuts further). Shared with the judge (F3). */
+export const AI_TEXT_MAX = 2_000;
+/** The most problem lines one repair request carries. Shared with the judge (F3). */
+export const MAX_REPAIR_PROBLEMS = 40;
 /** The most other tools a reason names after "instead of". */
 const MAX_REASON_ALTERNATIVES = 3;
 
@@ -279,7 +279,8 @@ function tuningOffer(ref: NeedRef, e: ReviewedTool, plan: ChoicePlan, p: RepoPro
 /** What the AI (or the judge's counter, F4) picked for one tool: choice values and tuning values, null for none. */
 export interface Picks { choices?: Readonly<Record<string, string | null>>; tuning?: Readonly<Record<string, readonly string[] | null>> }
 
-const shown = (v: unknown) => safeText(String(v), 60);
+/** An enum value or id as a problem line shows it (cut, terminal-safe). Shared with the judge (F3). */
+export const shown = (v: unknown) => safeText(String(v), 60);
 
 /**
  * The fence on picks (review F2 I3; ruling S2, F2-R2): the problems of `picks` for one key and one offered tool. A choice value must be
@@ -442,7 +443,10 @@ export function builderOffers(needs: readonly Need[], candidates: ReadonlyMap<st
 
 // ---------- the request ----------
 
-const enumOf = (xs: readonly string[]) => z.enum([...new Set(xs)] as [string, ...string[]]);
+/** A schema enum of the given values, each once. Shared with the judge (F3). */
+export const enumOf = (xs: readonly string[]) => z.enum([...new Set(xs)] as [string, ...string[]]);
+/** A nullable enum, or null only when nothing may be named. */
+export const nullableEnum = (xs: readonly string[]) => (xs.length > 0 ? enumOf(xs).nullable() : z.null());
 
 /** The answer's schema: need keys, candidate ids, choice values, tuning values and suggestion ids are enums of what was offered. */
 function builderSchema(o: BuilderOffers): AiSchema<BuilderAnswer> {
@@ -508,10 +512,13 @@ function builderRequest(code: string, p: RepoProfile, o: BuilderOffers, deps: Bu
   };
 }
 
-/** The repair request (ruling S3, S2): the first request (bundle included) plus pipegen's own problem lines, scrubbed. */
-function repairRequest(req: AiRequest, problems: readonly string[], kv: readonly string[]): AiRequest {
+/**
+ * The repair request (ruling S3, S2): the first request (for the builder, bundle included) plus pipegen's own problem lines, cut and
+ * scrubbed, in the caller's repair text. One function for the builder and the judge (F3), so the scrub can't drift between them.
+ */
+export function repairRequest(req: AiRequest, problems: readonly string[], kv: readonly string[], text: (lines: readonly string[]) => string): AiRequest {
   const lines = problems.slice(0, MAX_REPAIR_PROBLEMS).map((x) => safeText(x, 300));
-  return { ...req, user: `${req.user}${promptText(builderRepairText(lines), kv)}` };
+  return { ...req, user: `${req.user}${promptText(text(lines), kv)}` };
 }
 
 // ---------- checking the answer ----------
@@ -643,7 +650,7 @@ export async function buildChoices(needs: readonly Need[], candidates: ReadonlyM
     let problems: string[] = [];
     let done = false;
     for (let round = 0; round < 2 && !done; round++) {
-      const r = await ask(ai, round === 0 ? req : repairRequest(req, problems, kv), schema, usage);
+      const r = await ask(ai, round === 0 ? req : repairRequest(req, problems, kv, builderRepairText), schema, usage);
       usage = addUsage(usage, r.usage);
       const idProblems = builderAnswerProblems(r.data, o);
       if (idProblems.length > 0) { problems = idProblems; continue; }   // the whole answer is refused (ruling S3)

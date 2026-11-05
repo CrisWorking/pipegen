@@ -30,11 +30,12 @@ import {
   type AddedNeed, type AddedNeedRefusal,
 } from '../engine/needs.js';
 import { reviewedFor } from '../engine/reviewed.js';
-import { safeText } from '../util/safe-text.js';
 import {
   NEED_CATEGORIES, type AiProvider, type AiRequest, type AiUsage, type Candidate, type Capabilities, type Need, type RepoProfile, type ReviewedTool,
 } from '../types.js';
-import { NEVER_OFFERED_CATEGORIES, ZERO_USAGE, addUsage, ask, keyOffers, type Choice, type KeyOffers, type Offer } from './builder.js';
+import {
+  AI_TEXT_MAX, NEVER_OFFERED_CATEGORIES, ZERO_USAGE, addUsage, ask, keyOffers, nullableEnum, repairRequest, shown, type Choice, type KeyOffers, type Offer,
+} from './builder.js';
 import { CLEAN_DOC_PLACEHOLDER, cleanForDoc } from './clean.js';
 import { needKeyOf, type NeedRef } from './need-ref.js';
 
@@ -52,10 +53,6 @@ export const MAX_ADDED_NEEDS = 8;
 export const CLAIM_MAX = 300;
 /** The cap of the cleaned deploy approval reason. */
 export const APPROVAL_REASON_MAX = 300;
-/** The most characters of AI text the schema accepts per free-text field (the cleaner cuts further). */
-const AI_TEXT_MAX = 2_000;
-/** The most problem lines one repair request carries. */
-const MAX_REPAIR_PROBLEMS = 40;
 
 // ---------- types ----------
 
@@ -131,8 +128,6 @@ export class JudgeError extends Error {
 
 // ---------- what may be named ----------
 
-const shown = (v: unknown) => safeText(String(v), 60);
-
 /**
  * The keys, choices and enums of one critique. A choice is shown to the judge only for a key the AI may see (ruling B1) and only
  * when its tool is one offered for that key; the first choice per key counts. Throws NeedKeyError on a key collision.
@@ -156,34 +151,45 @@ export function judgeOffers(choices: readonly Choice[], needs: readonly Need[], 
 }
 
 /**
- * The tools a counter may name for an added need (ruling S7): the reviewed list's own full-mode entries for it (reviewedFor, never
- * the discovery map, no network), offered through keyOffers with every need of its key in `current` (so a blocking key never gets an
- * advisory-only tool). None when its key is one the AI may not see. When the key is already in the plan (another layer), only
- * tools also offered for it there.
+ * The tools a counter may name for `key` once the needs are `current`: the plan plus the additions kept from the same answer (ruling
+ * F3-R9, review F3 m1). A key no addition touched keeps the plan's own offers. A key an addition extends or creates is offered again
+ * through keyOffers over every need it now has, so its strictest blocking counts (an added blocking layer drops advisory-only tools),
+ * from a pool of: the plan's offers when the key is already in the plan (never more than the plan offered), else the reviewed list's
+ * own full-mode entries for it (ruling S7: reviewedFor, never the discovery map, no network). None when the AI may not see the key.
  */
-export function addedNeedOffers(added: Need, current: readonly Need[], p: RepoProfile, deps: JudgeDeps, plan: KeyOffers): Offer[] {
-  const key = needKeyOf(added);
+export function counterOffers(key: string, current: readonly Need[], p: RepoProfile, deps: JudgeDeps, plan: KeyOffers): Offer[] {
   const same = current.filter((n) => needKeyOf(n) === key);
-  const pool: Candidate[] = reviewedFor(added, needLanguage(added, p), [...deps.reviewed], 'full').map((t) => structuredClone(t.candidate));
-  const fresh = keyOffers([...same, added], new Map([[key, pool]]), p, deps);
-  if (!fresh.aiKeys.includes(key)) return [];
-  const offers = fresh.offers.get(key) ?? [];
-  if (!plan.refs.some((r) => r.key === key)) return offers;
-  const before = plan.aiKeys.includes(key) ? plan.offers.get(key) ?? [] : [];
-  return offers.filter((o) => before.some((b) => b.entry.id === o.entry.id));
+  const inPlan = plan.refs.find((r) => r.key === key);
+  const planOffers = inPlan !== undefined && plan.aiKeys.includes(key) ? plan.offers.get(key) ?? [] : [];
+  const planNeeds = new Set((inPlan?.needs ?? []).map(needKey));
+  if (inPlan !== undefined && same.every((n) => planNeeds.has(needKey(n)))) return planOffers;
+  const first = same[0];
+  if (first === undefined) return [];
+  const pool: Candidate[] = inPlan !== undefined
+    ? planOffers.map((o) => structuredClone(o.entry.candidate))
+    : reviewedFor(first, needLanguage(first, p), [...deps.reviewed], 'full').map((t) => structuredClone(t.candidate));
+  const fresh = keyOffers(same, new Map([[key, pool]]), p, deps);
+  return fresh.aiKeys.includes(key) ? fresh.offers.get(key) ?? [] : [];
+}
+
+/** The tools a counter may name for an added need, with `current` the needs before it (counterOffers over `current` plus it). */
+export function addedNeedOffers(added: Need, current: readonly Need[], p: RepoProfile, deps: JudgeDeps, plan: KeyOffers): Offer[] {
+  return counterOffers(needKeyOf(added), [...current, added], p, deps, plan);
 }
 
 const addedItem = (a: { id: string; layer: string; service: string | null }) => `${a.id} in ${a.layer}${a.service === null ? '' : ` for ${a.service}`}`;
 
 /**
- * Reads one answer (rulings S3, S7): pipegen's problem lines (any → the whole answer is refused), the objections kept and the notes.
- * `agreed: true` → no objection is read. At most MAX_OBJECTIONS objections and, among them, MAX_ADDED_NEEDS additions are read.
+ * Reads one answer (rulings S3, S7, F3-R9): pipegen's problem lines (any → the whole answer is refused), the objections kept and the
+ * notes. `agreed: true` → no objection is read. At most MAX_OBJECTIONS objections and, among them, MAX_ADDED_NEEDS additions are read.
+ * Two passes: first the keys and the additions (acceptAddedNeed, repeats dropped), then every counter against its key's offers with
+ * ALL the answer's kept additions in place (counterOffers), so an addition can't make an earlier or later counter unsafe.
  * Problem lines hold pipegen's words, enum values and checked names only, never the AI's text.
  */
 export function readJudgeAnswer(a: JudgeAnswer, j: JudgeOffers, needs: readonly Need[], p: RepoProfile, caps: Capabilities, deps: JudgeDeps): { problems: string[]; objections: Objection[]; notes: string[] } {
   if (a.agreed === true) return { problems: [], objections: [], notes: [] };
   const problems: string[] = [];
-  const kept: Omit<Objection, 'id'>[] = [];
+  const kept: (Omit<Objection, 'id'> & { asked: string | null })[] = [];
   const notes: string[] = [];
   const all = Array.isArray(a.objections) ? a.objections : [];
   const read = all.slice(0, MAX_OBJECTIONS);
@@ -197,6 +203,7 @@ export function readJudgeAnswer(a: JudgeAnswer, j: JudgeOffers, needs: readonly 
   const seen = new Set(needs.map(needKey));
   let adds = 0;
   let addsAsked = 0;
+  // pass 1: keys and additions
   for (const [i, o] of read.entries()) {
     const counter = typeof o?.counterCandidateId === 'string' ? o.counterCandidateId : null;
     const key = typeof o?.key === 'string' ? o.key : null;
@@ -207,8 +214,7 @@ export function readJudgeAnswer(a: JudgeAnswer, j: JudgeOffers, needs: readonly 
 
     if (key !== null) {
       if (!j.judgeKeys.includes(key)) { problems.push(`${shown(key)}: this need was not offered`); continue; }
-      if (counter !== null && !(j.keys.offers.get(key) ?? []).some((x) => x.entry.id === counter)) { problems.push(`${key}: ${shown(counter)} was not offered for this need`); continue; }
-      kept.push({ key, needId: (refs.get(key) as NeedRef).id, claim, severity, counter: counter === null ? {} : { candidateId: counter } });
+      kept.push({ key, needId: (refs.get(key) as NeedRef).id, claim, severity, counter: counter === null ? {} : { candidateId: counter }, asked: null });
       continue;
     }
 
@@ -222,16 +228,23 @@ export function readJudgeAnswer(a: JudgeAnswer, j: JudgeOffers, needs: readonly 
     if (!res.ok) { refused.set(res.reason, [...(refused.get(res.reason) ?? []), res.item]); continue; }
     const item = addedItem(asked);
     if (seen.has(needKey(res.need))) { already.push(item); continue; }
-    const offers = addedNeedOffers(res.need, current, p, deps, j.keys);
-    if (counter !== null && !offers.some((x) => x.entry.id === counter)) { problems.push(`${item}: ${shown(counter)} was not offered for this added check`); continue; }
     seen.add(needKey(res.need));
     current.push(res.need);
-    kept.push({ key: needKeyOf(res.need), needId: res.need.id, claim, severity, counter: { addNeed: res.need, ...(counter === null ? {} : { candidateId: counter }) } });
+    kept.push({ key: needKeyOf(res.need), needId: res.need.id, claim, severity, counter: { addNeed: res.need, ...(counter === null ? {} : { candidateId: counter }) }, asked: item });
+  }
+  // pass 2: every counter against its key's offers with all the kept additions in place
+  const offersOf = new Map<string, Offer[]>();
+  for (const o of kept) {
+    const counter = o.counter.candidateId;
+    if (counter === undefined) continue;
+    if (!offersOf.has(o.key)) offersOf.set(o.key, counterOffers(o.key, current, p, deps, j.keys));
+    if ((offersOf.get(o.key) as Offer[]).some((x) => x.entry.id === counter)) continue;
+    problems.push(o.asked === null ? `${o.key}: ${shown(counter)} was not offered for this need` : `${o.asked}: ${shown(counter)} was not offered for this added check`);
   }
   if (addsAsked > adds) notes.push(`pipegen read only the first ${MAX_ADDED_NEEDS} of ${addsAsked} added checks.`);
   for (const [reason, items] of refused) notes.push(refusedAdditionsNote(reason, [...new Set(items)]));
   for (const item of [...new Set(already)]) notes.push(`The judge asked to add ${item}, which pipegen already plans; pipegen left it out.`);
-  return { problems, objections: kept.map((o, n) => ({ id: `o${n + 1}`, ...o })), notes };
+  return { problems, objections: kept.map(({ asked: _asked, ...o }, n) => ({ id: `o${n + 1}`, ...o })), notes };
 }
 
 /** Ruling S8: on only when the judge says on AND gives a reason that is not empty after cleanForDoc. */
@@ -244,8 +257,6 @@ function approvalOf(a: JudgeAnswer): { requireDeployApproval: boolean; deployApp
 
 // ---------- the request ----------
 
-const enumOf = (xs: readonly string[]) => z.enum([...new Set(xs)] as [string, ...string[]]);
-const nullableEnum = (xs: readonly string[]) => (xs.length > 0 ? enumOf(xs).nullable() : z.null());
 
 /** The answer's schema (ruling S9): keys, counter ids, added need ids, layers, categories and services are enums; nothing else. */
 function judgeSchema(j: JudgeOffers): AiSchema<JudgeAnswer> {
@@ -262,6 +273,15 @@ function judgeSchema(j: JudgeOffers): AiSchema<JudgeAnswer> {
     deployApprovalReason: z.string().max(AI_TEXT_MAX),
   }) as unknown as z.ZodType<JudgeAnswer>);
 }
+
+/** The seven capability flags (types.ts Capabilities); the compile-time check below fails when the type gains or loses one. */
+const CAPABILITY_FLAGS = ['branchProtection', 'environments', 'envRequiredReviewers', 'deploymentBranchPolicies', 'attestations', 'codeScanning', 'keylessSigningAllowed'] as const;
+type MissingFlag = Exclude<keyof Capabilities, (typeof CAPABILITY_FLAGS)[number]>;
+const ALL_FLAGS_LISTED: [MissingFlag] extends [never] ? true : never = true;
+void ALL_FLAGS_LISTED;
+
+/** Only the named flags, each true only for a real `true` (review F3 m4): nothing else the object holds reaches the prompt. */
+const capabilityFlags = (caps: Capabilities): Record<string, boolean> => Object.fromEntries(CAPABILITY_FLAGS.map((f) => [f, caps[f] === true]));
 
 /** The picks and the reviewed tools as the judge sees them: enums, reviewed-list data and pipegen's own texts only. */
 function judgeBlocks(j: JudgeOffers, caps: Capabilities, reviewed: readonly ReviewedTool[]): string {
@@ -298,14 +318,16 @@ function judgeBlocks(j: JudgeOffers, caps: Capabilities, reviewed: readonly Revi
     return { key: x.key, check: ref.id, service: ref.service ?? null, layers: ref.layers, blocking: ref.blocking, coveredBy: x.by };
   });
   // the tools a counter may name, per check id: full-mode reviewed entries (the counter enum), with the languages they read
+  // A list of { check, tools } items, never an object keyed by check id: redact's generic rule reads a `"secrets": [` line as a
+  // secret and hides the whole list (review F3 m2); as a value after "check" the id is plain data.
   const listed = new Set(j.counterIds);
-  const tools: Record<string, { id: string; languages: string[] }[]> = {};
+  const tools: { check: string; tools: { id: string; languages: string[] }[] }[] = [];
   for (const id of NEED_IDS) {
     const ts = reviewed.filter((t) => listed.has(t.id) && toolCoversNeed(t.categories, id)).map((t) => ({ id: t.id, languages: [...t.languages] }));
-    if (ts.length > 0) tools[id] = ts;
+    if (ts.length > 0) tools.push({ check: id, tools: ts });
   }
   return [
-    `<${JUDGE_CAPABILITIES_TAG}>\n${JSON.stringify(caps, null, 1)}\n</${JUDGE_CAPABILITIES_TAG}>`,
+    `<${JUDGE_CAPABILITIES_TAG}>\n${JSON.stringify(capabilityFlags(caps), null, 1)}\n</${JUDGE_CAPABILITIES_TAG}>`,
     `<${JUDGE_CHOICES_TAG}>\n${JSON.stringify(choices, null, 1)}\n</${JUDGE_CHOICES_TAG}>`,
     `<${JUDGE_COVERED_TAG}>\n${JSON.stringify(covered, null, 1)}\n</${JUDGE_COVERED_TAG}>`,
     `<${JUDGE_TOOLS_TAG}>\n${JSON.stringify(tools, null, 1)}\n</${JUDGE_TOOLS_TAG}>`,
@@ -333,11 +355,6 @@ function judgeRequest(j: JudgeOffers, p: RepoProfile, caps: Capabilities, deps: 
   };
 }
 
-/** The repair request (ruling S3): the first request plus pipegen's own problem lines, scrubbed. */
-function repairRequest(req: AiRequest, problems: readonly string[], kv: readonly string[]): AiRequest {
-  const lines = problems.slice(0, MAX_REPAIR_PROBLEMS).map((x) => safeText(x, 300));
-  return { ...req, user: `${req.user}${promptText(judgeRepairText(lines), kv)}` };
-}
 
 // ---------- the call ----------
 
@@ -355,7 +372,7 @@ export async function critique(choices: readonly Choice[], needs: readonly Need[
   let usage: AiUsage = { ...ZERO_USAGE };
   let problems: string[] = [];
   for (let round = 0; round < 2; round++) {
-    const r = await ask(ai, round === 0 ? req : repairRequest(req, problems, kv), schema, usage);
+    const r = await ask(ai, round === 0 ? req : repairRequest(req, problems, kv, judgeRepairText), schema, usage);
     usage = addUsage(usage, r.usage);
     const read = readJudgeAnswer(r.data, j, needs, p, caps, deps);
     if (read.problems.length > 0) { problems = read.problems; continue; }   // the whole answer is refused (ruling S3)
