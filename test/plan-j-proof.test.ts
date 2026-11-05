@@ -39,6 +39,7 @@ const gh = {
 const FIXTURES = [
   'static-next-export', 'static-next-export-preview', 'static-astro', 'static-vite-spa', 'node-cli', 'node-container-service',
   'node-express', 'node-library', 'go-module', 'workspaces-python-backend', 'node-api-ci-deploy',
+  'flask-api-gated', 'node-cli-ts', 'node-web-chain',
 ] as const;
 type Fixture = typeof FIXTURES[number];
 
@@ -70,6 +71,11 @@ describe('Plan J proof set: project type', () => {
     'node-container-service': [{ types: ['server', 'container'], unsure: false }],
     'node-express': [{ types: ['server'], unsure: false }],
     'node-api-ci-deploy': [{ types: ['server'], unsure: false }],
+    'node-web-chain': [{ types: ['server'], unsure: false }],
+    // a TypeScript CLI with a bin map of two commands
+    'node-cli-ts': [{ types: ['cli'], unsure: false }],
+    // a Python service with a port default and a server package: server
+    'flask-api-gated': [{ types: ['server'], unsure: false }],
     'node-library': [{ types: ['library'], unsure: false }],
     // not a Node project: today's rule (no type found, nothing dropped)
     'go-module': [{ types: [], unsure: false }],
@@ -134,6 +140,12 @@ describe('Plan J proof set: credits only where the repo has the equivalent', () 
     'node-express': [], 'node-library': [], 'go-module': [], 'workspaces-python-backend': [],
     // gate form (b): the deploy job is in the CI workflow, needs every CI job, runs on a push to exactly [main]
     'node-api-ci-deploy': ['deploy-verify|deploy|deploy-gate'],
+    // form (b) again, in a different layout: one workflow for push and pull_request, build -> e2e -> release chain, event guard
+    'node-web-chain': ['deploy-verify|deploy|deploy-gate', 'unit-tests|push|push-default'],
+    'node-cli-ts': [],
+    // form (a) by checking out the tested commit (ref: head_sha, exact branches filter), pre-commit with only the gitleaks hook
+    // run by CI's checked binary, trivy-action at a safe SHA with its default version written out
+    'flask-api-gated': ['deploy-verify|deploy|deploy-gate', 'deps|push|push-default', 'hooks-ci|merge|hooks-ci', 'secrets|push|push-default', 'unit-tests|push|push-default'],
   };
   const creditedOf = async (f: Fixture) => (await audit(f)).coverage.filter((c) => c.credit !== undefined)
     .map((c) => `${c.need.category}|${c.need.layer}|${c.creditKind}`).sort();
@@ -155,11 +167,16 @@ describe('Plan J proof set: credits only where the repo has the equivalent', () 
       expect(hooksCi.some((c) => c.credit !== undefined), f).toBe(false);
     }
   });
+  it('push-default negative: CI that runs only on a push to main (no pull_request) and the deploy-only workflows get no push credit', async () => {
+    // node-api-ci-deploy: every job runs on push to main only, so no row is "partial for want of a push trigger" to credit
+    expect((await creditedOf('node-api-ci-deploy')).filter((x) => x.endsWith('push-default'))).toEqual([]);
+    for (const f of ['static-next-export-preview', 'static-vite-spa'] as const) expect((await creditedOf(f)).filter((x) => x.endsWith('push-default')), f).toEqual([]);
+  });
   it('the credited rows are shown with their credit text in the full report', async () => {
     const t = renderTerminal(await audit('static-next-export'), { knownValues: [], now: () => NOW, verbose: true });
     for (const c of (await audit('static-next-export')).coverage.filter((x) => x.credit !== undefined)) expect(t.replace(/\s+/g, ' ')).toContain(c.credit!.replace(/\s+/g, ' '));
   });
-  it('no credit on a static fixture ever covers signing, attestation or deploy-verify today ', async () => {
+  it('no fixture has a covered signing, attestation or sbom row (nothing here signs or builds an SBOM)', async () => {
     for (const f of FIXTURES) {
       const bad = (await audit(f)).coverage.filter((c) => ['signing', 'attestation', 'sbom'].includes(c.need.category) && c.status === 'covered');
       expect(bad.map(rowKey), f).toEqual([]);
@@ -198,6 +215,14 @@ describe('Plan J proof set: rows against the baseline at 10d48df', () => {
     },
     'node-express': {}, 'node-library': {}, 'go-module': {}, 'workspaces-python-backend': {},
     'node-api-ci-deploy': { changed: [['deploy-verify|deploy|notes-api|missing', 'deploy-verify|deploy|notes-api|covered']] },   // deploy gate, form (b) (J3b)
+    'node-web-chain': { changed: [PUSH_CREDIT('booking-web'), ['deploy-verify|deploy|booking-web|missing', 'deploy-verify|deploy|booking-web|covered']] },
+    'node-cli-ts': {},
+    // form (a) by ref; hooks-ci credit; trivy-action by safe SHA (deps rows); push credits; the ruff-free pre-commit file
+    'flask-api-gated': {
+      changed: [PUSH_CREDIT('ledger-api'), ['secrets|push||partial', 'secrets|push||covered'], ['hooks-ci|merge||missing', 'hooks-ci|merge||covered'],
+        ['deploy-verify|deploy|ledger-api|missing', 'deploy-verify|deploy|ledger-api|covered'],
+        ['deps|merge|ledger-api|partial', 'deps|merge|ledger-api|covered'], ['deps|push|ledger-api|partial', 'deps|push|ledger-api|covered']],
+    },
   };
   for (const f of FIXTURES) {
     it(`${f}: today's rows = the 10d48df rows minus ${DIFFS[f].gone?.length ?? 0} gone, with ${DIFFS[f].changed?.length ?? 0} changed`, async () => {
@@ -235,15 +260,28 @@ describe('Plan J proof set: rows against the baseline at 10d48df', () => {
 // ---------- 6. J3b: the deploy-gate credit and trivy-action by a safe SHA ----------
 describe('Plan J proof set: deploy gate and trivy-action by SHA (J3b)', () => {
   const rowOf = async (f: Fixture, key: string) => (await audit(f)).coverage.find((c) => `${c.need.category}|${c.need.layer}|${c.need.service ?? ''}` === key);
-  it('form (a): a guarded workflow_run deploy (guard on the first job, deploy through needs, SHA compared through an env var, exact branches filter) → deploy-verify covered, with its credit', async () => {
-    const r = await rowOf('static-next-export', 'deploy-verify|deploy|docs-site');
-    expect(r).toMatchObject({ status: 'covered', creditKind: 'deploy-gate' });
-    expect(r!.credit).toMatch(/deploy/i);
+  const GATE_WHY = /deploys run only after CI passed on main, for the commit CI tested, never for a fork's run/;
+  it('form (a), two shapes: a guarded workflow_run deploy (env-var SHA check; or checking out the tested commit by ref with an exact branches filter) → covered, with its credit', async () => {
+    for (const [f, key] of [['static-next-export', 'deploy-verify|deploy|docs-site'], ['flask-api-gated', 'deploy-verify|deploy|ledger-api']] as const) {
+      const r = await rowOf(f, key);
+      expect(r, f).toMatchObject({ status: 'covered', creditKind: 'deploy-gate' });
+      expect(r!.credit, f).toMatch(GATE_WHY);
+    }
   });
-  it('form (b): the deploy job inside CI, needing every CI job, on a push to exactly [main] → deploy-verify covered, with its credit', async () => {
-    const r = await rowOf('node-api-ci-deploy', 'deploy-verify|deploy|notes-api');
-    expect(r).toMatchObject({ status: 'covered', creditKind: 'deploy-gate' });
-    expect(r!.credit).toMatch(/deploy/i);
+  it('form (b), two layouts: the deploy job inside CI, needing every CI job, on a push to exactly [main] (push-only chain; or push + pull_request with an event guard) → covered', async () => {
+    for (const [f, key] of [['node-api-ci-deploy', 'deploy-verify|deploy|notes-api'], ['node-web-chain', 'deploy-verify|deploy|booking-web']] as const) {
+      const r = await rowOf(f, key);
+      expect(r, f).toMatchObject({ status: 'covered', creditKind: 'deploy-gate' });
+      expect(r!.credit, f).toMatch(GATE_WHY);
+      expect(r!.why, f).toMatch(/deploys only on a push to main, after every other job of the same run passed/);
+    }
+  });
+  it('hooks-ci credit, two shapes: pre-commit with the gitleaks hook, run in CI by a checksum-checked gitleaks binary (detect; or git) → covered, naming the hook', async () => {
+    for (const f of ['static-next-export', 'flask-api-gated'] as const) {
+      const r = await rowOf(f, 'hooks-ci|merge|');
+      expect(r, f).toMatchObject({ status: 'covered', creditKind: 'hooks-ci' });
+      expect(r!.credit, f).toMatch(/hook/i);
+    }
   });
   it('form (b) shape in its own push workflow (not inside CI, so the deploy does not wait for the tests) → deploy-verify stays missing', async () => {
     // static-next-export-preview deploys from deploy.yml on push [main] with a github.ref guard, but no job there needs the
@@ -255,11 +293,13 @@ describe('Plan J proof set: deploy gate and trivy-action by SHA (J3b)', () => {
   it('a Pages deploy by an environment, with no check that the commit passed → deploy-verify stays missing (astro)', async () => {
     expect((await rowOf('static-astro', 'deploy-verify|deploy|blog'))?.status).toBe('missing');
   });
-  it('trivy-action at a safe SHA with default inputs → not never-listed: dependency and licence rows covered, saying the action\'s cache is not re-checked', async () => {
-    for (const key of ['deps|merge|orders-api', 'deps|push|orders-api', 'licences|merge|']) {
-      const r = await rowOf('node-container-service', key);
-      expect(r?.status, key).toBe('covered');
-      expect(r?.why, key).toMatch(/cache isn't re-checked/);
+  it('trivy-action at a safe SHA, two shapes (own default inputs; or its default version written out) → not never-listed: rows covered, saying the action\'s cache is not re-checked', async () => {
+    for (const [f, keys] of [['node-container-service', ['deps|merge|orders-api', 'deps|push|orders-api', 'licences|merge|']], ['flask-api-gated', ['deps|merge|ledger-api', 'deps|push|ledger-api']]] as const) {
+      for (const key of keys) {
+        const r = await rowOf(f, key);
+        expect(r?.status, `${f} ${key}`).toBe('covered');
+        expect(r?.why, `${f} ${key}`).toMatch(/cache isn't re-checked/);
+      }
     }
   });
   it('the same trivy-action step with `version:` set → still never-listed (partial, no cache note)', async () => {
