@@ -15,8 +15,8 @@ import { pubKeySha256 } from '../src/engine/signing.js';
 import { PromptCancelledError, type Prompter } from '../src/cli/io.js';
 import { deliver, deliverCentral, PART_ORDER, planDelivery, previewText, SETUP_BRANCH, type DeliveryInput, type DeliverDeps, type SigningKey } from '../src/deliver/deliver.js';
 import { DeliverError, ghRead, ghWrite } from '../src/deliver/git-data.js';
-import { confirmView } from '../src/deliver/trust.js';
-import { readRecord, recordHash, recordMarker, recordPath, writeRecord } from '../src/deliver/record.js';
+import { confirmView, TYPED_VIEW_FIELDS } from '../src/deliver/trust.js';
+import { InstallRecordSchema, readRecord, recordHash, recordMarker, recordPath, writeRecord } from '../src/deliver/record.js';
 import { COMPAT_PREFIX, HARNESS_PATH } from '../src/proof/harness.js';
 import type { LockPlan } from '../src/layers/locks.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
@@ -869,6 +869,54 @@ describe('G10 fix round 1 (review-G10, ruling G10-R2)', () => {
     expect(text).not.toContain(HOOK_ORIG.slice(0, 30));
     // the local file vouches only the record this run wrote from the projection
     expect(JSON.parse(readFileSync(localFile(w), 'utf8')).recordHash).toBe(recordHash(out));
+  });
+
+  it('fix 3: the typed view is an allow-list: unshown facts (mergedAt, blockFrom, cosignPubSha256) never survive (G10-R5, R3-sweep)', async () => {
+    const w = world();
+    await firstRun(w);
+    const r = structuredClone(await record(w) as Rec);
+    r.mergedAt = '2026-01-01T00:00:00Z';
+    r.blockFrom = '9999-12-31';
+    r.cosignPubSha256 = 'f'.repeat(64);
+    r.serviceRoots = ['evil'];
+    r.protectedPaths = ['nothing-here'];
+    for (const f of r.files) if (f.path === 'Dockerfile') { f.part = 'docs'; f.aiEdited = true; }
+    r.environments = [{ name: 'production', created: false, previous: { wait_timer: 0, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: null, branch_policies: [] }, changed: ['wait_timer'], branchPolicyIds: [3] }];
+    w.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: JSON.stringify(r) });
+    const cv = confirmView(r);
+    if (!('view' in cv)) throw new Error(`refused: ${cv.refused}`);
+    for (const k of ['mergedAt', 'blockFrom', 'cosignPubSha256'] as const) expect(cv.view[k], k).toBeUndefined();
+    expect(cv.view.environments).toEqual([{ name: 'production', created: false, changed: [], branchPolicyIds: [] }]);
+    expect(cv.view.serviceRoots).toEqual([]);
+    expect(cv.view.protectedPaths).toEqual([]);
+    // end to end: none of them reaches the record the local file then vouches for
+    rmSync(localFile(w));
+    const p = profile();
+    const pin = (await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w, 'o/r')) as { sha: string }).sha;
+    await deliver(w.g.octokit(), p, planDelivery(input(p, pin)), fresh(), { ...deps(w, {}, { replace: true, typed: 'o/r' }), interactive: true });
+    const out = await record(w, upd) as Rec;
+    expect(out.mergedAt).toBeUndefined();
+    expect(out.blockFrom).toBeUndefined();
+    expect(out.cosignPubSha256).toBeUndefined();
+    expect(out.serviceRoots).toEqual(['.']);
+    expect(out.protectedPaths).toEqual(['.github/workflows/**', 'CODEOWNERS']);
+    expect(out.files.find((f) => f.path === 'Dockerfile')?.part).toBe('docker');
+    expect(JSON.parse(readFileSync(localFile(w), 'utf8')).recordHash).toBe(recordHash(out));
+  });
+
+  it('fix 3: every field of the record schema is classified by the typed view\'s allow-list (G10-R5)', () => {
+    const keys = (shape: object): string[] => Object.keys(shape).sort();
+    const sh = InstallRecordSchema.shape;
+    const el = (a: { element: { shape: object } }): object => a.element.shape;
+    const classified = (c: { keep: readonly string[]; fresh?: readonly string[]; drop?: readonly string[] }): string[] => [...c.keep, ...(c.fresh ?? []), ...(c.drop ?? [])].sort();
+    expect(classified(TYPED_VIEW_FIELDS.record)).toEqual(keys(sh));
+    expect(classified(TYPED_VIEW_FIELDS.files)).toEqual(keys(el(sh.files)));
+    expect(classified(TYPED_VIEW_FIELDS.secrets)).toEqual(keys(el(sh.secrets)));
+    expect(classified(TYPED_VIEW_FIELDS.variables)).toEqual(keys(el(sh.variables)));
+    expect(classified(TYPED_VIEW_FIELDS.environments)).toEqual(keys(el(sh.environments)));
+    expect(classified(TYPED_VIEW_FIELDS.rulesets)).toEqual(keys(el(sh.rulesets)));
+    // nothing is both kept and dropped
+    for (const c of Object.values(TYPED_VIEW_FIELDS)) expect(new Set(classified(c)).size, JSON.stringify(c)).toBe(classified(c).length);
   });
 
   it('fix 1: a local record file that matches no record is untrusted, and no question is asked (G10-R-sec6)', async () => {

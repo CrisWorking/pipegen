@@ -48,11 +48,37 @@ export const MAX_CONFIRM_ENTRIES = 200;
 export const MAX_CONFIRM_TEXT = 200;
 
 /**
+ * The typed-trusted view's allow-list (G10-R5): for the record and each entry kind, the fields kept (shown in the question, or proven
+ * harmless by the review: shas, githubCreatedAt, unconfirmed, part, aiEdited, overwritten, createdAt, centralSha), the fields written fresh
+ * (present, but never taken from the record), and the fields dropped. A test holds this list to InstallRecordSchema's keys, so a field the
+ * schema gains later is absent from the view until someone classifies it on purpose.
+ */
+export const TYPED_VIEW_FIELDS = {
+  record: {
+    keep: ['schema', 'pipegenVersion', 'createdAt', 'centralSha', 'app', 'name', 'files', 'secrets', 'variables', 'environments', 'rulesets'],
+    fresh: ['edits', 'planned', 'serviceRoots', 'protectedPaths'],
+    drop: ['mergedAt', 'blockFrom', 'cosignPubSha256', 'central', 'scratch', 'orgRuleset', 'classicProtection', 'repoSettings'],
+  },
+  files: { keep: ['repo', 'path', 'part', 'shas', 'aiEdited', 'adopted'] },
+  secrets: { keep: ['name', 'scope', 'created', 'overwritten', 'githubCreatedAt', 'unconfirmed'] },
+  variables: { keep: ['name', 'scope', 'created', 'githubCreatedAt', 'unconfirmed'], drop: ['previous'] },
+  environments: { keep: ['name', 'created', 'githubCreatedAt', 'unconfirmed'], fresh: ['changed', 'branchPolicyIds'], drop: ['previous'] },
+  rulesets: { keep: ['kind', 'id', 'name', 'githubCreatedAt'] },
+} as const satisfies Record<string, { keep: readonly string[]; fresh?: readonly string[]; drop?: readonly string[] }>;
+
+/** A copy of exactly the listed own fields that are present (deep-copied). */
+function pick<T extends object>(o: T, keys: readonly string[]): Partial<T> {
+  const out: Record<string, unknown> = {};
+  for (const k of keys) if (Object.hasOwn(o, k) && (o as Record<string, unknown>)[k] !== undefined) out[k] = structuredClone((o as Record<string, unknown>)[k]);
+  return out as Partial<T>;
+}
+
+/**
  * The typed question's entries and the view of the record that typing grants, made by ONE function so they can't drift (G10-R-sec7, sec8).
  * The lines list every entry the view keeps, nothing filtered or cut: all files (adopted ones tagged), the secrets and variables (created or
  * not), the environments (created or not) and the rulesets (with their ids). The view holds exactly those names and the record's plain facts
- * (app, name, roots, protected paths, hashes). G10-R4: no edits, no variable `previous` values and no `planned` requests (payloads the
- * question never showed; pipegen re-derives its edits and re-plans this run). Every other ownership-bearing field (central
+ * (TYPED_VIEW_FIELDS, an allow-list, G10-R5). G10-R4: no edits, no variable `previous` values and no `planned` requests (payloads the
+ * question never showed; pipegen re-derives its edits and re-plans this run); no mergedAt, blockFrom or cosignPubSha256. Every other ownership-bearing field (central
  * and scratch repo ids and createdByPipegen, the central ruleset/CODEOWNERS/actions access, the org ruleset, classic protection, repo
  * settings, an environment's previous settings, changes and branch policy ids) is dropped: typing proves nothing about them.
  * Refused (never a partial or altered list): more than MAX_CONFIRM_ENTRIES entries, or an entry safeText would change or that is longer than
@@ -71,18 +97,19 @@ export function confirmView(r: InstallRecord): { lines: string[]; view: InstallR
   if (all.length > MAX_CONFIRM_ENTRIES) return { refused: `it lists more than ${MAX_CONFIRM_ENTRIES} entries, too many to confirm by typing` };
   if (all.some((x) => x.length > MAX_CONFIRM_TEXT || safeText(x, MAX_CONFIRM_TEXT) !== x)) return { refused: 'one of its entries can\'t be shown exactly (too long, or holding characters a terminal would hide or change)' };
   const lines = groups.filter(([, xs]) => xs.length > 0).map(([label, xs]) => `  ${label}: ${xs.join(', ')}`);
-  const view: InstallRecord = {
-    schema: r.schema, pipegenVersion: r.pipegenVersion, createdAt: r.createdAt, ...(r.mergedAt === undefined ? {} : { mergedAt: r.mergedAt }),
-    centralSha: r.centralSha, app: { ...r.app }, name: r.name, serviceRoots: [...r.serviceRoots],
-    // G10-R4: no edits (their payloads, the text to cut, the scripts and jobs to restore, the originals, were never shown; pipegen re-derives
-    // its own edits this run), no variable `previous` values, no `planned` requests (re-planned this run)
-    files: r.files.map((f) => ({ ...f, shas: [...f.shas] })), edits: [], secrets: r.secrets.map((x) => ({ ...x })),
-    variables: r.variables.map((x) => ({ name: x.name, scope: x.scope, created: x.created, ...(x.githubCreatedAt === undefined ? {} : { githubCreatedAt: x.githubCreatedAt }), ...(x.unconfirmed === true ? { unconfirmed: true as const } : {}) })),
-    environments: r.environments.map((e) => ({ name: e.name, created: e.created, ...(e.githubCreatedAt === undefined ? {} : { githubCreatedAt: e.githubCreatedAt }), ...(e.unconfirmed === true ? { unconfirmed: true as const } : {}), changed: [], branchPolicyIds: [] })),
-    rulesets: r.rulesets.map((x) => ({ ...x })),
-    planned: { signingMode: 'none', environments: [], owners: { app: [], central: [] }, codeOwners: [] }, protectedPaths: [...r.protectedPaths],
-    ...(r.cosignPubSha256 === undefined ? {} : { cosignPubSha256: r.cosignPubSha256 }), ...(r.blockFrom === undefined ? {} : { blockFrom: r.blockFrom }),
-  };
+  const f = TYPED_VIEW_FIELDS;
+  // G10-R5: the view is built field by field from the allow-list; a field not listed there (a new schema key included) is absent
+  const view = {
+    ...pick(r, f.record.keep),
+    // written fresh: this run re-derives its edits, re-plans, and writes the roots and protected paths from the draft
+    edits: [], planned: { signingMode: 'none', environments: [], owners: { app: [], central: [] }, codeOwners: [] }, serviceRoots: [], protectedPaths: [],
+    app: { ...r.app },
+    files: r.files.map((x) => pick(x, f.files.keep)),
+    secrets: r.secrets.map((x) => pick(x, f.secrets.keep)),
+    variables: r.variables.map((x) => pick(x, f.variables.keep)),
+    environments: r.environments.map((x) => ({ ...pick(x, f.environments.keep), changed: [], branchPolicyIds: [] })),
+    rulesets: r.rulesets.map((x) => pick(x, f.rulesets.keep)),
+  } as InstallRecord;
   return { lines, view };
 }
 
