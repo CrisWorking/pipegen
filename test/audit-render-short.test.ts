@@ -323,6 +323,37 @@ describe('short report: ranking, merging and plan limits', () => {
     expect(t).toContain('Already good: nothing yet');
   });
 
+  it('short: a check is "Already good" only when every row of it is covered (rate-stop shape, and one service covered but another missing)', () => {
+    const r = report();
+    const goodLine = (rows: Coverage[]) => {
+      const t = flat(renderTerminal({ ...r, coverage: rows, wouldAdd: [] }, SHORT));
+      return { t, good: t.split('\n').find((l) => l.startsWith('Already good:')) ?? '' };
+    };
+    // shape 1: under a rate stop the push row of a check is unknown while the merge row is covered
+    const rate = goodLine([
+      { need: need('push', 'sast', 'a'), status: 'unknown', why: 'Could not read the run history.' },
+      { need: need('merge', 'sast', 'a'), status: 'covered', by: 'codeql', why: 'ok.' },
+      { need: need('push', 'secrets'), status: 'covered', by: 'betterleaks', why: 'ok.' },
+    ]);
+    expect(rate.good).toContain('Secret scan');
+    expect(rate.good).not.toContain('Code scan');
+    expect(rate.t).toContain("Couldn't tell: 1 check");
+    // shape 2: covered on one service, missing on another
+    const two = goodLine([
+      { need: need('push', 'deps', 'web'), status: 'covered', by: 'osv', why: 'ok.' },
+      { need: need('push', 'deps', 'api'), status: 'missing', why: 'No dependency scan.' },
+      { need: need('push', 'lint', 'web'), status: 'covered', by: 'eslint', why: 'ok.' },
+    ]);
+    expect(two.good).toContain('Lint');
+    expect(two.good).not.toContain('Dependency');
+    // shape 3: covered on one service, unknown on another
+    const three = goodLine([
+      { need: need('push', 'lint', 'web'), status: 'covered', by: 'eslint', why: 'ok.' },
+      { need: need('push', 'lint', 'api'), status: 'unknown', why: 'Could not tell.' },
+    ]);
+    expect(three.good).toBe('Already good: nothing yet');
+  });
+
   it('short: a plan limit is printed only when one of its checks is in Fix first', () => {
     const r = report();
     // the fixture has a code scan gap (serious) and no merge lock; the gate is pipegen's own, never serious
@@ -360,6 +391,12 @@ describe('short report: ranking, merging and plan limits', () => {
     const withType = (projectType: NonNullable<RepoProfile['services'][number]['projectType']>): AuditReport => ({ ...r, profile: { ...r.profile, services: [{ ...svc, projectType }] } });
     const unsure = renderTerminal(withType({ types: ['server'], unsure: true, evidence: ['looks like a static site, but it has the server signs above'] }), SHORT);
     expect(unsure).toContain('Type: shop-api: server (unsure:');
+    // an unsure library, or a folder that is not standalone, is not treated as a server, and the line must not say it is
+    for (const types of [['library'], ['library', 'static-site']] as const) {
+      const lib = renderTerminal(withType({ types: [...types], unsure: true, evidence: ['no run script'] }), SHORT);
+      expect(flat(lib)).toContain('(unsure: --type sets it)');
+      expect(lib).not.toContain('treats it as a server');
+    }
     const set = renderTerminal(withType({ types: ['static-site'], unsure: false, overridden: true, evidence: ['set to static-site by you'] }), SHORT);
     expect(set).toContain('Type: shop-api: static-site (set by you) — set to static-site by you');
     // evidence is cut to three pieces in the short report, whole in the full one

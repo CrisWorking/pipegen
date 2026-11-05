@@ -217,8 +217,9 @@ export function buildShortDoc(r: AuditReport, c: RenderCtx): Doc {
 
   out.push('');
   const label = labelsOf(r);
-  const open = new Set(r.coverage.filter(isGap).map((x) => `${x.need.id}\u0000${groupOf(x)}`));
-  const good = [...new Set(r.coverage.filter((x) => x.status === 'covered' && !open.has(`${x.need.id}\u0000${groupOf(x)}`)).map((x) => c.v(label(x))))];
+  // a check is good only when EVERY row of it (all layers, all services) is covered: a missing, partial or unknown row keeps it out (U23)
+  const open = new Set(r.coverage.filter((x) => x.status !== 'covered').map((x) => x.need.id));
+  const good = [...new Set(r.coverage.filter((x) => x.status === 'covered' && !open.has(x.need.id)).map((x) => c.v(label(x))))];
   const goodShown = good.slice(0, MAX_GOOD);
   out.push(...wrap(`Already good: ${good.length === 0 ? 'nothing yet' : `${goodShown.join(', ')}${good.length > goodShown.length ? ` and ${num(good.length - goodShown.length)} more` : ''}`}`, '', '  '));
   const skipped = notNeededLine(r, c);

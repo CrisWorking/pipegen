@@ -355,7 +355,8 @@ export function typeText(c: RenderCtx, s: AuditReport['profile']['services'][num
   const shown = all ? ev : ev.slice(0, MAX_TYPE_EVIDENCE);
   const more = ev.length - shown.length;
   const types = t.types.length === 0 ? 'unknown' : t.types.join(', ');
-  const unsure = t.unsure ? ' (unsure: pipegen treats it as a server; --type sets it)' : '';
+  // a library or not-standalone folder is not treated as a server, so the line must not say it is (final review, minor 2)
+  const unsure = !t.unsure ? '' : t.types.includes('server') ? ' (unsure: pipegen treats it as a server; --type sets it)' : ' (unsure: --type sets it)';
   const set = t.overridden === true ? ' (set by you)' : '';
   const why = shown.length === 0 ? '' : ` — ${shown.join('; ')}${more > 0 ? `; and ${num(more)} more (--verbose)` : ''}`;
   return `${c.v(s.name)}: ${types}${unsure}${set}${why}`;
