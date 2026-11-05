@@ -254,6 +254,31 @@ describe('choose: dead code, duplication, dockerfile', () => {
   });
 });
 
+describe('choose: hooks-ci', () => {
+  const hooksCi = (precommit: RepoProfile['precommit'], list: ReviewedTool[] = LIST) => {
+    const n: Need = { id: 'hooks-ci', layer: 'push', category: 'hooks-ci', why: '', blocking: true, floor: true };
+    return chooseTools(n, undefined, profile([svc()], { precommit }), caps, list);
+  };
+  const withLefthook = [...LIST, fixtureTool('lefthook', ['hooks-ci'])];
+  it('hooks-ci with pre-commit → built-in pre-commit run, no lefthook', () => {
+    const c = hooksCi('pre-commit', withLefthook);
+    expect(c.tool).toEqual({ kind: 'built-in' });
+    expect(c.also).toEqual([]);
+    expect(c.note).toContain('pre-commit run --all-files');
+    expect(c.note).not.toContain('lefthook');
+  });
+  it('hooks-ci with another hook manager → never a second manager next to it', () => {
+    expect(hooksCi('lefthook', withLefthook).tool).toEqual({ kind: 'built-in' });
+    expect(hooksCi('lefthook', withLefthook).note).toContain('lefthook run pre-commit');
+    const husky = hooksCi('husky', withLefthook);
+    expect(husky.tool).toBeNull();
+    expect(husky.note).not.toMatch(/lefthook/);
+  });
+  it('hooks-ci with no hook manager keeps the reviewed pick', () => {
+    expect(idOf(hooksCi(null, withLefthook).tool)).toBe('lefthook');
+  });
+});
+
 describe('choose: workflows, dependencies, licences', () => {
   const wf = (triggers: string[]): ExistingWorkflow => ({ path: '.github/workflows/a.yml', triggers, deploys: false, [USED]: [], jobs: ['a'] });
   it('choose: pull_request_target → workflow-lint also poutine; plain triggers → zizmor only', () => {
@@ -261,8 +286,19 @@ describe('choose: workflows, dependencies, licences', () => {
     expect(idOf(risky.tool)).toBe('actionlint');
     expect(alsoIds(risky)).toEqual(['zizmor', 'poutine']);
     expect(alsoIds(choose('workflow-lint', profile([svc()], { existingWorkflows: [wf(['push'])] })))).toEqual(['zizmor']);
-    expect(alsoIds(choose('workflow-lint', profile([svc()], { existingWorkflows: [wf(['workflow_run'])] })))).toContain('poutine');
     expect(alsoIds(choose('workflow-lint', profile([svc()], { existingWorkflows: [wf(['issue_comment'])] })))).toContain('poutine');
+  });
+  it('choose: workflow_run only → zizmor alone', () => {
+    const c = choose('workflow-lint', profile([svc()], { existingWorkflows: [wf(['workflow_run'])] }));
+    expect(alsoIds(c)).toEqual(['zizmor']);
+    expect(c.note).not.toContain('poutine');
+  });
+  it('choose: pull_request_target → zizmor + poutine, and the note names the trigger', () => {
+    const c = choose('workflow-lint', profile([svc()], { existingWorkflows: [wf(['push']), wf(['pull_request_target'])] }));
+    expect(alsoIds(c)).toEqual(['zizmor', 'poutine']);
+    expect(c.note).toContain('pull_request_target');
+    const both = choose('workflow-lint', profile([svc()], { existingWorkflows: [wf(['issue_comment', 'pull_request_target'])] }));
+    expect(both.note).toContain('pull_request_target and issue_comment');
   });
   it('choose: pinact; an actions lock adds the note', () => {
     expect(idOf(choose('workflow-pin-check', profile()).tool)).toBe('pinact');

@@ -141,6 +141,7 @@ import type { Capabilities, ExistingWorkflow, Need, RepoProfile } from '../types
 import { safeText } from '../util/safe-text.js';
 import { coverageMinimumRow, frameworkAdjust, publishingCoverage, updateConfigCoverage, versionAdjust } from './config-checks.js';
 import { DEPLOY_VERIFY_WHY, Dirs, Firsts, GATE_WHY, Scope, ciCoverage, firstPartialHit, hookCoverage, type Decide } from './coverage/decide.js';
+import { creditEquivalents } from './coverage/equivalents.js';
 import { hookRunHits, readHooks } from './coverage/hooks.js';
 import { compile, loadToolSignatures } from './coverage/signatures.js';
 import { fitOf, parseOn, scheduleFires, type BranchGuess } from './coverage/triggers.js';
@@ -163,6 +164,15 @@ export interface Coverage {
    * failed: that run (workflow path, branch, conclusion, day as YYYY-MM-DD or null).
    */
   lastRun?: { workflow: string; branch: string; conclusion: string; date: string | null };
+  /**
+   * DECISIONS #122 (J3a): the row is covered because the repo already has an equivalent of the check, not the plain
+   * one: plain English for the report, pipegen's own words (a tool id or a branch name cleaned by safeText at most).
+   * Always with `creditKind`. Dropped again when a later step makes the row partial (applyLastRuns).
+   */
+  credit?: string;
+  creditKind?: 'push-default' | 'hooks-ci' | 'signing';
+  /** Internal (J3a, S5): set by ciCoverage on a push row that is partial only for want of an every-push trigger; `why` is that row's own text. Not for output. */
+  trigger?: { kind: 'not-every-push'; why: string };
 }
 
 export interface MapCoverageOptions {
@@ -287,7 +297,9 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
     } else rows.push(ciCoverage(need, need.layer, d));
   }
   // PS22: the last steps, so the chooser reads the adjusted row
-  return unsupportedStack(licenceInstall(noLockfile(frameworkAdjust(versionAdjust(rows, p), p), p), p), p);
+  // DECISIONS #122 (J3a): after every adjuster, so a credit reads each row's final status
+  const adjusted = unsupportedStack(licenceInstall(noLockfile(frameworkAdjust(versionAdjust(rows, p), p), p), p), p);
+  return creditEquivalents(adjusted, d, ctx, p, hooks, opts.branchGuess === undefined ? {} : { branchGuess: opts.branchGuess });
 }
 
 /**

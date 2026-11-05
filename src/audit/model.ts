@@ -65,6 +65,7 @@ import { safeText } from '../util/safe-text.js';
 import { ConsentToken, CountingSummary, isSpent, spend } from './consent-token.js';
 import { chooseTools, skippedGroups, wouldSetSettings, type SkippedGroup, type WouldSet } from './choose.js';
 import { mapCoverage, type Coverage } from './coverage.js';
+import { PUSH_CREDIT_WARNING } from './coverage/equivalents.js';
 import { applyDefaultSetup, applyLastRuns, coveringWorkflow, type RunAnswer } from './github-signals.js';
 
 // ---------- types ----------
@@ -459,6 +460,7 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
   const signalsUnread: GitHubFact[] = [];
   coverage = await defaultSetupRows(deps, profile, coverage, signalsUnread);
   coverage = await lastRunRows(deps, profile, coverage, signalsUnread, notes);
+  for (const n of creditNotes(coverage, profile)) notes.add(n);
   const wouldSet = wouldSetFor.map((x) => wouldSetSettings(x, coverage, skippedWf)).reduce((a, b) => same(a, b));
   const wouldAdd = wouldAddRows(profile, coverage, deps, caps);
 
@@ -590,6 +592,15 @@ async function defaultSetupRows(deps: AuditDeps, p: RepoProfile, rows: Coverage[
   }
   if (setup.state === 'unknown' && setup.why === RATE_WHY.setup) unread.push('code-scanning-setup');
   return applyDefaultSetup(rows, setup, p);
+}
+
+/** The notes a credited row (DECISIONS #122) brings: what the credit leaves unchecked, and the private-repo signing warning (S17). */
+const KEYLESS_PRIVATE_NOTE = "If the release signing is keyless (no key given to cosign), it writes this private repo's and workflow's names to the public Sigstore log.";
+export function creditNotes(rows: readonly Coverage[], p: RepoProfile): string[] {
+  const out: string[] = [];
+  if (rows.some((r) => r.status === 'covered' && r.creditKind === 'push-default')) out.push(PUSH_CREDIT_WARNING);
+  if (p.private && rows.some((r) => r.status === 'covered' && r.creditKind === 'signing')) out.push(KEYLESS_PRIVATE_NOTE);
+  return out;
 }
 
 /** One row per need of either world: the row when both worlds agree on it, else unknown with RATE_WHY. */

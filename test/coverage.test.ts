@@ -1361,11 +1361,12 @@ describe('mapCoverage (Task 5, item 3: pre-commit hook contents)', () => {
     wf(dir, 'pre-commit.yaml', `on:\n  pull_request:\n  push:\n    branches: [main, stable]\n${job(run(FLASK_PRECOMMIT))}`);
     const rows = await coverage(dir, pyApp);
     expect(row(rows, 'merge', 'hooks-ci')).toMatchObject({ status: 'covered', by: 'pre-commit' });
-    expect(row(rows, 'push', 'hooks-ci').status).toBe('partial'); // feature-branch pushes don't run it
+    // feature-branch pushes don't run it, but every pull request and every push to the default branch do (J3a, credit 1)
+    expect(row(rows, 'push', 'hooks-ci')).toMatchObject({ status: 'covered', creditKind: 'push-default', by: 'pre-commit' });
     const lint = row(rows, 'merge', 'lint', 'app');
     expect(lint).toMatchObject({ status: 'covered', by: 'ruff', where: '.github/workflows/pre-commit.yaml (job scan) → .pre-commit-config.yaml' });
     expect(lint.why).toBe('The ruff check in the pre-commit hooks runs on every pull request.');
-    expect(row(rows, 'push', 'lint', 'app').status).toBe('partial');
+    expect(row(rows, 'push', 'lint', 'app')).toMatchObject({ status: 'covered', creditKind: 'push-default' });
     // the pre-commit/action runs `pre-commit run --all-files` by default
     const dir2 = makeTempDir();
     writeIn(dir2, '.pre-commit-config.yaml', hookConfig('      - id: ruff\n'));
