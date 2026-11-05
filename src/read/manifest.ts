@@ -6,6 +6,10 @@ export type Obj = Record<string, unknown>;
 export const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 /** Source files scanned for env var references and port defaults. */
 export const CODE_FILE_RE = /\.(js|mjs|cjs|jsx|ts|tsx|mts|cts|py)$/;
+/** A plain repo-relative path: letters, digits and . _ / - only, no leading / or -, no `..` segment (the same rule as the renderer's PLAIN_REL_RE, which the reader may not import). */
+export const PLAIN_PATH_RE = /^(?![-/])(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/-]{1,200}$/;
+/** A PORT default in code, one line at a time: `process.env.PORT || 3000`, `PORT ?? '8080'`, `port=8000`, `('PORT', 5000)`. Group 1 is the port. */
+export const PORT_RULES: readonly RegExp[] = [/\bPORT\b[^\n]{0,40}?(?:\|\||\?\?)\s*['"]?(\d{2,5})\b/, /\bport\s*=\s*(\d{2,5})\b/i, /\bPORT['"]\s*,\s*['"]?(\d{2,5})\b/];
 /** pip requirements files, matched on the file name (requirements.txt, requirements-dev.txt, ...). */
 export const REQUIREMENTS_FILE_RE = /^requirements.*\.txt$/;
 

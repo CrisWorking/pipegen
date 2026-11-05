@@ -8,14 +8,14 @@ import * as childProcess from 'node:child_process';
 import { bundleCode, COUNTING_ONLY_NOTE, EXCLUDED_PATTERNS, redact } from '../src/ai/redact.js';
 import { ignoreBudgetNote } from '../src/read/gitignore.js';
 import { mapCoverage } from '../src/audit/coverage.js';
-import { buildAudit, CURRENT_MILESTONE, type AuditDeps, type AuditReport } from '../src/audit/model.js';
+import { buildAudit, buildsNoImage, CURRENT_MILESTONE, needLabel, type AuditDeps, type AuditReport } from '../src/audit/model.js';
 import { renderJson, renderMarkdown, renderTerminal } from '../src/audit/render.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { floorNeeds, jobCategories } from '../src/engine/needs.js';
 import { estimate } from '../src/estimate/estimate.js';
 import { readProject } from '../src/read/project.js';
 import { skippedWorkflowCount } from '../src/read/workflows.js';
-import { DEFAULT_MODEL, type Capabilities, type RepoProfile, type ReviewedTool } from '../src/types.js';
+import { DEFAULT_MODEL, type Capabilities, type RepoProfile, type ReviewedTool, type Service } from '../src/types.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 import { fake } from './helpers/secret-repo.js';
 
@@ -1273,5 +1273,44 @@ describe('buildAudit: the audit respects .gitignore (Plan J J1, DECISIONS #126)'
     const b = await bundleCode(dir);
     expect(b.files.map((f) => f.path).some((p) => p.startsWith('d000'))).toBe(false);
     expect(b.notes).toContain(ignoreBudgetNote('ignored'));
+  });
+});
+
+describe('buildAudit: a static site gets no image, DAST or Dockerfile checks (Plan J J2, DECISIONS #121)', () => {
+  const deployWf = (run: string) => `name: deploy\non:\n  push:\n    branches: [main]\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm ci && npm run build\n      - run: ${run}\n`;
+  const shapes: Record<string, string>[] = [
+    {
+      'package.json': JSON.stringify({ name: 'site', scripts: { dev: 'next dev', build: 'next build', test: 'vitest run' }, dependencies: { next: '15.0.0', react: '19.0.0' }, devDependencies: { vitest: '1.0.0' } }),
+      'next.config.ts': "import type { NextConfig } from 'next';\nconst nextConfig: NextConfig = { output: 'export' };\nexport default nextConfig;\n",
+      'app/page.tsx': 'export default function Page() { return null; }\n',
+      '.github/workflows/deploy.yml': deployWf('npx wrangler pages deploy out'),
+    },
+    {
+      'package.json': JSON.stringify({ name: 'docs', scripts: { dev: 'vite', build: 'vite build', preview: 'vite preview' }, devDependencies: { vite: '7.0.0' } }),
+      'src/main.ts': 'document.body.textContent = "hi";\n',
+      '.github/workflows/pages.yml': deployWf('netlify deploy --prod --dir dist'),
+    },
+  ];
+  it('static-site service: no image, DAST, API DAST or Dockerfile rows, the skipped list says why, and a private repo gets a warning-only release signing row', async () => {
+    for (const files of shapes) {
+      for (const priv of [false, true]) {
+        const r = await buildAudit(repo(files), deps(priv ? { context: { private: true, ownerType: 'User', plan: 'free', defaultBranch: 'main' }, capabilities: bareCaps } : {}));
+        const s = r.profile.services[0] as Service;
+        expect(s.projectType?.types).toEqual(['static-site']);
+        expect(s.projectType?.evidence.join('\n')).toMatch(/deploys with/);
+        const cats = r.coverage.map((c) => c.need.category);
+        for (const c of ['image-build', 'image-scan', 'dast', 'api-dast', 'dockerfile-lint']) expect(cats, c).not.toContain(c);
+        for (const c of ['secrets', 'deps', 'sast', 'workflow-lint', 'workflow-pin-check', 'gate']) expect(cats, c).toContain(c);
+        expect(r.wouldCreate.map((w) => w.what)).not.toContain('docker');
+        const skipped = r.skipped.find((g) => g.why === 'this service is a static site: nothing runs as a server or in a container');
+        expect(skipped?.categories).toEqual(expect.arrayContaining(['image-build', 'image-scan', 'dast', 'api-dast']));
+        const signing = r.coverage.filter((c) => c.need.category === 'signing');
+        if (priv) {
+          expect(signing).toHaveLength(1);
+          expect(signing[0]?.need.blocking).toBe(false);
+          expect(needLabel('signing', { noImage: buildsNoImage(signing[0]!.need, r.profile) })).toBe('Release signing');
+        } else expect(signing.every((c) => c.need.blocking)).toBe(true);
+      }
+    }
   });
 });

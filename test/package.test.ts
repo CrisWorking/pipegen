@@ -37,6 +37,22 @@ function codeOf(text: string): string {
   }).join('\n');
 }
 
+/**
+ * Plan J J2 bundles sucrase (it strips TypeScript from a next.config.ts before acorn parses it). Its transforms hold the import lines they
+ * write as template text (`import {createRequire as ...} from "module"`, `from "${this.jsxImportSource}"`), which the text scan can't tell
+ * from code. So the scan leaves out the modules under `node_modules/sucrase/` (each starts at esbuild's `// node_modules/...` path line and
+ * runs to the next one), and the build test proves from esbuild's metafile that those modules import nothing outside the bundle.
+ */
+const TEXT_TEMPLATE_PACKAGES = ['sucrase'];
+function withoutTemplatePackages(raw: string): string {
+  let skipping = false;
+  return raw.split('\n').filter((line) => {
+    const m = /^\/\/ (node_modules\/(?:@[^/]+\/)?[^/]+|src)\//.exec(line);
+    if (m !== null) skipping = TEXT_TEMPLATE_PACKAGES.some((p) => m[1] === `node_modules/${p}`);
+    return !skipping;
+  }).join('\n');
+}
+
 describe('package', () => {
   it('codeOf (M5): a line that starts with a one-line comment and goes on with code is still scanned', () => {
     const code = codeOf(['/* @__PURE__ */ require("x")', '  /* a */ /* b */ import y from "y";', '// from "c"', ' * from "d"', '/**', '/* open', 'const z = 1; /* trailing */'].join('\n'));
@@ -106,7 +122,13 @@ describe('build', () => {
     // the release build refuses PENDING review entries: isReleaseBuild() is bundled as `return true`
     expect(raw).toMatch(/function isReleaseBuild\(\) \{\n\s*return true;/);
     // comments left out (the bundled Anthropic SDK's doc comments say things like "from 'queued' to 'starting'")
-    const out = codeOf(raw);
+    const out = codeOf(withoutTemplatePackages(raw));
+    expect(out.length).toBeGreaterThan(raw.length / 2); // the cut leaves most of the bundle to scan
+    // the modules the text scan leaves out import nothing outside the bundle (esbuild's metafile lists every import of every input)
+    const meta = JSON.parse(readFileSync(resolve(root, '.build/meta.json'), 'utf8')) as { inputs: Record<string, { imports: { path: string; external?: boolean }[] }> };
+    const left = Object.entries(meta.inputs).filter(([f]) => TEXT_TEMPLATE_PACKAGES.some((p) => f.startsWith(`node_modules/${p}/`)));
+    expect(left.length).toBeGreaterThan(0);
+    for (const [f, input] of left) for (const i of input.imports) expect(i.external !== true || isBuiltin(i.path), `${f} imports ${i.path}`).toBe(true);
     expect(readdirSync(resolve(root, 'dist'))).toEqual(['cli']); // no chunk next to main.js
     // Plan G G0 (carry E-b12, ruling S20): the JUnit worker entry is the one other file, next to main.js
     expect(readdirSync(resolve(root, 'dist/cli')).sort()).toEqual(['junit-thread.js', 'main.js']);

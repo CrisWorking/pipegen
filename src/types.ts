@@ -34,6 +34,21 @@ export interface RuntimeEnv {
 }
 /** P55 (batch B): a one-shot script, a folder built into another service's image, or an email-template package. */
 export type NotStandalone = 'one-shot' | 'built-in-image' | 'email-templates';
+/**
+ * Plan J J2 (DECISIONS #121): what a service is. `static-site` drops the image, Dockerfile and DAST checks (isRunnable) unless the service is
+ * also a `container`; `library` and `cli` change no check in v0.2 (F10); `server` = the runnable test of today (baseRunnable) and not static.
+ */
+export type ServiceType = 'static-site' | 'library' | 'cli' | 'server' | 'container';
+/**
+ * The detected type of a service (src/read/project-type.ts), never from the AI. `types` in the fixed order static-site, library, cli, server,
+ * container (several may hold; empty = none of them). `evidence`: one short line per fact, fixed wording plus repo-relative paths that pass
+ * PLAIN_PATH_RE only (S14), never repo text; show it through safeText. `unsure`: it looks like a static site but a server sign or an unreadable
+ * config was found, so it is not static (#121: the stricter type wins). `overridden`: set by applyTypeOverrides (`--type`, the type prompt);
+ * Plan G writes overridden types into PIPEGEN.md.
+ */
+export interface ProjectType { types: ServiceType[]; evidence: string[]; unsure: boolean; overridden?: true }
+/** Plan J J2: static hosts a workflow deploys to (evidence for a static site only; a host alone never makes one). */
+export type StaticHost = 'cloudflare-pages' | 'netlify' | 'github-pages' | 'firebase-hosting';
 export interface Service {
   name: string; path: string; language: Language; packageManager?: PackageManager; runtimeVersion?: string;
   /** P60 (R4): other languages the folder also holds (a Python app with a package.json for its asset build): tools of these cover it too. Set only when not empty. */
@@ -52,6 +67,7 @@ export interface Service {
   notStandalone?: NotStandalone;   // P55 (batch B): why this folder isn't a service of its own although it has a start or dev script (src/read/service-kind.ts). isRunnable is then false. Set only when true
   publishedPackage?: boolean;   // Plan U Task 5: the repo's only service, and a workflow publishes it to its registry (npm for node, PyPI for python). Set only when true. isRunnable then ignores a port found in its code (a library's default port isn't a server)
   quality: ServiceQuality;      // Plan P Task 1 (src/read/quality.ts): the facts the quality and supply-chain checks read. Always set; emptyServiceQuality() when nothing is known
+  projectType?: ProjectType;    // Plan J J2 (DECISIONS #121, ruling S4): set by readProject for every service (projectTypeOf, then finishProjectTypes after the workflow pass). Absent = today's rules (a hand-built profile)
 }
 // Plan P Task 1. Ruling PS5 left out what no task reads: QualityPackage 'jscpd', QualityConfig 'jscpd'/'hadolint', RepoFiles.rego.
 export type UiFramework = 'next' | 'nuxt' | 'vue' | 'svelte' | 'astro' | 'react-native';
@@ -72,6 +88,7 @@ export interface ExistingWorkflow {
   tagPinned?: number;   // Task 9 (PS36): how many `uses:` lines (steps and called workflows) point at an action by tag or branch, not by a 40-character commit. Absent = none
   usesUnchecked?: true;   // Task 9: a `uses:` line was too odd to check (regexSafe), so tagPinned may be too low
   publishes?: ('npm' | 'pypi')[];   // Plan U Task 5: registries a step publishes to (a run line that starts with a publish command, or the PyPI publish action). Absent = none
+  staticHosts?: StaticHost[];   // Plan J J2: static hosts a step deploys to (a run line that starts with wrangler pages deploy, netlify deploy or firebase deploy --only hosting; actions/deploy-pages, peaceiris/actions-gh-pages; cloudflare/wrangler-action with a pages deploy command), sorted. Absent = none
 }
 export type Plan = 'free' | 'pro' | 'team' | 'enterprise' | 'unknown';
 export type OtherHookManager = 'simple-git-hooks' | 'githooks' | 'husky-v4' | 'yorkie' | 'pre-commit-npm' | 'overcommit' | 'linked-config';

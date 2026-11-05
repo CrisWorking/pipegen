@@ -19,7 +19,7 @@ import { posix } from 'node:path';
 import { asString, baseOf, dirOf, inDir } from './manifest.js';
 import { regexLines, regexSafe } from './limits.js';
 import type { Obj } from './manifest.js';
-import type { NotStandalone } from '../types.js';
+import type { NotStandalone, Service } from '../types.js';
 
 /** Files read to prove a script one-shot (the entry and what it imports), and the size of each. */
 const MAX_ONE_SHOT_FILES = 12;
@@ -27,7 +27,8 @@ const MAX_ONE_SHOT_BYTES = 64 * 1024;
 /** Dockerfiles read for COPY lines, and COPY sources kept. */
 const MAX_DOCKERFILES = 20;
 const MAX_COPY_SOURCES = 400;
-const RUN_SCRIPTS = ['start', 'dev', 'serve'];
+/** The scripts that run a service (isRunnable and the type rules read the same list). */
+export const RUN_SCRIPTS: readonly string[] = ['start', 'dev', 'serve'];
 
 /** The email-template tools whose package is a design-time tool, by dependency name. */
 const EMAIL_TOOLS = ['react-email', '@react-email/components', '@react-email/render', 'mjml', '@maizzle/framework', 'maizzle'];
@@ -43,7 +44,7 @@ const FUNCTION_NAME_RE = /\bfunction\s*\*?\s*([A-Za-z_$][A-Za-z0-9_$]*)|\b(?:con
 /** P57 (I1): a call: a name right before `(` (one pass per line). */
 const CALL_RE = /(?<![A-Za-z0-9_$.])([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g;
 /** P57 (I1): dependencies that make a package a server (it listens), whatever else it uses. */
-const SERVER_DEPS = ['hono', '@hono/node-server', 'h3', 'elysia', 'express', 'fastify', 'koa', '@nestjs/core', 'next', 'nuxt', '@remix-run/node', '@remix-run/serve',
+export const SERVER_DEPS: readonly string[] = ['hono', '@hono/node-server', 'h3', 'elysia', 'express', 'fastify', 'koa', '@nestjs/core', 'next', 'nuxt', '@remix-run/node', '@remix-run/serve',
   '@sveltejs/kit', 'astro', 'nitropack', '@hapi/hapi', 'restify', 'polka', 'micro', 'srvx', 'socket.io', 'ws', 'graphql-yoga', '@apollo/server', 'apollo-server'];
 /** P57 (I1): the email tools' own CLIs (react-email's `email`, mjml, maizzle), optionally through npx / bunx / pnpm exec. */
 const EMAIL_CLI_RE = /^(?:(?:npx|bunx|pnpm exec|yarn)\s+)?(?:email|mjml|maizzle)(?:\s|$)/;
@@ -177,4 +178,16 @@ export async function notStandaloneOf(k: KindInput): Promise<NotStandalone | und
 /** The Dockerfiles of the repo (Dockerfile, Dockerfile.x, x.Dockerfile), at most MAX_DOCKERFILES, sorted. */
 export function dockerfilesOf(fileSet: ReadonlySet<string>): string[] {
   return [...fileSet].filter((f) => /^(?:Dockerfile(?:\.[A-Za-z0-9_.-]+)?|[A-Za-z0-9_.-]+\.Dockerfile)$/.test(baseOf(f))).sort().slice(0, MAX_DOCKERFILES);
+}
+
+/**
+ * Plan J J2 (ruling S1): the runnable test of isRunnable before project types (src/engine/needs.ts re-exports it). A start, dev or serve script,
+ * a server framework, a port, or a Dockerfile; never a folder that isn't standalone (P55). Plan U Task 5: a package the repo publishes needs a
+ * real server entry (a script, a framework or a Dockerfile); a port number in its code alone (Flask's `app.run(port=5000)` default) doesn't
+ * make it one. The `server` type is this test on a service that isn't static.
+ */
+export function baseRunnable(s: Pick<Service, 'notStandalone' | 'scripts' | 'frameworks' | 'port' | 'publishedPackage' | 'dockerfile'>): boolean {
+  if (s.notStandalone !== undefined) return false; // P55 (batch B): a one-shot script, built into another image, or an email-template package
+  return s.scripts.some((n) => RUN_SCRIPTS.includes(n)) || s.frameworks.length > 0 || (s.port !== undefined && s.publishedPackage !== true)
+    || (s.dockerfile ?? '') !== '';
 }
