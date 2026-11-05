@@ -49,6 +49,8 @@ import { readDefaultSetup, type DefaultSetup } from '../github/code-scanning-set
 import { lastCompletedRun } from '../github/workflow-runs.js';
 import { signingMode } from '../github/signing-mode.js';
 import { readHeadCommit, type HeadCommit } from '../read/git-head.js';
+import { readGitIndexPaths } from '../read/git-index.js';
+import { loadIgnore } from '../read/gitignore.js';
 import { IGNORED_DIRS, listFiles, READ_LIMITS, readTextLimited, readTextLimitedWithReason } from '../read/limits.js';
 import { readProject } from '../read/project.js';
 import { supportLevel } from '../read/support.js';
@@ -812,9 +814,16 @@ function nameLooksSecret(path: string): boolean {
 /**
  * Secret-like text in the files on disk now: every listed file (symlinks never followed; dependency and build folders
  * skipped, like every reader), lstat, then the limited reader, then findSecretLike. Rule names and file names only.
+ *
+ * Plan J J1 (DECISIONS #126): a file git ignores is skipped only when git's index can be read AND the file isn't in it
+ * (it isn't committed). A committed file is always checked, even when .gitignore lists it (Review Focus #3: a
+ * force-added .env.production), and with no readable index nothing is skipped (the check as it was before J1).
  */
 async function scanTree(dir: string, notes: Notes): Promise<SecretInTree[]> {
   const listing = await listFiles(dir, ['**/*'], IGNORED_DIRS.map((d) => `**/${d}/**`));
+  const index = await readGitIndexPaths(dir);
+  const ignore = index === null ? null : await loadIgnore(dir);
+  let gitIgnored = 0;
   const rows: SecretInTree[] = [];
   let more = 0;
   let bytes = 0;
@@ -826,6 +835,10 @@ async function scanTree(dir: string, notes: Notes): Promise<SecretInTree[]> {
     else more++;
   };
   for (const path of [...listing.files].sort()) {
+    if (index !== null && ignore !== null && !index.has(path) && ignore.ignored(path)) {
+      gitIgnored++;
+      continue;
+    }
     const hidden = nameLooksSecret(path);
     const file = hidden ? NAME_HIDDEN : path;
     const extra = isExcludedPath(path) ? { note: EXCLUDED_NOTE } : {};
@@ -852,6 +865,8 @@ async function scanTree(dir: string, notes: Notes): Promise<SecretInTree[]> {
     for (const rule of findSecretLike(text).sort()) add({ file, rule, ...extra });
   }
   notes.add(SKIPPED_DIRS_NOTE);
+  if (gitIgnored > 0) notes.add(`The quick secret check skipped ${gitIgnored === 1 ? '1 file' : `${gitIgnored} files`} git ignores (not committed).`);
+  for (const n of ignore?.notes ?? []) notes.add(n);
   if (listing.truncated) notes.add('The quick secret check stopped listing files at the file limit; the rest were not checked.');
   if (stopped) notes.add(`The quick secret check stopped after ${MAX_SCAN_BYTES / 1_000_000} MB of files; the rest were not checked.`);
   if (tooLarge > 0) notes.add(`The quick secret check skipped ${tooLarge === 1 ? '1 file' : `${tooLarge} files`} larger than 1 MB.`);

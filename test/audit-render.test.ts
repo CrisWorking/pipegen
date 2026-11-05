@@ -315,6 +315,9 @@ describe('rulings', () => {
     const lines = excludedSummaryLines();
     expect(lines).toEqual([
       ...EXCLUDED_PATTERN_GROUPS.map((g) => `- ${g.label}: ${g.summary}`),
+      // Plan J J1 (DECISIONS #126, ruling S12)
+      '- files your .gitignore lists',
+      "- files that aren't committed, when pipegen can read git's file list (.git/index)",
       '- binary files (images, archives, compiled programs), found by their content',
       `kept: ${EXCLUDED_KEPT.join(', ')}`,
     ]);

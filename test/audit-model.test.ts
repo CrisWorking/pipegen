@@ -1092,3 +1092,86 @@ describe('applyDefaultSetup: a language CodeQL can\'t scan (P57 M5)', () => {
     expect(rows[0]?.why).toContain("doesn't scan PHP code");
   });
 });
+
+describe('buildAudit: the audit respects .gitignore (Plan J J1, DECISIONS #126)', () => {
+  /** git with no user or system config; test setup only (pipegen itself never runs git). */
+  const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', HOME: '/nonexistent' };
+  const git = (dir: string, ...args: string[]) => childProcess.execFileSync('git', args, { cwd: dir, stdio: 'pipe', env: GIT_ENV });
+  /** A real git repo with a GitHub origin: `git add .` (so .gitignore decides what is tracked), then `git add -f` of `force`. */
+  function gitRepo(files: Record<string, string>, force: string[] = []): string {
+    const dir = makeTempDir();
+    for (const [rel, body] of Object.entries(files)) writeIn(dir, rel, body);
+    git(dir, 'init', '-q');
+    git(dir, 'remote', 'add', 'origin', 'https://github.com/o/r.git');
+    git(dir, 'add', '.');
+    if (force.length > 0) git(dir, 'add', '-f', '--', ...force);
+    vi.clearAllMocks(); // the setup's git calls are not the audit's
+    return dir;
+  }
+  const skippedNote = (n: number) => `The quick secret check skipped ${n === 1 ? '1 file' : `${n} files`} git ignores (not committed).`;
+
+  it('tracked but ignored file → secret check reads it, bundle drops it', async () => {
+    const stripe = fake.stripeKey();
+    const gh = fake.githubClassic();
+    const dir = gitRepo({
+      ...nodeApp(),
+      '.gitignore': '.env.production\ngenerated/\n',
+      '.env.production': `STRIPE=${stripe}\n`,
+      'generated/keys.ts': `export const t = '${gh}';\n`,
+      'src/a.ts': 'export const a = 1;\n',
+    }, ['.env.production', 'generated/keys.ts']);
+    const r = await buildAudit(dir, deps());
+    // committed, so the quick secret check reads both although .gitignore lists them
+    expect(r.secretsInTree).toEqual(expect.arrayContaining([
+      { file: '.env.production', rule: 'stripe-key', note: EXCLUDED_NOTE },
+      { file: 'generated/keys.ts', rule: 'github-token' },
+    ]));
+    expect(r.notes.some((n) => n.includes('git ignores'))).toBe(false);
+    // never in the AI bundle: package.json, index.js, .gitignore, src/a.ts
+    expect(r.aiBundle.topFolders).toEqual(['src']);
+    expect(r.aiBundle.files).toBe(4);
+    for (const v of [stripe, gh]) expect(anyContains(r, v), v.slice(0, 4)).toBe(false);
+    expect(childProcess.execFile).not.toHaveBeenCalled();
+    expect(childProcess.execFileSync).not.toHaveBeenCalled();
+    expect(childProcess.spawn).not.toHaveBeenCalled();
+  });
+
+  it("static export shape: .next/ and out/ ignored, not tracked → never in the bundle's top folders", async () => {
+    const aws = fake.awsKey();
+    const dir = gitRepo({
+      'package.json': JSON.stringify({ name: 'site', scripts: { build: 'next build', test: 'vitest run' }, dependencies: { next: '15.0.0' } }),
+      'next.config.mjs': "export default { output: 'export' };\n",
+      '.gitignore': '/.next/\n/out/\n',
+      'src/pages/index.tsx': 'export default function Home() { return null; }\n',
+      'src/pages/about.tsx': 'export default function About() { return null; }\n',
+      'docs/readme.md': '# site\n',
+      // build output: many more files than the source, a key baked into the built site
+      ...Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`.next/cache/webpack/chunk${i}.js`, `var c${i} = ${i};\n`])),
+      ...Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`out/_next/static/page${i}.js`, `var p${i} = ${i};\n`])),
+      'out/index.html': `<script>var k = '${aws}';</script>\n`,
+    });
+    const r = await buildAudit(dir, deps());
+    expect(r.aiBundle.topFolders).not.toContain('.next');
+    expect(r.aiBundle.topFolders).not.toContain('out');
+    expect([...r.aiBundle.topFolders].sort()).toEqual(['docs', 'src']);
+    // not committed and ignored: the quick secret check skips them, and says so
+    expect(r.secretsInTree).toEqual([]);
+    expect(r.notes).toContain(skippedNote(21));
+    expect(anyContains(r, aws)).toBe(false);
+  });
+
+  it('no index → secret check unchanged', async () => {
+    const aws = fake.awsKey();
+    const stripe = fake.stripeKey();
+    // repo(): .git/config written by hand, no .git/index
+    const dir = repo({ ...nodeApp(), '.gitignore': 'out/\n.env\n', 'out/app.js': `var k = '${aws}';\n`, '.env': `STRIPE=${stripe}\n`, 'src/a.ts': 'export const a = 1;\n' });
+    const r = await buildAudit(dir, deps());
+    expect(r.secretsInTree).toEqual(expect.arrayContaining([
+      { file: 'out/app.js', rule: 'aws-access-key' },
+      { file: '.env', rule: 'stripe-key', note: EXCLUDED_NOTE },
+    ]));
+    expect(r.notes.some((n) => n.includes('git ignores'))).toBe(false);
+    // the bundle still leaves out what .gitignore lists (index or not)
+    expect(r.aiBundle.topFolders).toEqual(['src']);
+  });
+});

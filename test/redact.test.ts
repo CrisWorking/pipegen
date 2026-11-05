@@ -7,7 +7,7 @@ import { build } from 'tsup';
 import { tsupOptions } from '../tsup.config.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
-  bundleCode, bundleText, EXCLUDED_PATTERNS, SCAN_CHUNK_SAFE_BYTES, SecretScanError, SecretScanRequiredError, secretScanArgv, secretScanConfigPath,
+  bundleCode, bundleText, EXCLUDED_PATTERNS, excludedSummaryLines, SCAN_CHUNK_SAFE_BYTES, SecretScanError, SecretScanRequiredError, secretScanArgv, secretScanConfigPath,
   decodedNamePieces, encodedSpans, highEntropyRuns, isBinary, MAX_NAME_LINES, NOTHING_FOUND, redact, scrubKnownValues, type CodeBundle,
 } from '../src/ai/redact.js';
 import { skippedByDefaultPaths } from '../src/ai/secret-scan-config.js';
@@ -144,6 +144,46 @@ describe('bundle: exclusions', () => {
     await expect(bundleCode(dir, { roots: ['../x'] })).rejects.toThrow(/root/i);
     await expect(bundleCode(dir, { roots: ['api/../../x'] })).rejects.toThrow(/root/i);
     await expect(bundleCode(dir, { roots: ['/etc'] })).rejects.toThrow(/root/i);
+  });
+});
+
+describe('bundle: git ignore rules and the index (Plan J J1, DECISIONS #126)', () => {
+  /** git with no user or system config; test setup only (pipegen never runs git). */
+  const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', HOME: '/nonexistent' };
+  const git = (dir: string, ...args: string[]) => execFileSync('git', args, { cwd: dir, stdio: 'pipe', env: GIT_ENV });
+
+  it('bundle: a committed file .gitignore lists is left out, with a note; the excluded list says so', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, '.gitignore', 'generated/\n');
+    writeIn(dir, 'src/app.ts', 'export const a = 1;\n');
+    writeIn(dir, 'generated/client.ts', 'export const b = 2;\n');
+    git(dir, 'init', '-q');
+    git(dir, 'add', '.');
+    git(dir, 'add', '-f', 'generated/client.ts');
+    const b = await bundleCode(dir);
+    expect(paths(b)).toEqual(['.gitignore', 'src/app.ts']);
+    expect(b.notes).toContain('Left out 1 file your .gitignore lists.');
+    expect(excludedSummaryLines()).toEqual(expect.arrayContaining(['- files your .gitignore lists']));
+  });
+
+  it("bundle: untracked, not-ignored file left out when the index is known; kept when it isn't", async () => {
+    const dir = makeTempDir();
+    writeIn(dir, 'src/app.ts', 'export const a = 1;\n');
+    writeIn(dir, 'src/local-draft.ts', 'export const draft = 1;\n');
+    writeIn(dir, 'out/index.html', '<p>built</p>\n');
+    writeIn(dir, '.gitignore', 'out/\n');
+    git(dir, 'init', '-q');
+    // no index yet (nothing added): ignored files are left out, untracked ones are kept
+    const unknown = await bundleCode(dir);
+    expect(paths(unknown)).toEqual(['.gitignore', 'src/app.ts', 'src/local-draft.ts']);
+    expect(unknown.notes.join('\n')).not.toMatch(/committed/);
+    git(dir, 'add', '--', '.gitignore', 'src/app.ts');
+    const known = await bundleCode(dir);
+    expect(paths(known)).toEqual(['.gitignore', 'src/app.ts']);
+    expect(known.notes).toContain("Left out 2 files that aren't committed (not in git's file list).");
+    // the checked bundle uses the same rule as the counting one
+    const checked = await bundleCode(dir, scanWith(gitleaksAt(makeStub(CLEAN).bin)));
+    expect(paths(checked)).toEqual(paths(known));
   });
 });
 
