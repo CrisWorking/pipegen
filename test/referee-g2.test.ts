@@ -692,6 +692,7 @@ describe('G2-R-sec2 (controller ruling): the sign job is held to the default-pus
       ['a caller without the deploy condition', [signFile({ sign: signJob() }), deployCaller(d, SIGN, { if: undefined })]],
       ['a caller in a pull_request-only pipegen.yml', [signFile({ sign: signJob() }), deployCaller(d, SIGN, {}, { pull_request: null })]],
       ['a second caller in another file', [signFile({ sign: signJob() }), deployCaller(d, SIGN), deployCaller(d, SIGN, { if: undefined, needs: [] }, { pull_request: null }, '.github/workflows/ci.yml')]],
+      ['the only caller in another file, with the deploy condition', [signFile({ sign: signJob() }), deployCaller(d, SIGN, {}, DEPLOY_ON_SIGN, '.github/workflows/ci.yml')]],
       ['the called file runs on its own trigger too', [{ ...workflow({ sign: signJob() }, { on: { workflow_call: null, push: { branches: ['main'] } } }), path: '.github/workflows/sign.yml' }, deployCaller(d, SIGN)]],
       ['in pipegen.yml without the deploy condition', [workflow({ ...jobsOf(d), sign: signJob({ needs: ['gate'] }) }, { on: DEPLOY_ON_SIGN })]],
       ['in a pull_request-only pipegen.yml', [workflow({ ...jobsOf(d), sign: signJob() })]],
