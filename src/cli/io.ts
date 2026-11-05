@@ -15,7 +15,14 @@ export interface Prompter {
  * commands run in, default process.cwd()) and `fetch` (the transport for GitHub calls, default the global fetch) let
  * tests run a command on a temp repo against a fake GitHub. Nothing else in the CLI reads process.env or the network.
  */
-export interface CliIO { prompt: Prompter; out: (s: string) => void; err: (s: string) => void; env: NodeJS.ProcessEnv; cwd?: string; fetch?: typeof fetch }
+export interface CliIO {
+  prompt: Prompter; out: (s: string) => void; err: (s: string) => void; env: NodeJS.ProcessEnv; cwd?: string; fetch?: typeof fetch;
+  /**
+   * Plan J J5 (ruling S9): true only when someone can answer at a terminal (stdin and the stream questions are drawn on
+   * are both TTYs). The type question is asked only then; unset or false, nothing waits for an answer.
+   */
+  interactive?: boolean;
+}
 
 /** The user cancelled a question (Ctrl+C / Esc), or there is no terminal to ask in. */
 export class PromptCancelledError extends Error {
@@ -71,5 +78,6 @@ export function processIO(): CliIO {
     out: (s) => { process.stdout.write(`${s}\n`); },
     err: (s) => { process.stderr.write(`${s}\n`); },
     env: process.env,
+    interactive: process.stdin.isTTY === true && process.stderr.isTTY === true,
   };
 }

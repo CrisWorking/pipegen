@@ -17,14 +17,14 @@
 // - aiBundle: what the full run would send to the AI, counted from bundleCode without the secret scan (counting only).
 // - warnings: a repo `.npmrc` with any key outside a small safe list (U12; Task 5 adds keys whose value only makes npm
 //   stricter) or a local node_modules/.bin/pipegen could change which pipegen runs (the `.npmrc` is read for that one
-//   fact; no value is kept); anonymous access.
+//   fact; no value is kept), or a committed node_modules (swapRisk, Plan J J5); anonymous access.
 // - ai (Task 2b, addAiSuggestions, `audit --ai` after consent): the needs the AI adds and MENTION-ONLY tool suggestions,
 //   from a secret-scanned bundle, with the run's AI usage and cost cap (rulings B2, B3, B4, S11, S16-S19, U11).
 //
 // Output rule (src/types.ts): repo-derived strings are kept RAW (validated by the readers) and cleaned only where
 // Task 3 prints them. Nothing here escapes a value, and no file content or secret value is ever stored.
 import { lstat, realpath } from 'node:fs/promises';
-import { join } from 'node:path';
+import { isAbsolute, join, relative, sep } from 'node:path';
 import type { Octokit } from '@octokit/rest';
 import { count, outputLimit } from '../ai/errors.js';
 import { ollamaHostOf } from '../ai/ollama.js';
@@ -53,6 +53,7 @@ import { readGitIndexPaths } from '../read/git-index.js';
 import { loadIgnore } from '../read/gitignore.js';
 import { IGNORED_DIRS, listFiles, READ_LIMITS, readTextLimited, readTextLimitedWithReason } from '../read/limits.js';
 import { readProject } from '../read/project.js';
+import { applyTypeOverrides, type TypeOverride } from '../read/project-type.js';
 import { supportLevel } from '../read/support.js';
 import { skippedWorkflowCount } from '../read/workflows.js';
 import {
@@ -243,6 +244,11 @@ export interface AuditDeps {
    * another folder, or a bundle that isn't a counting one), buildAudit builds its own.
    */
   bundle?: CodeBundle;
+  /**
+   * Plan J J5 (ruling B1): the types the user set (`--type`, or the type question the CLI asks before any GitHub call),
+   * applied with applyTypeOverrides right after the local read. Data, not a callback: nothing here asks anything.
+   */
+  typeOverrides?: readonly TypeOverride[];
 }
 
 // ---------- fixed texts ----------
@@ -349,8 +355,8 @@ const UNTRACKED_NOTE = "pipegen reads the files on disk without git, so files th
 
 // Worded so redact() leaves it whole at output ("No token: …" would be cut; review M3).
 const NO_TOKEN = 'Without a GitHub token, pipegen reads public data only and is rate-limited.';
-const SWAP_TEXT = 'This repo could change which pipegen runs. Run pipegen from outside the repo, from the npm registry, with:';
-const SWAP_TEXT_NO_COMMAND = 'This repo could change which pipegen runs. Run pipegen from outside the repo, from the npm registry, with an exact version (pipegen@x.y.z).';
+export const SWAP_TEXT = 'This repo could change which pipegen runs. Run pipegen from outside the repo, from the npm registry, with:';
+export const SWAP_TEXT_NO_COMMAND = 'This repo could change which pipegen runs. Run pipegen from outside the repo, from the npm registry, with an exact version (pipegen@x.y.z).';
 /**
  * Ruling U12: the `.npmrc` keys that can't change which pipegen npx fetches or how it starts it (npm's config docs):
  * saving, lockfile, engine and output settings. Any other key warns: registries (any scope), proxies, TLS (`strict-ssl`,
@@ -408,7 +414,7 @@ class Notes {
 export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditReport> {
   const notes = new Notes();
   const readerNotes: string[] = [];
-  const local = await readProject(dir, { notes: readerNotes });
+  const local = applyTypeOverrides(await readProject(dir, { notes: readerNotes }), deps.typeOverrides ?? []);
   // DoD run 2026-10-29: with no context (GitHub's rate limit), the profile's GitHub facts are placeholders (the
   // fail-closed side: private, plan unknown); nothing below states them, and --json writes them as null
   const context = deps.context ?? { private: true, ownerType: 'User' as const, plan: 'unknown' as const, defaultBranch: local.defaultBranch };
@@ -655,10 +661,10 @@ export interface LocalAudit {
 }
 
 /** The local-only audit of `dir`: reads files only (no GitHub, no AI, no child process). Throws NotGitHubRepoError like buildAudit. */
-export async function buildLocalAudit(dir: string, deps: { notes?: string[] } = {}): Promise<LocalAudit> {
+export async function buildLocalAudit(dir: string, deps: { notes?: string[]; typeOverrides?: readonly TypeOverride[] } = {}): Promise<LocalAudit> {
   const notes = new Notes();
   const readerNotes: string[] = [];
-  const profile = await readProject(dir, { notes: readerNotes });
+  const profile = applyTypeOverrides(await readProject(dir, { notes: readerNotes }), deps.typeOverrides ?? []);
   for (const n of readerNotes) notes.add(n);
   for (const n of deps.notes ?? []) notes.add(n);
   const secretsInTree = await scanTree(dir, notes);
@@ -879,21 +885,72 @@ async function scanTree(dir: string, notes: Notes): Promise<SecretInTree[]> {
 // ---------- how pipegen was started ----------
 
 /**
- * Ruling S30 / Review Focus 9 / U12: a repo `.npmrc` with any key outside NPMRC_SAFE_KEYS, or a local
- * node_modules/.bin/pipegen, could change which pipegen runs when started from inside the repo. The `.npmrc` is read
- * only for that yes/no (key names, and the value of `audit` compared with true/false; no value is kept); one that
- * can't be read safely (a symbolic link, too large) counts as yes.
- * node_modules/.bin/pipegen is an existence check with lstat: the last part is never followed (a dangling link
- * counts), while a symlinked node_modules or .bin folder on the way is followed, as npx would follow it too.
+ * Ruling S30 / Review Focus 9 / U12: a repo `.npmrc` with any key outside NPMRC_SAFE_KEYS, a local
+ * node_modules/.bin/pipegen, or (Plan J J5) a committed node_modules could change which pipegen runs when started from
+ * inside the repo: the warning, when pipegen runs from outside (inside, the CLI stops first; see swapRisk).
  */
 async function warningsOf(dir: string, anonymous: boolean): Promise<AuditWarning[]> {
   const out: AuditWarning[] = [];
-  if (await npmrcHasUnsafeKey(dir) || (await lstat(join(dir, 'node_modules', '.bin', 'pipegen')).catch(() => null)) !== null) {
+  if (await swapRisk(dir, dir)) {
     const command = safeRunCommand(packageVersion());
     out.push(command !== null ? { text: SWAP_TEXT, command } : { text: SWAP_TEXT_NO_COMMAND });
   }
   if (anonymous) out.push({ text: NO_TOKEN });
   return out;
+}
+
+/** The most folders swapRisk walks from the current folder up to the repo (deeper is refused: it can't say no). */
+const SWAP_WALK_MAX = 256;
+
+/**
+ * Plan J J5 (DECISIONS #124, ruling S8): what in the repo could change which pipegen `npx pipegen` runs, in plain words
+ * (the folder it is in, repo-relative), or null. Only when `cwd` is `dir` or inside it (by real path): from outside, npm
+ * reads none of the repo's settings, so the answer is null. npm reads the project `.npmrc` of the nearest folder from
+ * the current one up that has a package.json or a node_modules, and npx runs a local bin of that folder, so every folder
+ * from cwd up to and including dir is checked for:
+ * - a `.npmrc` with any key outside the safe list (read only for that yes/no; no value is kept; one that can't be read
+ *   safely, a symbolic link or too large, counts);
+ * - `node_modules/.bin/pipegen` (lstat: the last part is never followed, a dangling link counts; a symlinked
+ *   node_modules or .bin on the way is followed, as npx would follow it);
+ * - a node_modules folder that is committed: listed in the git index (readGitIndexPaths) when the index is known, or
+ *   any node_modules folder when it isn't (the stricter side).
+ */
+export async function swapRiskWhy(cwd: string, dir: string): Promise<string | null> {
+  const realDir = await realpath(dir).catch(() => null);
+  const realCwd = await realpath(cwd).catch(() => null);
+  if (realDir === null || realCwd === null) return null; // a folder that isn't there holds no settings
+  const rel = relative(realDir, realCwd);
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null;
+  const parts = rel === '' ? [] : rel.split(sep);
+  if (parts.length >= SWAP_WALK_MAX) return 'a folder too deep inside the repo for pipegen to check';
+  const index = await readGitIndexPaths(realDir);
+  for (let n = parts.length; n >= 0; n--) {
+    const relFolder = parts.slice(0, n).join('/');
+    const folder = n === 0 ? realDir : join(realDir, ...parts.slice(0, n));
+    const where = relFolder === '' ? 'the repo folder' : relFolder;
+    if (await npmrcHasUnsafeKey(folder)) return `an .npmrc with settings that can change what npm runs, in ${where}`;
+    if ((await lstat(join(folder, 'node_modules', '.bin', 'pipegen')).catch(() => null)) !== null) return `a local pipegen (node_modules/.bin/pipegen), in ${where}`;
+    const nm = relFolder === '' ? 'node_modules' : `${relFolder}/node_modules`;
+    if (index === null) {
+      if ((await lstat(join(folder, 'node_modules')).catch(() => null)) !== null) return `a node_modules folder pipegen can't tell is not committed (it found no git index it can read), in ${where}`;
+    } else if (inIndex(index, nm)) {
+      return `a committed node_modules folder, in ${where}`;
+    }
+  }
+  return null;
+}
+
+/** True when the index lists `path` itself (a link) or anything under it. */
+function inIndex(index: ReadonlySet<string>, path: string): boolean {
+  if (index.has(path)) return true;
+  const under = `${path}/`;
+  for (const p of index) if (p.startsWith(under)) return true;
+  return false;
+}
+
+/** True when swapRiskWhy has an answer: started from `cwd`, `npx pipegen` could run something other than pipegen. */
+export async function swapRisk(cwd: string, dir: string): Promise<boolean> {
+  return (await swapRiskWhy(cwd, dir)) !== null;
 }
 
 async function npmrcHasUnsafeKey(dir: string): Promise<boolean> {
