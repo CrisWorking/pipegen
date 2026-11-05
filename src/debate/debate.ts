@@ -18,12 +18,11 @@
 // - Every line, argument and reason returned is cleanForDoc text (F1), fit for PIPEGEN.md as it is. Lines name checks in plain
 //   words ("the sast check for web"), never by need key or planted item id (F5-R4).
 import { z } from 'zod';
-import { AiError, count } from '../ai/errors.js';
 import {
   ROUND_BUILDER_INSTRUCTIONS, ROUND_BUILDER_SYSTEM, ROUND_JUDGE_INSTRUCTIONS, ROUND_JUDGE_SYSTEM, ROUND_OBJECTIONS_TAG,
 } from '../ai/prompts/debate.js';
 import { untrustedAiText } from '../ai/prompts/untrusted.js';
-import type { CodeBundle } from '../ai/redact.js';
+import { knownValueScrubber, type CodeBundle } from '../ai/redact.js';
 import { aiSchema, type AiSchema } from '../ai/schema.js';
 import { needLanguage } from '../engine/discover.js';
 import { needWhy, promptProfile, promptText } from '../engine/needs.js';
@@ -32,10 +31,10 @@ import { reviewedFor } from '../engine/reviewed.js';
 import type { Variant } from '../proof/snapshot.js';
 import type { AiProvider, AiRequest, AiUsage, Candidate, Capabilities, Need, RepoProfile, ReviewedCandidate, StepSpec } from '../types.js';
 import {
-  AI_TEXT_MAX, BuilderError, ZERO_USAGE, addUsage, ask, buildChoices, enumOf, keyOffers, specFor, tuningMax,
+  AI_TEXT_MAX, BuilderError, SUGGESTION_WHY_MAX, ZERO_USAGE, addUsage, ask, buildChoices, enumOf, keyOffers, specFor, tuningMax, withUsageBefore,
   type BuilderDeps, type ByCode, type Choice, type KeyOffers, type Offer, type Picks, type Suggestion, type Uncovered,
 } from './builder.js';
-import { CLEAN_DOC_MAX, CLEAN_DOC_PLACEHOLDER, cleanForDoc } from './clean.js';
+import { CLEAN_DOC_MAX, CLEAN_DOC_PLACEHOLDER, cleanForDoc, stripForDoc } from './clean.js';
 import { counterOffers, critique, type Objection } from './judge.js';
 import { needKeyOf, type NeedRef } from './need-ref.js';
 
@@ -67,8 +66,9 @@ export type DebateDeps = Omit<BuilderDeps, 'caps'>;
 
 /** One option of a dispute: proven on its own Plan E variant (F6). */
 export interface DisputeOption {
-  label: 'builder' | 'judge';
-  /** `dispute-dN-a` for the builder; `dispute-dN-b`, or `dispute-dN-<j>-b` when the dispute has more than one judge option (ruling S11). */
+  /** 'pipegen' when pipegen replaced the builder's tool (no longer offered once an added check is in place), else 'builder'. */
+  label: 'builder' | 'pipegen' | 'judge';
+  /** `dispute-dN-a` for the key's current pick; `dispute-dN-b`, or `dispute-dN-<j>-b` when the dispute has more than one judge option (ruling S11). */
   variant: Variant;
   /** Built by code (specFor). The builder's is the current choice; a judge option takes the template's first values. */
   choice: Choice;
@@ -198,16 +198,31 @@ interface Pick { tool: string; picks: Picks | null; reason: string; by: 'ai' | '
 /** "the sast check in merge for web": enum values and checked service names only. */
 const checkLabel = (id: string, service?: string | null, layer?: string): string => `the ${id} check${layer === undefined ? '' : ` in ${layer}`}${service ? ` for ${service}` : ''}`;
 const shownText = (v: string | null) => v ?? CLEAN_DOC_PLACEHOLDER;
-const billed = (u: AiUsage) => u.inputTokens + u.outputTokens + count(u.cacheReadTokens) + count(u.cacheWriteTokens) > 0;
-
-/** A step of the builder or the judge; an AiError passes through with the debate's usage so far added. */
+/** A step of the builder or the judge; an AiError passes through with the debate's usage so far added (F2's withUsageBefore, cause kept). */
 async function passAi<T>(before: AiUsage, f: () => Promise<T>): Promise<T> {
   try {
     return await f();
   } catch (e) {
-    if (e instanceof AiError && billed(before)) throw new AiError(e.kind, e.message, addUsage(before, e.usage));
-    throw e;
+    throw withUsageBefore(e, before);
   }
+}
+
+/** The shortest cleaned form of a typed value that is scrubbed too (a shorter one would blank ordinary words). */
+const MIN_CLEANED_FORM = 4;
+
+/**
+ * Defence in depth for returned text (ruling F4-R12 m2; Plan G's vault check stays the gate): every value the user typed, in its
+ * own forms (knownValueScrubber) and in its cleaned form (cleanForDoc turns `_` and some marks into blanks, so a claim already
+ * holds that form), becomes the vault's placeholder, and the text is cleaned again. Text holding none is returned as it is.
+ */
+function returnedTextScrubber(knownValues: readonly string[]): (text: string, max: number) => string {
+  const forms = [...new Set(knownValues.flatMap((v) => {
+    const cleaned = stripForDoc(v);
+    return cleaned !== v && cleaned.trim().length >= MIN_CLEANED_FORM ? [v, cleaned] : [v];
+  }))].filter((v) => v.trim() !== '');
+  if (forms.length === 0) return (text) => text;
+  const scrub = knownValueScrubber(forms);
+  return (text, max) => { const t = scrub(text); return t === text ? text : cleanForDoc(t, max); };
 }
 
 /** A key-sorted copy, so two specs with the same choices compare equal (ruling S11's dedupe by candidate id and choices). */
@@ -358,7 +373,8 @@ export async function debate(
   const kv = deps.knownValues ?? [];
   const odeps = { reviewed: deps.reviewed, knownValues: kv };
   const transcript: string[] = [];
-  const say = (text: string) => { transcript.push(cleanForDoc(text, TRANSCRIPT_LINE_MAX)); };
+  const scrubbed = returnedTextScrubber(kv);
+  const say = (text: string) => { transcript.push(cleanForDoc(scrubbed(text, TRANSCRIPT_LINE_MAX), TRANSCRIPT_LINE_MAX)); };
   let usage: AiUsage = { ...ZERO_USAGE };
   let calls = 0;
 
@@ -421,7 +437,7 @@ export async function debate(
 
   // 3. the rounds: accept or rebut, then withdraw or keep (no new objections, ruling S7)
   const ctx: RoundCtx = { p, caps, kv, refs, current, counterOf };
-  const budgetLine = 'pipegen makes at most 9 AI calls in a debate, so the judge was not asked again; the open objections stay kept.';
+  const budgetLine = `pipegen makes at most ${MAX_DEBATE_CALLS} AI calls in a debate, so the judge was not asked again; the open objections stay kept.`;
   let rounds = 0;
   for (let round = 1; round <= MAX_ROUNDS; round++) {
     const open = tracked.filter((t) => t.status === 'open');
@@ -440,6 +456,12 @@ export async function debate(
       const rep = read.replies.get(t.o.id) as Reply;
       const counter = t.o.counter.candidateId;
       const add = t.o.counter.addNeed;
+      if (rep.answer === 'accept' && add !== undefined && counter !== undefined && switched.has(t.o.key)) {
+        // ruling F4-R12 I1: an accepted addition is always added; the one-switch rule limits only its tool switch
+        t.status = 'accepted';
+        say(`Round ${round}: the builder accepted ${t.o.id}, so pipegen adds ${labelOf(t.o)}; it keeps the tool another objection switched this check to in this round, not ${counter}.`);
+        continue;
+      }
       if (rep.answer === 'accept' && counter !== undefined && switched.has(t.o.key)) {
         // one switch per key per round: a second accept on the same key in the same round counts as a rebuttal
         t.rebuttal = 'The builder accepted another objection on this check in the same round.';
@@ -578,15 +600,20 @@ export async function debate(
     disputes.push({
       id, key: ref.key, needId: ref.id,
       options: [
-        { label: 'builder', variant: `dispute-${id}-a`, choice: mine, argument: shownText(rebuttal), objectionIds: all.map((t) => t.o.id) },
+        { label: mine.by === 'pipegen' ? 'pipegen' : 'builder', variant: `dispute-${id}-a`, choice: mine, argument: shownText(rebuttal), objectionIds: all.map((t) => t.o.id) },
         ...theirs.map((x, j): DisputeOption => ({ label: 'judge', variant: theirs.length === 1 ? `dispute-${id}-b` : `dispute-${id}-${j + 1}-b`, choice: x.choice, argument: x.argument, objectionIds: x.ids })),
       ],
     });
     say(`Dispute ${id} on ${checkLabel(ref.id, ref.service)}: ${mine.chosen.tool.id} (the builder's pick) against ${theirs.map((x) => x.choice.chosen.tool.id).join(' and ')} (the judge's); proof runs against planted problems decide, not a vote.`);
   }
 
+  // ruling F4-R12 m2: no typed value in any returned text (the transcript is scrubbed in `say`)
+  const scrubChoice = (c: Choice): Choice => { const reason = scrubbed(c.reason, CLEAN_DOC_MAX); return reason === c.reason ? c : { ...c, reason }; };
   return {
-    choices, needs: finalNeeds, suggestions: dedupeSuggestions(built.suggestions), disputes, transcript, requireDeployApproval,
+    choices: choices.map(scrubChoice), needs: finalNeeds,
+    suggestions: dedupeSuggestions(built.suggestions).map((s) => { const why = scrubbed(s.why, SUGGESTION_WHY_MAX); return why === s.why ? s : { ...s, why }; }),
+    disputes: disputes.map((d) => ({ ...d, options: d.options.map((o) => ({ ...o, argument: scrubbed(o.argument, ARGUMENT_MAX), choice: scrubChoice(o.choice) })) })),
+    transcript, requireDeployApproval,
     byCode: fin.byCode, uncovered: fin.uncovered, rounds, calls, usage,
   };
 }

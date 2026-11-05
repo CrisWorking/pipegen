@@ -17,7 +17,7 @@ import {
 import { needRefs, type NeedRef } from '../src/debate/need-ref.js';
 import { plantedFiles } from '../src/debate/planted.js';
 import { pipegenDocProblems } from '../src/engine/created-judges/pipegen-doc.js';
-import { DEBATE_CALLS, DEBATE_PROMPT_TOKENS, aiRequestBytes, estimate } from '../src/estimate/estimate.js';
+import { DEBATE_CALLS, DEBATE_MARGIN, aiRequestBytes, estimate } from '../src/estimate/estimate.js';
 import { VARIANT_RE } from '../src/proof/snapshot.js';
 import { DEFAULT_MODEL, type AiProvider, type AiRequest, type Candidate, type Need, type RepoProfile } from '../src/types.js';
 import { CLEAN, gitleaksAt, makeStub, scanWith } from './helpers/gitleaks-stub.js';
@@ -341,6 +341,26 @@ describe('debate (plan Task 3)', () => {
       expect(pipegenDocProblems(`# PIPEGEN\n\n- ${line}\n`, DOC_OPTS)).toEqual([]);
     }
     for (const o of r.disputes.flatMap((d) => d.options)) expect(o.argument.length).toBeLessThanOrEqual(ARGUMENT_MAX);
+
+    // ruling F4-R12 m2 (defence in depth): a value the user typed, written by either AI, never comes back in any returned text;
+    // it is replaced by the vault's placeholder word, also in its cleaned form (`_` became a blank)
+    const typedUnderscore = 'quartz_lemon_7781';
+    const k = routed({
+      builder: [built({ because: { [LEAK_KEY]: `Fast; ${TYPED} is fine.` }, suggestions: [{ id: 's1', why: `Try it with ${TYPED}.` }] })],
+      judge: [critiqued([{ key: LEAK_KEY, counter: 'gitleaks', claim: `The typed ${TYPED} and ${typedUnderscore} leaked.` }], { approval: true, reason: `Deploys use ${TYPED}.` })],
+      'debate-builder': [replies({}, `Keep it; ${TYPED} is safe.`)],
+      'debate-judge': [verdicts({}, `No, ${typedUnderscore} is exposed.`)],
+    });
+    const rk = await run(k.ai, { deps: ddeps({ knownValues: [TYPED, typedUnderscore] }) });
+    expect(rk.disputes).toHaveLength(1);
+    const back = texts(rk);
+    for (const line of back) {
+      expect(line).not.toContain(TYPED);
+      expect(line).not.toMatch(/quartz.lemon.7781/);
+      expect(cleanForDoc(line, TRANSCRIPT_LINE_MAX)).toBe(line);
+      expect(pipegenDocProblems(`# PIPEGEN\n\n- ${line}\n`, DOC_OPTS)).toEqual([]);
+    }
+    expect(back.filter((l) => l.includes('REDACTED')).length).toBeGreaterThanOrEqual(6);
     // the whole line is cleaned, not only the AI's parts: a service name holding `_` (the cleaner makes it a blank)
     const pu = profile({ services: [API, svc({ ...WEB, name: 'web_ui', path: 'web' })] });
     const nu = [need('lint', 'merge', 'web_ui')];
@@ -485,6 +505,22 @@ describe('debate (added)', () => {
     expect(r.choices.some((c) => c.key === 'deps--api')).toBe(false);
     expect(byKey(r, 'deps--web')).toMatchObject({ by: 'pipegen', chosen: { tool: { id: 'osv-scanner' } } });   // no counter: code's first offered tool
     expect(r.rounds).toBe(3);
+
+    // ruling F4-R12 I1 (review probe P3): an accepted addition is always added, even when another accept already switched its
+    // key in the same round; the one-switch rule limits only its tool switch. Both orders.
+    const addLint = { addNeed: { id: 'lint', layer: 'push', service: 'web' }, counter: 'oxlint-typeaware' };
+    for (const [objs, first] of [[[{ key: 'lint--web', counter: 'eslint' }, addLint], 'eslint'], [[addLint, { key: 'lint--web', counter: 'eslint' }], 'oxlint-typeaware']] as const) {
+      const g = routed({
+        builder: [built()],
+        judge: [critiqued([...objs])],
+        'debate-builder': [replies({ o1: 'accept', o2: 'accept' })],
+        'debate-judge': [verdicts({ o1: 'withdraw', o2: 'withdraw' })],
+      });
+      const r2 = await run(g.ai);
+      expect(r2.needs.slice(DN.length).map((n) => [n.id, n.layer, n.service])).toEqual([['lint', 'push', 'web']]);
+      expect(byKey(r2, 'lint--web').chosen.tool.id).toBe(first);   // the first accept in objection order switches the key
+      expect(r2.disputes).toEqual([]);
+    }
   });
 
   it('debate: at most 9 AI calls, at most 2 with the code bundle', async () => {
@@ -495,7 +531,10 @@ describe('debate (added)', () => {
     const badCritique = critiqued([{ key: 'secrets', counter: 'bandit' }]);
     const f = routed({
       builder: [notOffered, built()],
-      judge: [badCritique, critiqued([{ key: 'secrets', counter: 'gitleaks' }, { key: 'iac', counter: 'trivy-config' }])],
+      judge: [badCritique, critiqued([
+        { key: LEAK_KEY, counter: 'gitleaks' }, { key: 'iac', counter: 'trivy-config' }, { key: 'sast--api', counter: 'bandit' },
+        { key: 'lint--web', counter: 'eslint' }, { key: 'lint--web', counter: 'oxlint-typeaware' },
+      ])],
       'debate-builder': [replies()],
       'debate-judge': [verdicts()],
     });
@@ -507,29 +546,40 @@ describe('debate (added)', () => {
     expect(f.calls.map((c) => c.schemaName)).toEqual(['builder', 'builder', 'judge', 'judge', 'debate-builder', 'debate-judge', 'debate-builder', 'debate-judge', 'debate-builder']);
     expect(f.calls.filter((c) => c.user.includes(bundleText(bundle))).length).toBe(2);
     expect(r.rounds).toBe(3);
-    expect(r.disputes.map((d) => d.key)).toEqual(['secrets', 'iac']);
+    expect(r.disputes.map((d) => d.key)).toEqual([LEAK_KEY, 'sast--api', 'iac', 'lint--web']);
     expect(r.transcript.some((l) => /at most 9 AI calls/.test(l))).toBe(true);
     for (const req of f.calls) expect(req.maxOutputTokens).toBeGreaterThan(0);
 
-    // S10: the estimate's debate row covers this bound: 2 bundle calls and 7 others; every request's size without the bundle
-    // (bytes, which are at least tokens) fits the per-call prompt size the row counts
-    expect(DEBATE_CALLS.bundled.calls + DEBATE_CALLS.plain.calls).toBe(MAX_DEBATE_CALLS);
-    expect(DEBATE_CALLS.bundled.calls).toBe(MAX_BUNDLE_CALLS);
+    // S10 (ruling F4-R12 m1): the estimate's debate row is this worst case, each request counted at its measured size (bytes,
+    // which are at least tokens) times DEBATE_MARGIN; a bundled call adds the bundle at the needs row's 30k
+    expect(DEBATE_CALLS.builder.calls + DEBATE_CALLS.critique.calls + DEBATE_CALLS.round.calls).toBe(MAX_DEBATE_CALLS);
+    expect(DEBATE_CALLS.builder.calls).toBe(MAX_BUNDLE_CALLS);
+    expect(DEBATE_CALLS.builder.bundle).toBe(30_000);
+    expect(DEBATE_MARGIN).toBe(1.5);
+    const kind = (name: string) => (name === 'builder' ? DEBATE_CALLS.builder : name === 'judge' ? DEBATE_CALLS.critique : DEBATE_CALLS.round);
+    const largest = new Map<object, number>();
     for (const req of f.calls) {
       const withBundle = req.user.includes(bundleText(bundle));
+      expect(withBundle).toBe(req.schemaName === 'builder');
       const bytes = aiRequestBytes(req) - (withBundle ? Buffer.byteLength(bundleText(bundle)) : 0);
-      expect(bytes).toBeLessThanOrEqual(DEBATE_PROMPT_TOKENS);
-      expect(bytes).toBeLessThanOrEqual(DEBATE_CALLS.plain.input);
-      if (withBundle) expect(DEBATE_CALLS.bundled.input - DEBATE_PROMPT_TOKENS).toBeGreaterThanOrEqual(30_000);   // the bundle at the needs row's size
+      expect(bytes * DEBATE_MARGIN).toBeLessThanOrEqual(kind(req.schemaName).prompt);
+      largest.set(kind(req.schemaName), Math.max(largest.get(kind(req.schemaName)) ?? 0, bytes));
     }
+    // sized from the largest measurement of each kind with the stated margin, not far above it
+    for (const [k, bytes] of largest) expect((k as { prompt: number }).prompt).toBeLessThan(bytes * DEBATE_MARGIN + 1_000);
+    expect(largest.size).toBe(3);
     const row = estimate(PT, { 'pre-commit': [], push: [], merge: [], deploy: [], nightly: [] }, 2, { pushes: 0, prs: 0, capped: false }, { name: 'claude', model: DEFAULT_MODEL })
       .aiTokens.find((s) => s.stage === 'debate')!;
+    const b = DEBATE_CALLS.builder;
+    const c = DEBATE_CALLS.critique;
+    const rd = DEBATE_CALLS.round;
     expect(row).toEqual({
       stage: 'debate',
-      input: DEBATE_CALLS.bundled.calls * DEBATE_CALLS.bundled.input + DEBATE_CALLS.plain.calls * DEBATE_CALLS.plain.input,
-      output: DEBATE_CALLS.bundled.calls * DEBATE_CALLS.bundled.output + DEBATE_CALLS.plain.calls * DEBATE_CALLS.plain.output,
+      input: b.calls * (b.bundle + b.prompt) + c.calls * c.prompt + rd.calls * rd.prompt,
+      output: b.calls * b.output + c.calls * c.output + rd.calls * rd.output,
     });
-    expect(row.input).toBeGreaterThan(3 * 40_000);   // raised above the old 3 × 40k / 6k row
+    expect(row).toEqual({ stage: 'debate', input: 261_000, output: 35_000 });
+    expect(row.input).toBeGreaterThan(3 * 40_000);   // still above the old 3 × 40k / 6k row, as S10 requires
     expect(row.output).toBeGreaterThan(3 * 6_000);
   });
 
@@ -557,11 +607,14 @@ describe('debate (added)', () => {
       { builder: [built()], judge: [objs], 'debate-builder': [replies(), replies(), cap], 'debate-judge': [verdicts()] },
       { builder: [built()], judge: [objs], 'debate-builder': [replies()], 'debate-judge': [verdicts(), verdicts(), cap] },
     ];
-    for (const script of cases) {
+    for (const [i, script] of cases.entries()) {
       const f = routed(script);
       const err = await run(f.ai).then(() => null, (e: unknown) => e);
       expect(err).toBeInstanceOf(AiError);
       expect((err as AiError).kind).toBe('cost-cap');
+      // ruling F4-R12 m3: a re-made error keeps the provider's one as its cause (its stack survives)
+      if (i > 0) expect((err as Error).cause).toBeInstanceOf(AiError);
+      if (i > 0) expect(((err as Error).cause as AiError).usage?.inputTokens).toBe(5);
       // the usage of the calls before is carried (100 + 10 each) plus the failed call's own
       const before = f.calls.length - 1;
       expect((err as AiError).usage?.inputTokens).toBe(before * 100 + 5);
@@ -591,6 +644,20 @@ describe('debate (added)', () => {
     expect(dast.chosen).toEqual(specFor(refOf(r.needs, profile(), 'dast--web'), offerOf(r.needs, profile(), 'dast--web', 'zap-baseline', candidatesFor(needs, profile())), profile()));
     expect(dast.by).toBe('pipegen');
     expect(r.transcript.some((l) => /dast check for web/.test(l) && /no longer offered/.test(l))).toBe(true);
+
+    // ruling F4-R12 m6: when pipegen replaced the builder's tool, the key's option in a dispute is labelled 'pipegen', not 'builder'
+    // (a second blocking dast tool, a copy of zap-baseline under another id, gives the judge something else to counter with)
+    const zap = REVIEWED.find((t) => t.id === 'zap-baseline')!;
+    const zap2 = { ...zap, id: 'zap-two', candidate: { ...zap.candidate, id: 'zap-two', name: 'zap-two' } };
+    const withTwo = [...REVIEWED, zap2];
+    const m = routed({
+      builder: [built({ picks: { 'dast--web': 'nuclei' } })],
+      judge: [critiqued([{ addNeed: { id: 'dast', layer: 'push', service: 'web' } }, { key: 'dast--web', counter: 'zap-two' }])],
+      'debate-builder': [replies({ o1: 'accept' })],
+      'debate-judge': [verdicts()],
+    });
+    const rm = await run(m.ai, { needs, p: profile(), cands: candidatesFor(needs, profile(), {}, withTwo), deps: ddeps({ reviewed: withTwo }) });
+    expect(rm.disputes.map((d) => d.options.map((o) => [o.label, o.choice.chosen.tool.id]))).toEqual([[['pipegen', 'zap-baseline'], ['judge', 'zap-two']]]);
 
     // without zap-baseline on the reviewed list nothing is offered once the layer blocks: the key is uncovered, never the old tool
     const reviewed = REVIEWED.filter((t) => t.id !== 'zap-baseline');

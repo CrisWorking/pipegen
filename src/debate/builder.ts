@@ -609,15 +609,26 @@ export const addUsage = (a: AiUsage, b: AiUsage | undefined): AiUsage => (b === 
   inputTokens: count(a.inputTokens) + count(b.inputTokens), outputTokens: count(a.outputTokens) + count(b.outputTokens),
   cacheReadTokens: count(a.cacheReadTokens) + count(b.cacheReadTokens), cacheWriteTokens: count(a.cacheWriteTokens) + count(b.cacheWriteTokens),
 });
-const billed = (u: AiUsage) => u.inputTokens + u.outputTokens + count(u.cacheReadTokens) + count(u.cacheWriteTokens) > 0;
+/** Whether any tokens were counted. Shared with the debate (F4). */
+export const billed = (u: AiUsage) => u.inputTokens + u.outputTokens + count(u.cacheReadTokens) + count(u.cacheWriteTokens) > 0;
+
+/**
+ * An AiError with the usage of the earlier calls (`before`) added: same kind and message, the original kept as `cause` so its stack
+ * survives (review F4 m3). Anything else, or nothing billed before, is returned as it is. Shared with the judge (F3) and the debate (F4).
+ */
+export function withUsageBefore(e: unknown, before: AiUsage): unknown {
+  if (!(e instanceof AiError) || !billed(before)) return e;
+  const out = new AiError(e.kind, e.message, addUsage(before, e.usage));
+  out.cause = e;
+  return out;
+}
 
 /** completeValidated; an AiError passes through (same kind and message) with the usage of the earlier calls added. Shared with the judge (F3). */
 export async function ask<T>(ai: AiProvider, req: AiRequest, schema: AiSchema<T>, before: AiUsage): Promise<{ data: T; usage: AiUsage }> {
   try {
     return await completeValidated(ai, req, schema.zod);
   } catch (e) {
-    if (e instanceof AiError && billed(before)) throw new AiError(e.kind, e.message, addUsage(before, e.usage));
-    throw e;
+    throw withUsageBefore(e, before);
   }
 }
 
