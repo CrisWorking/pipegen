@@ -16,6 +16,7 @@ import { createHash } from 'node:crypto';
 import { resultArtifactName, slug } from './artifact-names.js';
 import { SIGN_STEP_ENV, signStepId, VERIFY_STEP_ENV, verifyStepId, type RenderedStep } from './job-rules.js';
 import { isGitHubRepo } from './names.js';
+import { pipegenScriptStep } from './pipegen-script.js';
 import { releaseInstallStep } from './render-cli.js';
 import { RenderError, show } from './render-error.js';
 import type { PipelineDraft, RepoProfile, ReviewedTool, SigningPlan } from '../types.js';
@@ -45,7 +46,6 @@ const COMMIT_RE = /^[0-9a-f]{40}$/;
 const IMAGE_REPO_RE = /^(?:ghcr\.io|docker\.io)(?:\/[a-z0-9]+(?:[._-][a-z0-9]+)*){1,10}$/;
 /** A branch name as it may appear inside a single-quoted identity: plain characters only. */
 const BRANCH_RE = /^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]{1,200}$/;
-const FIXED_PATH = 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 
 /** The sha256 (hex) of the public key's exact text, as the verify step computes it from PIPEGEN_COSIGN_PUB (`printf '%s'`: no newline added). */
 export function pubKeySha256(text: string): string {
@@ -87,7 +87,6 @@ function reviewedRelease(tool: ReviewedTool, id: string, repo: string, exe: stri
   if (tool.step.cli?.install.method !== 'github-release' || tool.step.cli.command[0] !== exe) throw new RenderError(`The reviewed ${id} entry is not the ${exe} release binary.`);
 }
 
-const HEAD = ['set -euo pipefail', 'unset CDPATH', FIXED_PATH, 'pg_fail() { echo "pipegen: $1" >&2; exit 1; }'];
 const q = (s: string): string => `'${s}'`;
 /** The lines that read the digest from the hand-off file and build `ref`: checked as sha256:<64 hex> before anything uses it. */
 function refLines(repo: string, artifact: string): string[] {
@@ -99,8 +98,7 @@ function refLines(repo: string, artifact: string): string[] {
     `ref=${q(repo)}"@$digest"`,
   ];
 }
-const runStep = (id: string, name: string, lines: readonly string[], env: Record<string, string> = {}): RenderedStep =>
-  ({ id, name, run: [...lines, ''].join('\n'), shell: 'bash', env: { BASH_ENV: '', ENV: '', ...env } });
+const runStep = pipegenScriptStep;
 
 /** The sign steps of one image (job `sign` only): the reviewed cosign, then the sign of `<repo>@<digest>`. */
 export function renderSignSteps(cosign: ReviewedTool, mode: 'key-env' | 'keyless', image: SignedImage): RenderedStep[] {
@@ -112,7 +110,7 @@ export function renderSignSteps(cosign: ReviewedTool, mode: 'key-env' | 'keyless
   const sign = mode === 'key-env'
     ? [`COSIGN_PASSWORD="$PIPEGEN_COSIGN_PASSWORD" ${bin} sign --yes --key env://PIPEGEN_COSIGN_KEY --tlog-upload=false --use-signing-config=false "$ref"`]
     : [`${bin} sign --yes --oidc-provider=github-actions "$ref"`];
-  return [install.step, runStep(signStepId(repo), `pipegen: sign ${repo} (${mode})`, [...HEAD, ...refLines(repo, artifact), ...sign], mode === 'key-env' ? { ...SIGN_STEP_ENV } : {})];
+  return [install.step, runStep(signStepId(repo), `pipegen: sign ${repo} (${mode})`, [...refLines(repo, artifact), ...sign], mode === 'key-env' ? { ...SIGN_STEP_ENV } : {})];
 }
 
 /**
@@ -142,7 +140,7 @@ export function renderVerifySteps(tool: ReviewedTool, draft: PipelineDraft, imag
     if (!isGitHubRepo(app)) throw new RenderError(`The repository ${show(app)} is not a plain GitHub owner/name.`);
     const install = releaseInstallStep(tool, 'pipegen-gh-verify');
     return [install.step, runStep(id, name, [
-      ...HEAD, ...refLines(repo, artifact),
+      ...refLines(repo, artifact),
       // a fresh config folder: the runner's own gh login or config is never read
       'ghcfg="$(mktemp -d "$RUNNER_TEMP/pipegen-gh.XXXXXX")"',
       `GH_TOKEN="$PIPEGEN_GH_TOKEN" GH_CONFIG_DIR="$ghcfg" GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 "${install.bin}" attestation verify "oci://$ref" --repo ${q(app)} --source-ref ${q(`refs/heads/${branch}`)} --signer-workflow ${q(signer)} --signer-digest ${q(centralSha)} --deny-self-hosted-runners`,
@@ -153,7 +151,7 @@ export function renderVerifySteps(tool: ReviewedTool, draft: PipelineDraft, imag
   const bin = `"${install.bin}"`;
   if (plan.mode === 'keyless') {
     return [install.step, runStep(id, name, [
-      ...HEAD, ...refLines(repo, artifact),
+      ...refLines(repo, artifact),
       `${bin} verify --certificate-identity ${q(keylessIdentity(draft.profile))} --certificate-oidc-issuer ${q(GITHUB_OIDC_ISSUER)} "$ref" > /dev/null`,
     ])];
   }
@@ -161,7 +159,7 @@ export function renderVerifySteps(tool: ReviewedTool, draft: PipelineDraft, imag
   const want = plan.cosignPubSha256;
   if (typeof want !== 'string' || !SHA256_HEX_RE.test(want)) throw new RenderError('Key-env verification needs the sha256 of the public key pipegen recorded (64 lower-case hex): without it the variable can not be trusted.');
   return [install.step, runStep(id, name, [
-    ...HEAD, ...refLines(repo, artifact),
+    ...refLines(repo, artifact),
     `want=${q(want)}`,
     'keydir="$(mktemp -d "$RUNNER_TEMP/pipegen-cosign-key.XXXXXX")"',
     'printf \'%s\' "$PIPEGEN_COSIGN_PUB" > "$keydir/cosign.pub"',

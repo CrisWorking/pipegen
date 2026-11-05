@@ -13,6 +13,7 @@ import {
   IMAGE_ARCHIVE_FILE, IMAGE_ARCHIVE_STEP_ID, IMAGE_SHA_ENV, IMAGE_SHA_OUTPUT, imageArchiveArtifact, imageCheckStepId, imageShaRef, stepOutputForm, type RenderedStep,
 } from './job-rules.js';
 import type { PlatformActions } from './pin.js';
+import { pipegenScriptStep } from './pipegen-script.js';
 import { RenderError, show } from './render-error.js';
 import { renderPlatformStep, renderStep, type RenderContext, type RenderResult } from './render-step.js';
 import type { ReviewedTool, StepSpec } from '../types.js';
@@ -23,10 +24,7 @@ export { imageArchiveArtifact, IMAGE_ARCHIVE_FILE, IMAGE_SHA_OUTPUT };
 export const imageBuildTag = (service: string): string => `pipegen-image/${slug(service)}:build`;
 /** The archive in the job's runner temp, as a shell word (the run steps name it; never an env value, which Actions would not expand). */
 const archivePath = (service: string): string => `$RUNNER_TEMP/pipegen-out/${imageArchiveArtifact(service)}/${IMAGE_ARCHIVE_FILE}`;
-const FIXED_PATH = 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
-const HEAD = ['set -euo pipefail', 'unset CDPATH', FIXED_PATH, 'pg_fail() { echo "pipegen: $1" >&2; exit 1; }'];
-const bash = (id: string, name: string, lines: readonly string[], env: Record<string, string> = {}): RenderedStep =>
-  ({ id, name, run: [...lines, ''].join('\n'), shell: 'bash', env: { BASH_ENV: '', ENV: '', ...env } });
+const bash = pipegenScriptStep;
 
 /** The service of a spec, with a slug (an image is per service). */
 function serviceOf(spec: StepSpec, ctx: RenderContext): string {
@@ -40,7 +38,6 @@ function serviceOf(spec: StepSpec, ctx: RenderContext): string {
 export function renderImageArchiveStep(service: string): RenderedStep {
   const artifact = imageArchiveArtifact(service);
   return bash(IMAGE_ARCHIVE_STEP_ID, `pipegen: save the image of ${slug(service)} as an archive`, [
-    ...HEAD,
     `dir="$RUNNER_TEMP/pipegen-out/${artifact}"`,
     'mkdir -p "$RUNNER_TEMP/pipegen-out"',
     'mkdir "$dir"',
@@ -76,7 +73,6 @@ export function renderImageBuild(spec: StepSpec, buildPush: ReviewedTool, platfo
 /** The scanner job's hash check: the downloaded archive must have exactly the sha256 its image-build job wrote, before anything reads it. */
 export function renderImageCheckStep(service: string): RenderedStep {
   return bash(imageCheckStepId(service), `pipegen: check the image archive of ${slug(service)}`, [
-    ...HEAD,
     `file="${archivePath(service)}"`,
     `if ! [[ "$${IMAGE_SHA_ENV}" =~ ^[0-9a-f]{64}$ ]]; then pg_fail "the image build gave no sha256 for its archive"; fi`,
     'if [ ! -f "$file" ] || [ -L "$file" ]; then pg_fail "the image archive is missing or not a regular file"; fi',
@@ -85,10 +81,12 @@ export function renderImageCheckStep(service: string): RenderedStep {
 }
 
 /** The image tools that read an archive, and how each names it in place of the image reference. */
-const ARCHIVE_WORD: Readonly<Record<string, (path: string) => string>> = Object.freeze({
+export const ARCHIVE_WORD: Readonly<Record<string, (path: string) => string>> = Object.freeze({
   'trivy-image': (path: string) => `--input "${path}"`,
   syft: (path: string) => `"docker-archive:${path}"`,
 });
+/** The ids of the image tools that read an archive (the referee's list, one source). */
+export const ARCHIVE_TOOL_IDS: ReadonlySet<string> = new Set(Object.keys(ARCHIVE_WORD));
 /** The image the transform renders with and replaces: a name no registry serves, so a left-over could never scan a real image. */
 const ARCHIVE_SENTINEL = `ghcr.io/pipegen-archive/sentinel@sha256:${'0'.repeat(64)}`;
 const count = (text: string, part: string): number => text.split(part).length - 1;

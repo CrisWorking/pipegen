@@ -3,7 +3,7 @@
 // the real renderer and stepsToYaml, some of it hand-written and hostile.
 import { centralWorkflowPath } from '../src/engine/central-path.js';
 import { Document, parseDocument } from 'yaml';
-import { NO_SCANS } from '../src/engine/job-rules.js';
+import { defaultPushTrigger, DEPLOY_PUSH_IF, NO_SCANS } from '../src/engine/job-rules.js';
 import { describe, expect, it } from 'vitest';
 import { JOB_PERMISSIONS, JOB_STEP_POLICY, pipegenLines, referee, type Linters, type RefereeDeps, type RefereeIssue, type RefereeReport } from '../src/engine/referee.js';
 import { gateJobList, jobIdFor } from '../src/engine/gate-job-list.js';
@@ -130,7 +130,8 @@ describe('referee: the renderer and the referee agree', () => {
       const nth = (perNeed.get(needFor(t)) ?? 0) + 1;
       perNeed.set(needFor(t), nth);
       // D9: a tool that runs the service's test command (c8) runs in a service that has a test script
-      const spec = specFor(t, { needId: needFor(t), service: ARGV_POLICIES[t.id]?.testCommand === true ? 'script-app' : nth === 1 ? 'app' : `app${nth}` });
+      // (v0.2 Plan G G2-R1 I2: the image build gets a service of its own, so the registry-form image scans of app stay this test's subject)
+      const spec = specFor(t, { needId: needFor(t), service: t.id === 'docker-build-push-action' ? 'app13' : ARGV_POLICIES[t.id]?.testCommand === true ? 'script-app' : nth === 1 ? 'app' : `app${nth}` });
       let steps: RenderedStep[];
       try {
         steps = t.id === 'docker-build-push-action'
@@ -147,7 +148,8 @@ describe('referee: the renderer and the referee agree', () => {
       // a listed check runs in the job named for it (ruling 3 of C0b fix round 1), with the outputs the gate reads
       const outputs = jobOutputsFor(steps);
       jobs[t.id === 'docker-build-push-action' ? 'image-publish' : jobIdFor(spec.needId, spec.service)] = job(steps, {
-        ...(t.id === 'docker-build-push-action' ? { permissions: { contents: 'read', packages: 'write' } } : {}), ...(Object.keys(outputs).length > 0 ? { outputs } : {}),
+        // (G2-R1 I3: image-publish is a deploy job: a default-branch push only, after the gate)
+        ...(t.id === 'docker-build-push-action' ? { permissions: { contents: 'read', packages: 'write' }, if: DEPLOY_PUSH_IF, needs: ['gate'] } : {}), ...(Object.keys(outputs).length > 0 ? { outputs } : {}),
       });
     }
     // the helper-rendered platform actions, as Plan G uses them
@@ -194,7 +196,7 @@ describe('referee: the renderer and the referee agree', () => {
     // the gate job: no checkout (ruling S21), the job list of this draft, and a needs entry for every job of it (ruling S4)
     const entries = gateJobList(d);
     jobs.gate = job([...harden, download(), renderGateStep(GATE, d), ...renderGateUploads(platform())], { name: GATE_CHECK_NAME.split(' / ')[1], if: 'always()', needs: entries.map((e) => e.job), permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } });
-    const r = await run([wf(jobs)], d, { list: [...reviewedList(), GATE, WATCHER] });
+    const r = await run([wf(jobs, { on: { push: defaultPushTrigger('main'), pull_request: null } })], d, { list: [...reviewedList(), GATE, WATCHER] });
     for (const id of Object.keys(JOB_STEP_POLICY)) expect(Object.keys(jobs), id).toContain(id);
     expect(show(r)).toBe('');
     expect(r.ok).toBe(true);
@@ -319,9 +321,10 @@ describe('referee: only reviewed tools, and only as their template', () => {
     const p = platform();
     const login = renderPlatformStep('docker-login', p, loginInputs(), { registry: 'ghcr.io' });
     const perms = { permissions: { contents: 'read', packages: 'write' } };
-    expect(show(await run([wf({ 'image-publish': job([login], perms) })], draftOf([])))).toBe('');
+    // (v0.2 Plan G G2-R1 I3: image-publish writes to the registry only from a deploy job on a default-branch push, so the login is judged in the sign job, the other row that holds it)
+    expect(show(await run([wf({ sign: job([login], perms) })], draftOf([])))).toBe('');
     const elsewhere = { ...login, with: { ...login.with, registry: 'evil.example' } };
-    expect(checks(await run([rawWf({ 'image-publish': job([elsewhere], perms) })], draftOf([])))).toContain('injection');
+    expect(checks(await run([rawWf({ sign: job([elsewhere], perms) })], draftOf([])))).toContain('injection');
     const up = renderUpload('pipegen-out-secrets', '${{ runner.temp }}/pipegen-out/pipegen-out-secrets/gitleaks.sarif', p);
     const outside = { ...up, with: { ...up.with, path: '/etc' } };
     expect(has(await run([wf({ a: job([outside]) })], draftOf([])), 'template')).toBe(true);

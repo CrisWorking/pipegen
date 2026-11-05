@@ -8,14 +8,14 @@ import { describe, expect, it } from 'vitest';
 import { aiChoiceNames, CODE_FILLED_CHOICES } from '../src/create/coverage.js';
 import { builderOffers } from '../src/debate/builder.js';
 import { jobIdFor } from '../src/engine/gate-job-list.js';
-import { checkExpressions, checkJobOrder, createdPathProblem, imageBuildJobId, jobOutputsProblems, NO_SCANS, SIGN_STEP_ENV, VERIFY_STEP_ENV, IMAGE_ARCHIVE_STEP_ID, IMAGE_SHA_OUTPUT, jobOutputsFor, NARROWING_CHOICES, type RenderedStep } from '../src/engine/job-rules.js';
+import { CALLER_WORKFLOW, checkExpressions, checkJobOrder, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, PUSH_WORKFLOW, createdPathProblem, imageBuildJobId, jobOutputsProblems, NO_SCANS, SIGN_STEP_ENV, VERIFY_STEP_ENV, IMAGE_ARCHIVE_STEP_ID, IMAGE_SHA_OUTPUT, jobOutputsFor, NARROWING_CHOICES, type RenderedStep } from '../src/engine/job-rules.js';
 import { referee, type Linters } from '../src/engine/referee.js';
 import { imageArchiveArtifact, imageBuildTag, renderImageArchiveScan, renderImageBuild } from '../src/engine/image-handoff.js';
 import { attestSignerWorkflow, COSIGN_ID, GH_ID, imageDigestArtifact, keylessIdentity, pubKeySha256, renderSignSteps, renderVerifySteps } from '../src/engine/signing.js';
 import { renderFindingsBlock, renderJobPrelude, renderPlatformStep, renderScrub, renderStep, renderUpload, scrubbedPath, type RenderContext } from '../src/engine/render-step.js';
 import { RenderError } from '../src/engine/render-error.js';
 import type { Candidate, CreatedFile, KnownValueCheck, Need, PipelineDraft, ReviewedTool, Service, SigningPlan, StepSpec } from '../src/types.js';
-import { draftOf, GATE, job, p, prof, show, workflow, type Job } from './helpers/gate-pipeline.js';
+import { draftOf, GATE, job, jobsOf, p, prof, show, workflow, type Job } from './helpers/gate-pipeline.js';
 import { entry, profile, reviewedList, service, specFor } from './helpers/render.js';
 
 /** Names spelled at run time (test/no-secret-literals.test.ts): the OIDC permission, the password and token env names. */
@@ -247,6 +247,11 @@ const scanJob = (d: PipelineDraft = imageDraft(), over: Job = {}, edit?: (s: Ren
 };
 const imageFile = (jobs: Record<string, Job>): CreatedFile => workflow(jobs);
 
+/** The deploy layout of pipegen.yml (ruling B2): the honest gate pipeline, a default-only push, the review trigger; deploy jobs need the gate. */
+const pubDraft = draftOf({ profile: { ...prof, services: prof.services.map((s) => (s.name === 'app' ? { ...s, dockerfile: 'Dockerfile' } : s)) } });
+const DEPLOY_ON = { push: defaultPushTrigger('main'), pull_request: null, pull_request_review: { types: ['submitted', 'dismissed'] } };
+const deployFile = (extra: Record<string, Job>, on: unknown = DEPLOY_ON, path = CALLER_WORKFLOW): CreatedFile => ({ ...workflow({ ...jobsOf(pubDraft), ...extra }, { on }), path });
+
 describe('G2: the image hand-off (B6)', () => {
   it('render: image-build uploads an OCI archive and its sha256; the scan job checks the hash before trivy --input', async () => {
     expect(imageBuildJobId('app')).toBe(jobIdFor('image-build', 'app'));
@@ -360,7 +365,8 @@ describe('G2: the image hand-off (B6)', () => {
     expect(has(alone, 'not-gate-readable', /base twin/), show(alone)).toBe(true);
     const ad0 = imageDraft();
     const withArchive = await runWith([imageFile({ 'image-build--app': buildJob(ad0), 'image-scan--app': scanJob(ad0), 'base-scan': base(Y) })], ad0);
-    expect(has(withArchive, 'not-gate-readable', /base twin.*archive/), show(withArchive)).toBe(true);
+    // (G2-R1 I2: with the image build in the draft no base twin of that scan is pipegen's step at all)
+    expect(has(withArchive, 'unreviewed', /not a step pipegen renders/), show(withArchive)).toBe(true);
     // the archive scan has no base twin at all (there is no base build yet, B6): its steps in base-scan are not pipegen's
     const ad = imageDraft();
     const archiveSteps = renderImageArchiveScan(scanSpec(), TRIVY, p, ictx(ad)).steps;
@@ -407,8 +413,10 @@ describe('G2: the image hand-off (B6)', () => {
     expect(has(lint, 'template', /build-push/), show(lint)).toBe(true);
     // image-publish: a Dockerfile of a service only
     const pub = (w: Record<string, string>): Job => job([...renderJobPrelude({}, p).steps, { ...renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: 'ghcr.io/o/r-app:main' }, { push: 'true' }), with: { ...renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: 'ghcr.io/o/r-app:main' }, { push: 'true' }).with, ...w } }], { permissions: { contents: 'read', packages: 'write' } });
-    expect(show(await runWith([imageFile({ 'image-publish': pub({}) })], d))).toBe('');
-    expect(has(await runWith([imageFile({ 'image-publish': pub({ file: 'evil/Dockerfile' }) })], d), 'template', /Dockerfile of a service/)).toBe(true);
+    // (G2-R1 I3: image-publish pushes only from a deploy job of pipegen.yml on a default-branch push, so it is judged there)
+    const dep = (w: Record<string, string>): Job => ({ ...pub(w), if: DEPLOY_PUSH_IF, needs: ['gate'] });
+    expect(show(await runWith([deployFile({ 'image-publish': dep({}) })], pubDraft))).toBe('');
+    expect(has(await runWith([deployFile({ 'image-publish': dep({ file: 'evil/Dockerfile' }) })], pubDraft), 'template', /Dockerfile of a service/)).toBe(true);
   });
 });
 
@@ -564,5 +572,89 @@ describe('G2: no narrowing value for a blocking need (F2-R11)', () => {
     const offer = builderOffers([need], candidates, profile([py]), { reviewed: odd, bar: {} as never, now: new Date('2026-11-05'), caps: draftOf().capabilities }).offers.get('coverage--api')?.find((o) => o.entry.id === 'coverage-py');
     expect(offer?.aiChoices).toEqual({});
     expect(offer?.codeChoices).toEqual({ 'fail-under': '60' });
+  });
+});
+
+describe('G2 fix round 1 (ruling G2-R1)', () => {
+  it('referee: a non-blocking copy of a need on another layer never lets a narrowing value through (G2-R1 I1)', async () => {
+    // P1: trivy-config CRITICAL alone, the need blocking on merge, a non-blocking push-layer copy listed first
+    const pushNeed: Need = { id: 'iac', layer: 'push', category: 'iac', why: 't', blocking: false, floor: false };
+    const mergeNeed: Need = { id: 'iac', layer: 'merge', category: 'iac', why: 't', blocking: true, floor: false };
+    const spec = specFor(entry('trivy-config'), { needId: 'iac', choices: { severity: 'CRITICAL' } });
+    const narrowSteps = renderStep(spec, entry('trivy-config'), p, { profile: imgProf, blocking: false }).steps;
+    for (const needs of [[pushNeed, mergeNeed], [mergeNeed, pushNeed]]) {
+      const d = draftOf({ profile: imgProf, needs, steps: [spec] });
+      const r = await runWith([workflow({ iac: job([...renderJobPrelude({}, p).steps, ...narrowSteps]) })], d);
+      expect(r.ok, `${needs[0]?.layer} first: ${show(r)}`).toBe(false);
+      expect(r.notes.some((n) => /narrow a blocking check/.test(n)), `${needs[0]?.layer} first`).toBe(true);
+    }
+    // P7: build-push push true for a blocking merge need with a non-blocking push-layer copy first
+    const pushBuild: Need = { id: 'image-build', layer: 'push', category: 'image-build', service: 'app', why: 't', blocking: false, floor: false };
+    const r7 = await runWith([], draftOf({ profile: imgProf, needs: [pushBuild, needOf('image-build', 'app')], steps: [buildSpec('app', { push: 'true' })] }));
+    expect(has(r7, 'unreviewed', /narrow/), show(r7)).toBe(true);
+    // control: every copy non-blocking, the value may stand
+    const r8 = await runWith([], draftOf({ profile: imgProf, needs: [pushBuild, needOf('image-build', 'app', false)], steps: [buildSpec('app', { push: 'true' })] }));
+    expect(r8.issues.some((i) => /narrow/.test(i.message)), show(r8)).toBe(false);
+  });
+
+  it('referee: with the image build in the draft, only the archive form scans that service\'s image (G2-R1 I2)', async () => {
+    // P5: the registry form of trivy-image, scanning some other image, next to the service's own image build
+    const d = imageDraft();
+    const other = `ghcr.io/library/clean@sha256:${'9'.repeat(64)}`;
+    const reg = renderFindingsBlock(scanSpec(), TRIVY, p, { profile: imgProf, targets: { image: other } }, GATE);
+    const r = await runWith([imageFile({ 'image-build--app': buildJob(d), 'image-scan--app': job(reg.steps, { outputs: jobOutputsFor(reg.steps) }) })], d);
+    const notOurs = /not a step pipegen renders|differs from what pipegen renders/;
+    expect(r.issues.some((i) => (i.check === 'unreviewed' || i.check === 'template') && notOurs.test(i.message) && /image-scan--app/.test(i.message)), show(r)).toBe(true);
+    // and its base twin is no step of pipegen's either (B6: no base twin yet)
+    const baseB = renderFindingsBlock(scanSpec(), TRIVY, p, { profile: imgProf, targets: { image: other }, base: true }, GATE);
+    const baseSteps = [...renderJobPrelude({ baseRef: true }, p).steps, ...baseB.steps];
+    const r2 = await runWith([imageFile({ 'image-build--app': buildJob(d), 'image-scan--app': scanJob(d), 'base-scan': job(baseSteps, { outputs: jobOutputsFor(baseSteps), permissions: { contents: 'read', actions: 'read' } }) })], d);
+    expect(r2.issues.some((i) => /In the job "base-scan"/.test(i.message) && notOurs.test(i.message)), show(r2)).toBe(true);
+    // the archive form still passes, and with no image build the registry form is as before
+    expect(show(await runWith([imageFile({ 'image-build--app': buildJob(d), 'image-scan--app': scanJob(d) })], d))).toBe('');
+    const noBuild = draftOf({ profile: imgProf, needs: [needOf('image-scan', 'app')], steps: [scanSpec()] });
+    expect(show(await runWith([imageFile({ 'image-scan--app': job(reg.steps, { outputs: jobOutputsFor(reg.steps) }) })], noBuild))).toBe('');
+  });
+
+  it('referee: an image push runs only in a deploy job of pipegen.yml on a default-branch push (G2-R1 I3)', async () => {
+    const bp = renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: 'ghcr.io/o/r-app:latest' }, { push: 'true' });
+    const pub = (over: Job = {}): Job => job([...renderJobPrelude({}, p).steps, bp], { permissions: { contents: 'read', packages: 'write' }, ...over });
+    const deploy = (over: Job = {}): Job => pub({ if: DEPLOY_PUSH_IF, needs: ['gate'], ...over });
+    expect(show(await runWith([deployFile({ 'image-publish': deploy() })], pubDraft))).toBe('');
+    const refused = (r: { issues: { check: string; message: string }[] }): boolean => has(r, 'permissions', /writes to the image registry/);
+    // P6: a pull_request-only pipegen.yml, the push file, a default-push pipegen.yml job without the deploy condition, another file
+    const cases: [string, CreatedFile][] = [
+      ['pull_request only', deployFile({ 'image-publish': pub({ needs: ['gate'] }) }, { pull_request: null })],
+      ['no deploy condition', deployFile({ 'image-publish': pub({ needs: ['gate'] }) })],
+      ['the push file', { ...workflow({ 'image-publish': pub() }, { on: { push: featurePushTrigger('main') } }), path: PUSH_WORKFLOW }],
+      ['another file', deployFile({ 'image-publish': deploy() }, DEPLOY_ON, '.github/workflows/release.yml')],
+    ];
+    for (const [name, f] of cases) {
+      const r = await runWith([f], pubDraft);
+      expect(refused(r), `${name}: ${show(r)}`).toBe(true);
+    }
+    // packages: write alone (a login with no push) is a registry write too; a no-push build without it is not
+    const login = renderPlatformStep('docker-login', p, { username: '${{ github.actor }}', [['pass', 'word'].join('')]: `${'$'}{{ secrets.${['GITHUB', 'TOK' + 'EN'].join('_')} }}` }, { registry: 'ghcr.io' });
+    expect(refused(await runWith([imageFile({ 'image-publish': job([login], { permissions: { contents: 'read', packages: 'write' } }) })], pubDraft))).toBe(true);
+    const nopush = renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: 'ghcr.io/o/r-app:x' }, { push: 'false' });
+    expect(refused(await runWith([imageFile({ 'image-publish': job([...renderJobPrelude({}, p).steps, nopush]) })], pubDraft))).toBe(false);
+  });
+
+  it('referee: sign, verify and image hand-off steps in a composite action are refused (G2-R1 m1)', async () => {
+    const klDraft = signingDraft(KEYLESS);
+    const action = (steps: RenderedStep[]): CreatedFile => {
+      const doc = new Document();
+      doc.contents = doc.createNode({ name: 'x', description: 'x', runs: { using: 'composite' } });
+      doc.setIn(['runs', 'steps'], doc.createNode(steps.map(({ usesComment: _c, ...rest }) => ({ ...rest, shell: rest.shell ?? undefined }))));
+      return { path: '.github/actions/x/action.yml', content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: 't', repo: 'central' };
+    };
+    for (const [name, steps, d] of [
+      ['verify', renderVerifySteps(COSIGN, klDraft, IMG), klDraft],
+      ['sign', renderSignSteps(COSIGN, 'keyless', IMG), klDraft],
+      ['image archive', renderImageBuild(buildSpec(), BUILD_PUSH, p, ictx()).steps.filter((x) => x.id === IMAGE_ARCHIVE_STEP_ID), imageDraft()],
+    ] as const) {
+      const r = await runWith([action([...steps])], d);
+      expect(has(r, 'permissions', /composite action/), `${name}: ${show(r)}`).toBe(true);
+    }
   });
 });
