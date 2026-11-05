@@ -209,20 +209,39 @@ async function passAi<T>(before: AiUsage, f: () => Promise<T>): Promise<T> {
 
 /** The shortest cleaned form of a typed value that is scrubbed too (a shorter one would blank ordinary words). */
 const MIN_CLEANED_FORM = 4;
+/** A sentinel word before a typed value, to see how the cleaner writes it after other words (review F4-r1 N1). */
+const SENTINEL = 'zqzq';
 
 /**
- * Defence in depth for returned text (ruling F4-R12 m2; Plan G's vault check stays the gate): every value the user typed, in its
- * own forms (knownValueScrubber) and in its cleaned form (cleanForDoc turns `_` and some marks into blanks, so a claim already
- * holds that form), becomes the vault's placeholder, and the text is cleaned again. Text holding none is returned as it is.
+ * The forms the cleaner can turn a typed value into (ruling F4-R13 N1). The doc alphabet acts on the left context: at the start of a
+ * text it drops leading list and heading marks and puts a blank after leading digits before `.` or `)`; after other words it does
+ * neither. So two forms: stripForDoc of the value alone (the start of a text) and of the value after a sentinel word, cut out (after
+ * other words; a trailing `!` goes at the end of a text, and a form found as a prefix still takes the whole value). `_`, `&`,
+ * typographic quotes and dashes, blanks and NFC change the same way in both. A form shorter than MIN_CLEANED_FORM is left out.
+ */
+function cleanedForms(v: string): string[] {
+  const out = new Set<string>([stripForDoc(v)]);
+  const after = stripForDoc(`${SENTINEL} ${v}`);
+  if (after.startsWith(`${SENTINEL} `)) out.add(after.slice(SENTINEL.length + 1));
+  return [...out].map((f) => f.trim()).filter((f) => f !== v && f.length >= MIN_CLEANED_FORM);
+}
+
+/**
+ * Defence in depth for returned text (rulings F4-R12 m2, F4-R13 N1; Plan G's vault check stays the gate): every value the user
+ * typed, in its own forms (knownValueScrubber) and in every form the cleaner writes it in (cleanedForms), becomes the vault's
+ * placeholder, and the text is cleaned again. The cleaned result is scrubbed once more; anything still found there gives the
+ * placeholder text (fail closed). Text holding none is returned as it is.
  */
 function returnedTextScrubber(knownValues: readonly string[]): (text: string, max: number) => string {
-  const forms = [...new Set(knownValues.flatMap((v) => {
-    const cleaned = stripForDoc(v);
-    return cleaned !== v && cleaned.trim().length >= MIN_CLEANED_FORM ? [v, cleaned] : [v];
-  }))].filter((v) => v.trim() !== '');
+  const forms = [...new Set(knownValues.flatMap((v) => [v, ...cleanedForms(v)]))].filter((v) => v.trim() !== '');
   if (forms.length === 0) return (text) => text;
   const scrub = knownValueScrubber(forms);
-  return (text, max) => { const t = scrub(text); return t === text ? text : cleanForDoc(t, max); };
+  return (text, max) => {
+    const before = scrub(text);
+    if (before === text) return text;
+    const cleaned = cleanForDoc(before, max);
+    return scrub(cleaned) === cleaned ? cleaned : cleanForDoc(CLEAN_DOC_PLACEHOLDER, max);
+  };
 }
 
 /** A key-sorted copy, so two specs with the same choices compare equal (ruling S11's dedupe by candidate id and choices). */
@@ -374,7 +393,7 @@ export async function debate(
   const odeps = { reviewed: deps.reviewed, knownValues: kv };
   const transcript: string[] = [];
   const scrubbed = returnedTextScrubber(kv);
-  const say = (text: string) => { transcript.push(cleanForDoc(scrubbed(text, TRANSCRIPT_LINE_MAX), TRANSCRIPT_LINE_MAX)); };
+  const say = (text: string) => { transcript.push(scrubbed(cleanForDoc(text, TRANSCRIPT_LINE_MAX), TRANSCRIPT_LINE_MAX)); };
   let usage: AiUsage = { ...ZERO_USAGE };
   let calls = 0;
 
@@ -604,7 +623,7 @@ export async function debate(
         ...theirs.map((x, j): DisputeOption => ({ label: 'judge', variant: theirs.length === 1 ? `dispute-${id}-b` : `dispute-${id}-${j + 1}-b`, choice: x.choice, argument: x.argument, objectionIds: x.ids })),
       ],
     });
-    say(`Dispute ${id} on ${checkLabel(ref.id, ref.service)}: ${mine.chosen.tool.id} (the builder's pick) against ${theirs.map((x) => x.choice.chosen.tool.id).join(' and ')} (the judge's); proof runs against planted problems decide, not a vote.`);
+    say(`Dispute ${id} on ${checkLabel(ref.id, ref.service)}: ${mine.chosen.tool.id} (${mine.by === 'pipegen' ? 'pipegen' : 'the builder'}'s pick) against ${theirs.map((x) => x.choice.chosen.tool.id).join(' and ')} (the judge's); proof runs against planted problems decide, not a vote.`);
   }
 
   // ruling F4-R12 m2: no typed value in any returned text (the transcript is scrubbed in `say`)

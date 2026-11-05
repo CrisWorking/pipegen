@@ -9,7 +9,7 @@ import { ROUND_OBJECTIONS_TAG } from '../src/ai/prompts/debate.js';
 import { UNTRUSTED_AI_TAG } from '../src/ai/prompts/untrusted.js';
 import { bundleCode, bundleText, type CodeBundle } from '../src/ai/redact.js';
 import { builderOffers, specFor, type Choice, type Offer } from '../src/debate/builder.js';
-import { cleanForDoc } from '../src/debate/clean.js';
+import { cleanForDoc, stripForDoc } from '../src/debate/clean.js';
 import {
   ARGUMENT_MAX, MAX_BUNDLE_CALLS, MAX_DEBATE_CALLS, MAX_ROUNDS, ROUND_MAX_OUTPUT_TOKENS, ROUND_TIMEOUT_MS, TRANSCRIPT_LINE_MAX,
   debate, dedupeSuggestions, readBuilderReplies, readJudgeVerdicts, type DebateDeps, type DebateResult,
@@ -361,6 +361,33 @@ describe('debate (plan Task 3)', () => {
       expect(pipegenDocProblems(`# PIPEGEN\n\n- ${line}\n`, DOC_OPTS)).toEqual([]);
     }
     expect(back.filter((l) => l.includes('REDACTED')).length).toBeGreaterThanOrEqual(6);
+
+    // ruling F4-R13 N1: every form the cleaner can turn a typed value into is scrubbed, wherever the value sits in a text: a leading
+    // `1.` (the cleaner puts a blank after the digits at the start of a text), `_`, `&`, dots, quotes and unicode dashes
+    const shapes = ['1.ab_cdefgh99', '42)xy_zw_kk17', 'tok&en_lime88', 'a.b.c.d_9911q', `quo"te'zz_55m`, 'uni\u2014dash\u2013x77k', '9.kl_mnop!'];
+    const at = (v: string, i: number) => [`${v} leaked here.`, `The typed ${v} leaked.`, `It leaked: ${v}`, v][i % 4]!;
+    const n = routed({
+      builder: [built({ because: { [LEAK_KEY]: at(shapes[0]!, 0), iac: at(shapes[1]!, 1) }, suggestions: [{ id: 's1', why: at(shapes[2]!, 2) }] })],
+      judge: [critiqued([
+        ...shapes.slice(0, 6).map((v, i) => ({ key: [LEAK_KEY, 'iac', 'lint--web', 'sast--api', LEAK_KEY, 'lint--web'][i]!, counter: ['gitleaks', 'trivy-config', 'eslint', 'bandit', 'gitleaks', 'oxlint-typeaware'][i]!, claim: at(v, i + 1) })),
+        { key: 'coverage--web', counter: 'c8', claim: at(shapes[6]!, 2) },   // after other words, at the end of a text: its own form
+      ], { approval: true, reason: at(shapes[3]!, 3) })],
+      'debate-builder': [replies({}, at(shapes[4]!, 0))],
+      'debate-judge': [verdicts({}, at(shapes[5]!, 0))],
+    });
+    const rn = await run(n.ai, { deps: ddeps({ knownValues: shapes }) });
+    expect(rn.disputes.length).toBeGreaterThan(0);
+    // an independent check: the value's letters and digits (with `&` as the cleaner writes it) never come back in a row
+    const skeleton = (t: string) => t.replace(/&/g, 'and').normalize('NFC').replace(/[^\p{L}\p{N}]/gu, '').toLowerCase();
+    for (const line of texts(rn)) {
+      for (const v of shapes) {
+        expect(line).not.toContain(v);
+        for (const form of [stripForDoc(v), stripForDoc(`x ${v} x`).slice(2, -2), stripForDoc(`x ${v}`).slice(2)]) expect(line).not.toContain(form);
+        expect(skeleton(line)).not.toContain(skeleton(v));
+      }
+      expect(cleanForDoc(line, TRANSCRIPT_LINE_MAX)).toBe(line);
+      expect(pipegenDocProblems(`# PIPEGEN\n\n- ${line}\n`, DOC_OPTS)).toEqual([]);
+    }
     // the whole line is cleaned, not only the AI's parts: a service name holding `_` (the cleaner makes it a blank)
     const pu = profile({ services: [API, svc({ ...WEB, name: 'web_ui', path: 'web' })] });
     const nu = [need('lint', 'merge', 'web_ui')];
@@ -658,6 +685,8 @@ describe('debate (added)', () => {
     });
     const rm = await run(m.ai, { needs, p: profile(), cands: candidatesFor(needs, profile(), {}, withTwo), deps: ddeps({ reviewed: withTwo }) });
     expect(rm.disputes.map((d) => d.options.map((o) => [o.label, o.choice.chosen.tool.id]))).toEqual([[['pipegen', 'zap-baseline'], ['judge', 'zap-two']]]);
+    // ruling F4-R13 N2: the dispute line follows the label
+    expect(rm.transcript).toContain("Dispute d1 on the dast check for web: zap-baseline (pipegen's pick) against zap-two (the judge's); proof runs against planted problems decide, not a vote.");
 
     // without zap-baseline on the reviewed list nothing is offered once the layer blocks: the key is uncovered, never the old tool
     const reviewed = REVIEWED.filter((t) => t.id !== 'zap-baseline');
