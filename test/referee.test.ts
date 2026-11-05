@@ -168,7 +168,9 @@ describe('referee: the renderer and the referee agree', () => {
     const download = (): RenderedStep => renderPlatformStep('download-artifact', p, { name: 'pipegen-out-sast--app', path: '${{ runner.temp }}/pipegen-out/pipegen-out-sast--app' });
     const harden = renderStep(specFor(entry('bullfrog'), { needId: 'egress' }), entry('bullfrog'), p, ctx).steps;
     // each mode of the gate action in the job that runs it (Plan C ruling B3); baseline-check has its own gate mode since C3
-    const gateAct = (mode: string): RenderedStep => ({ name: 'gate', uses: GATE.step.action?.uses as string, with: { mode, ...(mode === 'find-run' ? { layout: 'inline' } : {}) } });
+    // (G5, C8r1: the draft is private for attest mode, so it carries the central pin, and find-run looks for the central workflow at it)
+    const pin = { repo: 'o/pipelines', sha: 'c'.repeat(40) };
+    const gateAct = (mode: string): RenderedStep => ({ name: 'gate', uses: GATE.step.action?.uses as string, with: { mode, ...(mode === 'find-run' ? { layout: 'central', 'central-workflow': centralWorkflowPath(pin.repo, profN.repo), 'central-sha': pin.sha } : {}) } });
     const watchAct: RenderedStep = { name: 'watch', uses: WATCHER.step.action?.uses as string, with: { mode: 'watcher' } };
     const [checkout] = prelude();
     const co = checkout as RenderedStep;
@@ -201,7 +203,7 @@ describe('referee: the renderer and the referee agree', () => {
     jobs['unit-tests--script-app'] = job(scripts[0] as RenderedStep[]);
     jobs['lint--script-app'] = job(scripts[1] as RenderedStep[]);
     // (G3-R2 I1/M1: the sign job's actions/attest step runs only in attest mode, which signingMode gives a private repository with attestations)
-    const d = draftOf([...specs, repoWide], { profile: { ...profN, private: true }, signing: { mode: 'attest', images: [{ service: 'app', repo: 'ghcr.io/o/app' }] } });
+    const d = draftOf([...specs, repoWide], { profile: { ...profN, private: true }, centralPin: pin, signing: { mode: 'attest', images: [{ service: 'app', repo: 'ghcr.io/o/app' }] } });
     d.needs.push(needOf('unit-tests', true, 'script-app'), needOf('lint', true, 'script-app'));
     // the nightly job: its step is nightlyStepInputs(draft) (final review fix round A, ruling 3)
     jobs.nightly = job([download(), renderNightlyStep(GATE, d)], { permissions: { contents: 'read', actions: 'read', issues: 'write' } });

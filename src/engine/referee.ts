@@ -2218,6 +2218,11 @@ async function judgeFiles(allFiles: CreatedFile[], draft: PipelineDraft, platfor
     if (plan.text !== null) composeEnv = plan.env;
   }
   const ex = expectations(draft, platform, reviewed, add, notes, composeEnv);
+  // C8r1 (G5): a private repository's pipeline runs from its central workflows, pinned to the commit pipegen recorded; without a valid central
+  // pin its find-run step and its callers have nothing to be judged against (a public one keeps its workflows in the app and has no pin)
+  if (draft.profile.private === true && files.some((f) => f.repo === 'app' && fileKind(f) === 'workflow' && f.inserted === undefined) && centralOf(draft) === null) {
+    add('(draft)', 'template', 'A private repository runs its pipeline from its central workflows at the commit pipegen recorded, and the draft has no valid central pin (<owner>/pipelines at a 40-character commit).');
+  }
   const parsed = new Map<string, Parsed>();
   const lintable: CreatedFile[] = [];
   for (const f of files) {
