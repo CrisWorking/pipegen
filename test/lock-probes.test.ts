@@ -83,4 +83,23 @@ describe('G8 probes', () => {
       expect(g2.calls.length, what).toBe(appList === ok ? 2 : 1);
     }
   });
+
+  it('G8-R3: a collaborator list still paging at the 50-page cap stops with a plain reason, never a short list', async () => {
+    const page = (n: number, next: boolean): Reply => ({
+      body: n === 1 ? [{ login: 'alice', type: 'User', permissions: { admin: true, push: true, pull: true } }]
+        : n === 51 ? [{ login: 'bob', type: 'User', permissions: { push: true, pull: true } }]
+          : [{ login: `reader${n}`, type: 'User', permissions: { push: false, pull: true } }],
+      headers: next ? { link: `<${API}/repos/o/r/collaborators?page=${n + 1}>; rel="next"` } : {},
+    });
+    const route = (last: number) => (c: { url: URL }) => { const n = Number(c.url.searchParams.get('page') ?? '1'); return page(n, n < last); };
+    // 51 pages: the cap is reached while GitHub still has more (bob, the second writer, is on page 51)
+    const g = gh({ [`GET ${API}/repos/o/r/collaborators`]: route(51), [`GET ${API}/repos/o/pipelines/collaborators`]: route(1) });
+    const e = await readWriters(g.gh, 'o', 'r', 'pipelines', clock()).catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(GitHubAccessError);
+    expect((e as Error).message).toMatch(/more than 5000|too many/);
+    expect(g.calls.length).toBe(50);
+    // exactly 50 pages, the last with no next link: the whole list is read
+    const g2 = gh({ [`GET ${API}/repos/o/r/collaborators`]: route(50), [`GET ${API}/repos/o/pipelines/collaborators`]: route(1) });
+    expect(await readWriters(g2.gh, 'o', 'r', 'pipelines', clock())).toEqual({ app: ['alice'], central: ['alice'] });
+  });
 });

@@ -272,15 +272,16 @@ export function planLocks(i: LockInputs): LockPlan {
     }
   }
 
-  const plan: LockPlan = { owners: { app: blocks ? owners : [], central: blocks ? owners : [] }, writers: { app: [...i.writers.app], central: [...i.writers.central] }, notes };
+  const plan: LockPlan = { owners: { app: [], central: [] }, writers: { app: [...i.writers.app], central: [...i.writers.central] }, notes };
 
-  // 2. CODEOWNERS (D0b builders; the judges re-check them). A repo whose block can't be written gets no code-owner rule (G8-R2 m6)
+  // 2. CODEOWNERS (D0b builders; the judges re-check them). A repo whose block can't be written gets no code-owner rule (G8-R2 m6), and lists
+  // no code owners (G8-R3): owners are named only for a repo that gets a block
   if (blocks) {
-    plan.codeOwners = { owners, writers };
     const appCo = codeownersPlan('app', p.repoFiles.codeowners, i.appCodeowners, i.protectedPaths, owners, show(app), notes);
-    if (appCo !== undefined) plan.codeowners = appCo;
+    if (appCo !== undefined) { plan.codeowners = appCo; plan.owners.app = owners; }
     const cCo = codeownersPlan('central', i.central.codeowners.path, i.central.codeowners, CENTRAL_PROTECTED_PATHS, owners, show(centralName), notes);
-    if (cCo !== undefined) plan.centralCodeowners = cCo;
+    if (cCo !== undefined) { plan.centralCodeowners = cCo; plan.owners.central = owners; }
+    if (appCo !== undefined || cCo !== undefined) plan.codeOwners = { owners, writers };
   }
 
   // 3. the app's locks. An unknown plan whose branch rules weren't confirmed (G8-R2 m2): planned anyway; finish re-probes and reports a refused write

@@ -777,9 +777,9 @@ const WRITERS_PAGES = 50;
 export async function listWriters(gh: Octokit, owner: string, repo: string, clock: RateClock = clockOf(gh)): Promise<string[]> {
   checkRepoNames(owner, [repo]);
   const writers: string[] = [];
+  let more = false;
   for (let page = 1; page <= WRITERS_PAGES; page++) {
     let data: unknown;
-    let more = false;
     try {
       const res = await withRateLimit(() => gh.rest.repos.listCollaborators({ owner, repo, affiliation: 'all', per_page: 100, page }), clock);
       data = res.data;
@@ -805,5 +805,7 @@ export async function listWriters(gh: Octokit, owner: string, repo: string, cloc
     }
     if (!more) break;
   }
+  // G8-R3: GitHub still has pages at the cap; a short list would plan the locks as if fewer people could write, so stop instead
+  if (more) throw new GitHubAccessError(`${repoName(owner, repo)} has more than ${WRITERS_PAGES * 100} collaborators (GitHub still had more pages after ${WRITERS_PAGES}), too many for pipegen to read who can write; it can't plan who approves changes there.`);
   return writers;
 }

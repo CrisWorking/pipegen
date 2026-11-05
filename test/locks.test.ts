@@ -434,7 +434,8 @@ describe('G8: merge locks, central locks, required workflow, CODEOWNERS', () => 
       const f: CreatedFile = { path: '.github/CODEOWNERS', content: codeownersReplace(original, cOLD, cblock) as string, part: 'codeowners', reason: 't', repo: 'central', edited: { original } };
       return codeownersCentralJudge(f, { draft: d, files, ...envOf({ codeownersFacts: facts('central', cOLD), centralCodeowners: '.github/CODEOWNERS', ...(centralTree === undefined ? {} : { centralFiles: centralTree }) }) }).join(' | ');
     };
-    expect(centralRun('r--merge.yml @dev', centralFiles, [])).toMatch(/after the pipegen block/);
+    expect(centralRun('r--merge.yml @dev', [], ['.github/workflows/r--merge.yml'])).toMatch(/after the pipegen block/);
+    expect(centralRun('r--merge.yml @dev', centralFiles, ['installs/r.json'])).toMatch(/after the pipegen block/);
     // G8-R2 m3: a central re-run needs the central repo's file list; without it the file is refused, never judged on a shorter list
     expect(centralRun('README.md @docs')).toMatch(/central repository's file list/);
     expect(centralRun('README.md @docs', centralFiles, ['README.md'])).toBe('');
@@ -536,6 +537,38 @@ describe('G8: merge locks, central locks, required workflow, CODEOWNERS', () => 
       expect(central.centralCodeowners).toBeUndefined();
       expect(prRule(central.centralRuleset).require_code_owner_review).toBe(false);
       expect(prRule(central.rulesets?.reviews).require_code_owner_review).toBe(true);
+    });
+  });
+
+  describe('G8 fix round 2 (controller ruling G8-R3)', () => {
+    it('both CODEOWNERS files symbolic links (no block, no code-owner rule) → the plan lists no code owners', () => {
+      const prof = orgPriv({ repoFiles: { ...emptyRepoFiles(), codeowners: '.github/CODEOWNERS' } });
+      const link = { original: '* @x\n', isSymlink: true, inserted: null };
+      const plan = planLocks(inputs({ profile: prof, appCodeowners: link, central: { repo: 'o/pipelines', sha: SHA, branchProtection: true, codeowners: { path: '.github/CODEOWNERS', ...link } } }));
+      expect(plan.codeowners).toBeUndefined();
+      expect(plan.centralCodeowners).toBeUndefined();
+      expect(plan.codeOwners).toBeUndefined();
+      expect(plan.owners).toEqual({ app: [], central: [] });
+      // one repo linked: only the other lists its owners
+      const appOnly = planLocks(inputs({ profile: prof, appCodeowners: link }));
+      expect(appOnly.owners).toEqual({ app: [], central: OWNERS });
+      expect(appOnly.codeOwners).toEqual({ owners: OWNERS, writers: 2 });
+      const centralOnly = planLocks(inputs({ central: { repo: 'o/pipelines', sha: SHA, branchProtection: true, codeowners: { path: '.github/CODEOWNERS', ...link } } }));
+      expect(centralOnly.owners).toEqual({ app: OWNERS, central: [] });
+    });
+
+    it('central layout: an empty central file list is refused on a central re-run, like a missing one', async () => {
+      const { codeownersCentralJudge } = await import('../src/engine/created-judges/codeowners.js');
+      const cblock = codeownersBlock([...CENTRAL_PROTECTED_PATHS], OWNERS);
+      const cOLD = codeownersBlock(['installs/**'], OWNERS);
+      const original = `${cOLD}README.md @docs\n`;
+      const f: CreatedFile = { path: '.github/CODEOWNERS', content: codeownersReplace(original, cOLD, cblock) as string, part: 'codeowners', reason: 't', repo: 'central', edited: { original } };
+      const facts = { app: { isSymlink: false, inserted: null }, central: { isSymlink: false, inserted: cOLD } };
+      const run = (prof: RepoProfile, centralFiles?: string[]) => codeownersCentralJudge(f, { draft: planned(prof, { over: { codeOwners: { owners: OWNERS, writers: 2 } } }).draft, files: [], ...envOf({ codeownersFacts: facts, centralCodeowners: '.github/CODEOWNERS', ...(centralFiles === undefined ? {} : { centralFiles }) }) }).join(' | ');
+      // a private app (central layout): the central repo holds its workflows, so an empty list can't be its tree
+      expect(run(orgPriv(), [])).toMatch(/central repository's file list/);
+      expect(run(orgPriv())).toMatch(/central repository's file list/);
+      expect(run(orgPriv(), ['.github/workflows/r--merge.yml', 'installs/r.json'])).toBe('');
     });
   });
 });
