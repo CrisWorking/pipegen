@@ -140,6 +140,10 @@ describe('install record schema, fix round 1 (m1-m3)', () => {
       expect(() => parseRecord(JSON.stringify({ ...r, serviceRoots: [bad] })), bad).toThrow(RecordError);
       expect(() => parseRecord(JSON.stringify({ ...r, protectedPaths: [bad] })), bad).toThrow(RecordError);
     }
+    // G10-R3 N2: adopted is `true` or absent
+    const adopted = { ...r, files: [{ ...r.files[0], adopted: true }, ...r.files.slice(1)] };
+    expect(parseRecord(JSON.stringify(adopted)).files[0]?.adopted).toBe(true);
+    expect(() => parseRecord(JSON.stringify({ ...r, files: [{ ...r.files[0], adopted: false }, ...r.files.slice(1)] }))).toThrow(RecordError);
     expect(parseRecord(JSON.stringify({ ...r, serviceRoots: ['.', 'api', 'svc/web'], protectedPaths: ['.github/workflows/**', '**/x.yml'] })).serviceRoots).toEqual(['.', 'api', 'svc/web']);
   });
 });

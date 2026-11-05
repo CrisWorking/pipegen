@@ -95,7 +95,7 @@ export const InstallRecordSchema = z.strictObject({
   app: z.strictObject({ owner: OWNER, repo: REPO, repoId: ID, defaultBranch: BRANCH, private: z.boolean(), ownerType: z.enum(['User', 'Organization']) }),
   name: z.string().regex(/^[a-z0-9_][a-z0-9._-]{0,99}$/),
   serviceRoots: z.array(z.union([z.literal('.'), REL])).max(200),
-  files: z.array(z.strictObject({ repo: REPO_KIND, path: PATH, part: PART, shas: SHAS.min(1), aiEdited: z.literal(true).optional() })).max(5000),
+  files: z.array(z.strictObject({ repo: REPO_KIND, path: PATH, part: PART, shas: SHAS.min(1), aiEdited: z.literal(true).optional(), adopted: z.literal(true).optional() })).max(5000),
   edits: z.array(EDIT).max(500),
   secrets: z.array(z.strictObject({ name: SECRET_NAME, scope: z.union([z.literal('repo'), z.literal('central'), SCOPE_ENV]), created: z.boolean(), overwritten: z.literal(true).optional(), githubCreatedAt: ISO.optional(), unconfirmed: z.literal(true).optional() })).max(500),
   variables: z.array(z.strictObject({ name: SECRET_NAME, scope: z.union([z.literal('repo'), SCOPE_ENV]), created: z.boolean(), previous: z.string().max(10_000).optional(), githubCreatedAt: ISO.optional(), unconfirmed: z.literal(true).optional() })).max(200),
@@ -266,14 +266,23 @@ async function recordsDir(deps: LocalRecordDeps): Promise<string> {
   return prepareTrustedDir(configBase(deps), ['pipegen', 'records'], false, uid, KIND);
 }
 
+/** Where this machine's local record file of an app is (the path only; nothing is created). */
+export function localRecordPath(app: RepoRef, deps: LocalRecordDeps = {}): string {
+  return join(configBase(deps), 'pipegen', 'records', `${localName(app)}.json`);
+}
+
 /** Writes the local record file (0600: a fresh exclusive temp file, never through a link, fsynced, renamed). */
 export async function writeLocalRecord(app: RepoRef, v: LocalRecord, deps: LocalRecordDeps = {}): Promise<string> {
   return writeLocalJson(app, '', LOCAL.parse(v), deps);
 }
 
 /** One thing pipegen stored before a delivery stopped (names only, never a value): the leftovers file (fix round 1, m6). */
-export interface Leftover { kind: 'environment' | 'secret' | 'branch' | 'pull-request'; name: string; repo: string; scope?: string; githubCreatedAt?: string }
-const LEFTOVER = z.strictObject({ kind: z.enum(['environment', 'secret', 'branch', 'pull-request']), name: z.string().max(300), repo: z.string().max(200), scope: z.string().max(120).optional(), githubCreatedAt: ISO.optional() });
+export interface Leftover {
+  kind: 'environment' | 'secret' | 'branch' | 'pull-request'; name: string; repo: string; scope?: string; githubCreatedAt?: string;
+  /** G10-R3 N3: an existing environment pipegen narrowed: its settings before, and what pipegen changed (uninstall restores them). */
+  previous?: Record<string, unknown>; changed?: string[];
+}
+const LEFTOVER = z.strictObject({ kind: z.enum(['environment', 'secret', 'branch', 'pull-request']), name: z.string().max(300), repo: z.string().max(200), scope: z.string().max(120).optional(), githubCreatedAt: ISO.optional(), previous: ENV_SETTINGS.optional(), changed: z.array(z.string().max(40)).max(10).optional() });
 const LEFTOVERS = z.strictObject({ updatedAt: z.string().max(40), items: z.array(LEFTOVER).max(2000) });
 
 /** The local leftovers file of an app (`<owner>__<repo>.leftovers.json` beside the record file), or [] when there is none. */
@@ -290,7 +299,8 @@ export async function readLocalLeftovers(app: RepoRef, deps: LocalRecordDeps = {
 
 /** Adds `items` to the local leftovers file (an entry already listed is not listed twice). Returns the file's path. */
 export async function addLocalLeftovers(app: RepoRef, items: readonly Leftover[], now: Date, deps: LocalRecordDeps = {}): Promise<string> {
-  const had = await readLocalLeftovers(app, deps).catch(() => []);
+  // N4: an unreadable leftovers file stops here (its name in the error); it is never overwritten
+  const had = await readLocalLeftovers(app, deps);
   const key = (x: Leftover): string => `${x.kind}:${x.repo}:${x.scope ?? ''}:${x.name}`;
   const all = [...had, ...items.filter((x) => !had.some((h) => key(h) === key(x)))];
   return writeLocalJson(app, '.leftovers', LEFTOVERS.parse({ updatedAt: now.toISOString(), items: all }), deps);

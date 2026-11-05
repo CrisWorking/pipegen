@@ -48,7 +48,7 @@ import { safeText } from '../util/safe-text.js';
 import {
   commitFiles, compareStatus, DeliverError, ghRead, ghWrite, ISO_RE, openOrUpdatePr, readHead, readRepo, readTree, refusedMove, setBranch, statusOf, type RepoRef, type TreeEntry,
 } from './git-data.js';
-import { addLocalLeftovers, centralPrBase, centralUpdateBranch, RecordError, writeRecord, type Leftover, type LocalRecordDeps } from './record.js';
+import { addLocalLeftovers, centralPrBase, centralUpdateBranch, localRecordPath, RecordError, writeRecord, type Leftover, type LocalRecordDeps } from './record.js';
 import { trustedPrevious } from './trust.js';
 
 export { DeliverError };
@@ -324,7 +324,12 @@ export async function deliverCentral(gh: Octokit, p: RepoProfile, files: readonl
     const e = entries.get(f.path);
     if (e === undefined) continue;
     const mine = prev.record?.files.find((r) => r.repo === 'central' && r.path === f.path)?.shas.includes(e.sha) === true;
-    if (!mine) throw new DeliverError(`${show(f.path)} already exists in ${show(`${p.owner}/${CENTRAL_REPO}`)} and no install record pipegen trusts shows pipegen wrote it, so pipegen won't replace or claim it.${notes.length > 0 ? ` ${notes.join(' ')}` : ''} If pipegen did write it, run pipegen on the machine that set it up, or after \`npx pipegen finish\` added the central merge rule; otherwise rename or remove that file.`);
+    // N2: a file already byte-identical to what pipegen writes is neither replaced nor a stop (deliver records it, adopted unless proven)
+    if (mine || e.sha === gitBlobSha(f.content)) continue;
+    const wayOn = prev.why === 'mismatch'
+      ? `This machine's local record file doesn't match any install record pipegen can trust. If pipegen ran on another machine since, remove ${localRecordPath({ owner: p.owner, repo: p.repo }, deps.local ?? {})} and run pipegen again (it then checks the record on the default branch); otherwise rename or remove that file.`
+      : 'If pipegen did write it, run pipegen on the machine that set it up, or once its install record was merged through a reviewed pull request under the central merge rule (which `npx pipegen finish` adds); otherwise rename or remove that file.';
+    throw new DeliverError(`${show(f.path)} already exists in ${show(`${p.owner}/${CENTRAL_REPO}`)} and no install record pipegen trusts shows pipegen wrote it, so pipegen won't replace or claim it.${notes.length > 0 ? ` ${notes.join(' ')}` : ''} ${wayOn}`);
   }
   const changed = files.filter((f) => entries.get(f.path)?.sha !== gitBlobSha(f.content));
   if (changed.length === 0) {
@@ -541,7 +546,7 @@ function editOfFile(f: CreatedFile, d: DeliveryPlan, delivered: readonly Created
 
 interface RecordCtx {
   d: DeliveryPlan; prev: InstallRecord | null; delivered: readonly CreatedFile[]; appRepo: { id: number; defaultBranch: string; private: boolean; ownerType: 'User' | 'Organization' };
-  centralSha: string | null; secrets: SecretEntry[]; env: EnvEntry | null; now: Date; version: string;
+  centralSha: string | null; secrets: SecretEntry[]; env: EnvEntry | null; now: Date; version: string; adopted: ReadonlySet<CreatedFile>;
 }
 
 function buildRecord(x: RecordCtx): InstallRecord {
@@ -559,7 +564,8 @@ function buildRecord(x: RecordCtx): InstallRecord {
     const at = files.findIndex((r) => r.repo === f.repo && r.path === f.path);
     const sha = gitBlobSha(f.content);
     const aiEdited = f.aiEdited === true || (at >= 0 && files[at]?.aiEdited === true);
-    const entry = { repo: f.repo, path: f.path, part: f.part, shas: appendSha(at < 0 ? [] : files[at]?.shas ?? [], sha), ...(aiEdited ? { aiEdited: true as const } : {}) };
+    const adopted = at >= 0 ? files[at]?.adopted === true : x.adopted.has(f);   // N2: sticky; a file pipegen recorded as created stays created
+    const entry = { repo: f.repo, path: f.path, part: f.part, shas: appendSha(at < 0 ? [] : files[at]?.shas ?? [], sha), ...(aiEdited ? { aiEdited: true as const } : {}), ...(adopted ? { adopted: true as const } : {}) };
     if (at < 0) files.push(entry); else files[at] = entry;
   }
   const secrets = (prev?.secrets ?? []).filter((s) => !x.secrets.some((n) => n.name === s.name && n.scope === s.scope)).concat(x.secrets);
@@ -609,11 +615,13 @@ export interface DeliverResult {
 }
 
 /**
- * I2 (fix round 1): every pinned central workflow must be pipegen's to record: its blob at the pin is one the trusted record lists, or the
- * pin commit itself introduced it on top of nothing or of a blob the trusted record lists (deliverCentral's own commit). Else a stop.
+ * I2 (fix round 1), N2 (fix round 2): which pinned central workflows pipegen can't show it wrote. Proven pipegen's: the blob at the pin is
+ * one the trusted record lists, or the pin commit itself introduced it on top of nothing or of a blob the record lists (deliverCentral's own
+ * commit). Any other one (byte-identical to pipegen's text, since the pin was checked to hold it) is returned: it is recorded `adopted`.
  */
-async function checkPinnedOwn(gh: Octokit, c: RepoRef, pin: string, pinned: readonly CreatedFile[], prev: InstallRecord | null, clock: RateClock): Promise<void> {
-  if (pinned.length === 0) return;
+async function checkPinnedOwn(gh: Octokit, c: RepoRef, pin: string, pinned: readonly CreatedFile[], prev: InstallRecord | null, clock: RateClock): Promise<Set<CreatedFile>> {
+  const adopted = new Set<CreatedFile>();
+  if (pinned.length === 0) return adopted;
   const at = await readTree(gh, c, pin, clock);
   const parent = at.parents[0] === undefined ? null : await readTree(gh, c, at.parents[0], clock);
   for (const f of pinned) {
@@ -621,12 +629,14 @@ async function checkPinnedOwn(gh: Octokit, c: RepoRef, pin: string, pinned: read
     const here = at.entries.get(f.path)?.sha;
     const before = parent?.entries.get(f.path)?.sha;
     const mine = (here !== undefined && shas.includes(here)) || (parent !== null && (before === undefined || shas.includes(before)));
-    if (!mine) throw new DeliverError(`The pinned central commit holds ${show(f.path)}, and no install record pipegen trusts shows pipegen wrote it, so pipegen won't record it as its own. Run pipegen on the machine that set it up, or after \`npx pipegen finish\` added the central merge rule.`);
+    // N2: not proven pipegen's, but byte-identical to pipegen's text (holds() checked the pin): recorded as adopted, never as created
+    if (!mine) adopted.add(f);
   }
+  return adopted;
 }
 
 /** Base-tree checks of the app files (step 2): what changes, and the mode each file keeps. Throws before anything is written. */
-function checkBase(files: readonly CreatedFile[], entries: ReadonlyMap<string, TreeEntry>, prev: InstallRecord | null, repo: 'app' | 'central'): Map<CreatedFile, string> {
+function checkBase(files: readonly CreatedFile[], entries: ReadonlyMap<string, TreeEntry>, prev: InstallRecord | null, repo: 'app' | 'central', adopted: Set<CreatedFile>): Map<CreatedFile, string> {
   const changed = new Map<CreatedFile, string>();
   const keys = [...entries.keys()].map((k) => k.toLowerCase());
   for (const f of files) {
@@ -639,7 +649,9 @@ function checkBase(files: readonly CreatedFile[], entries: ReadonlyMap<string, T
       if (original === '' ? e !== undefined : e?.sha !== gitBlobSha(original)) throw new DeliverError(`${show(f.path)} changed since pipegen read it (it is not the file pipegen's edit was made from); run pipegen again.`);
     } else if (e !== undefined) {
       const mine = prev?.files.find((r) => r.repo === repo && r.path === f.path)?.shas.includes(e.sha) === true;
-      if (!mine) throw new DeliverError(`${show(f.path)} already exists in ${repo === 'app' ? 'your repository' : 'the central repo'} and pipegen didn't write it; pipegen never overwrites your files.`);
+      // N2: byte-identical to pipegen's text: not rewritten, recorded adopted (pipegen didn't prove it created it)
+      if (!mine && e.sha === gitBlobSha(f.content)) adopted.add(f);
+      else if (!mine) throw new DeliverError(`${show(f.path)} already exists in ${repo === 'app' ? 'your repository' : 'the central repo'} and pipegen didn't write it; pipegen never overwrites your files.`);
     }
     if (e?.sha !== gitBlobSha(f.content)) changed.set(f, e?.mode === '100755' ? '100755' : '100644');
   }
@@ -723,7 +735,7 @@ export async function deliver(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vaul
     const follow = all.filter((f) => f.repo === 'central' && !pinned.includes(f));
     if (!p.private && d.draft.centralPin !== undefined) throw new DeliverError('A public repository pins no central commit.');
     const centralSha = p.private ? await checkPin(gh, d, central, centralBranch, pinned, appFiles, clock) : null;
-    if (centralSha !== null) await checkPinnedOwn(gh, central, centralSha, pinned, prev, clock);
+    const adopted = centralSha === null ? new Set<CreatedFile>() : await checkPinnedOwn(gh, central, centralSha, pinned, prev, clock);
     // the central files that go with the record (the required workflow, the central CODEOWNERS): checked against the central default branch too
     const centralHead = await readHead(gh, central, centralBranch, clock);
     if (centralHead === null) throw new DeliverError(`${show(`${p.owner}/${CENTRAL_REPO}`)} has no default branch to write the install record on.`);
@@ -734,11 +746,11 @@ export async function deliver(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vaul
       const judged = [...new Set(d.centralFileList)].sort();
       if (now.length !== judged.length || now.some((x, i) => x !== judged[i])) throw new DeliverError(`The central repo's files changed since its CODEOWNERS was checked (the list it was judged against isn't ${show(`${p.owner}/${CENTRAL_REPO}`)}'s default branch now); run pipegen again.`);
     }
-    const followChanged = checkBase(follow, centralTree.entries, prev, 'central');
+    const followChanged = checkBase(follow, centralTree.entries, prev, 'central', adopted);
     const base = await readHead(gh, app, appRepo.defaultBranch, clock);
     if (base === null) throw new DeliverError(`${show(`${p.owner}/${p.repo}`)} has no default branch to open the setup pull request on.`);
     const baseTree = await readTree(gh, app, base, clock);
-    const changed = checkBase(appFiles, baseTree.entries, prev, 'app');
+    const changed = checkBase(appFiles, baseTree.entries, prev, 'app', adopted);
     const commits = d.appCommits.map((c) => ({ part: c.part, message: c.message, files: c.files.filter((f) => changed.has(f)) })).filter((c) => c.files.length > 0);
     if (commits.length === 0) throw new DeliverError('Every file pipegen would deliver is already on the default branch, so there is no setup pull request to open. Run `npx pipegen finish` if you haven\'t.');
 
@@ -766,6 +778,8 @@ export async function deliver(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vaul
       const known = prev?.environments.find((e) => e.name === SIGNING_ENVIRONMENT);
       env = await ensureSigningEnvironment(gh, app, appRepo.defaultBranch, known, clock, notes);
       if (env.created && known === undefined) stored.push({ kind: 'environment', name: SIGNING_ENVIRONMENT, repo: `${p.owner}/${p.repo}`, ...(env.githubCreatedAt === undefined ? {} : { githubCreatedAt: env.githubCreatedAt }) });
+      // N3: an existing environment pipegen narrowed: its settings before go into the leftovers, so a stop doesn't lose them for uninstall
+      else if (!env.created && known === undefined && env.changed.length > 0 && env.previous !== undefined) stored.push({ kind: 'environment', name: SIGNING_ENVIRONMENT, repo: `${p.owner}/${p.repo}`, previous: { ...env.previous }, changed: [...env.changed], ...(env.githubCreatedAt === undefined ? {} : { githubCreatedAt: env.githubCreatedAt }) });
       done.push(`environment ${SIGNING_ENVIRONMENT} (default branch only)`);
       const scope = `env:${SIGNING_ENVIRONMENT}` as const;
       const values: Record<(typeof SIGNING_SECRETS)[number], string> = { PIPEGEN_COSIGN_KEY: key.key, PIPEGEN_COSIGN_PASSWORD: key.password };
@@ -798,7 +812,7 @@ export async function deliver(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vaul
 
     // the record, to all three places
     const delivered = [...commits.flatMap((c) => c.files), ...appFiles.filter((f) => !changed.has(f)), ...pinned, ...follow];
-    const record = buildRecord({ d, prev, delivered, appRepo, centralSha, secrets, env, now, version });
+    const record = buildRecord({ d, prev, delivered, appRepo, centralSha, secrets, env, now, version, adopted });
     const via = trusted.exists || updateExists || await centralHasRules(gh, central, centralBranch, clock) ? 'pr' : 'direct';
     const w = await writeRecord(gh, { record, setupPr: pr.number, via, files: follow.filter((f) => followChanged.has(f)).map((f) => ({ path: f.path, content: f.content })), base: centralHead, clock, now: () => now, ...(deps.local === undefined ? {} : { local: deps.local }) });
     notes.push(...w.notes);
@@ -807,9 +821,9 @@ export async function deliver(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vaul
     } catch (e) {
       // m6: what was stored before the stop goes to the local leftovers file (names only), and the error names it
       if (stored.length === 0) throw e;
-      const names = stored.map((x) => `${x.kind} ${x.scope === undefined ? '' : `${x.scope} `}${x.name}`);
+      const names = stored.map((x) => `${x.kind} ${x.scope === undefined ? '' : `${x.scope} `}${x.name}${x.previous === undefined ? '' : ' (narrowed)'}`);
       let where = '';
-      try { where = ` (listed in ${await addLocalLeftovers(app, stored, now, deps.local ?? {})})`; } catch { where = ' (pipegen could not save the list locally)'; }
+      try { where = ` (listed in ${await addLocalLeftovers(app, stored, now, deps.local ?? {})})`; } catch (le) { where = ` (pipegen could not save the list locally: ${le instanceof RecordError ? le.message : 'an error'})`; }
       const why = e instanceof DeliverError || e instanceof RecordError ? e.message : `pipegen stopped (${statusOf(e) === undefined ? 'an error' : `HTTP ${statusOf(e)}`}).`;
       throw new DeliverError(`${why} Before it stopped, pipegen had stored: ${names.join(', ')}${where}. Run pipegen again (it asks before replacing them), or remove them by hand.`, { cause: e, leftovers: names });
     }

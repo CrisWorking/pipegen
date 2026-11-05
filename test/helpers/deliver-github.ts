@@ -26,6 +26,8 @@ export interface Repo {
   rulesets: Map<number, Record<string, unknown>>;
   /** The pull requests GitHub associates with a commit (GET …/commits/{sha}/pulls). */
   commitPulls: Map<string, Record<string, unknown>[]>;
+  /** The reviews of a pull request, by number (GET …/pulls/{n}/reviews). */
+  pullReviews: Map<number, Record<string, unknown>[]>;
 }
 export interface Call { route: string; params: Record<string, unknown> }
 type Hook = (call: Call) => { status: number; data?: unknown; headers?: Record<string, string> } | undefined;
@@ -48,7 +50,7 @@ export class FakeGitHub {
     const [owner, name] = fullName.split('/') as [string, string];
     const r: Repo = {
       owner, name, id: this.#ids++, private: opts.private ?? true, ownerType: opts.ownerType ?? 'User', defaultBranch: opts.defaultBranch ?? 'main',
-      refs: new Map(), commits: new Map(), trees: new Map(), blobs: new Map(), pulls: [], stored: new Map(), envs: new Map(), rules: [], rulesets: new Map(), commitPulls: new Map(),
+      refs: new Map(), commits: new Map(), trees: new Map(), blobs: new Map(), pulls: [], stored: new Map(), envs: new Map(), rules: [], rulesets: new Map(), commitPulls: new Map(), pullReviews: new Map(),
     };
     this.repos.set(fullName.toLowerCase(), r);
     const flat = new Map<string, Entry>();
@@ -220,6 +222,8 @@ export class FakeGitHub {
         }
         return ok(out.slice(0, Number(p.per_page ?? 30)));
       }
+      case 'GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews':
+        return ok(repo.pullReviews.get(Number(p.pull_number)) ?? []);
       case 'GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls':
         return ok(repo.commitPulls.get(String(p.commit_sha)) ?? []);
       case 'GET /repos/{owner}/{repo}/rulesets/{ruleset_id}': {

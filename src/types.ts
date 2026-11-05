@@ -249,7 +249,7 @@ export interface InstallRecord {
   app: { owner: string; repo: string; repoId: number; defaultBranch: string; private: boolean; ownerType: 'User' | 'Organization' };
   name: string;                                                        // centralProjectName(app.repo); the record is installs/<name>.json
   serviceRoots: string[];                                              // to re-check CREATED_RULES path claims
-  files: { repo: RecordRepo; path: string; part: Part; shas: string[]; aiEdited?: true }[];   // written whole; every blob sha pipegen wrote, newest last
+  files: { repo: RecordRepo; path: string; part: Part; shas: string[]; aiEdited?: true; adopted?: true }[];   // written whole; every blob sha pipegen wrote, newest last. adopted (G10-R3 N2): the file was already there, byte-identical to pipegen's; pipegen didn't prove it created it, so uninstall asks before deleting it
   edits: InstallEdit[];
   secrets: { name: string; scope: 'repo' | 'central' | `env:${string}`; created: boolean; overwritten?: true; githubCreatedAt?: string; unconfirmed?: true }[];
   variables: { name: string; scope: 'repo' | `env:${string}`; created: boolean; previous?: string; githubCreatedAt?: string; unconfirmed?: true }[];
