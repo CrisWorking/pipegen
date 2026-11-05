@@ -29,7 +29,7 @@ import type { Octokit } from '@octokit/rest';
 import type { Prompter } from '../cli/io.js';
 import { gitBlobSha } from '../create/guard.js';
 import { editOf } from '../create/package-edit.js';
-import { generateFpKey, storeEnvSecret, storeSecrets, type SecretVault } from '../create/secrets.js';
+import { COSIGN_KEY_SECRET, generateFpKey, storeCosignKey, storeEnvSecret, storeSecrets, type SecretVault } from '../create/secrets.js';
 import { isPlantedPath } from '../debate/planted.js';
 import { centralProjectName } from '../engine/central-path.js';
 import { CREATED_RULES } from '../engine/created-files.js';
@@ -43,6 +43,7 @@ import { COMPAT_PREFIX, HARNESS_PATH } from '../proof/harness.js';
 import { CENTRAL_REPO } from '../proof/target.js';
 import { isCompatCopy } from '../proof/workflow-check.js';
 import type { CreatedFile, EnvSettings, InstallEdit, InstallPlanned, InstallRecord, Part, PipelineDraft, RepoProfile } from '../types.js';
+import { cosignKeyProblem, cosignPubProblem } from '../util/cosign-pem.js';
 import { packageVersion } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
 import {
@@ -205,7 +206,11 @@ const copy = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
 
 /** The record's `planned`: the lock plan's requests, the signing mode, the environments, and the code owners only where their rule is planned (G8-R3). */
 function plannedOf(d: DeliveryPlan): InstallPlanned {
-  const l = d.locks;
+  return plannedOfLocks(d.locks, d.draft.signing?.mode ?? 'none', d.environments);
+}
+
+/** The record's `planned` of a lock plan (also used by `finish`, G11, when it re-derives the plan of a record trusted by typing). */
+export function plannedOfLocks(l: LockPlan, signingMode: InstallPlanned['signingMode'], environments: readonly { name: string; reviewers: boolean }[]): InstallPlanned {
   const app = codeOwnerRule(l.rulesets?.reviews) || codeOwnerRule(l.classic) ? [...l.owners.app] : [];
   const central = codeOwnerRule(l.centralRuleset) ? [...l.owners.central] : [];
   return copy({
@@ -214,7 +219,7 @@ function plannedOf(d: DeliveryPlan): InstallPlanned {
     ...(l.centralRuleset === undefined ? {} : { centralRuleset: l.centralRuleset }),
     ...(l.orgRequiredWorkflow === undefined ? {} : { orgRequiredWorkflow: { path: l.orgRequiredWorkflow.file.path, rule: l.orgRequiredWorkflow.rule } }),
     ...(l.shaPinning === undefined ? {} : { shaPinning: l.shaPinning }),
-    signingMode: d.draft.signing?.mode ?? 'none', environments: d.environments, owners: { app, central }, codeOwners: app,
+    signingMode, environments: environments.map((e) => ({ name: e.name, reviewers: e.reviewers })), owners: { app, central }, codeOwners: app,
   }) as InstallPlanned;
 }
 
@@ -363,13 +368,17 @@ export async function deliverCentral(gh: Octokit, p: RepoProfile, files: readonl
 // ---------- the N4 signing environment (S11) ----------
 
 type EnvEntry = InstallRecord['environments'][number];
-interface EnvRead { createdAt: string | null; settings: Omit<EnvSettings, 'branch_policies'>; policies: { id: number; name: string; type: 'branch' | 'tag' }[] }
+/** An environment as read: GitHub's created_at, its settings in the PUT form, and its branch and tag rules (with their ids). */
+export interface EnvRead { createdAt: string | null; settings: Omit<EnvSettings, 'branch_policies'>; policies: { id: number; name: string; type: 'branch' | 'tag' }[] }
 
-async function readEnv(gh: Octokit, app: RepoRef, clock: RateClock): Promise<EnvRead | null> {
+/** The environment `name` of the app (default: the signing one), or null when it is not there. Anything unreadable stops (DeliverError). */
+export async function readEnv(gh: Octokit, app: RepoRef, clock: RateClock, name: string = SIGNING_ENVIRONMENT): Promise<EnvRead | null> {
+  const signing = name === SIGNING_ENVIRONMENT;
+  const then = signing ? ', so it stores no signing key' : '';
   let d: unknown;
-  try { d = await ghRead(gh, 'GET /repos/{owner}/{repo}/environments/{environment_name}', app, { environment_name: SIGNING_ENVIRONMENT }, clock); } catch (e) {
+  try { d = await ghRead(gh, 'GET /repos/{owner}/{repo}/environments/{environment_name}', app, { environment_name: name }, clock); } catch (e) {
     if (statusOf(e) === 404) return null;
-    throw new DeliverError(`pipegen couldn't read the environment ${SIGNING_ENVIRONMENT} (HTTP ${statusOf(e) ?? '?'}), so it stores no signing key.`, { cause: e });
+    throw new DeliverError(`pipegen couldn't read the environment ${show(name, 100)} (HTTP ${statusOf(e) ?? '?'})${then}.`, { cause: e });
   }
   const env = isObj(d) ? d : {};
   const rules = Array.isArray(env.protection_rules) ? env.protection_rules.filter(isObj) : [];
@@ -378,7 +387,7 @@ async function readEnv(gh: Octokit, app: RepoRef, clock: RateClock): Promise<Env
   const dbp = env.deployment_branch_policy;
   const reviewers = (Array.isArray(rev?.reviewers) ? rev.reviewers : []).filter(isObj).map((r) => ({ type: r.type === 'Team' ? 'Team' as const : 'User' as const, id: isObj(r.reviewer) && Number.isSafeInteger(r.reviewer.id) ? r.reviewer.id as number : 0 }));
   if (reviewers.some((r) => r.id <= 0) || (dbp !== null && !(isObj(dbp) && typeof dbp.protected_branches === 'boolean' && typeof dbp.custom_branch_policies === 'boolean'))) {
-    throw new DeliverError(`GitHub's answer about the environment ${SIGNING_ENVIRONMENT} could not be read, so pipegen stores no signing key.`);
+    throw new DeliverError(`GitHub's answer about the environment ${show(name, 100)} could not be read${then}.`);
   }
   const settings = {
     wait_timer: Number.isSafeInteger(wait?.wait_timer) ? wait?.wait_timer as number : 0, prevent_self_review: rev?.prevent_self_review === true, reviewers,
@@ -386,9 +395,9 @@ async function readEnv(gh: Octokit, app: RepoRef, clock: RateClock): Promise<Env
   };
   let policies: EnvRead['policies'] = [];
   if (settings.deployment_branch_policy?.custom_branch_policies === true) {
-    const pd = await ghRead(gh, 'GET /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies', app, { environment_name: SIGNING_ENVIRONMENT, per_page: 100 }, clock);
+    const pd = await ghRead(gh, 'GET /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies', app, { environment_name: name, per_page: 100 }, clock);
     const list = isObj(pd) && Array.isArray(pd.branch_policies) ? pd.branch_policies.filter(isObj) : null;
-    if (list === null || !isObj(pd) || (typeof pd.total_count === 'number' && pd.total_count > list.length)) throw new DeliverError(`pipegen couldn't read all branch rules of the environment ${SIGNING_ENVIRONMENT}, so it stores no signing key.`);
+    if (list === null || !isObj(pd) || (typeof pd.total_count === 'number' && pd.total_count > list.length)) throw new DeliverError(`pipegen couldn't read all branch rules of the environment ${show(name, 100)}${then}.`);
     policies = list.map((x) => ({ id: Number.isSafeInteger(x.id) ? x.id as number : 0, name: typeof x.name === 'string' ? x.name : '', type: x.type === 'tag' ? 'tag' as const : 'branch' as const }));
   }
   return { createdAt: typeof env.created_at === 'string' ? env.created_at : null, settings, policies };
@@ -547,6 +556,8 @@ function editOfFile(f: CreatedFile, d: DeliveryPlan, delivered: readonly Created
 interface RecordCtx {
   d: DeliveryPlan; prev: InstallRecord | null; delivered: readonly CreatedFile[]; appRepo: { id: number; defaultBranch: string; private: boolean; ownerType: 'User' | 'Organization' };
   centralSha: string | null; secrets: SecretEntry[]; env: EnvEntry | null; now: Date; version: string; adopted: ReadonlySet<CreatedFile>;
+  /** key-env: the public key of the pair stored this run (G11: finish sets it as PIPEGEN_COSIGN_PUB after the merge). */
+  cosignPub: string | null;
 }
 
 function buildRecord(x: RecordCtx): InstallRecord {
@@ -578,6 +589,7 @@ function buildRecord(x: RecordCtx): InstallRecord {
   };
   const scratch = d.proofRepos?.scratch ?? prev?.scratch;
   const cosign = d.draft.signing?.cosignPubSha256 ?? prev?.cosignPubSha256;
+  const pub = x.cosignPub ?? (cosign !== undefined && prev?.cosignPubSha256 === cosign ? prev.cosignPub : undefined);
   return {
     schema: 2, pipegenVersion: x.version, createdAt: prev?.createdAt ?? x.now.toISOString(), ...(prev?.mergedAt === undefined ? {} : { mergedAt: prev.mergedAt }),
     centralSha: x.centralSha,
@@ -589,7 +601,7 @@ function buildRecord(x: RecordCtx): InstallRecord {
     ...(prev?.repoSettings === undefined ? {} : { repoSettings: prev.repoSettings }),
     central, ...(scratch === undefined ? {} : { scratch: { ...scratch } }),
     planned: plannedOf(d), protectedPaths: [...d.protectedPaths],
-    ...(cosign === undefined ? {} : { cosignPubSha256: cosign }), ...(prev?.blockFrom === undefined ? {} : { blockFrom: prev.blockFrom }),
+    ...(cosign === undefined ? {} : { cosignPubSha256: cosign }), ...(pub === undefined ? {} : { cosignPub: pub }), ...(prev?.blockFrom === undefined ? {} : { blockFrom: prev.blockFrom }),
   };
 }
 
@@ -767,6 +779,9 @@ export async function deliver(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vaul
       if (deps.signingKey === undefined || typeof want !== 'string') throw new DeliverError('key-env signing needs the key pair pipegen made before the setup pull request, and its public key hash.');
       key = await deps.signingKey();
       if (pubKeySha256(key.pub) !== want) throw new DeliverError('The signing key is not the one whose public key the verify workflow checks, so pipegen stores no key.');
+      // G11 (G10-R1): the private key in cosign's exact encrypted form (its own store path), the public key in cosign's form (the record keeps it)
+      const keyBad = cosignKeyProblem(key.key) ?? (cosignPubProblem(key.pub) === null ? null : 'has a public key that is not in the form cosign writes');
+      if (keyBad !== null) throw new DeliverError(`The signing key pair ${keyBad}, so pipegen stores no key.`);
       const scope = `env:${SIGNING_ENVIRONMENT}` as const;
       const there = (await readEnv(gh, app, clock)) === null ? [] : (await Promise.all(SIGNING_SECRETS.map(async (n) => ((await secretAt(gh, app, scope, n, clock)) === null ? null : n)))).filter((n): n is (typeof SIGNING_SECRETS)[number] => n !== null);
       if (there.length > 0) {
@@ -785,7 +800,7 @@ export async function deliver(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vaul
       done.push(`environment ${SIGNING_ENVIRONMENT} (default branch only)`);
       const scope = `env:${SIGNING_ENVIRONMENT}` as const;
       const values: Record<(typeof SIGNING_SECRETS)[number], string> = { PIPEGEN_COSIGN_KEY: key.key, PIPEGEN_COSIGN_PASSWORD: key.password };
-      for (const name of SIGNING_SECRETS) secrets.push(await storeOne(sctx, scope, name, () => storeEnvSecret(gh, app, SIGNING_ENVIRONMENT, name, values[name], clock), { replaceAnswered: replacePair }));
+      for (const name of SIGNING_SECRETS) secrets.push(await storeOne(sctx, scope, name, () => (name === COSIGN_KEY_SECRET ? storeCosignKey(gh, app, SIGNING_ENVIRONMENT, values[name], clock) : storeEnvSecret(gh, app, SIGNING_ENVIRONMENT, name, values[name], clock)), { replaceAnswered: replacePair }));
     }
 
     // the repo secrets: the fingerprint key (kept when it exists), then the vault's names
@@ -814,7 +829,7 @@ export async function deliver(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vaul
 
     // the record, to all three places
     const delivered = [...commits.flatMap((c) => c.files), ...appFiles.filter((f) => !changed.has(f)), ...pinned, ...follow];
-    const record = buildRecord({ d, prev, delivered, appRepo, centralSha, secrets, env, now, version, adopted });
+    const record = buildRecord({ d, prev, delivered, appRepo, centralSha, secrets, env, now, version, adopted, cosignPub: key?.pub ?? null });
     const via = trusted.exists || updateExists || await centralHasRules(gh, central, centralBranch, clock) ? 'pr' : 'direct';
     const w = await writeRecord(gh, { record, setupPr: pr.number, via, files: follow.filter((f) => followChanged.has(f)).map((f) => ({ path: f.path, content: f.content })), base: centralHead, clock, now: () => now, ...(deps.local === undefined ? {} : { local: deps.local }) });
     notes.push(...w.notes);

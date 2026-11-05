@@ -263,6 +263,11 @@ export interface InstallRecord {
   planned: InstallPlanned;
   protectedPaths: string[];                                            // used by the gate's integrity rule and `pipegen verify`
   cosignPubSha256?: string; blockFrom?: string;
+  /**
+   * G11: the public key's exact text (key-env), what `finish` sets as PIPEGEN_COSIGN_PUB after the merge (deliver stores the key pair before
+   * the PR, S11, but sets no variable). Public, never a secret; its sha256 is cosignPubSha256. Dropped from a record trusted by typing.
+   */
+  cosignPub?: string;
 }
 
 // ---------- constants ----------

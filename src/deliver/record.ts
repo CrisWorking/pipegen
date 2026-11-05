@@ -24,6 +24,7 @@ import { createdPathProblem } from '../engine/job-rules.js';
 import { clockOf } from '../github/client.js';
 import { CENTRAL_REPO } from '../proof/target.js';
 import type { InstallRecord } from '../types.js';
+import { cosignPubProblem, MAX_COSIGN_PUB_BYTES } from '../util/cosign-pem.js';
 import { prepareTrustedDir, type TrustedDirKind } from '../util/trusted-dir.js';
 import { safeText } from '../util/safe-text.js';
 import { commitFiles, compareStatus, DeliverError, ghRead, ghWrite, ISO_RE, openOrUpdatePr, readBlobText, readHead, readRepo, readTree, refusedMove, setBranch, type RepoRef, type TreeEntry } from './git-data.js';
@@ -121,6 +122,7 @@ export const InstallRecordSchema = z.strictObject({
   }),
   protectedPaths: z.array(REL).max(2000),
   cosignPubSha256: SHA256.optional(), blockFrom: DAY.optional(),
+  cosignPub: z.string().max(MAX_COSIGN_PUB_BYTES).refine((v) => cosignPubProblem(v) === null, 'not a cosign public key').optional(),
 }).superRefine((r, ctx) => {
   // fix round 1, m3: one entry per object, and the name the record path is made from
   if (r.name !== centralProjectName(r.app.repo)) ctx.addIssue({ code: 'custom', path: ['name'], message: 'not the central project name of the app repo' });
@@ -135,6 +137,8 @@ export const InstallRecordSchema = z.strictObject({
   once(r.variables, (x: { name: string; scope: string }) => `${x.scope}:${x.name}`, 'variables');
   once(r.environments, (x: { name: string }) => x.name.toLowerCase(), 'environments');
   once(r.rulesets, (x: { kind: string }) => x.kind, 'rulesets');
+  // G11: the public key text and its hash go together
+  if (r.cosignPub !== undefined && (r.cosignPubSha256 === undefined || createHash('sha256').update(r.cosignPub, 'utf8').digest('hex') !== r.cosignPubSha256)) ctx.addIssue({ code: 'custom', path: ['cosignPub'], message: 'not the key cosignPubSha256 names' });
 }) satisfies z.ZodType<InstallRecord>;
 
 /**

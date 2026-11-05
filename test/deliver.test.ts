@@ -21,6 +21,7 @@ import { COMPAT_PREFIX, HARNESS_PATH } from '../src/proof/harness.js';
 import type { LockPlan } from '../src/layers/locks.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
 import type { CreatedFile, PipelineDraft, RepoProfile } from '../src/types.js';
+import { cosignKey, cosignPub } from './helpers/cosign-keys.js';
 import { FakeGitHub } from './helpers/deliver-github.js';
 
 // ---------- fixtures ----------
@@ -37,7 +38,7 @@ const LOCK_NEW = '{ "name": "app", "lockfileVersion": 3, "packages": { "node_mod
 const DEPLOY_ORIG = 'on: { push: { branches: [main] } }\njobs:\n  deploy:\n    runs-on: ubuntu-24.04\n    steps: [{ run: ./deploy.sh }]\n';
 const DEPLOY_NEW = 'on: { push: { branches: [main] } }\njobs:\n  pipegen-verify:\n    runs-on: ubuntu-24.04\n    steps: [{ run: "true" }]\n  deploy:\n    needs: [pipegen-verify]\n    runs-on: ubuntu-24.04\n    steps: [{ run: ./deploy.sh }]\n';
 const PW = 'P'.repeat(40);
-const SIGNING = { key: 'K'.repeat(80), pub: 'cosign-public-key-' + 'Z'.repeat(40), [['pass', 'word'].join('')]: PW } as unknown as SigningKey;
+const SIGNING = { key: cosignKey(), pub: cosignPub(), [['pass', 'word'].join('')]: PW } as unknown as SigningKey;
 /** The secret-name request parameter, spelled at run time (test/no-secret-literals.test.ts). */
 const NAME_PARAM = ['secret', 'name'].join('_');
 const nameOf = (c: { params: Record<string, unknown> }): unknown => c.params[NAME_PARAM];
@@ -543,11 +544,28 @@ describe('G10 delivery: secrets and settings before the merge', () => {
     expect(r?.environments).toEqual([{ name: 'pipegen-signing', created: true, githubCreatedAt: env?.created_at, changed: [], branchPolicyIds: env?.policies.map((x) => x.id) }]);
     for (const n of ['PIPEGEN_COSIGN_KEY', 'PIPEGEN_COSIGN_PASSWORD']) expect(r?.secrets.find((s) => s.name === n)).toEqual({ name: n, scope: 'env:pipegen-signing', created: true, githubCreatedAt: env?.stored.get(n) });
     expect(r?.cosignPubSha256).toBe(pubKeySha256(SIGNING.pub));
+    expect(r?.cosignPub).toBe(SIGNING.pub);   // G11: finish sets it as PIPEGEN_COSIGN_PUB after the merge
     // a read-back that fails: recorded without created_at and marked, so uninstall asks instead of deleting
     const w2 = world();
     w2.g.hooks.push((c) => (c.route === 'GET /repos/{owner}/{repo}/actions/secrets/{secret_name}' && nameOf(c) === KEY && w2.g.repo('o/r').stored.has(KEY) ? { status: 500 } : undefined));
     await firstRun(w2);
     expect((await record(w2))?.secrets.find((s) => s.name === KEY)).toEqual({ name: KEY, scope: 'repo', created: true, unconfirmed: true });
+  });
+
+  it('deliver: the signing key pair must be in cosign\'s exact form; the private key goes through its own store path (G11, G10-R1)', async () => {
+    const signing = { signing: { mode: 'key-env' as const, images: [], cosignPubSha256: pubKeySha256(SIGNING.pub) } };
+    for (const bad of [{ ...SIGNING, key: 'K'.repeat(80) }, { ...SIGNING, key: `${SIGNING.key}trailing\n` }]) {
+      const w = world();
+      const before = w.g.calls.length;
+      const e = await firstRun(w, {}, { signingKey: async () => bad }, {}, signing).then(() => null, (x: unknown) => x) as Error;
+      expect(e.message).toMatch(/not a cosign encrypted private key.*stores no key/);
+      expect(e.message).not.toContain('KKKK');
+      expect(w.g.calls.slice(before).some((c) => c.route.includes('/environments/') && !c.route.startsWith('GET '))).toBe(false);
+    }
+    // a public key not in cosign's form
+    const w2 = world();
+    const pub = 'not a key';
+    await expect(firstRun(w2, {}, { signingKey: async () => ({ ...SIGNING, pub }) }, {}, { signing: { ...signing.signing, cosignPubSha256: pubKeySha256(pub) } })).rejects.toThrow(/public key that is not in the form cosign writes/);
   });
 
   it('deliver: applies no ruleset, environment or variable before merge', async () => {

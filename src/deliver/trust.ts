@@ -57,7 +57,7 @@ export const TYPED_VIEW_FIELDS = {
   record: {
     keep: ['schema', 'pipegenVersion', 'createdAt', 'centralSha', 'app', 'name', 'files', 'secrets', 'variables', 'environments', 'rulesets'],
     fresh: ['edits', 'planned', 'serviceRoots', 'protectedPaths'],
-    drop: ['mergedAt', 'blockFrom', 'cosignPubSha256', 'central', 'scratch', 'orgRuleset', 'classicProtection', 'repoSettings'],
+    drop: ['mergedAt', 'blockFrom', 'cosignPubSha256', 'cosignPub', 'central', 'scratch', 'orgRuleset', 'classicProtection', 'repoSettings'],
   },
   files: { keep: ['repo', 'path', 'part', 'shas', 'aiEdited', 'adopted'] },
   secrets: { keep: ['name', 'scope', 'created', 'overwritten', 'githubCreatedAt', 'unconfirmed'] },

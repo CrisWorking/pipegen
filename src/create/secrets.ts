@@ -21,6 +21,7 @@ import { isDangerousName } from '../engine/job-rules.js';
 import { NAME_RE } from '../read/manifest.js';
 import type { CreatedFile, Dependency, KnownValueCheck, RepoProfile } from '../types.js';
 import { onExit } from '../util/exit-hooks.js';
+import { cosignKeyProblem } from '../util/cosign-pem.js';
 import { holdsEscape, textForms } from '../util/known-values.js';
 import { displayForm, safeText } from '../util/safe-text.js';
 import { composeCoveredNames } from './compose.js';
@@ -355,6 +356,25 @@ export async function storeEnvSecret(gh: Octokit, repo: { owner: string; repo: s
   const key = await fetchKey(() => withRateLimit(() => gh.request('GET /repos/{owner}/{repo}/environments/{environment_name}/secrets/public-key', params), clock));
   const encrypted = seal(value, key.key);
   await put(() => withRateLimit(() => gh.request('PUT /repos/{owner}/{repo}/environments/{environment_name}/secrets/{secret_name}', { ...params, secret_name: up, encrypted_value: encrypted, key_id: key.keyId }), clock), up);
+}
+
+/** The environment secret the sign step reads the cosign private key from (`--key env://PIPEGEN_COSIGN_KEY`). */
+export const COSIGN_KEY_SECRET = 'PIPEGEN_COSIGN_KEY';
+
+/**
+ * G11 (controller ruling G10-R1): THE way to store the cosign private key, the one multi-line value pipegen stores. It is storeEnvSecret
+ * with one difference: the value must be exactly cosign's encrypted PEM block (cosignKeyProblem: header and footer lines, base64 body lines,
+ * a size cap) instead of a single line. The name is fixed (PIPEGEN_COSIGN_KEY); every other secret still goes through valueProblem.
+ */
+export async function storeCosignKey(gh: Octokit, repo: { owner: string; repo: string }, env: string, value: string, clock: RateClock = clockOf(gh)): Promise<void> {
+  if (!PART_RE.test(String(repo?.owner)) || !PART_RE.test(String(repo?.repo))) throw new SecretStoreError('the repository owner or name is not a plain name');
+  if (typeof env !== 'string' || !ENV_RE.test(env)) throw new SecretStoreError('the environment name is not a plain name');
+  const problem = cosignKeyProblem(value);
+  if (problem !== null) throw new SecretStoreError(`the value for ${COSIGN_KEY_SECRET} ${problem}`);
+  const params = { owner: repo.owner, repo: repo.repo, environment_name: env };
+  const key = await fetchKey(() => withRateLimit(() => gh.request('GET /repos/{owner}/{repo}/environments/{environment_name}/secrets/public-key', params), clock));
+  const encrypted = seal(value, key.key);
+  await put(() => withRateLimit(() => gh.request('PUT /repos/{owner}/{repo}/environments/{environment_name}/secrets/{secret_name}', { ...params, secret_name: COSIGN_KEY_SECRET, encrypted_value: encrypted, key_id: key.keyId }), clock), COSIGN_KEY_SECRET);
 }
 
 // ---------- the fingerprint key ----------
