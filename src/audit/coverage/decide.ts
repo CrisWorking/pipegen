@@ -352,7 +352,14 @@ export function ciCoverage(need: Need, ciLayer: CiLayer, d: Decide): Coverage {
     return { need, status: 'partial', ...located(partialRight), why: reasonWhy(partialRight, effectiveReason(need, partialRight.reason) as Reason, LAYER_DONE[layer], need.category) };
   }
   const partialTrigger = d.ci.first(cat, dirs, layer, [NF]);
-  if (partialTrigger) return { need, status: 'partial', ...located(partialTrigger), why: `${partialTrigger.subject} runs, but not ${LAYER_DONE[layer]}.` };
+  if (partialTrigger) {
+    const why = `${partialTrigger.subject} runs, but not ${LAYER_DONE[layer]}.`;
+    // J3a (S5): a push row that is partial only because the run's workflow has no every-push trigger. creditEquivalents
+    // reads this mark (and the row's unchanged `why`) and nothing else about why the row is partial.
+    const mark = layer === 'push' && need.layer === 'push' && partialTrigger.reason === null && partialTrigger.fit.pushDefault === true
+      ? { trigger: { kind: 'not-every-push' as const, why } } : {};
+    return { need, status: 'partial', ...located(partialTrigger), why, ...mark };
+  }
   const unsure = d.ci.first(unsureKeys(need.category, lang), dirs, layer, [FN, FC, FO, NF]);
   if (unsure) return { need, status: 'partial', ...located(unsure), why: UNSURE_LANG_WHY(unsure.subject) };
   const weakOpaque = d.ci.first(matchKeys(OPAQUE_KEY, lang), dirs, layer, [NF]);

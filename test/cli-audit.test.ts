@@ -1120,10 +1120,12 @@ describe('GitHub rate limit (DoD)', () => {
     expect(j.profile.defaultBranch).toBeNull();
     // P50 (M5): unread capabilities are null too, never the placeholders
     expect(Object.values((j as unknown as { capabilities: Record<string, unknown> }).capabilities).every((v) => v === null)).toBe(true);
-    // depends on the default branch: unknown, saying why; on every push (any branch) it is a real partial
+    // depends on the default branch: unknown, saying why. J3a (S5): so does the push row, since "every pull request + every
+    // push to the default branch" may cover it (DECISIONS #122), which the placeholder branch can't tell
     expect(cov(j, 'merge', 'unit-tests')).toMatchObject({ status: 'unknown' });
     expect(cov(j, 'merge', 'unit-tests')?.why).toMatch(/GitHub's rate limit/);
-    expect(cov(j, 'push', 'unit-tests')?.status).toBe('partial');
+    expect(cov(j, 'push', 'unit-tests')).toMatchObject({ status: 'unknown' });
+    expect(cov(j, 'push', 'unit-tests')?.why).toMatch(/GitHub's rate limit/);
     // a check that needs nothing from GitHub keeps its answer
     expect(cov(j, 'pre-commit', 'hooks')?.status).toBe('missing');
     expect(j.githubIncomplete?.rows).toBe(j.coverage.filter((c) => /GitHub's rate limit/.test(c.why)).length);

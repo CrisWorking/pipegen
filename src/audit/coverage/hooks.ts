@@ -14,7 +14,21 @@ import type { Ctx, Found, Hit, Manager, Obj, Reason } from './types.js';
 
 // ---------- hooks ----------
 
-export interface Hooks { manager: Manager | null; where: string; readable: boolean; found: Found[] }
+export interface Hooks {
+  manager: Manager | null; where: string; readable: boolean; found: Found[];
+  /**
+   * J3a (ruling B4): the hooks of the config pipegen can't say what they run: a hook from a repo it doesn't know, one
+   * that runs something it doesn't recognise (a script that calls no known tool, an entry it can't read, a hook
+   * `language` that doesn't run a command), or hooks past MAX_HOOKS. Labels are hook ids that are plain words, else a
+   * fixed phrase. Read for the pre-commit framework only; husky and lefthook run free shell, so it is always [] there
+   * and creditEquivalents never credits them.
+   */
+  unrecognised: string[];
+}
+/** What hookConfigRuns read: the tools the config runs and the hooks it couldn't place. */
+interface HookConfig { found: Found[]; unrecognised: string[] }
+const PLAIN_HOOK_ID = /^[A-Za-z0-9._-]{1,60}$/;
+const MAX_UNRECOGNISED = 20;
 /** husky runs a hook with `sh -e` (https://github.com/typicode/husky/blob/main/husky); lefthook runs each command
  *  with `sh -c`, without -e (internal/run/controller/exec/exec_unix.go). */
 const HUSKY_SHELL: ShellMode = { errexit: true, pipefail: false };
@@ -75,11 +89,11 @@ function formatterFails(by: string, words: readonly string[]): boolean {
   return false;
 }
 
-function readPrecommitConfig(ctx: Ctx): Promise<{ readable: boolean; found: Found[] }> {
+function readPrecommitConfig(ctx: Ctx): Promise<{ readable: boolean } & HookConfig> {
   ctx.precommitConfig ??= (async () => {
     const r = await ctx.read.yaml(HOOK_FILE['pre-commit']);
-    if ('fail' in r) return { readable: r.fail === 'missing', found: [] };
-    return { readable: true, found: await hookConfigRuns(ctx, r.ok) };
+    if ('fail' in r) return { readable: r.fail === 'missing', found: [], unrecognised: [] };
+    return { readable: true, ...(await hookConfigRuns(ctx, r.ok)) };
   })();
   return ctx.precommitConfig;
 }
@@ -100,25 +114,27 @@ function readPrekConfig(ctx: Ctx): Promise<'absent' | 'unreadable' | Found[]> {
     } catch {
       return 'unreadable';
     }
-    return hookConfigRuns(ctx, asObj(doc));
+    return (await hookConfigRuns(ctx, asObj(doc))).found;
   })();
   return ctx.prekConfig;
 }
 
 /** The tools a pre-commit config (`.pre-commit-config.yaml`, or prek.toml with the same keys) runs. */
-async function hookConfigRuns(ctx: Ctx, config: Obj): Promise<Found[]> {
+async function hookConfigRuns(ctx: Ctx, config: Obj): Promise<HookConfig> {
   {
     const r = { ok: config };
     const defaultStages = strs(r.ok.default_stages);
     const isSet = (o: Obj, key: string) => key in o && o[key] !== null && o[key] !== undefined;
     const topFiltered = isSet(r.ok, 'files') || isSet(r.ok, 'exclude');
     const found: Found[] = [];
+    const unrecognised: string[] = [];
     const scan = (text: string) => scanShell(text, '.', ctx.sigs, ctx.budget, DEFAULT_SHELL);
     // P57 (C1): a hook from a repo pipegen doesn't know may run anything, in any language: its id says nothing about which
     // P57 (fail closed): hooks past MAX_HOOKS aren't read, so what they run is unknown, never missing
     if (list(r.ok.repos).length > MAX_HOOKS || list(r.ok.repos).some((x) => list(asObj(x).hooks).length > MAX_HOOKS)) {
       found.push({ categories: [...HOOK_CATEGORIES].map((c) => `${UNKNOWN_PREFIX}${c}`), by: 'pre-commit', subject: 'The pre-commit config', dir: '.', reason: null,
         partialWhy: "The pre-commit config has more hooks than pipegen reads, so it can't tell what the rest run." });
+      unrecognised.push('(more hooks than pipegen reads)');
     }
     const tag = (fs: Found[], reason: Reason): Found[] => fs.map((f) => {
       const { langs: _langs, ...rest } = f;
@@ -172,16 +188,22 @@ async function hookConfigRuns(ctx: Ctx, config: Obj): Promise<Found[]> {
         if (filtered) hookFound = tag(hookFound, 'files');
         const stages = 'stages' in hook ? strs(hook.stages) : defaultStages;
         if (stages.length > 0 && !stages.some((st) => st === 'pre-commit' || st === 'commit')) hookFound = hookFound.map((f) => ({ ...f, reason: 'stage' }));
-        found.push(...hookFound);
+        // each hook's scripts are followed here, not at the end, so a hook whose script runs no known tool is seen (B4)
+        const resolved = (await resolveScripts(ctx, hookFound)).filter((f) => f.composeSentinel !== true); // P59 (4): no job env here
+        const lookalike = !local && !known; // a repo pipegen doesn't list: it can't see what the hook runs
+        if (lookalike || !resolved.some((f) => f.categories.some((c) => !c.startsWith(UNKNOWN_PREFIX)))) {
+          if (unrecognised.length < MAX_UNRECOGNISED) unrecognised.push(id !== '' && PLAIN_HOOK_ID.test(id) ? id : '(a hook without a readable id)');
+        }
+        found.push(...resolved);
       }
     }
-    return (await resolveScripts(ctx, found)).filter((f) => f.composeSentinel !== true); // P59 (4): no job env here
+    return { found, unrecognised };
   }
 }
 
 export async function readHooks(ctx: Ctx): Promise<Hooks> {
   const manager = ctx.p.precommit;
-  const none: Hooks = { manager, where: '', readable: true, found: [] };
+  const none: Hooks = { manager, where: '', readable: true, found: [], unrecognised: [] };
   if (manager === null) return none;
   const scan = async (text: string, base: string | null, mode: ShellMode) => {
     const g = gateOf([text], [], undefined, ctx.sigs.softEnv, ctx.sigs.configFiles);
@@ -191,11 +213,11 @@ export async function readHooks(ctx: Ctx): Promise<Hooks> {
     const where = '.husky/pre-commit';
     const r = await ctx.read.text(where);
     if ('fail' in r) return { ...none, where: '.husky', readable: r.fail === 'missing' };
-    return { manager, where, readable: true, found: await scan(r.ok, '.', HUSKY_SHELL) };
+    return { manager, where, readable: true, found: await scan(r.ok, '.', HUSKY_SHELL), unrecognised: [] };
   }
   if (manager === 'pre-commit') {
     const config = await readPrecommitConfig(ctx);
-    return { manager, where: HOOK_FILE['pre-commit'], readable: config.readable, found: config.found };
+    return { manager, where: HOOK_FILE['pre-commit'], readable: config.readable, found: config.found, unrecognised: config.unrecognised };
   }
   // lefthook: the first of lefthook.yml / lefthook.yaml that exists (readPrecommit's order)
   for (const where of ['lefthook.yml', 'lefthook.yaml']) {
@@ -208,7 +230,7 @@ export async function readHooks(ctx: Ctx): Promise<Hooks> {
     const found: Found[] = [];
     for (const e of entries) if (typeof e.run === 'string') found.push(...(await scan(e.run, firstSet(workingDir(e.root)), LEFTHOOK_SHELL)));
     // P57 (fail closed): commands past MAX_HOOKS aren't read: the rows they could cover are unknown, never missing
-    return { manager, where, readable: all.length <= MAX_HOOKS, found };
+    return { manager, where, readable: all.length <= MAX_HOOKS, found, unrecognised: [] };
   }
   return none;
 }
