@@ -904,106 +904,144 @@ async function warningsOf(dir: string, anonymous: boolean): Promise<AuditWarning
 const SWAP_WALK_MAX = 256;
 
 /**
- * Plan J J5 (DECISIONS #124, ruling S8; J5 review fix round 1): what in the folders npm reads could change which
- * pipegen `npx pipegen` runs, in plain words (the thing and its folder), or null. npm reads the project `.npmrc` of the
- * nearest folder from the current one up that has a package.json or a node_modules, and npx runs a local bin of that
- * folder. So two chains of folders are checked, each from the current folder (by real path) up:
- * - when `cwd` is `dir` or inside it: every folder up to and including `dir` (the audited repo, with its git index);
- * - whatever `--dir` says (npx already obeyed the folder pipegen was started in): every folder up to and including the
- *   first one that holds `.git` (that repo's index), or, with none, up to npm's own project folder (the first with a
- *   package.json or a node_modules; else the current folder alone). The user's home folder and the folders above it
- *   are never part of it: `~/.npmrc` is the user's own npm config, not a repo's.
+ * Plan J J5 (DECISIONS #124, ruling S8; J5 review fix rounds 1 and 2): what in the folders npm reads could change which
+ * pipegen `npx pipegen` runs, in plain words (the thing and the folder it is in), or null. npm reads the project
+ * `.npmrc` of the nearest folder from the current one up that has a package.json or a node_modules (it doesn't stop at
+ * `.git`), and npx runs a local bin. Two chains of folders are checked, each from the current folder (by real path) up:
+ * - **the audited repo**, when `cwd` is `dir` or inside it: every folder up to and including `dir`, with dir's git index;
+ *   named repo-relative;
+ * - **the start folder**, whatever `--dir` says (npx already obeyed it): every folder up to and including the higher of
+ *   the nearest one that holds `.git` and npm's own project folder (the nearest with a package.json or a node_modules),
+ *   else the current folder alone; and, for `node_modules/.bin/pipegen`, every folder up the way. Each folder's
+ *   node_modules is judged with the index of the nearest repo at or above it. The user's home folder and the folders
+ *   above it are never part of it (`~/.npmrc` is the user's own npm config, not a repo's). Named start-relative, with
+ *   the full path.
  * In each folder:
  * - a `.npmrc` with any key outside the safe list (read only for that yes/no; no value is kept; one that can't be read
  *   safely, a symbolic link or too large, counts);
  * - `node_modules/.bin/pipegen` (lstat: the last part is never followed, a dangling link counts; a symlinked
  *   node_modules or .bin on the way is followed, as npx would follow it);
- * - a committed node_modules: one the git index lists, in any letter case (on macOS and Windows `Node_Modules` is
- *   node_modules), or, when the index can't be read, any node_modules folder (the stricter side).
+ * - a committed node_modules. One that is on disk (lstat, so a case-insensitive file system does its own folding) counts
+ *   unless the git index proves it isn't committed; with an index, one the index lists counts too. Index names are
+ *   compared folded (foldName: NFKC, case folded with `ſ` as `s`, invisible characters removed), so `Node_Modules`,
+ *   `node_moduleſ` or a fullwidth look-alike that a file system could read as node_modules is flagged.
  */
 export async function swapRiskWhy(cwd: string, dir: string): Promise<string | null> {
   const realDir = await realpath(dir).catch(() => null);
   const realCwd = await realpath(cwd).catch(() => null);
   if (realCwd === null) return null; // a folder that isn't there holds no settings
-  let repoTop: string | null = null;
+  const indexes = new Map<string, Promise<ReadonlySet<string> | null>>();
+  const indexOf = (top: string) => {
+    let i = indexes.get(top);
+    if (i === undefined) indexes.set(top, (i = readGitIndexPaths(top)));
+    return i;
+  };
   if (realDir !== null) {
     const rel = relative(realDir, realCwd);
     if (!(rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel))) {
-      repoTop = realDir;
-      const why = await chainWhy(realDir, rel, 'the repo folder');
-      if (why !== null) return why;
+      const parts = rel === '' ? [] : rel.split(sep);
+      if (parts.length >= SWAP_WALK_MAX) return 'a folder nested too deep for pipegen to check';
+      const index = await indexOf(realDir);
+      for (let n = parts.length; n >= 0; n--) {
+        const relFolder = parts.slice(0, n).join('/');
+        const folder = n === 0 ? realDir : join(realDir, ...parts.slice(0, n));
+        const why = await folderWhy(folder, relFolder === '' ? 'the repo folder' : relFolder, { top: realDir, index, rel: relFolder }, true);
+        if (why !== null) return why;
+      }
     }
   }
-  const top = await startTop(realCwd);
-  if (top === null || top === repoTop) return null;
-  return chainWhy(top, relative(top, realCwd), top === realCwd ? 'the folder pipegen was started in' : top);
+  return startChainWhy(realCwd, indexOf);
 }
 
-/**
- * The top of the cwd chain: the first folder from `realCwd` up that holds `.git`, else the first that holds a
- * package.json or a node_modules, else `realCwd`; null when `realCwd` is the home folder or above it.
- */
-async function startTop(realCwd: string): Promise<string | null> {
+/** The start-folder chain (see swapRiskWhy). */
+async function startChainWhy(realCwd: string, indexOf: (top: string) => Promise<ReadonlySet<string> | null>): Promise<string | null> {
   const home = await realpath(homedir()).catch(() => resolve(homedir()));
   /** False for the home folder and every folder that holds it (up to the root). */
   const notHomeOrAbove = (f: string) => {
     const homeFromF = relative(f, home);
     return homeFromF === '..' || homeFromF.startsWith(`..${sep}`) || isAbsolute(homeFromF);
   };
-  if (!notHomeOrAbove(realCwd)) return null;
   const exists = async (p: string) => (await lstat(p).catch(() => null)) !== null;
-  let npmTop: string | null = null;
-  for (let f = realCwd, n = 0; notHomeOrAbove(f) && n < SWAP_WALK_MAX; n++) {
-    if (await exists(join(f, '.git'))) return f;
-    if (npmTop === null && (await exists(join(f, 'package.json')) || await exists(join(f, 'node_modules')))) npmTop = f;
+  const folders: { path: string; git: boolean }[] = [];
+  for (let f = realCwd; notHomeOrAbove(f); ) {
+    if (folders.length >= SWAP_WALK_MAX) return 'a folder nested too deep for pipegen to check';
+    folders.push({ path: f, git: await exists(join(f, '.git')) });
     const up = dirname(f);
     if (up === f) break;
     f = up;
   }
-  return npmTop ?? realCwd;
-}
-
-/** The checks for each folder from `top/rel` up to and including `top`; `topName` names `top` in the answer. */
-async function chainWhy(top: string, rel: string, topName: string): Promise<string | null> {
-  const parts = rel === '' ? [] : rel.split(sep);
-  if (parts.length >= SWAP_WALK_MAX) return 'a folder nested too deep for pipegen to check';
-  const index = await readGitIndexPaths(top);
-  const folders = parts.map((_, i) => parts.slice(0, parts.length - i).join('/')).concat(['']);
-  const committed = index === null ? null : committedNodeModules(index, folders);
-  const gitInfo = index === null ? await lstat(join(top, '.git')).catch(() => null) : null;
-  const noIndex = gitInfo?.isFile() === true
-    ? '.git is a file here (a git worktree or submodule), so pipegen can\'t read its git index'
-    : 'pipegen found no git index it can read';
-  for (const relFolder of folders) {
-    const folder = relFolder === '' ? top : join(top, ...relFolder.split('/'));
-    const where = relFolder === '' ? topName : relFolder;
-    if (await npmrcHasUnsafeKey(folder)) return `an .npmrc with settings that can change what npm runs, in ${where}`;
-    if ((await lstat(join(folder, 'node_modules', '.bin', 'pipegen')).catch(() => null)) !== null) return `a local pipegen (node_modules/.bin/pipegen), in ${where}`;
-    if (committed === null) {
-      if ((await lstat(join(folder, 'node_modules')).catch(() => null)) !== null) return `a node_modules folder pipegen can't tell is not committed (${noIndex}), in ${where}`;
-    } else if (committed.has(relFolder.toLowerCase())) {
-      return `a committed node_modules folder, in ${where}`;
-    }
+  let gitTop = -1;
+  let npmTop = -1;
+  for (let i = 0; i < folders.length && (gitTop < 0 || npmTop < 0); i++) {
+    const f = (folders[i] as { path: string; git: boolean });
+    if (gitTop < 0 && f.git) gitTop = i;
+    if (npmTop < 0 && (await exists(join(f.path, 'package.json')) || await exists(join(f.path, 'node_modules')))) npmTop = i;
+  }
+  const top = Math.max(gitTop, npmTop, 0);
+  for (let i = 0; i < folders.length; i++) {
+    const f = folders[i] as { path: string; git: boolean };
+    const where = i === 0 ? 'the folder pipegen was started in' : `${relative(realCwd, f.path).split(sep).join('/')} (${f.path})`;
+    // the nearest repo at or above this folder judges its node_modules
+    const owner = folders.slice(i).find((x) => x.git)?.path ?? null;
+    const repo = owner === null ? null : { top: owner, index: await indexOf(owner), rel: relative(owner, f.path).split(sep).join('/') };
+    const why = await folderWhy(f.path, where, repo, i <= top);
+    if (why !== null) return why;
   }
   return null;
 }
 
 /**
- * Of `folders` (repo-relative, '' for the top), those whose node_modules the index lists (the folder itself, a
- * committed link, or anything under it), in any letter case. One pass over the index, lower-cased keys.
+ * The checks for one folder. `repo`: the repo whose index judges its node_modules (`rel` the folder's path in it), or
+ * null (no repo: any node_modules counts). `all` false: only node_modules/.bin/pipegen (a folder above npm's project).
  */
-function committedNodeModules(index: ReadonlySet<string>, folders: readonly string[]): Set<string> {
-  const wanted = new Set(folders.map((f) => f.toLowerCase()));
-  const out = new Set<string>();
-  for (const p of index) {
-    const segs = p.toLowerCase().split('/');
-    for (let i = 0; i < segs.length; i++) {
-      if (segs[i] !== 'node_modules') continue;
-      const parent = segs.slice(0, i).join('/');
-      if (wanted.has(parent)) out.add(parent);
+async function folderWhy(folder: string, where: string, repo: { top: string; index: ReadonlySet<string> | null; rel: string } | null, all: boolean): Promise<string | null> {
+  if (all && await npmrcHasUnsafeKey(folder)) return `an .npmrc with settings that can change what npm runs, in ${where}`;
+  if ((await lstat(join(folder, 'node_modules', '.bin', 'pipegen')).catch(() => null)) !== null) return `a local pipegen (node_modules/.bin/pipegen), in ${where}`;
+  if (!all) return null;
+  if (repo !== null && repo.index !== null && committedNodeModules(repo.index, repo.rel)) return `a committed node_modules folder, in ${where}`;
+  if (repo !== null && repo.index !== null) return null; // the index proves what is on disk isn't committed
+  if ((await lstat(join(folder, 'node_modules')).catch(() => null)) === null) return null;
+  const gitInfo = repo === null ? null : await lstat(join(repo.top, '.git')).catch(() => null);
+  const noIndex = gitInfo?.isFile() === true
+    ? '.git is a file there (a git worktree or submodule), so pipegen can\'t read its git index'
+    : repo === null ? 'it is in no git repo' : 'pipegen found no git index it can read';
+  return `a node_modules folder pipegen can't tell is not committed (${noIndex}), in ${where}`;
+}
+
+/** Characters a file system or a terminal may ignore when it compares names (zero-width and other invisible ones). */
+const IGNORABLE = /\p{Default_Ignorable_Code_Point}/gu;
+/**
+ * A name folded the way a case- and normalization-insensitive file system could compare it, on the strict side (it
+ * may fold more than any real one): NFKC, invisible characters removed, upper- then lower-cased (so `ſ` → `S` → `s`,
+ * `K` (Kelvin) → `k`), NFKC again.
+ */
+export function foldName(s: string): string {
+  return s.normalize('NFKC').replace(IGNORABLE, '').toUpperCase().toLowerCase().normalize('NFKC').replace(IGNORABLE, '');
+}
+
+/** The folded folders (repo-relative, '' for the top) whose node_modules each index lists; built once per index. */
+const NODE_MODULES_PARENTS = new WeakMap<ReadonlySet<string>, ReadonlySet<string>>();
+const ASCII = /^[\x00-\x7f]*$/;
+const foldSeg = (seg: string) => (ASCII.test(seg) ? seg.toLowerCase() : foldName(seg));
+
+/**
+ * True when the index lists a node_modules (the folder itself, a committed link, or anything under it) right in the
+ * folder `rel` ('' for the repo top), in any letter case or look-alike form foldName folds to `node_modules`. One pass
+ * over the index (ASCII names only lower-cased), kept for the next folder.
+ */
+function committedNodeModules(index: ReadonlySet<string>, rel: string): boolean {
+  let parents = NODE_MODULES_PARENTS.get(index);
+  if (parents === undefined) {
+    const found = new Set<string>();
+    for (const p of index) {
+      const segs = p.split('/');
+      for (let i = 0; i < segs.length; i++) {
+        if (foldSeg(segs[i] as string) === 'node_modules') found.add(segs.slice(0, i).map(foldSeg).join('/'));
+      }
     }
+    NODE_MODULES_PARENTS.set(index, (parents = found));
   }
-  return out;
+  return parents.has(rel === '' ? '' : rel.split('/').map(foldSeg).join('/'));
 }
 
 /** True when swapRiskWhy has an answer: started from `cwd`, `npx pipegen` could run something other than pipegen. */

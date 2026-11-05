@@ -10,7 +10,7 @@ import * as execa from 'execa';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { makeProvider } from '../src/ai/provider.js';
 import { bundleCode, chooseSecretScanner, SECRET_SCANNER_ENV as SCANNER_ENV, SecretScanError } from '../src/ai/redact.js';
-import { addAiSuggestions, buildAudit, safeRunCommand, swapRisk, swapRiskWhy, type AuditReport } from '../src/audit/model.js';
+import { addAiSuggestions, buildAudit, foldName, safeRunCommand, swapRisk, swapRiskWhy, type AuditReport } from '../src/audit/model.js';
 import { CANT_SEE, renderTerminal } from '../src/audit/render.js';
 import { EXIT_UNSAFE_FOLDER } from '../src/cli/audit.js';
 import { run } from '../src/cli/main.js';
@@ -1474,6 +1474,57 @@ describe('npx pipegen inside the folder: the safe-mode stop (J5, #124, S8, S15)'
     // a clean start folder: the audit runs
     expect((await audit(['--dir', target], { cwd: makeTempDir() })).code).toBe(0);
     expect((await audit(['--dir', target], { cwd: repo() })).code).toBe(0);
+  });
+
+  it('npm\'s project folder above a nested .git is checked too; node_modules/.bin/pipegen in any folder up the way', async () => {
+    const target = repo();
+    // a nested .git (a folder, or a file as in a submodule) under a parent with package.json and a hostile .npmrc
+    for (const nested of ['folder', 'file'] as const) {
+      const r = makeTempDir();
+      writeIn(r, 'package.json', '{}');
+      writeIn(r, '.npmrc', 'node-options=--require=./x.js\n');
+      if (nested === 'folder') writeIn(r, 'sub/.git/config', '[core]\n');
+      else writeIn(r, 'sub/.git', 'gitdir: ../.git/modules/sub\n');
+      const res = await audit(['--dir', target], { cwd: join(r, 'sub') });
+      expect(res.code, nested).toBe(EXIT_UNSAFE_FOLDER);
+      expect(res.err.replace(/\s+/g, ' ')).toContain(`in .. (${r})`); // N2: the folder, start-relative, with its path
+      expect(res.calls).toEqual([]);
+    }
+    // no .git at all, package.json two levels up
+    const p2 = makeTempDir();
+    writeIn(p2, 'package.json', '{}');
+    writeIn(p2, '.npmrc', 'script-shell=./x.sh\n');
+    writeIn(p2, 'a/b/x.txt', '\n');
+    const two = await audit(['--dir', target], { cwd: join(p2, 'a/b') });
+    expect(two.code).toBe(EXIT_UNSAFE_FOLDER);
+    expect(two.err.replace(/\s+/g, ' ')).toContain(`in ../.. (${p2})`);
+    // a local pipegen above npm's project folder: still a stop
+    const q = makeTempDir();
+    writeIn(q, 'node_modules/.bin/pipegen', '#!/bin/sh\n');
+    writeIn(q, 'proj/package.json', '{}');
+    writeIn(q, 'proj/.git/config', '[core]\n');
+    expect((await audit(['--dir', target], { cwd: join(q, 'proj') })).code).toBe(EXIT_UNSAFE_FOLDER);
+    // a hostile .npmrc above both the repo top and npm's project folder: npm doesn't read it, no stop
+    const above = makeTempDir();
+    writeIn(above, '.npmrc', UNSAFE_NPMRC);
+    writeIn(above, 'proj/package.json', '{}');
+    writeIn(above, 'proj/.git/config', '[core]\n');
+    expect((await audit(['--dir', target], { cwd: join(above, 'proj') })).code).toBe(0);
+  });
+
+  it('a committed node_modules under a look-alike name a file system could fold (ſ, fullwidth, an invisible character) → exit 4', async () => {
+    expect(foldName('node_module\u017f')).toBe('node_modules');
+    for (const entry of ['node_module\u017f/x.js', '\uff4e\uff4f\uff44\uff45_\uff4d\uff4f\uff44\uff55\uff4c\uff45\uff53/y/package.json', 'node\u200b_modules/z.js']) {
+      const dir = repo();
+      writeIndex(dir, ['index.js', entry, 'package.json']);
+      const r = await audit([], { cwd: dir });
+      expect(r.code, entry).toBe(EXIT_UNSAFE_FOLDER);
+      expect(r.err).toContain('a committed node_modules folder');
+    }
+    // a name no file system folds to node_modules (a Cyrillic letter) is a different folder
+    const other = repo();
+    writeIndex(other, ['index.js', 'node_modul\u0435s/x.js', 'package.json']);
+    expect((await audit([], { cwd: other })).code).toBe(0);
   });
 
   it('the home folder and the folders above it are never checked (~/.npmrc is the user\'s own npm config)', async () => {
