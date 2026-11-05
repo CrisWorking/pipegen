@@ -150,10 +150,25 @@ async function step(x: Ctx, what: string, fn: () => Promise<void>): Promise<bool
 }
 const noteAbout = (l: LockPlan, re: RegExp): string | undefined => l.notes.find((n) => re.test(n));
 /**
- * m3: an earlier entry is about the same object when GitHub's created_at is the same, or when either side doesn't know it: an earlier
- * value is never dropped (nor replaced by pipegen's own settings) because GitHub didn't say when the object was made.
+ * G11-R2 d (replaces m3's broad match): an earlier entry found by name is the same object only when both created_at are known and equal.
+ * Unknown on either side: it is not adopted (its `created` mark never moves to an object pipegen can't show it made, so uninstall never
+ * deletes a same-name object of the user's), but its `previous` value is kept (see `priorOf`), never replaced by pipegen's own settings.
  */
-const sameObject = (priorAt: string | undefined, at: string | null): boolean => priorAt === undefined || at === null || priorAt === at;
+const sameObject = (priorAt: string | undefined, at: string | null): boolean => priorAt !== undefined && at !== null && priorAt === at;
+/**
+ * A ruleset is found by its id, which GitHub never reuses: the same object unless both created_at are known and differ (an unconfirmed
+ * ruleset pipegen made stays recorded on a re-run).
+ */
+const sameRuleset = (priorAt: string | undefined, at: string | null): boolean => priorAt === undefined || at === null || priorAt === at;
+/**
+ * The earlier entry (the record's first, then the pending file's) for the object GitHub holds now: `same` (adopted whole) or `maybe` (a
+ * created_at unknown on either side: only its `previous` is kept). A known, different created_at: another object, no entry.
+ */
+function priorOf<T extends { githubCreatedAt?: string; previous?: unknown }>(lists: readonly (readonly T[])[], match: (e: T) => boolean, at: string | null): { kind: 'same' | 'maybe'; entry: T } | undefined {
+  for (const l of lists) { const e = l.find((p) => match(p) && sameObject(p.githubCreatedAt, at)); if (e !== undefined) return { kind: 'same', entry: e }; }
+  for (const l of lists) { const e = l.find((p) => match(p) && (p.githubCreatedAt === undefined || at === null) && p.previous !== undefined); if (e !== undefined) return { kind: 'maybe', entry: e }; }
+  return undefined;
+}
 const atOf = (at: string | null): { githubCreatedAt: string } | { unconfirmed: true } => (at !== null && ISO_RE.test(at) ? { githubCreatedAt: at } : { unconfirmed: true as const });
 const pendingPath = (x: Ctx): string => localFinishPendingPath(x.app, x.deps.local ?? {});
 /** I1: the pending file saved with `change` applied, BEFORE the write it guards; a file that can't be saved: that write isn't made. */
@@ -168,6 +183,24 @@ async function keepPending(x: Ctx, change: (p: FinishPending) => void): Promise<
 /** I1: an object pipegen just made, saved to the pending file after its read-back (best effort: only its `created` mark is at stake). */
 async function keepMade(x: Ctx, change: (p: FinishPending) => void): Promise<void> {
   try { await keepPending(x, change); } catch { x.notes.push(`pipegen couldn't save locally that it made an object (${show(pendingPath(x))}); if this run stops before the install record is written, uninstall won't know pipegen made it.`); }
+}
+/**
+ * G11-R2 a: a write GitHub refused (HTTP 4xx) changed nothing, so the value `keepPending` saved for it is dropped again (`unsave`): a
+ * later run never takes it for what a setting the user changed themselves was before. Any other failure keeps it (the write may have
+ * gone through). The refusal is passed on.
+ */
+async function guardedWrite(x: Ctx, unsave: ((p: FinishPending) => void) | undefined, write: () => Promise<unknown>): Promise<void> {
+  try { await write(); } catch (e) {
+    const s = statusOf(e);
+    if (unsave !== undefined && s !== undefined && s >= 400 && s < 500) {
+      const next = structuredClone(x.pending);
+      unsave(next);
+      try { await writeFinishPending(x.app, x.repoId, next, (x.deps.now ?? (() => new Date()))(), x.deps.local ?? {}); x.pending = next; } catch {
+        x.notes.push(`pipegen couldn't take back from its pending file (${show(pendingPath(x))}) a value it saved for a write GitHub refused; remove the file before the next \`npx pipegen finish\`.`);
+      }
+    }
+    throw e;
+  }
 }
 const pendEnv = (p: FinishPending, e: EnvEntry): void => { p.environments = [...p.environments.filter((v) => v.name !== e.name), e]; };
 const pendVar = (p: FinishPending, v: VarEntry): void => { p.variables = [...p.variables.filter((w) => !(w.name === v.name && w.scope === v.scope)), v]; };
@@ -288,7 +321,7 @@ async function appLocks(x: Ctx): Promise<void> {
       try {
         const r = await upsertRuleset(x, t, name, req.body, existing);
         x.applied.push(`ruleset ${name}${r.wrote === 'none' ? ' (already in place)' : ''}`);
-        const prior = x.rec.rulesets.find((p) => p.kind === kind && p.id === r.id && sameObject(p.githubCreatedAt, r.createdAt));
+        const prior = x.rec.rulesets.find((p) => p.kind === kind && p.id === r.id && sameRuleset(p.githubCreatedAt, r.createdAt));
         const entry = recordedRuleset(x, r, prior, `the ruleset ${name}`, `The ruleset ${name} that was already on ${show(`${x.app.owner}/${x.app.repo}`)}`);
         if (entry !== undefined) x.rulesets.set(kind, { kind, id: r.id, name: name as 'pipegen' | 'pipegen-reviews', ...entry });
       } catch (e) {
@@ -323,7 +356,7 @@ async function classic(x: Ctx): Promise<void> {
       return;
     }
     if (prior === undefined) await keepPending(x, (p) => { p.classicProtection = { branch: x.branch, previous: before }; });
-    await x.api.write(`${req.method} ${req.route}`, { ...req.params, ...req.body });
+    await guardedWrite(x, prior === undefined ? (p) => { delete p.classicProtection; } : undefined, () => x.api.write(`${req.method} ${req.route}`, { ...req.params, ...req.body }));
     const back = await x.api.readOr404(route, req.params);
     if (back === null || !holdsWanted(req.body, classicPutForm(back))) throw new StepError(`Classic branch protection on ${show(x.branch, 100)} doesn't read back as pipegen set it.`);
     x.classic = prior ?? { branch: x.branch, previous: before };
@@ -346,7 +379,7 @@ async function shaPinning(x: Ctx): Promise<void> {
   if (x.print) { x.commands.push(apiCmd(F.request.method, F.request.route, F.request.params, F.request.body)); return; }
   await step(x, SHA_WHAT, async () => {
     if (prior === undefined) await keepPending(x, (p) => { p.repoSettings.shaPinningRequired = { previous: false }; });
-    await x.api.write(`${F.request.method} ${F.request.route}`, { ...F.request.params, ...F.request.body });
+    await guardedWrite(x, prior === undefined ? (p) => { delete p.repoSettings.shaPinningRequired; } : undefined, () => x.api.write(`${F.request.method} ${F.request.route}`, { ...F.request.params, ...F.request.body }));
     const back = await readShaPinning(x.gh, x.app.owner, x.app.repo, [], x.clock);
     if (back.state !== 'read' || back.required !== true) throw new StepError('The setting doesn\'t read back as on.');
     x.repoSettings.shaPinningRequired = prior ?? { previous: false };
@@ -372,7 +405,7 @@ async function securitySettings(x: Ctx): Promise<void> {
     }
     if (x.print) { x.commands.push(apiCmd('PUT', '/repos/{owner}/{repo}/vulnerability-alerts', p)); return; }
     if (prior === undefined) await keepPending(x, (q) => { q.repoSettings.vulnerabilityAlerts = { previous: false }; });
-    await x.api.write('PUT /repos/{owner}/{repo}/vulnerability-alerts', p);
+    await guardedWrite(x, prior === undefined ? (q) => { delete q.repoSettings.vulnerabilityAlerts; } : undefined, () => x.api.write('PUT /repos/{owner}/{repo}/vulnerability-alerts', p));
     if (!await alertsOn()) throw new StepError('Dependabot alerts don\'t read back as on.');
     x.repoSettings.vulnerabilityAlerts = prior ?? { previous: false };
     x.applied.push(what);
@@ -400,7 +433,7 @@ async function securitySettings(x: Ctx): Promise<void> {
     if (x.print) { x.commands.push(apiCmd('PATCH', '/repos/{owner}/{repo}', p, body)); return; }
     const add: NonNullable<InstallRecord['repoSettings']> = { ...(prior.ss === undefined && !cur.ss ? { secretScanning: { previous: false } } : {}), ...(prior.pp === undefined && !cur.pp ? { pushProtection: { previous: false } } : {}) };
     if (Object.keys(add).length > 0) await keepPending(x, (q) => { Object.assign(q.repoSettings, add); });
-    await x.api.write('PATCH /repos/{owner}/{repo}', { ...p, ...body });
+    await guardedWrite(x, Object.keys(add).length > 0 ? (q) => { for (const k of Object.keys(add) as (keyof typeof add)[]) delete q.repoSettings[k]; } : undefined, () => x.api.write('PATCH /repos/{owner}/{repo}', { ...p, ...body }));
     const back = await read();
     if (!back.ss || !back.pp) throw new StepError('Secret scanning and push protection don\'t read back as on.');
     keep();
@@ -430,7 +463,7 @@ async function actionsAccess(x: Ctx): Promise<void> {
     if (x.print) { x.commands.push(apiCmd('PUT', '/repos/{owner}/{repo}/actions/permissions/access', p, { access_level: level })); return; }
     const prev = prior ?? (cur !== null && /^[a-z_]{1,40}$/.test(cur) ? { previous: cur } : undefined);
     if (prior === undefined && prev !== undefined) await keepPending(x, (q) => { q.actionsAccess = prev; });
-    await x.api.write('PUT /repos/{owner}/{repo}/actions/permissions/access', { ...p, access_level: level });
+    await guardedWrite(x, prior === undefined && prev !== undefined ? (q) => { delete q.actionsAccess; } : undefined, () => x.api.write('PUT /repos/{owner}/{repo}/actions/permissions/access', { ...p, access_level: level }));
     if (await read() !== level) throw new StepError('The access level doesn\'t read back as set.');
     if (prev !== undefined) x.centralRec.actionsAccess = prev;
     x.applied.push(what);
@@ -462,9 +495,10 @@ async function orgRequired(x: Ctx): Promise<void> {
     if (x.print) { await printRuleset(x, t, name, { ...F.rule, body }, existing); return; }
     const r = await upsertRuleset(x, t, name, body, existing);
     const p = x.rec.orgRuleset;
-    const prior = p !== undefined && p.id === r.id && sameObject(p.githubCreatedAt, r.createdAt) ? p : undefined;
+    const prior = p !== undefined && p.id === r.id && sameRuleset(p.githubCreatedAt, r.createdAt) ? p : undefined;
     const entry = recordedRuleset(x, r, prior, `the org ruleset ${show(name, 100)}`, `The org ruleset ${show(name, 100)} that was already there`);
-    if (entry !== undefined) x.orgRuleset = { org: x.app.owner, id: r.id, name, ...entry };
+    // G11-R-sec1: the commit the rule's workflow entry is pinned to (read back above), so verify can hold the live rule to it
+    if (entry !== undefined) x.orgRuleset = { org: x.app.owner, id: r.id, name, ...entry, pinnedSha: x.centralHead };
     x.applied.push(`${what} (ruleset ${show(name, 100)}, pinned to ${x.centralHead.slice(0, 12)})${r.wrote === 'none' ? ' (already in place)' : ''}`);
   });
 }
@@ -497,19 +531,22 @@ async function environments(x: Ctx): Promise<void> {
       };
       const keys = Object.keys(want) as (keyof typeof want)[];
       const changed = cur === null ? [] : keys.filter((k) => JSON.stringify(want[k]) !== JSON.stringify(s?.[k]));
-      // captured once: an earlier entry for this environment (the record's, else one an earlier run saved before it stopped, I1; m3)
+      // captured once: an earlier entry for this environment (the record's, else one an earlier run saved before it stopped, I1), adopted
+      // only when it is the same object; a maybe-same one gives only its previous value (G11-R2 d)
       const curAt = cur?.createdAt ?? null;
-      const found = (p: EnvEntry): boolean => p.name === e.name && sameObject(p.githubCreatedAt, curAt);
-      const prior = cur === null ? undefined : x.rec.environments.find(found) ?? x.pending.environments.find(found);
+      const m = cur === null ? undefined : priorOf([x.rec.environments, x.pending.environments], (p) => p.name === e.name, curAt);
+      const prior = m?.kind === 'same' ? m.entry : undefined;
+      const kept = m?.kind === 'maybe' ? m.entry : undefined;
       let back = cur;
       if (cur === null || changed.length > 0) {
         const params = { ...appParams(x), environment_name: e.name };
         if (x.print) { x.commands.push(apiCmd('PUT', '/repos/{owner}/{repo}/environments/{environment_name}', params, { ...want })); return; }
-        if (cur !== null && prior === undefined) {
+        const saving = cur !== null && prior === undefined && kept === undefined;
+        if (saving) {
           const was: EnvEntry = { name: e.name, created: false, ...atOf(curAt), previous: { ...cur.settings, branch_policies: cur.policies.map((p) => ({ name: p.name, type: p.type })) }, changed, branchPolicyIds: [] };
           await keepPending(x, (q) => pendEnv(q, was));
         }
-        await x.api.write('PUT /repos/{owner}/{repo}/environments/{environment_name}', { ...params, ...want });
+        await guardedWrite(x, saving ? (q) => { q.environments = q.environments.filter((v) => v.name !== e.name); } : undefined, () => x.api.write('PUT /repos/{owner}/{repo}/environments/{environment_name}', { ...params, ...want }));
         back = await readEnv(x.gh, x.app, x.clock, e.name);
         if (back === null || keys.some((k) => JSON.stringify(back?.settings[k]) !== JSON.stringify(want[k]))) throw new StepError(`The environment ${show(e.name, 100)} doesn't read back as pipegen set it.`);
       }
@@ -517,6 +554,7 @@ async function environments(x: Ctx): Promise<void> {
       const atField = atOf(back?.createdAt ?? null);
       let entry: EnvEntry;
       if (prior !== undefined) entry = { ...prior, changed: [...new Set([...prior.changed, ...changed])] };
+      else if (kept !== undefined) entry = { name: e.name, created: false, ...atOf(curAt), previous: kept.previous as EnvSettings, changed: [...new Set([...kept.changed, ...changed])], branchPolicyIds: [] };
       else if (cur === null) {
         entry = { name: e.name, created: true, ...atField, changed: [], branchPolicyIds: [] };
         if ('githubCreatedAt' in atField) await keepMade(x, (q) => pendEnv(q, entry));
@@ -556,16 +594,21 @@ async function setVariable(x: Ctx, scope: 'repo' | `env:${string}`, name: string
     return;
   }
   // captured once: never pipegen's own value as previous (the record's entry, else one an earlier run saved before it stopped, I1; m3)
-  const found = (v: VarEntry): boolean => v.name === name && v.scope === scope && sameObject(v.githubCreatedAt, cur?.createdAt ?? null);
-  const prior = cur === null ? undefined : x.rec.variables.find(found) ?? x.pending.variables.find(found);
-  if (cur !== null && cur.value !== value && prior === undefined) await keepPending(x, (q) => pendVar(q, { name, scope, created: false, previous: cur.value, ...atOf(cur.createdAt) }));
+  // adopted only when it is the same object; a maybe-same one gives only its previous value (G11-R2 d)
+  const m = cur === null ? undefined : priorOf([x.rec.variables, x.pending.variables], (v) => v.name === name && v.scope === scope, cur.createdAt);
+  const prior = m?.kind === 'same' ? m.entry : undefined;
+  const kept = m?.kind === 'maybe' ? m.entry : undefined;
+  const saving = cur !== null && cur.value !== value && prior === undefined && kept === undefined;
+  if (saving) await keepPending(x, (q) => pendVar(q, { name, scope, created: false, previous: cur.value, ...atOf(cur.createdAt) }));
+  const unsave = saving ? (q: FinishPending): void => { q.variables = q.variables.filter((v) => !(v.name === name && v.scope === scope)); } : undefined;
   if (cur === null) await x.api.write(`POST ${all}`, { ...p, name, value });
-  else if (cur.value !== value) await x.api.write(`PATCH ${one}`, { ...p, name, value });
+  else if (cur.value !== value) await guardedWrite(x, unsave, () => x.api.write(`PATCH ${one}`, { ...p, name, value }));
   const back = await read();
   if (back === null || back.value !== value) throw new StepError(`${name} doesn't read back as pipegen set it.`);
   const at = atOf(back.createdAt);
   let entry: VarEntry;
   if (prior !== undefined) entry = { ...prior };
+  else if (kept !== undefined && cur !== null) entry = { name, scope, created: false, previous: kept.previous as string, ...atOf(cur.createdAt) };
   else if (cur === null) {
     entry = { name, scope, created: true, ...at };
     if ('githubCreatedAt' in at) await keepMade(x, (q) => pendVar(q, entry));
@@ -881,16 +924,15 @@ export async function finish(gh: Octokit, app: RepoRef, opts: FinishOpts, deps: 
     if (opts.rotateKey === true && planned.signingMode !== 'key-env') throw new FinishError('--rotate-key works only in key-env signing mode (a cosign key kept in the pipegen-signing environment); this repo signs another way, so pipegen applies nothing.');
     // I1: what an earlier run saved before it stopped (an unreadable file stops here, nothing applied; it is never overwritten)
     const pending = await readFinishPending(app, appRepo.id, deps.local ?? {});
-    // I2 (S18: never looser): the merge day + 7, or an earlier date the record vouches; a typed record carries none, so the variable's own
-    // earlier date (a valid day) is kept too
+    // I2 (S18: never looser): the earliest of the merge day + 7, the date the record vouches, and the variable's own date when it is a real
+    // day. Fix round 2: the variable counts for every record, typed or vouched (a re-delivery after a typed trust writes a vouched record
+    // with no blockFrom; a finish that set the variable may have stopped before its record was written)
     const mergeDay = new Date(Date.parse(`${p.mergedAt.slice(0, 10)}T00:00:00Z`) + 7 * DAY_MS).toISOString().slice(0, 10);
     blockFrom = mergeDay;
     if (rec.blockFrom !== undefined && rec.blockFrom < blockFrom) blockFrom = rec.blockFrom;
-    if (typed) {
-      const v = await api.readOr404('GET /repos/{owner}/{repo}/actions/variables/{name}', { owner: app.owner, repo: app.repo, name: BLOCK_FROM_VAR });
-      const day = isObj(v) && typeof v.value === 'string' ? v.value : '';
-      if (/^\d{4}-\d{2}-\d{2}$/.test(day) && !Number.isNaN(Date.parse(`${day}T00:00:00Z`)) && new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) === day && day < blockFrom) blockFrom = day;
-    }
+    const v = await api.readOr404('GET /repos/{owner}/{repo}/actions/variables/{name}', { owner: app.owner, repo: app.repo, name: BLOCK_FROM_VAR });
+    const varDay = isObj(v) && typeof v.value === 'string' ? v.value : '';
+    if (/^\d{4}-\d{2}-\d{2}$/.test(varDay) && !Number.isNaN(Date.parse(`${varDay}T00:00:00Z`)) && new Date(`${varDay}T00:00:00Z`).toISOString().slice(0, 10) === varDay && varDay < blockFrom) blockFrom = varDay;
     if (blockFrom !== mergeDay) notes.push(`${BLOCK_FROM_VAR} stays ${blockFrom}, the earlier date: a later merge never moves the end of the warn period later.`);
     x = {
       gh, api, app, central, clock, deps, print: opts.print === true, rotate: opts.rotateKey === true,

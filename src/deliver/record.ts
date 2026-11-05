@@ -106,7 +106,8 @@ export const InstallRecordSchema = z.strictObject({
   // G11 fix round 1 (m6): a ruleset pipegen made whose read-back had no created_at is recorded `unconfirmed` (one of the two, never both)
   rulesets: z.array(z.strictObject({ kind: z.enum(['gate', 'reviews']), id: ID, name: z.enum(['pipegen', 'pipegen-reviews']), githubCreatedAt: ISO.optional(), unconfirmed: z.literal(true).optional() }).refine(oneOfAt, 'githubCreatedAt or unconfirmed, one of them')).max(2),
   classicProtection: z.strictObject({ branch: BRANCH, previous: z.record(KEY, JSONISH).nullable() }).optional(),
-  orgRuleset: z.strictObject({ org: OWNER, id: ID, name: z.string().max(200), githubCreatedAt: ISO.optional(), unconfirmed: z.literal(true).optional() }).refine(oneOfAt, 'githubCreatedAt or unconfirmed, one of them').optional(),
+  // G11-R-sec1: pinnedSha, the central commit finish pinned the rule's workflow entries to (verify holds the live rule to it)
+  orgRuleset: z.strictObject({ org: OWNER, id: ID, name: z.string().max(200), githubCreatedAt: ISO.optional(), unconfirmed: z.literal(true).optional(), pinnedSha: SHA }).refine(oneOfAt, 'githubCreatedAt or unconfirmed, one of them').optional(),
   repoSettings: z.strictObject({
     shaPinningRequired: z.strictObject({ previous: z.boolean() }).optional(), vulnerabilityAlerts: z.strictObject({ previous: z.boolean() }).optional(),
     secretScanning: z.strictObject({ previous: z.boolean() }).optional(), pushProtection: z.strictObject({ previous: z.boolean() }).optional(),

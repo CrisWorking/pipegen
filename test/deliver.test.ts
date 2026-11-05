@@ -814,7 +814,7 @@ describe('G10 fix round 1 (review-G10, ruling G10-R2)', () => {
     const w = world();
     await firstRun(w);
     const r = structuredClone(await record(w) as Rec);
-    r.orgRuleset = { org: 'o', id: 11, name: 'pipegen-required--r', githubCreatedAt: '2026-11-06T00:00:00Z' };
+    r.orgRuleset = { org: 'o', id: 11, name: 'pipegen-required--r', githubCreatedAt: '2026-11-06T00:00:00Z', pinnedSha: 'a'.repeat(40) };
     r.classicProtection = { branch: 'main', previous: null };
     r.repoSettings = { shaPinningRequired: { previous: false } };
     r.central = { repoId: 99, createdByPipegen: true, rulesetId: 12, codeowners: { path: '.github/CODEOWNERS', created: true }, actionsAccess: { previous: 'none' } };
@@ -933,6 +933,7 @@ describe('G10 fix round 1 (review-G10, ruling G10-R2)', () => {
     expect(classified(TYPED_VIEW_FIELDS.variables)).toEqual(keys(el(sh.variables)));
     expect(classified(TYPED_VIEW_FIELDS.environments)).toEqual(keys(el(sh.environments)));
     expect(classified(TYPED_VIEW_FIELDS.rulesets)).toEqual(keys(el(sh.rulesets)));
+    expect(classified(TYPED_VIEW_FIELDS.orgRuleset)).toEqual(keys(sh.orgRuleset.unwrap().shape));
     // nothing is both kept and dropped
     for (const c of Object.values(TYPED_VIEW_FIELDS)) expect(new Set(classified(c)).size, JSON.stringify(c)).toBe(classified(c).length);
   });

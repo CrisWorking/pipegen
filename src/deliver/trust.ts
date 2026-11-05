@@ -64,6 +64,8 @@ export const TYPED_VIEW_FIELDS = {
   variables: { keep: ['name', 'scope', 'created', 'githubCreatedAt', 'unconfirmed'], drop: ['previous'] },
   environments: { keep: ['name', 'created', 'githubCreatedAt', 'unconfirmed'], fresh: ['changed', 'branchPolicyIds'], drop: ['previous'] },
   rulesets: { keep: ['kind', 'id', 'name', 'githubCreatedAt', 'unconfirmed'] },
+  // the record drops orgRuleset whole (record.drop); its fields are listed so a field it gains is classified on purpose (G11-R-sec1 pinnedSha)
+  orgRuleset: { keep: [], drop: ['org', 'id', 'name', 'githubCreatedAt', 'unconfirmed', 'pinnedSha'] },
 } as const satisfies Record<string, { keep: readonly string[]; fresh?: readonly string[]; drop?: readonly string[] }>;
 
 /** A copy of exactly the listed own fields that are present (deep-copied). */

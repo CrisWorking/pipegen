@@ -274,7 +274,7 @@ export interface InstallRecord {
   environments: { name: string; created: boolean; githubCreatedAt?: string; previous?: EnvSettings; changed: (keyof EnvSettings)[]; branchPolicyIds: number[]; unconfirmed?: true }[];
   rulesets: { kind: 'gate' | 'reviews'; id: number; name: 'pipegen' | 'pipegen-reviews'; githubCreatedAt?: string; unconfirmed?: true }[];   // G11 m6: unconfirmed = pipegen made it, GitHub didn't say when
   classicProtection?: { branch: string; previous: Record<string, unknown> | null };   // the PUT-form body as it was before; null = none
-  orgRuleset?: { org: string; id: number; name: string; githubCreatedAt?: string; unconfirmed?: true };
+  orgRuleset?: { org: string; id: number; name: string; githubCreatedAt?: string; unconfirmed?: true; pinnedSha: string };   // G11-R-sec1: pinnedSha = the central commit finish pinned every workflow entry of the rule to (verify requires it, and on the central default branch)
   repoSettings?: Partial<Record<'shaPinningRequired' | 'vulnerabilityAlerts' | 'secretScanning' | 'pushProtection', { previous: boolean }>>;
   central?: { repoId?: number; createdByPipegen: boolean; rulesetId?: number; rulesetCreatedAt?: string; codeowners?: { path: string; created: boolean }; actionsAccess?: { previous: string } };
   scratch?: { repoId?: number; createdByPipegen: boolean };

@@ -3,7 +3,7 @@
 // the merge locks, the environments, the signing environment's key and PIPEGEN_COSIGN_PUB, PIPEGEN_BLOCK_FROM, sha pinning, then the central
 // ruleset and CODEOWNERS last, and updates the install record; `pipegen verify` reports drift between the repos and the record. Every GitHub
 // call goes to an in-memory GitHub (test/helpers/finish-github.ts); cosign is a fake exec; no network.
-import { chmodSync, existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -511,7 +511,7 @@ describe('G11 finish: what it records (Plan V §5)', () => {
     const t = await seed({ org: true });
     await finish(t.g.octokit(), { owner: 'o', repo: 'r' }, {}, t.deps());
     const org = [...t.g.orgRulesets.values()][0];
-    expect((await recordOn(t)).orgRuleset).toEqual({ org: 'o', id: org?.id, name: 'pipegen-required--r', githubCreatedAt: org?.created_at });
+    expect((await recordOn(t)).orgRuleset).toEqual({ org: 'o', id: org?.id, name: 'pipegen-required--r', githubCreatedAt: org?.created_at, pinnedSha: (org?.body.rules as { parameters: { workflows: { sha: string }[] } }[])[0]?.parameters.workflows[0]?.sha });
   });
 
   it('finish: settings pipegen turns on record their previous value', async () => {
@@ -1014,13 +1014,16 @@ describe('G11 fix round 1: minor findings (m1-m9)', () => {
     (varOf(s, 'PIPEGEN_BLOCK_FROM') as { created_at: string }).created_at = '';
     await finish(s.g.octokit(), app, {}, s.deps());
     const second = await recordOn(s, 'pipegen/update-r');
-    expect(second.environments.find((e) => e.name === 'production')).toEqual(first.environments.find((e) => e.name === 'production'));
-    expect(second.variables.find((v) => v.name === 'PIPEGEN_BLOCK_FROM')).toEqual(first.variables.find((v) => v.name === 'PIPEGEN_BLOCK_FROM'));
+    // G11-R2 d: not adopted (no created_at to match), but the earlier previous is kept, never pipegen's own values
+    const { githubCreatedAt: _e, ...firstEnv } = first.environments.find((e) => e.name === 'production') as InstallRecord['environments'][number];
+    expect(second.environments.find((e) => e.name === 'production')).toEqual({ ...firstEnv, created: false, unconfirmed: true });
+    const { githubCreatedAt: _v, ...firstVar } = first.variables.find((v) => v.name === 'PIPEGEN_BLOCK_FROM') as InstallRecord['variables'][number];
+    expect(second.variables.find((v) => v.name === 'PIPEGEN_BLOCK_FROM')).toEqual({ ...firstVar, created: false, unconfirmed: true });
     // an earlier entry recorded without created_at (unconfirmed), GitHub holding pipegen's own value now: previous kept, never pipegen's
     const t = await seed({ recordOver: (r) => { r.variables.push({ name: 'PIPEGEN_BLOCK_FROM', scope: 'repo', created: false, unconfirmed: true, previous: '2026-12-31' }); } });
     t.g.x('o/r').variables.set('PIPEGEN_BLOCK_FROM', { value: BLOCK_FROM, created_at: '2026-02-02T00:00:00Z' });
     await finish(t.g.octokit(), app, {}, t.deps());
-    expect((await recordOn(t)).variables.find((v) => v.name === 'PIPEGEN_BLOCK_FROM')).toEqual({ name: 'PIPEGEN_BLOCK_FROM', scope: 'repo', created: false, unconfirmed: true, previous: '2026-12-31' });
+    expect((await recordOn(t)).variables.find((v) => v.name === 'PIPEGEN_BLOCK_FROM')).toEqual({ name: 'PIPEGEN_BLOCK_FROM', scope: 'repo', created: false, githubCreatedAt: '2026-02-02T00:00:00Z', previous: '2026-12-31' });
   });
 
   it('finish: the central rule that couldn\'t be switched on gets its own line, apart from what the record doesn\'t list (m4)', async () => {
@@ -1102,6 +1105,176 @@ describe('G11 fix round 1: minor findings (m1-m9)', () => {
     const from = s.g.calls.length;
     await expect(finish(s.g.octokit(), app, {}, s.deps())).rejects.toThrow(/not merged into the default branch/);
     expect(writeRoutes(s, from)).toEqual([]);
+  });
+});
+
+// ---------- fix round 2 (re-review G11 r1, ruling G11-R2 and G11-R-sec1) ----------
+
+describe('G11 fix round 2 (G11-R2, G11-R-sec1)', () => {
+  const app = { owner: 'o', repo: 'r' };
+  const vfy = (s: Seed) => verify(s.g.octokit(), app, { local: { home: s.home, env: {} }, clock: clock() });
+  type B = Record<string, any>;
+  const bodyOf = (s: Seed, repo: string, name: string): B => [...s.g.repo(repo).rulesets.values()].find((b) => b.name === name) as B;
+  const orgBody = (s: Seed): B => ([...s.g.orgRulesets.values()][0] as { body: B }).body;
+  const ORG = 'the org required workflow rule (pipegen-required--r)';
+
+  it('finish: PIPEGEN_BLOCK_FROM never moves later for a vouched record that carries no date: a re-delivery after a typed trust, then a later merge (I2)', async () => {
+    const s = await seed();
+    await finish(s.g.octokit(), app, {}, s.deps());
+    const first = await recordOn(s);
+    expect(varOf(s, 'PIPEGEN_BLOCK_FROM')?.value).toBe(BLOCK_FROM);
+    // a re-delivery from a machine that trusted the record by typing: the record it writes carries no blockFrom, its local file is not typed
+    s.g.commitOn('o/r', SETUP_BRANCH, { 'PIPEGEN.md': '# pipegen v2\n' }, 'pipegen: setup again');
+    const pr2 = ((await s.g.request('POST /repos/{owner}/{repo}/pulls', { owner: 'o', repo: 'r', head: SETUP_BRANCH, base: 'main', title: 'pipegen', body: 'again' })).data as { number: number }).number;
+    const again: InstallRecord = structuredClone(first);
+    delete again.blockFrom;
+    delete again.mergedAt;
+    rmSync(join(s.home, '.config'), { recursive: true, force: true });
+    await writeRecord(s.g.octokit(), { record: again, setupPr: pr2, via: 'direct', files: [], base: s.g.head('o/pipelines'), clock: clock(), now: () => new Date('2027-01-09T12:00:00Z'), local: { home: s.home, env: {} } });
+    expect((await readLocalRecord(app, { home: s.home, env: {} }))?.typed).not.toBe(true);
+    s.g.merge('o/r', SETUP_BRANCH, '2027-01-10T09:00:00Z');
+    const res = await finish(s.g.octokit(), app, {}, s.deps());
+    expect(varOf(s, 'PIPEGEN_BLOCK_FROM')?.value).toBe(BLOCK_FROM);
+    expect(res.applied.join('\n')).not.toMatch(/2027-01-17/);
+    expect((await recordOn(s)).blockFrom ?? (await recordOn(s, 'pipegen/update-r')).blockFrom).toBe(BLOCK_FROM);
+  });
+
+  it('finish: the org rule\'s pinned commit is recorded; verify: a repointed org rule, or a pinned commit off the central default branch, is drift (G11-R-sec1)', async () => {
+    const s = await seed({ org: true });
+    await finish(s.g.octokit(), app, {}, s.deps());
+    const holding = (orgBody(s).rules as B[])[0]?.parameters.workflows[0].sha as string;
+    const r = await recordOn(s);
+    expect(r.orgRuleset?.pinnedSha).toBe(holding);
+    expect((await vfy(s)).drift).toEqual([]);
+    // the record schema requires it (a record of an org rule without the commit it pins is refused)
+    const { pinnedSha: _p, ...bare } = r.orgRuleset as NonNullable<InstallRecord['orgRuleset']>;
+    expect(() => checkRecord({ ...r, orgRuleset: bare })).toThrow(/orgRuleset/);
+    // repointed to another commit
+    const wf = (orgBody(s).rules as B[])[0]?.parameters.workflows[0] as B;
+    wf.sha = 'f'.repeat(40);
+    const d = (await vfy(s)).drift;
+    expect(d.length).toBeGreaterThan(0);
+    expect(d.every((x) => x.what === ORG), JSON.stringify(d)).toBe(true);
+    expect(d.map((x) => x.expected).join('\n')).toContain(holding);
+    wf.sha = holding;
+    expect((await vfy(s)).drift).toEqual([]);
+    // a second workflow entry beside pipegen's, pinned elsewhere
+    const wfs = (orgBody(s).rules as B[])[0]?.parameters.workflows as B[];
+    wfs.push({ ...wf, sha: 'e'.repeat(40) });
+    expect((await vfy(s)).drift.some((x) => x.what === ORG && x.actual === 'e'.repeat(40))).toBe(true);
+    wfs.pop();
+    expect((await vfy(s)).drift).toEqual([]);
+    // the pinned commit is no longer on the central default branch's history
+    s.g.hooks.push((c) => (c.route === 'GET /repos/{owner}/{repo}/compare/{basehead}' && String(c.params.basehead).endsWith(`...${holding}`) ? { status: 200, data: { status: 'diverged', files: [] } } : undefined));
+    const e = (await vfy(s)).drift;
+    expect(e).toEqual([{ what: ORG, expected: `the pinned commit ${holding} on the central default branch`, actual: 'diverged' }]);
+  });
+
+  it('finish: a write GitHub refuses leaves no saved previous behind; a later run never records a setting the user turned on (G11-R2 a)', async () => {
+    const s = await seed();
+    let armed = true;
+    s.g.hooks.push((c) => (armed && (c.route === 'PUT /repos/{owner}/{repo}/vulnerability-alerts' || c.route === 'PUT /repos/{owner}/{repo}/environments/{environment_name}') ? { status: 422, data: { message: 'nope' } } : undefined));
+    s.g.repo('o/r').envs.set('production', { id: 77, created_at: '2026-01-01T00:00:00Z', wait_timer: 5, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: null, policies: [], stored: new Map() });
+    const r1 = await finish(s.g.octokit(), app, {}, s.deps());
+    expect(r1.skipped.map((x) => x.what)).toEqual(expect.arrayContaining(['Dependabot alerts', 'environment production']));
+    const pend = localFinishPendingPath(app, { home: s.home, env: {} });
+    const left = existsSync(pend) ? JSON.parse(readFileSync(pend, 'utf8')) as { repoSettings: object; environments: unknown[] } : { repoSettings: {}, environments: [] };
+    expect(left.repoSettings).toEqual({});
+    expect(left.environments).toEqual([]);
+    armed = false;
+    // the user turns Dependabot alerts on themselves, and sets production up their own way
+    s.g.x('o/r').vulnAlerts = true;
+    await finish(s.g.octokit(), app, {}, s.deps());
+    const r = await recordOn(s, 'pipegen/update-r').catch(() => recordOn(s));
+    expect(r.repoSettings?.vulnerabilityAlerts).toBeUndefined();
+  });
+
+  it('verify: a ruleset whose target changed is drift (G11-R2 b)', async () => {
+    const s = await seed();
+    await finish(s.g.octokit(), app, {}, s.deps());
+    bodyOf(s, 'o/r', 'pipegen').target = 'tag';
+    expect((await vfy(s)).drift).toEqual([{ what: 'ruleset pipegen', expected: 'pipegen\'s rules', actual: 'changed' }]);
+    bodyOf(s, 'o/r', 'pipegen').target = 'branch';
+    bodyOf(s, 'o/r', 'pipegen-reviews').target = 'push';
+    expect((await vfy(s)).drift).toEqual([{ what: 'ruleset pipegen-reviews', expected: 'pipegen\'s rules', actual: 'changed' }]);
+  });
+
+  it('verify: with classic protection and rulesets both in the record, both are checked (G11-R2 c)', async () => {
+    const s = await seed();
+    let refuse = true;
+    s.g.hooks.push((c) => (refuse && c.route === 'POST /repos/{owner}/{repo}/rulesets' && c.params.repo === 'r' ? { status: 403, data: { message: 'Upgrade to GitHub Pro or make this repository public to enable this feature.' } } : undefined));
+    await finish(s.g.octokit(), app, {}, s.deps());
+    refuse = false;
+    await finish(s.g.octokit(), app, {}, s.deps());
+    s.g.merge('o/pipelines', 'pipegen/update-r');
+    const r = await recordOn(s);
+    expect(r.classicProtection).toBeDefined();
+    expect(r.rulesets.map((x) => x.name).sort()).toEqual(['pipegen', 'pipegen-reviews']);
+    expect((await vfy(s)).drift).toEqual([]);
+    const gate = bodyOf(s, 'o/r', 'pipegen');
+    gate.bypass_actors = [{ actor_id: 5, actor_type: 'RepositoryRole', bypass_mode: 'always' }];
+    expect((await vfy(s)).drift).toEqual([{ what: 'ruleset pipegen', expected: 'no bypass actors', actual: '1 bypass actor' }]);
+    gate.bypass_actors = [];
+    // classic protection alone (rulesets refused, never recorded): no ruleset is reported missing
+    const t = await seed();
+    t.g.hooks.push((c) => (c.route === 'POST /repos/{owner}/{repo}/rulesets' && c.params.repo === 'r' ? { status: 403, data: { message: 'Upgrade to GitHub Pro or make this repository public to enable this feature.' } } : undefined));
+    await finish(t.g.octokit(), app, {}, t.deps());
+    expect((await vfy(t)).drift).toEqual([]);
+  });
+
+  it('finish: an earlier entry is adopted only when both created_at are known and equal; else its previous alone is kept (G11-R2 d)', async () => {
+    // the record lists a production pipegen made, date unknown; GitHub now holds the user's own production (another created_at)
+    const s = await seed({ recordOver: (rec) => { rec.environments.push({ name: 'production', created: true, unconfirmed: true, changed: [], branchPolicyIds: [] }); } });
+    s.g.repo('o/r').envs.set('production', { id: 88, created_at: '2026-10-01T00:00:00Z', wait_timer: 0, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: null, policies: [], stored: new Map() });
+    await finish(s.g.octokit(), app, {}, s.deps());
+    expect((await recordOn(s)).environments.find((e) => e.name === 'production')).toMatchObject({ created: false, githubCreatedAt: '2026-10-01T00:00:00Z', previous: { wait_timer: 0, reviewers: [] } });
+    // a variable recorded as made by pipegen, date unknown: GitHub's own (known date) is not taken for it
+    const t = await seed({ recordOver: (rec) => { rec.variables.push({ name: 'PIPEGEN_BLOCK_FROM', scope: 'repo', created: true, unconfirmed: true }); } });
+    t.g.x('o/r').variables.set('PIPEGEN_BLOCK_FROM', { value: '2099-01-01', created_at: '2026-10-01T00:00:00Z' });
+    await finish(t.g.octokit(), app, {}, t.deps());
+    expect((await recordOn(t)).variables.find((v) => v.name === 'PIPEGEN_BLOCK_FROM')).toEqual({ name: 'PIPEGEN_BLOCK_FROM', scope: 'repo', created: false, previous: '2099-01-01', githubCreatedAt: '2026-10-01T00:00:00Z' });
+  });
+
+  it('verify: a lock stricter than pipegen set it is reported as stricter, not as drift (G11-R2 e)', async () => {
+    const s = await seed();
+    await finish(s.g.octokit(), app, {}, s.deps());
+    const pr = (bodyOf(s, 'o/r', 'pipegen-reviews').rules as B[]).find((x) => x.type === 'pull_request') as B;
+    pr.parameters.required_approving_review_count += 1;
+    pr.parameters.required_review_thread_resolution = true;
+    const v1 = await vfy(s);
+    expect(v1.drift).toEqual([]);
+    expect(v1.notes.join('\n')).toMatch(/ruleset pipegen-reviews.*stricter/);
+    // stricter in one setting, looser in another: drift for the looser one
+    pr.parameters.dismiss_stale_reviews_on_push = false;
+    expect((await vfy(s)).drift.map((x) => x.what)).toEqual(['ruleset pipegen-reviews', 'ruleset pipegen-reviews']);
+    // classic protection with more approvals than planned
+    const t = await seed();
+    t.g.hooks.push((c) => (c.route === 'POST /repos/{owner}/{repo}/rulesets' && c.params.repo === 'r' ? { status: 403, data: { message: 'Upgrade to GitHub Pro or make this repository public to enable this feature.' } } : undefined));
+    await finish(t.g.octokit(), app, {}, t.deps());
+    (t.g.x('o/r').protection as B).required_pull_request_reviews.required_approving_review_count += 2;
+    const v2 = await vfy(t);
+    expect(v2.drift).toEqual([]);
+    expect(v2.notes.join('\n')).toMatch(/classic branch protection on main.*stricter/);
+  });
+
+  it('finish: a corrupt or unreadable pending file stops finish before any write (G11-R2 f)', async () => {
+    for (const bad of ['{ not json', JSON.stringify({ repoId: 1, extra: true })]) {
+      const s = await seed();
+      const pend = localFinishPendingPath(app, { home: s.home, env: {} });
+      mkdirSync(dirname(pend), { recursive: true, mode: 0o700 });
+      writeFileSync(pend, bad, { mode: 0o600 });
+      const from = s.g.calls.length;
+      await expect(finish(s.g.octokit(), app, {}, s.deps())).rejects.toThrow(/Nothing was applied/);
+      expect(writeRoutes(s, from)).toEqual([]);
+      expect(readFileSync(pend, 'utf8')).toBe(bad);
+    }
+    // a pending path that is not a regular file
+    const u = await seed();
+    const pend = localFinishPendingPath(app, { home: u.home, env: {} });
+    mkdirSync(pend, { recursive: true });
+    const from = u.g.calls.length;
+    await expect(finish(u.g.octokit(), app, {}, u.deps())).rejects.toThrow(FinishError);
+    expect(writeRoutes(u, from)).toEqual([]);
   });
 });
 

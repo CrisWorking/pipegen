@@ -9,6 +9,9 @@
 //     but couldn't record is checked by name), and each one's live contents match: enforcement active, no bypass actors, pipegen's rules
 //     (the required check `pipegen / gate` from the GitHub Actions app 15368; the review rules: dismiss stale reviews, approval after the
 //     last push, code-owner review, the approval count), classic branch protection too when it stands in;
+//   - fix round 2 (G11-R2, G11-R-sec1): each ruleset's target; classic protection AND the recorded rulesets when the record holds both; the org
+//     required workflow rule's every workflow entry pinned to record.orgRuleset.pinnedSha, that commit on the central default branch; a lock
+//     stricter than pipegen set it (more approvals, a review switch on that pipegen leaves off) is a note ("stricter"), not drift;
 //   - the pinned central commit (record.centralSha) on the central default branch's history.
 // It also warns (G29) about CODEOWNERS rules after pipegen's block that name only teams (the workflow's own token can't read a team's
 // members, so the gate can't check those approvals), and says (G26) that a key rotation resets the baseline.
@@ -98,19 +101,23 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
     if (actual !== r.cosignPubSha256) drift.push({ what: 'PIPEGEN_COSIGN_PUB (sha256)', expected: r.cosignPubSha256, actual });
   }
 
+  // a commit on the central default branch's history: compare says the branch is the commit or ahead of it (null: GitHub can't compare)
+  const centralRepo = await readRepo(gh, central, clock);
+  const statusOnDefault = async (sha: string): Promise<string | null> => {
+    if (centralRepo === null) return null;
+    try { return await compareStatus(gh, central, centralRepo.defaultBranch, sha, clock); } catch (e) {
+      if (statusOf(e) !== 404 && statusOf(e) !== 422) throw e;
+      return null;
+    }
+  };
+
   // the locks (I3): each planned one in force once finish ran, and its live contents as pipegen set them
-  await locks(api, app, central, r, drift, notes);
+  await locks(api, app, central, r, drift, notes, statusOnDefault);
 
   // the pinned central commit: on the central default branch's history
   if (r.centralSha !== null) {
-    const repo = await readRepo(gh, central, clock);
-    let status: string | null = null;
-    if (repo !== null) {
-      try { status = await compareStatus(gh, central, repo.defaultBranch, r.centralSha, clock); } catch (e) {
-        if (statusOf(e) !== 404 && statusOf(e) !== 422) throw e;
-      }
-    }
-    if (status !== 'identical' && status !== 'behind') drift.push({ what: 'pinned central commit', expected: `${r.centralSha} on the central default branch`, actual: status });
+    const status = await statusOnDefault(r.centralSha);
+    if (!onDefaultBranch(status)) drift.push({ what: 'pinned central commit', expected: `${r.centralSha} on the central default branch`, actual: status });
   }
 
   // G29: team-only CODEOWNERS rules that override pipegen's block
@@ -130,6 +137,9 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
 
 type Obj = Record<string, unknown>;
 type Lock = 'gate' | 'reviews' | 'central' | 'org';
+const onDefaultBranch = (status: string | null): boolean => status === 'identical' || status === 'behind';
+/** A sha GitHub's compare may be asked about (40 hex), as the org rule names it. */
+const SHA_RE = /^[0-9a-f]{40}$/;
 const REPO_ONE = 'GET /repos/{owner}/{repo}/rulesets/{ruleset_id}';
 const ORG_ONE = 'GET /orgs/{org}/rulesets/{ruleset_id}';
 
@@ -148,21 +158,78 @@ function reviewDrift(want: Obj | undefined, got: Obj | undefined): string[] {
 }
 const ruleOf = (rules: unknown, type: string): Obj | undefined => (Array.isArray(rules) ? rules.filter(isObj).find((x) => x.type === type) : undefined);
 
+/** G11-R2 e: the review settings a lock may hold stricter than pipegen sets them (a higher count; a switch on that pipegen leaves off). */
+const STRICTER_WORDS: Readonly<Record<string, string>> = {
+  required_approving_review_count: 'approving reviews', dismiss_stale_reviews_on_push: 'dismiss stale reviews', dismiss_stale_reviews: 'dismiss stale reviews',
+  require_code_owner_review: 'code-owner review', require_code_owner_reviews: 'code-owner review', require_last_push_approval: 'approval after the last push',
+  required_review_thread_resolution: 'resolved review threads', strict: 'branches up to date before merging',
+};
+/**
+ * G11-R2 e: `got` with each setting that is stricter than `want` set back to want's value (so the rest is still compared exactly), and the
+ * words for what is stricter. Only the listed counts (higher) and switches (on where pipegen leaves them off) count as stricter.
+ */
+function relaxStricter(want: Obj, got: Obj, counts: readonly string[], flags: readonly string[]): { got: Obj; stricter: string[] } {
+  const g = { ...got };
+  const stricter: string[] = [];
+  for (const k of counts) {
+    const w = want[k];
+    const v = g[k];
+    if (typeof w === 'number' && typeof v === 'number' && v > w) { stricter.push(`${v} ${STRICTER_WORDS[k] ?? k} (pipegen sets ${w})`); g[k] = w; }
+  }
+  for (const k of flags) if (want[k] === false && g[k] === true) { stricter.push(`${STRICTER_WORDS[k] ?? k} required (pipegen leaves it off)`); g[k] = false; }
+  return { got: g, stricter };
+}
+const RULESET_COUNTS = ['required_approving_review_count'] as const;
+const RULESET_FLAGS = ['dismiss_stale_reviews_on_push', 'require_code_owner_review', 'require_last_push_approval', 'required_review_thread_resolution'] as const;
+const CLASSIC_COUNTS = ['required_approving_review_count'] as const;
+const CLASSIC_FLAGS = ['dismiss_stale_reviews', 'require_code_owner_reviews', 'require_last_push_approval'] as const;
+/** The org rule's workflow entries, as GitHub lists them (every `workflows` parameter of every rule). */
+function workflowEntries(rules: unknown): Obj[] {
+  const out: Obj[] = [];
+  for (const rule of Array.isArray(rules) ? rules.filter(isObj) : []) {
+    const wfs = isObj(rule.parameters) && Array.isArray(rule.parameters.workflows) ? rule.parameters.workflows : [];
+    for (const wf of wfs) out.push(isObj(wf) ? wf : {});
+  }
+  return out;
+}
+
+interface LockDiff { drift: VerifyDrift[]; stricter: string[] }
 /**
  * What differs between a live ruleset and the one pipegen planned (the same rules finish's read-back checks), each as drift: enforcement
- * active, no bypass actors, the planned rules held (lists of the same length) and conditions, then the fixed rules whatever the record plans:
- * the gate's one required check from the GitHub Actions app, and the review settings never weaker.
+ * active, no bypass actors, the planned target, rules (lists of the same length) and conditions, then the fixed rules whatever the record
+ * plans: the gate's one required check from the GitHub Actions app, and the review settings never weaker. A review setting stricter than
+ * planned is not drift: it comes back in `stricter` (G11-R2 e). The org rule (G11-R-sec1): its planned workflow entries are held to
+ * `pinnedSha` (the commit finish pinned and recorded), and every live entry must name it; with no recorded pin (a same-name rule found by
+ * name) the sha is left out of the comparison and each live entry's commit is checked on the central default branch by the caller.
  */
-function rulesetDrift(what: string, kind: Lock, want: Obj | undefined, got: Obj | null): VerifyDrift[] {
-  if (got === null) return [{ what, expected: 'there, as pipegen set it', actual: null }];
+function rulesetDrift(what: string, kind: Lock, want: Obj | undefined, got: Obj | null, pinnedSha?: string): LockDiff {
+  if (got === null) return { drift: [{ what, expected: 'there, as pipegen set it', actual: null }], stricter: [] };
   const out: VerifyDrift[] = [];
+  const stricter: string[] = [];
   const state = typeof got.enforcement === 'string' ? got.enforcement : null;
   if (state !== 'active') out.push({ what, expected: 'enforcement active', actual: state === null ? null : show(state, 40) });
   const by = got.bypass_actors;
   if (!Array.isArray(by) || by.length > 0) out.push({ what, expected: 'no bypass actors', actual: Array.isArray(by) ? `${by.length} bypass actor${by.length === 1 ? '' : 's'}` : 'not shown' });
-  // the org rule is pinned to the central head finish found then, not the planned sha
-  const w = want === undefined ? undefined : kind === 'org' ? stripSha(want) : want;
-  if (w !== undefined && (!holdsWanted(w.rules, got.rules) || !holdsWanted(w.conditions, got.conditions))) out.push({ what, expected: 'pipegen\'s rules', actual: 'changed' });
+  const w = want === undefined ? undefined : kind === 'org' ? pinTo(want, pinnedSha) : want;
+  // G11-R2 e: the live pull_request rule with its stricter settings set back to pipegen's, so only a looser or other change is drift
+  let gotRules = got.rules;
+  const wantPr = ruleOf(w?.rules, 'pull_request');
+  if (isObj(wantPr?.parameters) && Array.isArray(got.rules)) {
+    const wp = wantPr.parameters;
+    gotRules = got.rules.map((rule) => {
+      if (!isObj(rule) || rule.type !== 'pull_request' || !isObj(rule.parameters)) return rule;
+      const x = relaxStricter(wp, rule.parameters, RULESET_COUNTS, RULESET_FLAGS);
+      stricter.push(...x.stricter);
+      return { ...rule, parameters: x.got };
+    });
+  }
+  if (w !== undefined && (!holdsWanted(w.target, got.target) || !holdsWanted(w.rules, gotRules) || !holdsWanted(w.conditions, got.conditions))) out.push({ what, expected: 'pipegen\'s rules', actual: 'changed' });
+  if (kind === 'org' && pinnedSha !== undefined) {
+    // G11-R-sec1: every workflow the rule runs is pinned to the commit finish recorded (a repointed or added entry is drift)
+    const entries = workflowEntries(got.rules);
+    if (entries.length === 0) out.push({ what, expected: `the required workflow pinned to ${pinnedSha}`, actual: null });
+    for (const e of entries) if (e.sha !== pinnedSha) out.push({ what, expected: `every required workflow pinned to ${pinnedSha}`, actual: typeof e.sha === 'string' ? show(e.sha, 64) : null });
+  }
   if (kind === 'gate') {
     const checks = ruleOf(got.rules, 'required_status_checks')?.parameters;
     const list = isObj(checks) && Array.isArray(checks.required_status_checks) ? checks.required_status_checks : [];
@@ -173,19 +240,31 @@ function rulesetDrift(what: string, kind: Lock, want: Obj | undefined, got: Obj 
     const weaker = reviewDrift(ruleOf(w?.rules, 'pull_request'), ruleOf(got.rules, 'pull_request'));
     if (weaker.length > 0) out.push({ what, expected: `the review rules: ${weaker.join(', ')}`, actual: 'weaker or missing' });
   }
-  return out;
+  return { drift: out, stricter };
 }
-function stripSha(want: Obj): Obj {
+/**
+ * The planned org rule with each workflow entry's sha set to the commit finish pinned (G11-R-sec1); with no recorded pin, the sha left out
+ * (the caller checks each live entry's commit on the central default branch instead).
+ */
+function pinTo(want: Obj, pinnedSha: string | undefined): Obj {
   const c = structuredClone(want);
   for (const rule of Array.isArray(c.rules) ? c.rules.filter(isObj) : []) {
     const wfs = isObj(rule.parameters) && Array.isArray(rule.parameters.workflows) ? rule.parameters.workflows : [];
-    for (const wf of wfs) if (isObj(wf)) delete wf.sha;
+    for (const wf of wfs) {
+      if (!isObj(wf)) continue;
+      if (pinnedSha === undefined) delete wf.sha;
+      else wf.sha = pinnedSha;
+    }
   }
   return c;
 }
 
-/** I3: every lock the record plans, in force once finish ran, with its live contents as planned (see rulesetDrift). */
-async function locks(api: SettingsApi, app: RepoRef, central: RepoRef, r: InstallRecord, drift: VerifyDrift[], notes: string[]): Promise<void> {
+/**
+ * I3: every lock the record plans, in force once finish ran, with its live contents as planned (see rulesetDrift). Fix round 2: classic
+ * protection and the recorded rulesets are both checked when the record holds both (G11-R2 c); the org rule's pinned commit must be on the
+ * central default branch (G11-R-sec1); stricter settings are notes.
+ */
+async function locks(api: SettingsApi, app: RepoRef, central: RepoRef, r: InstallRecord, drift: VerifyDrift[], notes: string[], statusOnDefault: (sha: string) => Promise<string | null>): Promise<void> {
   const P = r.planned;
   const finished = r.mergedAt !== undefined;
   const get = async (route: string, params: Obj): Promise<Obj | null> => { const d = await api.readOr404(route, params); return isObj(d) ? d : null; };
@@ -196,38 +275,75 @@ async function locks(api: SettingsApi, app: RepoRef, central: RepoRef, r: Instal
   };
   const appP = { owner: app.owner, repo: app.repo };
   const centralP = { owner: central.owner, repo: central.repo };
+  const stricterNote = (what: string, stricter: readonly string[]): void => {
+    if (stricter.length > 0) notes.push(`The ${what.replace(/^the /, '')} is stricter than pipegen set it (${stricter.join('; ')}); that is not drift.`);
+  };
+  /** One live lock compared: its drift recorded, its stricter settings noted; the org rule's commits checked on the central default branch. */
+  const check = async (what: string, kind: Lock, want: Obj | undefined, got: Obj | null, pinnedSha?: string): Promise<VerifyDrift[]> => {
+    const d = rulesetDrift(what, kind, want, got, pinnedSha);
+    if (kind === 'org' && got !== null) {
+      // G11-R-sec1: the recorded pin (else each commit the live rule names) must be on the central default branch
+      const shas = pinnedSha !== undefined ? [pinnedSha] : [...new Set(workflowEntries(got.rules).map((e) => e.sha).filter((x): x is string => typeof x === 'string'))].slice(0, 10);
+      for (const sha of shas) {
+        const status = SHA_RE.test(sha) ? await statusOnDefault(sha) : null;
+        if (!onDefaultBranch(status)) d.drift.push({ what, expected: `the pinned commit ${show(sha, 64)} on the central default branch`, actual: status });
+      }
+    }
+    drift.push(...d.drift);
+    stricterNote(what, d.stricter);
+    return d.drift;
+  };
   /** A planned ruleset the record doesn't list: the same-name one (finish updated it but couldn't record it, ruling 8), or drift. */
   const unrecorded = async (what: string, kind: Lock, want: Obj | undefined, list: string, one: string, params: Obj, name: string): Promise<void> => {
     const id = await byName(list, kind === 'org' ? params : { ...params, includes_parents: false }, name);
     if (id === null) { drift.push({ what, expected: 'applied by finish', actual: null }); return; }
-    const d = rulesetDrift(what, kind, want, await get(one, { ...params, ruleset_id: id }));
-    drift.push(...d);
+    const d = await check(what, kind, want, await get(one, { ...params, ruleset_id: id }));
     if (d.length === 0) notes.push(`The ${what.replace(/^the /, '')} (id ${id}) holds pipegen's rules but is not in the install record (it was there before pipegen; uninstall leaves it).`);
   };
 
-  // the app's rulesets (or classic branch protection standing in for them)
+  // classic branch protection (standing in for the rulesets GitHub refused)
   if (r.classicProtection !== undefined) {
     const what = `classic branch protection on ${show(r.classicProtection.branch, 100)}`;
     const got = await api.readOr404('GET /repos/{owner}/{repo}/branches/{branch}/protection', { ...appP, branch: r.classicProtection.branch });
     if (got === null) drift.push({ what, expected: 'pipegen\'s rules', actual: null });
-    else if (P.classic !== undefined && !holdsWanted(P.classic.body, classicPutForm(got))) drift.push({ what, expected: 'pipegen\'s rules', actual: 'changed' });
-  } else if (P.rulesets !== undefined || r.rulesets.length > 0) {
+    else if (P.classic !== undefined) {
+      const want = P.classic.body;
+      const form = classicPutForm(got);
+      const stricter: string[] = [];
+      // G11-R2 e: stricter review settings, and branches required up to date, set back to pipegen's before the exact comparison
+      if (isObj(want.required_pull_request_reviews) && isObj(form.required_pull_request_reviews)) {
+        const x = relaxStricter(want.required_pull_request_reviews, form.required_pull_request_reviews, CLASSIC_COUNTS, CLASSIC_FLAGS);
+        form.required_pull_request_reviews = x.got;
+        stricter.push(...x.stricter);
+      }
+      if (isObj(want.required_status_checks) && isObj(form.required_status_checks)) {
+        const x = relaxStricter(want.required_status_checks, form.required_status_checks, [], ['strict']);
+        form.required_status_checks = x.got;
+        stricter.push(...x.stricter);
+      }
+      if (!holdsWanted(want, form)) drift.push({ what, expected: 'pipegen\'s rules', actual: 'changed' });
+      stricterNote(what, stricter);
+    }
+  }
+  // the app's rulesets: every recorded one compared, with or without classic protection (G11-R2 c); a planned one the record lacks is
+  // looked up by name only when classic protection doesn't stand in for it
+  if (P.rulesets !== undefined || r.rulesets.length > 0) {
     const planned: ['gate' | 'reviews', string, Obj | undefined][] = [['gate', GATE_RULESET, P.rulesets?.gate.body], ['reviews', REVIEWS_RULESET, P.rulesets?.reviews?.body]];
     for (const [kind, name, want] of planned) {
       const what = `ruleset ${name}`;
       const rec = r.rulesets.find((x) => x.kind === kind);
-      if (rec !== undefined) drift.push(...rulesetDrift(what, kind, want, await get(REPO_ONE, { ...appP, ruleset_id: rec.id })));
-      else if (finished && want !== undefined) await unrecorded(what, kind, want, 'GET /repos/{owner}/{repo}/rulesets', REPO_ONE, appP, name);
+      if (rec !== undefined) await check(what, kind, want, await get(REPO_ONE, { ...appP, ruleset_id: rec.id }));
+      else if (finished && want !== undefined && r.classicProtection === undefined) await unrecorded(what, kind, want, 'GET /repos/{owner}/{repo}/rulesets', REPO_ONE, appP, name);
     }
   }
   // the central merge rule: recorded either way once finish made or reused it
   const cWhat = `the central merge rule (ruleset ${CENTRAL_RULESET} on ${central.owner}/${central.repo})`;
-  if (r.central?.rulesetId !== undefined) drift.push(...rulesetDrift(cWhat, 'central', P.centralRuleset?.body, await get(REPO_ONE, { ...centralP, ruleset_id: r.central.rulesetId })));
+  if (r.central?.rulesetId !== undefined) await check(cWhat, 'central', P.centralRuleset?.body, await get(REPO_ONE, { ...centralP, ruleset_id: r.central.rulesetId }));
   else if (finished && P.centralRuleset !== undefined) drift.push({ what: cWhat, expected: 'applied by finish', actual: null });
-  // the org required workflow rule
+  // the org required workflow rule, held to the commit finish pinned (G11-R-sec1)
   const oName = typeof P.orgRequiredWorkflow?.rule.body.name === 'string' ? P.orgRequiredWorkflow.rule.body.name : r.orgRuleset?.name ?? '';
   const oWhat = `the org required workflow rule (${show(r.orgRuleset?.name ?? oName, 100)})`;
-  if (r.orgRuleset !== undefined) drift.push(...rulesetDrift(oWhat, 'org', P.orgRequiredWorkflow?.rule.body, await get(ORG_ONE, { org: r.orgRuleset.org, ruleset_id: r.orgRuleset.id })));
+  if (r.orgRuleset !== undefined) await check(oWhat, 'org', P.orgRequiredWorkflow?.rule.body, await get(ORG_ONE, { org: r.orgRuleset.org, ruleset_id: r.orgRuleset.id }), r.orgRuleset.pinnedSha);
   else if (finished && P.orgRequiredWorkflow !== undefined) await unrecorded(oWhat, 'org', P.orgRequiredWorkflow.rule.body, 'GET /orgs/{org}/rulesets', ORG_ONE, { org: app.owner }, oName);
 }
 
