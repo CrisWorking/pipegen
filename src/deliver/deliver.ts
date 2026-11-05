@@ -46,9 +46,9 @@ import type { CreatedFile, EnvSettings, InstallEdit, InstallPlanned, InstallReco
 import { packageVersion } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
 import {
-  commitFiles, compareStatus, DeliverError, ghRead, ghWrite, openOrUpdatePr, readHead, readRepo, readTree, setBranch, statusOf, type RepoRef, type TreeEntry,
+  commitFiles, compareStatus, DeliverError, findOpenPr, ghRead, ghWrite, openOrUpdatePr, readHead, readRepo, readTree, setBranch, statusOf, type RepoRef, type TreeEntry,
 } from './git-data.js';
-import { centralUpdateBranch, readRecord, RecordError, writeRecord, type LocalRecordDeps } from './record.js';
+import { centralUpdateBranch, readLocalRecord, readRecord, recordMarkerOf, RecordError, writeRecord, type LocalRecordDeps } from './record.js';
 
 export { DeliverError };
 
@@ -368,7 +368,7 @@ const defaultOnly = (e: EnvRead, branch: string): boolean => e.settings.deployme
  * environment that reads back default-branch only is returned. `known`: its entry in an earlier record (kept when GitHub's created_at
  * still matches: `previous` is captured once, never pipegen's own settings).
  */
-export async function ensureSigningEnvironment(gh: Octokit, app: RepoRef, defaultBranch: string, known: EnvEntry | undefined, clock: RateClock = clockOf(gh)): Promise<EnvEntry> {
+export async function ensureSigningEnvironment(gh: Octokit, app: RepoRef, defaultBranch: string, known: EnvEntry | undefined, clock: RateClock = clockOf(gh), notes: string[] = []): Promise<EnvEntry> {
   const params = { environment_name: SIGNING_ENVIRONMENT };
   const cur = await readEnv(gh, app, clock);
   const ids: number[] = [];
@@ -385,14 +385,24 @@ export async function ensureSigningEnvironment(gh: Octokit, app: RepoRef, defaul
     if (others.length > 0) throw new DeliverError(`The environment ${SIGNING_ENVIRONMENT} already allows other branches or tags (${others.map((x) => show(x.name, 60)).join(', ')}); pipegen keeps its signing key only where the default branch alone can use it. Remove those rules, then run pipegen again.`);
     const dbp = cur.settings.deployment_branch_policy;
     if (!(dbp?.protected_branches === false && dbp.custom_branch_policies === true)) {
-      const { wait_timer, prevent_self_review, reviewers } = cur.settings;
-      await ghWrite(gh, 'PUT /repos/{owner}/{repo}/environments/{environment_name}', app, { ...params, wait_timer, prevent_self_review, reviewers, deployment_branch_policy: { protected_branches: false, custom_branch_policies: true } }, clock);
+      // G10-R-sec 2: GitHub resets every setting a PUT leaves out, so all of them are sent back as read (can_admins_bypass included)
+      const { wait_timer, prevent_self_review, reviewers, can_admins_bypass } = cur.settings;
+      await ghWrite(gh, 'PUT /repos/{owner}/{repo}/environments/{environment_name}', app, { ...params, wait_timer, prevent_self_review, reviewers, can_admins_bypass, deployment_branch_policy: { protected_branches: false, custom_branch_policies: true } }, clock);
       changed.push('deployment_branch_policy');
     }
     if (!cur.policies.some((x) => x.name === defaultBranch && x.type === 'branch')) { await addPolicy(); changed.push('branch_policies'); }
   }
   const back = await readEnv(gh, app, clock);
   if (back === null || !defaultOnly(back, defaultBranch)) throw new DeliverError(`The environment ${SIGNING_ENVIRONMENT} doesn't read back as usable from the default branch only, so pipegen stores no signing key there.`);
+  // G10-R-sec 2: every setting but the branch rule must read back as it was; a change is reported and recorded (uninstall restores `previous`)
+  if (cur !== null) {
+    for (const k of ['wait_timer', 'prevent_self_review', 'reviewers', 'can_admins_bypass'] as const) {
+      if (JSON.stringify(back.settings[k]) !== JSON.stringify(cur.settings[k])) {
+        notes.push(`GitHub changed the setting ${k} of the environment ${SIGNING_ENVIRONMENT} when pipegen narrowed it to the default branch; check it in the repository settings (uninstall puts the old value back).`);
+        changed.push(k);
+      }
+    }
+  }
   const policyIds = ids.length > 0 ? ids : cur === null ? back.policies.map((x) => x.id).filter((x) => x > 0) : [];
   const own = known !== undefined && known.githubCreatedAt !== undefined && known.githubCreatedAt === back.createdAt;
   if (own) return { ...known, changed: [...new Set([...known.changed, ...changed])], branchPolicyIds: [...new Set([...known.branchPolicyIds, ...policyIds])] };
@@ -562,6 +572,34 @@ export interface DeliverDeps {
 export interface DeliverResult {
   prUrl: string; prNumber: number; centralSha: string | null; recordHash: string; centralPrUrl?: string;
   done: string[]; skipped: { what: string; why: string }[];
+  /** Plain lines for the user (a setting GitHub changed, an earlier record pipegen didn't trust). */
+  notes: string[];
+}
+
+/**
+ * The earlier install record pipegen builds on (G10-R-sec 1). The one on the central default branch is trusted (its rules guard it once
+ * `finish` ran; it is what pipegen itself merged or committed). A record found only on the central pull request branch, which anyone with
+ * write on the central repo can push to, is used only when its hash equals the local record file's or the setup PR body's marker;
+ * otherwise pipegen claims nothing from it (null) and says so.
+ */
+async function trustedPrevious(gh: Octokit, app: RepoRef, central: RepoRef, centralBranch: string, updateBranch: string | null, local: LocalRecordDeps, clock: RateClock, notes: string[]): Promise<InstallRecord | null> {
+  const onDefault = await readRecord(gh, central, app.repo, { branch: centralBranch, clock });
+  if (onDefault !== null) return onDefault.record;
+  if (updateBranch === null) return null;
+  const onBranch = await readRecord(gh, central, app.repo, { branch: updateBranch, clock });
+  if (onBranch === null) return null;
+  const known = new Set<string>();
+  const file = await readLocalRecord(app, local).catch((e: unknown) => { if (e instanceof RecordError) return null; throw e; });
+  if (file !== null) known.add(file.recordHash);
+  const pr = await findOpenPr(gh, app, SETUP_BRANCH, clock);
+  if (pr !== null) {
+    const d = await ghRead(gh, 'GET /repos/{owner}/{repo}/pulls/{pull_number}', app, { pull_number: pr.number }, clock);
+    const marker = recordMarkerOf(isObj(d) && typeof d.body === 'string' ? d.body : null);
+    if (marker !== null) known.add(marker);
+  }
+  if (known.has(onBranch.hash)) return onBranch.record;
+  notes.push(`The install record on the central pull request branch ${show(updateBranch, 100)} doesn't match the hash pipegen saved (the local record file or the setup pull request), so pipegen claims nothing from it: it writes a new record, and treats every existing file and secret as not its own.`);
+  return null;
 }
 
 /** Base-tree checks of the app files (step 2): what changes, and the mode each file keeps. Throws before anything is written. */
@@ -626,6 +664,7 @@ export async function deliver(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vaul
     const app: RepoRef = { owner: p.owner, repo: p.repo };
     const done: string[] = [];
     const skipped: { what: string; why: string }[] = [];
+    const notes: string[] = [];
 
     // the changes that run code: their own yes, asked before anything else
     let all = [...d.appCommits.flatMap((c) => c.files), ...d.centralFiles];
@@ -650,8 +689,7 @@ export async function deliver(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vaul
     const { ref: central, defaultBranch: centralBranch } = await centralRepoOf(gh, p, clock);
     const updateBranch = centralUpdateBranch(p.repo);
     const updateExists = await readHead(gh, central, updateBranch, clock) !== null;
-    const prevRead = await readRecord(gh, central, p.repo, { branch: centralBranch, clock }) ?? (updateExists ? await readRecord(gh, central, p.repo, { branch: updateBranch, clock }) : null);
-    const prev = prevRead?.record ?? null;
+    const prev = await trustedPrevious(gh, app, central, centralBranch, updateExists ? updateBranch : null, deps.local ?? {}, clock, notes);
     if (prev !== null && (prev.app.repoId !== appRepo.id || prev.app.owner.toLowerCase() !== p.owner.toLowerCase() || prev.app.repo.toLowerCase() !== p.repo.toLowerCase())) {
       throw new DeliverError(`The install record at ${show(`installs/${centralProjectName(p.repo)}.json`)} is not this repository's (another repo id or name), so pipegen won't build on it. Move it away, then run pipegen again.`);
     }
@@ -680,7 +718,7 @@ export async function deliver(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vaul
       if (deps.signingKey === undefined || typeof want !== 'string') throw new DeliverError('key-env signing needs the key pair pipegen made before the setup pull request, and its public key hash.');
       const key = await deps.signingKey();
       if (pubKeySha256(key.pub) !== want) throw new DeliverError('The signing key is not the one whose public key the verify workflow checks, so pipegen stores no key.');
-      env = await ensureSigningEnvironment(gh, app, appRepo.defaultBranch, prev?.environments.find((e) => e.name === SIGNING_ENVIRONMENT), clock);
+      env = await ensureSigningEnvironment(gh, app, appRepo.defaultBranch, prev?.environments.find((e) => e.name === SIGNING_ENVIRONMENT), clock, notes);
       done.push(`environment ${SIGNING_ENVIRONMENT} (default branch only)`);
       const scope = `env:${SIGNING_ENVIRONMENT}` as const;
       const values: Record<(typeof SIGNING_SECRETS)[number], string> = { PIPEGEN_COSIGN_KEY: key.key, PIPEGEN_COSIGN_PASSWORD: key.password };
@@ -716,7 +754,7 @@ export async function deliver(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vaul
     const via = prev !== null || updateExists || await centralHasRules(gh, central, centralBranch, clock) ? 'pr' : 'direct';
     const w = await writeRecord(gh, { record, setupPr: pr.number, via, files: follow.filter((f) => followChanged.has(f)).map((f) => ({ path: f.path, content: f.content })), clock, now: () => now, ...(deps.local === undefined ? {} : { local: deps.local }) });
     done.push(w.via === 'direct' ? `install record committed to ${p.owner}/${CENTRAL_REPO}` : `install record in the central pull request ${w.centralPr?.url ?? ''}`);
-    return { prUrl: pr.url, prNumber: pr.number, centralSha, recordHash: w.recordHash, ...(w.centralPr === undefined ? {} : { centralPrUrl: w.centralPr.url }), done, skipped };
+    return { prUrl: pr.url, prNumber: pr.number, centralSha, recordHash: w.recordHash, ...(w.centralPr === undefined ? {} : { centralPrUrl: w.centralPr.url }), done, skipped, notes };
   } finally {
     vault.wipe();
   }

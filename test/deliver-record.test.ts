@@ -64,6 +64,7 @@ describe('install record schema (S13, Plan V §5)', () => {
     const many = Array.from({ length: 6000 }, (_, i) => ({ repo: 'app' as const, path: `f${i}`, part: 'pipeline' as const, shas: [SHA('a')] }));
     expect(() => parseRecord(JSON.stringify(sampleRecord({ files: many })))).toThrow(RecordError);
     expect(() => parseRecord('{not json')).toThrow(RecordError);
+    for (const schema of [1, 3]) expect(InstallRecordSchema.safeParse({ ...sampleRecord(), schema }).success).toBe(false);
     expect(InstallRecordSchema.safeParse({ ...sampleRecord(), edits: [{ repo: 'app', path: 'x', kind: 'verify-job', inserted: 'x', originalSha: null, writtenShas: [] }] }).success).toBe(false);
   });
 

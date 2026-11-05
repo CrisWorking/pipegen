@@ -14,7 +14,7 @@ import { newRateBudget } from '../src/engine/github-rate.js';
 import { pubKeySha256 } from '../src/engine/signing.js';
 import type { Prompter } from '../src/cli/io.js';
 import { deliver, deliverCentral, PART_ORDER, planDelivery, previewText, SETUP_BRANCH, type DeliveryInput, type DeliverDeps, type SigningKey } from '../src/deliver/deliver.js';
-import { DeliverError } from '../src/deliver/git-data.js';
+import { DeliverError, ghRead, ghWrite } from '../src/deliver/git-data.js';
 import { readRecord, recordHash, recordMarker, recordPath, writeRecord } from '../src/deliver/record.js';
 import { COMPAT_PREFIX, HARNESS_PATH } from '../src/proof/harness.js';
 import type { LockPlan } from '../src/layers/locks.js';
@@ -248,6 +248,16 @@ describe('G10 delivery: what goes out', () => {
       'PUT /repos/{owner}/{repo}/actions/secrets/{secret_name}', 'PUT /repos/{owner}/{repo}/environments/{environment_name}',
       'POST /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies', 'PUT /repos/{owner}/{repo}/environments/{environment_name}/secrets/{secret_name}',
     ]));
+  });
+
+  it('deliver: a write outside the fixed list is refused before it is sent', async () => {
+    const g = new FakeGitHub();
+    g.addRepo('o/r');
+    for (const route of ['PUT /repos/{owner}/{repo}/contents/{path}', 'POST /repos/{owner}/{repo}/rulesets', 'POST /repos/{owner}/{repo}/actions/variables', 'DELETE /repos/{owner}/{repo}/git/refs/{ref}']) {
+      await expect(ghWrite(g.octokit(), route, { owner: 'o', repo: 'r' }, {})).rejects.toThrow(/not a write the delivery makes/);
+    }
+    await expect(ghRead(g.octokit(), 'GET /repos/{owner}/{repo}/contents/{path}', { owner: 'o', repo: 'r' }, { path: 'x' })).rejects.toThrow(/not a read/);
+    expect(g.calls).toEqual([]);
   });
 
   it('deliver: an edited file must still be the original it was made from; a symbolic link is never written through (G1 carry, G28)', async () => {
@@ -549,6 +559,84 @@ describe('G10 delivery: secrets and settings before the merge', () => {
     const w3 = world();
     await expect(firstRun(w3, {}, { signingKey: async () => ({ ...SIGNING, pub: 'another key' }) }, {}, { signing: { mode: 'key-env', images: [], cosignPubSha256: pubKeySha256(SIGNING.pub) } })).rejects.toThrow(/public key/);
     expect(w3.g.calls.some((c) => c.route.includes('/secrets/{secret_name}') && c.route.startsWith('PUT') && String(nameOf(c)).startsWith('PIPEGEN_COSIGN'))).toBe(false);
+  });
+
+  it('deliver: an existing pipegen-signing keeps every setting but its branch rule; one that allows other branches is a stop (G10-R-sec 2)', async () => {
+    const signing = { signing: { mode: 'key-env' as const, images: [], cosignPubSha256: pubKeySha256(SIGNING.pub) } };
+    const w = world();
+    w.g.repo('o/r').envs.set('pipegen-signing', { id: 5, created_at: '2026-01-01T00:00:00Z', wait_timer: 0, prevent_self_review: true, reviewers: [{ type: 'User', id: 9 }], can_admins_bypass: false, deployment_branch_policy: null, policies: [], stored: new Map() });
+    const { res } = await firstRun(w, {}, { signingKey: async () => SIGNING }, {}, signing);
+    const env = w.g.repo('o/r').envs.get('pipegen-signing');
+    expect(env?.can_admins_bypass).toBe(false);
+    expect(env?.reviewers).toEqual([{ type: 'User', id: 9 }]);
+    expect(env?.prevent_self_review).toBe(true);
+    const put = w.g.calls.find((c) => c.route === 'PUT /repos/{owner}/{repo}/environments/{environment_name}');
+    expect(put?.params.can_admins_bypass).toBe(false);
+    const e = (await record(w))?.environments[0];
+    expect(e).toMatchObject({ name: 'pipegen-signing', created: false, githubCreatedAt: '2026-01-01T00:00:00Z', changed: ['deployment_branch_policy', 'branch_policies'] });
+    expect(e?.previous).toEqual({ wait_timer: 0, prevent_self_review: true, reviewers: [{ type: 'User', id: 9 }], can_admins_bypass: false, deployment_branch_policy: null, branch_policies: [] });
+    expect(res.notes).toEqual([]);
+    // GitHub changes another setting anyway: reported, and recorded as changed (so uninstall restores it)
+    const w2 = world();
+    w2.g.repo('o/r').envs.set('pipegen-signing', { id: 5, created_at: '2026-01-01T00:00:00Z', wait_timer: 0, prevent_self_review: false, reviewers: [], can_admins_bypass: false, deployment_branch_policy: null, policies: [], stored: new Map() });
+    w2.g.hooks.push((c) => { if (c.route === 'PUT /repos/{owner}/{repo}/environments/{environment_name}') c.params.can_admins_bypass = true; return undefined; });
+    const r2 = await firstRun(w2, {}, { signingKey: async () => SIGNING }, {}, signing);
+    expect(r2.res.notes.join('\n')).toMatch(/can_admins_bypass/);
+    expect((await record(w2))?.environments[0]?.changed).toContain('can_admins_bypass');
+    // other branch or tag rules: a stop before any write
+    const w3 = world();
+    w3.g.repo('o/r').envs.set('pipegen-signing', { id: 5, created_at: '2026-01-01T00:00:00Z', wait_timer: 0, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: { protected_branches: false, custom_branch_policies: true }, policies: [{ id: 1, name: 'main', type: 'branch' }, { id: 2, name: 'release/*', type: 'branch' }], stored: new Map() });
+    await expect(firstRun(w3, {}, { signingKey: async () => SIGNING }, {}, signing)).rejects.toThrow(/other branches or tags/);
+    expect(w3.g.calls.some((c) => c.params.repo === 'r' && !c.route.startsWith('GET '))).toBe(false);
+  });
+
+  it('deliver: a record found only on the central PR branch is trusted only when its hash matches the local record file or the PR marker (G10-R-sec 1)', async () => {
+    const upd = `pipegen/update-${centralProjectName('r')}`;
+    const rerun = async (w: World): Promise<Awaited<ReturnType<typeof deliver>>> => {
+      const p = profile();
+      const v = new SecretVault();
+      v.set(KEY, KEY_VALUE);
+      const pin = (await deliverCentral(w.g.octokit(), p, centralFiles(), {}) as { sha: string }).sha;
+      const files = [...centralFiles(), ...appFiles(pin).map((f) => (f.path === 'Dockerfile' ? { ...f, content: 'FROM node:26\n' } : f))];
+      return deliver(w.g.octokit(), p, planDelivery(input(p, pin, { files })), v, deps(w, {}, { replace: true }));
+    };
+    const setup = async (): Promise<World> => {
+      const w = world();
+      const p = profile();
+      const c = await deliverCentral(w.g.octokit(), p, centralFiles(), {});
+      w.g.repo('o/pipelines').rules = [{ type: 'pull_request' }];   // the record goes to the central PR branch only
+      await deliver(w.g.octokit(), p, planDelivery(input(p, (c as { sha: string }).sha)), w.vault, deps(w));
+      expect(await record(w)).toBeUndefined();
+      return w;
+    };
+    // the local record file's hash matches: trusted (the earlier sha is kept, pipegen's own secret stays created)
+    const w = await setup();
+    const res = await rerun(w);
+    expect(res.notes).toEqual([]);
+    const r = await record(w, upd);
+    expect(r?.files.find((f) => f.path === 'Dockerfile')?.shas).toEqual([gitBlobSha('FROM node:24\n'), gitBlobSha('FROM node:26\n')]);
+    expect(r?.secrets.find((s) => s.name === KEY)?.created).toBe(true);
+    // no local file, but the setup PR's marker matches: trusted
+    const w2 = await setup();
+    rmSync(join(w2.home, '.config', 'pipegen', 'records', 'o__r.json'));
+    expect((await rerun(w2)).notes).toEqual([]);
+    expect((await record(w2, upd))?.files.find((f) => f.path === 'Dockerfile')?.shas.length).toBe(2);
+    // the PR body's marker edited away, but the local record file matches: trusted
+    const w4 = await setup();
+    (w4.g.repo('o/r').pulls[0] as { body: string }).body = 'edited by someone';
+    expect((await rerun(w4)).notes).toEqual([]);
+    expect((await record(w4, upd))?.files.find((f) => f.path === 'Dockerfile')?.shas.length).toBe(2);
+    // a record planted on the branch (someone with write on the central repo changed it): claims nothing
+    const w3 = await setup();
+    const planted = { ...(await record(w3, upd) as NonNullable<Awaited<ReturnType<typeof record>>>) };
+    planted.files.push({ repo: 'app', path: 'README.md', part: 'docs', shas: [gitBlobSha('hi\n')] });
+    w3.g.commitOn('o/pipelines', upd, { [recordPath('r')]: JSON.stringify(planted) });
+    const res3 = await rerun(w3);
+    expect(res3.notes.join('\n')).toMatch(/central pull request branch.*doesn't match/i);
+    const r3 = await record(w3, upd);
+    expect(r3?.files.some((f) => f.path === 'README.md')).toBe(false);
+    expect(r3?.files.find((f) => f.path === 'Dockerfile')?.shas).toEqual([gitBlobSha('FROM node:26\n')]);
+    expect(r3?.secrets.find((s) => s.name === KEY)).toMatchObject({ created: false, overwritten: true });
   });
 
   it('deliver: vault wiped after delivery', async () => {

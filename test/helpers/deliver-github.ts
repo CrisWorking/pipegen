@@ -138,6 +138,7 @@ export class FakeGitHub {
         return { status: out.status, data: out.data, headers: out.headers ?? {} };
       }
     }
+    params = call.params;   // a hook may change what GitHub receives (a fault the test injects)
     const ok = (data: unknown, status = 200) => ({ status, data, headers: {} });
     const r = this.repos.get(`${String(params.owner)}/${String(params.repo)}`.toLowerCase());
     if (r === undefined) fail(404);
@@ -238,10 +239,12 @@ export class FakeGitHub {
         return ok(this.#envView(p.environment_name, this.#env(repo, p.environment_name)));
       case 'PUT /repos/{owner}/{repo}/environments/{environment_name}': {
         const e = repo.envs.get(p.environment_name) ?? { id: this.#ids++, created_at: this.now(), wait_timer: 0, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: null, policies: [], stored: new Map() };
-        if (p.wait_timer !== undefined) e.wait_timer = p.wait_timer;
-        if (p.prevent_self_review !== undefined) e.prevent_self_review = p.prevent_self_review;
-        if (p.reviewers !== undefined) e.reviewers = p.reviewers ?? [];
-        if (p.deployment_branch_policy !== undefined) e.deployment_branch_policy = p.deployment_branch_policy;
+        // as GitHub does: a setting the PUT leaves out is reset to its default (wait 0, no reviewers, admins may bypass, any branch)
+        e.wait_timer = p.wait_timer ?? 0;
+        e.prevent_self_review = p.prevent_self_review ?? false;
+        e.reviewers = p.reviewers ?? [];
+        e.can_admins_bypass = p.can_admins_bypass ?? true;
+        e.deployment_branch_policy = p.deployment_branch_policy ?? null;
         repo.envs.set(p.environment_name, e);
         return ok(this.#envView(p.environment_name, e));
       }
