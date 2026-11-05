@@ -292,10 +292,14 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
     // a blocking check pipegen can not render (a pnpm service's project scripts: npm only in v0.2) stops too, never a silent drop
     const pnpm = planned(profileOf([node({ packageManager: 'pnpm', npmLockfileVersion: undefined })]));
     expect(() => assemble(pnpm)).toThrow(/The blocking check "unit-tests" for "app" can not be written: pnpm is not supported yet/);
-    // a TypeScript service: no reviewed type checker fits it (mypy is Python's), so type-check is uncovered and blocking
+    // a service whose folder no reviewed tool may read (../odd): its blocking checks are uncovered (none-offered), and assembly stops
+    const odd = planned(profileOf([node({ path: '../odd' })]));
+    expect(odd.plan.uncovered.some((u) => u.needId === 'sast' && u.blocking && u.reason === 'none-offered')).toBe(true);
+    expect(() => assemble(odd)).toThrow(/"sast" for "app": reviewed tools exist for it, but none fits this repository; .*\)\. It never guesses a tool\./);
+    // a TypeScript service with no typescript in its lockfile (G4b): type-check is uncovered and blocking, with the repo built-in's own plain reason
     const ts = planned(profileOf([node({ quality: { ...emptyServiceQuality(), tsconfig: true } })]));
-    expect(ts.plan.uncovered.some((u) => u.needId === 'type-check' && u.blocking)).toBe(true);
-    expect(() => assemble(ts)).toThrow(/"type-check" for "app": reviewed tools exist for it, but none fits this repository\)\. It never guesses a tool\./);
+    expect(ts.plan.uncovered.some((u) => u.needId === 'type-check' && u.blocking && u.reason === 'no-repo-tool')).toBe(true);
+    expect(() => assemble(ts)).toThrow(/"type-check" for "app": tsc: typescript is not in the lockfile, so pipegen has no pinned type checker to run \(add typescript as a dev dependency and commit package-lock\.json\)\)\. It never guesses a tool\./);
     // nothing is guessed: no step was invented for it
     expect(ts.draft.steps.some((s) => s.needId === 'type-check')).toBe(false);
     // a non-blocking uncovered need is not a stop

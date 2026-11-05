@@ -50,12 +50,12 @@ import {
   STEP_KEYS as STEP_KEY_LIST, WORKFLOW_CONCURRENCY, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact,
 } from './job-rules.js';
 import { signingMode } from '../github/signing-mode.js';
-import { containerRefusal, RenderError, renderComposeUp, renderProjectScript, renderRuntimeEnv, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
+import { containerRefusal, RenderError, renderComposeUp, renderProjectScript, renderRepoTool, renderRuntimeEnv, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
 import { COMPOSE_PATH, planCompose } from '../create/compose.js';
 import { dockerfilesOf } from './created-judges/compose.js';
 import { loadBaseImages } from './base-images.js';
 import { centralWorkflowFile, centralWorkflowPath } from './central-path.js';
-import { projectScriptFor } from './reviewed.js';
+import { projectScriptFor, repoToolFor } from './reviewed.js';
 import { slotProblem, type SlotKind } from './slots.js';
 import { expectedSigningSteps } from './signing.js';
 import { ARCHIVE_TOOL_IDS, imageBuildTag, renderImageArchiveScan, renderImageBuild } from './image-handoff.js';
@@ -274,6 +274,8 @@ const SIGN_SOURCE = 'sign';
 const VERIFY_SOURCE = 'verify';
 const IMAGE_ARCHIVE_SOURCE = 'image-archive';
 const IMAGE_CHECK_SOURCE = 'image-check';
+/** G4b: the source prefix of a repo built-in's steps (`repotool:<need id>:<service>`); they are repo code, like a project script's. */
+const REPO_TOOL_SOURCE = 'repotool';
 /** A scanner of the PR's own image on its archive (B6): the head check itself, rendered another way (so it counts as the spec's step). */
 const ARCHIVE_SUFFIX = ':archive';
 const SOURCE_KIND: Readonly<Record<string, StepKind>> = Object.freeze({ [SIGN_SOURCE]: 'sign', [VERIFY_SOURCE]: 'verify', [IMAGE_ARCHIVE_SOURCE]: 'image-archive', [IMAGE_CHECK_SOURCE]: 'image-check',
@@ -614,6 +616,24 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
         record(`script:${need.id}:${s.name}`, ctxs.map((c) => renderProjectScript(ps, platform, c).steps), false, need.blocking, true, key, key);
       } catch (e) {
         if (!(e instanceof RenderError)) throw e;
+      }
+    }
+  }
+  // G4b (ruling G4-R3, DECISIONS #95): the repo's own tool a need calls for (a TypeScript service's tsc at its lockfile version), re-derived
+  // from the profile by repoToolFor and rendered by renderRepoTool: its steps are accepted only in exactly that form (string equality, like
+  // every run step here), only in its own check's job, and only when it rendered (the blocking rule counts it only then)
+  for (const need of draft.needs) {
+    for (const s of draft.profile.services) {
+      const rt = repoToolFor(need, s);
+      if (rt === null) continue;
+      const source = `${REPO_TOOL_SOURCE}:${need.id}:${s.name}`;
+      try {
+        const key = keyOf(need.id, need.service);
+        record(source, ctxs.map((c) => renderRepoTool(rt, platform, c).steps), false, need.blocking, true, key, key);
+        ex.rendered.add(source);
+      } catch (e) {
+        if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e;
+        notes.push(`The repository's own tool for ${show(need.id)} can not be rendered, so no step may claim to be it: ${safeText(e.message, 200)}`);
       }
     }
   }
@@ -1434,7 +1454,7 @@ function judgeListedJobs(ex: Expectations, draft: PipelineDraft, expected: reado
     // G2 (B6): the archive scan of a spec and its registry render are one check rendered two ways: either one counts
     const sameCheck = (a: string | undefined, src: string): boolean => a !== undefined && (a === src || a.replace(/:archive$/, '') === src.replace(/:archive$/, ''));
     for (const src of sources) {
-      if (!holds(e.job).some((x) => sameCheck(x.match?.source, src))) nb(`The job ${show(e.job)} is in the gate's list for the check ${show(e.needId)}, but it holds no step of the check (the rendered ${src.startsWith('script:') ? 'project script' : 'tool run'}); the gate would wait on a job that does not run it.`);
+      if (!holds(e.job).some((x) => sameCheck(x.match?.source, src))) nb(`The job ${show(e.job)} is in the gate's list for the check ${show(e.needId)}, but it holds no step of the check (the rendered ${src.startsWith('script:') ? 'project script' : src.startsWith(`${REPO_TOOL_SOURCE}:`) ? 'repo built-in' : 'tool run'}); the gate would wait on a job that does not run it.`);
     }
     // 1b. an action check: its action step is in the listed job and in no other job of the file
     for (const entryId of new Set(actionsOf(e.job))) {
@@ -1753,7 +1773,7 @@ function judgeStep(fc: FileCtx, where: string, raw: unknown): Judged {
       appRunning = r.appRunning;
       const id = r.step.id ?? '';
       kind = r.source === PR_CHECK_SOURCE ? 'pr-check'
-        : sourceKind(r.source) ?? (r.source.startsWith('script:') || appRunning ? 'repo-code' : /^(?:checker-run|tool-run|tool-install|tool-pull)-/.test(id) ? 'tool' : 'repo-code');
+        : sourceKind(r.source) ?? (r.source.startsWith('script:') || r.source.startsWith(`${REPO_TOOL_SOURCE}:`) || appRunning ? 'repo-code' : /^(?:checker-run|tool-run|tool-install|tool-pull)-/.test(id) ? 'tool' : 'repo-code');
       reads = kind === 'tool' && r.readsWorkspace;
     }
     // trivy keeps a cache between runs unless it runs with pipegen's pinned config (cache.backend: memory, ruling S3), whether
@@ -2098,9 +2118,10 @@ function blockingRule(draft: PipelineDraft, ex: Expectations, add: Add, notes: s
       const f = isObj(s) && s.needId === need.id && s.service === need.service ? formatOf(s, si) : undefined;
       return f === undefined ? [] : [f];
     });
-    const script = draft.profile.services.some((s) => projectScriptFor(need, s) !== null);
+    // G4b: the repo's own tool counts only when it rendered (ex.rendered), the same rule as a reviewed spec
+    const script = draft.profile.services.some((s) => projectScriptFor(need, s) !== null || (repoToolFor(need, s) !== null && ex.rendered.has(`${REPO_TOOL_SOURCE}:${need.id}:${s.name}`)));
     if (formats.length === 0 && !script && need.layer !== 'pre-commit' && !(category !== undefined && PIPEGEN_JOB_CATEGORIES.has(category))) {
-      add(`draft.needs[${i}]`, 'not-gate-readable', `The blocking check ${show(need.id)}${need.service === undefined ? '' : ` for ${show(need.service)}`} has no reviewed tool step and no project script, so the gate would have nothing to read.`);
+      add(`draft.needs[${i}]`, 'not-gate-readable', `The blocking check ${show(need.id)}${need.service === undefined ? '' : ` for ${show(need.service)}`} has no reviewed tool step, no project script and no repo built-in, so the gate would have nothing to read.`);
       return;
     }
     // the category comes from the need id, never from the tool

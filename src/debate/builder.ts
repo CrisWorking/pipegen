@@ -4,8 +4,9 @@
 // step, so (threats T1, T4, T22):
 // - What is offered is decided by code (rulings B2, S9, S20). A candidate is offered for a key only when the reviewed list has an
 //   entry with its id that reviewedFor(…, 'full') gives for the need (category, language, at least one proof), that entry is
-//   reviewed, and, for a blocking key, it is not an advisory-only tool. Needs pipegen's own jobs or the project's own scripts
-//   cover, and needs whose check has no reviewed entry at all, never reach the AI (`byCode`); a need with nothing offered is
+//   reviewed, and, for a blocking key, it is not an advisory-only tool. Needs pipegen's own jobs, the project's own scripts or the
+//   repo's own tools (a TypeScript service's tsc, G4b) cover, and needs whose check has no reviewed entry at all, never reach the AI
+//   (`byCode`); a need with nothing offered is
 //   `uncovered`, never guessed and never filled from the audit list. A key the AI may not see (ruling B1) is decided by code.
 // - Every id the AI returns is an enum in the schema and is checked again by code against what was offered for THAT key
 //   (Review Focus 1, ruling S3). An id that wasn't offered refuses the whole answer; the AI is asked once more with pipegen's
@@ -34,7 +35,7 @@ import { NEED_ID_CATEGORY, toolCoversNeed } from '../engine/need-ids.js';
 import { needWhy, promptProfile, promptText } from '../engine/needs.js';
 import type { QualityBar } from '../engine/quality-bar.js';
 import { validateSpec } from '../engine/render-step.js';
-import { projectScriptFor, reviewedFor } from '../engine/reviewed.js';
+import { projectScriptFor, repoToolFor, repoToolProblem, reviewedFor } from '../engine/reviewed.js';
 import { COVERAGE_MINIMUMS } from '../engine/tool-flags.js';
 import { LANGUAGE_FOLDERS, SEMGREP_RULE_FOLDERS, TUNING_OPTIONS, tuningEnums } from '../engine/tuning.js';
 import { safeMarkdown, safeText } from '../util/safe-text.js';
@@ -103,18 +104,21 @@ export function suggestionName(name: string, repo: string): string {
 }
 
 /** Why code, not the AI, covers a need (ruling S20). */
-export type ByCodeKind = 'pipegen-job' | 'project-script' | 'pipegen-egress' | 'no-reviewed-tool';
+export type ByCodeKind = 'pipegen-job' | 'project-script' | 'repo-tool' | 'pipegen-egress' | 'no-reviewed-tool';
 /**
  * A need code covers. `pipegen-egress` (review F2 I2, ruling F2-R12): the egress allow list of release jobs is never an AI pick; Plan G
- * renders it with Plan E's egress step and the reviewed domain sets per job. `no-reviewed-tool` is listed here only for a non-blocking
- * need; a blocking one is `uncovered` (review m2).
+ * renders it with Plan E's egress step and the reviewed domain sets per job. `repo-tool` (G4b, ruling G4-R3, DECISIONS #95): the repo's own
+ * tool at its lockfile version (a TypeScript service's tsc, repoToolFor), never an AI pick. `no-reviewed-tool` is listed here only for a
+ * non-blocking need; a blocking one is `uncovered` (review m2).
  */
 export interface ByCode { key: string; needId: string; service?: string; kind: ByCodeKind; blocking: boolean }
 /**
  * A need nothing covers (ruling S20): never guessed, never filled in audit mode. `none-offered`: reviewed tools exist for its check, but
- * none was offered for this key; `no-reviewed-tool`: the reviewed list has no tool for its check at all (blocking needs only, review m2).
+ * none was offered for this key; `no-reviewed-tool`: the reviewed list has no tool for its check at all (blocking needs only, review m2);
+ * `no-repo-tool` (G4b): a repo built-in is meant to cover it (a Node service's type-check), but the repository has none pipegen can run
+ * (repoToolProblem says why, in plain words).
  */
-export interface Uncovered { key: string; needId: string; service?: string; blocking: boolean; reason: 'none-offered' | 'no-reviewed-tool' }
+export interface Uncovered { key: string; needId: string; service?: string; blocking: boolean; reason: 'none-offered' | 'no-reviewed-tool' | 'no-repo-tool' }
 
 /** What the builder needs besides the needs and the AI (ruling B2; `caps` for the profile summary, see the F2 report). */
 export interface BuilderDeps {
@@ -414,6 +418,9 @@ export function keyOffers(needs: readonly Need[], candidates: ReadonlyMap<string
     if (category !== undefined && PIPEGEN_JOB_CATEGORIES.has(category)) { byCode('pipegen-job'); continue; }
     if (category !== undefined && NEVER_OFFERED_CATEGORIES.has(category)) { byCode('pipegen-egress'); continue; }
     if (svc && projectScriptFor(ref.needs[0] as Need, svc) !== null) { byCode('project-script'); continue; }
+    // G4b: the repo's own tool (DECISIONS #95) decides before any reviewed entry; one it can not run is uncovered, never another tool
+    if (svc && repoToolFor(ref.needs[0] as Need, svc) !== null) { byCode('repo-tool'); continue; }
+    if (svc && repoToolProblem(ref.needs[0] as Need, svc) !== null) { result.uncovered.push({ ...where(ref), blocking: ref.blocking, reason: 'no-repo-tool' }); continue; }
     if (!deps.reviewed.some((t) => toolCoversNeed(t.categories, ref.id))) {
       if (ref.blocking) result.uncovered.push({ ...where(ref), blocking: true, reason: 'no-reviewed-tool' });
       else byCode('no-reviewed-tool');

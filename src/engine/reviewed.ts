@@ -1408,6 +1408,64 @@ export function projectScriptFor(need: Need, s: Service): ProjectScriptStep | nu
   return step;
 }
 
+// ---------- the repo's own tools (DECISIONS #95) ----------
+
+/**
+ * The type checker a Node service's own setup calls for (Plan P catalogue rule, shared by the audit's choice and the pipeline): vue-tsc for
+ * Vue, svelte-check for Svelte, `astro check` for Astro, else tsc. `pkg` is the package whose lockfile version is the tool's.
+ */
+export function nodeTypeChecker(q: Service['quality']): { tool: string; pkg: 'typescript' | 'vue-tsc' | 'svelte-check' | '@astrojs/check' } {
+  if (q.uiFrameworks.includes('vue')) return { tool: 'vue-tsc', pkg: 'vue-tsc' };
+  if (q.uiFrameworks.includes('svelte')) return { tool: 'svelte-check', pkg: 'svelte-check' };
+  if (q.uiFrameworks.includes('astro')) return { tool: 'astro check', pkg: '@astrojs/check' };
+  return { tool: 'tsc', pkg: 'typescript' };
+}
+
+/**
+ * The repo's own tool for a need, as the audit names it (any version the reader found, a package.json range included), or null: only the
+ * type-check of a Node service has one today, and only when its package's version is known. `workingDir` is the raw Service.path.
+ */
+export function repoToolStep(need: Pick<Need, 'id' | 'service'>, s: Service): RepoToolStep | null {
+  if (need.id !== 'type-check' || s.language !== 'node' || (need.service !== undefined && need.service !== s.name)) return null;
+  const pick = nodeTypeChecker(s.quality);
+  const version = s.quality.versions[pick.pkg];
+  if (version === undefined) return null;
+  const step: RepoToolStep = { kind: 'repo-tool', needId: need.id, service: s.name, tool: pick.tool, version };
+  if (s.quality.fromRange.includes(pick.pkg)) step.fromRange = true;
+  if (s.path !== '' && s.path !== '.') step.workingDir = s.path;
+  return step;
+}
+
+/** The repo tools the pipeline runs (v0.2): the repository's own tsc. vue-tsc, svelte-check and `astro check` are named by the audit only. */
+const RUNNABLE_REPO_TOOLS: ReadonlySet<string> = new Set(['tsc']);
+
+/**
+ * Why the pipeline can not run the repo's own tool for a need a repo built-in is meant to cover (a Node service's type-check), in plain
+ * words built from fixed text only; null when it can (repoToolFor gives the step) or when no repo built-in covers the need (the reviewed
+ * tools do, as for Python's mypy).
+ */
+export function repoToolProblem(need: Pick<Need, 'id' | 'service'>, s: Service): string | null {
+  if (need.id !== 'type-check' || s.language !== 'node' || (need.service !== undefined && need.service !== s.name)) return null;
+  const { tool, pkg } = nodeTypeChecker(s.quality);
+  const step = repoToolStep(need, s);
+  if (step === null) return `${tool}: ${pkg} is not in the lockfile, so pipegen has no pinned type checker to run (add ${pkg} as a dev dependency and commit package-lock.json)`;
+  if (!RUNNABLE_REPO_TOOLS.has(step.tool)) return `${tool}: pipegen runs only the repository's own tsc as a type check in v0.2; ${tool} is not run yet`;
+  if (s.packageManager !== 'npm') return `${tool}: pipegen installs the dependencies with npm only (${s.packageManager === undefined ? 'no package manager was found' : `${s.packageManager} is not supported yet`})`;
+  if (step.fromRange === true) return `${tool}: ${pkg}'s version comes from a package.json range, not from package-lock.json, so pipegen can't run the pinned version (commit package-lock.json)`;
+  if (s.npmLockfileVersion === undefined) return `${tool}: the service has no package-lock.json, so pipegen can't install the pinned version`;
+  if (s.npmLockfileVersion < 2) return `${tool}: package-lock.json is lockfile version ${String(s.npmLockfileVersion)}; pipegen reads lockfile version 2 or later (run npm install with npm 7 or later)`;
+  if (!s.quality.tsconfig) return `${tool}: the service has no tsconfig.json, so ${tool} would have nothing to check`;
+  return null;
+}
+
+/**
+ * The built-in step that runs the repo's own tool for a need (G4b, DECISIONS #95), or null: the one source for the builder (byCode
+ * `repo-tool`), the renderer (renderRepoTool re-derives it), the referee and the jobs. Only a step repoToolProblem has nothing against.
+ */
+export function repoToolFor(need: Pick<Need, 'id' | 'service'>, s: Service): RepoToolStep | null {
+  return repoToolProblem(need, s) === null ? repoToolStep(need, s) : null;
+}
+
 // ---------- package existence ----------
 
 const PACKAGE_TIMEOUT_MS = 20_000;

@@ -16,7 +16,7 @@
 import { codeSecurityAvailable } from '../github/availability.js';
 import { needLanguage } from '../engine/discover.js';
 import { skippedChecks, type SkippedCheck } from '../engine/needs.js';
-import { neverImage, neverListed, reviewedFor, type RepoToolStep, type WouldAddTool } from '../engine/reviewed.js';
+import { neverImage, neverListed, nodeTypeChecker, repoToolStep, reviewedFor, type RepoToolStep, type WouldAddTool } from '../engine/reviewed.js';
 import { emptyServiceQuality } from '../read/quality.js';
 import type { Capabilities, Need, NeedCategory, RepoProfile, ReviewedTool, Service } from '../types.js';
 import { PATH_SHOWN_MAX, safeText } from '../util/safe-text.js';
@@ -166,15 +166,15 @@ function typeCheckRule(c: Ctx): Choice {
     return checker !== undefined ? own(c, checker, null, `${checker} is already configured`) : reviewed(c, T.mypy, 'mypy: no Python type checker configured');
   }
   if (c.lang !== 'node') return generic(c);
-  const pick = q.uiFrameworks.includes('vue') ? { tool: 'vue-tsc', pkg: 'vue-tsc' as const }
-    : q.uiFrameworks.includes('svelte') ? { tool: 'svelte-check', pkg: 'svelte-check' as const }
-      : q.uiFrameworks.includes('astro') ? { tool: 'astro check', pkg: '@astrojs/check' as const }
-        : { tool: 'tsc', pkg: 'typescript' as const };
+  // G4b: the pick is the pipeline's too (reviewed.ts nodeTypeChecker, repoToolStep), so the audit and the pipeline never name different tools
+  const pick = nodeTypeChecker(q);
   const version = q.versions[pick.pkg];
   if (version === undefined) {
     return none(`${pick.tool}: ${pick.pkg} is not in the lockfile, so pipegen can only suggest it (add ${pick.pkg} as a dev dependency)`);
   }
-  return own(c, pick.tool, version, `${pick.tool} is in the ${q.fromRange.includes(pick.pkg) ? 'package.json' : 'lockfile'}`, pick.pkg);
+  const reason = `${pick.tool} is in the ${q.fromRange.includes(pick.pkg) ? 'package.json' : 'lockfile'}`;
+  const step = c.s === undefined ? null : repoToolStep(c.need, c.s);
+  return step === null ? own(c, pick.tool, version, reason, pick.pkg) : { tool: step, also: [], note: reason };
 }
 
 const COVERAGE_NOTE = '`floor(current) - 1`; 60% of lines for repos with few tests; an existing minimum is kept';

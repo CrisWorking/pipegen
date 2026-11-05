@@ -547,6 +547,34 @@ describe('builder (added, pre-flight §7)', () => {
     for (const id of ['signing', 'deploy-verify', 'gate', 'unit-tests', 'lint']) expect(block).not.toContain(`"check": "${id}"`);
   });
 
+  it('builder: repo-tool needs are decided by code and never sent to the AI', async () => {
+    // G4b (ruling G4-R3): the TypeScript type-check runs the repo's own tsc at its lockfile version (DECISIONS #95); code decides it
+    const tsWeb = { ...WEB, npmLockfileVersion: 3, quality: { ...emptyServiceQuality(), tsconfig: true, versions: { typescript: '5.6.3' } } };
+    const p = profile({ services: [API, tsWeb] });
+    const needs = [...NEEDS, need('type-check', 'push', 'web'), need('type-check', 'merge', 'web')];
+    const { ai, calls } = scripted(ok());
+    const r = await buildChoices(needs, candidatesFor(needs, p), p, bundle, ai, deps());
+    expect(r.byCode).toContainEqual({ key: 'type-check--web', needId: 'type-check', service: 'web', kind: 'repo-tool', blocking: true });
+    expect(r.uncovered.map((u) => u.key)).not.toContain('type-check--web');
+    expect(r.choices.map((c) => c.key)).not.toContain('type-check--web');
+    const keys = schemaNames(calls[0]!).keys;
+    const block = calls[0]!.user.slice(calls[0]!.user.indexOf(`<${BUILDER_NEEDS_TAG}>`), calls[0]!.user.indexOf(`</${BUILDER_NEEDS_TAG}>`));
+    expect(keys).not.toContain('type-check--web');
+    expect(block).not.toContain('"type-check--web"');
+    expect(block).not.toContain('"check": "type-check"');
+    // nothing about it reaches any prompt part: not the key, not the tool, not the version
+    for (const c of calls) for (const part of [c.system, c.user, JSON.stringify(c.jsonSchema)]) {
+      expect(part).not.toContain('type-check--web');
+      expect(part).not.toContain('5.6.3');
+    }
+    // the same key with no typescript in the lockfile: uncovered (plain reason), still never sent to the AI
+    const bare = profile({ services: [API, { ...WEB, npmLockfileVersion: 3, quality: { ...emptyServiceQuality(), tsconfig: true } }] });
+    const second = scripted(ok());
+    const u = await buildChoices(needs, candidatesFor(needs, bare), bare, bundle, second.ai, deps());
+    expect(u.uncovered).toContainEqual({ key: 'type-check--web', needId: 'type-check', service: 'web', blocking: true, reason: 'no-repo-tool' });
+    expect(schemaNames(second.calls[0]!).keys).not.toContain('type-check--web');
+  });
+
   it('builder: ranked = offered reviewed candidates in the AI\'s order, chosen first, no repeats', async () => {
     const picks = DEFAULT_PICKS.map((p) => {
       if (p.key === 'secrets') return { ...p, candidateId: 'gitleaks', ranked: ['betterleaks', 'gitleaks', 'betterleaks'] };

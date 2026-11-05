@@ -26,7 +26,8 @@
 // - findings jobs: renderFindingsBlock (stage for the secrets tools, the scan, the scrub, the upload of exactly resultArtifactName), and the
 //   outputs `<artifact>-sha256|-status|-error` (jobOutputsFor). The merge layer's secrets job adds the pre-push head fetch (C9r1) and the
 //   commit-range block (C9) after a full-history checkout;
-// - job-status jobs: the tool's steps, or the project's own script first (it brings its own checkout); a test job of a service with
+// - job-status jobs: the tool's steps, or the project's own script first (it brings its own checkout), or the repo's own tool (G4b: a
+//   TypeScript service's tsc at its lockfile version, after the guarded npm ci and a run-time lockfile check; no key, no secret); a test job of a service with
 //   dependencies gets the runtime env and compose up, only when the draft holds the compose file pipegen computes (D4);
 // - DAST (G4-R1, dast-handoff.ts): `dast-run--<svc>` with no key and no secret starts the app in containers only (pipegen's compose file, or
 //   the checked image archive on 127.0.0.1), runs the reviewed scan and hands the raw result on with its sha256; `dast--<svc>` (the gate's
@@ -65,9 +66,9 @@ import { APP_RUNNING_CATEGORIES, renderStarterTestRun } from '../engine/render-c
 import { RenderError } from '../engine/render-error.js';
 import {
   dedupeJobSteps, renderBaselineCheckStep, renderComposeUp, renderFindingsBlock, renderGateStep, renderGateUploads, renderJobPrelude, renderNightlyStep,
-  renderProjectScript, renderRangeBlock, renderRuntimeEnv, renderScrub, renderStep, renderUpload, scanFactOf, scrubbedPath, type RenderContext,
+  renderProjectScript, renderRangeBlock, renderRepoTool, renderRuntimeEnv, renderScrub, renderStep, renderUpload, scanFactOf, scrubbedPath, type RenderContext,
 } from '../engine/render-step.js';
-import { projectScriptFor } from '../engine/reviewed.js';
+import { projectScriptFor, repoToolFor, repoToolProblem, type RepoToolStep } from '../engine/reviewed.js';
 import { PLATFORM_USES, RANGE_TOOL } from '../engine/tool-flags.js';
 import type { SigningMode } from '../github/signing-mode.js';
 import { signJob, type SignJob } from './central.js';
@@ -183,6 +184,7 @@ function checkSteps(draft: PipelineDraft, plan: JobsPlan, reviewed: readonly Rev
 const UNCOVERED_REASON: Readonly<Record<string, string>> = Object.freeze({
   'none-offered': 'reviewed tools exist for it, but none fits this repository',
   'no-reviewed-tool': 'pipegen has no reviewed tool for it yet',
+  'no-repo-tool': "the repository has no tool of its own for it that pipegen can run",
 });
 
 // ---------- egress ----------
@@ -271,8 +273,10 @@ function checkJob(c: Ctx, need: Need, specs: readonly StepSpec[], range: boolean
   }
   if (specs.length === 0) {
     const ps = svc === undefined ? null : projectScriptFor(need, svc);
-    if (ps === null) return fail(`Nothing runs the check ${where(need)}.`);
-    body.push(...renderProjectScript(ps, c.deps.platform, ctx).steps);
+    // G4b: else the repo's own tool (a TypeScript service's tsc at its lockfile version): a job-status check, no scrub, no key, no secret
+    const rt = svc === undefined || ps !== null ? null : repoToolFor(need, svc);
+    if (ps === null && rt === null) return fail(`Nothing runs the check ${where(need)}.`);
+    body.push(...(ps !== null ? renderProjectScript(ps, c.deps.platform, ctx) : renderRepoTool(rt as RepoToolStep, c.deps.platform, ctx)).steps);
     script = true;
   }
   if (range) {
@@ -283,7 +287,7 @@ function checkJob(c: Ctx, need: Need, specs: readonly StepSpec[], range: boolean
     body.push(renderRangeFetchStep(), ...b.steps);
     scans.set(b.scan.stepId, b.scan.fact);
   }
-  // a project script brings its own checkout and setup (item 38), so no prelude; any other job checks out first (fetch depth per its tools)
+  // a project script or a repo tool brings its own checkout and setup (item 38), so no prelude; any other job checks out first (fetch depth per its tools)
   const prelude = script ? [] : renderJobPrelude(fullHistory ? { fetchDepth: '0' } : {}, c.deps.platform).steps;
   let steps = [...prelude, ...body];
   // D4: a test job of a service with dependencies starts them first (runtime env, then compose up), only with pipegen's own compose file
@@ -435,7 +439,10 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     if (n.length > 0 && n.every((x) => skipped(x) !== undefined)) continue;
     const limit = limitOf({ id: u.needId, category: categoryOf(u.needId) ?? u.needId });
     if (limit !== undefined) { addNote(notes, limit); continue; }
-    stop.push(`${where(u)}: ${UNCOVERED_REASON[u.reason] ?? 'no reviewed tool covers it'}`);
+    // G4b: a repo built-in that can not run says why in its own plain words (fixed text, repoToolProblem)
+    const svc = serviceNamed(input, u.service);
+    const why = u.reason === 'no-repo-tool' && svc !== undefined ? repoToolProblem({ id: u.needId, ...(u.service === undefined ? {} : { service: u.service }) }, svc) : null;
+    stop.push(`${where(u)}: ${why ?? UNCOVERED_REASON[u.reason] ?? 'no reviewed tool covers it'}`);
   }
   if (stop.length > 0) fail(`pipegen stopped before writing the pipeline: these blocking checks have no tool it can run (${stop.join('; ')}). It never guesses a tool.`);
   checkSteps(input, plan, deps.reviewed);
@@ -526,7 +533,7 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     }
     if (specs.length === 0 && !n.blocking) {
       const svc = serviceNamed(draft, n.service);
-      if (svc === undefined || projectScriptFor(n, svc) === null) return;   // a non-blocking check nothing runs: no job (the gate does not list it)
+      if (svc === undefined || (projectScriptFor(n, svc) === null && repoToolFor(n, svc) === null)) return;   // a non-blocking check nothing runs: no job (the gate does not list it)
     }
     const range = n.layer === 'merge' && n.id === 'secrets' && n.service === undefined && specs.some((s) => isFindings(toolOf(c, s.tool.id)));
     try { into[id] = checkJob(c, n, specs, range); } catch (e) {

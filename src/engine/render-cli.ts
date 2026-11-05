@@ -1151,11 +1151,16 @@ function checkerInstall(tool: ReviewedTool, pins: readonly (NpmPin & { resolved:
   return { lines, env: { PIPEGEN_NPM_LOCK: compact, PIPEGEN_NPM_PACKAGE: pkg } };
 }
 
-/** For a tool that runs repo code: the guarded `npm ci` of the repo (ids deduped per job and folder) and the verification step that needs its marker. */
-function repoInstall(pins: readonly (NpmPin & { resolved: string })[], artifact: string, nodeMajor: string, workingDir: string | undefined): RenderedStep[] {
+/** The id hash of a folder's guarded `npm ci` and the marker file it leaves (one per job and folder). */
+function installMarker(workingDir: string | undefined): { hash: string; marker: string } {
   const folder = (workingDir ?? '').split('/').filter((p) => p !== '' && p !== '.').join('/');
   const hash = sha16(folder === '' ? '.' : folder);
-  const marker = `$RUNNER_TEMP/pipegen-npm-ci/${hash}`;
+  return { hash, marker: `$RUNNER_TEMP/pipegen-npm-ci/${hash}` };
+}
+
+/** For a tool that runs repo code: the guarded `npm ci` of the repo (ids deduped per job and folder) and the verification step that needs its marker. */
+function repoInstall(pins: readonly (NpmPin & { resolved: string })[], artifact: string, nodeMajor: string, workingDir: string | undefined): RenderedStep[] {
+  const { hash, marker } = installMarker(workingDir);
   const expect = { PIPEGEN_NPM_EXPECT: JSON.stringify(pins) };
   const common = [...prologue(artifact, { nodeMajor }), ...cdLines(workingDir), ...allowlist(`$nodebin:${FIXED_PATH}`, [])];
   const ci = runStep('pipegen: install the project dependencies (npm ci, no scripts)', script([
@@ -1190,6 +1195,78 @@ export function projectScriptSteps(artifact: string, which: 'test' | 'lint', nod
     `"\${pg_env[@]}" "$nodebin/npm" ${which === 'test' ? 'test' : 'run lint'}`,
   ]);
   return [ci, runStep(`pipegen: run the project's ${which} script`, run, {}, `repocode-${sha16(`project-script:${artifact}:${which}`)}`)];
+}
+
+// ---------- the repo's own tools (G4b, DECISIONS #95) ----------
+
+/**
+ * The repo tools pipegen runs, each from its own package folder by a fixed path with fixed arguments (no AI value, no repo text): the
+ * repository's tsconfig decides what is checked and how strictly (the developers' own check), `--noEmit` keeps tsc from writing anything.
+ */
+export const REPO_TOOLS: Readonly<Record<string, { package: string; bin: string; args: readonly string[] }>> = Object.freeze({
+  tsc: Object.freeze({ package: 'typescript', bin: 'bin/tsc', args: Object.freeze(['--noEmit']) }),
+});
+
+/**
+ * The run-time check before a repo tool runs (G4b): `package-lock.json` is a lockfile of version 2 or later whose entry for the package is
+ * a plain registry package at an exact version (the registry tarball, a sha512 integrity, no link, no bundle); the installed package is a
+ * real folder inside a real node_modules, at that version, installed from that tarball (npm ci's own record, node_modules/.package-lock.json);
+ * its bin is a regular file inside it. The version is read when the job runs, never written into the step, so a lockfile bump keeps working.
+ * `pkg` and `bin` come from REPO_TOOLS only.
+ */
+export function repoToolCheckJs(pkg: string, bin: string): string {
+  if (!isNpmName(pkg) || !/^[a-z0-9][a-z0-9._-]{0,40}(?:\/[a-z0-9][a-z0-9._-]{0,40}){0,3}$/i.test(bin)) return refuse('The repo tool is not a plain package with a plain bin path.');
+  return [
+    'const fs = require("fs"), path = require("path");',
+    `const name = ${JSON.stringify(pkg)}, bin = ${JSON.stringify(bin)};`,
+    'const fail = (m) => { console.error("pipegen: " + m); process.exit(1); };',
+    'const lstat = (f) => { try { return fs.lstatSync(f); } catch (e) { return null; } };',
+    'const json = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch (e) { return null; } };',
+    'const lock = json("package-lock.json");',
+    'if (!lock || typeof lock !== "object" || !(lock.lockfileVersion >= 2) || !lock.packages || typeof lock.packages !== "object") fail("package-lock.json is not a lockfile of version 2 or later");',
+    'const p = lock.packages["node_modules/" + name];',
+    'if (!p || typeof p !== "object" || p.link || p.inBundle || typeof p.version !== "string" || !/^[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z.-]{1,40})?$/.test(p.version)) fail(name + " is not a plain package at an exact version in package-lock.json");',
+    `const tarball = ${JSON.stringify(REGISTRY_URL)} + name + "/-/" + name.slice(name.indexOf("/") + 1) + "-" + p.version + ".tgz";`,
+    'if (p.resolved !== tarball || typeof p.integrity !== "string" || !/^sha512-[A-Za-z0-9+/]{86}==$/.test(p.integrity)) fail(name + " in package-lock.json is not the registry tarball with a sha512 integrity");',
+    'const top = lstat("node_modules");',
+    'if (!top || !top.isDirectory() || top.isSymbolicLink()) fail("node_modules is not a real folder");',
+    'const root = fs.realpathSync("node_modules");',
+    'const dir = path.join("node_modules", name);',
+    'const st = lstat(dir);',
+    'if (!st || !st.isDirectory() || st.isSymbolicLink()) fail(name + " is not a real folder in node_modules");',
+    'const real = fs.realpathSync(dir);',
+    'if (!real.startsWith(root + path.sep)) fail(name + " is outside node_modules");',
+    'const installed = (json(path.join(dir, "package.json")) || {}).version;',
+    'if (installed !== p.version) fail(name + " is " + installed + ", not the " + p.version + " package-lock.json pins");',
+    'const h = ((json("node_modules/.package-lock.json") || {}).packages || {})["node_modules/" + name];',
+    'if (!h || h.integrity !== p.integrity || h.resolved !== p.resolved) fail(name + " was not installed from the registry tarball package-lock.json pins");',
+    'const file = path.join(dir, bin);',
+    'const b = lstat(file);',
+    'if (!b || !b.isFile() || b.isSymbolicLink() || !fs.realpathSync(file).startsWith(real + path.sep)) fail("the " + bin + " of " + name + " is not a regular file inside its package");',
+    'process.exit(0);',
+  ].join('\n');
+}
+
+/**
+ * The steps of a repo tool (G4b): the guarded repo `npm ci --ignore-scripts` (shared with the project scripts and the repo-code tools: same
+ * id, run and marker, so a job installs once), then ONE repo-code step (`repocode-…` id): the install marker, the lockfile check
+ * (repoToolCheckJs) and the tool from its package folder, under the env -i allowlist, so nothing runs between the check and the tool.
+ * `workingDir` is the already-checked service folder.
+ */
+export function repoToolSteps(artifact: string, tool: string, nodeMajor: string, workingDir: string | undefined): RenderedStep[] {
+  const t = own(REPO_TOOLS, tool);
+  if (t === undefined) return refuse(`${show(tool)} is not a repo tool pipegen runs.`);
+  const ci = repoInstall([], artifact, nodeMajor, workingDir)[0] as RenderedStep;
+  const { marker } = installMarker(workingDir);
+  const run = script([
+    ...prologue(artifact, { nodeMajor }), ...cdLines(workingDir),
+    ...allowlist(`$nodebin:${FIXED_PATH}`, []),
+    `[ -f "${marker}" ] && [ ! -L "${marker}" ] || pg_fail "the dependencies were not installed by pipegen's own npm ci step"`,
+    `js=${q(repoToolCheckJs(t.package, t.bin))}`,
+    '"${pg_env[@]}" "$nodebin/node" -e "$js"',
+    `"\${pg_env[@]}" "$nodebin/node" node_modules/${t.package}/${t.bin} ${t.args.join(' ')}`,
+  ]);
+  return [ci, runStep(`pipegen: run the repository's own ${tool} (its lockfile version)`, run, {}, `repocode-${sha16(`repo-tool:${artifact}:${tool}`)}`)];
 }
 
 // ---------- the proof harness's helpers (Plan E E3) ----------
