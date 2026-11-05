@@ -36,7 +36,7 @@ import type { QualityBar } from '../engine/quality-bar.js';
 import { validateSpec } from '../engine/render-step.js';
 import { projectScriptFor, reviewedFor } from '../engine/reviewed.js';
 import { COVERAGE_MINIMUMS } from '../engine/tool-flags.js';
-import { TUNING_OPTIONS, tuningEnums } from '../engine/tuning.js';
+import { LANGUAGE_FOLDERS, TUNING_OPTIONS, tuningEnums } from '../engine/tuning.js';
 import { safeMarkdown, safeText } from '../util/safe-text.js';
 import {
   NEED_CATEGORIES, type AiProvider, type AiRequest, type AiUsage, type Candidate, type Capabilities, type Need, type PipelineDraft, type RepoProfile,
@@ -87,10 +87,18 @@ export interface Choice {
 export type Suggestion = PipelineDraft['suggestions'][number];
 
 /** Why code, not the AI, covers a need (ruling S20). */
-export type ByCodeKind = 'pipegen-job' | 'project-script' | 'no-reviewed-tool';
-export interface ByCode { key: string; needId: string; service?: string; kind: ByCodeKind }
-/** A need with no offered reviewed candidate (ruling S20): never guessed, never filled in audit mode. */
-export interface Uncovered { key: string; needId: string; service?: string; blocking: boolean }
+export type ByCodeKind = 'pipegen-job' | 'project-script' | 'pipegen-egress' | 'no-reviewed-tool';
+/**
+ * A need code covers. `pipegen-egress` (review F2 I2, ruling F2-R12): the egress allow list of release jobs is never an AI pick; Plan G
+ * renders it with Plan E's egress step and the reviewed domain sets per job. `no-reviewed-tool` is listed here only for a non-blocking
+ * need; a blocking one is `uncovered` (review m2).
+ */
+export interface ByCode { key: string; needId: string; service?: string; kind: ByCodeKind; blocking: boolean }
+/**
+ * A need nothing covers (ruling S20): never guessed, never filled in audit mode. `none-offered`: reviewed tools exist for its check, but
+ * none was offered for this key; `no-reviewed-tool`: the reviewed list has no tool for its check at all (blocking needs only, review m2).
+ */
+export interface Uncovered { key: string; needId: string; service?: string; blocking: boolean; reason: 'none-offered' | 'no-reviewed-tool' }
 
 /** What the builder needs besides the needs and the AI (ruling B2; `caps` for the profile summary, see the F2 report). */
 export interface BuilderDeps {
@@ -158,13 +166,40 @@ const NARROWED: Readonly<Record<string, (v: string) => boolean>> = {
   push: (v) => v === 'false',
 };
 
+/** The Semgrep rule folders of the services a key is for (review F2 I1): node → javascript (+ typescript with a tsconfig), python → python, … */
+function ruleFolders(ref: NeedRef, p: RepoProfile): Set<string> {
+  const svc = serviceOf(ref, p);
+  const scope = svc === null ? [] : svc === undefined ? p.services : [svc];
+  const out = new Set<string>();
+  for (const s of scope) {
+    for (const lang of [s.language, ...(s.alsoLanguages ?? [])]) {
+      for (const f of Object.hasOwn(LANGUAGE_FOLDERS, lang) ? (LANGUAGE_FOLDERS[lang] as readonly string[]) : []) out.add(f);
+      if (lang === 'node' && s.quality?.tsconfig === true) out.add('typescript');
+    }
+  }
+  return out;
+}
+
+/**
+ * Choices whose safe values depend on the key (review F2 I1): another language's Semgrep rules would leave the service's own code
+ * unscanned, so `rules` keeps only the service's own folders, for the AI and for every code default alike.
+ */
+const KEY_NARROWED: Readonly<Record<string, Readonly<Record<string, (ref: NeedRef, p: RepoProfile) => (v: string) => boolean>>>> = {
+  semgrep: { rules: (ref, p) => { const ok = ruleFolders(ref, p); return (v) => ok.has(v); } },
+};
+
+/** Tools of these categories are never offered: their inputs are pipegen's own (egress, review F2 I2). */
+const NEVER_OFFERED_CATEGORIES: ReadonlySet<string> = new Set(['egress']);
+
 const sameList = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
 
-/** The AI's and code's choices of an entry, or null when the entry can't be offered (a coverage minimum it can't fill, a choice with no safe value). */
-function choicePlan(e: ReviewedTool): { ai: Record<string, string[]>; code: Record<string, string> } | null {
+/** The AI's and code's choices of an entry for a key, or null when it can't be offered (a coverage minimum it can't fill, a choice with no safe value). */
+function choicePlan(e: ReviewedTool, ref: NeedRef, p: RepoProfile): { ai: Record<string, string[]>; code: Record<string, string> } | null {
+  if (e.categories.some((c) => NEVER_OFFERED_CATEGORIES.has(c))) return null;
   const ai: Record<string, string[]> = {};
   const code: Record<string, string> = {};
   const aiNames = new Set(aiChoiceNames(e.id, e.choices));
+  const perKey = Object.hasOwn(KEY_NARROWED, e.id) ? KEY_NARROWED[e.id] : undefined;
   for (const [name, raw] of Object.entries(e.choices)) {
     const values = Array.isArray(raw) ? raw.filter((v): v is string => typeof v === 'string') : [];
     // Plan D I4: a coverage minimum is code's, never the AI's: the CODE_FILLED_CHOICES entry, and any choice whose values are exactly the minimums (coverage.py's fail-under)
@@ -173,7 +208,8 @@ function choicePlan(e: ReviewedTool): { ai: Record<string, string[]>; code: Reco
       code[name] = COVERAGE_MINIMUMS[0];
       continue;
     }
-    const keep = Object.hasOwn(NARROWED, name) ? values.filter(NARROWED[name] as (v: string) => boolean) : values;
+    let keep = Object.hasOwn(NARROWED, name) ? values.filter(NARROWED[name] as (v: string) => boolean) : values;
+    if (perKey !== undefined && Object.hasOwn(perKey, name)) keep = keep.filter((perKey[name] as (r: NeedRef, q: RepoProfile) => (v: string) => boolean)(ref, p));
     if (keep.length === 0) return null;
     if (keep.length === 1) code[name] = keep[0] as string;
     else ai[name] = keep;
@@ -213,12 +249,49 @@ function tuningOffer(ref: NeedRef, e: ReviewedTool, plan: { ai: Record<string, s
   return Object.fromEntries(Object.entries(out).filter(([, v]) => v.length > 0));
 }
 
+/** What the AI (or the judge's counter, F4) picked for one tool: choice values and tuning values, null for none. */
+export interface Picks { choices?: Readonly<Record<string, string | null>>; tuning?: Readonly<Record<string, readonly string[] | null>> }
+
+const shown = (v: unknown) => safeText(String(v), 60);
+
+/**
+ * The fence on picks (review F2 I3; ruling S2, F2-R2): the problems of `picks` for one key and one offered tool. A choice value must be
+ * one the tool offers the AI for this key; a choice code fills may only be given back with code's own value; a choice the tool
+ * doesn't have is ignored. A tuning value must be one offered for this key. Used by builderAnswerProblems, the build of the answer and
+ * specFor, so there is one fence. Problem lines hold pipegen's words, field paths and the (cut) values.
+ */
+export function offeredPickProblems(key: string, offer: Offer, picks: Picks): { choices: string[]; tuning: string[] } {
+  const choices: string[] = [];
+  const raw = picks.choices !== null && typeof picks.choices === 'object' ? picks.choices : {};
+  for (const [name, v] of Object.entries(raw)) {
+    if (v === null || v === undefined) continue;
+    const aiValues = Object.hasOwn(offer.aiChoices, name) ? offer.aiChoices[name] : undefined;
+    const codeValue = Object.hasOwn(offer.codeChoices, name) ? offer.codeChoices[name] : undefined;
+    if (aiValues === undefined && codeValue === undefined) continue;   // a name the tool doesn't have: never read
+    if (aiValues !== undefined ? !aiValues.includes(v) : v !== codeValue) choices.push(`${key}: choices.${shown(name)}: ${shown(v)} is not one of the values offered for this tool`);
+  }
+  const tuning: string[] = [];
+  const rawT = picks.tuning !== null && typeof picks.tuning === 'object' ? picks.tuning : {};
+  for (const [opt, values] of Object.entries(rawT)) {
+    if (values === null || values === undefined) continue;
+    if (!Array.isArray(values)) { tuning.push(`${key}: choices.tuning.${shown(opt)}: must be a list of values`); continue; }
+    if (values.length === 0) continue;
+    const allowed = Object.hasOwn(offer.tuning, opt) ? offer.tuning[opt] : undefined;
+    if (allowed === undefined) { tuning.push(`${key}: choices.tuning.${shown(opt)}: this tool has no tuning option with that name for this need`); continue; }
+    values.forEach((v, i) => { if (!allowed.includes(v)) tuning.push(`${key}: choices.tuning.${shown(opt)}[${i}]: ${JSON.stringify(shown(v))} is not one of the values offered`); });
+  }
+  return { choices, tuning };
+}
+
 /**
  * The StepSpec for one key and one offered tool, built by code (ruling S2): the entry's own candidate and output template, the
  * need's id, service and service folder, code's choices, and the AI's picks where given (else each choice's first allowed value).
  * Exported for the debate (F4) and Plan G's fix loop (the next ranked tool with template defaults, ruling S22).
  */
-export function specFor(ref: NeedRef, offer: Offer, p: RepoProfile, picks?: { choices?: Readonly<Record<string, string | null>>; tuning?: Readonly<Record<string, readonly string[] | null>> }): StepSpec {
+export function specFor(ref: NeedRef, offer: Offer, p: RepoProfile, picks?: Picks): StepSpec {
+  // the one fence (review F2 I3): a pick outside what was offered for this key and tool is refused, never rendered
+  const bad = offeredPickProblems(ref.key, offer, picks ?? {});
+  if (bad.choices.length > 0 || bad.tuning.length > 0) throw new BuilderError('pipegen refused a pick that was not offered for this need.', [...bad.choices, ...bad.tuning]);
   const choices: StepChoices = {};
   for (const [name, values] of Object.entries(offer.aiChoices)) {
     const v = picks?.choices !== undefined && Object.hasOwn(picks.choices, name) ? picks.choices[name] : null;
@@ -254,7 +327,7 @@ function offersFor(ref: NeedRef, cands: readonly Candidate[], p: RepoProfile, de
     const e = listed.get(c.id);
     if (e === undefined || !isReviewed(e.candidate) || e.candidate.id !== e.id || !toolCoversNeed(e.categories, ref.id)) continue;
     if (ref.blocking && ADVISORY_TOOLS.has(e.id)) continue;   // ruling S9: an advisory tool never covers a blocking need
-    const plan = choicePlan(e);
+    const plan = choicePlan(e, ref, p);
     if (plan === null) continue;
     seen.add(c.id);
     const offer: Offer = { entry: e, aiChoices: plan.ai, codeChoices: plan.code, tuning: tuningOffer(ref, e, plan, p, kv) };
@@ -280,11 +353,17 @@ export function builderOffers(needs: readonly Need[], candidates: ReadonlyMap<st
   for (const ref of refs) {
     const category = categoryOf(ref.id);
     const svc = serviceOf(ref, p);
-    if (category !== undefined && PIPEGEN_JOB_CATEGORIES.has(category)) { result.byCode.push({ ...where(ref), kind: 'pipegen-job' }); continue; }
-    if (svc && projectScriptFor(ref.needs[0] as Need, svc) !== null) { result.byCode.push({ ...where(ref), kind: 'project-script' }); continue; }
-    if (!deps.reviewed.some((t) => toolCoversNeed(t.categories, ref.id))) { result.byCode.push({ ...where(ref), kind: 'no-reviewed-tool' }); continue; }
+    const byCode = (kind: ByCodeKind) => result.byCode.push({ ...where(ref), kind, blocking: ref.blocking });
+    if (category !== undefined && PIPEGEN_JOB_CATEGORIES.has(category)) { byCode('pipegen-job'); continue; }
+    if (category !== undefined && NEVER_OFFERED_CATEGORIES.has(category)) { byCode('pipegen-egress'); continue; }
+    if (svc && projectScriptFor(ref.needs[0] as Need, svc) !== null) { byCode('project-script'); continue; }
+    if (!deps.reviewed.some((t) => toolCoversNeed(t.categories, ref.id))) {
+      if (ref.blocking) result.uncovered.push({ ...where(ref), blocking: true, reason: 'no-reviewed-tool' });
+      else byCode('no-reviewed-tool');
+      continue;
+    }
     const offers = offersFor(ref, candidates.get(ref.key) ?? [], p, deps, kv);
-    if (offers.length === 0) { result.uncovered.push({ ...where(ref), blocking: ref.blocking }); continue; }
+    if (offers.length === 0) { result.uncovered.push({ ...where(ref), blocking: ref.blocking, reason: 'none-offered' }); continue; }
     result.offers.set(ref.key, offers);
     (ref.offered ? result.aiKeys : result.codeKeys).push(ref.key);
   }
@@ -384,8 +463,6 @@ function repairRequest(req: AiRequest, problems: readonly string[], kv: readonly
 
 // ---------- checking the answer ----------
 
-const shown = (v: unknown) => safeText(String(v), 60);
-
 /**
  * pipegen's own problem lines for the ids and choice values of an answer (ruling S3): a key that wasn't offered, answered twice
  * or not at all; a candidate or ranked id not offered for THAT key; a choice value the chosen tool doesn't allow (or a value for a
@@ -406,30 +483,12 @@ export function builderAnswerProblems(answer: BuilderAnswer, o: BuilderOffers): 
     for (const id of Array.isArray(item.ranked) ? item.ranked : []) {
       if (!offers.some((x) => x.entry.id === id)) out.push(`${key}: ranked: ${shown(id)} was not offered for this need`);
     }
-    const picks = item.choices !== null && typeof item.choices === 'object' ? item.choices : {};
-    for (const [name, v] of Object.entries(picks)) {
-      if (v === null || v === undefined) continue;
-      const aiValues = Object.hasOwn(offer.aiChoices, name) ? offer.aiChoices[name] : undefined;
-      if (aiValues === undefined && !Object.hasOwn(offer.codeChoices, name)) continue;   // a name the chosen tool doesn't have: not used
-      if (aiValues === undefined || !aiValues.includes(v)) out.push(`${key}: choices.${shown(name)}: ${shown(v)} is not one of the values offered for this tool`);
-    }
+    out.push(...offeredPickProblems(key, offer, { choices: item.choices }).choices);   // the one fence (also in specFor)
   }
   for (const key of o.aiKeys) if (!answered.has(key)) out.push(`${key}: no choice was given for this need`);
   const sugIds = new Set(o.suggestions.map((s) => s.id));
   for (const s of Array.isArray(answer?.suggestions) ? answer.suggestions : []) {
     if (typeof s?.id !== 'string' || !sugIds.has(s.id)) out.push(`suggestions: ${shown(s?.id)} was not offered`);
-  }
-  return out;
-}
-
-/** The tuning picks of an item that are not in what was offered for this key and tool (validateSpec checks them against the call's own enum too). */
-function tuningOfferProblems(key: string, offer: Offer, tuning: BuilderAnswer['choices'][number]['tuning']): string[] {
-  const out: string[] = [];
-  for (const [opt, values] of Object.entries(tuning ?? {})) {
-    if (!Array.isArray(values) || values.length === 0) continue;
-    const allowed = Object.hasOwn(offer.tuning, opt) ? offer.tuning[opt] : undefined;
-    if (allowed === undefined) { out.push(`${key}: choices.tuning.${shown(opt)}: this tool has no tuning option with that name for this need`); continue; }
-    values.forEach((v, i) => { if (!allowed.includes(v)) out.push(`${key}: choices.tuning.${shown(opt)}[${i}]: ${shown(v)} is not one of the values offered`); });
   }
   return out;
 }
@@ -446,15 +505,19 @@ function choicesFrom(answer: BuilderAnswer, o: BuilderOffers, p: RepoProfile, fi
     const offers = o.offers.get(item.key) as Offer[];
     const offer = offers.find((x) => x.entry.id === item.candidateId) as Offer;
     const ctx = { profile: p };
-    let spec = specFor(ref, offer, p, { choices: item.choices, tuning: item.tuning });
-    let bad = validateSpec(spec, offer.entry, ctx).map((x) => `${item.key}: ${x}`);
-    if (bad.length === 0) bad = tuningOfferProblems(item.key, offer, item.tuning);
+    // the fence first (specFor refuses anything outside it), then validateSpec against this call's own enums
+    let bad = offeredPickProblems(item.key, offer, { tuning: item.tuning }).tuning;
+    let spec: StepSpec | undefined;
+    if (bad.length === 0) {
+      spec = specFor(ref, offer, p, { choices: item.choices, tuning: item.tuning });
+      bad = validateSpec(spec, offer.entry, ctx).map((x) => `${item.key}: ${x}`);
+    }
     if (bad.length > 0 && final && bad.every(isTuningProblem(item.key))) {
       // ruling S2: tuning still wrong after the repair → the tuning section is dropped (the AI does less: no added rules, no skip)
       spec = specFor(ref, offer, p, { choices: item.choices });
       bad = validateSpec(spec, offer.entry, ctx).map((x) => `${item.key}: ${x}`);
     }
-    if (bad.length > 0) { problems.push(...bad); continue; }
+    if (bad.length > 0 || spec === undefined) { problems.push(...bad); continue; }
     const ranked: ReviewedCandidate[] = [structuredClone(offer.entry.candidate)];
     for (const id of item.ranked) {
       if (ranked.some((c) => c.id === id)) continue;

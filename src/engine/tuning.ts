@@ -129,7 +129,8 @@ const sortedUnique = (xs: readonly string[]): string[] => [...new Set(xs)].sort(
 
 // ---------- the enums ----------
 
-const LANGUAGE_FOLDERS: Readonly<Record<string, readonly string[]>> = { node: ['javascript'], python: ['python'], go: ['go'], java: ['java'], dotnet: ['csharp'], ruby: ['ruby'], php: ['php'] };
+/** The Semgrep rule folder of each language (also the builder's per-service `rules` enum, Plan F F2 fix round 1). */
+export const LANGUAGE_FOLDERS: Readonly<Record<string, readonly string[]>> = { node: ['javascript'], python: ['python'], go: ['go'], java: ['java'], dotnet: ['csharp'], ruby: ['ruby'], php: ['php'] };
 
 function extraRuleFolders(f: Facts): string[] {
   const chosen = f.spec.choices?.rules;

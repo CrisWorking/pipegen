@@ -7,8 +7,9 @@ import { AiError } from '../src/ai/errors.js';
 import { BUILDER_NEEDS_TAG } from '../src/ai/prompts/builder.js';
 import { bundleCode, bundleText, type CodeBundle } from '../src/ai/redact.js';
 import {
-  ADVISORY_TOOLS, BuilderError, buildChoices, builderAnswerProblems, builderOffers, type BuilderDeps, type Choice,
+  ADVISORY_TOOLS, BuilderError, buildChoices, builderAnswerProblems, builderOffers, specFor, type BuilderDeps, type Choice,
 } from '../src/debate/builder.js';
+import { BUILDER_SYSTEM } from '../src/ai/prompts/builder.js';
 import { cleanForDoc } from '../src/debate/clean.js';
 import { NeedKeyError, needKeyOf } from '../src/debate/need-ref.js';
 import { needLanguage } from '../src/engine/discover.js';
@@ -118,7 +119,7 @@ function answerFor(req: AiRequest, picks: Pick[], suggestions: { id: string; why
 
 const DEFAULT_PICKS: Pick[] = [
   { key: 'secrets', candidateId: 'betterleaks', ranked: ['betterleaks', 'gitleaks'] },
-  { key: 'sast--api', candidateId: 'semgrep', ranked: ['semgrep', 'bandit'], choices: { rules: 'python' } },
+  { key: 'sast--api', candidateId: 'semgrep', ranked: ['semgrep', 'bandit'] },   // rules: code fills python (one value for a python service)
   { key: 'sast--web', candidateId: 'semgrep', choices: { rules: 'javascript' } },
   { key: 'coverage--web', candidateId: 'vitest-coverage', ranked: ['vitest-coverage', 'c8'] },
   { key: 'dast--web', candidateId: 'zap-baseline' },
@@ -236,12 +237,12 @@ describe('builder (plan Task 1)', () => {
   });
 
   it('builder: invalid step spec → retry with problems listed', async () => {
-    // python rules are in the union enum (offered for api), not in web's enum: validateSpec refuses, the AI is asked once more
-    const bad = DEFAULT_PICKS.map((p) => (p.key === 'sast--web' ? { ...p, tuning: { 'extra-rules': ['python'] } } : p));
+    // javascript is in web's offered union (over every rules value), but with rules javascript it adds nothing: validateSpec refuses, the AI is asked once more
+    const bad = DEFAULT_PICKS.map((p) => (p.key === 'sast--web' ? { ...p, tuning: { 'extra-rules': ['javascript'] } } : p));
     const { ai, calls } = scripted(ok(bad), ok());
     const r = await buildChoices(NEEDS, candidatesFor(NEEDS), P, bundle, ai, deps());
     expect(calls).toHaveLength(2);
-    expect(calls[1]!.user).toMatch(/sast--web: choices\.tuning\.extra-rules\[0\]: "python" is not one of the values/);
+    expect(calls[1]!.user).toMatch(/sast--web: choices\.tuning\.extra-rules\[0\]: "javascript" is not one of the values/);
     expect(byKey(r.choices, 'sast--web').chosen.choices.tuning).toBeUndefined();
   });
 
@@ -382,7 +383,7 @@ describe('builder (added, pre-flight §7)', () => {
     // extra-rules: the union over every `rules` value (javascript and typescript for a TypeScript node service); the generated folder of web only
     expect(webSemgrep.tuning).toEqual({ 'extra-rules': ['typescript', 'javascript'], 'skip-generated': ['web/dist'] });
     const apiSemgrep = offers.offers.get('sast--api')!.find((o) => o.entry.id === 'semgrep')!;
-    expect(apiSemgrep.tuning).toEqual({ 'extra-rules': ['python'] });   // no generated folder under api: skip-generated left out
+    expect(apiSemgrep.tuning).toEqual({});   // python rules are the base set (I1): nothing extra; no generated folder under api: skip-generated left out
     const bandit = offers.offers.get('sast--api')!.find((o) => o.entry.id === 'bandit')!;
     expect(bandit.tuning).toEqual({});
     const zap = offers.offers.get('dast--web')!.find((o) => o.entry.id === 'zap-baseline')!;
@@ -465,7 +466,10 @@ describe('builder (added, pre-flight §7)', () => {
     map.set('image-scan--web', []);
     const { ai, calls } = scripted(ok());
     const r = await buildChoices(needs, map, P, bundle, ai, deps());
-    expect(r.uncovered).toEqual([{ key: 'image-scan--web', needId: 'image-scan', service: 'web', blocking: true }]);
+    expect(r.uncovered).toEqual([
+      { key: 'unit-tests--api', needId: 'unit-tests', service: 'api', blocking: true, reason: 'no-reviewed-tool' },
+      { key: 'image-scan--web', needId: 'image-scan', service: 'web', blocking: true, reason: 'none-offered' },
+    ]);
     expect(r.choices.map((c) => c.key)).not.toContain('image-scan--web');
     expect(schemaNames(calls[0]!).keys).not.toContain('image-scan--web');
 
@@ -479,7 +483,7 @@ describe('builder (added, pre-flight §7)', () => {
     expect(withTrivy.get('image-scan--web')!.map((c) => c.id)).toEqual(['trivy-image']);
     const offers = builderOffers(needs, withTrivy, P, deps({ reviewed: unproven }));
     expect(offers.offers.get('image-scan--web')).toBeUndefined();
-    expect(offers.uncovered.map((u) => u.key)).toEqual(['image-scan--web']);
+    expect(offers.uncovered.map((u) => u.key)).toEqual(['unit-tests--api', 'image-scan--web']);
   });
 
   it('builder: project-script and pipegen-job needs are not sent to the AI', async () => {
@@ -489,13 +493,14 @@ describe('builder (added, pre-flight §7)', () => {
     const { ai, calls } = scripted(ok());
     const r = await buildChoices(needs, candidatesFor(needs, p), p, bundle, ai, deps());
     expect(r.byCode).toEqual([
-      { key: 'unit-tests--web', needId: 'unit-tests', service: 'web', kind: 'project-script' },
-      { key: 'unit-tests--api', needId: 'unit-tests', service: 'api', kind: 'no-reviewed-tool' },
-      { key: 'gate', needId: 'gate', kind: 'pipegen-job' },
-      { key: 'signing--web', needId: 'signing', service: 'web', kind: 'pipegen-job' },
-      { key: 'deploy-verify--web', needId: 'deploy-verify', service: 'web', kind: 'pipegen-job' },
-      { key: 'lint--web', needId: 'lint', service: 'web', kind: 'project-script' },
+      { key: 'unit-tests--web', needId: 'unit-tests', service: 'web', kind: 'project-script', blocking: true },
+      { key: 'gate', needId: 'gate', kind: 'pipegen-job', blocking: true },
+      { key: 'signing--web', needId: 'signing', service: 'web', kind: 'pipegen-job', blocking: true },
+      { key: 'deploy-verify--web', needId: 'deploy-verify', service: 'web', kind: 'pipegen-job', blocking: true },
+      { key: 'lint--web', needId: 'lint', service: 'web', kind: 'project-script', blocking: true },
     ]);
+    // m2: a blocking need whose check has no reviewed entry at all is reported like uncovered, never as covered by code
+    expect(r.uncovered).toContainEqual({ key: 'unit-tests--api', needId: 'unit-tests', service: 'api', blocking: true, reason: 'no-reviewed-tool' });
     const keys = schemaNames(calls[0]!).keys;
     const block = calls[0]!.user.slice(calls[0]!.user.indexOf(`<${BUILDER_NEEDS_TAG}>`), calls[0]!.user.indexOf(`</${BUILDER_NEEDS_TAG}>`));
     expect(block).toContain('"sast--api"');
@@ -658,7 +663,7 @@ describe('builder (added, pre-flight §7)', () => {
     const hidden = r.choices.find((c) => c.chosen.service === hiddenName)!;
     expect(hidden.by).toBe('pipegen');
     expect(hidden.chosen.tool.id).toBe('semgrep');
-    expect(hidden.chosen.choices).toEqual({ rules: 'javascript' });   // the template's first value, no tuning
+    expect(hidden.chosen.choices).toEqual({ rules: 'python' });   // the service's own language (I1), no tuning
     expect(hidden.ranked.map((c) => c.id)).toEqual(['semgrep', 'bandit']);
     expect(hidden.reason).not.toContain(hiddenName);
     expect(pipegenDocProblems(`# PIPEGEN\n\n- ${hidden.reason}\n`, DOC_OPTS)).toEqual([]);
@@ -687,5 +692,116 @@ describe('builder (added, pre-flight §7)', () => {
     const r = await buildChoices(needs, candidatesFor(needs), P, bundle, ai, deps());
     expect(byKey(r.choices, 'image-scan--web').chosen.choices).toEqual({ severity: 'HIGH,CRITICAL', 'ignore-unfixed': 'false' });
     expect(byKey(r.choices, 'image-build--web').chosen.choices).toEqual({ push: 'false' });
+  });
+});
+
+// ---------- fix round 1 (review-F2.md, controller ruling F2-R12) ----------
+
+describe('builder (fix round 1)', () => {
+  it('builder: semgrep rules follow the service language, for the AI and for code defaults (I1)', async () => {
+    const plainNode = svc({ name: 'plain', path: 'plain' });
+    const p = profile({ services: [API, WEB, plainNode] });
+    const needs = [need('sast', 'merge', 'api'), need('sast', 'merge', 'web'), need('sast', 'merge', 'plain')];
+    const o = builderOffers(needs, candidatesFor(needs, p), p, deps());
+    const semgrep = (key: string) => o.offers.get(key)!.find((x) => x.entry.id === 'semgrep')!;
+    expect(semgrep('sast--api').aiChoices).toEqual({});
+    expect(semgrep('sast--api').codeChoices).toEqual({ rules: 'python' });
+    expect(semgrep('sast--web').aiChoices).toEqual({ rules: ['javascript', 'typescript'] });   // TypeScript service: both node folders
+    expect(semgrep('sast--plain').codeChoices).toEqual({ rules: 'javascript' });
+    // the code defaults (specFor, the code-decided path, Plan G's next tool) take the service's language
+    const ref = (key: string) => o.refs.find((r) => r.key === key)!;
+    expect(specFor(ref('sast--api'), semgrep('sast--api'), p).choices.rules).toBe('python');
+    expect(specFor(ref('sast--plain'), semgrep('sast--plain'), p).choices.rules).toBe('javascript');
+    // the AI path: another language's rules are refused by code (and are not in the schema enum)
+    const item = (key: string, rules: string) => ({ key, candidateId: 'semgrep', ranked: [], because: 'x', choices: { rules }, tuning: {} });
+    expect(builderAnswerProblems({ choices: [item('sast--web', 'python'), item('sast--api', 'python'), item('sast--plain', 'javascript')], suggestions: [] }, o))
+      .toEqual(['sast--web: choices.rules: python is not one of the values offered for this tool']);
+    expect(builderAnswerProblems({ choices: [item('sast--web', 'javascript'), item('sast--api', 'typescript'), item('sast--plain', 'javascript')], suggestions: [] }, o))
+      .toEqual(['sast--api: choices.rules: typescript is not one of the values offered for this tool']);
+    const { ai, calls } = scripted((req) => answerFor(req, [{ key: 'sast--api', candidateId: 'semgrep' }, { key: 'sast--web', candidateId: 'semgrep' }, { key: 'sast--plain', candidateId: 'semgrep' }]));
+    const r = await buildChoices(needs, candidatesFor(needs, p), p, bundle, ai, deps());
+    expect(schemaNames(calls[0]!).choices).toEqual(['rules']);
+    const enumOfRules = ((calls[0]!.jsonSchema as { properties: { choices: { items: { properties: { choices: { properties: { rules: { anyOf?: { enum?: string[] }[]; enum?: string[] } } } } } } } })
+      .properties.choices.items.properties.choices.properties.rules);
+    expect(JSON.stringify(enumOfRules)).not.toContain('python');
+    expect(byKey(r.choices, 'sast--api').chosen.choices.rules).toBe('python');
+    expect(byKey(r.choices, 'sast--web').chosen.choices.rules).toBe('javascript');
+    expect(byKey(r.choices, 'sast--plain').chosen.choices.rules).toBe('javascript');
+    // a folder's other languages count too; a repo-wide key takes every service's languages
+    const mixed = profile({ services: [svc({ name: 'mix', path: 'mix', language: 'python', packageManager: 'pip', alsoLanguages: ['node'] })] });
+    const mixNeeds = [need('sast', 'merge', 'mix')];
+    const mixOffer = builderOffers(mixNeeds, candidatesFor(mixNeeds, mixed), mixed, deps()).offers.get('sast--mix')!.find((x) => x.entry.id === 'semgrep')!;
+    expect(mixOffer.aiChoices).toEqual({ rules: ['javascript', 'python'] });
+    const nodeOnly = profile({ services: [plainNode, svc({ name: 'other', path: 'other' })] });
+    const wide = [need('sast', 'merge', undefined)];
+    const wideOffer = builderOffers(wide, candidatesFor(wide, nodeOnly), nodeOnly, deps()).offers.get('sast')!.find((x) => x.entry.id === 'semgrep')!;
+    expect(wideOffer.codeChoices).toEqual({ rules: 'javascript' });
+  });
+
+  it('builder: egress is decided by code, never by the AI; no answer can set Bullfrog choices (I2)', async () => {
+    const egress = need('egress', 'deploy', 'web', true);
+    const needs = [...NEEDS, egress];
+    const map = candidatesFor(needs);
+    expect(map.get('egress--web')!.map((c) => c.id)).toEqual(['bullfrog']);
+    const o = builderOffers(needs, map, P, deps());
+    expect(o.byCode).toContainEqual({ key: 'egress--web', needId: 'egress', service: 'web', kind: 'pipegen-egress', blocking: true });
+    expect(o.offers.get('egress--web')).toBeUndefined();
+    expect(o.aiKeys).not.toContain('egress--web');
+    expect(builderAnswerProblems({ choices: [{ key: 'egress--web', candidateId: 'bullfrog', ranked: [], because: 'x', choices: { 'allowed-domains': 'osv' }, tuning: {} }], suggestions: [] }, o))
+      .toContain('egress--web: this need was not offered');
+    const { ai, calls } = scripted(ok());
+    const r = await buildChoices(needs, map, P, bundle, ai, deps());
+    expect(schemaNames(calls[0]!).keys).not.toContain('egress--web');
+    expect(schemaNames(calls[0]!).ids).not.toContain('bullfrog');
+    const all = propertyNames(calls[0]!.jsonSchema);
+    expect(all).not.toContain('allowed-domains');
+    expect(all).not.toContain('allowed-ips');
+    expect(r.choices.some((c) => c.chosen.tool.id === 'bullfrog')).toBe(false);
+    // an egress tool is never offered for any key, even if a map lists it under another need
+    const wrongKey = new Map(candidatesFor(NEEDS));
+    wrongKey.set('sast--web', [...wrongKey.get('sast--web')!, ...map.get('egress--web')!]);
+    expect(builderOffers(NEEDS, wrongKey, P, deps()).offers.get('sast--web')!.map((x) => x.entry.id)).toEqual(['semgrep']);
+    // even an egress tool that also claimed another check is never offered for it
+    const twoHats = REVIEWED.map((t) => (t.id === 'bullfrog' ? { ...t, categories: ['egress', 'sast'], languages: ['any' as const] } : t));
+    expect(builderOffers(NEEDS, wrongKey, P, deps({ reviewed: twoHats })).offers.get('sast--web')!.map((x) => x.entry.id)).toEqual(['semgrep']);
+  });
+
+  it('builder: specFor uses only values offered for that key; any other pick is refused, never rendered (I3)', () => {
+    const scan = need('image-scan', 'merge', 'web', true);
+    const build = need('image-build', 'merge', 'web', true);
+    const needs = [scan, build, need('sast', 'merge', 'web'), need('sast', 'merge', 'api')];
+    const o = builderOffers(needs, candidatesFor(needs), P, deps());
+    const ref = (key: string) => o.refs.find((r) => r.key === key)!;
+    const offer = (key: string, id: string) => o.offers.get(key)!.find((x) => x.entry.id === id)!;
+    const trivy = offer('image-scan--web', 'trivy-image');
+    expect(() => specFor(ref('image-scan--web'), trivy, P, { choices: { severity: 'CRITICAL' } })).toThrow(BuilderError);
+    expect(() => specFor(ref('image-scan--web'), trivy, P, { choices: { 'ignore-unfixed': 'true' } })).toThrow(BuilderError);
+    expect(() => specFor(ref('image-build--web'), offer('image-build--web', 'docker-build-push-action'), P, { choices: { push: 'true' } })).toThrow(BuilderError);
+    expect(() => specFor(ref('sast--api'), offer('sast--api', 'semgrep'), P, { choices: { rules: 'javascript' } })).toThrow(BuilderError);
+    expect(() => specFor(ref('sast--web'), offer('sast--web', 'semgrep'), P, { tuning: { 'extra-rules': ['python'] } })).toThrow(BuilderError);
+    expect(() => specFor(ref('sast--web'), offer('sast--web', 'semgrep'), P, { tuning: { 'not-an-option': ['x'] } })).toThrow(BuilderError);
+    const err = (() => { try { specFor(ref('image-scan--web'), trivy, P, { choices: { severity: 'CRITICAL' } }); } catch (e) { return e as BuilderError; } return null; })();
+    expect(err!.problems).toEqual(['image-scan--web: choices.severity: CRITICAL is not one of the values offered for this tool']);
+    // offered picks, and the code value given back as it is, are fine
+    expect(specFor(ref('image-scan--web'), trivy, P, { choices: { severity: 'MEDIUM,HIGH,CRITICAL', 'ignore-unfixed': 'false' } }).choices)
+      .toEqual({ severity: 'MEDIUM,HIGH,CRITICAL', 'ignore-unfixed': 'false' });
+    expect(specFor(ref('sast--web'), offer('sast--web', 'semgrep'), P, { choices: { rules: 'typescript' }, tuning: { 'extra-rules': ['javascript'], 'skip-generated': null } }).choices)
+      .toEqual({ rules: 'typescript', tuning: { 'extra-rules': ['javascript'] } });
+  });
+
+  it('builder: a tuning value offered for another key is refused by the fence and repaired, never built', async () => {
+    // web/dist is in the union enum (offered for sast--web); semgrep on sast--api has no such folder
+    const bad = DEFAULT_PICKS.map((p) => (p.key === 'sast--api' ? { ...p, tuning: { 'skip-generated': ['web/dist'] } } : p));
+    const { ai, calls } = scripted(ok(bad), ok());
+    const r = await buildChoices(NEEDS, candidatesFor(NEEDS), P, bundle, ai, deps());
+    expect(calls).toHaveLength(2);
+    expect(calls[1]!.user).toContain('sast--api: choices.tuning.skip-generated: this tool has no tuning option with that name for this need');
+    expect(byKey(r.choices, 'sast--api').chosen.choices.tuning).toBeUndefined();
+  });
+
+  it('builder: the system text names folder paths and suggested repos as untrusted data (m1)', () => {
+    expect(BUILDER_SYSTEM).toMatch(/folder/);
+    expect(BUILDER_SYSTEM).toMatch(/suggest/);
+    expect(BUILDER_SYSTEM).toMatch(/untrusted|data only/);
   });
 });
