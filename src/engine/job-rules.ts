@@ -576,7 +576,7 @@ const BUILD_PUSH_USES_RE = new RegExp(`^${PLATFORM_USES['build-push'].replace(/[
 const isBuildPushStep = (s: RenderedStep): boolean => s.run === undefined && s.uses !== undefined && BUILD_PUSH_USES_RE.test(s.uses);
 
 /**
- * B6: in the job `image-build--<slug>` the reviewed build-push step builds the repository's Dockerfile inside BuildKit's own containers
+ * B6 (and controller ruling G2-R-sec 1): in the job `image-build--<slug>`, every step before the build known harmless, the reviewed build-push step builds the repository's Dockerfile inside BuildKit's own containers
  * (nothing it runs reaches the runner), and right after it, as the job's last two steps, come exactly the archive step and the upload of
  * this service's archive folder (no scrub: it is an image, not a result; the scanners check its sha256). The index where that tail starts,
  * or null when the job is not an image build or its tail is not exactly this. Anything else in the job is held to the order rule as usual.
@@ -589,7 +589,10 @@ function imageBuildTailAt(steps: readonly RenderedStep[], jobId: string | undefi
   const artifact = imageArchiveArtifact(s);
   const folder = `\${{ runner.temp }}/pipegen-out/${artifact}`;
   const upload = uploadFolder(u) === artifact && u.with?.name === artifact && u.with?.path === folder && u.if === undefined && u['continue-on-error'] === undefined;
-  return isBuildPushStep(b) && isImageArchiveStep(a) && upload ? n - 2 : null;
+  // controller ruling G2-R-sec 1: only when the build is the job's one step that is not known harmless; repo code anywhere before the tail
+  // could rewrite what the archive step saves or uploads, so the tail then follows the order rule like any other step
+  const before = steps.slice(0, n - 3).every(isKnownHarmless);
+  return before && isBuildPushStep(b) && isImageArchiveStep(a) && upload ? n - 2 : null;
 }
 /** Plan G's job outputs (G22, three of four; the nested not-proven output is Plan H's): each on its own job only, from its own step only. */
 const G_OUTPUTS: Readonly<Record<string, { job: string; step: string; is: (s: RenderedStep) => boolean }>> = Object.freeze({

@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 import { aiChoiceNames, CODE_FILLED_CHOICES } from '../src/create/coverage.js';
 import { builderOffers } from '../src/debate/builder.js';
 import { jobIdFor } from '../src/engine/gate-job-list.js';
-import { createdPathProblem, imageBuildJobId, IMAGE_ARCHIVE_STEP_ID, IMAGE_SHA_OUTPUT, jobOutputsFor, NARROWING_CHOICES, type RenderedStep } from '../src/engine/job-rules.js';
+import { checkExpressions, checkJobOrder, createdPathProblem, imageBuildJobId, jobOutputsProblems, NO_SCANS, SIGN_STEP_ENV, VERIFY_STEP_ENV, IMAGE_ARCHIVE_STEP_ID, IMAGE_SHA_OUTPUT, jobOutputsFor, NARROWING_CHOICES, type RenderedStep } from '../src/engine/job-rules.js';
 import { referee, type Linters } from '../src/engine/referee.js';
 import { imageArchiveArtifact, imageBuildTag, renderImageArchiveScan, renderImageBuild } from '../src/engine/image-handoff.js';
 import { attestSignerWorkflow, COSIGN_ID, GH_ID, imageDigestArtifact, keylessIdentity, pubKeySha256, renderSignSteps, renderVerifySteps } from '../src/engine/signing.js';
@@ -121,6 +121,9 @@ describe('G2: signing and verification steps (B3 b, d)', () => {
     expect(show(await runWith([signFile({ sign: signJob(keyless, { environment: undefined, permissions: { contents: 'read', [OIDC]: 'write' } }) })], klDraft))).toBe('');
     expect((await runWith([signFile({ sign: signJob(keyEnv) })], klDraft)).ok).toBe(false);
     expect((await runWith([signFile({ 'image-publish': signJob(keyless, { environment: undefined, permissions: SIGN_PERMS }) })], klDraft)).ok).toBe(false);
+    // a job with no power (contents: read) and no row of its own: the placement rule alone refuses the sign step there
+    const plain = await runWith([signFile({ lint: job([digestDownload(), ...keyless]) })], klDraft);
+    expect(has(plain, 'permissions', /signs only in the job sign/), show(plain)).toBe(true);
     // keyless on a private repository would put its image names in a public log: refused, whatever the files
     const priv = await runWith([signFile({ sign: signJob(keyless, { environment: undefined, permissions: { contents: 'read', [OIDC]: 'write' } }) })], { ...klDraft, profile: { ...klDraft.profile, private: true } });
     expect(has(priv, 'permissions', /keyless/), show(priv)).toBe(true);
@@ -129,7 +132,7 @@ describe('G2: signing and verification steps (B3 b, d)', () => {
     // the signing key's secrets reach only the sign step, never another step of the job
     const leak = { ...digestDownload(), env: { PIPEGEN_COSIGN_KEY: '${{ secrets.PIPEGEN_COSIGN_KEY }}' } };
     const r = await runWith([rawFile({ sign: job([leak, ...keyEnv], { permissions: SIGN_PERMS, environment: 'pipegen-signing' }) }, { on: { workflow_call: null } }, '.github/workflows/sign.yml')], keDraft);
-    expect(r.ok, show(r)).toBe(false);
+    expect(has(r, 'injection', /signing secret "PIPEGEN_COSIGN_KEY" reaches a step that is not pipegen's sign step/), show(r)).toBe(true);
   });
 
   it('render: cosign verify with the pub-key sha256 literal checked first; gh attestation verify only from the pinned gh entry; only in pipegen-verify', async () => {
@@ -164,7 +167,13 @@ describe('G2: signing and verification steps (B3 b, d)', () => {
     expect(ghSteps[0]?.env?.PIPEGEN_DL_SHA256).toBe('c'.repeat(64));
     const ghRun = lastRun(ghSteps).run as string;
     expect(attestSignerWorkflow('o/pipelines')).toBe('o/pipelines/.github/workflows/pipegen--sign.yml');
-    expect(ghRun).toContain(`"$RUNNER_TEMP/pipegen-bin/pipegen-gh-verify/gh" attestation verify "oci://$ref" --repo 'o/r' --signer-workflow 'o/pipelines/.github/workflows/pipegen--sign.yml'`);
+    // G2-R-sec 2: bound like keyless: the source is the app's default branch, the signer is the central sign workflow AT the central commit
+    // pipegen pinned (a reusable workflow called at a commit signs with that commit), on a GitHub-hosted runner
+    expect(ghRun).toContain(`"$RUNNER_TEMP/pipegen-bin/pipegen-gh-verify/gh" attestation verify "oci://$ref" --repo 'o/r' --source-ref 'refs/heads/main' --signer-workflow 'o/pipelines/.github/workflows/pipegen--sign.yml' --signer-digest '${'a'.repeat(40)}' --deny-self-hosted-runners`);
+    for (const defaultBranch of ['-x', 'a..b', "ma'in", 'ma in', '']) {
+      expect(() => renderVerifySteps(gh, { ...at, profile: { ...at.profile, defaultBranch } }, IMG), defaultBranch).toThrow(RenderError);
+    }
+    expect(() => renderVerifySteps(gh, { ...at, centralPin: { repo: 'o/pipelines', sha: 'main' } }, IMG)).toThrow(RenderError);
     expect(ghRun).not.toMatch(/(?:^|[\s;|&(])gh\s/m);
     expect(lastRun(ghSteps).env).toEqual({ BASH_ENV: '', ENV: '', [GHT_NAME]: '${{ github.token }}' });
     for (const bad of [ghEntry({ id: 'gh-fork' }), ghEntry({ repo: 'evil/cli' }), ghEntry({ reviewed: false } as unknown as Partial<Candidate>), COSIGN]) {
@@ -297,6 +306,14 @@ describe('G2: the image hand-off (B6)', () => {
     expect(noArchive.ok, show(noArchive)).toBe(false);
     const elsewhere = await runWith([imageFile({ 'image-build--app': buildJob(d), 'lint--app': job(renderJobPrelude({}, p).steps, { outputs: { [IMAGE_SHA_OUTPUT]: `\${{ steps.${IMAGE_ARCHIVE_STEP_ID}.outputs.sha256 }}` } }) })], d);
     expect(has(elsewhere, 'injection', /image-sha256/), show(elsewhere)).toBe(true);
+    // G2-R-sec 1: the tail is exempt only after harmless steps and the build: repo code before it puts the archive and upload under the order rule
+    const repoStep: RenderedStep = { id: 'x-repo', name: 'repo code', run: 'npm ci\n', shell: 'bash' };
+    const steps0 = (buildJob(d).steps as RenderedStep[]);
+    expect(checkJobOrder(steps0, { id: 'image-build--app', scans: NO_SCANS })).toEqual([]);
+    const withRepo = [...steps0.slice(0, 1), repoStep, ...steps0.slice(1)];
+    expect(checkJobOrder(withRepo, { id: 'image-build--app', scans: NO_SCANS }).join('\n')).toMatch(/comes after the repo-code step "repo code"/);
+    const injected = await runWith([rawFile({ 'image-build--app': buildJob(d, {}, (x) => [...x.slice(0, 1), repoStep, ...x.slice(1)]) })], d);
+    expect(has(injected, 'injection', /comes after the repo-code step/), show(injected)).toBe(true);
     // the archive step of another service's job, or in a job that is not an image build
     const moved = await runWith([imageFile({ 'image-scan--app': scanJob(d, {}, (x) => [...renderImageBuild(buildSpec(), BUILD_PUSH, p, ictx(d)).steps.filter((y) => y.id === IMAGE_ARCHIVE_STEP_ID), ...x]) })], d);
     expect(moved.ok, show(moved)).toBe(false);
@@ -324,6 +341,20 @@ describe('G2: the image hand-off (B6)', () => {
     // the same, with the twin in another file of the same pipeline
     const split = await runWith([workflow({ 'image-scan--app': head(X) }), { ...workflow({ 'base-scan': base(X) }), path: '.github/workflows/pipegen-merge.yml' }], d);
     expect(has(split, 'not-gate-readable', /base twin/), show(split)).toBe(true);
+    // G2-R-sec 3: compared on the parsed reference and the digest, not the text: another spelling of the same image, or another name with
+    // the same digest, is the same input
+    const D1 = `sha256:${'1'.repeat(64)}`;
+    for (const [h, b] of [[`docker.io/library/nginx@${D1}`, `nginx@${D1}`], [`nginx@${D1}`, `index.docker.io/library/nginx@${D1}`], [`library/nginx@${D1}`, `docker.io/library/nginx@${D1}`], [X, `ghcr.io/o/other@${D1}`], [X, `docker.io/library/nginx@${D1}`]] as const) {
+      const r = await runWith([workflow({ 'image-scan--app': head(h), 'base-scan': base(b) })], d);
+      expect(has(r, 'not-gate-readable', /base twin/), `${h} / ${b}: ${show(r)}`).toBe(true);
+    }
+    // a tag with the digest, or upper case: not a form pipegen writes, so the twin is no step of pipegen's at all
+    for (const b of [`ghcr.io/o/r-app:v1@${D1}`, `GHCR.IO/o/r-app@${D1}`, `ghcr.io/O/r-app@${D1}`]) {
+      const planted = base(Y);
+      const edited = { ...planted, steps: (planted.steps as RenderedStep[]).map((st) => (st.env === undefined ? st : { ...st, env: Object.fromEntries(Object.entries(st.env).map(([k, v]) => [k, v === Y ? b : v])) })) };
+      const r = await runWith([rawFile({ 'image-scan--app': head(X), 'base-scan': edited })], d);
+      expect(r.ok, `${b}: ${show(r)}`).toBe(false);
+    }
     // a base twin with no head step of its check, or next to a head that reads the PR's image archive: nothing to compare, refused
     const alone = await runWith([workflow({ 'base-scan': base(Y) })], d);
     expect(has(alone, 'not-gate-readable', /base twin/), show(alone)).toBe(true);
@@ -378,6 +409,44 @@ describe('G2: the image hand-off (B6)', () => {
     const pub = (w: Record<string, string>): Job => job([...renderJobPrelude({}, p).steps, { ...renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: 'ghcr.io/o/r-app:main' }, { push: 'true' }), with: { ...renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: 'ghcr.io/o/r-app:main' }, { push: 'true' }).with, ...w } }], { permissions: { contents: 'read', packages: 'write' } });
     expect(show(await runWith([imageFile({ 'image-publish': pub({}) })], d))).toBe('');
     expect(has(await runWith([imageFile({ 'image-publish': pub({ file: 'evil/Dockerfile' }) })], d), 'template', /Dockerfile of a service/)).toBe(true);
+  });
+});
+
+describe('G2: the exact forms one by one (the emitter and the shared rules)', () => {
+  it('forms: each expression only on the step id it belongs to; image-sha256 only on an image build; the archive tail exact', async () => {
+    const run = (id: string, env: Record<string, string>): RenderedStep => ({ id, name: 'x', run: 'true\n', shell: 'bash', env });
+    const signId = lastRun(renderSignSteps(COSIGN, 'key-env', IMG)).id as string;
+    const verifyId = lastRun(renderVerifySteps(COSIGN, signingDraft(KEY_ENV), IMG)).id as string;
+    expect(() => checkExpressions(run(signId, { ...SIGN_STEP_ENV }))).not.toThrow();
+    expect(() => checkExpressions(run(verifyId, { ...SIGN_STEP_ENV }))).toThrow(RenderError);
+    expect(() => checkExpressions(run('tool-run-0000000000000000', { ...SIGN_STEP_ENV }))).toThrow(RenderError);
+    expect(() => checkExpressions(run(verifyId, { ...VERIFY_STEP_ENV }))).not.toThrow();
+    expect(() => checkExpressions(run(signId, { ...VERIFY_STEP_ENV }))).toThrow(RenderError);
+    expect(() => checkExpressions(run('pipegen-image-check--app', { PIPEGEN_IMAGE_SHA256: '${{ needs.image-build--app.outputs.image-sha256 }}' }))).not.toThrow();
+    for (const v of ['${{ needs.image-build--web.outputs.image-sha256 }}', '${{ needs.other.outputs.image-sha256 }}', '${{ github.event.head_commit.message }}']) {
+      expect(() => checkExpressions(run('pipegen-image-check--app', { PIPEGEN_IMAGE_SHA256: v })), v).toThrow(RenderError);
+    }
+    const archive = (renderImageBuild(buildSpec(), BUILD_PUSH, p, ictx()).steps)[1] as RenderedStep;
+    const form = `\${{ steps.${IMAGE_ARCHIVE_STEP_ID}.outputs.sha256 }}`;
+    expect(jobOutputsProblems('image-build--app', { [IMAGE_SHA_OUTPUT]: form }, [archive])).toEqual([]);
+    expect(jobOutputsProblems('lint--app', { [IMAGE_SHA_OUTPUT]: form }, [archive]).join('\n')).toMatch(/only an image-build--<service> job/);
+    // the tail: exactly archive then this service's upload, last, right after the build
+    const steps = buildJob().steps as RenderedStep[];
+    const ctxJ = { id: 'image-build--app', scans: NO_SCANS };
+    expect(checkJobOrder(steps, ctxJ)).toEqual([]);
+    expect(checkJobOrder([...steps, steps.at(-1) as RenderedStep], ctxJ).length).toBeGreaterThan(0);
+    const otherUpload = { ...(steps.at(-1) as RenderedStep), with: { ...(steps.at(-1) as RenderedStep).with, name: 'pipegen-out-image-archive--web', path: '${{ runner.temp }}/pipegen-out/pipegen-out-image-archive--web' } };
+    expect(checkJobOrder([...steps.slice(0, -1), otherUpload], ctxJ).length).toBeGreaterThan(0);
+    expect(checkJobOrder(steps, { id: 'image-build--web', scans: NO_SCANS }).length).toBeGreaterThan(0);
+    // the archive step in a plain job of no power: only the placement rule refuses it
+    const d = imageDraft();
+    const plain = await runWith([imageFile({ 'lint--app': job([...renderJobPrelude({}, p).steps, archive]) })], d);
+    expect(has(plain, 'permissions', /is made only in its own job/), show(plain)).toBe(true);
+    // an image build of no service
+    const ghost = await runWith([imageFile({ 'image-build--ghost': buildJob(d) })], d);
+    expect(has(ghost, 'template', /image build of no service/), show(ghost)).toBe(true);
+    // an archive scan has no base twin
+    expect(() => renderImageArchiveScan(scanSpec(), TRIVY, p, { ...ictx(), base: true })).toThrow(/no base twin/);
   });
 });
 
@@ -463,12 +532,18 @@ describe('G2: no narrowing value for a blocking need (F2-R11)', () => {
         }
       }
     }
-    expect(narrowed).toBeGreaterThanOrEqual(4);   // trivy-image CRITICAL and ignore-unfixed true, trivy-config CRITICAL, build-push push true
+    expect(narrowed).toBeGreaterThanOrEqual(4);
+    // a list whose first (default) value narrows: refused with no choice given, for a blocking need
+    const oldOrder = { ...TRIVY, choices: { ...TRIVY.choices, severity: ['CRITICAL', 'HIGH,CRITICAL'] } };
+    expect(() => renderStep(scanSpec(), oldOrder, p, ctxs[0] as RenderContext)).toThrow(/narrow/);
+    expect(() => renderStep(scanSpec(), oldOrder, p, { ...(ctxs[0] as RenderContext), blocking: false })).not.toThrow();   // trivy-image CRITICAL and ignore-unfixed true, trivy-config CRITICAL, build-push push true
     // the referee: a file holding a narrowed scan for a blocking need is not pipegen's step, and a blocking action spec with one is refused
     const d = draftOf({ profile: imgProf, needs: [needOf('iac')], steps: [specFor(entry('trivy-config'), { needId: 'iac', choices: { severity: 'CRITICAL' } })] });
     const narrowSteps = renderStep(d.steps[0] as StepSpec, entry('trivy-config'), p, { profile: imgProf, blocking: false }).steps;
     const r = await runWith([workflow({ iac: job([...renderJobPrelude({}, p).steps, ...narrowSteps]) })], d);
     expect(r.ok, show(r)).toBe(false);
+    expect(r.notes.some((n) => /narrow a blocking check/.test(n)), r.notes.join('\n')).toBe(true);
+    expect(has(r, 'unreviewed', /not a step pipegen renders/), show(r)).toBe(true);
     const push = await runWith([], draftOf({ profile: imgProf, needs: [needOf('image-build', 'app')], steps: [buildSpec('app', { push: 'true' })] }));
     expect(has(push, 'unreviewed', /narrow/), show(push)).toBe(true);
     // a non-blocking need's action spec may push (image-publish's own job is judged by its binding)

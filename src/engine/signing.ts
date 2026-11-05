@@ -40,6 +40,7 @@ export const imageDigestArtifact = (service: string): string => resultArtifactNa
 export type SignedImage = SigningPlan['images'][number];
 
 const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+const COMMIT_RE = /^[0-9a-f]{40}$/;
 /** The image repository as signed: ghcr.io or docker.io, lower-case path segments, no tag, no digest (the attest subject-name rule, tighter). */
 const IMAGE_REPO_RE = /^(?:ghcr\.io|docker\.io)(?:\/[a-z0-9]+(?:[._-][a-z0-9]+)*){1,10}$/;
 /** A branch name as it may appear inside a single-quoted identity: plain characters only. */
@@ -130,6 +131,13 @@ export function renderVerifySteps(tool: ReviewedTool, draft: PipelineDraft, imag
     const central = draft.centralPin?.repo;
     if (central === undefined) throw new RenderError('Attest mode verifies against the central sign workflow, and the draft has no central pin.');
     const signer = attestSignerWorkflow(central);
+    // controller ruling G2-R-sec 2: bound like keyless. The source is the app's default branch; the signer is the central sign workflow at
+    // the commit pipegen pinned (a reusable workflow called at a commit signs with that commit, so --signer-digest binds its ref; gh's
+    // --signer-workflow takes no ref); never a self-hosted runner. Flags checked against gh 2.87.3's help; the pinned entry's version: live checklist.
+    const centralSha = draft.centralPin?.sha;
+    if (typeof centralSha !== 'string' || !COMMIT_RE.test(centralSha)) throw new RenderError('Attest mode binds the signer to the central commit pipegen pinned, and the draft has no 40-character central commit.');
+    const branch = draft.profile.defaultBranch;
+    if (typeof branch !== 'string' || !BRANCH_RE.test(branch)) throw new RenderError(`The default branch ${show(String(branch))} is not a plain branch name, so the attestation's source ref can not be bound.`);
     const app = `${draft.profile.owner}/${draft.profile.repo}`;
     if (!isGitHubRepo(app)) throw new RenderError(`The repository ${show(app)} is not a plain GitHub owner/name.`);
     const install = releaseInstallStep(tool, 'pipegen-gh-verify');
@@ -137,7 +145,7 @@ export function renderVerifySteps(tool: ReviewedTool, draft: PipelineDraft, imag
       ...HEAD, ...refLines(repo, artifact),
       // a fresh config folder: the runner's own gh login or config is never read
       'ghcfg="$(mktemp -d "$RUNNER_TEMP/pipegen-gh.XXXXXX")"',
-      `GH_TOKEN="$PIPEGEN_GH_TOKEN" GH_CONFIG_DIR="$ghcfg" GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 "${install.bin}" attestation verify "oci://$ref" --repo ${q(app)} --signer-workflow ${q(signer)}`,
+      `GH_TOKEN="$PIPEGEN_GH_TOKEN" GH_CONFIG_DIR="$ghcfg" GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 "${install.bin}" attestation verify "oci://$ref" --repo ${q(app)} --source-ref ${q(`refs/heads/${branch}`)} --signer-workflow ${q(signer)} --signer-digest ${q(centralSha)} --deny-self-hosted-runners`,
     ], { PIPEGEN_GH_TOKEN: VERIFY_STEP_ENV.PIPEGEN_GH_TOKEN as string })];
   }
   reviewedRelease(tool, COSIGN_ID, COSIGN_REPO, 'cosign');

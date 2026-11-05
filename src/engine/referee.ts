@@ -36,7 +36,7 @@ import { ArtifactNameError, slug } from './artifact-names.js';
 import { FINDINGS_CATEGORIES, gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES, readableFormat, type JobListEntry } from './gate-job-list.js';
 import { GATE_JSON_INPUTS, gateStepInputs, NIGHTLY_JSON_INPUTS, nightlyStepInputs } from './gate-inputs.js';
 import { runLinters } from './linters.js';
-import { COMMIT_SHA_RE } from './names.js';
+import { COMMIT_SHA_RE, parseImageRef } from './names.js';
 import { NEED_ID_CATEGORY, toolCoversNeed } from './need-ids.js';
 import { PLATFORM_ACTION_IDS, type PlatformActions } from './pin.js';
 import { APP_RUNNING_CATEGORIES, renderRangeScan, TRIVY_LAUNCH_RE } from './render-cli.js';
@@ -375,7 +375,7 @@ interface Expectations {
   /** every steps job judged, in every file */
   jobs: JobRecord[];
   /** C-MUST-1 (G2): the image or URL slot value of every recognised scan step, by source, for the base-twin rule */
-  twinInputs: { source: string; value: string; file: CreatedFile }[];
+  twinInputs: { source: string; keys: string[]; file: CreatedFile }[];
 }
 
 const coreOf = (s: RenderedStep): Obj => ({ id: s.id, uses: s.uses, with: s.with, run: s.run, shell: s.shell, env: s.env, 'working-directory': s['working-directory'] });
@@ -1485,9 +1485,9 @@ function judgeStep(fc: FileCtx, where: string, raw: unknown): Judged {
     else {
       match = r;
       // C-MUST-1 (G2): the image or URL a scan step reads, for the base-twin rule (judgeBaseTwins)
-      for (const [k, slotKind] of r.slots) if (TWIN_SLOT_KINDS.has(slotKind) && typeof env[k] === 'string') fc.ex.twinInputs.push({ source: r.source, value: env[k] as string, file: fc.file });
+      for (const [k, slotKind] of r.slots) if (TWIN_SLOT_KINDS.has(slotKind) && typeof env[k] === 'string') fc.ex.twinInputs.push({ source: r.source, keys: twinKeys(slotKind, env[k] as string), file: fc.file });
       // an archive scan reads the PR's own image with no input a base twin could be compared with (B6)
-      if (r.source.endsWith(ARCHIVE_SUFFIX)) fc.ex.twinInputs.push({ source: r.source, value: '', file: fc.file });
+      if (r.source.endsWith(ARCHIVE_SUFFIX)) fc.ex.twinInputs.push({ source: r.source, keys: [], file: fc.file });
       if (r.source === RUNTIME_ENV_SOURCE) fc.dbPwOk += dbPwCount(JSON.stringify(raw));
       // G2 (B6): an archive scan is the head check itself, read from the archive
       if (r.final) fc.ex.matched.add(r.source.endsWith(ARCHIVE_SUFFIX) ? r.source.slice(0, -ARCHIVE_SUFFIX.length) : r.source);
@@ -1779,6 +1779,28 @@ function judgeAction(fc: FileCtx, js: Obj): void {
  * equals one a head step of the same check reads (in any file of the pipeline), when the head reads the PR's image archive (no input to
  * compare with: B6 has no base build yet), or when no head step of the check is there at all (fail closed).
  */
+/**
+ * Controller ruling G2-R-sec 3: what a twin input is compared on, never its text. An image: its sha256 digest (lower case) and its parsed
+ * reference (parseImageRef: registry aliases and docker.io/library folded) with that digest; an unparsable one keeps a key of its own text
+ * (the slot check refuses it anyway). A URL: the loopback app on its port (localhost and 127.0.0.1 are one host; the path does not matter).
+ * Two inputs are the same when any key is shared.
+ */
+function twinKeys(kind: SlotKind, value: string): string[] {
+  if (kind === 'image-digest') {
+    const at = value.lastIndexOf('@');
+    const digest = /^sha256:[0-9a-f]{64}$/i.test(value.slice(at + 1)) ? value.slice(at + 1).toLowerCase() : null;
+    const ref = at > 0 ? parseImageRef(value.slice(0, at)) : null;
+    return [`text:${value.toLowerCase()}`, ...(digest === null ? [] : [`digest:${digest}`]), ...(ref === null || digest === null ? [] : [`ref:${ref.display.toLowerCase()}@${digest}`])];
+  }
+  try {
+    const u = new URL(value);
+    const host = u.hostname === '127.0.0.1' || u.hostname.toLowerCase() === 'localhost' ? 'loopback' : u.hostname.toLowerCase();
+    return [`text:${value.toLowerCase()}`, `url:${host}:${u.port === '' ? (u.protocol === 'https:' ? '443' : '80') : u.port}`];
+  } catch {
+    return [`text:${value.toLowerCase()}`];
+  }
+}
+
 function judgeBaseTwins(ex: Expectations, add: Add): void {
   for (const b of ex.twinInputs) {
     if (!b.source.endsWith(':base')) continue;
@@ -1786,7 +1808,7 @@ function judgeBaseTwins(ex: Expectations, add: Add): void {
     const heads = ex.twinInputs.filter((h) => h.source === head);
     const why = ex.twinInputs.some((h) => h.source === `${head}${ARCHIVE_SUFFIX}`) ? 'the head check reads the pull request\'s own image archive, and pipegen builds no image of the base commit yet'
       : heads.length === 0 ? 'no head step of the same check is there to compare it with'
-        : heads.some((h) => h.value === b.value) ? 'it reads the same input as the head check, so every head finding would look old (a wrong pass)' : null;
+        : heads.some((h) => h.keys.some((k) => b.keys.includes(k))) ? 'it reads the same input as the head check, so every head finding would look old (a wrong pass)' : null;
     if (why !== null) add(b.file.path, 'not-gate-readable', `A base twin of an image or URL scan is refused: ${why}. The base twin must scan the base commit's own image or app; until pipegen builds one there is no base twin.`, undefined, b.file.repo);
   }
 }
