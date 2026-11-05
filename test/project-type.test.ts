@@ -500,3 +500,119 @@ describe('project type: overrides', () => {
     expect(skippedChecks(profile([svc({ name: 'web', scripts: ['start'] })]), CAPS).some((k) => k.category === 'image-scan')).toBe(false);
   });
 });
+
+// ---------- fix round 1 (review J2: I1, I2, I3, controller ruling on unsure) ----------
+
+const vitePkg = (extra: Record<string, unknown> = {}) => pkg({ scripts: { dev: 'vite', build: 'vite build' }, devDependencies: { vite: '7.0.0' }, ...extra });
+const SERVER_JS = "require('http').createServer((q, s) => s.end()).listen(process.env.PORT || 8080);\n";
+
+describe('project type: code pipegen did not read is never "no server sign" (review J2 I1)', () => {
+  it('a code file over the read limit → unsure, the evidence names it', async () => {
+    const shapes: Record<string, string>[] = [
+      { 'package.json': vitePkg(), 'server.js': `${'// pad\n'.repeat(150_000)}${SERVER_JS}` },
+      { 'package.json': nextPkg(), 'next.config.mjs': "export default { output: 'export' };\n", 'app/page.tsx': PAGE, 'tools/big.ts': `${'export const x = 1;\n'.repeat(60_000)}${SERVER_JS}` },
+    ];
+    for (const files of shapes) {
+      const t = await typeOf(files);
+      const big = Object.keys(files).find((f) => (files[f] as string).length > 1_000_000) as string;
+      expect(isStatic(t), big).toBe(false);
+      expect(t.unsure).toBe(true);
+      expect(t.evidence.join('\n')).toContain(`pipegen couldn't read ${big}`);
+    }
+  });
+
+  it('a code line too long to check → unsure, the evidence names the file', async () => {
+    const shapes: Record<string, string>[] = [
+      { 'package.json': vitePkg(), 'server.js': `/*${'x'.repeat(5000)}*/ ${SERVER_JS}` },
+      { 'package.json': pkg({ scripts: { start: 'docusaurus start', build: 'docusaurus build' }, dependencies: { '@docusaurus/core': '3.0.0' } }), 'src/bundle.min.js': `var a=${'1+'.repeat(3000)}1;${SERVER_JS}` },
+    ];
+    for (const files of shapes) {
+      const t = await typeOf(files);
+      expect(isStatic(t)).toBe(false);
+      expect(t.unsure).toBe(true);
+      expect(t.evidence.join('\n')).toMatch(/lines too long for pipegen to check/);
+    }
+  });
+
+  it('a file list cut at the read limit → unsure', async () => {
+    const shapes: Record<string, string>[] = [
+      { 'package.json': vitePkg(), 'src/main.ts': 'export {};\n' },
+      { 'package.json': pkg({ scripts: { build: 'eleventy' }, devDependencies: { '@11ty/eleventy': '3.0.0' } }) },
+    ];
+    for (const files of shapes) {
+      const dir = repo(files);
+      // more files than the listing reads (READ_LIMITS.maxFiles = 20,000): plain pages
+      for (let i = 0; i < 20_001; i++) writeIn(dir, `content/p${Math.floor(i / 1000)}/${i}.md`, '#\n');
+      const t = (await readProject(dir)).services[0]?.projectType as ProjectType;
+      expect(isStatic(t)).toBe(false);
+      expect(t.unsure).toBe(true);
+      expect(t.evidence.join('\n')).toMatch(/listed only part of the files/);
+    }
+  }, 120_000);
+});
+
+describe('project type: another server in the same folder (review J2 I2, I3)', () => {
+  it('a Python, Go or other-language app in the same folder as a static build → unsure server', async () => {
+    const shapes: Record<string, string>[] = [
+      { 'package.json': vitePkg(), 'requirements.txt': 'django==5.0\ngunicorn==22.0\n', 'manage.py': 'import django\n', Procfile: 'web: gunicorn site.wsgi\n' },
+      { 'package.json': vitePkg(), 'go.mod': 'module example.com/app\n\ngo 1.23\n', 'main.go': 'package main\nimport "net/http"\nfunc main() { http.ListenAndServe(":8080", nil) }\n' },
+      { 'package.json': pkg({ scripts: { build: 'vite build' }, devDependencies: { vite: '7.0.0' } }), Gemfile: "source 'https://rubygems.org'\ngem 'sinatra'\n", 'config.ru': 'run App\n' },
+    ];
+    for (const files of shapes) {
+      const p = await profileOf(files);
+      const s = p.services[0] as Service;
+      expect(isStatic(s.projectType as ProjectType), Object.keys(files).join()).toBe(false);
+      expect(s.projectType?.unsure).toBe(true);
+      expect(s.projectType?.types).toContain('server');
+      expect(isRunnable(s)).toBe(true);
+      expect(s.projectType?.evidence.join('\n')).toMatch(/another language's app in the same folder/);
+    }
+  });
+
+  it('a Worker or serverless functions next to the static build → unsure server', async () => {
+    const worker = 'export default { fetch() { return new Response("{}"); } };\n';
+    const shapes: Record<string, string>[] = [
+      { 'package.json': vitePkg({ devDependencies: { vite: '7.0.0', '@cloudflare/vite-plugin': '1.0.0', wrangler: '4.0.0' } }), 'wrangler.jsonc': '{\n  // the API\n  "name": "app",\n  "main": "worker/index.ts",\n}\n', 'worker/index.ts': worker },
+      { 'package.json': vitePkg({ devDependencies: { vite: '7.0.0', wrangler: '4.0.0' } }), 'wrangler.toml': 'name = "app"\nmain = "src/worker.ts"\ncompatibility_date = "2026-01-01"\n', 'src/worker.ts': worker },
+      { 'package.json': vitePkg(), 'wrangler.json': '{ "name": "app", "main": "edge.js" }\n', 'edge.js': worker },
+      { 'package.json': vitePkg(), 'public/_worker.js': worker },
+      { 'package.json': vitePkg(), 'netlify.toml': '[build]\n  publish = "dist"\n  functions = "lambda"\n', 'lambda/hello.js': 'exports.handler = async () => ({ statusCode: 200 });\n' },
+      { 'package.json': vitePkg(), 'vercel.json': '{ "functions": { "server/*.js": { "memory": 128 } } }\n', 'server/hi.js': 'module.exports = (q, s) => s.end();\n' },
+      { 'package.json': vitePkg(), 'firebase.json': '{ "hosting": { "public": "dist", "rewrites": [{ "source": "/api/**", "function": "api" }] } }\n' },
+      { 'package.json': vitePkg({ dependencies: { '@netlify/functions': '3.0.0' } }) },
+      // the Worker plugin alone (its config may sit elsewhere, or come from the plugin's defaults)
+      { 'package.json': vitePkg({ devDependencies: { vite: '7.0.0', '@cloudflare/vite-plugin': '1.0.0' } }), 'src/main.ts': 'export {};\n' },
+    ];
+    for (const files of shapes) {
+      const t = await typeOf(files);
+      expect(isStatic(t), Object.keys(files).join()).toBe(false);
+      expect(t.unsure, Object.keys(files).join()).toBe(true);
+    }
+  });
+
+  it('a Pages-only wrangler config or a hosting-only firebase.json stays static', async () => {
+    const shapes: Record<string, string>[] = [
+      { 'package.json': vitePkg({ devDependencies: { vite: '7.0.0', wrangler: '4.0.0' } }), 'wrangler.toml': 'name = "site"\npages_build_output_dir = "dist"\n# main is not set: a Pages project\n' },
+      { 'package.json': nextPkg(), 'next.config.mjs': "export default { output: 'export' };\n", 'app/page.tsx': PAGE, 'firebase.json': '{ "hosting": { "public": "out", "cleanUrls": true } }\n', 'wrangler.jsonc': '{ "name": "site", "pages_build_output_dir": "out" }\n' },
+    ];
+    for (const files of shapes) expect((await typeOf(files)).types, Object.keys(files).join()).toEqual(['static-site']);
+  });
+});
+
+describe('project type: an unsure static site is a server (controller ruling, review J2 ⚠️1)', () => {
+  it('unsure with no run script → type server, runnable, DAST planned', async () => {
+    const shapes: Record<string, string>[] = [
+      { 'package.json': pkg({ scripts: { build: 'vite build' }, devDependencies: { vite: '7.0.0' } }), 'functions/api/hi.ts': 'export const onRequest = () => new Response("");\n' },
+      { 'package.json': pkg({ scripts: { build: 'docusaurus build' }, dependencies: { '@docusaurus/core': '3.0.0' } }), 'api/ping.js': 'module.exports = (q, s) => s.end();\n' },
+      { 'package.json': pkg({ scripts: { build: 'eleventy' }, devDependencies: { '@11ty/eleventy': '3.0.0' } }), 'netlify/functions/x.mjs': 'export default async () => new Response("");\n' },
+    ];
+    for (const files of shapes) {
+      const p = await profileOf(files);
+      const s = p.services[0] as Service;
+      expect(s.projectType?.unsure, Object.keys(files).join()).toBe(true);
+      expect(s.projectType?.types).toEqual(['server']);
+      expect(isRunnable(s)).toBe(true);
+      expect(floorNeeds({ ...p, private: false, ownerType: 'User', plan: 'free' }, CAPS).some((n) => n.id === 'dast' && n.service === s.name)).toBe(true);
+    }
+  });
+});

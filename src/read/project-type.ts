@@ -25,7 +25,7 @@
 // Evidence lines hold fixed wording and repo-relative paths that pass PLAIN_PATH_RE only (ruling S14), never repo text.
 import { parse } from 'acorn';
 import { transform } from 'sucrase';
-import type { ExistingWorkflow, ProjectType, RepoProfile, Service, ServiceType, StaticHost } from '../types.js';
+import type { ExistingWorkflow, Language, ProjectType, RepoProfile, Service, ServiceType, StaticHost } from '../types.js';
 import { safeText } from '../util/safe-text.js';
 import { readGitIndexPaths } from './git-index.js';
 import { loadIgnore } from './gitignore.js';
@@ -44,6 +44,10 @@ export interface TypeInput extends KindInput {
    * Absent = no path is left out.
    */
   untrackedIgnored?: () => Promise<(rel: string) => boolean>;
+  /** Fix round 1 (review J2 I2): other languages the folder holds (Service.alsoLanguages): a server sign for a static decision. */
+  alsoLanguages?: readonly Language[];
+  /** Fix round 1 (review J2 I1): the repo's file listing was cut (the read limit) or dropped paths, so some files were never looked at. */
+  listingIncomplete?: boolean;
 }
 
 /** One `--type` choice (J5): `service: null` = the repo's only service. */
@@ -88,7 +92,29 @@ const OWN_COMMAND: Readonly<Record<Gen, RegExp>> = {
 const VITE_BUILD = new RegExp(`${RUNNER}vite\\s+build${ARGS}`);
 /** Meta-frameworks that render pages on a server, on top of SERVER_DEPS (a dependency is a server sign). */
 const SSR_DEPS: readonly string[] = ['vike', 'vite-plugin-ssr', '@tanstack/react-start', '@tanstack/solid-start', '@tanstack/start', '@solidjs/start', '@analogjs/platform',
-  '@builder.io/qwik-city', 'waku', '@react-router/dev', '@react-router/node', '@react-router/serve', 'vinxi', '@hono/vite-dev-server', '@sveltejs/adapter-node', 'express', 'nitro'];
+  '@builder.io/qwik-city', 'waku', '@react-router/dev', '@react-router/node', '@react-router/serve', 'vinxi', '@hono/vite-dev-server', '@sveltejs/adapter-node', 'express', 'nitro',
+  // fix round 1 (review J2 I3): runtimes of serverless functions and Workers built next to a static site (each runs code on a server)
+  '@cloudflare/vite-plugin', '@cloudflare/workers-types', '@cloudflare/next-on-pages', '@opennextjs/cloudflare', '@opennextjs/aws', '@netlify/functions', '@netlify/edge-functions',
+  '@netlify/vite-plugin', '@vercel/node', '@vercel/functions', 'firebase-functions', 'firebase-admin', 'itty-router', 'serverless', 'serverless-http', '@vendia/serverless-express', '@types/aws-lambda'];
+/**
+ * Fix round 1 (review J2 I2): project files of another language's app (at the service folder's root): a Ruby, PHP, Java, Rust, Elixir or .NET
+ * app, or a Procfile's web process, next to a static build is a server pipegen doesn't read. Python and Go come in through alsoLanguages.
+ */
+const OTHER_APP_FILES: readonly string[] = ['Procfile', 'Gemfile', 'config.ru', 'composer.json', 'pom.xml', 'build.gradle', 'build.gradle.kts', 'Cargo.toml', 'mix.exs', 'manage.py', 'app.yaml'];
+const OTHER_APP_EXT = /\.(?:csproj|fsproj)$/;
+/**
+ * Fix round 1 (review J2 I3): host configs that add server code to a static site, at the service folder's root, each with the line that says
+ * so. A Pages-only wrangler config (pages_build_output_dir, no `main`) and a hosting-only firebase.json don't count. Read as text, one line at
+ * a time: a match inside a comment counts too (the safe direction).
+ */
+const HOST_SERVER_CONFIGS: readonly { file: string; re: RegExp; what: string }[] = [
+  { file: 'wrangler.toml', re: /^\s*main\s*=/, what: 'a Worker entry (main)' },
+  { file: 'wrangler.json', re: /"main"\s*:/, what: 'a Worker entry (main)' },
+  { file: 'wrangler.jsonc', re: /"main"\s*:/, what: 'a Worker entry (main)' },
+  { file: 'netlify.toml', re: /^\s*(?:\[\[?\s*)?(?:edge_)?functions\b/, what: 'Netlify functions' },
+  { file: 'vercel.json', re: /"(?:functions|builds)"\s*:/, what: 'Vercel functions' },
+  { file: 'firebase.json', re: /"(?:functions|function|run)"\s*:/, what: 'Firebase functions or a Cloud Run rewrite' },
+];
 /** Astro adapter packages: the official ones by name, and any package whose name says it is an Astro adapter. */
 const ASTRO_ADAPTER_DEP = /^@astrojs\/(?:node|vercel|netlify|cloudflare|deno)$|astro.*adapter|adapter.*astro|^astro-sst$/;
 const GATSBY_ADAPTER_DEP = /^gatsby-adapter-/;
@@ -101,6 +127,7 @@ const ROUTE_RES: readonly RegExp[] = [
   /^api\/.+\.(?:js|jsx|ts|tsx|mjs|mts|cjs|cts|py|go|rb)$/,
   /^functions\/.+\.(?:js|jsx|ts|tsx|mjs|mts|cjs|cts|py)$/,
   /^netlify\/(?:edge-)?functions\/.+/,
+  /(?:^|\/)_worker\.js(?:$|\/)/, // a Pages advanced-mode Worker, wherever the build copies it from
 ];
 const NEXT_ROUTE_RES: readonly RegExp[] = [/^(?:src\/)?proxy\.(?:js|jsx|ts|tsx|mjs|mts|cjs|cts)$/];
 const GATSBY_ROUTE_RES: readonly RegExp[] = [/^src\/api\/.+/];
@@ -293,6 +320,11 @@ function astroOutput(parsed: { program: N; nodes: N[] }): AstroOutput {
   if (plainObject(value) === null) return 'unclear';
   if (outputs.some((o) => literalString(o.value) !== 'static' || o.kind !== 'init')) return 'unclear';
   if (writesMember(nodes, ['output', 'adapter'])) return 'unclear';
+  // fix round 1 (review J2 minor 2): the module handles of the Next.js verdict, a dynamic import, and an import of the config file itself (a
+  // local import of a plugin stays fine: Astro configs often import their own remark or vite plugins)
+  const selfImport = nodes.some((n) => n.type === 'ImportExpression' || ((n.type === 'ImportDeclaration' || n.type === 'ExportNamedDeclaration' || n.type === 'ExportAllDeclaration')
+    && isNode(n.source) && /(?:^|\/)astro\.config(?:\.[a-z]+)?$/.test(literalString(n.source) ?? 'astro.config')));
+  if (selfImport || reachesModuleHandles(nodes)) return 'unclear';
   return 'static';
 }
 
@@ -368,6 +400,18 @@ async function serverSigns(k: TypeInput, g: { gen: Gen; pkg: string; label: stri
   const names = new Set([...Object.keys(k.deps), ...Object.keys(k.devDeps)]);
   for (const d of [...SERVER_DEPS, ...SSR_DEPS]) if (d !== g.pkg && names.has(d) && !signs.some((x) => x.startsWith(`${d} `))) signs.push(`${d} in package.json (a server package)`);
   if (g.gen === 'astro' && [...names].some((d) => regexSafe(d) && ASTRO_ADAPTER_DEP.test(d))) signs.push('an Astro adapter package in package.json');
+  if (k.listingIncomplete === true) signs.push("pipegen listed only part of the files (a read limit), so it couldn't check them all for a server");
+  for (const l of k.alsoLanguages ?? []) signs.push(`another language's app in the same folder (${l === 'python' ? 'Python' : l === 'go' ? 'Go' : 'another language'})`);
+  const otherApp = [...OTHER_APP_FILES.map((f) => inDir(k.dir, f)).filter((f) => k.fileSet.has(f)),
+    ...[...k.fileSet].filter((f) => f.startsWith(k.dir === '.' ? '' : `${k.dir}/`) && !f.slice(k.dir === '.' ? 0 : k.dir.length + 1).includes('/') && OTHER_APP_EXT.test(f))].sort();
+  if (otherApp.length > 0) signs.push(`another language's app in the same folder (${otherApp.slice(0, 3).map((f) => shown(f, 'a file')).join(', ')})`);
+  for (const c of HOST_SERVER_CONFIGS) {
+    const rel = inDir(k.dir, c.file);
+    if (!k.fileSet.has(rel)) continue;
+    const text = await k.read(rel);
+    if (text === null) signs.push(`pipegen couldn't read ${shown(rel, 'a host config')} to check it for server code`);
+    else if (text.split(/\r?\n/).some((l) => !regexSafe(l) || c.re.test(l))) signs.push(`${c.what} in ${shown(rel, 'a host config')}`);
+  }
   for (const name of RUN_SCRIPTS) {
     if (!Object.hasOwn(k.scripts, name)) continue;
     const ps = parts(scriptText(k, name));
@@ -381,7 +425,8 @@ async function serverSigns(k: TypeInput, g: { gen: Gen; pkg: string; label: stri
   const routes = [...ROUTE_RES, ...(g.gen === 'next' ? NEXT_ROUTE_RES : []), ...(g.gen === 'gatsby' ? GATSBY_ROUTE_RES : [])];
   const route = owned.find((f) => regexSafe(f) && routes.some((re) => re.test(relTo(f))));
   if (route !== undefined) signs.push(`a server route or function: ${shown(route, 'a file')}`);
-  const code = owned.filter((f) => CODE_FILE_RE.test(f) && !isTestFile(relTo(f)) && !/^(?:next|astro|vite|gatsby-config|docusaurus|vitepress)\.config\./.test(baseOf(f)));
+  // the generator's own config at the service root isn't app code (minor 3: only there; a config deeper in the tree is scanned)
+  const code = owned.filter((f) => CODE_FILE_RE.test(f) && !isTestFile(relTo(f)) && !(!relTo(f).includes('/') && /^(?:next|astro|vite|gatsby-config|docusaurus|vitepress)\.config\./.test(baseOf(f))));
   if (code.length > MAX_SIGNAL_FILES) {
     signs.push(`more than ${MAX_SIGNAL_FILES.toLocaleString('en-US')} code files: pipegen couldn't check them all for a server`);
     return signs;
@@ -390,10 +435,14 @@ async function serverSigns(k: TypeInput, g: { gen: Gen; pkg: string; label: stri
   let port: string | undefined;
   let server: string | undefined;
   let ssr: string | undefined;
+  let unread: string | undefined;
+  let longLines: string | undefined;
   for (const f of code) {
     if (port !== undefined && server !== undefined && (g.gen !== 'gatsby' || ssr !== undefined)) break;
     const text = await k.read(f);
-    if (text === null) continue;
+    // fix round 1 (review J2 I1): code pipegen couldn't read, or lines too long to check, could hold a server: never "no server sign"
+    if (text === null) { unread ??= f; continue; }
+    if (longLines === undefined && text.split(/\r?\n/).some((l) => !regexSafe(l))) longLines = f;
     bytes += text.length;
     if (bytes > MAX_SIGNAL_BYTES) {
       signs.push("too much code to read: pipegen couldn't check it all for a server");
@@ -405,6 +454,8 @@ async function serverSigns(k: TypeInput, g: { gen: Gen; pkg: string; label: stri
       if (g.gen === 'gatsby' && ssr === undefined && GATSBY_SSR_RE.test(line)) ssr = f;
     }
   }
+  if (unread !== undefined) signs.push(`pipegen couldn't read ${shown(unread, 'a code file')} (too large or not a regular file) to check it for a server`);
+  if (longLines !== undefined) signs.push(`${shown(longLines, 'a code file')} has lines too long for pipegen to check for a server`);
   if (port !== undefined) signs.push(`a port default in ${shown(port, 'a code file')}`);
   if (server !== undefined) signs.push(`code that starts a server in ${shown(server, 'a code file')}`);
   if (ssr !== undefined) signs.push(`server-rendered pages (getServerData) in ${shown(ssr, 'a code file')}`);
@@ -493,6 +544,10 @@ export function finishProjectTypes(services: Service[], workflows: readonly Exis
     if (!types.has('static-site') && baseRunnable(s)) {
       if (!types.has('server')) evidence.push(serverLine(s));
       types.add('server');
+    } else if (!types.has('static-site') && t.unsure && !types.has('server')) {
+      // controller ruling (review J2 ⚠️1): an unsure static site is a server, even with no run script (#121: the stricter type wins)
+      types.add('server');
+      evidence.push("treated as a server: pipegen isn't sure it is a static site");
     }
     if (types.has('static-site')) evidence.push(...hostLines);
     s.projectType = { types: ordered(types), evidence: [...new Set(evidence)], unsure: t.unsure, ...(t.overridden === true ? { overridden: true as const } : {}) };

@@ -202,6 +202,8 @@ interface Shared {
   repo: string; serviceDirs: string[]; quality: QualityRun; copies: DockerCopy[];
   /** Plan J J2: git's untracked-and-ignored test (J1's rule), loaded once and only when a static generator is found. */
   untrackedIgnored: () => Promise<(rel: string) => boolean>;
+  /** Fix round 1 (review J2 I1): the file listing was cut at the read limit or left out paths too long to check. */
+  listingIncomplete: boolean;
 }
 
 async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Service> {
@@ -295,7 +297,7 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
   };
   const notStandalone = await notStandaloneOf(kind);
   // Plan J J2 (ruling B2): the type from the service's own files; finishProjectTypes completes it after the workflow pass
-  const projectType = await projectTypeOf({ ...kind, manifest: pkg ?? {}, untrackedIgnored: shared.untrackedIgnored });
+  const projectType = await projectTypeOf({ ...kind, manifest: pkg ?? {}, untrackedIgnored: shared.untrackedIgnored, alsoLanguages, listingIncomplete: shared.listingIncomplete });
   return {
     name, path: dir, language, ...(alsoLanguages.length === 0 ? {} : { alsoLanguages }), ...(alsoPackageManagers.length === 0 ? {} : { alsoPackageManagers }), packageManager,
     ...(npmLockfileVersion === undefined ? {} : { npmLockfileVersion }), runtimeVersion, dockerfile, port, hasTests, testFramework, ...env, scripts, frameworks, quality,
@@ -371,6 +373,7 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
   const ignore = IGNORED_DIRS.map((d) => `**/${d}/**`);
   const listing = await listFiles(dir, ['**/*'], ignore);
   const ctx: Ctx = { root: dir, fileSet: new Set(listing.files.filter(regexSafe)), notes };
+  const listingIncomplete = listing.truncated || ctx.fileSet.size < listing.files.length;
   if (listing.truncated) note(ctx, `Only the first ${MAX_FILES_TEXT} files were read. Results may be incomplete.`);
   for (const name of ROOT_FILES) if (!ctx.fileSet.has(name) && (await lstat(joinOs(dir, name)).catch(() => null))) ctx.fileSet.add(name);
 
@@ -418,6 +421,7 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
   const shared: Shared = {
     repo, serviceDirs: dirs, quality: newQualityRun(dir, [...ctx.fileSet], dirs, workspaceMembers), copies: [],
     untrackedIgnored: () => (untracked ??= untrackedIgnoredOf(dir)),
+    listingIncomplete,
   };
   // P55 (batch B): what each Dockerfile copies into its image (read once; a folder it copies is part of that image)
   const known = new Set<string>(ctx.fileSet);

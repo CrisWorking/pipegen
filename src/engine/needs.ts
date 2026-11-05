@@ -104,12 +104,14 @@ export interface NeedsPlan {
 /**
  * A start, dev or serve script, a server framework, a port, or a Dockerfile (baseRunnable). A library with only build/test scripts isn't.
  * Plan J J2 (DECISIONS #121, ruling S1): a static site that isn't also a container isn't, whatever its scripts say, so image build and scan,
- * DAST, API DAST and the created Dockerfile drop out through the table. A service with no projectType (a hand-built profile) keeps today's rule.
+ * DAST, API DAST and the created Dockerfile drop out through the table; a service of type `server` is (fix round 1: an unsure static site is a
+ * server even with no run script). A service with no projectType (a hand-built profile) keeps today's rule.
  */
 export function isRunnable(s: Service): boolean {
   const types = s.projectType?.types;
   if (types !== undefined && types.includes('static-site') && !types.includes('container')) return false;
-  return baseRunnable(s);
+  // fix round 1 (controller ruling, review J2 ⚠️1): the `server` type runs, also an unsure static site with no run script
+  return (types?.includes('server') ?? false) || baseRunnable(s);
 }
 export { baseRunnable };
 
