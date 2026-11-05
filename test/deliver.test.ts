@@ -2,7 +2,7 @@
 // pre-flight §5 items 1-7, binding): the proven draft goes out as the one setup PR (and the central PR), the secrets pipegen needs before
 // the merge are stored (an existing one only with its own yes), and the install record is written to all three places. Every GitHub call
 // goes to an in-memory GitHub (test/helpers/deliver-github.ts); no network.
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -590,7 +590,7 @@ describe('G10 delivery: secrets and settings before the merge', () => {
     expect(w3.g.calls.some((c) => c.params.repo === 'r' && !c.route.startsWith('GET '))).toBe(false);
   });
 
-  it('deliver: a record found only on the central PR branch is trusted only when its hash matches the local record file or the PR marker (G10-R-sec 1)', async () => {
+  it('deliver: a record found only on the central PR branch is trusted only when its hash matches the local record file (G10-R-sec, G10-R-sec2)', async () => {
     const upd = `pipegen/update-${centralProjectName('r')}`;
     const rerun = async (w: World): Promise<Awaited<ReturnType<typeof deliver>>> => {
       const p = profile();
@@ -616,16 +616,24 @@ describe('G10 delivery: secrets and settings before the merge', () => {
     const r = await record(w, upd);
     expect(r?.files.find((f) => f.path === 'Dockerfile')?.shas).toEqual([gitBlobSha('FROM node:24\n'), gitBlobSha('FROM node:26\n')]);
     expect(r?.secrets.find((s) => s.name === KEY)?.created).toBe(true);
-    // no local file, but the setup PR's marker matches: trusted
-    const w2 = await setup();
-    rmSync(join(w2.home, '.config', 'pipegen', 'records', 'o__r.json'));
-    expect((await rerun(w2)).notes).toEqual([]);
-    expect((await record(w2, upd))?.files.find((f) => f.path === 'Dockerfile')?.shas.length).toBe(2);
     // the PR body's marker edited away, but the local record file matches: trusted
     const w4 = await setup();
     (w4.g.repo('o/r').pulls[0] as { body: string }).body = 'edited by someone';
     expect((await rerun(w4)).notes).toEqual([]);
     expect((await record(w4, upd))?.files.find((f) => f.path === 'Dockerfile')?.shas.length).toBe(2);
+    // the PR marker is never a trust source (any app writer can edit the body): no local file + a matching marker → untrusted
+    const w2 = await setup();
+    rmSync(join(w2.home, '.config', 'pipegen', 'records', 'o__r.json'));
+    const res2 = await rerun(w2);
+    expect(res2.notes.join('\n')).toMatch(/can't be checked from this machine/);
+    expect((await record(w2, upd))?.files.find((f) => f.path === 'Dockerfile')?.shas).toEqual([gitBlobSha('FROM node:26\n')]);
+    // a local file whose hash differs + a matching marker → untrusted
+    const w5 = await setup();
+    const file = join(w5.home, '.config', 'pipegen', 'records', 'o__r.json');
+    writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf8')), recordHash: 'e'.repeat(64) }));
+    expect(w5.g.repo('o/r').pulls[0]?.body.split('\n').at(-1)).toMatch(/record-sha256=/);
+    expect((await rerun(w5)).notes.join('\n')).toMatch(/doesn't match/);
+    expect((await record(w5, upd))?.secrets.find((s) => s.name === KEY)).toMatchObject({ created: false, overwritten: true });
     // a record planted on the branch (someone with write on the central repo changed it): claims nothing
     const w3 = await setup();
     const planted = { ...(await record(w3, upd) as NonNullable<Awaited<ReturnType<typeof record>>>) };

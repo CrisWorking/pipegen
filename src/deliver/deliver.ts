@@ -46,9 +46,9 @@ import type { CreatedFile, EnvSettings, InstallEdit, InstallPlanned, InstallReco
 import { packageVersion } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
 import {
-  commitFiles, compareStatus, DeliverError, findOpenPr, ghRead, ghWrite, openOrUpdatePr, readHead, readRepo, readTree, setBranch, statusOf, type RepoRef, type TreeEntry,
+  commitFiles, compareStatus, DeliverError, ghRead, ghWrite, openOrUpdatePr, readHead, readRepo, readTree, setBranch, statusOf, type RepoRef, type TreeEntry,
 } from './git-data.js';
-import { centralUpdateBranch, readLocalRecord, readRecord, recordMarkerOf, RecordError, writeRecord, type LocalRecordDeps } from './record.js';
+import { centralUpdateBranch, readLocalRecord, readRecord, RecordError, writeRecord, type LocalRecordDeps } from './record.js';
 
 export { DeliverError };
 
@@ -577,10 +577,10 @@ export interface DeliverResult {
 }
 
 /**
- * The earlier install record pipegen builds on (G10-R-sec 1). The one on the central default branch is trusted (its rules guard it once
- * `finish` ran; it is what pipegen itself merged or committed). A record found only on the central pull request branch, which anyone with
- * write on the central repo can push to, is used only when its hash equals the local record file's or the setup PR body's marker;
- * otherwise pipegen claims nothing from it (null) and says so.
+ * The earlier install record pipegen builds on (G10-R-sec, G10-R-sec2). The one on the central default branch is trusted (its rules guard
+ * it once `finish` ran; it is what pipegen itself committed or merged). A record found only on the central pull request branch, which anyone
+ * with write on the central repo can push to, is used only when this machine's local record file exists and holds its hash. The setup PR
+ * body's marker is never a trust source here (any app writer can edit it). Otherwise pipegen claims nothing from it (null) and says so.
  */
 async function trustedPrevious(gh: Octokit, app: RepoRef, central: RepoRef, centralBranch: string, updateBranch: string | null, local: LocalRecordDeps, clock: RateClock, notes: string[]): Promise<InstallRecord | null> {
   const onDefault = await readRecord(gh, central, app.repo, { branch: centralBranch, clock });
@@ -588,17 +588,11 @@ async function trustedPrevious(gh: Octokit, app: RepoRef, central: RepoRef, cent
   if (updateBranch === null) return null;
   const onBranch = await readRecord(gh, central, app.repo, { branch: updateBranch, clock });
   if (onBranch === null) return null;
-  const known = new Set<string>();
   const file = await readLocalRecord(app, local).catch((e: unknown) => { if (e instanceof RecordError) return null; throw e; });
-  if (file !== null) known.add(file.recordHash);
-  const pr = await findOpenPr(gh, app, SETUP_BRANCH, clock);
-  if (pr !== null) {
-    const d = await ghRead(gh, 'GET /repos/{owner}/{repo}/pulls/{pull_number}', app, { pull_number: pr.number }, clock);
-    const marker = recordMarkerOf(isObj(d) && typeof d.body === 'string' ? d.body : null);
-    if (marker !== null) known.add(marker);
-  }
-  if (known.has(onBranch.hash)) return onBranch.record;
-  notes.push(`The install record on the central pull request branch ${show(updateBranch, 100)} doesn't match the hash pipegen saved (the local record file or the setup pull request), so pipegen claims nothing from it: it writes a new record, and treats every existing file and secret as not its own.`);
+  if (file !== null && file.recordHash === onBranch.hash) return onBranch.record;
+  notes.push(file === null
+    ? `The install record on ${show(updateBranch, 100)} (the central pull request branch) can't be checked from this machine (no local record file), so pipegen claims nothing from it: it writes a new record, and treats every existing file and secret as not its own.`
+    : `The install record on ${show(updateBranch, 100)} (the central pull request branch) doesn't match the hash in this machine's local record file, so pipegen claims nothing from it: it writes a new record, and treats every existing file and secret as not its own.`);
   return null;
 }
 
