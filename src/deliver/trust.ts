@@ -63,7 +63,7 @@ export const TYPED_VIEW_FIELDS = {
   secrets: { keep: ['name', 'scope', 'created', 'overwritten', 'githubCreatedAt', 'unconfirmed'] },
   variables: { keep: ['name', 'scope', 'created', 'githubCreatedAt', 'unconfirmed'], drop: ['previous'] },
   environments: { keep: ['name', 'created', 'githubCreatedAt', 'unconfirmed'], fresh: ['changed', 'branchPolicyIds'], drop: ['previous'] },
-  rulesets: { keep: ['kind', 'id', 'name', 'githubCreatedAt'] },
+  rulesets: { keep: ['kind', 'id', 'name', 'githubCreatedAt', 'unconfirmed'] },
 } as const satisfies Record<string, { keep: readonly string[]; fresh?: readonly string[]; drop?: readonly string[] }>;
 
 /** A copy of exactly the listed own fields that are present (deep-copied). */

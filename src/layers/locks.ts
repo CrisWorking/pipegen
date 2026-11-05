@@ -52,7 +52,8 @@ export const requiredRulesetName = (project: string): string => `pipegen-require
 export { REQUIRED_JOB };
 /** GitHub's name for the default branch in a ruleset condition: the rule follows a renamed default branch. */
 const DEFAULT_BRANCH = '~DEFAULT_BRANCH';
-const CO_PLACES: readonly string[] = ['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS'];
+/** The CODEOWNERS places GitHub reads, in the order it reads them (finish and verify read the same list). */
+export const CO_PLACES: readonly string[] = ['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS'];
 const NEW_CODEOWNERS = '.github/CODEOWNERS';
 const ALLOWED_ACTIONS: ReadonlySet<string> = new Set(['all', 'local_only', 'selected']);
 const MARKER_RE = /pipegen:(?:begin|end)/;

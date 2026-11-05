@@ -272,9 +272,9 @@ export interface InstallRecord {
   secrets: { name: string; scope: 'repo' | 'central' | `env:${string}`; created: boolean; overwritten?: true; githubCreatedAt?: string; unconfirmed?: true }[];
   variables: { name: string; scope: 'repo' | `env:${string}`; created: boolean; previous?: string; githubCreatedAt?: string; unconfirmed?: true }[];
   environments: { name: string; created: boolean; githubCreatedAt?: string; previous?: EnvSettings; changed: (keyof EnvSettings)[]; branchPolicyIds: number[]; unconfirmed?: true }[];
-  rulesets: { kind: 'gate' | 'reviews'; id: number; name: 'pipegen' | 'pipegen-reviews'; githubCreatedAt: string }[];
+  rulesets: { kind: 'gate' | 'reviews'; id: number; name: 'pipegen' | 'pipegen-reviews'; githubCreatedAt?: string; unconfirmed?: true }[];   // G11 m6: unconfirmed = pipegen made it, GitHub didn't say when
   classicProtection?: { branch: string; previous: Record<string, unknown> | null };   // the PUT-form body as it was before; null = none
-  orgRuleset?: { org: string; id: number; name: string; githubCreatedAt: string };
+  orgRuleset?: { org: string; id: number; name: string; githubCreatedAt?: string; unconfirmed?: true };
   repoSettings?: Partial<Record<'shaPinningRequired' | 'vulnerabilityAlerts' | 'secretScanning' | 'pushProtection', { previous: boolean }>>;
   central?: { repoId?: number; createdByPipegen: boolean; rulesetId?: number; rulesetCreatedAt?: string; codeowners?: { path: string; created: boolean }; actionsAccess?: { previous: string } };
   scratch?: { repoId?: number; createdByPipegen: boolean };

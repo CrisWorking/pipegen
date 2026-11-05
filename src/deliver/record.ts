@@ -78,6 +78,8 @@ const ENV_SETTINGS = z.strictObject({
   deployment_branch_policy: z.strictObject({ protected_branches: z.boolean(), custom_branch_policies: z.boolean() }).nullable(),
   branch_policies: z.array(z.strictObject({ name: z.string().max(255), type: z.enum(['branch', 'tag']) })).max(200),
 });
+/** An entry carries GitHub's created_at, or says it is unconfirmed: exactly one of the two. */
+const oneOfAt = (x: { githubCreatedAt?: string; unconfirmed?: true }): boolean => (x.githubCreatedAt === undefined) !== (x.unconfirmed === undefined);
 const ENV_KEYS = ['wait_timer', 'prevent_self_review', 'reviewers', 'can_admins_bypass', 'deployment_branch_policy', 'branch_policies'] as const;
 const EDIT_BASE = { path: PATH, originalSha: SHA, writtenShas: SHAS };
 const EDIT = z.discriminatedUnion('kind', [
@@ -101,9 +103,10 @@ export const InstallRecordSchema = z.strictObject({
   secrets: z.array(z.strictObject({ name: SECRET_NAME, scope: z.union([z.literal('repo'), z.literal('central'), SCOPE_ENV]), created: z.boolean(), overwritten: z.literal(true).optional(), githubCreatedAt: ISO.optional(), unconfirmed: z.literal(true).optional() })).max(500),
   variables: z.array(z.strictObject({ name: SECRET_NAME, scope: z.union([z.literal('repo'), SCOPE_ENV]), created: z.boolean(), previous: z.string().max(10_000).optional(), githubCreatedAt: ISO.optional(), unconfirmed: z.literal(true).optional() })).max(200),
   environments: z.array(z.strictObject({ name: ENV_NAME, created: z.boolean(), githubCreatedAt: ISO.optional(), previous: ENV_SETTINGS.optional(), changed: z.array(z.enum(ENV_KEYS)).max(6), branchPolicyIds: z.array(ID).max(200), unconfirmed: z.literal(true).optional() })).max(100),
-  rulesets: z.array(z.strictObject({ kind: z.enum(['gate', 'reviews']), id: ID, name: z.enum(['pipegen', 'pipegen-reviews']), githubCreatedAt: ISO })).max(2),
+  // G11 fix round 1 (m6): a ruleset pipegen made whose read-back had no created_at is recorded `unconfirmed` (one of the two, never both)
+  rulesets: z.array(z.strictObject({ kind: z.enum(['gate', 'reviews']), id: ID, name: z.enum(['pipegen', 'pipegen-reviews']), githubCreatedAt: ISO.optional(), unconfirmed: z.literal(true).optional() }).refine(oneOfAt, 'githubCreatedAt or unconfirmed, one of them')).max(2),
   classicProtection: z.strictObject({ branch: BRANCH, previous: z.record(KEY, JSONISH).nullable() }).optional(),
-  orgRuleset: z.strictObject({ org: OWNER, id: ID, name: z.string().max(200), githubCreatedAt: ISO }).optional(),
+  orgRuleset: z.strictObject({ org: OWNER, id: ID, name: z.string().max(200), githubCreatedAt: ISO.optional(), unconfirmed: z.literal(true).optional() }).refine(oneOfAt, 'githubCreatedAt or unconfirmed, one of them').optional(),
   repoSettings: z.strictObject({
     shaPinningRequired: z.strictObject({ previous: z.boolean() }).optional(), vulnerabilityAlerts: z.strictObject({ previous: z.boolean() }).optional(),
     secretScanning: z.strictObject({ previous: z.boolean() }).optional(), pushProtection: z.strictObject({ previous: z.boolean() }).optional(),
@@ -312,6 +315,55 @@ export async function addLocalLeftovers(app: RepoRef, items: readonly Leftover[]
   return writeLocalJson(app, '.leftovers', LEFTOVERS.parse({ updatedAt: now.toISOString(), items: all }), deps);
 }
 
+// ---------- finish's pending file (G11 fix round 1, I1) ----------
+
+/**
+ * What `finish` found before it changed a setting (the `previous` values, and the objects it made with GitHub's created_at), kept in a local
+ * 0600 file beside the record file BEFORE the write that changes it: a run that stops before its install record is written (a refused record
+ * commit, a rate limit, a rejected token) loses nothing, and the next `finish` records these instead of what GitHub holds by then (pipegen's
+ * own settings). An entry leaves the file once an install record holds it. Never a secret value.
+ */
+export interface FinishPending {
+  environments: InstallRecord['environments']; variables: InstallRecord['variables'];
+  repoSettings: NonNullable<InstallRecord['repoSettings']>;
+  classicProtection?: InstallRecord['classicProtection']; actionsAccess?: { previous: string };
+}
+const RS = InstallRecordSchema.shape;
+const PENDING = z.strictObject({
+  updatedAt: z.string().max(40), repoId: ID, environments: RS.environments, variables: RS.variables, repoSettings: RS.repoSettings.unwrap(),
+  classicProtection: RS.classicProtection, actionsAccess: z.strictObject({ previous: z.string().max(40) }).optional(),
+});
+const PENDING_SUFFIX = '.finish-pending';
+export const emptyFinishPending = (): FinishPending => ({ environments: [], variables: [], repoSettings: {} });
+
+/** Where finish's pending file of an app is (the path only). */
+export function localFinishPendingPath(app: RepoRef, deps: LocalRecordDeps = {}): string {
+  return join(configBase(deps), 'pipegen', 'records', `${localName(app)}${PENDING_SUFFIX}.json`);
+}
+
+/** finish's pending file for the repo `repoId` (empty when there is none, or when it is another repo's of the same name). Unreadable: an error. */
+export async function readFinishPending(app: RepoRef, repoId: number, deps: LocalRecordDeps = {}): Promise<FinishPending> {
+  const dir = await recordsDir(deps);
+  const file = join(dir, `${localName(app)}${PENDING_SUFFIX}.json`);
+  let info;
+  try { info = lstatSync(file); } catch (e) { if ((e as { code?: unknown }).code === 'ENOENT') return emptyFinishPending(); throw new RecordError(`pipegen couldn't check ${file}.`, { cause: e }); }
+  if (!info.isFile() || info.size > MAX_RECORD_BYTES) throw new RecordError(`${file} is not pipegen's pending file; move it away, then run finish again.`);
+  const r = PENDING.safeParse((() => { try { return JSON.parse(readFileSync(file, 'utf8')); } catch { return null; } })());
+  if (!r.success) throw new RecordError(`${file} is not pipegen's pending file; move it away, then run finish again.`);
+  if (r.data.repoId !== repoId) return emptyFinishPending();
+  const { updatedAt: _u, repoId: _r, ...p } = r.data;
+  return p as FinishPending;
+}
+
+/** Saves finish's pending file (0600, written as the record file is); nothing left in it: the file is removed. Returns its path. */
+export async function writeFinishPending(app: RepoRef, repoId: number, p: FinishPending, now: Date, deps: LocalRecordDeps = {}): Promise<string> {
+  const empty = p.environments.length === 0 && p.variables.length === 0 && Object.keys(p.repoSettings).length === 0 && p.classicProtection === undefined && p.actionsAccess === undefined;
+  if (!empty) return writeLocalJson(app, PENDING_SUFFIX, PENDING.parse({ updatedAt: now.toISOString(), repoId, ...p }), deps);
+  const file = join(await recordsDir(deps), `${localName(app)}${PENDING_SUFFIX}.json`);
+  try { unlinkSync(file); } catch (e) { if ((e as { code?: unknown }).code !== 'ENOENT') throw new RecordError(`pipegen couldn't remove ${file}.`, { cause: e }); }
+  return file;
+}
+
 async function writeLocalJson(app: RepoRef, suffix: string, value: unknown, deps: LocalRecordDeps): Promise<string> {
   const dir = await recordsDir(deps);
   const file = join(dir, `${localName(app)}${suffix}.json`);
@@ -329,7 +381,7 @@ async function writeLocalJson(app: RepoRef, suffix: string, value: unknown, deps
   } catch (e) {
     if (fd !== null) try { closeSync(fd); } catch { /* closed */ }
     try { unlinkSync(tmp); } catch { /* gone */ }
-    throw new RecordError(`pipegen couldn't save its local ${suffix === '' ? 'record' : 'leftovers'} file in ${dir}.`, { cause: e });
+    throw new RecordError(`pipegen couldn't save its local ${suffix === '' ? 'record' : suffix === PENDING_SUFFIX ? 'pending' : 'leftovers'} file in ${dir}.`, { cause: e });
   }
   return file;
 }

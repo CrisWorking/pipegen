@@ -3,7 +3,7 @@
 // the merge locks, the environments, the signing environment's key and PIPEGEN_COSIGN_PUB, PIPEGEN_BLOCK_FROM, sha pinning, then the central
 // ruleset and CODEOWNERS last, and updates the install record; `pipegen verify` reports drift between the repos and the record. Every GitHub
 // call goes to an in-memory GitHub (test/helpers/finish-github.ts); cosign is a fake exec; no network.
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -14,7 +14,7 @@ import { newRateBudget } from '../src/engine/github-rate.js';
 import { pubKeySha256 } from '../src/engine/signing.js';
 import { ensureSigningEnvironment, plannedOfLocks, SETUP_BRANCH } from '../src/deliver/deliver.js';
 import { finish, FinishError, FINISH_WRITE_ROUTES, type FinishDeps, type FinishProbe } from '../src/deliver/finish.js';
-import { readLocalRecord, readRecord, recordHash, recordMarkerOf, writeLocalRecord, writeRecord } from '../src/deliver/record.js';
+import { localFinishPendingPath, readLocalRecord, readRecord, recordHash, recordMarkerOf, writeLocalRecord, writeRecord } from '../src/deliver/record.js';
 import { SettingsApi } from '../src/deliver/settings-api.js';
 import { verify } from '../src/deliver/verify.js';
 import { planLocks, type LockPlan } from '../src/layers/locks.js';
@@ -753,6 +753,305 @@ describe('G11 verify', () => {
     // gone altogether
     s.g.hooks.unshift((c) => (c.route === 'GET /repos/{owner}/{repo}/compare/{basehead}' ? { status: 404 } : undefined));
     expect((await v(s)).drift.find((x) => x.what === 'pinned central commit')).toMatchObject({ actual: null });
+  });
+});
+
+// ---------- fix round 1 (review G11, ruling G11-R1) ----------
+
+describe('G11 fix round 1: a failed or stopped finish, the block date (I1, I2)', () => {
+  const app = { owner: 'o', repo: 'r' };
+  const userEnv = (s: Seed) => s.g.repo('o/r').envs.set('production', { id: 77, created_at: '2026-01-01T00:00:00Z', wait_timer: 5, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: null, policies: [], stored: new Map() });
+
+  it('finish: a record write that fails keeps what each setting was before in a local 0600 file; the re-run records it (I1)', async () => {
+    const s = await seed({ keyEnv: true });
+    userEnv(s);
+    s.g.x('o/r').variables.set('PIPEGEN_BLOCK_FROM', { value: '2026-12-31', created_at: '2026-02-02T00:00:00Z' });
+    let armed = true;
+    s.g.hooks.push((c) => (armed && !c.route.startsWith('GET ') && c.params.repo === 'pipelines' && /\/git\//.test(c.route) ? { status: 500, data: { message: 'boom' } } : undefined));
+    const err = await finish(s.g.octokit(), app, {}, s.deps()).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(FinishError);
+    const pending = localFinishPendingPath(app, { home: s.home, env: {} });
+    expect((err as Error).message).toContain(pending);
+    expect(statSync(pending).mode & 0o777).toBe(0o600);
+    const out = s.lines.join('\n');
+    expect(out).toMatch(/done: environment production/);
+    expect(out).toMatch(/central merge rule.*switched off/i);
+    armed = false;
+    await finish(s.g.octokit(), app, {}, s.deps());
+    const r = await recordOn(s, 'pipegen/update-r');
+    expect(r.environments.find((e) => e.name === 'production')).toMatchObject({ created: false, githubCreatedAt: '2026-01-01T00:00:00Z', previous: { wait_timer: 5, reviewers: [], prevent_self_review: false } });
+    expect(r.variables.find((v) => v.name === 'PIPEGEN_BLOCK_FROM')).toMatchObject({ created: false, previous: '2026-12-31' });
+    expect(r.repoSettings).toMatchObject({ shaPinningRequired: { previous: false }, vulnerabilityAlerts: { previous: false } });
+    expect(r.central?.actionsAccess).toEqual({ previous: 'none' });
+  });
+
+  it('finish: classic protection\'s earlier body survives a failed record write (I1)', async () => {
+    const s = await seed();
+    s.g.hooks.push((c) => (c.route === 'POST /repos/{owner}/{repo}/rulesets' && c.params.repo === 'r' ? { status: 403, data: { message: 'Upgrade to GitHub Pro or make this repository public to enable this feature.' } } : undefined));
+    const before = { url: 'u', enforce_admins: { enabled: false }, allow_force_pushes: { enabled: true }, allow_deletions: { enabled: false } };
+    s.g.x('o/r').protection = structuredClone(before);
+    let armed = true;
+    s.g.hooks.push((c) => (armed && !c.route.startsWith('GET ') && c.params.repo === 'pipelines' && /\/git\//.test(c.route) ? { status: 500, data: { message: 'boom' } } : undefined));
+    await expect(finish(s.g.octokit(), app, {}, s.deps())).rejects.toThrow(FinishError);
+    armed = false;
+    await finish(s.g.octokit(), app, {}, s.deps());
+    const r = await recordOn(s, 'pipegen/update-r');
+    expect(r.classicProtection).toMatchObject({ branch: 'main', previous: { enforce_admins: false, allow_force_pushes: true, required_status_checks: null } });
+  });
+
+  it('finish: a stop mid-run (a rejected token) prints what was applied; the re-run keeps the earlier values (I1)', async () => {
+    const s = await seed();
+    userEnv(s);
+    let armed = true;
+    s.g.hooks.push((c) => (armed && c.route === 'POST /repos/{owner}/{repo}/actions/variables' ? { status: 401, data: { message: 'Bad credentials' } } : undefined));
+    await expect(finish(s.g.octokit(), app, {}, s.deps())).rejects.toThrow(/401/);
+    const out = s.lines.join('\n');
+    expect(out).toMatch(/stopped before it wrote the install record/i);
+    expect(out).toMatch(/done: ruleset pipegen\b/);
+    expect(out).toMatch(/done: environment production/);
+    expect(out).toContain(localFinishPendingPath(app, { home: s.home, env: {} }));
+    armed = false;
+    await finish(s.g.octokit(), app, {}, s.deps());
+    const r = await recordOn(s);
+    expect(r.environments.find((e) => e.name === 'production')).toMatchObject({ created: false, previous: { wait_timer: 5, reviewers: [] } });
+    expect(r.repoSettings?.vulnerabilityAlerts).toEqual({ previous: false });
+  });
+
+  it('finish: PIPEGEN_BLOCK_FROM never moves later: a later setup PR merge keeps the earlier date (I2)', async () => {
+    const s = await seed();
+    await finish(s.g.octokit(), app, {}, s.deps());
+    expect(varOf(s, 'PIPEGEN_BLOCK_FROM')?.value).toBe(BLOCK_FROM);
+    // a later delivery: a new setup PR, merged on 2027-01-10 (merge day + 7 would be 2027-01-17)
+    s.g.commitOn('o/r', SETUP_BRANCH, { 'PIPEGEN.md': '# pipegen v2\n' }, 'pipegen: setup again');
+    const pr2 = ((await s.g.request('POST /repos/{owner}/{repo}/pulls', { owner: 'o', repo: 'r', head: SETUP_BRANCH, base: 'main', title: 'pipegen', body: 'again' })).data as { number: number }).number;
+    s.g.merge('o/r', SETUP_BRANCH, '2027-01-10T09:00:00Z');
+    const loc = await readLocalRecord(app, { home: s.home, env: {} });
+    await writeLocalRecord(app, { ...(loc as NonNullable<typeof loc>), setupPr: pr2 }, { home: s.home, env: {} });
+    await finish(s.g.octokit(), app, {}, s.deps());
+    expect(varOf(s, 'PIPEGEN_BLOCK_FROM')?.value).toBe(BLOCK_FROM);
+    const r = await recordOn(s, 'pipegen/update-r');
+    expect(r.blockFrom).toBe(BLOCK_FROM);
+    expect(r.mergedAt).toBe('2027-01-10T09:00:00Z');
+    // a recorded date later than the merge day + 7: the earlier one wins
+    const t = await seed({ recordOver: (rec) => { rec.blockFrom = '2026-12-25'; } });
+    await finish(t.g.octokit(), app, {}, t.deps());
+    expect(varOf(t, 'PIPEGEN_BLOCK_FROM')?.value).toBe(BLOCK_FROM);
+    expect((await recordOn(t)).blockFrom).toBe(BLOCK_FROM);
+    // a recorded date earlier than the merge day + 7 stays
+    const u = await seed({ recordOver: (rec) => { rec.blockFrom = '2026-11-08'; } });
+    await finish(u.g.octokit(), app, {}, u.deps());
+    expect(varOf(u, 'PIPEGEN_BLOCK_FROM')?.value).toBe('2026-11-08');
+    expect((await recordOn(u)).blockFrom).toBe('2026-11-08');
+    // a record trusted by typing carries no date: the variable's own earlier date stays
+    const w = await seed();
+    rmSync(join(w.home, '.config'), { recursive: true, force: true });
+    w.g.x('o/r').variables.set('PIPEGEN_BLOCK_FROM', { value: '2026-11-09', created_at: '2026-11-06T10:00:00Z' });
+    const io = { confirm: async () => false, select: async () => { throw new Error('no'); }, text: async () => 'o/r' } as never;
+    await finish(w.g.octokit(), app, {}, w.deps({ io, interactive: true }));
+    expect(varOf(w, 'PIPEGEN_BLOCK_FROM')?.value).toBe('2026-11-09');
+    expect((await recordOn(w)).blockFrom).toBe('2026-11-09');
+  });
+});
+
+describe('G11 fix round 1: verify compares the locks (I3)', () => {
+  const app = { owner: 'o', repo: 'r' };
+  const vfy = (s: Seed) => verify(s.g.octokit(), app, { local: { home: s.home, env: {} }, clock: clock() });
+  const CENTRAL = 'the central merge rule (ruleset pipegen on o/pipelines)';
+
+  it('verify: a planned ruleset finish couldn\'t apply is drift', async () => {
+    const s = await seed();
+    s.g.hooks.push((c) => (c.route === 'POST /repos/{owner}/{repo}/rulesets' && c.params.name === 'pipegen-reviews' ? { status: 500, data: { message: 'boom' } } : undefined));
+    await finish(s.g.octokit(), app, {}, s.deps());
+    expect((await vfy(s)).drift).toEqual([{ what: 'ruleset pipegen-reviews', expected: 'applied by finish', actual: null }]);
+    // and the central rule planned but never made
+    const t = await seed();
+    t.g.hooks.push((c) => (c.route === 'POST /repos/{owner}/{repo}/rulesets' && c.params.repo === 'pipelines' ? { status: 500, data: { message: 'boom' } } : undefined));
+    await finish(t.g.octokit(), app, {}, t.deps());
+    expect((await vfy(t)).drift).toEqual([{ what: CENTRAL, expected: 'applied by finish', actual: null }]);
+  });
+
+  it('verify: a ruleset emptied, given a bypass actor, switched to evaluate, or with weaker check or review settings is drift', async () => {
+    const s = await seed({ org: true });
+    await finish(s.g.octokit(), app, {}, s.deps());
+    expect((await vfy(s)).drift).toEqual([]);
+    type B = Record<string, any>;
+    const rule = (b: B, type: string): B => (b.rules as B[]).find((x) => x.type === type) as B;
+    const bodyOf = (repo: string, name: string): B => [...s.g.repo(repo).rulesets.values()].find((b) => b.name === name) as B;
+    const org = (): B => ([...s.g.orgRulesets.values()][0] as { body: B }).body;
+    const cases: [string, () => B, (b: B) => void, RegExp][] = [
+      ['ruleset pipegen', () => bodyOf('o/r', 'pipegen'), (b) => { b.rules = []; }, /pipegen's rules/],
+      ['ruleset pipegen', () => bodyOf('o/r', 'pipegen'), (b) => { b.bypass_actors = [{ actor_id: 5, actor_type: 'RepositoryRole', bypass_mode: 'always' }]; }, /no bypass actors/],
+      ['ruleset pipegen', () => bodyOf('o/r', 'pipegen'), (b) => { b.enforcement = 'evaluate'; }, /active/],
+      ['ruleset pipegen', () => bodyOf('o/r', 'pipegen'), (b) => { rule(b, 'required_status_checks').parameters.required_status_checks = [{ context: 'pipegen / gate', integration_id: 1 }]; }, /15368/],
+      ['ruleset pipegen', () => bodyOf('o/r', 'pipegen'), (b) => { rule(b, 'required_status_checks').parameters.required_status_checks = [{ context: 'other', integration_id: 15368 }]; }, /pipegen \/ gate/],
+      ['ruleset pipegen-reviews', () => bodyOf('o/r', 'pipegen-reviews'), (b) => { rule(b, 'pull_request').parameters.dismiss_stale_reviews_on_push = false; }, /dismiss/],
+      ['ruleset pipegen-reviews', () => bodyOf('o/r', 'pipegen-reviews'), (b) => { rule(b, 'pull_request').parameters.require_last_push_approval = false; }, /last push/],
+      ['ruleset pipegen-reviews', () => bodyOf('o/r', 'pipegen-reviews'), (b) => { rule(b, 'pull_request').parameters.require_code_owner_review = false; }, /code-owner review/],
+      ['ruleset pipegen-reviews', () => bodyOf('o/r', 'pipegen-reviews'), (b) => { rule(b, 'pull_request').parameters.required_approving_review_count = 0; }, /approv/],
+      ['ruleset pipegen-reviews', () => bodyOf('o/r', 'pipegen-reviews'), (b) => { b.bypass_actors = [{ actor_id: 1, actor_type: 'OrganizationAdmin', bypass_mode: 'pull_request' }]; }, /no bypass actors/],
+      [CENTRAL, () => bodyOf('o/pipelines', 'pipegen'), (b) => { b.rules = (b.rules as B[]).filter((x) => x.type !== 'pull_request'); }, /pipegen's rules/],
+      [CENTRAL, () => bodyOf('o/pipelines', 'pipegen'), (b) => { b.bypass_actors = [{ actor_id: 5, actor_type: 'RepositoryRole', bypass_mode: 'always' }]; }, /no bypass actors/],
+      ['the org required workflow rule (pipegen-required--r)', org, (b) => { b.bypass_actors = [{ actor_id: 5, actor_type: 'RepositoryRole', bypass_mode: 'always' }]; }, /no bypass actors/],
+      ['the org required workflow rule (pipegen-required--r)', org, (b) => { b.rules = []; }, /pipegen's rules/],
+      ['the org required workflow rule (pipegen-required--r)', org, (b) => { b.enforcement = 'disabled'; }, /active/],
+    ];
+    for (const [what, get, change, want] of cases) {
+      const b = get();
+      const saved = structuredClone(b);
+      change(b);
+      const d = (await vfy(s)).drift;
+      expect(d.length, `${what} ${want}`).toBeGreaterThan(0);
+      expect(d.every((x) => x.what === what), `${what} ${want}: ${JSON.stringify(d)}`).toBe(true);
+      expect(d.map((x) => x.expected).join('\n'), what).toMatch(want);
+      for (const k of Object.keys(b)) delete b[k];
+      Object.assign(b, saved);
+    }
+    expect((await vfy(s)).drift).toEqual([]);
+  });
+
+  it('verify: a planned ruleset pipegen updated but couldn\'t record is checked by name, not reported missing', async () => {
+    const s = await seed();
+    s.g.repo('o/r').rulesets.set(5, { name: 'pipegen', target: 'branch', enforcement: 'disabled', bypass_actors: [], conditions: {}, rules: [], created_at: '2026-03-03T00:00:00Z' });
+    await finish(s.g.octokit(), app, {}, s.deps());
+    expect((await recordOn(s)).rulesets.map((x) => x.name)).toEqual(['pipegen-reviews']);
+    const v = await vfy(s);
+    expect(v.drift).toEqual([]);
+    expect(v.notes.join('\n')).toMatch(/ruleset pipegen .*not in the install record/i);
+    (s.g.repo('o/r').rulesets.get(5) as Record<string, unknown>).bypass_actors = [{ actor_id: 5, actor_type: 'RepositoryRole', bypass_mode: 'always' }];
+    expect((await vfy(s)).drift).toEqual([{ what: 'ruleset pipegen', expected: 'no bypass actors', actual: '1 bypass actor' }]);
+  });
+
+  it('verify: classic protection weakened after finish is drift', async () => {
+    const s = await seed();
+    s.g.hooks.push((c) => (c.route === 'POST /repos/{owner}/{repo}/rulesets' && c.params.repo === 'r' ? { status: 403, data: { message: 'Upgrade to GitHub Pro or make this repository public to enable this feature.' } } : undefined));
+    await finish(s.g.octokit(), app, {}, s.deps());
+    expect((await vfy(s)).drift).toEqual([]);
+    (s.g.x('o/r').protection as Record<string, any>).required_pull_request_reviews.required_approving_review_count = 0;
+    expect((await vfy(s)).drift).toEqual([{ what: 'classic branch protection on main', expected: 'pipegen\'s rules', actual: 'changed' }]);
+    s.g.x('o/r').protection = null;
+    expect((await vfy(s)).drift).toEqual([{ what: 'classic branch protection on main', expected: 'pipegen\'s rules', actual: null }]);
+  });
+});
+
+describe('G11 fix round 1: minor findings (m1-m9)', () => {
+  const app = { owner: 'o', repo: 'r' };
+
+  it('finish --rotate-key with no central ruleset: the note says the record names the new key now (m1)', async () => {
+    const s = await seed({ keyEnv: true, plannedOver: (p) => { delete p.centralRuleset; } });
+    await finish(s.g.octokit(), app, {}, s.deps());
+    const res = await finish(s.g.octokit(), app, { rotateKey: true }, s.deps());
+    const notes = res.notes.join('\n');
+    expect(notes).not.toMatch(/reports the key as changed/);
+    expect(notes).toMatch(/install record on o\/pipelines names the new key/);
+    expect(notes).toMatch(/verify step fails closed until a pull request/);
+    expect((await recordOn(s)).cosignPubSha256).toBe(pubKeySha256(envVarOf(s, 'pipegen-signing', 'PIPEGEN_COSIGN_PUB')?.value as string));
+  });
+
+  it('finish --rotate-key: a half-done rotation says signing is broken and how to fix it (m2)', async () => {
+    const s = await seed({ keyEnv: true });
+    await finish(s.g.octokit(), app, {}, s.deps());
+    s.g.hooks.push((c) => (c.route === 'PUT /repos/{owner}/{repo}/environments/{environment_name}/secrets/{secret_name}' && String(c.params[['secret', 'name'].join('_')]).endsWith('WORD') ? { status: 500, data: { message: 'boom' } } : undefined));
+    const res = await finish(s.g.octokit(), app, { rotateKey: true }, s.deps());
+    const why = res.skipped.find((x) => /signing key/.test(x.what))?.why ?? '';
+    expect(why).toMatch(/stored the new PIPEGEN_COSIGN_KEY/);
+    expect(why).toMatch(/signing is broken/i);
+    expect(why).toMatch(/finish --rotate-key/);
+  });
+
+  it('finish: an earlier entry whose created_at is unknown on either side keeps its previous value (m3)', async () => {
+    const s = await seed();
+    s.g.repo('o/r').envs.set('production', { id: 77, created_at: '2026-01-01T00:00:00Z', wait_timer: 5, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: null, policies: [], stored: new Map() });
+    s.g.x('o/r').variables.set('PIPEGEN_BLOCK_FROM', { value: '2026-12-31', created_at: '2026-02-02T00:00:00Z' });
+    await finish(s.g.octokit(), app, {}, s.deps());
+    const first = await recordOn(s);
+    // GitHub doesn't say when they were made this time: the earlier previous values stay
+    delete (s.g.repo('o/r').envs.get('production') as { created_at?: string }).created_at;
+    (varOf(s, 'PIPEGEN_BLOCK_FROM') as { created_at: string }).created_at = '';
+    await finish(s.g.octokit(), app, {}, s.deps());
+    const second = await recordOn(s, 'pipegen/update-r');
+    expect(second.environments.find((e) => e.name === 'production')).toEqual(first.environments.find((e) => e.name === 'production'));
+    expect(second.variables.find((v) => v.name === 'PIPEGEN_BLOCK_FROM')).toEqual(first.variables.find((v) => v.name === 'PIPEGEN_BLOCK_FROM'));
+    // an earlier entry recorded without created_at (unconfirmed), GitHub holding pipegen's own value now: previous kept, never pipegen's
+    const t = await seed({ recordOver: (r) => { r.variables.push({ name: 'PIPEGEN_BLOCK_FROM', scope: 'repo', created: false, unconfirmed: true, previous: '2026-12-31' }); } });
+    t.g.x('o/r').variables.set('PIPEGEN_BLOCK_FROM', { value: BLOCK_FROM, created_at: '2026-02-02T00:00:00Z' });
+    await finish(t.g.octokit(), app, {}, t.deps());
+    expect((await recordOn(t)).variables.find((v) => v.name === 'PIPEGEN_BLOCK_FROM')).toEqual({ name: 'PIPEGEN_BLOCK_FROM', scope: 'repo', created: false, unconfirmed: true, previous: '2026-12-31' });
+  });
+
+  it('finish: the central rule that couldn\'t be switched on gets its own line, apart from what the record doesn\'t list (m4)', async () => {
+    const s = await seed();
+    s.g.hooks.push((c) => (c.route === 'PUT /repos/{owner}/{repo}/rulesets/{ruleset_id}' && c.params.repo === 'pipelines' && c.params.enforcement === 'active' ? { status: 500, data: { message: 'boom' } } : undefined));
+    await finish(s.g.octokit(), app, {}, s.deps());
+    const out = s.lines.join('\n');
+    expect(out).not.toMatch(/doesn't list them:\n {2}- the central merge rule/);
+    expect(out).toMatch(/The install record lists the central merge rule .*, but it is switched off/);
+    expect((await recordOn(s)).central?.rulesetId).toBeDefined();
+  });
+
+  it('finish: a ruleset pipegen made whose read-back has no created_at is recorded unconfirmed, with its own note (m6)', async () => {
+    const s = await seed();
+    const strip = (repo: string) => (c: { route: string; params: Record<string, unknown> }) => {
+      if (c.route !== 'GET /repos/{owner}/{repo}/rulesets/{ruleset_id}' || c.params.repo !== repo) return undefined;
+      const rs = s.g.repo(`o/${repo}`).rulesets.get(Number(c.params.ruleset_id));
+      if (rs === undefined) return undefined;
+      const { created_at: _c, ...rest } = rs as Record<string, unknown>;
+      return { status: 200, data: { id: Number(c.params.ruleset_id), ...structuredClone(rest) } };
+    };
+    s.g.hooks.push(strip('r'), strip('pipelines'));
+    const res = await finish(s.g.octokit(), app, {}, s.deps());
+    const r = await recordOn(s);
+    const ids = rulesetsOf(s, 'o/r');
+    expect(r.rulesets).toEqual([
+      { kind: 'gate', id: ids.find((x) => x.name === 'pipegen')?.id, name: 'pipegen', unconfirmed: true },
+      { kind: 'reviews', id: ids.find((x) => x.name === 'pipegen-reviews')?.id, name: 'pipegen-reviews', unconfirmed: true },
+    ]);
+    const notes = res.notes.join('\n');
+    expect(notes).toMatch(/pipegen made the ruleset pipegen, but GitHub didn't say when/);
+    expect(notes).not.toMatch(/already on .* can't show it made it/);
+    // the central rule: recorded by id without a created_at, and still switched on last
+    const c = rulesetsOf(s, 'o/pipelines')[0];
+    expect(r.central?.rulesetId).toBe(c?.id);
+    expect(r.central?.rulesetCreatedAt).toBeUndefined();
+    expect(c?.enforcement).toBe('active');
+  });
+
+  it('finish: a weakened request planted in a vouched record\'s planned is never sent (m7)', async () => {
+    const s = await seed({ org: true, plannedOver: (p) => {
+      const g = p.rulesets?.gate.body as Record<string, any>;
+      g.enforcement = 'evaluate';
+      g.bypass_actors = [{ actor_id: 5, actor_type: 'RepositoryRole', bypass_mode: 'always' }];
+      (p.centralRuleset?.body as Record<string, any>).rules = [];
+      (p.shaPinning?.request.body as Record<string, any>).sha_pinning_required = false;
+    } });
+    const res = await finish(s.g.octokit(), app, {}, s.deps());
+    const gate = rulesetsOf(s, 'o/r').find((b) => b.name === 'pipegen');
+    expect(gate).toMatchObject({ enforcement: 'active', bypass_actors: [] });
+    expect(rulesetsOf(s, 'o/pipelines')[0]?.rules.map((x: { type: string }) => x.type)).toEqual(['deletion', 'non_fast_forward', 'pull_request']);
+    expect(s.g.x('o/r').actions.sha_pinning_required).toBe(true);
+    expect(res.skipped).toEqual([]);
+  });
+
+  it('finish --print: an unreadable signing environment is reported; a typed record says what happens to PIPEGEN_COSIGN_PUB (m8)', async () => {
+    const s = await seed({ keyEnv: true });
+    s.g.hooks.push((c) => (c.route === 'GET /repos/{owner}/{repo}/environments/{environment_name}' && c.params.environment_name === 'pipegen-signing' ? { status: 500, data: { message: 'boom' } } : undefined));
+    const res = await finish(s.g.octokit(), app, { print: true }, s.deps());
+    expect(res.skipped.find((x) => /signing environment/.test(x.what))?.why).toMatch(/HTTP 500/);
+    // typed: the public key can't be re-derived; --print says so
+    const t = await seed({ keyEnv: true });
+    rmSync(join(t.home, '.config'), { recursive: true, force: true });
+    const io = { confirm: async () => false, select: async () => { throw new Error('no'); }, text: async () => 'o/r' } as never;
+    const tres = await finish(t.g.octokit(), app, { print: true }, t.deps({ io, interactive: true }));
+    expect(tres.skipped.find((x) => /PIPEGEN_COSIGN_PUB/.test(x.what))?.why).toMatch(/couldn't re-derive the public key.*--rotate-key/);
+  });
+
+  it('finish: a setup pull request merged into another branch than the default one is not the merge (m9)', async () => {
+    const s = await seed({ merge: false });
+    const pr = s.g.repo('o/r').pulls.find((p) => p.number === s.pr) as { base: string };
+    pr.base = 'other';
+    s.g.merge('o/r', SETUP_BRANCH, MERGED_AT);
+    const from = s.g.calls.length;
+    await expect(finish(s.g.octokit(), app, {}, s.deps())).rejects.toThrow(/not merged into the default branch/);
+    expect(writeRoutes(s, from)).toEqual([]);
   });
 });
 

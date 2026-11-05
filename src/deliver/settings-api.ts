@@ -92,7 +92,8 @@ export class SettingsApi {
 
 // ---------- comparing what GitHub holds with what pipegen wants ----------
 
-const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
+/** A plain JSON object (not null, not a list): the one check finish and verify use on GitHub's answers. */
+export const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
 
 /**
  * Whether `got` (GitHub's answer) holds everything `want` says: every key of an object (GitHub adds its own: ids, urls, defaults), every
