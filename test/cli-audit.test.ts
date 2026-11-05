@@ -39,12 +39,6 @@ vi.mock('node:child_process', async (importOriginal) => {
 });
 vi.mock('execa', () => ({ execa: vi.fn(), execaSync: vi.fn(), execaNode: vi.fn(), execaCommand: vi.fn(), execaCommandSync: vi.fn(), $: vi.fn() }));
 // The AI: the real makeProvider runs (its key and flag checks), then a test's fake provider stands in for it.
-// J4: the terminal report is the short one unless `verbose`. These tests are about the full report; the CLI's `--verbose`
-// flag arrives with J5 (merge: delete this mock and pass `--verbose` in the args of the tests that read the full report).
-vi.mock('../src/audit/render.js', async (importOriginal) => {
-  const a = await importOriginal<typeof import('../src/audit/render.js')>();
-  return { ...a, renderTerminal: (r: Parameters<typeof a.renderTerminal>[0], o: Parameters<typeof a.renderTerminal>[1]) => a.renderTerminal(r, { ...o, verbose: true }) };
-});
 vi.mock('../src/ai/provider.js', async (importOriginal) => {
   const a = await importOriginal<typeof import('../src/ai/provider.js')>();
   return { ...a, makeProvider: vi.fn((opts: Parameters<typeof a.makeProvider>[0]) => { const real = a.makeProvider(opts); return hooks.ai ?? real; }) };
@@ -227,7 +221,7 @@ function aiSetup(why?: string, service?: string, body = CLEAN) {
 describe('pipegen audit (brief)', () => {
   it('cli: audit prints report, exit 0, makes no write calls (only GET), report on stdout', async () => {
     const dir = repo();
-    const r = await audit(['audit'], { cwd: dir });
+    const r = await audit(['audit', '--verbose'], { cwd: dir });
     expect(r.code).toBe(0);
     expect(r.out).toContain('pipegen audit: o/r');
     expect(r.out).toContain('pipegen changed nothing in the repo or on GitHub.');
@@ -244,7 +238,7 @@ describe('pipegen audit (brief)', () => {
     const dir = repo();
     const work = makeTempDir();
     const before = listTree(dir);
-    const r = await audit(['audit', '--dir', dir, '--out', 'report.md'], { cwd: work });
+    const r = await audit(['audit', '--verbose', '--dir', dir, '--out', 'report.md'], { cwd: work });
     expect(r.code).toBe(0);
     const file = join(work, 'report.md');
     const md = readFileSync(file, 'utf8');
@@ -259,7 +253,7 @@ describe('pipegen audit (brief)', () => {
 
   it('cli: --json prints AuditReport (stdout is only JSON)', async () => {
     const dir = repo();
-    const r = await audit(['audit', '--json'], { cwd: dir });
+    const r = await audit(['audit', '--verbose', '--json'], { cwd: dir });
     expect(r.code).toBe(0);
     const j = JSON.parse(r.out) as Record<string, unknown> & { profile: { owner: string; repo: string }; coverage: unknown[]; warnings: { text: string }[] };
     expect(j.profile).toMatchObject({ owner: 'o', repo: 'r', private: false });
@@ -270,7 +264,7 @@ describe('pipegen audit (brief)', () => {
 
   it('cli: private repo without auth → fine-grained read-only instructions, no gh auth login (S22)', async () => {
     const dir = repo();
-    const r = await audit(['audit'], { cwd: dir, routes: publicRoutes({ [`GET ${R}`]: err(404, 'Not Found') }) });
+    const r = await audit(['audit', '--verbose'], { cwd: dir, routes: publicRoutes({ [`GET ${R}`]: err(404, 'Not Found') }) });
     expect(r.code).toBe(1);
     expect(r.err).toContain("pipegen can't see o/r: it's private or doesn't exist. If it's private, pipegen needs read access to o/r.");
     expect(r.err).toContain('fine-grained token for this one repo');
@@ -279,7 +273,7 @@ describe('pipegen audit (brief)', () => {
     expect(r.err).toContain('pipegen refuses broad classic tokens');
     expect(r.all).not.toMatch(/gh auth login/);
     // with a token that can't see the repo: the same read-only steps
-    const withTok = await audit(['audit'], { cwd: dir, env: { [GH_VAR]: fake.githubPat() }, routes: privateRoutes({ [`GET ${R}`]: err(404, 'Not Found') }) });
+    const withTok = await audit(['audit', '--verbose'], { cwd: dir, env: { [GH_VAR]: fake.githubPat() }, routes: privateRoutes({ [`GET ${R}`]: err(404, 'Not Found') }) });
     expect(withTok.code).toBe(1);
     expect(withTok.err).toContain('pipegen needs read access to o/r. Create a fine-grained token for this one repo');
     expect(withTok.all).not.toMatch(/gh auth login/);
@@ -290,7 +284,7 @@ describe('pipegen audit (brief)', () => {
     const dir = repo();
     const { ai, env } = aiSetup();
     const ask = prompter(false);
-    const r = await audit(['audit', '--ai'], { cwd: dir, env, prompt: ask });
+    const r = await audit(['audit', '--verbose', '--ai'], { cwd: dir, env, prompt: ask });
     expect(r.code).toBe(0);
     expect(ask.asked).toHaveLength(1);
     expect(ask.asked[0]).toContain('pipegen audit --ai is about to send part of your code to an AI. Nothing has left this computer yet.');
@@ -306,7 +300,7 @@ describe('pipegen audit (brief)', () => {
     const dir = repo();
     const { ai, env } = aiSetup();
     const ask = prompter(true);
-    const r = await audit(['audit', '--ai'], { cwd: dir, env, prompt: ask });
+    const r = await audit(['audit', '--verbose', '--ai'], { cwd: dir, env, prompt: ask });
     expect(r.code).toBe(0);
     expect(ai.complete).toHaveBeenCalled();
     expect(r.out).toContain('You ran it with --ai');
@@ -329,13 +323,13 @@ describe('pipegen audit (brief)', () => {
       [`GET ${R2}`]: { body: { private: false, default_branch: 'main', owner: { type: 'User', login: 'o' } } },
       [`GET ${R2}/rulesets`]: { body: [] }, [`GET ${R2}/events`]: { body: [] }, [`GET ${R2}/pulls`]: { body: [] },
     });
-    const dflt = await audit(['audit', '--json'], { cwd: here, routes });
+    const dflt = await audit(['audit', '--verbose', '--json'], { cwd: here, routes });
     expect((JSON.parse(dflt.out) as { profile: { repo: string } }).profile.repo).toBe('r');
-    const given = await audit(['audit', '--json', '--dir', other], { cwd: here, routes });
+    const given = await audit(['audit', '--verbose', '--json', '--dir', other], { cwd: here, routes });
     expect((JSON.parse(given.out) as { profile: { repo: string } }).profile.repo).toBe('r2');
     // a relative --dir is read from the current folder
     const work = makeTempDir();
-    const rel = await audit(['audit', '--json', '--dir', join('..', other.split('/').pop() as string)], { cwd: resolve(work), routes });
+    const rel = await audit(['audit', '--verbose', '--json', '--dir', join('..', other.split('/').pop() as string)], { cwd: resolve(work), routes });
     expect((JSON.parse(rel.out) as { profile: { repo: string } }).profile.repo).toBe('r2');
   });
 
@@ -358,7 +352,7 @@ describe('pipegen audit (brief)', () => {
 
   it('cli: no token on a public repo → anonymous Octokit, no-token note, exit 0', async () => {
     const dir = repo();
-    const r = await audit(['audit'], { cwd: dir });
+    const r = await audit(['audit', '--verbose'], { cwd: dir });
     expect(r.code).toBe(0);
     expect(r.out).toContain('Without a GitHub token, pipegen reads public data only and is rate-limited.');
     for (const c of r.calls) expect(c.headers.authorization).toBeUndefined();
@@ -386,9 +380,9 @@ describe('pipegen audit (brief)', () => {
     env[GH_VAR] = ghVal;
     const work = makeTempDir();
     const ask = prompter(true);
-    const json = await audit(['audit', '--dir', dir, '--json', '--ai', '--out', 'r.md'], { cwd: work, env, routes, prompt: ask });
+    const json = await audit(['audit', '--verbose', '--dir', dir, '--json', '--ai', '--out', 'r.md'], { cwd: work, env, routes, prompt: ask });
     expect(json.code).toBe(0);
-    const term = await audit(['audit', '--dir', dir], { cwd: work, env, routes });
+    const term = await audit(['audit', '--verbose', '--dir', dir], { cwd: work, env, routes });
     expect(term.code).toBe(0);
     const md = readFileSync(join(work, 'r.md'), 'utf8');
     // the values were really there: the GitHub calls carried the token, the repo's workflow and folder are named like it
@@ -418,7 +412,7 @@ describe('pipegen audit (brief)', () => {
   it('cli: audit without --ai starts no child process (child_process and execa spied)', async () => {
     const dir = repo();
     vi.clearAllMocks();
-    const r = await audit(['audit', '--out', join(makeTempDir(), 'x.md')], { cwd: dir });
+    const r = await audit(['audit', '--verbose', '--out', join(makeTempDir(), 'x.md')], { cwd: dir });
     expect(r.code).toBe(0);
     expect(childCalls()).toEqual([]);
     expect(execaCalls()).toEqual([]);
@@ -431,7 +425,7 @@ describe('pipegen audit (brief)', () => {
       const s = aiSetup();
       const ask = prompter(true);
       vi.clearAllMocks();
-      const r = await audit(['audit', '--ai'], { cwd: dir, env: { ...s.env, ...env }, prompt: ask });
+      const r = await audit(['audit', '--verbose', '--ai'], { cwd: dir, env: { ...s.env, ...env }, prompt: ask });
       expect(r.code, name).toBe(0);
       expect(s.ai.complete, name).toHaveBeenCalled();
       const calls = childCalls();
@@ -469,7 +463,7 @@ describe('pipegen audit (brief)', () => {
     const { ai, env } = aiSetup();
     const ask = prompter(true);
     vi.clearAllMocks();
-    const r = await audit(['audit', '--ai'], { cwd: dir, env: { ...env, [SCANNER_ENV]: odd }, prompt: ask });
+    const r = await audit(['audit', '--verbose', '--ai'], { cwd: dir, env: { ...env, [SCANNER_ENV]: odd }, prompt: ask });
     expect(r.code).toBe(1);
     expect(r.err).toContain('PIPEGEN_SECRET_SCANNER must be betterleaks (the default) or gitleaks.');
     expect(r.all).not.toContain(odd);
@@ -478,7 +472,7 @@ describe('pipegen audit (brief)', () => {
     expect(ensurePinnedBinary).not.toHaveBeenCalled();
     expect(ai.complete).not.toHaveBeenCalled();
     // without --ai nothing is scanned or sent, so the setting is not read
-    const plain = await audit(['audit'], { cwd: dir, env: { [SCANNER_ENV]: odd } });
+    const plain = await audit(['audit', '--verbose'], { cwd: dir, env: { [SCANNER_ENV]: odd } });
     expect(plain.code).toBe(0);
   });
 
@@ -486,7 +480,7 @@ describe('pipegen audit (brief)', () => {
     for (const code of [2, 126, 255]) {
       const dir = repo();
       const s = aiSetup(undefined, undefined, `writeReport('[]'); process.exit(${code});`);
-      const r = await audit(['audit', '--ai'], { cwd: dir, env: s.env, prompt: prompter(true) });
+      const r = await audit(['audit', '--verbose', '--ai'], { cwd: dir, env: s.env, prompt: prompter(true) });
       expect(r.code, String(code)).toBe(0); // the plain audit is still reported
       expect(s.ai.complete, String(code)).not.toHaveBeenCalled();
       const out = oneLine(r.out);
@@ -497,7 +491,7 @@ describe('pipegen audit (brief)', () => {
     // gitleaks is already the fallback: its failure names no other scanner
     const dir = repo();
     const s = aiSetup(undefined, undefined, 'process.exit(2);');
-    const r = await audit(['audit', '--ai'], { cwd: dir, env: { ...s.env, [SCANNER_ENV]: 'gitleaks' }, prompt: prompter(true) });
+    const r = await audit(['audit', '--verbose', '--ai'], { cwd: dir, env: { ...s.env, [SCANNER_ENV]: 'gitleaks' }, prompt: prompter(true) });
     expect(s.ai.complete).not.toHaveBeenCalled();
     expect(oneLine(r.out)).toContain("the required gitleaks check couldn't run. gitleaks failed (exit code 2).");
     expect(r.out).not.toContain('To use the gitleaks fallback');
@@ -509,17 +503,17 @@ describe('pipegen audit (brief)', () => {
 describe('pipegen audit (flags and help)', () => {
   it('flags: an unknown flag is exit 1 with a cleaned message; audit takes no positional arguments', async () => {
     const cwd = makeTempDir();
-    const bad = await audit(['audit', '--evil\u001b[31m\u202e'], { cwd });
+    const bad = await audit(['audit', '--verbose', '--evil\u001b[31m\u202e'], { cwd });
     expect(bad.code).toBe(1);
     expect(bad.err).toMatch(/Unknown option/);
     expect(bad.all).not.toMatch(UNSAFE);
-    const extra = await audit(['audit', 'stray'], { cwd });
+    const extra = await audit(['audit', '--verbose', 'stray'], { cwd });
     expect(extra.code).toBe(1);
     expect(extra.err).toContain('pipegen audit takes no arguments');
-    const unknownAi = await audit(['audit', '--ai=gemini'], { cwd });
+    const unknownAi = await audit(['audit', '--verbose', '--ai=gemini'], { cwd });
     expect(unknownAi.code).toBe(1);
     expect(unknownAi.err).toContain('Unknown --ai value "gemini". Use claude, openai or ollama.');
-    const modelOnly = await audit(['audit', '--model', 'x'], { cwd });
+    const modelOnly = await audit(['audit', '--verbose', '--model', 'x'], { cwd });
     expect(modelOnly.code).toBe(1);
     expect(modelOnly.err).toContain('--model and --effort only work with --ai.');
     const inspectOut = await audit(['inspect', '--out', 'x.md'], { cwd });
@@ -583,7 +577,7 @@ describe('pipegen audit (auth and GitHub, ruling B1)', () => {
   it('access, S18: the run uses ONE rate budget for every GitHub call, buildAudit, addAiSuggestions and fetchStats (S18)', async () => {
     const dir = repo();
     const { env } = aiSetup();
-    const r = await audit(['audit', '--ai'], { cwd: dir, env, prompt: prompter(true) });
+    const r = await audit(['audit', '--verbose', '--ai'], { cwd: dir, env, prompt: prompter(true) });
     expect(r.code).toBe(0);
     const budget = vi.mocked(buildAudit).mock.calls[0]?.[1].budget as RateBudget;
     expect(budget).toBeDefined();
@@ -598,9 +592,9 @@ describe('pipegen audit (auth and GitHub, ruling B1)', () => {
 
   it('access, B1: GET /user only with a token; the login reads a personal plan; buildAudit gets the context, the probe and the full-run permissions', async () => {
     const dir = repo();
-    const anon = await audit(['audit'], { cwd: dir });
+    const anon = await audit(['audit', '--verbose'], { cwd: dir });
     expect(anon.calls.some((c) => c.url.pathname === '/user')).toBe(false);
-    const withTok = await audit(['audit', '--json'], { cwd: dir, env: { [GH_VAR]: fake.githubPat() }, routes: privateRoutes() });
+    const withTok = await audit(['audit', '--verbose', '--json'], { cwd: dir, env: { [GH_VAR]: fake.githubPat() }, routes: privateRoutes() });
     expect(withTok.code).toBe(0);
     expect(withTok.calls.filter((c) => c.url.pathname === '/user').length).toBeGreaterThan(0);
     const deps = vi.mocked(buildAudit).mock.calls[1]?.[1];
@@ -614,13 +608,13 @@ describe('pipegen audit (auth and GitHub, ruling B1)', () => {
   it('access, S23: classic tokens are refused unless the broad-token flag is given', async () => {
     const dir = repo();
     const env = { [GH_VAR]: fake.githubClassic() };
-    const refused = await audit(['audit'], { cwd: dir, env, routes: privateRoutes() });
+    const refused = await audit(['audit', '--verbose'], { cwd: dir, env, routes: privateRoutes() });
     expect(refused.code).toBe(1);
     expect(refused.err).toContain("pipegen won't use this token");
     expect(refused.err).toContain('it is a classic token, which reaches every repo you have');
     expect(refused.err).toContain('--allow-broad-token');
     expect(refused.all).not.toContain(fake.githubClassic());
-    const allowed = await audit(['audit', '--allow-broad-token'], { cwd: dir, env, routes: privateRoutes() });
+    const allowed = await audit(['audit', '--verbose', '--allow-broad-token'], { cwd: dir, env, routes: privateRoutes() });
     expect(allowed.code).toBe(0);
     expect(allowed.all).not.toContain(fake.githubClassic());
   });
@@ -628,7 +622,7 @@ describe('pipegen audit (auth and GitHub, ruling B1)', () => {
   it('access, S21: not a GitHub repo → a friendly message, exit 1 (S21)', async () => {
     const dir = makeTempDir();
     writeIn(dir, 'package.json', '{}');
-    const r = await audit(['audit'], { cwd: dir });
+    const r = await audit(['audit', '--verbose'], { cwd: dir });
     expect(r.code).toBe(1);
     expect(r.err).toContain('pipegen audit needs a clone of a GitHub repository');
     expect(r.err).toContain('--dir');
@@ -638,7 +632,7 @@ describe('pipegen audit (auth and GitHub, ruling B1)', () => {
   it('access, R10: GitHub can\'t be read (no answer, 5xx) → only the local parts, "GitHub: not read", exit 1 (R10); no guessed GitHub facts', async () => {
     const dir = repo({ 'config/dev.json': JSON.stringify({ id: fake.awsKey() }), '.github/workflows/ci.yml': 'on: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm test\n' });
     const down = publicRoutes({ [`GET ${R}`]: err(503, 'Service Unavailable') });
-    const r = await audit(['audit'], { cwd: dir, routes: down });
+    const r = await audit(['audit', '--verbose'], { cwd: dir, routes: down });
     expect(r.code).toBe(1);
     expect(r.out).toContain('pipegen audit: o/r');
     expect(r.out).toContain('GitHub: not read (the error is on stderr).');
@@ -648,12 +642,12 @@ describe('pipegen audit (auth and GitHub, ruling B1)', () => {
     expect(r.out).not.toMatch(/Verdict|Checks by layer|What your GitHub plan allows|Costs of the full setup|Permissions the full setup needs/);
     expect(r.err).toContain("GitHub: not read: pipegen couldn't reach https://api.github.com to check o/r (HTTP 503");
     // --json: the local parts as JSON, github "not read"
-    const j = await audit(['audit', '--json'], { cwd: dir, routes: down });
+    const j = await audit(['audit', '--verbose', '--json'], { cwd: dir, routes: down });
     expect(j.code).toBe(1);
     expect(JSON.parse(j.out)).toMatchObject({ github: 'not read', profile: { owner: 'o', repo: 'r' } });
     // --out: no half report is written
     const work = makeTempDir();
-    const o = await audit(['audit', '--dir', dir, '--out', 'r.md'], { cwd: work, routes: down });
+    const o = await audit(['audit', '--verbose', '--dir', dir, '--out', 'r.md'], { cwd: work, routes: down });
     expect(o.code).toBe(1);
     expect(existsSync(join(work, 'r.md'))).toBe(false);
     expect(o.err).toContain('No report file was written: GitHub could not be read.');
@@ -662,11 +656,11 @@ describe('pipegen audit (auth and GitHub, ruling B1)', () => {
   it('access, M12: GitHub names the repo differently (renamed or transferred) → a note, and the run goes on', async () => {
     const dir = repo();
     const moved = publicRoutes({ [`GET ${R}`]: { body: { full_name: 'newowner/new-name', private: false, default_branch: 'main', owner: { type: 'Organization', login: 'newowner' } } } });
-    const r = await audit(['audit', '--json'], { cwd: dir, routes: moved });
+    const r = await audit(['audit', '--verbose', '--json'], { cwd: dir, routes: moved });
     expect(r.code).toBe(0);
     expect((JSON.parse(r.out) as { notes: string[] }).notes).toContain('GitHub says this repo is now newowner/new-name (renamed or transferred); the facts below are for that repo.');
     // the same name in another letter case is the same repo: no note
-    const same = await audit(['audit', '--json'], { cwd: dir, routes: publicRoutes({ [`GET ${R}`]: { body: { full_name: 'O/R', private: false, default_branch: 'main', owner: { type: 'User', login: 'O' } } } }) });
+    const same = await audit(['audit', '--verbose', '--json'], { cwd: dir, routes: publicRoutes({ [`GET ${R}`]: { body: { full_name: 'O/R', private: false, default_branch: 'main', owner: { type: 'User', login: 'O' } } } }) });
     expect(same.code).toBe(0);
     expect(same.out).not.toContain('GitHub says this repo is now');
   });
@@ -685,7 +679,7 @@ describe('pipegen audit (auth and GitHub, ruling B1)', () => {
 
 /** The B3 checks, with loadReviewed failing (the caller restores it). */
 async function reviewedUnavailable(dir: string, msg: string) {
-  const r = await audit(['audit', '--json'], { cwd: dir });
+  const r = await audit(['audit', '--verbose', '--json'], { cwd: dir });
   expect(r.code).toBe(0);
   const j = JSON.parse(r.out) as { warnings: { text: string }[]; reviewedUnavailable: boolean; wouldAdd: { note: string; tool: unknown }[] };
   expect(j.warnings[0]?.text).toBe(`${B3_PREFIX}${msg.replace(/\.$/, '')}${B3_SUFFIX}`); // one full stop
@@ -693,7 +687,7 @@ async function reviewedUnavailable(dir: string, msg: string) {
   expect(j.wouldAdd.some((w) => w.note === "pipegen's reviewed tool list couldn't be loaded, so it has no tool to add here")).toBe(true);
   expect(j.wouldAdd.every((w) => w.tool === null || (w.tool as { kind: string }).kind !== 'reviewed')).toBe(true);
   expect(vi.mocked(buildAudit).mock.calls[0]?.[1]).toMatchObject({ reviewed: [], reviewedUnavailable: true });
-  const t = await audit(['audit'], { cwd: dir });
+  const t = await audit(['audit', '--verbose'], { cwd: dir });
   expect(t.code).toBe(0);
   const warnAt = t.out.indexOf('⚠ Warnings');
   expect(t.out.indexOf(B3_PREFIX)).toBeGreaterThan(warnAt);
@@ -710,7 +704,7 @@ describe('pipegen audit (Task 5: real-repo fixes)', () => {
       [`GET ${API}/orgs/o`]: { body: { login: 'o' } },
       [`GET ${R}/events`]: { body: page },
     });
-    const r = await audit(['audit', '--json'], { cwd: dir, routes });
+    const r = await audit(['audit', '--verbose', '--json'], { cwd: dir, routes });
     expect(r.code).toBe(0);
     const gh = r.calls.filter((c) => c.url.origin === API);
     expect(gh.filter((c) => c.url.pathname === '/repos/o/r')).toHaveLength(1);
@@ -722,7 +716,7 @@ describe('pipegen audit (Task 5: real-repo fixes)', () => {
 
   it('requests (M6): with a token, GET /repos is still read once (getAuth makes no anonymous check)', async () => {
     const dir = repo();
-    const r = await audit(['audit', '--json'], { cwd: dir, routes: privateRoutes(), env: { [GH_VAR]: fake.githubPat() } });
+    const r = await audit(['audit', '--verbose', '--json'], { cwd: dir, routes: privateRoutes(), env: { [GH_VAR]: fake.githubPat() } });
     expect(r.code).toBe(0);
     expect(r.calls.filter((c) => c.url.origin === API && c.url.pathname === '/repos/o/r')).toHaveLength(1);
   });
@@ -732,7 +726,7 @@ describe('pipegen audit (Task 5: real-repo fixes)', () => {
     const reason = '23 entries still wait for human review (a, b and 21 more)';
     vi.mocked(loadReviewed).mockImplementation(() => { throw new ReviewedListError(`This pipegen release refuses its reviewed tool list: ${reason}. Nothing unreviewed may run in your CI.`, { reason }); });
     try {
-      const r = await audit(['audit', '--json'], { cwd: dir });
+      const r = await audit(['audit', '--verbose', '--json'], { cwd: dir });
       expect(r.code).toBe(0);
       const j = JSON.parse(r.out) as { warnings: { text: string }[] };
       expect(j.warnings[0]?.text).toBe(`${B3_PREFIX}${reason}${B3_SUFFIX}`);
@@ -758,7 +752,7 @@ describe('pipegen audit --ai (checks before consent)', () => {
     Object.defineProperty(process, 'platform', { ...desc, value: 'win32' });
     let r: Awaited<ReturnType<typeof audit>>;
     try {
-      r = await audit(['audit', '--ai'], { cwd: dir, env, prompt: ask });
+      r = await audit(['audit', '--verbose', '--ai'], { cwd: dir, env, prompt: ask });
     } finally {
       Object.defineProperty(process, 'platform', desc);
     }
@@ -772,11 +766,11 @@ describe('pipegen audit --ai (checks before consent)', () => {
   it('provider: no AI key → the audit --ai message (S15), exit 1, nothing asked', async () => {
     const dir = repo();
     const ask = prompter(true);
-    const r = await audit(['audit', '--ai'], { cwd: dir, env: {}, prompt: ask });
+    const r = await audit(['audit', '--verbose', '--ai'], { cwd: dir, env: {}, prompt: ask });
     expect(r.code).toBe(1);
     expect(r.err).toBe(S15);
     expect(ask.asked).toEqual([]);
-    const openai = await audit(['audit', '--ai', 'openai'], { cwd: dir, env: { [OPENAI_VAR]: 'x'.repeat(20) }, prompt: ask });
+    const openai = await audit(['audit', '--verbose', '--ai', 'openai'], { cwd: dir, env: { [OPENAI_VAR]: 'x'.repeat(20) }, prompt: ask });
     expect(openai.code).toBe(1);
     expect(openai.err).toContain('needs a model: pass --model');
   });
@@ -784,7 +778,7 @@ describe('pipegen audit --ai (checks before consent)', () => {
   it('unpriced: a model with no price stops before consent with the estimate\'s message (U14)', async () => {
     const dir = repo();
     const ask = prompter(true);
-    const r = await audit(['audit', '--ai', 'openai', '--model', 'gpt-5-pro'], { cwd: dir, env: { [OPENAI_VAR]: 'x'.repeat(20) }, prompt: ask });
+    const r = await audit(['audit', '--verbose', '--ai', 'openai', '--model', 'gpt-5-pro'], { cwd: dir, env: { [OPENAI_VAR]: 'x'.repeat(20) }, prompt: ask });
     expect(r.code).toBe(1);
     expect(r.err).toContain("pipegen doesn't know the price of gpt-5-pro, so it can't keep a hard cost limit. Choose one of: gpt-5, gpt-5-mini, gpt-5.5.");
     expect(ask.asked).toEqual([]);
@@ -795,27 +789,27 @@ describe('pipegen audit --ai (checks before consent)', () => {
     const dir = repo();
     const ask = prompter(false);
     const show = (reply: Reply): Routes => publicRoutes({ 'POST http://127.0.0.1:11434/api/show': reply });
-    const cloudHost = await audit(['audit', '--ai', 'ollama'], { cwd: dir, env: { OLLAMA_HOST: 'https://ollama.com' }, prompt: ask });
+    const cloudHost = await audit(['audit', '--verbose', '--ai', 'ollama'], { cwd: dir, env: { OLLAMA_HOST: 'https://ollama.com' }, prompt: ask });
     expect(cloudHost.code).toBe(1);
     expect(cloudHost.err).toContain('OLLAMA_HOST points at ollama.com');
     expect(cloudHost.calls).toEqual([]);
     for (const host of ['api.OLLAMA.com:443', 'ollama.com..', 'OLLAMA.COM.', 'https://Ollama.Com.../x', '\uff4f\uff4c\uff4c\uff41\uff4d\uff41\u3002com']) {
-      const sub = await audit(['audit', '--ai', 'ollama'], { cwd: dir, env: { OLLAMA_HOST: host }, prompt: ask });
+      const sub = await audit(['audit', '--verbose', '--ai', 'ollama'], { cwd: dir, env: { OLLAMA_HOST: host }, prompt: ask });
       expect(sub.code, host).toBe(1);
       expect(sub.err, host).toContain('OLLAMA_HOST points at ollama.com'); // refused by name, before any request (M10)
       expect(sub.calls, host).toEqual([]);
     }
-    const remote = await audit(['audit', '--ai', 'ollama', '--model', 'llama3.1'], { cwd: dir, env: {}, prompt: ask, routes: show({ body: { remote_host: 'https://ollama.com:443', remote_model: 'gpt-oss:120b', details: {} } }) });
+    const remote = await audit(['audit', '--verbose', '--ai', 'ollama', '--model', 'llama3.1'], { cwd: dir, env: {}, prompt: ask, routes: show({ body: { remote_host: 'https://ollama.com:443', remote_model: 'gpt-oss:120b', details: {} } }) });
     expect(remote.code).toBe(1);
     expect(remote.err).toContain('Ollama cloud models send your code to ollama.com');
-    const down = await audit(['audit', '--ai', 'ollama'], { cwd: dir, env: {}, prompt: ask, routes: show({ status: 500, body: {} }) });
+    const down = await audit(['audit', '--verbose', '--ai', 'ollama'], { cwd: dir, env: {}, prompt: ask, routes: show({ status: 500, body: {} }) });
     expect(down.code).toBe(1);
     expect(down.err).toContain('pipegen couldn\'t confirm that the Ollama model "llama3.1" runs on 127.0.0.1:11434');
-    const notJson = await audit(['audit', '--ai', 'ollama'], { cwd: dir, env: {}, prompt: ask, routes: show({ raw: 'not json' }) });
+    const notJson = await audit(['audit', '--verbose', '--ai', 'ollama'], { cwd: dir, env: {}, prompt: ask, routes: show({ raw: 'not json' }) });
     expect(notJson.code).toBe(1);
     expect(ask.asked).toEqual([]);
     // a model that runs on that server: the consent screen is shown (and answered No here)
-    const ok = await audit(['audit', '--ai', 'ollama'], { cwd: dir, env: {}, prompt: ask, routes: show({ body: { details: { family: 'llama' }, model_info: {} } }) });
+    const ok = await audit(['audit', '--verbose', '--ai', 'ollama'], { cwd: dir, env: {}, prompt: ask, routes: show({ body: { details: { family: 'llama' }, model_info: {} } }) });
     expect(ok.code).toBe(0);
     expect(ask.asked).toHaveLength(1);
     const showCall = ok.calls.find((c) => c.url.pathname === '/api/show') as Call;
@@ -829,7 +823,7 @@ describe('pipegen audit --ai (checks before consent)', () => {
     const ghVal = fake.githubPat();
     env[GH_VAR] = ghVal;
     const ask = prompter(true);
-    const r = await audit(['audit', '--ai'], { cwd: dir, env, routes: privateRoutes(), prompt: ask });
+    const r = await audit(['audit', '--verbose', '--ai'], { cwd: dir, env, routes: privateRoutes(), prompt: ask });
     expect(r.code).toBe(0);
     const deps = vi.mocked(addAiSuggestions).mock.calls[0]?.[2];
     if (deps === undefined) throw new Error('addAiSuggestions was not called');
@@ -846,18 +840,18 @@ describe('pipegen audit (output)', () => {
   it('out: --out inside the repo is refused without --force, also when --dir is not given (dir always passed); errors on stderr, exit 1', async () => {
     const dir = repo();
     const before = listTree(dir);
-    const r = await audit(['audit', '--out', 'report.md'], { cwd: dir });
+    const r = await audit(['audit', '--verbose', '--out', 'report.md'], { cwd: dir });
     expect(r.code).toBe(1);
     expect(r.err).toContain("Don't write the report into the repo you're auditing");
     expect(listTree(dir)).toEqual(before);
     // an existing file is refused without --force; --force replaces it
     const work = makeTempDir();
     writeFileSync(join(work, 'old.md'), 'old\n');
-    const exists = await audit(['audit', '--dir', dir, '--out', 'old.md'], { cwd: work });
+    const exists = await audit(['audit', '--verbose', '--dir', dir, '--out', 'old.md'], { cwd: work });
     expect(exists.code).toBe(1);
     expect(exists.err).toMatch(/already exists/);
     expect(readFileSync(join(work, 'old.md'), 'utf8')).toBe('old\n');
-    const forced = await audit(['audit', '--dir', dir, '--out', 'old.md', '--force'], { cwd: work });
+    const forced = await audit(['audit', '--verbose', '--dir', dir, '--out', 'old.md', '--force'], { cwd: work });
     expect(forced.code).toBe(0);
     expect(readFileSync(join(work, 'old.md'), 'utf8')).toMatch(/^# pipegen audit/);
   });
@@ -865,7 +859,7 @@ describe('pipegen audit (output)', () => {
   it('out: --json and --out together: JSON on stdout, Markdown in the file, the "written" line on stderr', async () => {
     const dir = repo();
     const work = makeTempDir();
-    const r = await audit(['audit', '--dir', dir, '--json', '--out', 'r.md'], { cwd: work });
+    const r = await audit(['audit', '--verbose', '--dir', dir, '--json', '--out', 'r.md'], { cwd: work });
     expect(r.code).toBe(0);
     expect(() => JSON.parse(r.out) as unknown).not.toThrow();
     expect(readFileSync(join(work, 'r.md'), 'utf8')).toMatch(/^# pipegen audit: o\/r/);
@@ -897,7 +891,7 @@ describe('pipegen audit (Plan U final review)', () => {
     const first = Array.from({ length: 97 }, (_, i) => ({ type: 'WatchEvent', created_at: daysAgo(i / 40) }));
     const pushes = [3, 4, 5].map((d) => ({ type: 'PushEvent', created_at: daysAgo(d) }));
     const json = async (pages: unknown[][]) => {
-      const r = await audit(['audit', '--json'], { cwd: dir, routes: publicRoutes({ [`GET ${R}/events`]: eventPages(pages) }) });
+      const r = await audit(['audit', '--verbose', '--json'], { cwd: dir, routes: publicRoutes({ [`GET ${R}/events`]: eventPages(pages) }) });
       expect(r.code).toBe(0);
       return (JSON.parse(r.out) as { estimates: { monthlyMinutes: number; basis: string[] } }).estimates;
     };
@@ -913,14 +907,14 @@ describe('pipegen audit (Plan U final review)', () => {
     const capped = await json(pages);
     expect(capped.basis.some((b) => b.startsWith('Activity: at least 3 pushes and at least 0 pull requests in the last 30 days'))).toBe(true);
     expect(capped.monthlyMinutes).toBe(exact.monthlyMinutes);
-    const t = await audit(['audit'], { cwd: dir, routes: publicRoutes({ [`GET ${R}/events`]: eventPages(pages) }) });
+    const t = await audit(['audit', '--verbose'], { cwd: dir, routes: publicRoutes({ [`GET ${R}/events`]: eventPages(pages) }) });
     expect(oneLine(t.out)).toContain(`After setup: about ${capped.monthlyMinutes.toLocaleString('en-US')} minutes a month, or more (pipegen could count only part of the activity).`);
     expect(oneLine(t.out)).toContain('Activity: at least 3 pushes');
   });
 
   it('I3: the private-repo access steps ask for exactly Metadata, Pull requests, Actions and Code scanning alerts, all read', async () => {
     const dir = repo();
-    const r = await audit(['audit'], { cwd: dir, routes: publicRoutes({ [`GET ${R}`]: err(404, 'Not Found') }) });
+    const r = await audit(['audit', '--verbose'], { cwd: dir, routes: publicRoutes({ [`GET ${R}`]: err(404, 'Not Found') }) });
     expect(r.code).toBe(1);
     expect(r.err).toContain('with Metadata: read, Pull requests: read, Actions: read, Code scanning alerts: read,');
     expect(r.err).not.toMatch(/Secrets|Variables|Environments|Administration|Contents|Workflows|write/);
@@ -937,7 +931,7 @@ describe('pipegen audit (Plan U final review)', () => {
     const dir = repo();
     const leaked = fake.githubClassic(); // not a known value: only redact() can hide it
     vi.mocked(buildAudit).mockRejectedValueOnce(new Error(`unexpected failure near ${leaked}`));
-    const r = await audit(['audit'], { cwd: dir });
+    const r = await audit(['audit', '--verbose'], { cwd: dir });
     expect(r.code).toBe(1);
     expect(r.err).toContain('pipegen audit failed: unexpected failure near');
     expect(r.all).not.toContain(leaked);
@@ -945,7 +939,7 @@ describe('pipegen audit (Plan U final review)', () => {
 
   it('M5: an anonymous run says "without a token", never "with this token"', async () => {
     const dir = repo();
-    const r = await audit(['audit', '--json'], { cwd: dir });
+    const r = await audit(['audit', '--verbose', '--json'], { cwd: dir });
     expect(r.code).toBe(0);
     const notes = (JSON.parse(r.out) as { notes: string[] }).notes;
     expect(notes.some((n) => n.startsWith("Couldn't check code scanning without a token"))).toBe(true);
@@ -956,7 +950,7 @@ describe('pipegen audit (Plan U final review)', () => {
     const dir = repo();
     const { env } = aiSetup();
     const ask = prompter(true);
-    const r = await audit(['audit', '--ai'], { cwd: dir, env, prompt: ask });
+    const r = await audit(['audit', '--verbose', '--ai'], { cwd: dir, env, prompt: ask });
     expect(r.code).toBe(0);
     const cap = /pipegen stops if the AI cost reaches (\$\d+\.\d\d)\./.exec(ask.asked[0] as string)?.[1];
     expect(cap).toBeDefined();
@@ -971,13 +965,13 @@ describe('pipegen audit (Plan U final review)', () => {
     expect(oneLine(r.out)).toContain(`pipegen would send ${files} file`);
     // a plain run builds it once
     vi.mocked(bundleCode).mockClear();
-    expect((await audit(['audit'], { cwd: dir })).code).toBe(0);
+    expect((await audit(['audit', '--verbose'], { cwd: dir })).code).toBe(0);
     expect(vi.mocked(bundleCode)).toHaveBeenCalledTimes(1);
   });
 
   it('M7: --json carries the "what this audit can\'t see" list', async () => {
     const dir = repo();
-    const r = await audit(['audit', '--json'], { cwd: dir });
+    const r = await audit(['audit', '--verbose', '--json'], { cwd: dir });
     // J4: only the limits that apply to the repo; a repo with no workflows is not told about workflow limits
     const cantSee = (JSON.parse(r.out) as { cantSee: string[] }).cantSee;
     const all = CANT_SEE.map((x) => x.text);
@@ -1001,7 +995,7 @@ describe('pipegen audit --ai (P40: report-wide masking of scanner-flagged names)
     const work = makeTempDir();
     for (const json of [false, true]) {
       const { env } = aiSetup(undefined, undefined, body);
-      const argv = ['audit', '--ai', '--dir', dir, '--out', json ? 'r2.md' : 'r1.md', ...(json ? ['--json'] : [])];
+      const argv = ['audit', '--verbose', '--ai', '--dir', dir, '--out', json ? 'r2.md' : 'r1.md', ...(json ? ['--json'] : [])];
       const r = await audit(argv, { cwd: work, env, prompt: prompter(true) });
       expect(r.code, r.err).toBe(0);
       const md = readFileSync(join(work, json ? 'r2.md' : 'r1.md'), 'utf8');
@@ -1031,7 +1025,7 @@ describe('pipegen audit --ai (P45: every printable name is scanned; what the sca
     for (const json of [false, true]) {
       const { env } = aiSetup(undefined, undefined, body);
       const file = json ? 'j.md' : 't.md';
-      const r = await audit(['audit', '--ai', '--dir', dir, '--out', file, ...(json ? ['--json'] : [])], { cwd: work, env, prompt: prompter(true) });
+      const r = await audit(['audit', '--verbose', '--ai', '--dir', dir, '--out', file, ...(json ? ['--json'] : [])], { cwd: work, env, prompt: prompter(true) });
       expect(r.code, r.err).toBe(0);
       expect(oneLine(r.out), 'the --ai scan ran').toMatch(/checked the bundle/);
       outs.push({ where: `${json ? 'json' : 'terminal'} stdout`, text: r.out }, { where: 'stderr', text: r.err }, { where: `${file}`, text: readFileSync(join(work, file), 'utf8') });
@@ -1104,7 +1098,7 @@ describe('pipegen audit --ai (P45 addendum: a name longer than the scanner saw i
     for (const json of [false, true]) {
       const { env } = aiSetup(undefined, undefined, body);
       const file = json ? 'j.md' : 't.md';
-      const r = await audit(['audit', '--ai', '--dir', dir, '--out', file, ...(json ? ['--json'] : [])], { cwd: work, env, prompt: prompter(true) });
+      const r = await audit(['audit', '--verbose', '--ai', '--dir', dir, '--out', file, ...(json ? ['--json'] : [])], { cwd: work, env, prompt: prompter(true) });
       expect(r.code, r.err).toBe(0);
       expect(oneLine(r.out)).toMatch(/checked the bundle/);
       const md = readFileSync(join(work, file), 'utf8');
@@ -1135,7 +1129,7 @@ describe('GitHub rate limit (DoD)', () => {
     const dir = repo({ '.github/workflows/ci.yml': CI });
     const reset = resetSec();
     const routes = publicRoutes({ [`GET ${R}`]: limited403(reset) });
-    const r = await audit(['audit'], { cwd: dir, routes });
+    const r = await audit(['audit', '--verbose'], { cwd: dir, routes });
     expect(r.code).toBe(3);
     expect(r.out).toContain('Verdict:');
     expect(r.out).toContain('Checks by layer');
@@ -1149,7 +1143,7 @@ describe('GitHub rate limit (DoD)', () => {
     // one request, then nothing more is asked of GitHub
     expect(r.calls.filter((c) => c.url.origin === API)).toHaveLength(1);
 
-    const j = JSON.parse((await audit(['audit', '--json'], { cwd: dir, routes })).out) as J;
+    const j = JSON.parse((await audit(['audit', '--verbose', '--json'], { cwd: dir, routes })).out) as J;
     expect(j.githubIncomplete).toMatchObject({ reason: 'github-rate-limit', resetsAt: new Date(reset * 1000).toISOString() });
     expect(j.githubIncomplete?.unread).toEqual(expect.arrayContaining(['repo', 'branch-protection', 'environments', 'code-scanning', 'activity']));
     expect(j.profile.private).toBeNull();
@@ -1169,7 +1163,7 @@ describe('GitHub rate limit (DoD)', () => {
 
     // --out writes the report, warning first
     const work = makeTempDir();
-    const o = await audit(['audit', '--dir', dir, '--out', 'r.md'], { cwd: work, routes });
+    const o = await audit(['audit', '--verbose', '--dir', dir, '--out', 'r.md'], { cwd: work, routes });
     expect(o.code).toBe(3);
     const md = readFileSync(join(work, 'r.md'), 'utf8');
     expect(md).toContain("GitHub's rate limit was reached");
@@ -1180,7 +1174,7 @@ describe('GitHub rate limit (DoD)', () => {
     const dir = repo({ '.github/workflows/ci.yml': CI });
     for (const limitedReply of [limited403(resetSec()), limited429()]) {
       const routes = publicRoutes({ [`GET ${R}/environments`]: limitedReply });
-      const r = await audit(['audit', '--json'], { cwd: dir, routes });
+      const r = await audit(['audit', '--verbose', '--json'], { cwd: dir, routes });
       expect(r.code).toBe(3);
       const j = JSON.parse(r.out) as J;
       expect(j.githubIncomplete?.unread).toEqual(expect.arrayContaining(['environments', 'code-scanning', 'activity']));
@@ -1197,8 +1191,8 @@ describe('GitHub rate limit (DoD)', () => {
 
   it('rate limit at the last call (activity): every check keeps its answer; the minutes say so; still exit 3', async () => {
     const dir = repo({ '.github/workflows/ci.yml': CI });
-    const full = JSON.parse((await audit(['audit', '--json'], { cwd: dir })).out) as J;
-    const r = await audit(['audit', '--json'], { cwd: dir, routes: publicRoutes({ [`GET ${R}/events`]: limited403(resetSec()) }) });
+    const full = JSON.parse((await audit(['audit', '--verbose', '--json'], { cwd: dir })).out) as J;
+    const r = await audit(['audit', '--verbose', '--json'], { cwd: dir, routes: publicRoutes({ [`GET ${R}/events`]: limited403(resetSec()) }) });
     expect(r.code).toBe(3);
     const j = JSON.parse(r.out) as J;
     expect(j.githubIncomplete).toMatchObject({ reason: 'github-rate-limit', unread: ['activity'], rows: 0 });
@@ -1210,22 +1204,22 @@ describe('GitHub rate limit (DoD)', () => {
     const dir = repo({ '.github/workflows/ci.yml': CI });
     const routes = publicRoutes({ [`GET ${R}`]: limited403(resetSec()) });
     const NOTE = 'These picks are based on incomplete GitHub data (rate limit)';
-    const t = await audit(['audit'], { cwd: dir, routes });
+    const t = await audit(['audit', '--verbose'], { cwd: dir, routes });
     expect(t.out.replace(/\n {2,}/g, ' ')).toContain(NOTE);
-    const j = JSON.parse((await audit(['audit', '--json'], { cwd: dir, routes })).out) as { wouldAddNote: string | null };
+    const j = JSON.parse((await audit(['audit', '--verbose', '--json'], { cwd: dir, routes })).out) as { wouldAddNote: string | null };
     expect(j.wouldAddNote).toContain(NOTE);
     const work = makeTempDir();
-    await audit(['audit', '--dir', dir, '--out', 'r.md'], { cwd: work, routes });
+    await audit(['audit', '--verbose', '--dir', dir, '--out', 'r.md'], { cwd: work, routes });
     expect(readFileSync(join(work, 'r.md'), 'utf8').replace(/\n/g, ' ')).toContain(NOTE);
     // a complete run has no such note
-    expect((JSON.parse((await audit(['audit', '--json'], { cwd: dir })).out) as { wouldAddNote: unknown }).wouldAddNote).toBeNull();
+    expect((JSON.parse((await audit(['audit', '--verbose', '--json'], { cwd: dir })).out) as { wouldAddNote: unknown }).wouldAddNote).toBeNull();
     // the --ai consent screen (answered No)
     const { env } = aiSetup();
     const ask = prompter(false);
-    await audit(['audit', '--ai'], { cwd: dir, env, routes, prompt: ask });
+    await audit(['audit', '--verbose', '--ai'], { cwd: dir, env, routes, prompt: ask });
     expect(ask.asked[0]).toContain('Based on incomplete GitHub data (rate limit)');
     const okAsk = prompter(false);
-    await audit(['audit', '--ai'], { cwd: dir, env: aiSetup().env, prompt: okAsk });
+    await audit(['audit', '--verbose', '--ai'], { cwd: dir, env: aiSetup().env, prompt: okAsk });
     expect(okAsk.asked[0]).not.toContain('incomplete GitHub data');
   });
 
@@ -1233,7 +1227,7 @@ describe('GitHub rate limit (DoD)', () => {
     const dir = repo({ '.github/workflows/ci.yml': CI });
     const tok = fake.githubPat();
     const routes = privateRoutes({ [`GET ${API}/user`]: limited403(resetSec()) });
-    const r = await audit(['audit'], { cwd: dir, routes, env: { [GH_VAR]: tok } });
+    const r = await audit(['audit', '--verbose'], { cwd: dir, routes, env: { [GH_VAR]: tok } });
     expect(r.code).toBe(3);
     const flatOut = r.out.replace(/\n {2,}/g, ' ');
     expect(flatOut).toContain("GitHub's rate limit was reached");
@@ -1241,7 +1235,7 @@ describe('GitHub rate limit (DoD)', () => {
     expect(flatOut).toContain('This limit counts the requests made with your token');
     expect(r.all).not.toContain(tok);
     // a refused token is not a rate limit: unchanged (exit 1, GitHub not read)
-    const refused = await audit(['audit'], { cwd: dir, routes: privateRoutes({ [`GET ${API}/user`]: err(401, 'Bad credentials') }), env: { [GH_VAR]: tok } });
+    const refused = await audit(['audit', '--verbose'], { cwd: dir, routes: privateRoutes({ [`GET ${API}/user`]: err(401, 'Bad credentials') }), env: { [GH_VAR]: tok } });
     expect(refused.code).toBe(1);
     expect(refused.out).toContain('GitHub: not read');
   });
@@ -1354,7 +1348,7 @@ describe('npx pipegen inside the folder: the safe-mode stop (J5, #124, S8, S15)'
 
   it('outside + unsafe .npmrc → warning, audit runs', async () => {
     const dir = repo({ '.npmrc': UNSAFE_NPMRC });
-    const r = await audit(['audit', '--dir', dir], { cwd: makeTempDir() });
+    const r = await audit(['audit', '--verbose', '--dir', dir], { cwd: makeTempDir() });
     expect(r.code).toBe(0);
     expect(r.out.replace(/\s+/g, ' ')).toContain(SWAP_TEXT); // the terminal wraps the warning
     expect(r.out).toContain(RUN_COMMAND);

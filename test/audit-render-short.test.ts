@@ -175,7 +175,7 @@ describe('short report: invented repos of different kinds', () => {
     const short = renderTerminal(r, SHORT);
     expect(lines(short).find((l) => l.startsWith('Type:'))).toMatch(/tool: library/);
     expect(short).toMatch(/Not needed here:.*Container image/s);
-    expect(lines(short).length).toBeLessThanOrEqual(36);
+    expect(lines(short).length).toBeLessThanOrEqual(32);
   });
 
   it('node container service → server and container, no Dockerfile or DAST in "Not needed here"', async () => {
@@ -188,7 +188,7 @@ describe('short report: invented repos of different kinds', () => {
     const full = renderTerminal(r, FULL);
     expect(full).toContain('Dockerfile RUN lines count only');
     expect(full.slice(full.indexOf("What this audit can't see"))).not.toContain('PyPI');
-    expect(lines(short).length).toBeLessThanOrEqual(36);
+    expect(lines(short).length).toBeLessThanOrEqual(32);
   });
 
   it('markdown and json unchanged except cantSee', async () => {
@@ -378,7 +378,10 @@ describe('short report: ranking, merging and plan limits', () => {
   it('short: hostile values are cleaned like the full report', () => {
     const r = report();
     const bad = '\u001b[31mred\u202e';
-    const rows: Coverage[] = [{ need: need('push', 'custom-check', `svc${bad}`), status: 'missing', why: `Why ${bad}.` }];
+    const rows: Coverage[] = [
+      { need: need('push', 'custom-check', `svc${bad}`), status: 'missing', why: `Why ${bad}.` },
+      { need: need('push', `good-check${bad}`), status: 'covered', why: 'ok.' },
+    ];
     const t = renderTerminal({ ...r, coverage: rows, wouldAdd: [], warnings: [{ text: `warn ${bad}` }] }, SHORT);
     expect(t).not.toContain('\u001b');
     expect(t).not.toContain('\u202e');
