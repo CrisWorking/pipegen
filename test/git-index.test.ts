@@ -181,6 +181,25 @@ describe('parseGitIndex (hand-built indexes)', () => {
     }
   });
 
+  it('500,000 entries → the paths; 500,001 (enough bytes for all of them) → null, by the entry limit alone', () => {
+    const index = (count: number) => {
+      const entry = Buffer.alloc(64); // 62 fixed bytes, the name "a", one NUL: a multiple of 8
+      entry.writeUInt32BE(0o100644, 24);
+      entry.writeUInt16BE(1, 60);
+      entry.write('a', 62, 'latin1');
+      const head = Buffer.alloc(12);
+      head.write('DIRC', 0, 'latin1');
+      head.writeUInt32BE(2, 4);
+      head.writeUInt32BE(count, 8);
+      const body = Buffer.alloc(12 + count * 64);
+      head.copy(body, 0);
+      for (let i = 0; i < count; i++) entry.copy(body, 12 + i * 64);
+      return resign(body);
+    };
+    expect([...(parseGitIndex(index(GIT_INDEX_LIMITS.maxEntries)) ?? [])]).toEqual(['a']);
+    expect(parseGitIndex(index(GIT_INDEX_LIMITS.maxEntries + 1))).toBeNull();
+  });
+
   it('a v4 strip count over the previous path → null', () => {
     expect(parseGitIndex(handIndex(4, PATHS, { strip: (i, prev) => (i === 2 ? prev.length + 1 : 0) }))).toBeNull();
   });

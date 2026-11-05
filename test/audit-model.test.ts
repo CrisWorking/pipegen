@@ -5,7 +5,8 @@ import { join, resolve } from 'node:path';
 import type { Octokit } from '@octokit/rest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as childProcess from 'node:child_process';
-import { COUNTING_ONLY_NOTE, EXCLUDED_PATTERNS, redact } from '../src/ai/redact.js';
+import { bundleCode, COUNTING_ONLY_NOTE, EXCLUDED_PATTERNS, redact } from '../src/ai/redact.js';
+import { ignoreBudgetNote } from '../src/read/gitignore.js';
 import { mapCoverage } from '../src/audit/coverage.js';
 import { buildAudit, CURRENT_MILESTONE, type AuditDeps, type AuditReport } from '../src/audit/model.js';
 import { renderJson, renderMarkdown, renderTerminal } from '../src/audit/render.js';
@@ -1113,24 +1114,36 @@ describe('buildAudit: the audit respects .gitignore (Plan J J1, DECISIONS #126)'
   it('tracked but ignored file → secret check reads it, bundle drops it', async () => {
     const stripe = fake.stripeKey();
     const gh = fake.githubClassic();
+    const aws1 = fake.awsKey();
+    const aws2 = 'AK' + 'IA' + 'F'.repeat(16);
+    // three force-added files .gitignore lists; only .env.production is also an excluded pattern, the other three
+    // reach the bundle's rules only through .gitignore: a root folder rule, a root name rule, a nested folder rule
     const dir = gitRepo({
       ...nodeApp(),
-      '.gitignore': '.env.production\ngenerated/\n',
+      '.gitignore': '.env.production\ngenerated/\n*.local.json\n',
       '.env.production': `STRIPE=${stripe}\n`,
       'generated/keys.ts': `export const t = '${gh}';\n`,
+      'config/settings.local.json': `{ "key": "${aws1}" }\n`,
+      'pkg/.gitignore': 'fixtures/\n',
+      'pkg/fixtures/sample.json': `{ "key": "${aws2}" }\n`,
+      'pkg/index.ts': 'export const p = 1;\n',
       'src/a.ts': 'export const a = 1;\n',
-    }, ['.env.production', 'generated/keys.ts']);
+    }, ['.env.production', 'generated/keys.ts', 'config/settings.local.json', 'pkg/fixtures/sample.json']);
     const r = await buildAudit(dir, deps());
-    // committed, so the quick secret check reads both although .gitignore lists them
+    // committed, so the quick secret check reads them all although .gitignore lists them
     expect(r.secretsInTree).toEqual(expect.arrayContaining([
       { file: '.env.production', rule: 'stripe-key', note: EXCLUDED_NOTE },
       { file: 'generated/keys.ts', rule: 'github-token' },
+      { file: 'config/settings.local.json', rule: 'aws-access-key' },
+      { file: 'pkg/fixtures/sample.json', rule: 'aws-access-key' },
     ]));
     expect(r.notes.some((n) => n.includes('git ignores'))).toBe(false);
-    // never in the AI bundle: package.json, index.js, .gitignore, src/a.ts
-    expect(r.aiBundle.topFolders).toEqual(['src']);
-    expect(r.aiBundle.files).toBe(4);
-    for (const v of [stripe, gh]) expect(anyContains(r, v), v.slice(0, 4)).toBe(false);
+    // never in the AI bundle: package.json, index.js, .gitignore, pkg/.gitignore, pkg/index.ts, src/a.ts
+    expect(r.aiBundle.topFolders).toEqual(['pkg', 'src']);
+    expect(r.aiBundle.files).toBe(6);
+    const b = await bundleCode(dir);
+    expect(b.files.map((f) => f.path).sort()).toEqual(['.gitignore', 'index.js', 'package.json', 'pkg/.gitignore', 'pkg/index.ts', 'src/a.ts']);
+    for (const v of [stripe, gh, aws1, aws2]) expect(anyContains(r, v), v.slice(0, 4)).toBe(false);
     expect(childProcess.execFile).not.toHaveBeenCalled();
     expect(childProcess.execFileSync).not.toHaveBeenCalled();
     expect(childProcess.spawn).not.toHaveBeenCalled();
@@ -1138,40 +1151,127 @@ describe('buildAudit: the audit respects .gitignore (Plan J J1, DECISIONS #126)'
 
   it("static export shape: .next/ and out/ ignored, not tracked → never in the bundle's top folders", async () => {
     const aws = fake.awsKey();
-    const dir = gitRepo({
-      'package.json': JSON.stringify({ name: 'site', scripts: { build: 'next build', test: 'vitest run' }, dependencies: { next: '15.0.0' } }),
-      'next.config.mjs': "export default { output: 'export' };\n",
-      '.gitignore': '/.next/\n/out/\n',
-      'src/pages/index.tsx': 'export default function Home() { return null; }\n',
-      'src/pages/about.tsx': 'export default function About() { return null; }\n',
-      'docs/readme.md': '# site\n',
-      // build output: many more files than the source, a key baked into the built site
-      ...Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`.next/cache/webpack/chunk${i}.js`, `var c${i} = ${i};\n`])),
-      ...Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`out/_next/static/page${i}.js`, `var p${i} = ${i};\n`])),
-      'out/index.html': `<script>var k = '${aws}';</script>\n`,
-    });
-    const r = await buildAudit(dir, deps());
-    expect(r.aiBundle.topFolders).not.toContain('.next');
-    expect(r.aiBundle.topFolders).not.toContain('out');
-    expect([...r.aiBundle.topFolders].sort()).toEqual(['docs', 'src']);
-    // not committed and ignored: the quick secret check skips them, and says so
-    expect(r.secretsInTree).toEqual([]);
-    expect(r.notes).toContain(skippedNote(21));
-    expect(anyContains(r, aws)).toBe(false);
+    // two invented shapes: a static-export site (build cache and built pages) and a Python package (bytecode, test
+    // environments, coverage pages); both have more build files than source files
+    const shapes: { files: Record<string, string>; source: string[]; built: string[]; skipped: number }[] = [
+      {
+        files: {
+          'package.json': JSON.stringify({ name: 'site', scripts: { build: 'next build', test: 'vitest run' }, dependencies: { next: '15.0.0' } }),
+          'next.config.mjs': "export default { output: 'export' };\n",
+          '.gitignore': '/.next/\n/out/\n',
+          'src/pages/index.tsx': 'export default function Home() { return null; }\n',
+          'src/pages/about.tsx': 'export default function About() { return null; }\n',
+          'docs/readme.md': '# site\n',
+          ...Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`.next/cache/webpack/chunk${i}.js`, `var c${i} = ${i};\n`])),
+          ...Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`out/_next/static/page${i}.js`, `var p${i} = ${i};\n`])),
+          'out/index.html': `<script>var k = '${aws}';</script>\n`,
+        },
+        source: ['docs', 'src'], built: ['.next', 'out'], skipped: 21,
+      },
+      {
+        files: {
+          'pyproject.toml': '[project]\nname = "tool"\n',
+          '.gitignore': '__pycache__/\n.tox/\nhtmlcov/\n*.egg-info/\n',
+          'tool/main.py': 'print(1)\n',
+          'tests/test_main.py': 'def test_x():\n    assert True\n',
+          ...Object.fromEntries(Array.from({ length: 6 }, (_, i) => [`tool/__pycache__/m${i}.cpython-312.pyc`, `cache ${i}\n`])),
+          ...Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`.tox/py312/lib/site${i}.py`, `x = ${i}\n`])),
+          'tool.egg-info/PKG-INFO': 'Name: tool\n',
+          'htmlcov/index.html': `<p>${aws}</p>\n`,
+        },
+        source: ['tests', 'tool'], built: ['.tox', 'htmlcov', 'tool.egg-info', '__pycache__'], skipped: 17,
+      },
+    ];
+    for (const shape of shapes) {
+      const dir = gitRepo(shape.files);
+      const r = await buildAudit(dir, deps());
+      for (const b of shape.built) expect(r.aiBundle.topFolders).not.toContain(b);
+      expect([...r.aiBundle.topFolders].sort()).toEqual(shape.source);
+      // not committed and ignored: the quick secret check skips them, and says so
+      expect(r.secretsInTree).toEqual([]);
+      expect(r.notes).toContain(skippedNote(shape.skipped));
+      expect(anyContains(r, aws)).toBe(false);
+    }
   });
 
   it('no index → secret check unchanged', async () => {
     const aws = fake.awsKey();
     const stripe = fake.stripeKey();
+    const gh = fake.githubClassic();
     // repo(): .git/config written by hand, no .git/index
-    const dir = repo({ ...nodeApp(), '.gitignore': 'out/\n.env\n', 'out/app.js': `var k = '${aws}';\n`, '.env': `STRIPE=${stripe}\n`, 'src/a.ts': 'export const a = 1;\n' });
+    const dir = repo({
+      ...nodeApp(), '.gitignore': 'out/\n.env\n', 'out/app.js': `var k = '${aws}';\n`, '.env': `STRIPE=${stripe}\n`, 'src/a.ts': 'export const a = 1;\n',
+      'pkg/.gitignore': '*.log\n', 'pkg/debug.log': `token ${gh}\n`,
+    });
     const r = await buildAudit(dir, deps());
     expect(r.secretsInTree).toEqual(expect.arrayContaining([
       { file: 'out/app.js', rule: 'aws-access-key' },
       { file: '.env', rule: 'stripe-key', note: EXCLUDED_NOTE },
+      { file: 'pkg/debug.log', rule: 'github-token' },
     ]));
     expect(r.notes.some((n) => n.includes('git ignores'))).toBe(false);
     // the bundle still leaves out what .gitignore lists (index or not)
+    expect([...r.aiBundle.topFolders].sort()).toEqual(['pkg', 'src']);
+  });
+
+  it("a .gitignore rule pipegen can't use as written (two `**`, too long, unreadable): the secret check reads the file, the bundle leaves it out", async () => {
+    const keys = Array.from({ length: 6 }, (_, i) => 'AK' + 'IA' + String.fromCharCode(71 + i).repeat(16));
+    const dir = gitRepo({
+      ...nodeApp(),
+      '.gitignore': 'reports/**/tmp/**/*.json\n',
+      'tools/.gitignore': `${'a'.repeat(1001)}*\n`,
+      // over 1 MB, so pipegen can't read it; git does, and its rule ignores vendored/x.gen.js
+      'vendored/.gitignore': `${'#'.repeat(1_000_001)}\n*.gen.js\n`,
+      'src/a.ts': 'export const a = 1;\n',
+      // untracked (git ignores them, so `git add .` leaves them out): read by the secret check, whose unsure side is "not ignored"
+      'reports/x/tmp/y/run.json': `{ "k": "${keys[0]}" }\n`,
+      'vendored/x.gen.js': `var k = '${keys[1]}';\n`,
+      // committed (force-added): the bundle's unsure side is "ignored", so they are left out
+      'reports/q/tmp/r/kept.json': `{ "k": "${keys[2]}" }\n`,
+      'tools/build.js': `var k = '${keys[3]}';\n`,
+      'vendored/lib.js': `var k = '${keys[4]}';\n`,
+    }, ['reports/q/tmp/r/kept.json', 'tools/build.js', 'vendored/lib.js']);
+    // what git did: the two-`**` rule and the rule past 1 MB left these out of the index (a 1,001-character rule can't
+    // match a file name, so the long rule is tested on the bundle side only)
+    const tracked = String(git(dir, 'ls-files')).split('\n');
+    expect(tracked).not.toContain('reports/x/tmp/y/run.json');
+    expect(tracked).not.toContain('vendored/x.gen.js');
+    expect(tracked).toContain('tools/build.js');
+    vi.clearAllMocks();
+    const r = await buildAudit(dir, deps());
+    expect(r.secretsInTree).toEqual(expect.arrayContaining([
+      { file: 'reports/x/tmp/y/run.json', rule: 'aws-access-key' },
+      { file: 'vendored/x.gen.js', rule: 'aws-access-key' },
+      { file: 'reports/q/tmp/r/kept.json', rule: 'aws-access-key' },
+      { file: 'tools/build.js', rule: 'aws-access-key' },
+      { file: 'vendored/lib.js', rule: 'aws-access-key' },
+    ]));
+    const b = await bundleCode(dir);
+    const sent = b.files.map((f) => f.path);
+    for (const p of ['reports/q/tmp/r/kept.json', 'tools/build.js', 'vendored/lib.js', 'reports/x/tmp/y/run.json', 'vendored/x.gen.js']) expect(sent, p).not.toContain(p);
+    expect(sent).toContain('src/a.ts');
     expect(r.aiBundle.topFolders).toEqual(['src']);
+  });
+
+  it('past the matching work budget: the secret check reads the remaining files, the bundle leaves them out', async () => {
+    const keys = ['AK' + 'IA' + 'M'.repeat(16), 'AK' + 'IA' + 'N'.repeat(16)];
+    // 10,000 rules (the S11 maximum) and a folder 150 levels deep: matching one deep path costs more than the budget
+    const deep = Array.from({ length: 150 }, (_, i) => `d${String(i).padStart(18, '0')}`).join('/');
+    const dir = gitRepo({
+      ...nodeApp(),
+      '.gitignore': `${Array.from({ length: 9_999 }, (_, i) => `r${i}.cache`).join('\n')}\n*.tmp\n`,
+      'src/a.ts': 'export const a = 1;\n',
+      [`${deep}/a.tmp`]: `var k = '${keys[0]}';\n`, // untracked: *.tmp
+      [`${deep}/b.tmp`]: `var k = '${keys[1]}';\n`, // force-added below
+    }, [`${deep}/b.tmp`]);
+    const r = await buildAudit(dir, deps());
+    expect(r.secretsInTree).toEqual(expect.arrayContaining([
+      { file: `${deep}/a.tmp`, rule: 'aws-access-key' },
+      { file: `${deep}/b.tmp`, rule: 'aws-access-key' },
+    ]));
+    expect(r.notes).toContain(ignoreBudgetNote('not-ignored'));
+    const b = await bundleCode(dir);
+    expect(b.files.map((f) => f.path).some((p) => p.startsWith('d000'))).toBe(false);
+    expect(b.notes).toContain(ignoreBudgetNote('ignored'));
   });
 });

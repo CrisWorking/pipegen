@@ -822,7 +822,7 @@ function nameLooksSecret(path: string): boolean {
 async function scanTree(dir: string, notes: Notes): Promise<SecretInTree[]> {
   const listing = await listFiles(dir, ['**/*'], IGNORED_DIRS.map((d) => `**/${d}/**`));
   const index = await readGitIndexPaths(dir);
-  const ignore = index === null ? null : await loadIgnore(dir);
+  const ignore = index === null ? null : await loadIgnore(dir, { whenUnsure: 'not-ignored' }); // unsure → checked
   let gitIgnored = 0;
   const rows: SecretInTree[] = [];
   let more = 0;

@@ -488,7 +488,7 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
   const links = found.links.filter((p) => inRoots(p) && (only === null || only.has(p)));
   // J1: the same rule for the counting and the checked bundle (the consent token compares them)
   const index = await readGitIndexPaths(dir);
-  const ignore = await loadIgnore(dir);
+  const ignore = await loadIgnore(dir, { whenUnsure: 'ignored' }); // unsure → never sent (review J1, I1)
   let excluded = 0;
   let secretNames = 0;
   let notCommitted = 0;
