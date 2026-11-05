@@ -34,6 +34,7 @@ import { gateJobList, GateJobListError, jobIdFor, FINDINGS_CATEGORIES, type JobL
 import { NEED_ID_CATEGORY } from '../engine/need-ids.js';
 import { isRateStop } from '../engine/github-rate.js';
 import { clockOf } from '../github/client.js';
+import { PLANTED_FIXTURES } from '../debate/planted.js';
 import { FLOOR_NEEDS, type Finding, type NotProven, type Part, type PartResult, type PipelineDraft, type ProofResult, type RepoProfile } from '../types.js';
 import { safeText } from '../util/safe-text.js';
 import { asFindings, gateResultOf, type GateFinding, type GateResultDoc } from './gate-result.js';
@@ -56,8 +57,11 @@ export interface VariantRuns {
 }
 /** A created (starter) test run: its service and the validator's static test count (Plan D countTests). */
 export interface CreatedTestRun { service: string; staticCount: number }
-/** A planted item of Plan F (injected): what the scanner of `category` must catch. */
-export interface PlantedItem { id: string; category: string; item: string; file?: string }
+/**
+ * A planted item of Plan F (injected): what the scanner of `category` must catch. `needKey`: the job that must catch it
+ * (jobIdFor(need, service)); Plan G G0 (F-2) judges every item by that job's tool and refusal, and an item without one is a failure.
+ */
+export interface PlantedItem { id: string; category: string; item: string; file?: string; needKey?: string }
 export type KeysMode = 'none' | 'placeholder' | 'real';
 export interface EvalContext {
   /** The last default-branch run of each of the user's own workflows, by path (userMainStatuses). A path not listed is 'none'. */
@@ -770,24 +774,28 @@ function plantedChecks(
   const doc = read.doc;
   if (doc.pass) { sheet.fail('pipeline', "the gate didn't block planted problems: its report says it passed", undefined, gateRun.handle.url); return; }
 
-  const refusedNeeds = new Set(refused.keys());
+  // Plan G G0 (F-2, F5-R4): everything below is per JOB (the need key: jobIdFor(need, service)), never per category, so a second
+  // service whose scanner is another tool, or whose job was refused, is judged by its own job (two services, two tools)
   const scanners = jobList.filter((e) => e.blocking && e.range !== true && e.format === 'sarif' && e.tool !== undefined && FINDINGS_CATEGORIES.has(e.category) && !/^zap/.test(e.tool) && [...scannerJobs.values()].includes(e.needId));
-  const toolsByCategory = new Map<string, string>();
-  const needOfCategory = new Map<string, string>();
-  for (const e of scanners) { if (!toolsByCategory.has(e.category)) toolsByCategory.set(e.category, e.tool as string); if (!needOfCategory.has(e.category)) needOfCategory.set(e.category, e.needId); }
+  const byJob = new Map<string, JobListEntry>();
+  for (const e of scanners) if (!byJob.has(e.job)) byJob.set(e.job, e);
+  const refusedJobs = new Set<string>();
+  for (const [job, needId] of scannerJobs) if ((refused.get(needId) ?? []).some((h) => jobNameMatches(h.job.name, job))) refusedJobs.add(job);
   const blocking = doc.blocking;
   const items = ctx.plantedItems ?? [];
+  const keyOf = (i: PlantedItem): string | undefined => (Object.hasOwn(i, 'needKey') && typeof i.needKey === 'string' && i.needKey !== '' ? i.needKey : undefined);
 
   // the floor scanners come from the draft's floor needs, not only from the filtered job list: one with no result to read is failed
   for (const n of draft.needs) {
     const cat = categoryOf(n.id, n.category);
-    if ((FLOOR.has(n.id) || FLOOR.has(cat)) && FINDINGS_CATEGORIES.has(cat) && !toolsByCategory.has(cat) && !refusedNeeds.has(n.id)) {
+    const job = inFolderNeed(n);
+    if ((FLOOR.has(n.id) || FLOOR.has(cat)) && FINDINGS_CATEGORIES.has(cat) && !byJob.has(job) && !refusedJobs.has(job)) {
       sheet.fail('pipeline', `${st(n.id, 60)}: no scanner result for it is read from the planted run, so it is not shown to catch anything`, n.id, gateRun.handle.url);
     }
   }
   // secrets: every C1b placement, by file; at least one placement must be expected (an empty list proves nothing)
-  const secretsTool = toolsByCategory.get('secrets');
-  if (secretsTool !== undefined && !refusedNeeds.has('secrets')) {
+  const secretsTool = byJob.get('secrets')?.tool;
+  if (secretsTool !== undefined && !refusedJobs.has('secrets')) {
     if (!ctx.planted.some((p) => p.kind === 'secret')) sheet.fail('pipeline', `${st(secretsTool, 60)}: no planted secret was expected, so secrets is not shown to catch anything`, 'secrets', gateRun.handle.url);
     const secretFindings = blocking.filter((f) => f.needId === 'secrets' || f.secret);
     for (const p of ctx.planted) {
@@ -802,33 +810,61 @@ function plantedChecks(
     }
   }
 
-  // Plan F's items, by category
-  const wanted = items.filter((i) => toolsByCategory.has(i.category) && !refusedNeeds.has(needOfCategory.get(i.category) as string));
+  // Plan F's items, each by its own job (needKey): that job's tool, and skipped only when that job was refused
+  const keyless = items.filter((i) => keyOf(i) === undefined);
+  if (keyless.length > 0) sheet.fail('pipeline', "a planted item names no check it belongs to, so pipegen can't tell which scanner must catch it");
+  const wanted = items.filter((i) => { const k = keyOf(i); return k !== undefined && byJob.has(k) && !refusedJobs.has(k); });
   if (wanted.length > 0) {
     if (ctx.matchPlanted === undefined) sheet.fail('pipeline', 'planted items were given but no matcher, so no scanner is shown to catch its item');
     else {
-      const m = ctx.matchPlanted(asFindings(blocking), wanted.map((w) => ({ ...w })), new Map(toolsByCategory));
-      const missed = new Set(Array.isArray(m?.missed) ? m.missed : []);
-      const caught = new Set(Array.isArray(m?.caught) ? m.caught : []);
+      // matchPlanted takes one tool per category, so it is asked once per (category, tool) group, as decide.ts optionRunOf does;
+      // its origin rule (the finding's needKey) keeps each finding with the job that produced it
+      const groups = new Map<string, { category: string; tool: string; items: PlantedItem[] }>();
       for (const w of wanted) {
+        const e = byJob.get(keyOf(w) as string) as JobListEntry;
+        const g = groups.get(`${w.category}\u0000${e.tool}`) ?? { category: w.category, tool: e.tool as string, items: [] };
+        g.items.push(w);
+        groups.set(`${w.category}\u0000${e.tool}`, g);
+      }
+      const found = asFindings(blocking);
+      const caught = new Set<string>();
+      const missed = new Set<string>();
+      for (const g of groups.values()) {
+        let m: { caught: string[]; missed: string[] } | undefined;
+        try { m = ctx.matchPlanted(found.map((f) => ({ ...f })), g.items.map((w) => ({ ...w })), new Map([[g.category, g.tool]])); } catch { m = undefined; }
+        for (const id of Array.isArray(m?.missed) ? m.missed : []) missed.add(id);
+        for (const id of Array.isArray(m?.caught) ? m.caught : []) caught.add(id);
+      }
+      for (const w of wanted) {
+        const e = byJob.get(keyOf(w) as string) as JobListEntry;
         // an item neither caught nor missed is not shown to have been caught
-        if (missed.has(w.id) || !caught.has(w.id)) sheet.fail('pipeline', `${st(toolsByCategory.get(w.category) as string, 60)} didn't catch the planted ${st(w.item, 120)}`, needOfCategory.get(w.category), gateRun.handle.url);
+        if (missed.has(w.id) || !caught.has(w.id)) sheet.fail('pipeline', `${st(e.tool as string, 60)} didn't catch the planted ${st(w.item, 120)}`, e.needId, gateRun.handle.url);
       }
     }
   }
-  // blocking scanners with no planted item at all: not shown to catch anything (a floor need is failed, never not-proven)
-  for (const [category, tool] of toolsByCategory) {
-    const needId = needOfCategory.get(category) as string;
-    if (category === 'secrets' || refusedNeeds.has(needId) || tool === 'nuclei') continue;
-    if (items.some((i) => i.category === category)) continue;
-    const floor = FLOOR.has(needId) || FLOOR.has(category);
-    const text = `${st(tool, 60)}: no planted item for ${st(needId, 60)}, so it is not shown to catch anything`;
-    if (floor) sheet.fail('pipeline', text, needId);
-    else sheet.notProven('pipeline', text, { needId });
+  // blocking scanner jobs with no planted item of their own (Plan G G0, F-3, F5-R2(a), S18)
+  const servicesByName = new Map(draft.profile.services.map((sv) => [sv.name, sv]));
+  for (const [job, e] of byJob) {
+    const tool = e.tool as string;
+    if (job === 'secrets' || refusedJobs.has(job) || tool === 'nuclei') continue;
+    if (items.some((i) => keyOf(i) === job)) continue;
+    const floor = FLOOR.has(e.needId) || FLOOR.has(e.category);
+    if (floor) {
+      // a sast/deps floor need of a service whose language has no planted template (or a repo-wide one): not proven, with a
+      // plain reason, and it caps the pipeline (the proof is not ok: a floor need is never warn-only or delivered unproven);
+      // a service that HAS a template but no item (the items were not passed): failed
+      const sv = e.service === undefined ? undefined : servicesByName.get(e.service);
+      const template = sv !== undefined && Object.hasOwn(PLANTED_FIXTURES, sv.language);
+      if (template) sheet.fail('pipeline', `${st(tool, 60)}: no planted item for ${st(job, 80)}, so it is not shown to catch anything`, e.needId);
+      else sheet.notProven('pipeline', `${st(job, 80)}: pipegen has no planted problem for this service's language yet, so it is not shown to catch anything`, { needId: e.needId, caps: true });
+    } else {
+      // stays blocking: shown, never warn-only and never a not-proven need (draft.notProven)
+      sheet.note('pipeline', `${st(job, 80)} (${st(tool, 60)}) has no planted item, so it is not shown to catch anything; it stays blocking`);
+    }
   }
-  // dast with nuclei: deferred (S23)
-  for (const e of jobList) if (e.tool === 'nuclei' && !items.some((i) => i.category === e.category)) {
-    sheet.notProven('pipeline', `${st(e.needId, 60)}: nuclei has no planted item yet (deferred), so it is not shown to catch anything: no planted item`, { needId: e.needId });
+  // dast with nuclei: deferred (S23); like any blocking scanner without an item, it stays blocking and is shown (F-3)
+  for (const e of jobList) if (e.tool === 'nuclei' && !items.some((i) => keyOf(i) === e.job || i.category === e.category)) {
+    sheet.note('pipeline', `${st(e.job, 80)} (nuclei) has no planted item yet (deferred), so it is not shown to catch anything; it stays blocking`);
   }
   void draft;
 }

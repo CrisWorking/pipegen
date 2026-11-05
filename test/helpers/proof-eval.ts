@@ -97,10 +97,11 @@ export function greenMain(d: PipelineDraft = draftOf(), o: { mergeSha?: string; 
     ],
   };
 }
+// Plan G G0 (F-2): every item names its job (needKey), as plantedFiles' items do; evaluate judges an item by that job only
 export const PLANTED_ITEMS = [
-  { id: 'sast-eval', category: 'sast', item: 'eval of user input', file: 'pipegen-planted/sast.js' },
-  { id: 'deps-vuln', category: 'deps', item: 'vulnerable dependency', file: 'pipegen-planted/package.json' },
-  { id: 'image-cve', category: 'image-scan', item: 'vulnerable base image', file: 'pipegen-planted/Dockerfile' },
+  { id: 'sast-eval', category: 'sast', item: 'eval of user input', file: 'pipegen-planted/sast.js', needKey: 'sast--api' },
+  { id: 'deps-vuln', category: 'deps', item: 'vulnerable dependency', file: 'pipegen-planted/package.json', needKey: 'deps--api' },
+  { id: 'image-cve', category: 'image-scan', item: 'vulnerable base image', file: 'pipegen-planted/Dockerfile', needKey: 'image-scan--api' },
 ];
 export const c1b = (): PlantedPlacement[] => [
   { kind: 'secret', path: 'node_modules/x.js', pathBytes: Buffer.from('node_modules/x.js'), rule: 'generic-api-key', line: 1 },

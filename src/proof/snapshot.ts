@@ -1185,7 +1185,8 @@ export async function pushProofSetup(input: ProofSetupInput, deps: ProofSetupDep
     let defaultBranchState = input.defaultBranchState;
     if (defaultBranchState === 'pending') {
       notStopping();
-      defaultBranchState = await setScratchDefaultBranch(deps.gh, scratch, clock);
+      // Plan G G0 (E-F2 m3): set only to the commit pipegen built and just pushed
+      defaultBranchState = await setScratchDefaultBranch(deps.gh, scratch, clock, base.sha);
       if (defaultBranchState === 'pending') throw new ProofStopError(`${scratch.fullName} still shows no branch after the base push; check it on GitHub, then run pipegen again.`);
     }
     notStopping();

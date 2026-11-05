@@ -1300,17 +1300,59 @@ function toReviewedTool(e: Entry): ReviewedTool {
 
 // ---------- lookups ----------
 
+// ---------- the proof bootstrap (Plan G G0, ruling B8, carry F-1) ----------
+
+/** The environment switch of the proof bootstrap: exactly `1` turns it on, in a dev run only. */
+export const BOOTSTRAP_PROOFS_ENV = 'PIPEGEN_BOOTSTRAP_PROOFS';
+/** The line the preview and PIPEGEN.md show when the bootstrap offered the tools (fixed text, ruling B8). */
+export const BOOTSTRAP_PROOFS_NOTE = 'pipegen chose these tools in a bootstrap run: these tools are proven on your repo but not yet counted as proven by pipegen.';
+export class BootstrapProofsError extends Error {}
+type Env = Readonly<Record<string, string | undefined>>;
+
+/**
+ * Whether the proof bootstrap is on (ruling B8): every reviewed entry starts with `proofs: 0`, so `full` mode would offer no
+ * tool before the first live run; with PIPEGEN_BOOTSTRAP_PROOFS=1 a DEV run (from src, or the .dev-dist build) offers the
+ * human-reviewed entries with no proof yet, and shows BOOTSTRAP_PROOFS_NOTE. A release build (isReleaseBuild: the bundled dist
+ * or NODE_ENV=production) refuses the switch whenever it is set, whatever its value: a BootstrapProofsError, nothing offered.
+ * Any value but exactly `1` is off. A delegated review then raises `proofs` in data/reviewed-tools.yml (data, no re-pin).
+ */
+export function bootstrapProofs(env: Env = process.env): boolean {
+  const v = env[BOOTSTRAP_PROOFS_ENV];
+  if (v === undefined || v === '') return false;
+  if (isReleaseBuild()) {
+    throw new BootstrapProofsError(`${BOOTSTRAP_PROOFS_ENV} is for pipegen's own development runs; this release refuses it, so it offers only tools with a passed proof. Unset ${BOOTSTRAP_PROOFS_ENV} and run pipegen again.`);
+  }
+  return v === '1';
+}
+
+/** BOOTSTRAP_PROOFS_NOTE when the bootstrap is on (bootstrapProofs; throws the same refusal in a release build), else null. */
+export function bootstrapProofsNote(env: Env = process.env): string | null {
+  return bootstrapProofs(env) ? BOOTSTRAP_PROOFS_NOTE : null;
+}
+
+/**
+ * Whether full mode may offer an entry: at least one passed proof; or, with the bootstrap on (a dev run only), a human-reviewed
+ * entry (never one still PENDING review) with none yet. The one rule for every full-mode offer (reviewedFor, the judge's counters).
+ */
+export function offeredInFull(t: Pick<ReviewedTool, 'proofs' | 'reviewedBy'>, env: Env = process.env): boolean {
+  return fullModeOk(t, bootstrapProofs(env));
+}
+const fullModeOk = (t: Pick<ReviewedTool, 'proofs' | 'reviewedBy'>, boot: boolean): boolean => t.proofs >= 1 || (boot && t.proofs === 0 && t.reviewedBy !== PENDING);
+
 /**
  * Reviewed entries for a need: its category (from NEED_ID_CATEGORY, which must agree with need.category, ruling S6)
  * is one of the entry's categories, and the entry is for this language or 'any'. Full runs (v0.2+) only use entries
- * with at least one passed proof; the audit (v0.1) uses human-reviewed, exactly pinned entries with none.
+ * with at least one passed proof (offeredInFull: or, in a dev run with the proof bootstrap on, a reviewed entry with none);
+ * the audit (v0.1) uses human-reviewed, exactly pinned entries with none. `env`: where the bootstrap switch is read.
  */
-export function reviewedFor(need: Need, language: Language, list: ReviewedTool[], mode: 'audit' | 'full'): ReviewedTool[] {
+export function reviewedFor(need: Need, language: Language, list: ReviewedTool[], mode: 'audit' | 'full', env: Env = process.env): ReviewedTool[] {
   const category = (NEED_ID_CATEGORY as Readonly<Record<string, string>>)[need.id];
   if (category === undefined || category !== need.category) return [];
+  // the switch is read (and refused in a release build) once per call, before any entry is looked at
+  const boot = mode === 'full' && bootstrapProofs(env);
   return list.filter((t) => t.categories.includes(category)
     && (t.languages.includes(language) || t.languages.includes('any'))
-    && (mode === 'audit' || t.proofs >= 1));
+    && (mode === 'audit' || fullModeOk(t, boot)));
 }
 
 // effectiveProtectedPaths lives in the leaf protected-paths.ts (the gate bundles it without this loader); re-exported for the engine.

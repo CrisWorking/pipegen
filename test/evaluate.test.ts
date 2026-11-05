@@ -441,8 +441,11 @@ describe('planted', () => {
     const r = await evaluate(d, both(d), ctxOf({ plantedItems: [] }));
     expect(need(r, 'pipeline', 'sast')?.status).toBe('failed');
     expect(need(r, 'pipeline', 'deps')?.status).toBe('failed');
-    // a non-floor scanner (image-scan) without an item is a not-proven note
-    expect(need(r, 'pipeline', 'image-scan')?.status).toBe('not-proven');
+    // a non-floor scanner (image-scan) without an item: Plan G G0 (F-3) a note in the pipeline's detail, it stays blocking, never
+    // a not-proven need entry (draft.notProven)
+    expect(need(r, 'pipeline', 'image-scan')).toBeUndefined();
+    const shown = await evaluate(d, both(d), ctxOf({ plantedItems: PLANTED_ITEMS.filter((i) => i.category !== 'image-scan') }));
+    expect(part(shown, 'pipeline')?.detail).toMatch(/image-scan--api \(trivy-image\) has no planted item, so it is not shown to catch anything; it stays blocking/);
     // items given but no matcher: ambiguous, failed
     const r2 = await evaluate(d, both(d), ctxOf({ matchPlanted: undefined }));
     expect(part(r2, 'pipeline')?.status).toBe('failed');
@@ -470,8 +473,9 @@ describe('planted', () => {
       steps: [spec('gitleaks', 'secrets'), spec('semgrep', 'sast', 'api'), spec('osv-scanner', 'deps', 'api'), spec('nuclei', 'dast', 'api')],
     });
     const r = await evaluate(d, both(d), ctxOf());
-    expect(need(r, 'pipeline', 'dast')).toMatchObject({ status: 'not-proven' });
-    expect(need(r, 'pipeline', 'dast')?.detail).toMatch(/nuclei.*no planted item/);
+    // Plan G G0 (F-3): a note in the pipeline's detail (it stays blocking), never a not-proven need entry
+    expect(need(r, 'pipeline', 'dast')).toBeUndefined();
+    expect(part(r, 'pipeline')?.detail).toMatch(/nuclei.*no planted item/);
     expect(part(r, 'pipeline')?.status).toBe('proven');
     expect(r.ok).toBe(true);
   });

@@ -8,7 +8,9 @@ export const METAFILE_PATH = '.build/meta.json';
 
 // Exported so the package test can build a probe entry with exactly the same settings.
 export const tsupOptions = {
-  entry: { 'cli/main': 'src/cli/main.ts' },
+  // Plan G G0 (carry E-b12, ruling S20): the JUnit worker (src/create/junit-worker.ts starts ./junit-thread.js next to the
+  // bundle as a worker_threads Worker), built next to main.js
+  entry: { 'cli/main': 'src/cli/main.ts', 'cli/junit-thread': 'src/create/junit-thread.ts' },
   outDir: 'dist',
   format: ['esm'],
   platform: 'node',

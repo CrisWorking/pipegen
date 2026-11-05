@@ -7,7 +7,7 @@
 //      reply that is not what the worker protocol says is a caught error;
 //   3. turns every one of those into `{ ok: false, reason: 'report unreadable: ...' }`. A refusal, a timeout, a crash and a limit
 //      hit are never a pass, and never "no results" either: the caller shows the reason as the result.
-// The worker entry is the build's `junit-thread.js` next to this module (Plan G adds the tsup entry with the proof wiring). From
+// The worker entry is the build's `junit-thread.js` next to this module (tsup.config.ts entry cli/junit-thread, Plan G G0). From
 // the TypeScript sources there is none, so a caller may pass `workerUrl`; with neither, the report is unreadable (fails closed).
 import { existsSync } from 'node:fs';
 import { open } from 'node:fs/promises';

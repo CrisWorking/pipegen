@@ -51,9 +51,10 @@ describe('E1 guardedWrite (S3)', () => {
   it('scratch: writes under /repos/{owner}/{repo} go out with the guarded owner and repo', async () => {
     const g = world({ repos: both });
     const s = assertScratch(proofTarget(app()), app());
-    // final review I-1: the one ref the API makes on the scratch repo is its default branch (setScratchDefaultBranch)
-    await guardedWrite(g.gh, s, 'POST /repos/{owner}/{repo}/git/refs', { ref: 'refs/heads/main', sha: SHA_MAIN });
-    expect(g.seen()).toEqual([`POST /repos/${OWNER}/${SCRATCH}/git/refs`]);
+    // Plan G G0 (E-F2 m3): the API makes no ref on the scratch repo any more (the base push makes the default branch)
+    await expect(guardedWrite(g.gh, s, 'POST /repos/{owner}/{repo}/git/refs', { ref: 'refs/heads/main', sha: SHA_MAIN })).rejects.toThrow(ScratchGuardError);
+    await guardedWrite(g.gh, s, 'PATCH /repos/{owner}/{repo}', { allow_forking: false });
+    expect(g.seen()).toEqual([`PATCH /repos/${OWNER}/${SCRATCH}`]);
   });
 
   it('refuses a route outside the repo, a read, reserved params and dot segments, before any call', async () => {
@@ -260,7 +261,6 @@ describe('final review I-1: the scratch guard takes only the writes pipegen make
     ['PATCH /repos/{owner}/{repo}', { default_branch: 'main' }],                                       // repos.ts setScratchDefaultBranch
     ['PATCH /repos/{owner}/{repo}', { private: true }],                                                // target.ts makeRepoPrivate
     ['PATCH /repos/{owner}/{repo}', { visibility: 'private' }],
-    ['POST /repos/{owner}/{repo}/git/refs', { ref: 'refs/heads/main', sha }],                         // repos.ts setScratchDefaultBranch
     ['POST /repos/{owner}/{repo}/pulls', { title: 't', head: `proof/${RUN_ID}/main`, base: 'main', body: 'b' }],   // run.ts openProofPr
     ['PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge', { pull_number: 3, sha, merge_method: 'merge' }],      // run.ts mergeProofPr
     ['PATCH /repos/{owner}/{repo}/pulls/{pull_number}', { pull_number: 3, state: 'closed' }],                     // run.ts closeProofPr
@@ -301,7 +301,7 @@ describe('final review I-1: the scratch guard takes only the writes pipegen make
     // the reads and the central repo's writes are not scratch writes
     for (const r of ['PUT /repos/{owner}/{repo}/actions/permissions/access']) found.delete(r);
     expect([...found].filter((r) => !covered.has(r))).toEqual([]);
-    expect(found.size).toBeGreaterThanOrEqual(10);
+    expect(found.size).toBeGreaterThanOrEqual(9);   // Plan G G0 (E-F2 m3): setScratchDefaultBranch's POST git/refs is gone
   });
 
   it('the empty commit and the forced reset of the default branch go only through cleanupWrite (cleanup mode)', async () => {

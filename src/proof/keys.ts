@@ -692,8 +692,11 @@ const isTokenRejected = (gh: Octokit, e: unknown): boolean => (e as { status?: u
  * when a workflow can't be parsed, when `secrets` appears without a name (`secrets[expr]`, `toJSON(secrets)`, the word in a
  * name or a script), or when a `secrets:` key passes anything but a map (`secrets: inherit` passes them all). The key
  * `secrets:` of a reusable-workflow call itself reads nothing: its values are scanned like any scalar.
+ * Plan G G0 (E-F2 m2): an empty list (or no list) is null too. A proof always pushes at least one workflow, so an empty list
+ * can only be a caller that passed the wrong set; read as "reads no secret" it would let an org secret through the brand.
  */
 export function workflowSecretNames(workflows: readonly { content: string | Uint8Array }[]): string[] | null {
+  if (!Array.isArray(workflows) || workflows.length === 0) return null;
   const names = new Set<string>();
   for (const w of workflows) {
     const text = typeof w.content === 'string' ? w.content : Buffer.from(w.content).toString('utf8');

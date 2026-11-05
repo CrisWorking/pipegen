@@ -376,20 +376,27 @@ describe('E1 repos (plan Task 1, preflight S1/S13/S19)', () => {
   });
 
   it('repos: scratch default branch set to the app\'s default branch', async () => {
-    // the branch exists in the scratch repo: PATCH default_branch
+    // Plan G G0 (E-F2 m3): checkProofRepos runs before pipegen built any commit, so it changes no default branch: the branch
+    // exists (at a commit pipegen didn't build) → 'pending', nothing written; E2 sets it after the base push (test/plan-g0.test.ts)
     const has = run({ repos: { pipelines: { private: true }, [SCRATCH]: { private: true, refs: { main: SHA_MAIN, develop: '2'.repeat(40) } } }, access: 'user' }, app({ defaultBranch: 'develop' }));
     const r = await has.result;
     expect(r.scratchDefaultBranch).toBe('develop');
     expect(r.target.defaultBranch).toBe('develop');
+    expect(r.defaultBranchState).toBe('pending');
+    expect(has.g.writes()).toEqual([]);
+    // at the base commit pipegen built: PATCH default_branch
+    const built = '2'.repeat(40);
+    expect(await setScratchDefaultBranch(has.g.gh, assertScratch(r.target, app({ defaultBranch: 'develop' })), undefined, built)).toBe('set');
     expect(writePaths(has.g)).toEqual([`PATCH /repos/${OWNER}/${SCRATCH}`]);
     expect(JSON.parse(has.g.writes()[0]?.body ?? '{}')).toEqual({ default_branch: 'develop' });
     expect(has.g.repos[SCRATCH]?.default_branch).toBe('develop');
 
-    // missing: made from the current default head, then set
+    // missing: never made through the API (Plan G G0, E-F2 m3); the base push makes it at pipegen's commit
     const make = run({ repos: both, access: 'user' }, app({ defaultBranch: 'release/2026' }));
-    expect((await make.result).scratchDefaultBranch).toBe('release/2026');
-    expect(writePaths(make.g)).toEqual([`POST /repos/${OWNER}/${SCRATCH}/git/refs`, `PATCH /repos/${OWNER}/${SCRATCH}`]);
-    expect(JSON.parse(make.g.writes()[0]?.body ?? '{}')).toEqual({ ref: 'refs/heads/release/2026', sha: SHA_MAIN });
+    const m = await make.result;
+    expect(m.scratchDefaultBranch).toBe('release/2026');
+    expect(m.defaultBranchState).toBe('pending');
+    expect(make.g.writes()).toEqual([]);
 
     // an empty scratch repo: nothing to set yet (the base push creates the branch), so no write; E2 calls it again after
     const empty = run({ repos: { pipelines: { private: true }, [SCRATCH]: { private: true, refs: 'empty' } }, access: 'user' }, app({ defaultBranch: 'develop' }));
@@ -541,8 +548,10 @@ describe('E1 repos: answers GitHub may give (mutation-driven)', () => {
   it('make private: GitHub\'s answer must say private; default branch: GitHub\'s answer must name the branch', async () => {
     const stays = run({ repos: { pipelines: { private: true }, [SCRATCH]: { private: false } }, patchBody: { private: false, visibility: 'public' } });
     await expect(stays.result).rejects.toThrow(/didn't confirm CrisWorking\/pipegen-proof-shop is private/);
-    const branch = run({ repos: { pipelines: { private: true }, [SCRATCH]: { private: true, refs: { main: SHA_MAIN, develop: SHA_MAIN } } }, access: 'user', patchBody: { default_branch: 'main' } }, app({ defaultBranch: 'develop' }));
-    await expect(branch.result).rejects.toThrow(/didn't confirm develop as the default branch/);
+    // Plan G G0 (E-F2 m3): the default branch is set after the base push, at the commit pipegen built (SHA_MAIN here)
+    const bw = world({ repos: { pipelines: { private: true }, [SCRATCH]: { private: true, refs: { main: SHA_MAIN, develop: SHA_MAIN } } }, access: 'user', patchBody: { default_branch: 'main' } });
+    const dev = app({ defaultBranch: 'develop' });
+    await expect(setScratchDefaultBranch(bw.gh, assertScratch(proofTarget(dev), dev), undefined, SHA_MAIN)).rejects.toThrow(/didn't confirm develop as the default branch/);
   });
 
   it('central make-private takes private true only', async () => {
@@ -604,7 +613,10 @@ describe('E1 fix round 1: marker (M5), default-branch failures (M4), reads are G
   });
 
   it('a default-branch write GitHub refuses → a stop that says what to change', async () => {
-    const r = run({ repos: { pipelines: { private: true }, [SCRATCH]: { private: true, refs: { main: SHA_MAIN, develop: SHA_MAIN } } }, access: 'user', patchStatus: 403 }, app({ defaultBranch: 'develop' }));
+    // Plan G G0 (E-F2 m3): the write happens after the base push, at the commit pipegen built (SHA_MAIN here)
+    const w = world({ repos: { pipelines: { private: true }, [SCRATCH]: { private: true, refs: { main: SHA_MAIN, develop: SHA_MAIN } } }, access: 'user', patchStatus: 403 });
+    const dev = app({ defaultBranch: 'develop' });
+    const r = { result: setScratchDefaultBranch(w.gh, assertScratch(proofTarget(dev), dev), undefined, SHA_MAIN) };
     await expect(r.result).rejects.toThrow(ProofStopError);
     await expect(r.result).rejects.toThrow(/couldn't set develop as the default branch of CrisWorking\/pipegen-proof-shop \(HTTP 403\).*Settings → General → Default branch/s);
   });

@@ -274,8 +274,10 @@ describe('minor findings', () => {
       steps: [spec('gitleaks', 'secrets'), spec('semgrep', 'sast', 'api'), spec('osv-scanner', 'deps', 'api'), spec('nuclei', 'dast', 'api')],
     });
     const r = await evaluate(d, [greenMain(d), plantedRuns(d)], ctxOf());
-    expect(ent(r, 'pipeline', 'dast')).toHaveLength(1);
-    expect(ent(r, 'pipeline', 'dast')[0]?.detail).toMatch(/deferred/);
+    // Plan G G0 (F-3): a blocking scanner with no planted item stays blocking and is shown in the pipeline's detail, once; it is
+    // never a not-proven need entry (which would reach draft.notProven)
+    expect(ent(r, 'pipeline', 'dast')).toHaveLength(0);
+    expect(r.parts.find((p) => p.part === 'pipeline' && p.needId === undefined)?.detail.match(/deferred/g)).toHaveLength(1);
   });
 });
 void COMPAT_PREFIX; void HARNESS_PATH; void harnessJob; void MERGE;

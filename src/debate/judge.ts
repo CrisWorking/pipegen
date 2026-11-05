@@ -29,7 +29,7 @@ import {
   LAYERS, NEED_IDS, acceptAddedNeed, addedNeedContext, needKey, needWhy, promptProfile, promptServiceNames, promptText, refusedAdditionsNote,
   type AddedNeed, type AddedNeedRefusal,
 } from '../engine/needs.js';
-import { reviewedFor } from '../engine/reviewed.js';
+import { offeredInFull, reviewedFor } from '../engine/reviewed.js';
 import {
   NEED_CATEGORIES, type AiProvider, type AiRequest, type AiUsage, type Candidate, type Capabilities, type Need, type RepoProfile, type ReviewedTool,
 } from '../types.js';
@@ -146,7 +146,7 @@ export function judgeOffers(choices: readonly Choice[], needs: readonly Need[], 
   // a superset of every key's offers (code checks each pick per key): full-mode reviewed entries that cover some check, never an
   // egress tool (its inputs are pipegen's own, review F2 I2), each id unchanged by the scrub
   const counterIds = deps.reviewed
-    .filter((t) => t.proofs >= 1 && isReviewed(t.candidate) && t.candidate.id === t.id && promptText(t.id, kv) === t.id
+    .filter((t) => offeredInFull(t) && isReviewed(t.candidate) && t.candidate.id === t.id && promptText(t.id, kv) === t.id
       && !t.categories.some((c) => NEVER_OFFERED_CATEGORIES.has(c)) && NEED_IDS.some((id) => toolCoversNeed(t.categories, id)))
     .map((t) => t.id);
   return { keys, judgeKeys: keys.aiKeys.filter((k) => byKey.has(k)), choices: byKey, counterIds: [...new Set(counterIds)], services: promptServiceNames(p, kv) };

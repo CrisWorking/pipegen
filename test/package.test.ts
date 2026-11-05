@@ -107,8 +107,9 @@ describe('build', () => {
     expect(raw).toMatch(/function isReleaseBuild\(\) \{\n\s*return true;/);
     // comments left out (the bundled Anthropic SDK's doc comments say things like "from 'queued' to 'starting'")
     const out = codeOf(raw);
-    expect(readdirSync(resolve(root, 'dist'))).toEqual(['cli']); // one file: no chunk next to main.js
-    expect(readdirSync(resolve(root, 'dist/cli'))).toEqual(['main.js']);
+    expect(readdirSync(resolve(root, 'dist'))).toEqual(['cli']); // no chunk next to main.js
+    // Plan G G0 (carry E-b12, ruling S20): the JUnit worker entry is the one other file, next to main.js
+    expect(readdirSync(resolve(root, 'dist/cli')).sort()).toEqual(['junit-thread.js', 'main.js']);
     const specs = [
       // a module specifier has no whitespace or comma (so a string list like "--volumes-from", "--stop-signal" isn't one)
       ...out.matchAll(/\bfrom\s*["']([^"'\s,]+)["']/g),
@@ -119,6 +120,27 @@ describe('build', () => {
     for (const s of specs) expect(s.startsWith('node:'), `non-builtin import: ${s}`).toBe(true);
     for (const name of shimRequires(out)) expect(isBuiltin(name), `non-builtin require: ${name}`).toBe(true);
   });
+
+  it('build: dist/cli/junit-thread.js is built and readJunitBytes from the bundle parses a report', async () => {
+    // the release build makes the worker entry next to main.js (readJunitBytes' default: ./junit-thread.js next to the bundle)
+    execFileSync('npx', ['tsup'], { cwd: root, stdio: 'pipe' });
+    const thread = resolve(root, 'dist/cli/junit-thread.js');
+    const code = readFileSync(thread, 'utf8');
+    expect(code).toMatch(/parentPort/);   // the worker side, bundled on its own (no import of anything but node: built-ins)
+    for (const s of [...codeOf(code).matchAll(/\bfrom\s*["']([^"'\s,]+)["']/g)].map((m) => m[1] as string)) expect(s.startsWith('node:'), s).toBe(true);
+    // a probe bundled with the same options calls readJunitBytes with no workerUrl, next to a copy of the built worker file
+    const dir = makeTempDir();
+    await build({ ...tsupOptions, entry: { probe: 'test/helpers/junit-probe.ts' }, outDir: dir, config: false, silent: true });
+    writeIn(dir, 'junit-thread.js', code);
+    const report = resolve(root, 'test/fixtures/junit/vitest-5.0.5.xml');
+    const out = JSON.parse(execFileSync('node', [join(dir, 'probe.js'), report], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()) as { ok: boolean; statuses?: string[]; reason?: string };
+    expect(out).toEqual({ ok: true, statuses: ['pass', 'fail', 'skip', 'pass', 'pass'] });
+    // without the worker file next to it the report is unreadable (fails closed), never a pass
+    const bare = makeTempDir();
+    await build({ ...tsupOptions, entry: { probe: 'test/helpers/junit-probe.ts' }, outDir: bare, config: false, silent: true });
+    const none = JSON.parse(execFileSync('node', [join(bare, 'probe.js'), report], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()) as { ok: boolean };
+    expect(none.ok).toBe(false);
+  }, 120_000);
 
   it('a probe bundled with the same options runs readProject, bundleCode and makeProvider under plain node', async () => {
     // An installed-package layout: <pkg>/package.json (name pipegen), <pkg>/data/, and the probe in <pkg>/dist/cli/,

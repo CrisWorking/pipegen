@@ -421,9 +421,13 @@ export class StateStore {
    * Final review I-2: the verdict of the proof that just ended and its final draft (CreatedFile.aiEdited kept), saved together
    * before the stage moves (proveThenClean). The draft is checked against the state format first, and the write refuses any
    * secret value (#write): a StateError, and nothing is written. Without a draft, the saved one stays and the verdict is
-   * not a pass.
+   * not a pass. Plan G G0 (E-F2 m1): accepted only at the stage `proving`, the one moment proveThenClean (its only caller,
+   * test/plan-g0.test.ts scans src for it) records the proof that just ended; at any other stage (a proven or cleaned proof,
+   * stopped, interrupted, delivered) it is a StateError and nothing is written.
    */
   recordVerdict(v: { ok: boolean; draft?: PipelineDraft; stopped?: string }): void {
+    const stage = this.#need().stage;
+    if (stage !== 'proving') throw new StateError(`pipegen records a proof's verdict only while it proves (the stage is ${stage}).`);
     let checked: PipelineDraft | undefined;
     if (v.draft !== undefined) {
       const parsed = draft.safeParse(structuredClone(v.draft));

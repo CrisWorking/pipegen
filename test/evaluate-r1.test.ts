@@ -207,7 +207,9 @@ describe('messages and branches pinned by the mutation round', () => {
     expect(r.parts.some((p) => p.status === 'failed' && p.needId === 'dast')).toBe(false);
     const n = mk('nuclei');
     const rn = await evaluate(n, [greenMain(n), plantedRuns(n)], ctxOf());
-    expect(rn.parts.some((p) => p.needId === 'dast' && p.status === 'not-proven' && /deferred/.test(p.detail))).toBe(true);
+    // Plan G G0 (F-3): shown in the pipeline's detail, never a not-proven need entry
+    expect(rn.parts.some((p) => p.needId === 'dast' && p.status === 'not-proven')).toBe(false);
+    expect(rn.parts.some((p) => p.part === 'pipeline' && p.needId === undefined && /nuclei[^;]*deferred/.test(p.detail))).toBe(true);
   });
 
   it('created tests: each rule is named', async () => {

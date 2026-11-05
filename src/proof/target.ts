@@ -274,21 +274,20 @@ const VARIABLES_PATH_RE = /(?:^|\/)variables(?:\/|$)/;
 export const SCRATCH_VARIABLES: readonly string[] = Object.freeze(['PIPEGEN_BLOCK_FROM']);
 
 type RouteCheck = (t: ProofTarget, p: Params) => boolean;
-const SHA_RE = /^[0-9a-f]{40}$/;
 const runOnly: RouteCheck = (_t, p) => onlyKeys(p, ['run_id']);
 /**
  * Final review I-1 (ruling E-F1): the scratch repo's writes ("METHOD path" under /repos/{owner}/{repo}), exactly the ones
  * pipegen makes, each with the check its parameters must pass. No write that adds or changes content (contents, git blobs,
  * trees, commits, tags, a branch moved to another commit) and no environment write: a workflow reaches the scratch repo
  * only through a git push of a commit buildProofBranch checked (checkProofWorkflows), and nothing re-enables a workflow
- * disableUserWorkflows turned off. Callers: repos.ts (forking off, the marker, setScratchDefaultBranch's branch and
- * default), snapshot.ts (Dependabot updates off, a user workflow disabled), run.ts (the proof PR opened, merged, closed;
+ * disableUserWorkflows turned off. Callers: repos.ts (forking off, the marker, setScratchDefaultBranch's default branch),
+ * snapshot.ts (Dependabot updates off, a user workflow disabled), run.ts (the proof PR opened, merged, closed;
  * runs cancelled, force-cancelled, failed jobs re-run), and the declared Actions variable (E4-R2). test/proof-target.test.ts
  * scans src/proof for the routes, so a new caller fails a test until it is listed here.
  */
 const SCRATCH_WRITES: ReadonlyMap<string, RouteCheck> = new Map<string, RouteCheck>([
-  // repos.ts setScratchDefaultBranch: the app's default branch, made at the scratch default branch's head
-  ['POST /git/refs', (t, p) => onlyKeys(p, ['ref', 'sha']) && p.ref === `refs/heads/${t.defaultBranch}` && typeof p.sha === 'string' && SHA_RE.test(p.sha)],
+  // Plan G G0 (E-F2 m3): no branch is made through the API (POST git/refs is not listed): the app's default branch is made only
+  // by the push of the base commit pipegen built, and setScratchDefaultBranch then makes it the default only at that commit
   ['POST /pulls', (t, p) => onlyKeys(p, ['title', 'head', 'base', 'body']) && p.base === t.defaultBranch
     && typeof p.head === 'string' && p.head.startsWith(`proof/${t.runId}/`)],
   ['PUT /pulls/{pull_number}/merge', (_t, p) => onlyKeys(p, ['pull_number', 'sha', 'merge_method'])],
@@ -323,7 +322,9 @@ function checkScratch(r: GuardedRepo, method: string, path: string, p: Params, m
     }
   }
   if (path === '' && mode === 'plain') {
-    if (method === 'PATCH' && Object.keys(p).length > 0 && onlyKeys(p, [...SCRATCH_REPO_PATCH]) && towardsPrivate(p)) return;
+    // the default branch only ever the app's (Plan G G0; the E final review's out-of-scope note: never another branch)
+    const ownDefault = p.default_branch === undefined || p.default_branch === r.target.defaultBranch;
+    if (method === 'PATCH' && Object.keys(p).length > 0 && onlyKeys(p, [...SCRATCH_REPO_PATCH]) && towardsPrivate(p) && ownDefault) return;
     refuse(method === 'DELETE' ? `deleting ${r.fullName} needs the exact name and pipegen's created marker (cleanup).`
       : `${method} on ${r.fullName} may only make it private, turn forking off, set its default branch or pipegen's marker.`);
   }

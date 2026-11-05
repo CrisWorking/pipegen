@@ -83,7 +83,10 @@ export interface ProofRepos {
   createdIds?: Record<string, number>;
   /** When ready: always the app's default branch (S1). */
   scratchDefaultBranch?: string;
-  /** 'pending': the scratch repo has no commit yet; E2 calls setScratchDefaultBranch again after the base push. */
+  /**
+   * 'pending': the scratch repo's default branch is not the app's yet; E2 calls setScratchDefaultBranch again after the base
+   * push, with the base commit's sha (Plan G G0, E-F2 m3: only a branch at a commit pipegen built becomes the default).
+   */
   defaultBranchState?: DefaultBranchState;
   /** Organisations only. */
   orgPerm?: OrgPermission;
@@ -529,51 +532,44 @@ export async function ensureActionsAccess(gh: Octokit, t: ProofTarget, app: Proo
 
 /**
  * Sets the scratch repo's default branch to the app's (ruling S1), so the gate's default-branch trust and the deploy
- * layer behave as in the app repo. Already equal: nothing. The branch exists: PATCH default_branch. It doesn't: made from
- * the current default head (POST git/refs), then PATCH. An empty repo (no commit): 'pending', nothing written: the base
- * push creates the branch, and E2 calls this again after it.
+ * layer behave as in the app repo. Already equal: nothing. Plan G G0 (E-F2 m3): the default branch is set ONLY when the
+ * app's branch exists in the scratch repo AND its head is `built`, the base commit pipegen built and pushed (snapshot.ts
+ * pushProofSetup calls this after the base push with that sha). Anything else (no `built`, as checkProofRepos calls it before
+ * any pipegen commit exists; the branch missing; its head another commit; an empty repo) writes nothing and gives 'pending'.
+ * No branch is ever made through the API (the guard refuses POST git/refs on the scratch repo): the base push makes it.
  */
-export async function setScratchDefaultBranch(gh: Octokit, scratch: GuardedRepo, clock: RateClock = clockOf(gh)): Promise<DefaultBranchState> {
+export async function setScratchDefaultBranch(gh: Octokit, scratch: GuardedRepo, clock: RateClock = clockOf(gh), built?: string): Promise<DefaultBranchState> {
   requireGuarded(scratch, 'scratch');
   const branch = scratch.target.defaultBranch;
   const seen = await readHelper(gh, scratch.owner, scratch.repo, clock);
   if (!seen.exists) throw new GitHubAccessError(`pipegen can't see ${scratch.fullName} any more.`);
   if (seen.defaultBranch === branch) return 'already';
-  const head = async (b: string): Promise<string | 'missing' | 'empty'> => {
-    try {
-      const d = await read(gh, clock, 'GET /repos/{owner}/{repo}/git/ref/{ref}', { owner: scratch.owner, repo: scratch.repo, ref: `heads/${b}` }) as { object?: { sha?: unknown } } | null;
-      const sha = d?.object?.sha;
-      if (typeof sha !== 'string' || !/^[0-9a-f]{40}$/.test(sha)) throw new GitHubAccessError(`GitHub's answer about the branch ${safeText(b, 100)} of ${scratch.fullName} could not be read.`);
-      return sha;
-    } catch (e) {
-      if (e instanceof GitHubAccessError) throw e;
-      rethrowHard(gh, e);
-      if (statusOf(e) === 409) return 'empty';
-      if (statusOf(e) === 404) return 'missing';
-      throw new GitHubAccessError(`pipegen couldn't read the branches of ${scratch.fullName} (${saidOf(e)}).`, { status: statusOf(e) });
-    }
-  };
-  const want = await head(branch);
-  if (want === 'empty') return 'pending';
-  let from = '';
-  if (want === 'missing') {
-    const h = await head(seen.defaultBranch);
-    if (h === 'empty' || h === 'missing') return 'pending';
-    from = h;
+  if (typeof built !== 'string' || !/^[0-9a-f]{40}$/.test(built)) return 'pending';
+  let head: string | 'missing' | 'empty';
+  try {
+    const d = await read(gh, clock, 'GET /repos/{owner}/{repo}/git/ref/{ref}', { owner: scratch.owner, repo: scratch.repo, ref: `heads/${branch}` }) as { object?: { sha?: unknown } } | null;
+    const sha = d?.object?.sha;
+    if (typeof sha !== 'string' || !/^[0-9a-f]{40}$/.test(sha)) throw new GitHubAccessError(`GitHub's answer about the branch ${safeText(branch, 100)} of ${scratch.fullName} could not be read.`);
+    head = sha;
+  } catch (e) {
+    if (e instanceof GitHubAccessError) throw e;
+    rethrowHard(gh, e);
+    if (statusOf(e) === 409) head = 'empty';
+    else if (statusOf(e) === 404) head = 'missing';
+    else throw new GitHubAccessError(`pipegen couldn't read the branches of ${scratch.fullName} (${saidOf(e)}).`, { status: statusOf(e) });
   }
+  // only a branch at the commit pipegen built becomes the default (never one somebody else pushed)
+  if (head !== built) return 'pending';
   const byHand = `Set it by hand (${scratch.fullName} → Settings → General → Default branch → ${branch}), then run pipegen again.`;
+  let res: Awaited<ReturnType<typeof guardedWrite>>;
   // GitHub refusing a write (no Administration write: 403; a 422) is a stop that says what to change (review M4)
-  const write = async (route: string, params: Record<string, unknown>) => {
-    try {
-      return await guardedWrite(gh, scratch, route, params, clock);
-    } catch (e) {
-      if (e instanceof ScratchGuardError) throw e;
-      rethrowHard(gh, e);
-      throw new ProofStopError(`pipegen couldn't set ${branch} as the default branch of ${scratch.fullName} (${saidOf(e)}). ${byHand}`);
-    }
-  };
-  if (want === 'missing') await write('POST /repos/{owner}/{repo}/git/refs', { ref: `refs/heads/${branch}`, sha: from });
-  const res = await write('PATCH /repos/{owner}/{repo}', { default_branch: branch });
+  try {
+    res = await guardedWrite(gh, scratch, 'PATCH /repos/{owner}/{repo}', { default_branch: branch }, clock);
+  } catch (e) {
+    if (e instanceof ScratchGuardError) throw e;
+    rethrowHard(gh, e);
+    throw new ProofStopError(`pipegen couldn't set ${branch} as the default branch of ${scratch.fullName} (${saidOf(e)}). ${byHand}`);
+  }
   if ((res.data as { default_branch?: unknown } | null)?.default_branch !== branch) {
     throw new ProofStopError(`GitHub didn't confirm ${branch} as the default branch of ${scratch.fullName}. ${byHand}`);
   }

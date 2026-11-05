@@ -240,10 +240,12 @@ describe('E8 cleanup after the proof', () => {
     const order: string[] = [];
     e.store.update((s) => { s.stage = 'proving'; });
     // final review I-2: a proof that passed (its verdict and final draft saved) is proven; see test/proof-e-final.test.ts for the rest
-    const out = await proveThenClean(e.store, async () => { order.push('prove'); return 'outcome'; }, async () => { order.push(`cleanup (${e.store.state?.stage})`); return e.clean(false); }, () => ({ ok: true, draft: draftOf() }));
+    // Plan G G0 (E-F2 m1): a verdict reader may only make a result stricter, so the outcome is a passing FixOutcome itself
+    const passed = { draft: draftOf(), result: { ok: true } };
+    const out = await proveThenClean(e.store, async () => { order.push('prove'); return passed; }, async () => { order.push(`cleanup (${e.store.state?.stage})`); return e.clean(false); });
     order.push(`preview (${e.store.state?.stage})`);
     expect(order).toEqual(['prove', 'cleanup (proven)', 'preview (cleaned)']);
-    expect(out.outcome).toBe('outcome');
+    expect(out.outcome).toBe(passed);
     expect(e.w.s.values.size).toBe(0);
     // a proof that fails: the cleanup still runs, then the error goes on; nothing shown before it
     const f = await setup({ repoId: 77_006 });

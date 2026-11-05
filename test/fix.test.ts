@@ -1302,6 +1302,41 @@ describe('final review I-3: the read secret names follow the workflows of each p
     expect(t.some((x) => x.startsWith('placeholders:'))).toBe(false);
   });
 
+  it('fix: empty workflows list → secret names unknown, no excerpt', async () => {
+    // Plan G G0 (E-F2 m2): a proof always pushes at least one workflow, so an empty list is a wiring bug, never "reads no secret"
+    const { workflowSecretNames, ScratchKeys, isExcerptEvidence } = await import('../src/proof/keys.js');
+    const { keysWorld, quietIo, app: keysApp } = await import('./helpers/scratch-secrets.js');
+    expect(workflowSecretNames([])).toBeNull();
+    // the fix loop: workflowsOf → [] before the push, ProofRun.workflows [] after it → the ticket and the excerpt get null
+    const w = world({ stored: [STRIPE], workflowsOf: () => [], prove: (n) => ({ ...(n === 0 ? failing('alpha') : green()), workflows: [] }), answers: [giveUp()] });
+    await w.run();
+    expect(w.keys.ticketReadBy[0]).toBeNull();
+    expect(w.keys.evidenceReadBy[0]).toBeNull();
+    // a re-run of a proof whose list was empty keeps "unknown"
+    const r = world({
+      stored: [STRIPE], workflowsOf: () => [],
+      prove: (n) => ({ ...(n === 0 ? proof({ part: 'docker', needId: 'image-build', log: log('The runner has received a shutdown signal.') }) : green()), workflows: [] }),
+      rerun: () => ({ ...failing('gamma'), workflows: [] }),
+      answers: [giveUp()],
+    });
+    await r.run();
+    expect(r.reruns).toHaveLength(1);
+    expect(r.keys.ticketReadBy.every((x) => x === null)).toBe(true);
+    expect(r.keys.evidenceReadBy.every((x) => x === null)).toBe(true);
+    // ScratchKeys with those names: an organisation secret is visible → no excerpt brand (the fail-open the review found is closed)
+    const k = keysWorld();
+    k.s.orgShared = [REGISTRY];
+    const keys = new ScratchKeys(k.g.gh, proofTarget(keysApp()), new SecretVault(), { io: quietIo, readByWorkflows: workflowSecretNames([]) ?? undefined });
+    await keys.placeholders([STRIPE]);
+    const names = workflowSecretNames([]);
+    expect(await keys.evidence(await keys.ticket({ readBy: names }), [EVIDENCE_RUN], { readBy: names })).toBeNull();
+    expect(keys.lastRefusal).toMatch(/organisation secret/);
+    // control: the same repo with the names of a real pushed workflow that doesn't read the org secret gives the brand
+    const real = workflowSecretNames([{ content: `on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    env:\n      K: \${{ secrets.${STRIPE} }}\n` }]);
+    expect(real).toEqual([STRIPE]);
+    expect(isExcerptEvidence(await keys.evidence(await keys.ticket({ readBy: real }), [EVIDENCE_RUN], { readBy: real }))).toBe(true);
+  });
+
   it('unknown names (no workflows given back, or a workflow workflowSecretNames can\'t read) → every organisation secret counts as read (null)', async () => {
     const w = world({ stored: [STRIPE], prove: (n) => (n === 0 ? failing('alpha') : green()), answers: [giveUp()] });
     await w.run();

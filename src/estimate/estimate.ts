@@ -127,15 +127,35 @@ export const DEBATE_CALLS = {
   critique: { calls: 2, prompt: 31_000, output: 4_000 },
   round: { calls: 5, prompt: 19_000, output: 3_000 },
 } as const;
-const debateInput = DEBATE_CALLS.builder.calls * (DEBATE_CALLS.builder.bundle + DEBATE_CALLS.builder.prompt)
-  + DEBATE_CALLS.critique.calls * DEBATE_CALLS.critique.prompt + DEBATE_CALLS.round.calls * DEBATE_CALLS.round.prompt;
-const debateOutput = DEBATE_CALLS.builder.calls * DEBATE_CALLS.builder.output + DEBATE_CALLS.critique.calls * DEBATE_CALLS.critique.output
-  + DEBATE_CALLS.round.calls * DEBATE_CALLS.round.output;
+/** The number of need keys DEBATE_CALLS was measured at (test/debate.test.ts, the 9-call worst case). */
+export const DEBATE_MEASURED_KEYS = 7;
+/**
+ * Plan G G0 (ruling F-F2, carry F-12): the debate row for `needKeys` need keys. Up to DEBATE_MEASURED_KEYS it is DEBATE_CALLS
+ * as measured; above, every request's prompt (the code bundle excepted: its size doesn't depend on the keys) and the builder's
+ * answer (one choice per key) grow in proportion, each rounded up to 1k. The critique and round answers are bounded by their
+ * objections, not the keys. A count that is not a whole number above 0 counts as the measured 7 (the spend meter still fails
+ * closed at the cap, so a low count only stops early, it never overspends).
+ */
+function debateRow(needKeys: number | undefined): { input: number; output: number; keys: number } {
+  const keys = Number.isSafeInteger(needKeys) && (needKeys as number) > DEBATE_MEASURED_KEYS ? needKeys as number : DEBATE_MEASURED_KEYS;
+  const grow = (x: number): number => Math.ceil((x * keys) / DEBATE_MEASURED_KEYS / 1000) * 1000;
+  const { builder: b, critique: c, round: r } = DEBATE_CALLS;
+  return {
+    input: b.calls * (b.bundle + grow(b.prompt)) + c.calls * grow(c.prompt) + r.calls * grow(r.prompt),
+    output: b.calls * grow(b.output) + c.calls * c.output + r.calls * r.output,
+    keys,
+  };
+}
 
-/** Tokens per stage of a full run (fixed table, brief; the debate row from DEBATE_CALLS). */
+/** The debate's need keys among `needs` (debate/need-ref.ts needKeyOf: one key per need id and service, any layer). */
+export function needKeyCount(needs: readonly { id: string; service?: string }[]): number {
+  return new Set(needs.map((n) => `${n.id}\u0000${n.service ?? ''}`)).size;
+}
+
+/** Tokens per stage of a full run (fixed table, brief; the debate row from DEBATE_CALLS, scaled by debateRow). */
 const STAGE_TOKENS: readonly { stage: AiStage; input: number; output: number; times: number }[] = [
   { stage: 'needs', input: 30_000, output: 3_000, times: 1 },
-  { stage: 'debate', input: debateInput, output: debateOutput, times: 1 },   // at most 9 calls (each retried at most once), 2 with the bundle
+  { stage: 'debate', input: 0, output: 0, times: 1 },   // debateRow: at most 9 calls (each retried at most once), 2 with the bundle
   { stage: 'creators', input: 60_000, output: 20_000, times: 1 },
   { stage: 'fix-loop', input: 15_000, output: 4_000, times: 0 },        // times set below
 ];
@@ -308,9 +328,10 @@ function noCostLine(provider: AiProviderChoice): string {
  * The estimates for a full run. `jobs`: the CI jobs per layer by need category (jobCategories(floorNeeds(p, caps))).
  * `variants`: proof variants (at least 1; callers pass 2: `main` and `planted`). `activity`: activity30d's answer.
  * `provider`: the chosen AI provider and model (pass the provider itself, see AiProviderChoice), or null when there is
- * none. The result's `pricedFor` records it.
+ * none. The result's `pricedFor` records it. `opts.needKeys`: the debate's need keys (needKeyCount of the needs; Plan G G0,
+ * ruling F-F2): the debate row grows with them above the measured 7; absent, the row is the measured one.
  */
-export function estimate(p: RepoProfile, jobs: JobCategories, variants: number, activity: Activity, provider: AiProviderChoice | null): Estimates {
+export function estimate(p: RepoProfile, jobs: JobCategories, variants: number, activity: Activity, provider: AiProviderChoice | null, opts: { needKeys?: number } = {}): Estimates {
   const basis: string[] = [];
   const v = Math.max(1, count(variants));
 
@@ -370,12 +391,17 @@ export function estimate(p: RepoProfile, jobs: JobCategories, variants: number, 
   if (provider === null) {
     basis.push('No AI provider is set, so there is no AI cost.');
   } else {
+    const debate = debateRow(opts.needKeys);
     aiTokens = STAGE_TOKENS.map((s) => {
+      if (s.stage === 'debate') return { stage: s.stage, input: debate.input, output: debate.output };
       const times = s.stage === 'fix-loop' ? FIX_ATTEMPTS_PER_PART * EXPECTED_FAILING_PARTS : s.times;
       return { stage: s.stage, input: s.input * times, output: s.output * times };
     });
+    const scaled = debate.keys > DEBATE_MEASURED_KEYS
+      ? ` (sized for ${debate.keys} need keys: measured at ${DEBATE_MEASURED_KEYS}, each prompt and the builder's answer grow in proportion)`
+      : '';
     basis.push(
-      `AI tokens per stage (input / output): needs ${thousands(30_000)} / ${thousands(3_000)}; debate at most ${DEBATE_CALLS.builder.calls + DEBATE_CALLS.critique.calls + DEBATE_CALLS.round.calls} calls, each retried at most once when its answer can not be read: the builder ${DEBATE_CALLS.builder.calls} with the code bundle at ${thousands(DEBATE_CALLS.builder.bundle + DEBATE_CALLS.builder.prompt)} / ${thousands(DEBATE_CALLS.builder.output)}, the judge's critique ${DEBATE_CALLS.critique.calls} at ${thousands(DEBATE_CALLS.critique.prompt)} / ${thousands(DEBATE_CALLS.critique.output)}, ${DEBATE_CALLS.round.calls} round answers at ${thousands(DEBATE_CALLS.round.prompt)} / ${thousands(DEBATE_CALLS.round.output)}; `
+      `AI tokens per stage (input / output): needs ${thousands(30_000)} / ${thousands(3_000)}; debate at most ${DEBATE_CALLS.builder.calls + DEBATE_CALLS.critique.calls + DEBATE_CALLS.round.calls} calls, each retried at most once when its answer can not be read: the builder ${DEBATE_CALLS.builder.calls} with the code bundle at ${thousands(DEBATE_CALLS.builder.bundle + DEBATE_CALLS.builder.prompt)} / ${thousands(DEBATE_CALLS.builder.output)}, the judge's critique ${DEBATE_CALLS.critique.calls} at ${thousands(DEBATE_CALLS.critique.prompt)} / ${thousands(DEBATE_CALLS.critique.output)}, ${DEBATE_CALLS.round.calls} round answers at ${thousands(DEBATE_CALLS.round.prompt)} / ${thousands(DEBATE_CALLS.round.output)}${scaled}; `
         + `creators ${thousands(60_000)} / ${thousands(20_000)}; fix loop ${FIX_ATTEMPTS_PER_PART} attempts of ${thousands(15_000)} / ${thousands(4_000)} for each of ${EXPECTED_FAILING_PARTS} parts expected to need a fix.`,
     );
     const pr = priceFor(provider);

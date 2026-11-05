@@ -611,6 +611,20 @@ export function proofVerdict(outcome: unknown): ProofVerdict {
 }
 
 /**
+ * Plan G G0 (E-F2 m1): the verdict of `base` (proofVerdict over the outcome) made only stricter by a reader's `extra`: a pass
+ * only when both pass, always `base`'s draft and cap (a reader adds a cap only when base has none), and the reader's reason
+ * when it gives one. A reader that is absent leaves `base` as it is.
+ */
+function stricterVerdict(base: ProofVerdict, extra: ProofVerdict | undefined): ProofVerdict {
+  if (extra === undefined) return base;
+  const r: Record<string, unknown> = isRecord(extra) ? extra : {};
+  const ok = base.ok === true && r.ok === true;
+  const stopped = typeof r.stopped === 'string' && r.stopped !== '' ? r.stopped : base.stopped;
+  const cap = base.cap ?? (r.cap === 'ai-cost' || r.cap === 'actions-minutes' ? r.cap : undefined);
+  return { ok, ...(base.draft === undefined ? {} : { draft: base.draft }), ...(stopped === undefined ? {} : { stopped }), ...(cap === undefined ? {} : { cap }) };
+}
+
+/**
  * The proof stage with its cleanup right after it, before anything is shown (spec §19): `prove` runs, then `cleanup` runs
  * on EVERY path (proven, failed, a cap stop that throws or returns, an error), and no state write can skip it (review I-1:
  * the stage moves are best-effort). An error of `prove` is thrown again after the cleanup; a CapReachedError → stopped.
@@ -618,8 +632,12 @@ export function proofVerdict(outcome: unknown): ProofVerdict {
  * saved first (recordVerdict); then proving → proven → cleaned only when it passed and that save worked, else proving →
  * stopped ('proof-failed', or the cap it reached), from which a resume proves again and never delivers. Plan G shows the
  * preview only after this returns.
+ * Plan G G0 (E-F2 m1): `verdict` may only make the result stricter. The outcome is always read by proofVerdict as well; it is a
+ * pass only when both say so, the draft saved is always the FixOutcome's own (a reader can't swap it), and a reader's `stopped`
+ * reason is kept when it refuses. A prove that returns after the stage left `proving` (a cap stop that saved `stopped`) records
+ * no verdict: recordVerdict is refused outside `proving`, and the resume proves again.
  */
-export async function proveThenClean<T>(store: StateStore, prove: () => Promise<T>, cleanup: () => Promise<CleanupResult>, verdict: (outcome: T) => ProofVerdict = proofVerdict): Promise<{ outcome: T; cleanup: CleanupResult }> {
+export async function proveThenClean<T>(store: StateStore, prove: () => Promise<T>, cleanup: () => Promise<CleanupResult>, verdict?: (outcome: T) => ProofVerdict): Promise<{ outcome: T; cleanup: CleanupResult }> {
   const best = (f: () => void): void => { try { f(); } catch { /* a state write never skips the cleanup */ } };
   let outcome!: T;
   let failed = false;
@@ -634,11 +652,14 @@ export async function proveThenClean<T>(store: StateStore, prove: () => Promise<
     if (failure instanceof CapReachedError && store.state?.stage !== 'stopped') { const kind = failure.cap.kind; best(() => store.setStage('stopped', { stoppedBy: kind })); }
   } else {
     let v: ProofVerdict;
-    try { v = verdict(outcome); } catch { v = { ok: false }; }
-    let saved = false;
-    best(() => { store.recordVerdict(v); saved = true; });
-    // the draft couldn't be saved (a secret value in it, the state format, the disk): never a pass a resume could deliver
-    if (!saved) best(() => store.recordVerdict({ ok: false, stopped: 'pipegen couldn\'t save the proof\'s verdict and final draft' }));
+    try { v = stricterVerdict(proofVerdict(outcome), verdict === undefined ? undefined : verdict(outcome)); } catch { v = { ok: false }; }
+    // G0 (E-F2 m1): a verdict is recorded only while the stage is proving (a cap stop that already saved stopped records none)
+    if (store.state?.stage === 'proving') {
+      let saved = false;
+      best(() => { store.recordVerdict(v); saved = true; });
+      // the draft couldn't be saved (a secret value in it, the state format, the disk): never a pass a resume could deliver
+      if (!saved) best(() => store.recordVerdict({ ok: false, stopped: 'pipegen couldn\'t save the proof\'s verdict and final draft' }));
+    }
     // the stage follows the verdict as SAVED (a pass with its draft), never the reader's word alone
     if (store.state?.stage === 'proving') {
       const stoppedBy = v.cap ?? 'proof-failed';

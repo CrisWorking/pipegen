@@ -435,6 +435,6 @@ describe('E8 readByWorkflows (carry E4-R4 R7)', () => {
     expect(workflowSecretNames([{ content: 'run: echo ${{ toJSON(secrets) }}' }])).toBeNull();
     expect(workflowSecretNames([{ content: 'run: echo ${{ secrets[format(\'{0}\', env.N)] }}' }])).toBeNull();
     expect(workflowSecretNames([{ content: `    ${LIST}: inherit\n` }])).toBeNull();
-    expect(workflowSecretNames([])).toEqual([]);
+    expect(workflowSecretNames([])).toBeNull();   // Plan G G0 (E-F2 m2): an empty list is unknown, never "reads no secret"
   });
 });
