@@ -15,6 +15,7 @@ import { pubKeySha256 } from '../src/engine/signing.js';
 import { PromptCancelledError, type Prompter } from '../src/cli/io.js';
 import { deliver, deliverCentral, PART_ORDER, planDelivery, previewText, SETUP_BRANCH, type DeliveryInput, type DeliverDeps, type SigningKey } from '../src/deliver/deliver.js';
 import { DeliverError, ghRead, ghWrite } from '../src/deliver/git-data.js';
+import { confirmView } from '../src/deliver/trust.js';
 import { readRecord, recordHash, recordMarker, recordPath, writeRecord } from '../src/deliver/record.js';
 import { COMPAT_PREFIX, HARNESS_PATH } from '../src/proof/harness.js';
 import type { LockPlan } from '../src/layers/locks.js';
@@ -738,7 +739,7 @@ describe('G10 fix round 1 (review-G10, ruling G10-R2)', () => {
       return w;
     };
     const p = profile();
-    const trustQ = (w: World): string[] => w.asked.filter((q) => /Type o\/r to trust it/.test(q));
+    const trustQ = (w: World): string[] => w.asked.filter((q) => /Type o\/r to trust exactly these entries/.test(q));
     // typed correctly: trusted, and vouched into the local file (no second question in the same run)
     const w = await make();
     const c = await deliverCentral(w.g.octokit(), p, centralFiles(' # v2'), cdeps(w, 'o/r'));
@@ -779,7 +780,7 @@ describe('G10 fix round 1 (review-G10, ruling G10-R2)', () => {
       r.rulesets.push({ kind: 'gate', id: 4, name: 'pipegen', githubCreatedAt: '2026-11-06T00:00:00Z' });
     });
     await deliverCentral(w.g.octokit(), p, centralFiles(' # v2'), cdeps(w, 'o/r'));
-    const q = w.asked.find((x) => /to trust it/.test(x)) as string;
+    const q = w.asked.find((x) => /to trust exactly these entries/.test(x)) as string;
     const r = await record(w) as Rec;
     for (const f of r.files) expect(q, f.path).toContain(f.path);
     for (const e of r.edits) expect(q, e.path).toContain(e.path);
@@ -788,7 +789,48 @@ describe('G10 fix round 1 (review-G10, ruling G10-R2)', () => {
     // more entries than the cap: no question, untrusted, and said so
     const big = await make((r) => { for (let i = 0; i < 210; i++) r.files.push({ repo: 'app', path: `gen/f${i}.txt`, part: 'docs', shas: [gitBlobSha(`${i}\n`)] }); });
     await expect(deliverCentral(big.g.octokit(), p, centralFiles(' # v2'), cdeps(big, 'o/r'))).rejects.toThrow(/more than 200 entries/);
-    expect(big.asked.filter((x) => /to trust it/.test(x))).toEqual([]);
+    expect(big.asked.filter((x) => /to trust exactly these entries/.test(x))).toEqual([]);
+  });
+
+  it('fix 1: a record trusted by typing grants ownership only for the entries the question listed (G10-R-sec8)', async () => {
+    const w = world();
+    await firstRun(w);
+    const r = structuredClone(await record(w) as Rec);
+    r.orgRuleset = { org: 'o', id: 11, name: 'pipegen-required--r', githubCreatedAt: '2026-11-06T00:00:00Z' };
+    r.classicProtection = { branch: 'main', previous: null };
+    r.repoSettings = { shaPinningRequired: { previous: false } };
+    r.central = { repoId: 99, createdByPipegen: true, rulesetId: 12, codeowners: { path: '.github/CODEOWNERS', created: true }, actionsAccess: { previous: 'none' } };
+    r.scratch = { repoId: 98, createdByPipegen: true };
+    r.environments = [{ name: 'pipegen-signing', created: true, githubCreatedAt: '2026-11-06T00:00:00Z', changed: ['deployment_branch_policy'], branchPolicyIds: [5] }];
+    w.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: JSON.stringify(r) });
+    rmSync(localFile(w));
+    const view = confirmView(r);
+    if (!('view' in view)) throw new Error('refused');
+    for (const k of ['orgRuleset', 'classicProtection', 'repoSettings', 'central', 'scratch'] as const) expect(view.view[k], k).toBeUndefined();
+    expect(view.view.environments).toEqual([{ name: 'pipegen-signing', created: true, githubCreatedAt: '2026-11-06T00:00:00Z', changed: [], branchPolicyIds: [] }]);
+    expect(view.view.files).toEqual(r.files);
+    // the delivery built on it carries none of the unlisted claims (and the next run, through the local file, gets the same view)
+    const p = profile();
+    await deliverCentral(w.g.octokit(), p, centralFiles(' # v2'), cdeps(w, 'o/r'));
+    expect(JSON.parse(readFileSync(localFile(w), 'utf8'))).toMatchObject({ recordHash: recordHash(r), typed: true });
+    w.g.repo('o/pipelines').refs.set('heads/main', w.g.head('o/pipelines', upd));   // merge the central PR
+    const pin = (await deliverCentral(w.g.octokit(), p, centralFiles(' # v2'), cdeps(w)) as { sha: string }).sha;
+    await deliver(w.g.octokit(), p, planDelivery(input(p, pin, { files: [...centralFiles(' # v2'), ...appFiles(pin)], proofRepos: {} })), fresh(), deps(w));
+    const out = await record(w, upd) as Rec;
+    for (const k of ['orgRuleset', 'classicProtection', 'repoSettings', 'scratch'] as const) expect(out[k], k).toBeUndefined();
+    expect(out.central).toEqual({ createdByPipegen: false });
+    expect(out.environments.find((e) => e.name === 'pipegen-signing')?.branchPolicyIds).toEqual([]);
+  });
+
+  it('fix 1: an entry the question can\'t show exactly refuses the typed path (G10-R-sec8)', async () => {
+    const base = (await (async () => { const w = world(); await firstRun(w); return record(w); })()) as Rec;
+    const cleaned = structuredClone(base);
+    cleaned.secrets.push({ name: 'X‮Y', scope: 'repo', created: true } as Rec['secrets'][number]);
+    expect(confirmView(cleaned)).toEqual({ refused: expect.stringMatching(/can't be shown exactly/) });
+    const long = structuredClone(base);
+    long.files.push({ repo: 'app', path: `${'d/'.repeat(160)}f.txt`, part: 'docs', shas: [gitBlobSha('x\n')] });
+    expect(confirmView(long)).toEqual({ refused: expect.stringMatching(/can't be shown exactly/) });
+    expect('view' in confirmView(base)).toBe(true);
   });
 
   it('fix 1: a local record file that matches no record is untrusted, and no question is asked (G10-R-sec6)', async () => {
@@ -796,7 +838,7 @@ describe('G10 fix round 1 (review-G10, ruling G10-R2)', () => {
     await firstRun(w);
     writeFileSync(localFile(w), JSON.stringify({ ...JSON.parse(readFileSync(localFile(w), 'utf8')), recordHash: 'e'.repeat(64) }));
     await expect(deliverCentral(w.g.octokit(), profile(), centralFiles(' # v2'), cdeps(w, 'o/r'))).rejects.toThrow(/doesn't match the hash in this machine's local record file/);
-    expect(w.asked.filter((q) => /to trust it/.test(q))).toEqual([]);
+    expect(w.asked.filter((q) => /to trust exactly these entries/.test(q))).toEqual([]);
   });
 
   for (const merged of [false, true]) {

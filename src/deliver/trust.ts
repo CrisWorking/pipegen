@@ -7,7 +7,8 @@
 //   2. with no local file, no automatic trust (G10-R-sec6: every proof built from GitHub state, a ruleset, a merged and reviewed pull
 //      request, CODEOWNERS at the head, opened another door, so that fallback is gone). Instead, an interactive run that finds a record on
 //      the central default branch shows what it claims as pipegen's (names only) and asks the user to type the app repo (`owner/repo`):
-//      typed correctly, the record is trusted and vouched into the local record file; anything else, a non-interactive run (--yes, CI), no
+//      typed correctly, the record is trusted (only the entries the question listed, G10-R-sec8: confirmView) and vouched into the local
+//      record file with `typed: true`, so a later run grants the same view and no more; anything else, a non-interactive run (--yes, CI), no
 //      terminal, or an unreadable record is untrusted;
 //   3. untrusted: pipegen claims nothing (prev = null for ownership) and says so in a plain note.
 // The setup PR body's marker is never a trust source (any app writer can edit it), and an unverified record is never vouched for: with
@@ -43,12 +44,20 @@ async function readFor(gh: Octokit, central: RepoRef, appRepo: string, branch: s
 /** The most entries the typed question lists (G10-R-sec7): a record that claims more is never trusted by typing (never a partial list). */
 export const MAX_CONFIRM_ENTRIES = 200;
 
+/** The longest entry the typed question shows; a longer one refuses the typed path (G10-R-sec8: never a cut entry). */
+export const MAX_CONFIRM_TEXT = 200;
+
 /**
- * Every entry of a record that pipegen's ownership checks act on (G10-R-sec7: the same entries, nothing filtered, nothing cut), one name per
- * line group, each through safeText: the files (adopted ones tagged), the edits, the secrets and variables (created or not), the environments
- * and the rulesets. Returns null when there are more than MAX_CONFIRM_ENTRIES.
+ * The typed question's entries and the view of the record that typing grants, made by ONE function so they can't drift (G10-R-sec7, sec8).
+ * The lines list every entry pipegen's ownership checks act on, nothing filtered or cut: all files (adopted ones tagged), the edits, the
+ * secrets and variables (created or not), the environments (created or not) and the rulesets (with their ids). The view holds exactly those
+ * entries and the record's plain facts (app, name, roots, planned, protected paths, hashes); every other ownership-bearing field (central
+ * and scratch repo ids and createdByPipegen, the central ruleset/CODEOWNERS/actions access, the org ruleset, classic protection, repo
+ * settings, an environment's previous settings, changes and branch policy ids) is dropped: typing proves nothing about them.
+ * Refused (never a partial or altered list): more than MAX_CONFIRM_ENTRIES entries, or an entry safeText would change or that is longer than
+ * MAX_CONFIRM_TEXT.
  */
-export function recordClaims(r: InstallRecord): string[] | null {
+export function confirmView(r: InstallRecord): { lines: string[]; view: InstallRecord } | { refused: string } {
   const repo = (x: { repo: string }): string => (x.repo === 'central' ? 'central ' : '');
   const groups: [string, string[]][] = [
     ['files', r.files.map((f) => `${repo(f)}${f.path}${f.adopted === true ? ' (adopted)' : ''}`)],
@@ -56,32 +65,45 @@ export function recordClaims(r: InstallRecord): string[] | null {
     ['secrets', r.secrets.map((x) => `${x.name} (${x.scope}${x.created ? ', created' : ', not created'})`)],
     ['variables', r.variables.map((x) => `${x.name} (${x.scope}${x.created ? ', created' : ', not created'})`)],
     ['environments', r.environments.map((x) => `${x.name}${x.created ? ' (created)' : ' (not created)'}`)],
-    ['rulesets', r.rulesets.map((x) => `${x.name} (${x.kind})`)],
+    ['rulesets', r.rulesets.map((x) => `${x.name} (${x.kind}, id ${x.id})`)],
   ];
-  if (groups.reduce((n, [, xs]) => n + xs.length, 0) > MAX_CONFIRM_ENTRIES) return null;
-  return groups.filter(([, xs]) => xs.length > 0).map(([label, xs]) => `  ${label}: ${xs.map((x) => safeText(x, 300)).join(', ')}`);
+  const all = groups.flatMap(([, xs]) => xs);
+  if (all.length > MAX_CONFIRM_ENTRIES) return { refused: `it lists more than ${MAX_CONFIRM_ENTRIES} entries, too many to confirm by typing` };
+  if (all.some((x) => x.length > MAX_CONFIRM_TEXT || safeText(x, MAX_CONFIRM_TEXT) !== x)) return { refused: 'one of its entries can\'t be shown exactly (too long, or holding characters a terminal would hide or change)' };
+  const lines = groups.filter(([, xs]) => xs.length > 0).map(([label, xs]) => `  ${label}: ${xs.join(', ')}`);
+  const view: InstallRecord = {
+    schema: r.schema, pipegenVersion: r.pipegenVersion, createdAt: r.createdAt, ...(r.mergedAt === undefined ? {} : { mergedAt: r.mergedAt }),
+    centralSha: r.centralSha, app: { ...r.app }, name: r.name, serviceRoots: [...r.serviceRoots],
+    files: r.files.map((f) => ({ ...f, shas: [...f.shas] })), edits: structuredClone(r.edits), secrets: r.secrets.map((x) => ({ ...x })), variables: r.variables.map((x) => ({ ...x })),
+    environments: r.environments.map((e) => ({ name: e.name, created: e.created, ...(e.githubCreatedAt === undefined ? {} : { githubCreatedAt: e.githubCreatedAt }), ...(e.unconfirmed === true ? { unconfirmed: true as const } : {}), changed: [], branchPolicyIds: [] })),
+    rulesets: r.rulesets.map((x) => ({ ...x })),
+    planned: structuredClone(r.planned), protectedPaths: [...r.protectedPaths],
+    ...(r.cosignPubSha256 === undefined ? {} : { cosignPubSha256: r.cosignPubSha256 }), ...(r.blockFrom === undefined ? {} : { blockFrom: r.blockFrom }),
+  };
+  return { lines, view };
 }
 
 /** Step 2's question; true only for the exact app repo name (letter case and surrounding spaces ignored). No terminal is a no. */
-async function askToTrust(confirm: RecordConfirm | undefined, app: RepoRef, central: RepoRef, branch: string, r: InstallRecord, notes: string[]): Promise<boolean> {
-  if (confirm === undefined || confirm.interactive !== true) return false;
+async function askToTrust(confirm: RecordConfirm | undefined, app: RepoRef, central: RepoRef, branch: string, r: InstallRecord, notes: string[]): Promise<InstallRecord | null> {
+  if (confirm === undefined || confirm.interactive !== true) return null;
   const name = `${app.owner}/${app.repo}`;
-  const claims = recordClaims(r);
-  if (claims === null) {
-    notes.push(`The install record for ${safeText(name, 140)} lists more than ${MAX_CONFIRM_ENTRIES} entries, too many to confirm by typing, so pipegen doesn't ask about it.`);
-    return false;
+  const cv = confirmView(r);
+  if ('refused' in cv) {
+    notes.push(`The install record for ${safeText(name, 140)} can't be confirmed by typing: ${cv.refused}. pipegen doesn't ask about it.`);
+    return null;
   }
+  const claims = cv.lines;
   const msg = [
     `pipegen found an install record for ${safeText(name, 140)} on the default branch ${safeText(branch, 100)} of ${safeText(`${central.owner}/${central.repo}`, 120)}, and this machine can't check it (it has no local record file for it). If you trust it, pipegen treats these as its own: it may replace them, and uninstalling pipegen may delete them.`,
     ...(claims.length === 0 ? ['  (it claims nothing as created)'] : claims),
-    `Type ${safeText(name, 140)} to trust it; anything else, and pipegen claims nothing from it.`,
+    `Type ${safeText(name, 140)} to trust exactly these entries; anything else, and pipegen claims nothing from it.`,
   ].join('\n');
   let typed: string;
   try { typed = await confirm.io.text(msg); } catch (e) {
-    if (e instanceof PromptCancelledError) return false;
+    if (e instanceof PromptCancelledError) return null;
     throw e;
   }
-  return typeof typed === 'string' && typed.trim().toLowerCase() === name.toLowerCase();
+  return typeof typed === 'string' && typed.trim().toLowerCase() === name.toLowerCase() ? cv.view : null;
 }
 
 /** The earlier record, in the trust order of the header. `notes` gets a plain line when a record exists that pipegen doesn't trust. */
@@ -92,11 +114,18 @@ export async function trustedPrevious(gh: Octokit, app: RepoRef, central: RepoRe
   if (!exists) return { record: null, exists };
   const file = await readLocalRecord(app, local).catch((e: unknown) => { if (e instanceof RecordError) return null; throw e; });
   // 1. vouched by this machine's local record file: the newest such record, the central PR branch first (it was built on the default one)
-  for (const r of [onBranch, onDefault]) if (file !== null && r !== null && r !== 'unreadable' && r.hash === file.recordHash) return { record: r.record, exists };
+  for (const r of [onBranch, onDefault]) {
+    if (file === null || r === null || r === 'unreadable' || r.hash !== file.recordHash) continue;
+    // a hash the user vouched for by typing grants only the view they were shown (G10-R-sec8)
+    if (file.typed !== true) return { record: r.record, exists };
+    const cv = confirmView(r.record);
+    if ('view' in cv) return { record: cv.view, exists };
+  }
   // 2. no local file: the user confirms the default branch's record by typing the repo name; it is then vouched into the local file
-  if (file === null && onDefault !== null && onDefault !== 'unreadable' && await askToTrust(confirm, app, central, centralBranch, onDefault.record, notes)) {
-    await writeLocalRecord(app, { recordHash: onDefault.hash, updatedAt: new Date().toISOString() }, local);
-    return { record: onDefault.record, exists };
+  const typed = file === null && onDefault !== null && onDefault !== 'unreadable' ? await askToTrust(confirm, app, central, centralBranch, onDefault.record, notes) : null;
+  if (typed !== null && onDefault !== null && onDefault !== 'unreadable') {
+    await writeLocalRecord(app, { recordHash: onDefault.hash, typed: true, updatedAt: new Date().toISOString() }, local);
+    return { record: typed, exists };
   }
   // 3. nothing: say which record, and why
   const where = [onDefault === null ? null : `the default branch ${safeText(centralBranch, 100)}`, onBranch === null || updateBranch === null ? null : `the central pull request branch ${safeText(updateBranch, 100)}`].filter((x) => x !== null).join(' and ');
