@@ -53,6 +53,11 @@ export function hooksJudge(file: CreatedFile, ctx: CreatedCtx): string[] {
   }
   const out = [...remoteProblems(manager, original, file.content)];
   if (!file.content.startsWith(original)) out.push('the user\'s text was changed: pipegen only appends its hooks after it');
+  // G1-R2 I4: a YAML hook config is exactly one document that parses strictly (a second document, or a broken one, would hide pipegen's hooks)
+  if (manager !== 'husky') {
+    const r = parseYaml(file.content, 'strict');
+    if ('problems' in r) out.push(`the file does not parse as one strict YAML document (${r.problems.join('; ')}), so the manager would not read pipegen's hooks`);
+  }
   const built = hookFile(manager, original, draft, ctx.reviewed);
   if ('note' in built) return [...out, built.note];
   if (file.content !== built.content) out.push('the file is not exactly what pipegen\'s builder writes (the user\'s bytes unchanged, then pipegen\'s reviewed hook block appended), so it is refused');

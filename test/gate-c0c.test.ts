@@ -227,7 +227,8 @@ describe('CF3a: one event-switched base form', () => {
   });
   it('it is accepted in every trigger layout, a called workflow included', async () => {
     for (const on of ['pull_request', { merge_group: null }, { push: { branches: ['main'] } }, { pull_request: null, merge_group: null, push: { branches: ['main'] } }, { pull_request: null, workflow_dispatch: null }, { workflow_call: null }]) {
-      const r = await run([wfOn(on, jobs())], d);
+      // G1-R2 I1: pipegen.yml takes only its own triggers, so the trigger layouts are shown in another workflow file
+      const r = await run([{ ...wfOn(on, jobs()), path: '.github/workflows/ci.yml' }], d);
       expect(show(r), JSON.stringify(on)).toBe('');
     }
   });

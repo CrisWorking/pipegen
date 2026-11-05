@@ -45,7 +45,8 @@ import { isObj, parseYaml, uniq, type Obj, type Parsed } from './yaml-parse.js';
 import { createdFileProblems, duplicatePathProblems, type CreatedInputs, type CreatedRule } from './created-files.js';
 import {
   ACTION_PATH_RE, CALLER_WORKFLOW, checkExpressions, createdPathProblem, checkJobOrder, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, gateResultUploadProblems, IF_VALUES,
-  isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, PR_CHECK_IF, PR_CHECK_JOB, PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, SECRET_REF_RE,
+  CALLER_TRIGGERS, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, LOCAL_MERGE_WORKFLOW, NIGHTLY_CONCURRENCY, NIGHTLY_WORKFLOW, PR_CHECK_IF, PR_CHECK_JOB,
+  PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, SECRET_REF_RE,
   STEP_KEYS as STEP_KEY_LIST, WORKFLOW_CONCURRENCY, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact,
 } from './job-rules.js';
 import { containerRefusal, RenderError, renderComposeUp, renderProjectScript, renderRuntimeEnv, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
@@ -544,10 +545,12 @@ function judgeTop(fc: FileCtx, js: Obj): void {
   if (!isObj(p) || Object.keys(p).length > 0) bad('permissions', 'The workflow must start from `permissions: {}`, so a job gets only what it declares.');
   for (const k of ['name', 'run-name']) if (hasExpr(js[k])) bad('injection', `The workflow's ${k} holds an expression (\${{), which pipegen never writes there.`);
   const triggers = triggersOf(js.on);
-  // G1 (ruling B1): an expression in the workflow's concurrency only as the one per-ref form, at the top of the two app callers (never a called workflow)
-  if (hasExpr(js.concurrency) && !concurrencyFormOk(fc, js, triggers ?? [])) {
-    bad('injection', `The workflow's concurrency holds an expression (\${{), which pipegen writes only as its one per-ref form (group ${WORKFLOW_CONCURRENCY.group}, cancel-in-progress except on the default branch), at the top of ${CALLER_WORKFLOW} or ${PUSH_WORKFLOW}, never in a called workflow.`);
+  // G1 (rulings B1, G1-R1, G1-R2 I2): a workflow's concurrency is the one exact form, at the top of the two app callers only (never a called workflow);
+  // any other value, a plain group too, is refused (a shared group cancels or queues other refs' runs, the default branch's among them)
+  if (js.concurrency !== undefined && !concurrencyFormOk(fc, js, triggers ?? [])) {
+    bad('injection', `The workflow's concurrency is not pipegen's one form (group ${WORKFLOW_CONCURRENCY.group}, cancel-in-progress: true), which it writes only at the top of ${CALLER_WORKFLOW} or ${PUSH_WORKFLOW}, never in a called workflow; no other concurrency, a plain group included, is accepted.`);
   }
+  judgeTriggerSet(fc, js, triggers);
   if (triggers === null || triggers.length === 0) bad('template', 'The workflow has no triggers pipegen can read.');
   else for (const t of triggers) {
     // G1 (rulings B1, B2): the approval re-run, exactly its form, only in pipegen.yml
@@ -668,24 +671,65 @@ function calledFileOf(fc: FileCtx, repo: CreatedFile['repo'], uses: unknown): { 
   return parsed === undefined ? undefined : { parsed, repo: 'central', key };
 }
 const stepsOf = (j: Obj): Obj[] => (Array.isArray(j.steps) ? j.steps.filter(isObj) : []);
-/** The gate, by any sign: the job id gate, a job named like the gate's check, or a step in gate mode (whatever action it names). */
-const holdsGate = (id: string, j: Obj): boolean => id === 'gate' || j.name === GATE_JOB_NAME || j.name === GATE_CHECK_NAME || stepsOf(j).some((s) => isObj(s.with) && s.with.mode === 'gate');
+/** A job or check name as GitHub might match it (G1-R2 m1): trimmed, lower case, spaces collapsed, no space around a slash, slashes collapsed. */
+const normName = (v: unknown): string | undefined => (typeof v === 'string' ? v.trim().toLowerCase().replace(/\s*\/+\s*/g, '/').replace(/\s+/g, ' ') : undefined);
+const GATE_NAMES: ReadonlySet<string> = new Set([normName(GATE_JOB_NAME) as string, normName(GATE_CHECK_NAME) as string]);
+/** Whether a name reads as the gate's job or check name once normalized. */
+const gateNameLike = (v: unknown): boolean => { const n = normName(v); return n !== undefined && GATE_NAMES.has(n); };
+/** The gate, by any sign: the job id gate (any case), a job named like the gate's check (normalized), or a step in gate mode (whatever action it names). */
+const holdsGate = (id: string, j: Obj): boolean => id.toLowerCase() === 'gate' || gateNameLike(j.name) || stepsOf(j).some((s) => isObj(s.with) && s.with.mode === 'gate');
 /** What a scheduled run never holds (C7s): baseline-check and find-run read the event's repository payload, which schedule has not; and the gate (B2). */
 const SCHEDULE_FORBIDDEN_MODES: ReadonlySet<string> = new Set(['baseline-check', 'find-run', 'gate']);
 const scheduleForbidden = (id: string, j: Obj): boolean => id === 'baseline-check' || id === 'gate' || stepsOf(j).some((s) => isObj(s.with) && SCHEDULE_FORBIDDEN_MODES.has(String(s.with.mode)));
-/** Whether jobs (and the workflows their caller jobs call, transitively) hold what `hit` looks for. A call that can not be resolved is judgeCaller's issue. */
-function reaches(fc: FileCtx, repo: CreatedFile['repo'], jobs: unknown, hit: (id: string, j: Obj) => boolean, depth = 0, seen: Set<string> = new Set()): boolean {
+/**
+ * Whether jobs (and the workflows their caller jobs call, transitively) hold what `hit` looks for. A call that can not be resolved is judgeCaller's
+ * issue. G1-R2 m3: a call past MAX_CALL_DEPTH is not followed and never counts as a hit (it would make a job a gate holder); `walk.tooDeep` marks
+ * it, and judgeLayoutJobs refuses such a chain on its own.
+ */
+function reaches(fc: FileCtx, repo: CreatedFile['repo'], jobs: unknown, hit: (id: string, j: Obj) => boolean, depth = 0, seen: Set<string> = new Set(), walk?: { tooDeep: boolean }): boolean {
   if (!isObj(jobs)) return false;
   for (const [id, j] of Object.entries(jobs)) {
     if (!isObj(j)) continue;
     if (hit(id, j)) return true;
     const c = j.uses === undefined ? undefined : calledFileOf(fc, repo, j.uses);
     if (c === undefined || seen.has(c.key)) continue;
-    if (depth >= MAX_CALL_DEPTH) return true;
+    if (depth >= MAX_CALL_DEPTH) { if (walk !== undefined) walk.tooDeep = true; continue; }
     seen.add(c.key);
-    if (reaches(fc, c.repo, c.parsed.js.jobs, hit, depth + 1, seen)) return true;
+    if (reaches(fc, c.repo, c.parsed.js.jobs, hit, depth + 1, seen, walk)) return true;
   }
   return false;
+}
+
+/**
+ * G1-R2 I1 (ruling B2): each file of the layout runs on its own triggers and nothing else. pipegen.yml: push (default-only, C3), pull_request
+ * (bare) and pull_request_review (its form), any of them, no other (workflow_call, workflow_dispatch, merge_group or schedule would let an event
+ * that is not a push to the default branch reach its deploy jobs as `push`, or run the gate without a pull request). pipegen-push.yml: exactly
+ * the feature push. pipegen-nightly.yml: schedule only (cron entries). A called workflow (any central file, the local merge file, or any file
+ * with workflow_call): workflow_call only. Other app workflows are not part of the layout and keep the general trigger list.
+ */
+function judgeTriggerSet(fc: FileCtx, js: Obj, triggers: readonly string[] | null): void {
+  if (triggers === null) return;   // judgeTop refuses unreadable triggers
+  const bad = (m: string): void => fc.add(fc.file.path, 'template', m, undefined, fc.file.repo);
+  const on = js.on;
+  const app = fc.file.repo === 'app';
+  if (app && fc.file.path === CALLER_WORKFLOW) {
+    const ok = triggers.every((t) => CALLER_TRIGGERS.includes(t)) && (isObj(on) ? !Object.hasOwn(on, 'pull_request') || on.pull_request === null : triggers.every((t) => t === 'pull_request'));
+    if (!ok) bad(`${CALLER_WORKFLOW} runs only on push [<default>], pull_request (with no filter) and pull_request_review [${PR_REVIEW_TRIGGER.types.join(', ')}], nothing else: another trigger could reach its deploy jobs as a push that is not to the default branch, or run the gate without a pull request.`);
+    return;
+  }
+  if (app && fc.file.path === PUSH_WORKFLOW) {
+    if (!(isObj(on) && Object.keys(on).length === 1 && isFeaturePush(on.push, fc.draft.profile.defaultBranch))) bad(`${PUSH_WORKFLOW} runs only on the push to every branch but the default (branches-ignore: [<default>]), nothing else.`);
+    return;
+  }
+  if (app && fc.file.path === NIGHTLY_WORKFLOW) {
+    const crons = isObj(on) ? on.schedule : undefined;
+    const ok = isObj(on) && Object.keys(on).length === 1 && Array.isArray(crons) && crons.length > 0 && crons.every((c) => isObj(c) && Object.keys(c).length === 1 && typeof c.cron === 'string');
+    if (!ok) bad(`${NIGHTLY_WORKFLOW} runs only on schedule (its cron entries), nothing else.`);
+    return;
+  }
+  if (!app || fc.file.path === LOCAL_MERGE_WORKFLOW || triggers.includes('workflow_call')) {
+    if (!(triggers.length === 1 && triggers[0] === 'workflow_call')) bad('A called workflow runs only on workflow_call (a central file, the local merge file, or any file with workflow_call): another trigger would run its jobs outside the caller that grants their permissions and passes their secrets.');
+  }
 }
 
 /** A file pipegen writes whole: C3 (pipegen.yml's push trigger), then the job rules of the layout. */
@@ -716,7 +760,12 @@ function judgeLayoutJobs(fc: FileCtx, on: unknown, triggers: readonly string[] |
   if (pushOffDefault(on, triggers, fc.draft.profile.defaultBranch) && reaches(fc, fc.file.repo, picked, holdsGate)) {
     fc.add(fc.file.path, 'not-gate-readable', `The workflow runs on pushes to a branch other than the default (or to tags), so it may hold no gate job, no job named like the gate (${GATE_CHECK_NAME}) and call no workflow that holds one (C5a): a push has no pull request, so a gate there decides nothing that can be trusted. The gate runs from ${CALLER_WORKFLOW}, whose push runs on the default branch only, and on pull requests.`, undefined, fc.file.repo);
   }
-  if ((triggers ?? []).includes('schedule') && reaches(fc, fc.file.repo, picked, scheduleForbidden)) {
+  // G1-R2 m3: a chain of calls deeper than GitHub runs (or than pipegen follows) is refused outright
+  const walk = { tooDeep: false };
+  reaches(fc, fc.file.repo, picked, () => false, 0, new Set(), walk);
+  if (walk.tooDeep) fc.add(fc.file.path, 'template', `The workflow calls a chain of reusable workflows deeper than ${MAX_CALL_DEPTH} levels, which pipegen does not follow or write.`, undefined, fc.file.repo);
+  // G1-R2 m2: triggers pipegen can not read count as schedule (fail closed, as in the push rule)
+  if ((triggers === null || triggers.includes('schedule')) && reaches(fc, fc.file.repo, picked, scheduleForbidden)) {
     fc.add(fc.file.path, 'template', 'The workflow runs on schedule, whose event carries no repository payload, so it holds no baseline-check or find-run step, no gate (mode gate), no job baseline-check or gate, and calls no workflow that holds one (C7s); the nightly job is the one gate mode a scheduled run has.', undefined, fc.file.repo);
   }
 }
@@ -794,6 +843,8 @@ function judgeJob(fc: FileCtx, id: string, j: unknown): void {
   // expressions: nowhere on a job except the forms below (a caller's explicit secrets) and the job outputs, which jobOutputsProblems judges (ruling B3)
   for (const k of ['name', 'runs-on', 'needs', 'environment', 'concurrency', 'timeout-minutes', 'with']) if (hasExpr(j[k])) bad('injection', `${where} has an expression (\${{) in ${k}, which pipegen does not write there.`);
   judgeJobIf(fc, id, j, where);
+  // G1-R2 I2: a job's concurrency only as the nightly job's own form (B5), on the job nightly
+  if (j.concurrency !== undefined && !(id === 'nightly' && j.concurrency === NIGHTLY_CONCURRENCY)) bad('injection', `${where} has a concurrency; pipegen writes a job concurrency only on the job nightly, exactly ${NIGHTLY_CONCURRENCY} (no shared group may cancel or queue another run's job).`);
   if (j['timeout-minutes'] !== undefined && !(typeof j['timeout-minutes'] === 'number' && Number.isInteger(j['timeout-minutes']) && j['timeout-minutes'] >= 1 && j['timeout-minutes'] <= 360)) bad('template', `${where} has a timeout-minutes that is not 1 to 360.`);
   judgeEnv(fc, j.env, where);
   judgeGateName(fc, id, j);
@@ -1080,13 +1131,18 @@ function judgeStepPolicy(fc: FileCtx, id: string, where: string, j: Obj, judged:
   if (firstRepo >= 0) judged.slice(firstRepo + 1).forEach((x) => { if (x.kind === 'gate' || x.kind === 'watcher') bad('injection', `In ${where}: pipegen's ${x.kind} action comes after a step that runs code pipegen did not render.`); });
 }
 
-/** No job takes the gate's check name; the gate job (id `gate`) has the name the required check expects (GATE_CHECK_NAME, never a literal). */
+/**
+ * No job takes the gate's check name; the gate job (id `gate`) has the name the required check expects (GATE_CHECK_NAME, never a literal).
+ * G1-R2 m1: a look-alike is compared normalized (gateNameLike: case, spaces, slashes), and a job id that is `gate` in another case counts too.
+ */
 function judgeGateName(fc: FileCtx, id: string, j: Obj): void {
-  const gateJob = GATE_CHECK_NAME.split(' / ')[1];
   const bad = issueFor(fc);
-  if (j.name === GATE_CHECK_NAME) bad('not-gate-readable', `The job ${show(id)} is named like the gate's required check (${GATE_CHECK_NAME}); only the gate may report under that name.`);
-  else if (id === 'gate' && j.name !== undefined && j.name !== gateJob) bad('not-gate-readable', `The gate job must be named ${show(gateJob)} so the required check is ${GATE_CHECK_NAME}.`);
-  else if (id !== 'gate' && j.name === gateJob) bad('not-gate-readable', `The job ${show(id)} is named ${show(gateJob)}, like the gate; a check under the gate's name could pass for it.`);
+  if (id === 'gate') {
+    if (j.name === GATE_CHECK_NAME) bad('not-gate-readable', `The job ${show(id)} is named like the gate's required check (${GATE_CHECK_NAME}); only the gate may report under that name.`);
+    else if (j.name !== undefined && j.name !== GATE_JOB_NAME) bad('not-gate-readable', `The gate job must be named ${show(GATE_JOB_NAME)} so the required check is ${GATE_CHECK_NAME}.`);
+    return;
+  }
+  if (gateNameLike(j.name) || (j.name === undefined && gateNameLike(id))) bad('not-gate-readable', `The job ${show(id)} is named like the gate (${GATE_CHECK_NAME}, compared without case, spaces or doubled slashes); a check under the gate's name could pass for it, so only the gate job may have it.`);
 }
 
 /**

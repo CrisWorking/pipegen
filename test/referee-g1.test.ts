@@ -4,12 +4,12 @@
 import { describe, expect, it } from 'vitest';
 import {
   BASELINE_CHECK_STEP_ID, CALLER_WORKFLOW, defaultPushTrigger, DEPLOY_PUSH_IF, DIGEST_STEP_ID, featurePushTrigger, jobOutputsFor, jobOutputsProblems, PR_CHECK_IF,
-  checkExpressions, PR_CHECK_STEP_ID, PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, stepOutputForm, WORKFLOW_CONCURRENCY, type RenderedStep,
+  checkExpressions, PR_CHECK_STEP_ID, PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, stepOutputForm, CONCURRENCY_GROUP, NIGHTLY_CONCURRENCY, WORKFLOW_CONCURRENCY, type RenderedStep,
 } from '../src/engine/job-rules.js';
 import { Document } from 'yaml';
 import { renderBaselineCheckStep, renderFindRunStep, renderJobPrelude, renderNightlyStep, stepsToYaml } from '../src/engine/render-step.js';
 import { createdFileProblems, CREATED_RULES } from '../src/engine/created-files.js';
-import { HOOK_FILES, hookCommands, hookFile } from '../src/engine/created-builders.js';
+import { HOOK_FILES, hookBlock, hookCommands, hookDataProblem, hookFile } from '../src/engine/created-builders.js';
 import { GATE_CHECK_NAME, type CreatedFile, type ExistingWorkflow, type Need, type PipelineDraft } from '../src/types.js';
 import { draftOf, GATE, job, jobsOf, p, prof, run, show, workflow as stepsWorkflow, type Job } from './helpers/gate-pipeline.js';
 import { entry, reviewedList, specFor } from './helpers/render.js';
@@ -120,7 +120,9 @@ describe('G1: the triggers of Plan G\'s layout (B1, B2, C3)', () => {
     // a call chain deeper than GitHub runs is read as holding the gate (fail closed)
     const chain = Array.from({ length: 12 }, (_, i) => at(workflow({ next: { uses: `./.github/workflows/c${i + 1}.yml`, permissions: { contents: 'read' } } }, { on: { workflow_call: null } }), `.github/workflows/c${i}.yml`));
     const deep = await run([...chain, at(workflow({ c: { uses: './.github/workflows/c0.yml', permissions: { contents: 'read' } } }, { on: { push: featurePushTrigger('main') } }), '.github/workflows/deep.yml')], d);
-    expect(has(deep, 'not-gate-readable', /pushes to a branch other than the default/), show(deep)).toBe(true);
+    // G1-R2 m3: refused as too deep, never read as holding the gate
+    expect(has(deep, 'template', /deeper than/), show(deep)).toBe(true);
+    expect(has(deep, 'not-gate-readable', /pushes to a branch other than the default/), show(deep)).toBe(false);
     // and a push-layer file without a gate passes
     expect(show(await run([gateFile(), pushFile()], d))).toBe('');
     // a job pipegen inserts into a user's workflow that pushes on any branch may not be named like the gate either
@@ -135,7 +137,7 @@ describe('G1: the triggers of Plan G\'s layout (B1, B2, C3)', () => {
     const schedule = { schedule: [{ cron: '17 3 * * *' }] };
     const bc = job([renderBaselineCheckStep(GATE)], { permissions: { contents: 'read', actions: 'read' }, outputs: jobOutputsFor([renderBaselineCheckStep(GATE)]) });
     const verify = job([renderFindRunStep(GATE, {})], { permissions: { contents: 'read', actions: 'read', packages: 'read', attestations: 'read' } });
-    const nightly = job([renderNightlyStep(GATE, d)], { permissions: { contents: 'read', actions: 'read', issues: 'write' }, concurrency: 'pipegen-nightly' });
+    const nightly = job([renderNightlyStep(GATE, d)], { permissions: { contents: 'read', actions: 'read', issues: 'write' }, concurrency: NIGHTLY_CONCURRENCY });
     const nightlyFile = (jobs: Record<string, Job>, on: unknown = schedule): CreatedFile => at(workflow(jobs, { on }), '.github/workflows/pipegen-nightly.yml');
     // the nightly job alone (mode nightly) is the scheduled gate mode
     const ok = await run([gateFile(), nightlyFile({ nightly })], d);
@@ -171,22 +173,23 @@ describe('G1: the triggers of Plan G\'s layout (B1, B2, C3)', () => {
 
 describe('G1: workflow concurrency, job conditions and job outputs (B1, G22, BP-6)', () => {
   it('referee: workflow concurrency only in the exact per-ref form (cancel except the default branch); any other expression refused', async () => {
-    expect(WORKFLOW_CONCURRENCY).toEqual({ group: 'pipegen-${{ github.ref }}', 'cancel-in-progress': "${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}" });
+    // ruling G1-R1 / G1-R1b: one exact form (it replaced B1's). Its meaning per event is in the G1-R2 describe below
+    expect(WORKFLOW_CONCURRENCY).toEqual({ group: CONCURRENCY_GROUP, 'cancel-in-progress': true });
     const exact = { ...WORKFLOW_CONCURRENCY };
     expect(show(await run([gateFile({ concurrency: exact })], d))).toBe('');
     expect(show(await run([gateFile(), pushFile({}, { concurrency: exact })], d))).toBe('');
-    // a plain value holds no expression and is not this rule's business
-    expect(show(await run([gateFile({ concurrency: 'pipegen' })], d))).toBe('');
+    // G1-R2 I2: a plain value is refused too (a shared plain group cancels other refs' runs); so is B1's earlier form
+    const B1_FORM = { group: 'pipegen-${{ github.ref }}', 'cancel-in-progress': "${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}" };
     for (const c of [
-      { group: 'pipegen-${{ github.head_ref }}', 'cancel-in-progress': exact['cancel-in-progress'] },
-      { group: exact.group, 'cancel-in-progress': '${{ true }}' },
-      { group: exact.group, 'cancel-in-progress': "${{ github.ref != 'refs/heads/main' }}" },
-      { group: exact.group, 'cancel-in-progress': exact['cancel-in-progress'].replace('!=', '==') },
-      { group: exact.group, 'cancel-in-progress': `${exact['cancel-in-progress']} ` },
-      { group: `${exact.group}-x`, 'cancel-in-progress': exact['cancel-in-progress'] },
-      { group: exact.group },
+      'pipegen', { group: 'pipegen', 'cancel-in-progress': true }, { group: 'pipegen', 'cancel-in-progress': false }, B1_FORM,
+      { group: CONCURRENCY_GROUP.replace('github.run_id', 'github.sha'), 'cancel-in-progress': true },
+      { group: CONCURRENCY_GROUP.replace(", github.event_name", ''), 'cancel-in-progress': true },
+      { group: CONCURRENCY_GROUP, 'cancel-in-progress': 'true' },
+      { group: CONCURRENCY_GROUP, 'cancel-in-progress': false },
+      { group: CONCURRENCY_GROUP },
+      { group: `${CONCURRENCY_GROUP} `, 'cancel-in-progress': true },
       { ...exact, extra: 'x' },
-      'pipegen-${{ github.ref }}',
+      CONCURRENCY_GROUP,
     ]) {
       const r = await run([gateFile({ concurrency: c })], d);
       expect(has(r, 'injection', /concurrency/), `${JSON.stringify(c)}: ${show(r)}`).toBe(true);
@@ -407,7 +410,7 @@ describe('G1: pre-commit, husky and lefthook appends (B4)', () => {
   it('referee: pre-commit, husky and lefthook edits judged byte-exact as appends of reviewed hook text', async () => {
     expect(HOOK_FILES).toEqual({ 'pre-commit': '.pre-commit-config.yaml', husky: '.husky/pre-commit', lefthook: 'lefthook.yml' });
     // the reviewed command: the root service's pinned biome, from its own lockfile install (npx --no never downloads)
-    expect(hookCommands(hookDraft('husky'), reviewedList())).toEqual([{ id: 'pipegen-biome', run: 'npx --no -- biome check --staged --no-errors-on-unmatched' }]);
+    expect(hookCommands(hookDraft('husky'), reviewedList())).toEqual([{ id: 'pipegen-biome', run: `npx --no --package=@biomejs/biome@${entry('biome').step.cli?.install.version as string} -- biome check --staged --no-errors-on-unmatched` }]);
     const cases = [
       ['pre-commit', PRE_COMMIT, hookDraft('pre-commit')], ['pre-commit', PRE_COMMIT.replace(/^ {2}/gm, ''), hookDraft('pre-commit')],
       ['husky', HUSKY, hookDraft('husky')], ['husky', '', hookDraft('husky')], ['husky', 'npm test', hookDraft('husky')],
@@ -489,5 +492,171 @@ describe('G1: pre-commit, husky and lefthook appends (B4)', () => {
     }
     // the user's own remote repos are theirs: kept untouched, and pipegen's append next to them passes
     expect(judge(hookCreated(HOOK_FILES['pre-commit'], PRE_COMMIT, ours), draft)).toEqual([]);
+  });
+});
+
+// ---------- fix round 1 (review-G1, controller ruling G1-R2) ----------
+
+/** CONCURRENCY_GROUP evaluated for one event, the way Actions would (format, ==, && and || on strings): the test translates it to JS. */
+function groupFor(ev: { ref: string; defaultBranch: string; runId: string; name: string }): string {
+  const body = CONCURRENCY_GROUP.slice(3, -2).trim();
+  const js = body.replace(/github\.event\.repository\.default_branch/g, 'e.defaultBranch').replace(/github\.run_id/g, 'e.runId').replace(/github\.event_name/g, 'e.name').replace(/github\.ref/g, 'e.ref').replace(/==/g, '===');
+  const format = (f: string, ...a: string[]): string => f.replace(/\{(\d)\}/g, (_m, i: string) => a[Number(i)] as string);
+  return new Function('e', 'format', `return (${js});`)(ev, format) as string;
+}
+
+describe('G1 fix round 1 (ruling G1-R2)', () => {
+  it('I1: pipegen.yml takes only push [<default>], pull_request and pull_request_review; the push, nightly and called files only their own triggers', async () => {
+    const full = { push: defaultPushTrigger('main'), pull_request: null, pull_request_review: { ...PR_REVIEW_TRIGGER, types: [...PR_REVIEW_TRIGGER.types] } };
+    expect(show(await run([gateFile({ on: full })], d))).toBe('');
+    const deploy = job(renderJobPrelude({}, p).steps, { needs: ['gate'], if: DEPLOY_PUSH_IF });
+    for (const extra of [{ workflow_dispatch: null }, { workflow_call: null }, { merge_group: null }, { schedule: [{ cron: '0 3 * * *' }] }]) {
+      const r = await run([gateFile({ on: { ...full, ...extra } }, { deploy })], d);
+      expect(has(r, 'template', /pipegen\.yml runs only on/), `${JSON.stringify(extra)}: ${show(r)}`).toBe(true);
+    }
+    for (const pr of [{}, { branches: ['main'] }, { types: ['opened'] }]) {
+      expect(has(await run([gateFile({ on: { ...full, pull_request: pr } })], d), 'template', /pipegen\.yml runs only on/), JSON.stringify(pr)).toBe(true);
+    }
+    // the push file: exactly the feature push; the nightly file: schedule only; a called file: workflow_call only
+    for (const on of [{ push: featurePushTrigger('main'), pull_request: null }, { push: featurePushTrigger('main'), workflow_dispatch: null }, { pull_request: null }]) {
+      expect(has(await run([gateFile(), at(workflow({ 'sast--app': jobsOf(d)['sast--app'] as Job }, { on }), PUSH_WORKFLOW)], d), 'template', /pipegen-push\.yml runs only on/), JSON.stringify(on)).toBe(true);
+    }
+    const nightly = job([renderNightlyStep(GATE, d)], { permissions: { contents: 'read', actions: 'read', issues: 'write' }, concurrency: NIGHTLY_CONCURRENCY });
+    const nf = (on: unknown): CreatedFile => at(workflow({ nightly }, { on }), '.github/workflows/pipegen-nightly.yml');
+    expect(has(await run([gateFile(), nf({ schedule: [{ cron: '17 3 * * *' }] })], d), 'template', /runs only on/)).toBe(false);
+    for (const on of [{ schedule: [{ cron: '17 3 * * *' }], workflow_dispatch: null }, { schedule: [{ cron: '17 3 * * *' }], push: defaultPushTrigger('main') }, { pull_request: null }]) {
+      expect(has(await run([gateFile(), nf(on)], d), 'template', /pipegen-nightly\.yml runs only on/), JSON.stringify(on)).toBe(true);
+    }
+    const called = (on: unknown, path: string, repo: CreatedFile['repo']): CreatedFile => at(workflow({ 'sast--app': jobsOf(d)['sast--app'] as Job }, { on }), path, repo);
+    for (const [path, repo] of [['.github/workflows/pipegen-merge.yml', 'app'], ['.github/workflows/r--merge.yml', 'central'], ['.github/workflows/x.yml', 'central'], ['.github/workflows/ci.yml', 'app']] as const) {
+      expect(has(await run([gateFile(), called({ workflow_call: null, pull_request: null }, path, repo)], d), 'template', /called workflow runs only on workflow_call/), `${repo}:${path}`).toBe(true);
+    }
+    expect(has(await run([gateFile(), called({ pull_request: null }, '.github/workflows/r--merge.yml', 'central')], d), 'template', /called workflow runs only on workflow_call/)).toBe(true);
+    expect(has(await run([gateFile(), called({ workflow_call: null }, '.github/workflows/r--merge.yml', 'central')], d), 'template', /runs only on/)).toBe(false);
+  });
+
+  it('I2: one concurrency form (G1-R1, G1-R1b): default-branch runs each their own group, PR and review runs apart; no other concurrency anywhere', async () => {
+    const base = { defaultBranch: 'main', runId: '' };
+    // the default branch: a unique group per run (nothing queued, nothing cancelled), whatever the event
+    expect(groupFor({ ...base, ref: 'refs/heads/main', runId: '11', name: 'push' })).toBe('pipegen-11');
+    expect(groupFor({ ...base, ref: 'refs/heads/main', runId: '12', name: 'push' })).toBe('pipegen-12');
+    // a pull request: one group per ref and event, so the review run never cancels the pull_request run (G1-R1b)
+    const pr = groupFor({ ...base, ref: 'refs/pull/7/merge', runId: '13', name: 'pull_request' });
+    const review = groupFor({ ...base, ref: 'refs/pull/7/merge', runId: '14', name: 'pull_request_review' });
+    expect(pr).toBe('pipegen-refs/pull/7/merge-pull_request');
+    expect(review).toBe('pipegen-refs/pull/7/merge-pull_request_review');
+    expect(pr).not.toBe(review);
+    expect(groupFor({ ...base, ref: 'refs/pull/7/merge', runId: '15', name: 'pull_request' })).toBe(pr);   // a new push to the PR cancels its old run
+    // a feature-branch push and a branch named like the default in another repo shape: grouped per ref, never the unique default arm
+    expect(groupFor({ ...base, ref: 'refs/heads/feature', runId: '16', name: 'push' })).toBe('pipegen-refs/heads/feature-push');
+    expect(groupFor({ ...base, ref: 'refs/tags/main', runId: '17', name: 'push' })).toBe('pipegen-refs/tags/main-push');
+    // job-level concurrency: only the nightly job's own form, on the job nightly
+    const j = jobsOf(d);
+    for (const [id, c] of [['sast--app', 'x'], ['sast--app', { group: 'x', 'cancel-in-progress': true }], ['gate', NIGHTLY_CONCURRENCY], ['base-scan', { ...WORKFLOW_CONCURRENCY }]] as const) {
+      const r = await run([workflow({ ...j, [id]: { ...(j[id] as Job), concurrency: c } })], d);
+      expect(has(r, 'injection', /concurrency/), `${id} ${JSON.stringify(c)}: ${show(r)}`).toBe(true);
+    }
+    const nightly = (c: unknown): Job => job([renderNightlyStep(GATE, d)], { permissions: { contents: 'read', actions: 'read', issues: 'write' }, concurrency: c });
+    const nf = (c: unknown): CreatedFile => at(workflow({ nightly: nightly(c) }, { on: { schedule: [{ cron: '17 3 * * *' }] } }), '.github/workflows/pipegen-nightly.yml');
+    expect(has(await run([gateFile(), nf(NIGHTLY_CONCURRENCY)], d), 'injection', /concurrency/)).toBe(false);
+    for (const c of ['pipegen-nightly-x', { group: NIGHTLY_CONCURRENCY, 'cancel-in-progress': true }, { group: NIGHTLY_CONCURRENCY }]) {
+      expect(has(await run([gateFile(), nf(c)], d), 'injection', /concurrency/), JSON.stringify(c)).toBe(true);
+    }
+    // a called workflow's job may not carry the workflow form either
+    const merge = at(workflow({ ...j, 'sast--app': { ...(j['sast--app'] as Job), concurrency: { ...WORKFLOW_CONCURRENCY } } }, { on: { workflow_call: null } }), '.github/workflows/pipegen-merge.yml');
+    expect(has(await run([merge], d), 'injection', /concurrency/)).toBe(true);
+  });
+
+  it('I3: the hook command names the reviewed package at its reviewed version', async () => {
+    const biome = entry('biome');
+    const install = biome.step.cli?.install as { package: string; version: string };
+    const [hook] = hookCommands(hookDraft('husky'), reviewedList());
+    expect(hook?.run).toBe(`npx --no --package=${install.package}@${install.version} -- biome check --staged --no-errors-on-unmatched`);
+    // the version comes from the reviewed entry, never a bare name: another reviewed version gives another command
+    const bumped = reviewedList().map((t) => (t.id !== 'biome' || t.step.cli === undefined ? t : { ...t, step: { ...t.step, cli: { ...t.step.cli, install: { ...t.step.cli.install, version: '9.9.9' } } } }));
+    expect(hookCommands(hookDraft('husky'), bumped)[0]?.run).toContain(`--package=${install.package}@9.9.9 `);
+    // a bare-name hook (no --package pin) is refused by the judge
+    const draft = hookDraft('husky');
+    const ok = built('husky', HUSKY, draft);
+    const bare = ok.replace(` --package=${install.package}@${install.version}`, '');
+    expect(bare).not.toBe(ok);
+    expect(judge(hookCreated(HOOK_FILES.husky, HUSKY, bare), draft)).not.toEqual([]);
+  });
+
+  it('I4: the hook builder parses its result; an original it can not append to safely gives no edit and a note', async () => {
+    const lh = hookDraft('lefthook');
+    const pc = hookDraft('pre-commit');
+    for (const [manager, original, draft] of [
+      ['lefthook', '{colors: false}\n', lh], ['lefthook', 'colors: false\n...\n', lh], ['lefthook', 'colors: false\n---\nx: 1\n', lh], ['lefthook', 'colors: false\n# a comment\n...\n', lh],
+      ['pre-commit', 'repos:\n- {repo: local, hooks: []}\n...\n', pc], ['pre-commit', '{repos: [{repo: local, hooks: []}]}\n', pc], ['pre-commit', 'repos:\n- repo: local\n  hooks: []\n---\nx: 1\n', pc],
+    ] as const) {
+      const b = hookFile(manager, original, draft, reviewedList());
+      expect('note' in b, `${manager} ${JSON.stringify(original)}`).toBe(true);
+      // and the judge refuses what a naive append would give
+      const naive = `${original}${hookBlock(manager, hookCommands(draft, reviewedList()))}`;
+      expect(judge(hookCreated(HOOK_FILES[manager], original, naive), draft), `${manager} ${JSON.stringify(original)}`).not.toEqual([]);
+    }
+    // the data rule itself: a result that parses but changes the user's data, or adds other hooks, is a problem
+    const cmds = hookCommands(lh, reviewedList());
+    const lhBlock = hookBlock('lefthook', cmds);
+    expect(hookDataProblem('lefthook', 'colors: false\n', `colors: false\n${lhBlock}`, cmds)).toBeNull();
+    expect(hookDataProblem('lefthook', 'colors: false\n', `colors: true\n${lhBlock}`, cmds)).toMatch(/exactly pipegen's hooks/);
+    expect(hookDataProblem('lefthook', 'colors: false\n', `colors: false\n${lhBlock}    extra:\n      run: "x"\n`, cmds)).toMatch(/exactly pipegen's hooks/);
+    expect(hookDataProblem('pre-commit', 'repos: []\nfail_fast: true\n', `fail_fast: false\nrepos:\n${hookBlock('pre-commit', cmds)}`, cmds)).toMatch(/exactly pipegen's hooks/);
+    // every file the builder does write parses as one document holding the user's data plus exactly pipegen's hooks
+    for (const [manager, original, draft] of [['lefthook', LEFTHOOK, lh], ['lefthook', '', hookDraft(null)], ['pre-commit', PRE_COMMIT, pc], ['pre-commit', PRE_COMMIT.replace(/^ {2}/gm, ''), pc]] as const) {
+      const content = built(manager, original, draft);
+      expect(judge(hookCreated(HOOK_FILES[manager], original, content), draft)).toEqual([]);
+    }
+  });
+
+  it('m1: gate look-alike names are compared normalized (case, spaces, slashes)', async () => {
+    for (const name of ['Gate', 'GATE', 'gate ', ' gate', 'pipegen / Gate', 'pipegen /gate', 'Pipegen//gate', 'pipegen  /  gate', 'pipegen/gate']) {
+      const r = await run([gateFile(), pushFile({}, {}, { lookalike: job(renderJobPrelude({}, p).steps, { name }) })], d);
+      expect(has(r, 'not-gate-readable', /pushes to a branch other than the default/), `${JSON.stringify(name)}: ${show(r)}`).toBe(true);
+      const r2 = await run([workflow({ ...jobsOf(d), other: job(renderJobPrelude({}, p).steps, { name }) })], d);
+      expect(has(r2, 'not-gate-readable', /named like the gate/), `${JSON.stringify(name)}: ${show(r2)}`).toBe(true);
+    }
+    const byId = await run([gateFile(), pushFile({}, {}, { Gate: job(renderJobPrelude({}, p).steps) })], d);
+    expect(has(byId, 'not-gate-readable', /pushes to a branch other than the default/), show(byId)).toBe(true);
+    const byIdHere = await run([workflow({ ...jobsOf(d), Gate: job(renderJobPrelude({}, p).steps) })], d);
+    expect(has(byIdHere, 'not-gate-readable', /named like the gate/), show(byIdHere)).toBe(true);
+    // a name that merely contains the word is not a look-alike
+    expect(has(await run([gateFile(), pushFile({}, {}, { lookalike: job(renderJobPrelude({}, p).steps, { name: 'gate keeper' }) })], d), 'not-gate-readable', /pushes to a branch/)).toBe(false);
+  });
+
+  it('m2: unreadable triggers fail closed in the schedule rule too', async () => {
+    const ed = editedUser('  push:\n', 'pipegen-verify', [renderFindRunStep(GATE, {})], VERIFY_PERMS);
+    const odd = { ...ed.f, content: ed.f.content.replace('on:\n  push:\n', 'on: 5\n'), inserted: { ...(ed.f.inserted as NonNullable<CreatedFile['inserted']>), original: (ed.f.inserted?.original as string).replace('on:\n  push:\n', 'on: 5\n') } };
+    expect(odd.content).not.toBe(ed.f.content);
+    const r = await run([odd], ed.draft);
+    expect(has(r, 'template', /runs on schedule/), show(r)).toBe(true);
+  });
+
+  it('m3: a call chain deeper than the limit is refused, never read as holding the gate', async () => {
+    const chain = Array.from({ length: 12 }, (_, i) => at(workflow({ next: { uses: `./.github/workflows/c${i + 1}.yml`, permissions: { contents: 'read' } } }, { on: { workflow_call: null } }), `.github/workflows/c${i}.yml`));
+    const on = { push: defaultPushTrigger('main'), pull_request: null };
+    // a deploy job needing a job whose chain is too deep: the deep job is no gate holder, so the deploy condition is refused too
+    const f = workflow({ ...jobsOf(d), deep: { uses: './.github/workflows/c0.yml', permissions: { contents: 'read' } }, deploy: job(renderJobPrelude({}, p).steps, { needs: ['deep'], if: DEPLOY_PUSH_IF }) }, { on });
+    const r = await run([...chain, f], d);
+    expect(has(r, 'template', /deeper than/), show(r)).toBe(true);
+    expect(has(r, 'template', /deploy condition/), show(r)).toBe(true);
+    // a shallow chain is fine
+    const short = await run([...chain.slice(0, 3).map((c, i) => (i === 2 ? at(workflow({ x: job(renderJobPrelude({}, p).steps) }, { on: { workflow_call: null } }), c.path) : c)), at(workflow({ c: { uses: './.github/workflows/c0.yml', permissions: { contents: 'read' } } }, { on: { push: featurePushTrigger('main') } }), PUSH_WORKFLOW)], d);
+    expect(has(short, 'template', /deeper than/), show(short)).toBe(false);
+  });
+
+  it('m4: a husky original with exit, exec, a heredoc or an unclosed construct gets no append, only a note', () => {
+    const draft = hookDraft('husky');
+    for (const original of ['npm test\nexit 0\n', 'exec npm test\n', 'if [ -n "$CI" ]; then\n  npm test\n', 'case "$x" in\n  a) npm test ;;\n', 'case "$x" in\n  (a) npm test ;;\n', 'for f in a b; do\n  echo $f\n', 'while true; do\n', 'cat <<1\n', 'cat <<\\EOF\n', "cat <<'EOF'\n", 'echo "unclosed\n', "echo 'unclosed\n", 'npm test || exit 1\n', '{\n  npm test\n', '(\n  npm test\n']) {
+      const b = hookFile('husky', original, draft, reviewedList());
+      expect('note' in b, JSON.stringify(original)).toBe(true);
+      const naive = `${original}${hookBlock('husky', hookCommands(draft, reviewedList()))}`;
+      expect(judge(hookCreated(HOOK_FILES.husky, original, naive), draft), JSON.stringify(original)).not.toEqual([]);
+    }
+    // closed constructs and plain lines are fine
+    for (const original of ['npm test\n', 'if [ -n "$CI" ]; then\n  npm test\nfi\n', 'for f in a b; do\n  echo "$f"\ndone\n', "echo 'ok' \"ok\"\n", '# exit early? no\nnpm run lint\n']) {
+      expect('content' in hookFile('husky', original, draft, reviewedList()), JSON.stringify(original)).toBe(true);
+    }
   });
 });

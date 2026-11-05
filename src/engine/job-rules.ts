@@ -416,14 +416,26 @@ export const PUSH_WORKFLOW = '.github/workflows/pipegen-push.yml';
 /** The approval re-run (Plan G l. 40): `pull_request_review` with exactly these types, and only in CALLER_WORKFLOW. */
 export const PR_REVIEW_TRIGGER: Readonly<{ types: readonly string[] }> = Object.freeze({ types: Object.freeze(['submitted', 'dismissed']) });
 /**
- * The workflow-level `concurrency` of the two app callers (Plan G l. 42): one group per ref, and an in-progress run is cancelled except on the
- * default branch (its baseline, signing and deploy runs always finish, design §19). Never in a called workflow (it would share the group with
- * its caller and deadlock).
+ * The one concurrency group expression (ruling G1-R1, with G1-R1b): on the default branch every run gets its own group (`pipegen-<run id>`), so
+ * no baseline, signing or deploy run is ever queued behind another or cancelled (GitHub keeps one pending run per group and cancels the older
+ * pending one); on any other ref the group is the ref and the event (`pipegen-<ref>-<event>`), so a newer push cancels the older run of the same
+ * ref, but a review run never cancels the pull request's pull_request run. `format(...)` is never empty, so the `&& ||` choice is exact.
  */
-export const WORKFLOW_CONCURRENCY: Readonly<{ group: string; 'cancel-in-progress': string }> = Object.freeze({
-  group: 'pipegen-${{ github.ref }}',
-  'cancel-in-progress': "${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}",
-});
+export const CONCURRENCY_GROUP = "${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && format('pipegen-{0}', github.run_id) || format('pipegen-{0}-{1}', github.ref, github.event_name) }}";
+/**
+ * The workflow-level `concurrency` of the two app callers (G1-R1): the one form pipegen writes, and the only concurrency the referee accepts at a
+ * workflow's top (G1-R2 I2: a plain group is refused too). Never in a called workflow (it would share the group with its caller and deadlock).
+ */
+export const WORKFLOW_CONCURRENCY: Readonly<{ group: string; 'cancel-in-progress': true }> = Object.freeze({ group: CONCURRENCY_GROUP, 'cancel-in-progress': true });
+/** The nightly job's own concurrency (ruling B5, carry C7n: no overlapping nightly runs): the one job-level concurrency, on the job nightly only. */
+export const NIGHTLY_CONCURRENCY = 'pipegen-nightly';
+/** The app's nightly workflow (ruling B2): schedule only. */
+export const NIGHTLY_WORKFLOW = '.github/workflows/pipegen-nightly.yml';
+/** The app's local merge workflow of the public layout (G2/G43): called by pipegen.yml, so workflow_call only. */
+export const LOCAL_MERGE_WORKFLOW = '.github/workflows/pipegen-merge.yml';
+/** CALLER_WORKFLOW's trigger names (ruling B2, G1-R2 I1): nothing else (no workflow_dispatch, workflow_call, merge_group, schedule). */
+export const CALLER_TRIGGERS: readonly string[] = Object.freeze(['push', 'pull_request', 'pull_request_review']);
+
 /** The job that looks for an open pull request of the pushed branch, and its one output. */
 export const PR_CHECK_JOB = 'pr-check';
 export const HAS_PR_OUTPUT = 'has-pr';

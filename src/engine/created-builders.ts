@@ -188,9 +188,10 @@ export const HOOKS_MARKER = 'pipegen:hooks';
 const HOOKS_NOTE = "pipegen's reviewed hooks; the install record holds this text";
 /**
  * The reviewed local hook commands, by reviewed entry id (B4: a hook runs only a reviewed, pinned command, never a hook repo URL): the tool's
- * argv on the developer's machine. The tool runs from the repository's own install (`npx --no` never downloads anything: the version is the
- * one the lockfile pins, which pipegen's devDependency edit adds with its integrity, Plan D D6). One row per tool whose hook form is
- * reviewed; G6 adds rows here (and only here) under review, and the judge follows, since it calls the same builder.
+ * argv on the developer's machine. The command names the reviewed package at its reviewed version (G1-R2 I3: `npx --no --package=<package>@<version>`),
+ * so npx runs exactly that version from the local install and, with `--no`, never downloads one: a missing or other version fails the hook
+ * instead of running something else (pipegen's devDependency edit adds that version with its integrity, Plan D D6). One row per tool whose
+ * hook form is reviewed; G6 adds rows here (and only here) under review, and the judge follows, since it calls the same builder.
  */
 export const HOOK_COMMANDS: Readonly<Record<string, readonly string[]>> = Object.freeze({
   // biome checks format and lint of the staged files only (PC3), and passes when none of them is one it reads
@@ -199,6 +200,8 @@ export const HOOK_COMMANDS: Readonly<Record<string, readonly string[]>> = Object
 /** One hook pipegen appends: its id (`pipegen-<tool>`) and its command line. */
 export interface HookCommand { id: string; run: string }
 const HOOK_RUN_RE = /^[A-Za-z0-9 ._@=:/-]{1,300}$/;
+const NPM_PACKAGE_RE = /^(?:@[a-z0-9][a-z0-9._-]{0,100}\/)?[a-z0-9][a-z0-9._-]{0,100}$/;
+const NPM_EXACT_VERSION_RE = /^\d{1,9}\.\d{1,9}\.\d{1,9}(?:-[0-9A-Za-z.-]{1,40})?$/;
 const HOOK_ID_RE = /^pipegen-[a-z0-9][a-z0-9-]{0,60}$/;
 const isRootPath = (path: string): boolean => path === '' || path === '.' || path === './';
 const sameReviewed = (a: unknown, t: ReviewedTool): boolean => {
@@ -223,8 +226,10 @@ export function hookCommands(draft: PipelineDraft, reviewed: readonly ReviewedTo
       if (spec?.needId !== need.id || spec.service !== need.service) continue;
       const t = reviewed.find((r) => r.id === spec.tool?.id);
       const argv = t === undefined || !Object.hasOwn(HOOK_COMMANDS, t.id) ? undefined : HOOK_COMMANDS[t.id];
-      if (t === undefined || argv === undefined || !sameReviewed(spec.tool, t) || t.step.cli?.install.method !== 'npm') continue;
-      const hook: HookCommand = { id: `pipegen-${t.id}`, run: ['npx', '--no', '--', ...argv].join(' ') };
+      const install = t?.step.cli?.install;
+      if (t === undefined || argv === undefined || !sameReviewed(spec.tool, t) || install?.method !== 'npm') continue;
+      if (!NPM_PACKAGE_RE.test(install.package) || typeof install.version !== 'string' || !NPM_EXACT_VERSION_RE.test(install.version)) throw new Error(`the reviewed package of ${t.id} is not an npm name at an exact version`);
+      const hook: HookCommand = { id: `pipegen-${t.id}`, run: ['npx', '--no', `--package=${install.package}@${install.version}`, '--', ...argv].join(' ') };
       if (!HOOK_ID_RE.test(hook.id) || !HOOK_RUN_RE.test(hook.run)) throw new Error(`the hook command of ${t.id} is not plain text pipegen can write`);
       if (!out.some((h) => h.id === hook.id)) out.push(hook);
     }
@@ -260,10 +265,17 @@ export function hookFile(manager: HookManager, original: string, draft: Pipeline
   if (/[\r\t]/.test(original)) return by('it uses CRLF line ends or tabs');
   const nl = original === '' || original.endsWith('\n') ? original : `${original}\n`;
   const done = (block: string): { content: string; inserted: string } => ({ content: nl + block, inserted: (nl + block).slice(original.length) });
+  // G1-R2 I4: the result must parse strictly as ONE document holding the user's data plus exactly pipegen's hooks (a flow map, a document end
+  // marker or a second document in the original would leave a broken file, or one whose hooks never run)
+  const checked = (out: { content: string; inserted: string }): { content: string; inserted: string } | { note: string } => {
+    const problem = hookDataProblem(manager, original, out.content, commands);
+    return problem === null ? out : by(problem);
+  };
   if (manager === 'husky') {
     const lines = original.split('\n').filter((l) => l.trim() !== '');
     if (/\\\s*$/.test(lines[lines.length - 1] ?? '')) return by('its last line continues onto the next');
-    if (/<<-?\s*['"]?[A-Za-z_]/.test(original)) return by('it has a here-document');
+    const why = huskyAppendProblem(original);
+    if (why !== null) return by(why);
     return done(hookBlock('husky', commands));
   }
   if (manager === 'lefthook') {
@@ -272,9 +284,9 @@ export function hookFile(manager: HookManager, original: string, draft: Pipeline
       if ('problems' in r) return by(`it does not parse strictly: ${r.problems.join('; ')}`);
       if (Object.hasOwn(r.parsed.js, 'pre-commit')) return by('it already has a pre-commit key, which pipegen does not edit');
     }
-    return done(hookBlock('lefthook', commands));
+    return checked(done(hookBlock('lefthook', commands)));
   }
-  if (original === '') return done(`repos:\n${hookBlock('pre-commit', commands)}`);
+  if (original === '') return checked(done(`repos:\n${hookBlock('pre-commit', commands)}`));
   const r = parseYaml(original, 'strict');
   if ('problems' in r) return by(`it does not parse strictly: ${r.problems.join('; ')}`);
   const keys = Object.keys(r.parsed.js);
@@ -285,5 +297,61 @@ export function hookFile(manager: HookManager, original: string, draft: Pipeline
   const body = lines.slice((at[0] as number) + 1).filter((l) => l.trim() !== '' && !/^\s*#/.test(l));
   const indent = /^( *)- /.exec(body[0] ?? '')?.[1];
   if (indent === undefined || (indent !== '' && indent !== '  ') || body.some((l) => !l.startsWith(`${indent}- `) && !l.startsWith(`${indent} `))) return by('the repos are not a block sequence at indentation 0 or 2');
-  return done(hookBlock('pre-commit', commands, indent));
+  return checked(done(hookBlock('pre-commit', commands, indent)));
+}
+
+/** The data a hook manager reads from pipegen's block (pre-commit's local repo item, lefthook's pre-commit key). */
+function hookData(manager: 'pre-commit' | 'lefthook', commands: readonly HookCommand[]): unknown {
+  if (manager === 'lefthook') return { commands: Object.fromEntries(commands.map((c) => [c.id, { run: c.run }])) };
+  return { repo: 'local', hooks: commands.map((c) => ({ id: c.id, name: c.id, entry: c.run, language: 'system', pass_filenames: false, always_run: true })) };
+}
+/**
+ * Why an appended YAML hook file is not the user's data plus exactly pipegen's (G1-R2 I4), or null: both texts parse strictly as one document
+ * each; for lefthook the result is the original map plus the new `pre-commit` key; for pre-commit its `repos` are the original's plus pipegen's
+ * local item, and every other key is unchanged.
+ */
+export function hookDataProblem(manager: HookManager, original: string, content: string, commands: readonly HookCommand[]): string | null {
+  if (manager === 'husky') return null;
+  const before = original === '' ? { parsed: { js: manager === 'pre-commit' ? { repos: [] } : {} } } : parseYaml(original, 'strict');
+  const after = parseYaml(content, 'strict');
+  if ('problems' in before) return `the original does not parse as one strict YAML document (${before.problems.join('; ')})`;
+  if ('problems' in after) return `the file with the hooks appended would not parse as one strict YAML document (${after.problems.join('; ')}), so the manager would read no hook of pipegen's`;
+  const a = before.parsed.js as Record<string, unknown>;
+  const b = after.parsed.js;
+  const want = manager === 'lefthook'
+    ? { ...a, 'pre-commit': hookData('lefthook', commands) }
+    : { ...a, repos: [...(Array.isArray(a.repos) ? a.repos : []), hookData('pre-commit', commands)] };
+  if (JSON.stringify(sortKeys(b)) !== JSON.stringify(sortKeys(want))) return 'the file with the hooks appended would not read as the original plus exactly pipegen\'s hooks';
+  return null;
+}
+const sortKeys = (v: unknown): unknown => (Array.isArray(v) ? v.map(sortKeys) : isObj(v) ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sortKeys(v[k])])) : v);
+
+/**
+ * Why pipegen's lines appended to a husky script might never run, or run as something else (G1-R2 m4), or null. Shell can not be judged
+ * whole, so this refuses what makes it unclear: `exit` or `exec` anywhere outside a comment, any here-document or here-string (`<<`), a quote
+ * left open, and an `if`/`case`/loop or a brace or parenthesis left open at the end. A refused script gets no append and a note.
+ */
+export function huskyAppendProblem(original: string): string | null {
+  // the code outside comments and quoted strings (quoted text kept as an empty pair, so a word inside a string is not a keyword)
+  let code = '';
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < original.length; i++) {
+    const c = original[i] as string;
+    if (quote === "'") { if (c === "'") { quote = null; code += "'"; } continue; }
+    if (quote === '"') { if (c === '\\') { i++; continue; } if (c === '"') { quote = null; code += '"'; } continue; }
+    if (c === '\\') { code += c + (original[i + 1] ?? ''); i++; continue; }
+    if (c === "'" || c === '"') { quote = c; code += c; continue; }
+    if (c === '#' && (i === 0 || /\s/.test(original[i - 1] as string))) { while (i < original.length && original[i] !== '\n') i++; code += '\n'; continue; }
+    code += c;
+  }
+  if (quote !== null) return 'it leaves a quote open at its end';
+  if (/\b(?:exit|exec)\b/.test(code)) return 'it has an exit or exec, after which appended lines would not run';
+  if (code.includes('<<')) return 'it has a here-document or here-string';
+  const n = (re: RegExp): number => (code.match(re) ?? []).length;
+  const word = (w: string): RegExp => new RegExp(`(?:^|[\\s;&|(){}])${w}(?=$|[\\s;&|(){}])`, 'g');
+  if (n(word('if')) !== n(word('fi'))) return 'an if is left open at its end';
+  if (n(word('case')) !== n(word('esac'))) return 'a case is left open at its end';
+  if (n(word('for')) + n(word('while')) + n(word('until')) + n(word('select')) !== n(word('done'))) return 'a loop is left open at its end';
+  if (n(/\{/g) !== n(/\}/g) || n(/\(/g) !== n(/\)/g)) return 'a brace or parenthesis is left open at its end';
+  return null;
 }
