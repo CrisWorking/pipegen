@@ -1187,6 +1187,13 @@ describe('G11 fix round 2 (G11-R2, G11-R-sec1)', () => {
     await finish(s.g.octokit(), app, {}, s.deps());
     const r = await recordOn(s, 'pipegen/update-r').catch(() => recordOn(s));
     expect(r.repoSettings?.vulnerabilityAlerts).toBeUndefined();
+    // a failure that is not a refusal (no answer, a server error) may have gone through: the saved value stays
+    const t = await seed();
+    t.g.hooks.push((c) => (c.route === 'PUT /repos/{owner}/{repo}/environments/{environment_name}' ? { status: 502, data: { message: 'bad gateway' } } : undefined));
+    t.g.repo('o/r').envs.set('production', { id: 77, created_at: '2026-01-01T00:00:00Z', wait_timer: 5, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: null, policies: [], stored: new Map() });
+    await finish(t.g.octokit(), app, {}, t.deps());
+    const tp = JSON.parse(readFileSync(localFinishPendingPath(app, { home: t.home, env: {} }), 'utf8')) as { environments: { name: string; previous: { wait_timer: number } }[] };
+    expect(tp.environments).toMatchObject([{ name: 'production', previous: { wait_timer: 5 } }]);
   });
 
   it('verify: a ruleset whose target changed is drift (G11-R2 b)', async () => {
@@ -1246,7 +1253,9 @@ describe('G11 fix round 2 (G11-R2, G11-R-sec1)', () => {
     expect(v1.notes.join('\n')).toMatch(/ruleset pipegen-reviews.*stricter/);
     // stricter in one setting, looser in another: drift for the looser one
     pr.parameters.dismiss_stale_reviews_on_push = false;
-    expect((await vfy(s)).drift.map((x) => x.what)).toEqual(['ruleset pipegen-reviews', 'ruleset pipegen-reviews']);
+    const v3 = await vfy(s);
+    expect(v3.drift.map((x) => x.what)).toEqual(['ruleset pipegen-reviews', 'ruleset pipegen-reviews']);
+    expect(v3.notes.join('\n')).not.toMatch(/dismiss stale/);
     // classic protection with more approvals than planned
     const t = await seed();
     t.g.hooks.push((c) => (c.route === 'POST /repos/{owner}/{repo}/rulesets' && c.params.repo === 'r' ? { status: 403, data: { message: 'Upgrade to GitHub Pro or make this repository public to enable this feature.' } } : undefined));
@@ -1255,6 +1264,23 @@ describe('G11 fix round 2 (G11-R2, G11-R-sec1)', () => {
     const v2 = await vfy(t);
     expect(v2.drift).toEqual([]);
     expect(v2.notes.join('\n')).toMatch(/classic branch protection on main.*stricter/);
+  });
+
+  it('finish: a ruleset pipegen made and recorded unconfirmed stays recorded on a re-run (rulesets match by id, G11-R2 d)', async () => {
+    const s = await seed();
+    const strip = (c: { route: string; params: Record<string, unknown> }) => {
+      if (c.route !== 'GET /repos/{owner}/{repo}/rulesets/{ruleset_id}' || c.params.repo !== 'r') return undefined;
+      const rs = s.g.repo('o/r').rulesets.get(Number(c.params.ruleset_id));
+      if (rs === undefined) return undefined;
+      const { created_at: _c, ...rest } = rs as Record<string, unknown>;
+      return { status: 200, data: { id: Number(c.params.ruleset_id), ...structuredClone(rest) } };
+    };
+    s.g.hooks.push(strip);
+    await finish(s.g.octokit(), app, {}, s.deps());
+    const first = (await recordOn(s)).rulesets;
+    expect(first.map((x) => x.unconfirmed)).toEqual([true, true]);
+    await finish(s.g.octokit(), app, {}, s.deps());
+    expect((await recordOn(s, 'pipegen/update-r')).rulesets).toEqual(first);
   });
 
   it('finish: a corrupt or unreadable pending file stops finish before any write (G11-R2 f)', async () => {
