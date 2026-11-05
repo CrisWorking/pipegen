@@ -15,7 +15,8 @@ import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
 const neverOff = vi.hoisted(() => ({ on: false }));
 vi.mock('../src/engine/never-list.js', async (importOriginal) => {
   const a = await importOriginal<typeof import('../src/engine/never-list.js')>();
-  return { ...a, neverListed: (ref: unknown) => (neverOff.on ? null : a.neverListed(ref)) };
+  // J3b (S6): the coverage mapper calls neverListedStep, which reads the never-list through neverListed
+  return { ...a, neverListed: (ref: unknown) => (neverOff.on ? null : a.neverListed(ref)), neverListedStep: (ref: unknown) => (neverOff.on ? null : a.neverListedStep(ref)) };
 });
 afterEach(() => {
   neverOff.on = false;

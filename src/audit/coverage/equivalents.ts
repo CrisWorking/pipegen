@@ -11,11 +11,15 @@
 //   hooks run also runs in CI, unconditionally and in the same folder, on this row's own trigger.
 // - signing: a release (no image) signed in CI by cosign. ciCoverage already covers the row from the `cosign sign` and
 //   `cosign sign-blob` signatures; this only says so in the report.
-// - deploy-verify (J3b): not built here yet; the place is marked below.
+// - deploy-verify (J3b, ruling B3): every workflow that deploys passes deployGateOf (./deploy-gate.ts: a guarded
+//   workflow_run deploy with a commit check, or a deploy job inside the CI workflow that needs every CI job and runs only
+//   on a push to the default branch), and no workflow was unreadable. Worked out once by deployGates (it reads files),
+//   passed in as `opts.deployGates`; every deploy-verify row is then covered, or none.
 import type { RepoProfile } from '../../types.js';
 import { safeText } from '../../util/safe-text.js';
 import type { Coverage } from '../coverage.js';
-import type { Decide } from './decide.js';
+import { DEPLOY_VERIFY_WHY, type Decide } from './decide.js';
+import type { DeployGates } from './deploy-gate.js';
 import type { Hooks } from './hooks.js';
 import { UNKNOWN_PREFIX } from './settings.js';
 import type { Ctx, Found, Hit } from './types.js';
@@ -23,6 +27,8 @@ import type { Ctx, Found, Hit } from './types.js';
 export interface CreditOptions {
   /** DoD run 2026-10-29: the default branch is a placeholder (rate limit); see BranchGuess. Only `narrowest` may credit. */
   branchGuess?: 'widest' | 'narrowest';
+  /** J3b: deployGates' answer for this repo (null or absent: no deploy-verify credit). */
+  deployGates?: DeployGates | null;
 }
 
 export const PUSH_CREDIT_WARNING = "Pushes to branches without a pull request aren't checked.";
@@ -93,16 +99,28 @@ function signingCredit(r: Coverage, d: Decide): Coverage | undefined {
   return { ...r, credit: 'CI signs the release artifacts with cosign (sign-blob)', creditKind: 'signing' };
 }
 
+/** Credit 3 (J3b). The row is pipegen's own "missing" deploy check; every deploying workflow passed deployGateOf. */
+function deployGateCredit(r: Coverage, p: RepoProfile, gates: DeployGates | null | undefined): Coverage | undefined {
+  if (gates === null || gates === undefined || gates.paths.length === 0 || p.defaultBranch === '') return undefined;
+  if (r.need.category !== 'deploy-verify' || r.status !== 'missing' || r.why !== DEPLOY_VERIFY_WHY || r.credit !== undefined) return undefined;
+  const b = safeText(p.defaultBranch, 100);
+  const shown = gates.paths.slice(0, 3).join(', ') + (gates.paths.length > 3 ? ` and ${gates.paths.length - 3} more` : '');
+  const ev = gates.evidence.slice(0, 3).join('; ') + (gates.evidence.length > 3 ? `; and ${gates.evidence.length - 3} more` : '');
+  return {
+    need: r.need, status: 'covered', where: shown,
+    why: `Every deploy runs only after CI passed on ${b}, for the commit CI tested, and never for a fork's run: ${ev}.`,
+    credit: `deploys run only after CI passed on ${b}, for the commit CI tested, never for a fork's run`, creditKind: 'deploy-gate',
+  };
+}
+
 /**
  * One pass over the final rows. `rows` is returned in order, a credited row with `status: 'covered'`, `credit` and
  * `creditKind`; the internal `trigger` mark is removed from every row.
  */
 export function creditEquivalents(rows: Coverage[], d: Decide, _ctx: Ctx, p: RepoProfile, hooks: Hooks, opts: CreditOptions = {}): Coverage[] {
   return rows.map((r) => {
-    const credited = pushDefaultCredit(r, rows, p, opts) ?? hooksCiCredit(r, d, hooks) ?? signingCredit(r, d) ?? unrecognisedHooksWhy(r, hooks)
-      // J3b: the deploy-verify credit (deployGateOf, DECISIONS #122 credit 3) is added here, with the same rule:
-      // every piece of its evidence, else the row keeps its status.
-      ?? r;
+    const credited = pushDefaultCredit(r, rows, p, opts) ?? hooksCiCredit(r, d, hooks) ?? signingCredit(r, d) ?? deployGateCredit(r, p, opts.deployGates)
+      ?? unrecognisedHooksWhy(r, hooks);
     const { trigger: _t, ...clean } = credited;
     void _t;
     return clean;

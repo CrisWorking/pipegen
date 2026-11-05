@@ -1,6 +1,8 @@
 // pipegen's never-list (catalogue §4 "Remove / never add"), in one leaf module (no imports) so every rule that reads it
 // uses the same list: the reviewed-list loader, discovery and the chooser (reviewed.ts re-exports it), and the audit's
-// coverage mapper (Plan P ruling P33: a step that uses a never-listed action never makes a check "covered").
+// coverage mapper (Plan P ruling P33: a step that uses a never-listed action never makes a check "covered"). J3b (ruling
+// S6): the coverage mapper alone judges a step pinned to a checked commit SHA by that SHA (NEVER_SAFE_SHAS,
+// neverListedStep); everything pipegen adds still goes through neverListed, which refuses the name at any ref.
 
 const lower = (s: string) => s.toLowerCase();
 /**
@@ -34,6 +36,68 @@ export const NEVER_REPOS: Readonly<Record<string, string>> = Object.freeze({
   'portswigger/dastardly-github-action': 'Dastardly: unmaintained action with a mutable :latest image (catalogue §4, ruling PS21)',
   'portswigger/dastardly': 'Dastardly: a mutable :latest image from an unmaintained product (catalogue §4, ruling PS21)',
 });
+
+/**
+ * DECISIONS #122, ruling S6 (J3b): never-listed actions pipegen judges by a commit SHA instead of by name, lowercased
+ * `owner/name` → commits checked against upstream. Used ONLY by the coverage mapper (neverListedStep, for a step the repo
+ * already has); the reviewed-list loader, discovery and the chooser keep refusing the name at any ref (neverListed).
+ * NEVER_REPOS keeps its type. Only aquasecurity/trivy-action is here (owner choice 8: gitleaks-action's reasons don't
+ * depend on the pin; setup-trivy had every tag replaced and is never exempt).
+ *
+ * A trivy-action commit is listed only when, checked on the day, (1) it is on the action's default branch, (2) its
+ * action.yaml pins aquasecurity/setup-trivy by a commit SHA that is itself on setup-trivy's default branch and whose
+ * action.yaml was read, and (3) that install checks the Trivy binary by checksum. Commits younger than 7 days are not
+ * listed (the cooldown pipegen uses for new releases). The upstream state checked on 2026-11-05:
+ * - trivy-action commits, master: https://api.github.com/repos/aquasecurity/trivy-action/commits?sha=master and
+ *   https://api.github.com/repos/aquasecurity/trivy-action/compare/<sha>...master ("ahead": the commit is on master).
+ * - action.yaml at each listed commit: https://raw.githubusercontent.com/aquasecurity/trivy-action/<sha>/action.yaml,
+ *   identical at the four commits but for the default `version` (v0.74.0, v0.75.0, v0.76.0, v0.76.1); each pins
+ *   `aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567` (v0.3.1) and actions/cache by SHA. entrypoint.sh
+ *   (same URL, /entrypoint.sh) is the same file at all four; it downloads nothing (its one network call is the optional
+ *   dependency-snapshot upload to GitHub).
+ * - setup-trivy 81e514348e19b6112ce2a7e3ecbafe19c1e1f567 is setup-trivy's main
+ *   (https://api.github.com/repos/aquasecurity/setup-trivy/compare/81e514348e19b6112ce2a7e3ecbafe19c1e1f567...main:
+ *   "identical"); its action.yaml
+ *   (https://raw.githubusercontent.com/aquasecurity/setup-trivy/81e514348e19b6112ce2a7e3ecbafe19c1e1f567/action.yaml)
+ *   pins actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 and actions/cache/{restore,save}@9255dc7a253b0ccc959486e2bca901246202afeb
+ *   (both on their repos' main) and runs Trivy's install script from aquasecurity/trivy at
+ *   75c4dc0f45c5d7ffd05ae26df1e0c666787bdf2a (on trivy's main:
+ *   https://api.github.com/repos/aquasecurity/trivy/compare/75c4dc0f45c5d7ffd05ae26df1e0c666787bdf2a...main).
+ * - that install script (https://raw.githubusercontent.com/aquasecurity/trivy/75c4dc0f45c5d7ffd05ae26df1e0c666787bdf2a/contrib/install.sh)
+ *   downloads the archive and the release's checksums file and refuses an archive whose sha256 differs
+ *   (hash_sha256_verify); the four default versions are immutable GitHub releases
+ *   (https://api.github.com/repos/aquasecurity/trivy/releases/tags/v0.76.1 and the same for v0.76.0, v0.75.0, v0.74.0:
+ *   "immutable": true), so their checksums file can't be changed after publication.
+ * Not listed: 38b337fff0a2f984d5be173c99e3f633438167ec (master on 2026-11-05, Trivy v0.76.2 published the same day).
+ */
+export const NEVER_SAFE_SHAS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  'aquasecurity/trivy-action': Object.freeze([
+    '8f28faec26515256b6d22074d1d2a8986f4cbd87', // 2026-10-21, Trivy v0.76.1
+    '6abccf398f78b4c337599c0656f933d91efb91a0', // 2026-10-14, Trivy v0.76.0
+    'c03d123cb480c08c69b054af418ea5e69fe6e57e', // 2026-10-01, Trivy v0.75.0
+    'd2a0b60797ff03db6132bd4e2b293f9b37081297', // 2026-08-14, Trivy v0.74.0
+  ]),
+});
+
+/** Exactly `owner/name@<40 lowercase hex>`: no sub-path, no spaces, no escapes, no other ref form. */
+const STEP_AT_SHA = /^([A-Za-z0-9-]{1,39})\/([A-Za-z0-9._-]{1,100})@([0-9a-f]{40})$/;
+
+/**
+ * The coverage mapper's never-list check for a step's `uses:` (ruling S6): null when the value is exactly
+ * `owner/name@<sha>` for a SHA in NEVER_SAFE_SHAS (owner and name in any letter case, as GitHub reads them); otherwise
+ * neverListed's answer, so a tag, a branch, another commit, a sub-path, a fork or a look-alike stays listed. Never use
+ * this outside the coverage mapper: the loader, discovery and the chooser refuse the name at any ref.
+ */
+export function neverListedStep(uses: unknown): NeverHit | null {
+  if (typeof uses === 'string') {
+    const m = STEP_AT_SHA.exec(uses);
+    if (m !== null) {
+      const key = `${m[1]}/${m[2]}`.toLowerCase();
+      if (Object.hasOwn(NEVER_SAFE_SHAS, key) && (NEVER_SAFE_SHAS[key] as readonly string[]).includes(m[3] as string)) return null;
+    }
+  }
+  return neverListed(uses);
+}
 
 /**
  * Repo names refused under ANY owner (fix round 1): a fork or a copy shares the code and often the commit network of

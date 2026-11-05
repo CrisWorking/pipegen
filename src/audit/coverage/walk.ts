@@ -6,7 +6,7 @@ import { linkedLevel, parseYamlLimited, readTextLimitedWithReason, regexSafe } f
 import { asObj } from '../../read/manifest.js';
 import { JOB_ID_RE, MAX_WORKFLOWS, WORKFLOW_FILE } from '../../read/workflows.js';
 import { codeSecurityAvailable } from '../../github/availability.js';
-import { neverListed, plainNeverReason } from '../../engine/never-list.js';
+import { neverListedStep, plainNeverReason } from '../../engine/never-list.js';
 import { safeText } from '../../util/safe-text.js';
 import { MAX_FILTER_PATTERNS, MAX_HITS, MAX_JOBS, MAX_LOCAL_FILES, MAX_SCAN_BYTES, MAX_SCRIPT_FILES, MAX_STEPS, MAX_STEP_VISITS } from './bounds.js';
 import { MAY_NOT_RUN, OPAQUE_WHY } from './decide.js';
@@ -256,9 +256,11 @@ const pinnedRef = (uses: string) => {
  * called workflow any ref but a SHA or a tag); inputs that don't set the action up for the check (requireInputs).
  * Before all of these (ruling P33, final review I1): an action on pipegen's own never-list (neverListed, the loader's
  * rule: any letter case, a fork's name family under any owner, a look-alike) is partial with that reason, never covered.
+ * J3b (DECISIONS #122, ruling S6): except exactly `owner/name@<sha>` for a commit pipegen checked (NEVER_SAFE_SHAS,
+ * through neverListedStep), which is then judged like any other step. Only here: nothing pipegen adds uses it.
  */
 function actionFinds(ctx: Ctx, tools: readonly ToolSignature[], uses: string, w: Inputs, reusable: boolean, c: StepCtx): Found[] {
-  const never = neverListed(uses);
+  const never = neverListedStep(uses);
   return tools.filter((t) => !actionSkipped(t, w)).map((t) => {
     if (never !== null) {
       const f = foundOf(t, '.', 'never-listed');
