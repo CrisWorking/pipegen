@@ -150,33 +150,41 @@ describe('G4b: the type-check through the repo\'s own tsc (ruling G4-R3)', () =>
     const version = '5.6.3';
     const resolved = `https://registry.npmjs.org/typescript/-/typescript-${version}.tgz`;
     const integrity = `sha512-${'A'.repeat(86)}==`;
-    const fixture = (o: { lock?: Obj; installed?: string; hidden?: Obj; link?: boolean; binLink?: boolean; noBin?: boolean } = {}): string => {
+    // each hostile case differs from a clean install in ONE property only: npm ci's own record (.package-lock.json) and the installed
+    // package.json follow the lockfile entry, so every guard of the check is shown to hold on its own (mutation pass, G4b)
+    type Fx = { entry?: Obj; lockVersion?: number; lock?: Obj; installed?: string; hidden?: Obj; link?: boolean; binLink?: boolean; noBin?: boolean };
+    const fixture = (o: Fx = {}): string => {
       const d = makeTempDir();
-      const entry = { version, resolved, integrity, dev: true };
-      writeFileSync(join(d, 'package-lock.json'), JSON.stringify(o.lock ?? { lockfileVersion: 3, packages: { '': {}, 'node_modules/typescript': entry } }));
+      const entry = { version, resolved, integrity, dev: true, ...o.entry };
+      writeFileSync(join(d, 'package-lock.json'), JSON.stringify(o.lock ?? { lockfileVersion: o.lockVersion ?? 3, packages: { '': {}, 'node_modules/typescript': entry } }));
       mkdirSync(join(d, 'node_modules'));
-      const pkgDir = o.link === true ? join(d, 'elsewhere') : join(d, 'node_modules', 'typescript');
+      // a linked package folder points INSIDE node_modules (a store folder), so only the link test refuses it
+      const pkgDir = o.link === true ? join(d, 'node_modules', '.store', 'typescript') : join(d, 'node_modules', 'typescript');
       mkdirSync(join(pkgDir, 'bin'), { recursive: true });
       if (o.link === true) symlinkSync(pkgDir, join(d, 'node_modules', 'typescript'));
-      writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({ name: 'typescript', version: o.installed ?? version }));
-      if (o.binLink === true) { writeFileSync(join(d, 'outside.js'), ''); symlinkSync(join(d, 'outside.js'), join(pkgDir, 'bin', 'tsc')); }
+      writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({ name: 'typescript', version: o.installed ?? entry.version }));
+      // a linked bin points at a file inside the package itself, so only the link test refuses it
+      if (o.binLink === true) { writeFileSync(join(pkgDir, 'bin', 'real.js'), ''); symlinkSync(join(pkgDir, 'bin', 'real.js'), join(pkgDir, 'bin', 'tsc')); }
       else if (o.noBin !== true) writeFileSync(join(pkgDir, 'bin', 'tsc'), '');
       writeFileSync(join(d, 'node_modules', '.package-lock.json'), JSON.stringify({ packages: o.hidden ?? { 'node_modules/typescript': entry } }));
       return d;
     };
     const runs = (d: string): number => { try { execFileSync(process.execPath, ['-e', js], { cwd: d, env: {}, stdio: 'pipe' }); return 0; } catch (e) { return (e as { status: number }).status; } };
     expect(runs(fixture())).toBe(0);
-    const bad: [string, Parameters<typeof fixture>[0]][] = [
+    const range = '^5.6.3';
+    const bad: [string, Fx][] = [
       ['another installed version', { installed: '5.6.4' }],
       ['a linked package folder', { link: true }],
       ['a bin that is a link', { binLink: true }],
       ['no bin', { noBin: true }],
-      ['lockfile v1', { lock: { lockfileVersion: 1, dependencies: { typescript: { version } } } }],
+      ['lockfile v1 (even with a packages map)', { lockVersion: 1 }],
+      ['lockfile v1 without packages', { lock: { lockfileVersion: 1, dependencies: { typescript: { version } } } }],
       ['not in the lockfile', { lock: { lockfileVersion: 3, packages: { '': {} } } }],
-      ['a link entry', { lock: { lockfileVersion: 3, packages: { 'node_modules/typescript': { version, resolved, integrity, link: true } } } }],
-      ['another source', { lock: { lockfileVersion: 3, packages: { 'node_modules/typescript': { version, resolved: 'https://evil.example/typescript.tgz', integrity } } } }],
-      ['no sha512', { lock: { lockfileVersion: 3, packages: { 'node_modules/typescript': { version, resolved, integrity: 'sha1-abc' } } } }],
-      ['a range, not a version', { lock: { lockfileVersion: 3, packages: { 'node_modules/typescript': { version: '^5.6.3', resolved, integrity } } } }],
+      ['a link entry', { entry: { link: true } }],
+      ['a bundled entry', { entry: { inBundle: true } }],
+      ['another source', { entry: { resolved: 'https://evil.example/typescript.tgz' } }],
+      ['no sha512', { entry: { integrity: 'sha1-abc' } }],
+      ['a range, not a version', { entry: { version: range, resolved: `https://registry.npmjs.org/typescript/-/typescript-${range}.tgz` } }],
       ['not installed by npm ci (hidden lockfile differs)', { hidden: { 'node_modules/typescript': { version, resolved, integrity: `sha512-${'B'.repeat(86)}==` } } }],
       ['no hidden lockfile entry', { hidden: {} }],
     ];
