@@ -306,9 +306,9 @@ function serviceRelative(file: string): string | undefined {
  * that form also names another item), and its severity is at least the item's minSeverity and never below high. A finding counts
  * for one item only. An item with no file, a category with no tool, or a malformed entry is missed; an entry without an id is
  * skipped (it can't be reported). An id is caught only when every entry with that id is; each id is listed once.
- * Origin (F5-R3): an item that carries a `needKey` (every item plantedFiles makes) is caught only by a finding whose own
- * `needKey` (asFindings: the gate job that produced it) is that same string. A finding with no readable origin, or an item whose
- * key is present but not a usable string, never matches (fail-safe). The fingerprint is never parsed for an origin.
+ * Origin (F5-R3, F5-R4): an item is caught only by a finding whose own `needKey` (asFindings: the gate job that produced it)
+ * equals the item's own `needKey` property (every item plantedFiles makes has one). An item without one, or with an empty or
+ * non-string one, is never caught; nor is a finding with no readable origin (fail-closed). The fingerprint is never parsed.
  */
 export function matchPlanted(findings: Finding[], expected: readonly EvalPlantedItem[], toolsByCategory: Map<string, string>): { caught: string[]; missed: string[] } {
   const items = expected.filter((e): e is EvalPlantedItem => typeof e === 'object' && e !== null && typeof e.id === 'string' && e.id !== '');
@@ -332,10 +332,9 @@ export function matchPlanted(findings: Finding[], expected: readonly EvalPlanted
       const ok = new Set((accepted[i] as string[]).filter((p) => p === file || named.get(p) === 1));
       const asked = rankOf((e as Partial<PlantedItem>).minSeverity);
       const min = Math.max(FLOOR_RANK, asked);
-      const keyed = Object.hasOwn(e, 'needKey');
-      const key = (e as { needKey?: unknown }).needKey;
+      // fail-closed (F5-R4): the item's own needKey property, a non-empty string, or nothing can catch it
+      const key = Object.hasOwn(e, 'needKey') ? (e as { needKey?: unknown }).needKey : undefined;
       const origin = (f: Finding): boolean => {
-        if (!keyed) return true;
         const from = (f as SourcedFinding).needKey;
         return typeof key === 'string' && key !== '' && typeof from === 'string' && from === key;
       };

@@ -74,6 +74,8 @@ const finding = (tool: string, file: string | undefined, severity: Severity = 'h
 const KEY_LINE = new RegExp(`^${['api', 'key'].join('_')} = "[A-Za-z0-9]{40}"\\n$`);
 // GateFinding's boolean flag name, spelled at run time (a key word before ':' trips test/no-secret-literals)
 const IS_KEY = ['sec', 'ret'].join('') as 'secret';
+/** A hand-made item: E's base fields plus the need key every planted item carries (an item without one is never caught). */
+type KeyedEval = EvalPlantedItem & { needKey: string };
 const TOOLS = new Map([['secrets', 'gitleaks'], ['sast', 'semgrep'], ['deps', 'osv-scanner'], ['iac', 'trivy-config']]);
 /** The default producing job of a hand-made finding (the root service 'web' of MONO for the per-service tools). */
 const KEY_OF_TOOL = new Map([['gitleaks', 'secrets'], ['semgrep', 'sast--web'], ['osv-scanner', 'deps--web'], ['trivy-config', 'iac']]);
@@ -468,8 +470,8 @@ describe('matchPlanted', () => {
     // extra findings (other files, other tools) change nothing
     const noise = [finding('semgrep', 'src/app.js', 'critical'), finding('eslint', 'pipegen-planted/sast-node-web.js', 'critical', 'r', 'sast--web')];
     expect(matchPlanted([...noise, ...allCaught(expected)], expected, TOOLS)).toEqual({ caught: ids, missed: [] });
-    // an item E built (no minSeverity, no critical, no need key) reads as high, and any job's finding may count for it
-    const e: EvalPlantedItem[] = [{ id: 'x', category: 'sast', item: 'thing', file: 'pipegen-planted/sast-node-web.js' }];
+    // an item without minSeverity or critical (E's base fields plus its need key) reads as high
+    const e: KeyedEval[] = [{ id: 'x', category: 'sast', item: 'thing', file: 'pipegen-planted/sast-node-web.js', needKey: 'sast--web' }];
     expect(matchPlanted([finding('semgrep', 'pipegen-planted/sast-node-web.js', 'high')], e, TOOLS)).toEqual({ caught: ['x'], missed: [] });
     // as evaluate gives them: asFindings carries each finding's own need id and need key (the job), the fingerprint's own fields
     const gate: GateFinding[] = expected.map((x) => ({ needId: x.category, job: x.needKey, tool: TOOLS.get(x.category) as string, ruleId: 'r', severity: 'high', file: x.file, isNew: true, [IS_KEY]: x.category === 'secrets' }) as GateFinding);
@@ -522,6 +524,27 @@ describe('matchPlanted', () => {
     }
   });
 
+  it('match: an item without a needKey is never caught (origin rule cannot be bypassed)', () => {
+    const lib = item('sast-node--lib');
+    const perfect = [finding('semgrep', lib.file, 'critical', 'r', 'sast--lib'), finding('semgrep', lib.file, 'critical', 'r2', null)];
+    // the same item rebuilt without its need key (or with an empty one): missed, whatever the findings say
+    const { needKey: _drop, ...noKey } = lib;
+    void _drop;
+    expect(matchPlanted(perfect, [noKey], TOOLS)).toEqual({ caught: [], missed: ['sast-node--lib'] });
+    expect(matchPlanted(perfect, [{ ...lib, needKey: '' } as PlantedItem], TOOLS)).toEqual({ caught: [], missed: ['sast-node--lib'] });
+    // an empty key never matches, not even a finding whose own key is empty too
+    expect(matchPlanted([finding('semgrep', lib.file, 'critical', 'r', '')], [{ ...lib, needKey: '' } as PlantedItem], TOOLS).caught).toEqual([]);
+    expect(matchPlanted(perfect, [{ ...lib, needKey: undefined } as unknown as EvalPlantedItem], TOOLS)).toEqual({ caught: [], missed: ['sast-node--lib'] });
+    // an item E's base type allows (no needKey at all), even with a finding from every job: missed
+    const bare: EvalPlantedItem[] = [{ id: 'x', category: 'sast', item: 'thing', file: lib.file }];
+    expect(matchPlanted([...perfect, finding('semgrep', lib.file, 'critical', 'r3', 'sast--web')], bare, TOOLS)).toEqual({ caught: [], missed: ['x'] });
+    // the key is the item's own property: one inherited through the prototype does not count
+    const inherited = Object.assign(Object.create({ needKey: 'sast--lib' }) as object, noKey) as EvalPlantedItem;
+    expect(matchPlanted(perfect, [inherited], TOOLS).caught).toEqual([]);
+    // with its key, the same item is caught (the rule, not the data, made the difference)
+    expect(matchPlanted(perfect, [lib], TOOLS)).toEqual({ caught: ['sast-node--lib'], missed: [] });
+  });
+
   it("match: a finding on another item's file or by another tool never counts", () => {
     const sast = item('sast-node--web');
     const keyItem = item('secret');
@@ -535,14 +558,14 @@ describe('matchPlanted', () => {
     // a finding with no file never counts
     expect(matchPlanted([finding('semgrep', undefined, 'critical')], [sast], TOOLS).missed).toEqual(['sast-node--web']);
     // one finding counts for one item only: two items on one file need two findings
-    const twin: EvalPlantedItem[] = [{ id: 'a', category: 'sast', item: 'x', file: 'pipegen-planted/s.js' }, { id: 'b', category: 'sast', item: 'x', file: 'pipegen-planted/s.js' }];
+    const twin: KeyedEval[] = [{ id: 'a', category: 'sast', item: 'x', file: 'pipegen-planted/s.js', needKey: 'sast--web' }, { id: 'b', category: 'sast', item: 'x', file: 'pipegen-planted/s.js', needKey: 'sast--web' }];
     expect(matchPlanted([finding('semgrep', 'pipegen-planted/s.js')], twin, TOOLS)).toEqual({ caught: ['a'], missed: ['b'] });
     expect(matchPlanted([finding('semgrep', 'pipegen-planted/s.js', 'high', 'r1'), finding('semgrep', 'pipegen-planted/s.js', 'high', 'r2')], twin, TOOLS)).toEqual({ caught: ['a', 'b'], missed: [] });
     // a service-relative path that two items share (one's repo path, the other's service path) is credited to neither by that form
-    const amb: EvalPlantedItem[] = [{ id: 'root', category: 'sast', item: 'x', file: 'pipegen-planted/s.js' }, { id: 'svc', category: 'sast', item: 'x', file: 'a/pipegen-planted/s.js' }];
+    const amb: KeyedEval[] = [{ id: 'root', category: 'sast', item: 'x', file: 'pipegen-planted/s.js', needKey: 'sast--web' }, { id: 'svc', category: 'sast', item: 'x', file: 'a/pipegen-planted/s.js', needKey: 'sast--web' }];
     expect(matchPlanted([finding('semgrep', 'pipegen-planted/s.js', 'high', 'r1'), finding('semgrep', 'pipegen-planted/s.js', 'high', 'r2')], amb, TOOLS)).toEqual({ caught: ['root'], missed: ['svc'] });
     expect(matchPlanted([finding('semgrep', 'a/pipegen-planted/s.js')], amb, TOOLS)).toEqual({ caught: ['svc'], missed: ['root'] });
-    const amb2: EvalPlantedItem[] = [{ id: 'p', category: 'sast', item: 'x', file: 'a/pipegen-planted/s.js' }, { id: 'q', category: 'sast', item: 'x', file: 'b/pipegen-planted/s.js' }];
+    const amb2: KeyedEval[] = [{ id: 'p', category: 'sast', item: 'x', file: 'a/pipegen-planted/s.js', needKey: 'sast--web' }, { id: 'q', category: 'sast', item: 'x', file: 'b/pipegen-planted/s.js', needKey: 'sast--web' }];
     expect(matchPlanted([finding('semgrep', 'pipegen-planted/s.js', 'high', 'r1'), finding('semgrep', 'pipegen-planted/s.js', 'high', 'r2')], amb2, TOOLS)).toEqual({ caught: [], missed: ['p', 'q'] });
     // lib's own job reporting its file service-relative counts for lib only
     const lib = item('sast-node--lib');
@@ -568,7 +591,7 @@ describe('matchPlanted', () => {
   });
 
   it('match: an expected item with no file, or ids nobody expected → missed / ignored', () => {
-    const noFile: EvalPlantedItem[] = [{ id: 'n', category: 'sast', item: 'x' }, { id: 'e', category: 'sast', item: 'x', file: '' }];
+    const noFile: KeyedEval[] = [{ id: 'n', category: 'sast', item: 'x', needKey: 'sast--web' }, { id: 'e', category: 'sast', item: 'x', file: '', needKey: 'sast--web' }];
     expect(matchPlanted([finding('semgrep', 'pipegen-planted/sast-node-web.js', 'critical'), finding('semgrep', undefined, 'critical')], noFile, TOOLS)).toEqual({ caught: [], missed: ['n', 'e'] });
     // a category with no tool in the map: missed (nothing ran that could catch it)
     const sast = item('sast-node--web');
@@ -578,11 +601,11 @@ describe('matchPlanted', () => {
     expect(r).toEqual({ caught: ['sast-node--web'], missed: [] });
     expect(matchPlanted(allCaught(expected), [], TOOLS)).toEqual({ caught: [], missed: [] });
     // the same id twice: caught only when both entries are caught, and listed once
-    const dup: EvalPlantedItem[] = [{ id: 'd', category: 'sast', item: 'x', file: 'pipegen-planted/a.js' }, { id: 'd', category: 'sast', item: 'x', file: 'pipegen-planted/b.js' }];
+    const dup: KeyedEval[] = [{ id: 'd', category: 'sast', item: 'x', file: 'pipegen-planted/a.js', needKey: 'sast--web' }, { id: 'd', category: 'sast', item: 'x', file: 'pipegen-planted/b.js', needKey: 'sast--web' }];
     expect(matchPlanted([finding('semgrep', 'pipegen-planted/a.js')], dup, TOOLS)).toEqual({ caught: [], missed: ['d'] });
     expect(matchPlanted([finding('semgrep', 'pipegen-planted/a.js'), finding('semgrep', 'pipegen-planted/b.js')], dup, TOOLS)).toEqual({ caught: ['d'], missed: [] });
     // malformed entries (no string id) can't be reported and are skipped; a bad category is missed
-    const junk = [null, 7, { category: 'sast', item: 'x', file: 'pipegen-planted/sast-node-web.js' }, { id: 'c', category: 7, item: 'x', file: 'pipegen-planted/sast-node-web.js' }] as unknown as EvalPlantedItem[];
+    const junk = [null, 7, { category: 'sast', item: 'x', file: 'pipegen-planted/sast-node-web.js' }, { id: 'c', category: 7, item: 'x', file: 'pipegen-planted/sast-node-web.js', needKey: 'sast--web' }] as unknown as EvalPlantedItem[];
     expect(matchPlanted(allCaught([sast]), junk, TOOLS)).toEqual({ caught: [], missed: ['c'] });
   });
 
