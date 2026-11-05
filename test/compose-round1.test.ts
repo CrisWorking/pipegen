@@ -17,6 +17,7 @@ import { renderComposeUp, renderJobPrelude, renderRuntimeEnv, stepsToYaml, type 
 import type { CreatedFile, Dependency, DependencyKind, PipelineDraft, Service } from '../src/types.js';
 import { DBPW } from './helpers/dbpw.js';
 import { platform, profile, reviewedList, service } from './helpers/render.js';
+import { withEgress } from './helpers/egress-step.js';
 
 const list = loadBaseImages();
 const dep = (kind: DependencyKind, envVars: string[] = [], version?: string): Dependency => ({ kind, name: kind, evidence: 'x', envVars, ...(version === undefined ? {} : { version }) });
@@ -31,7 +32,7 @@ const has = (r: RefereeReport, c: string): boolean => r.issues.some((i) => i.che
 const wf = (steps: RenderedStep[], top: Record<string, unknown> = {}, jobOver: Record<string, unknown> = {}): CreatedFile => {
   const doc = new Document();
   doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, ...top, jobs: { 'app-start': { 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none', ...jobOver } } });
-  doc.setIn(['jobs', 'app-start', 'steps'], stepsToYaml(steps));
+  doc.setIn(['jobs', 'app-start', 'steps'], stepsToYaml(withEgress(steps)));
   return { path: '.github/workflows/pipegen.yml', content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: 't', repo: 'app' };
 };
 const prelude = (): RenderedStep[] => renderJobPrelude({}, platform()).steps;

@@ -11,6 +11,7 @@ import {
   type RenderContext, type RenderedStep,
 } from '../../src/engine/render-step.js';
 import { emptyRepoFiles } from '../../src/read/quality.js';
+import { renderEgressStep } from '../../src/engine/egress.js';
 import type { Capabilities, CreatedFile, Need, PipelineDraft, ReviewedTool, StepSpec } from '../../src/types.js';
 import { entry, platform, profile, reviewedList, service, specFor } from './render.js';
 
@@ -30,7 +31,10 @@ const LINTERS: Linters = { actionlint: async () => '/stub', zizmor: async () => 
 export const run = (files: CreatedFile[], d: PipelineDraft): Promise<RefereeReport> => referee(files, d, p, reviewedList(), LINTERS, 'tok', { runLinters: async () => [] });
 export const show = (r: RefereeReport): string => r.issues.map((i) => `${i.check}: ${i.message}`).join('\n');
 export type Job = Record<string, unknown>;
-export const job = (steps: RenderedStep[], over: Job = {}): Job => ({ 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none', steps, ...over });
+/** G4-R1: every job pipegen writes starts with its egress step (the referee's backstop); the helper adds the github-core one when a test gives none. */
+const EGRESS = renderEgressStep([], { dockerNetworks: false });
+const withEgress = (steps: RenderedStep[]): RenderedStep[] => (steps[0]?.uses?.startsWith('bullfrogsec/bullfrog@') === true ? steps : [EGRESS, ...steps]);
+export const job = (steps: RenderedStep[], over: Job = {}): Job => ({ 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none', steps: withEgress(steps), ...over });
 
 /** The workflow file of these jobs; `top` adds top-level keys (a workflow-level env, say). */
 export function workflow(jobs: Record<string, Job>, top: Record<string, unknown> = {}): CreatedFile {

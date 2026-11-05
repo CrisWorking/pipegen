@@ -23,6 +23,7 @@ import { stageWorkspace } from '../gate/src/stage.js';
 import { entry, gateEntry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
 import { exec, fakeTool, sandbox, stepEnv } from './helpers/step-harness.js';
 import { cleanupRepos, writeIn } from './helpers/make-repo.js';
+import { withEgress } from './helpers/egress-step.js';
 
 const live = process.env.PIPEGEN_LIVE_TESTS === '1';
 const sha16 = (s: string): string => createHash('sha256').update(s).digest('hex').slice(0, 16);
@@ -51,7 +52,7 @@ function workflow(jobs: Record<string, Job>, raw = false): CreatedFile {
   doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, jobs: plain });
   for (const [id, j] of Object.entries(jobs)) {
     const steps = j.steps as RenderedStep[];
-    doc.setIn(['jobs', id, 'steps'], raw ? doc.createNode(steps.map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(steps));
+    doc.setIn(['jobs', id, 'steps'], raw ? doc.createNode(withEgress(steps).map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(withEgress(steps)));
   }
   return { path: '.github/workflows/pipegen.yml', content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: 't', repo: 'app' };
 }

@@ -13,6 +13,7 @@ import { HOOK_FILES, hookBlock, hookCommands, hookDataProblem, hookFile } from '
 import { GATE_CHECK_NAME, type CreatedFile, type ExistingWorkflow, type Need, type PipelineDraft } from '../src/types.js';
 import { draftOf, GATE, job, jobsOf, p, prof, run, show, workflow as stepsWorkflow, type Job } from './helpers/gate-pipeline.js';
 import { entry, reviewedList, specFor } from './helpers/render.js';
+import { withEgress } from './helpers/egress-step.js';
 
 const d = draftOf();
 /** The helper's workflow, also with reusable-workflow caller jobs (a job with `uses` and no steps). */
@@ -21,7 +22,7 @@ function workflow(jobs: Record<string, Job>, top: Record<string, unknown> = {}):
   const doc = new Document();
   const plain = Object.fromEntries(Object.entries(jobs).map(([id, j]) => [id, Object.fromEntries(Object.entries(j).filter(([k]) => k !== 'steps'))]));
   doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, ...top, jobs: plain });
-  for (const [id, j] of Object.entries(jobs)) if (Array.isArray(j.steps)) doc.setIn(['jobs', id, 'steps'], id === 'gate' ? doc.createNode((j.steps as RenderedStep[]).map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(j.steps as RenderedStep[]));
+  for (const [id, j] of Object.entries(jobs)) if (Array.isArray(j.steps)) doc.setIn(['jobs', id, 'steps'], id === 'gate' ? doc.createNode(withEgress(j.steps as RenderedStep[]).map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(withEgress(j.steps as RenderedStep[])));
   return { path: '.github/workflows/pipegen.yml', content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: 't', repo: 'app' };
 }
 const has = (r: { issues: { check: string; message: string }[] }, check: string, re: RegExp): boolean => r.issues.some((i) => i.check === check && re.test(i.message));
@@ -43,7 +44,7 @@ function editedUser(on: string, insertedId: string, steps: RenderedStep[], perms
   const text0 = original.replace('  deploy:\n    runs-on', `  deploy:\n    needs: [${insertedId}]\n    runs-on`);
   const ins = new Document();
   ins.contents = ins.createNode({ [insertedId]: { 'runs-on': 'ubuntu-latest', permissions: perms, 'cache-mode': 'none' } });
-  ins.setIn([insertedId, 'steps'], stepsToYaml(steps));
+  ins.setIn([insertedId, 'steps'], stepsToYaml(withEgress(steps)));
   const text = `${text0}${ins.toString({ lineWidth: 0 }).split('\n').map((l) => (l === '' ? l : `  ${l}`)).join('\n')}`;
   const f: CreatedFile = { path: '.github/workflows/deploy.yml', content: text, part: 'deploy-verify', reason: 't', repo: 'app', inserted: { original, jobs: [insertedId], needs: [{ job: 'deploy', added: [insertedId] }] } };
   const draft = draftOf({ profile: { ...prof, existingWorkflows: [{ path: '.github/workflows/deploy.yml', triggers: ['push'], deploys: true, [SEC_USED]: [], jobs: ['deploy'] } as unknown as ExistingWorkflow] } });

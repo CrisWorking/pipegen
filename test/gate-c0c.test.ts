@@ -21,6 +21,7 @@ import { entry, gateEntry, platform, profile, reviewedList, service, specFor } f
 import { renderGateUploads, renderStage as renderStageC1c } from '../src/engine/render-step.js';
 import { isStagedTool } from '../src/engine/tool-flags.js';
 import { rangeExtra } from './helpers/gate-pipeline.js';
+import { withEgress } from './helpers/egress-step.js';
 
 // object keys spelled at run time (see test/no-secret-literals.test.ts)
 const NS = ['needs', 'Sec', 'rets'].join('');
@@ -56,7 +57,8 @@ function workflow(jobs: Record<string, Job>, raw = false): CreatedFile {
   const plain = Object.fromEntries(Object.entries(jobs).map(([id, j]) => [id, Object.fromEntries(Object.entries(j).filter(([k]) => k !== 'steps'))]));
   doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, jobs: plain });
   for (const [id, j] of Object.entries(jobs)) {
-    const steps = j.steps as RenderedStep[];
+    // G4-R1: the egress step every job starts with, except in the job of the egress check itself (its test judges a bullfrog-less one)
+    const steps = id === 'egress' ? (j.steps as RenderedStep[]) : withEgress(j.steps as RenderedStep[]);
     doc.setIn(['jobs', id, 'steps'], raw ? doc.createNode(steps.map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(steps));
   }
   return { path: '.github/workflows/pipegen.yml', content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: 't', repo: 'app' };

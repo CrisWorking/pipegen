@@ -85,6 +85,9 @@ export function egressSetsForTool(tool: ReviewedTool): EgressSet[] {
   return [...out].sort();
 }
 
+/** E3-R3 (E-b5): the egress sets whose hosts serve anyone's content (release assets, the OSV API, the Trivy DB mirror): never in a job with a user secret. */
+export const SHARED_CDN_SETS: ReadonlySet<EgressSet> = new Set<EgressSet>(['github-releases', 'osv', 'trivy-db']);
+
 /** The Docker network range a job's services and containers use (the reviewed `allowed-ips` choice). */
 const DOCKER_RANGE = '172.16.0.0/12';
 

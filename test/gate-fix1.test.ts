@@ -17,6 +17,7 @@ import { entry, gateEntry, platform, profile, reviewedList, service, specFor } f
 import { renderGateUploads, renderStage as renderStageC1c } from '../src/engine/render-step.js';
 import { isStagedTool } from '../src/engine/tool-flags.js';
 import { rangeExtra } from './helpers/gate-pipeline.js';
+import { withEgress } from './helpers/egress-step.js';
 
 // object keys spelled at run time (see test/no-secret-literals.test.ts)
 const NS = ['needs', 'Sec', 'rets'].join('');
@@ -53,7 +54,7 @@ function workflow(jobs: Record<string, Job>, raw = false): CreatedFile {
   doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, jobs: plain });
   for (const [id, j] of Object.entries(jobs)) {
     const steps = j.steps as RenderedStep[];
-    doc.setIn(['jobs', id, 'steps'], raw ? doc.createNode(steps.map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(steps));
+    doc.setIn(['jobs', id, 'steps'], raw ? doc.createNode(withEgress(steps).map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(withEgress(steps)));
   }
   return { path: '.github/workflows/pipegen.yml', content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: 't', repo: 'app' };
 }

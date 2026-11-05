@@ -22,6 +22,7 @@ import { gateToolView, resolveSettings } from '../gate/src/settings.js';
 import type { Capabilities, CreatedFile, Need, NotProven, PipelineDraft, Service, StepSpec } from '../src/types.js';
 import { entry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
 import { rangeExtra } from './helpers/gate-pipeline.js';
+import { withEgress } from './helpers/egress-step.js';
 
 // object keys spelled at run time (see test/no-secret-literals.test.ts)
 const GH_IN = ['github', 'token'].join('-');
@@ -56,7 +57,7 @@ function workflow(jobs: Record<string, Job>): CreatedFile {
   doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, jobs: plain });
   for (const [id, j] of Object.entries(jobs)) {
     const steps = j.steps as RenderedStep[];
-    doc.setIn(['jobs', id, 'steps'], id === 'gate' ? doc.createNode(steps.map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(steps));
+    doc.setIn(['jobs', id, 'steps'], id === 'gate' ? doc.createNode(withEgress(steps).map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(withEgress(steps)));
   }
   return { path: '.github/workflows/pipegen.yml', content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: 't', repo: 'app' };
 }

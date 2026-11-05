@@ -10,6 +10,7 @@ import { renderComposeUp, renderJobPrelude, renderRuntimeEnv, stepsToYaml, type 
 import type { CreatedFile, Dependency, ExistingWorkflow, DependencyKind, PipelineDraft, Service } from '../src/types.js';
 import { DBPW, runtimeOf } from './helpers/dbpw.js';
 import { platform, profile, reviewedList, service } from './helpers/render.js';
+import { withEgress } from './helpers/egress-step.js';
 
 const list = loadBaseImages();
 const dep = (kind: DependencyKind, envVars: string[] = []): Dependency => ({ kind, name: kind, evidence: 'x', envVars });
@@ -90,7 +91,7 @@ const has = (r: RefereeReport, check: string): boolean => r.issues.some((i) => i
 const wfText = (steps: RenderedStep[], top: Record<string, unknown> = {}, jobOver: Record<string, unknown> = {}): string => {
   const doc = new Document();
   doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, ...top, jobs: { 'app-start': { 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none', ...jobOver } } });
-  doc.setIn(['jobs', 'app-start', 'steps'], stepsToYaml(steps));
+  doc.setIn(['jobs', 'app-start', 'steps'], stepsToYaml(withEgress(steps)));
   return doc.toString({ lineWidth: 0 });
 };
 const wf = (steps: RenderedStep[], top?: Record<string, unknown>, jobOver?: Record<string, unknown>): CreatedFile => ({ path: '.github/workflows/pipegen.yml', content: wfText(steps, top, jobOver), part: 'pipeline', reason: 'test', repo: 'app' });
@@ -192,7 +193,7 @@ describe('referee: the password name in an edited user workflow', () => {
   const userWf = (extra = ''): string => `name: deploy\non: push\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n    steps:\n      - run: echo hi${extra}\n`;
   const inserted = (original: string, steps: RenderedStep[]): CreatedFile => {
     const doc = parseDocument(`${original}  app-start:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n    cache-mode: none\n    steps: []\n`);
-    doc.setIn(['jobs', 'app-start', 'steps'], stepsToYaml(steps));
+    doc.setIn(['jobs', 'app-start', 'steps'], stepsToYaml(withEgress(steps)));
     return { path: '.github/workflows/deploy.yml', content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: 'test', repo: 'app', inserted: { original, jobs: ['app-start'], needs: [] } };
   };
   it('the recognised runtime-env step in an added job passes; the name in an added unrecognised step is an injection; the user\'s own text is not judged', async () => {

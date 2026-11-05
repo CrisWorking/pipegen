@@ -13,6 +13,7 @@ import type { Capabilities, CreatedFile, Need, PipelineDraft, StepSpec } from '.
 import { entry, gateEntry, platform, profile, reviewedList, service, specFor, scansFor } from './helpers/render.js';
 import { renderStage as renderStageC1c } from '../src/engine/render-step.js';
 import { isStagedTool } from '../src/engine/tool-flags.js';
+import { withEgress } from './helpers/egress-step.js';
 
 const api = service({ name: 'api', path: '.', scripts: ['test'], envVars: ['STRIPE_KEY'] });
 const prof = { ...profile([api]), repoFiles: { ...emptyRepoFiles() } };
@@ -25,7 +26,7 @@ const draftOf = (steps: StepSpec[], needs: Need[], over: Partial<PipelineDraft> 
 function wf(jobs: Record<string, RenderedStep[]>, raw = false): CreatedFile {
   const doc = new Document();
   doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, jobs: Object.fromEntries(Object.keys(jobs).map((id) => [id, { 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none' }])) });
-  for (const [id, steps] of Object.entries(jobs)) doc.setIn(['jobs', id, 'steps'], raw ? doc.createNode(steps.map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(steps));
+  for (const [id, steps] of Object.entries(jobs)) doc.setIn(['jobs', id, 'steps'], raw ? doc.createNode(withEgress(steps).map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(withEgress(steps)));
   return { path: '.github/workflows/pipegen.yml', content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: 't', repo: 'app' };
 }
 /** A secret reference, built at run time (test/no-secret-literals.test.ts). */

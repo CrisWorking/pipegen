@@ -153,6 +153,8 @@ export function isKnownHarmless(s: RenderedStep): boolean {
   if (CHECKER_STEP_ID_RE.test(s.id) || TOOL_STEP_ID_RE.test(s.id)) return s.run !== undefined && s.uses === undefined;
   // G2 (B6): the archive's hash check of a scanner job, pipegen's own script (it reads the downloaded archive and the build's output only)
   if (IMAGE_CHECK_ID_RE.test(s.id)) return s.run !== undefined && s.uses === undefined;
+  // G4-R1: the scrub job's hash check of the downloaded raw DAST result (it reads the download and the run job's output only)
+  if (DAST_CHECK_ID_RE.test(s.id)) return s.run !== undefined && s.uses === undefined;
   return false;   // an unknown or renamed id
 }
 
@@ -196,7 +198,8 @@ export function checkJobOrder(steps: readonly RenderedStep[], job: Partial<JobCo
   const keyJob = steps.some(isScrubStep);
   const scrubbed = new Set<string>();   // the artifacts a scrub step earlier in this job rebuilt
   // G2 (B6): the exact tail of an image-build job (archive step, then the archive's upload, right after the build) is the one exception
-  const tail = imageBuildTailAt(steps, job.id);
+  // G4-R1: and the exact tail of a dast-run job (the app in containers, the DAST step, the raw hand-off), after harmless steps only
+  const tail = imageBuildTailAt(steps, job.id) ?? dastRunTailAt(steps, job.id);
   steps.forEach((s, i) => {
     if (tail !== null && i >= tail) return;
     if (isKnownHarmless(s)) {
@@ -304,6 +307,8 @@ const isCheckout = (s: RenderedStep): boolean => s.run === undefined && s.uses !
 /** The scrub inputs every scrub step carries (mode is what makes it a scrub step). */
 const SCRUB_INPUTS = ['artifact', 'tool', 'format', 'raw', 'out', 'fp-key'] as const;
 /** The ids a scan step of a result can have: the tool's run step, named by the hash of its artifact. */
+/** The DAST result a hash-check step id stands for (G4-R1), or undefined. */
+const dastCheckFor = (id: string): string | undefined => { const m = DAST_CHECK_ID_RE.exec(id); return m === null ? undefined : resultArtifactName('dast', m[1] as string); };
 const scanIdsOf = (artifact: string): string[] => [`tool-run-${sha16(artifact)}`, `checker-run-${sha16(artifact)}`];
 
 /**
@@ -330,7 +335,8 @@ export function scrubChainProblems(steps: readonly RenderedStep[], scans?: Reado
     else first.set(artifact, i);
     const tool = w.tool;
     if (typeof tool === 'string' && tool !== '' && !Object.hasOwn(ARGV_POLICIES, tool)) problems.push(`${at} scrubs for the tool ${show(tool)}, which is not a tool pipegen reviewed.`);
-    const scanAt = steps.findIndex((x) => x.run !== undefined && x.id !== undefined && scanIdsOf(artifact).includes(x.id));
+    // G4-R1: a scrub of a handed-off DAST result follows its hash check (the scan ran in the dast-run job), in place of a scan step
+    const scanAt = steps.findIndex((x) => x.run !== undefined && x.id !== undefined && (scanIdsOf(artifact).includes(x.id) || dastCheckFor(x.id) === artifact));
     if (scanAt < 0 || scanAt > i) {
       problems.push(`${at} scrubs the result ${show(artifact)}, but no scan step of that result comes before it in this job: the scrub must follow the tool run that wrote the raw file.`);
       return;
@@ -629,6 +635,78 @@ export const IMAGE_ARCHIVE_STEP_ID = 'pipegen-image-archive';
 export const IMAGE_SHA_OUTPUT = 'image-sha256';
 const IMAGE_SHA_VALUE = stepOutputForm(IMAGE_ARCHIVE_STEP_ID, 'sha256');
 const isImageArchiveStep = (s: RenderedStep): boolean => s.id === IMAGE_ARCHIVE_STEP_ID && typeof s.run === 'string' && s.uses === undefined;
+// ---------- G4 fix round 1 (G4-R1, the reviewer's design A): DAST in two jobs ----------
+// `dast-run--<svc>` holds no key and no secret: it starts the app in containers only (pipegen's compose file, or the image archive checked by
+// its sha256 and run bound to 127.0.0.1), runs the reviewed DAST step against it, and hands the raw result on (the hand-off step writes its
+// sha256 as the job output `raw-sha256`, then the upload of that folder). `dast--<svc>` (the gate's job id) downloads it, checks the sha256
+// against that output before anything reads it, scrubs and uploads the result. The fingerprint key is in the scrub only (render-step.ts),
+// so it never reaches a job that runs the app.
+
+/** The run job of a service's DAST check, and its slug. */
+export const DAST_RUN = 'dast-run';
+export const dastRunJobId = (service: string): string => `${DAST_RUN}--${slug(service)}`;
+const DAST_RUN_JOB_RE = /^dast-run--([a-z0-9][a-z0-9-]{0,39})$/;
+export const dastRunSlugOf = (jobId: string | undefined): string | null => {
+  const m = jobId === undefined ? null : DAST_RUN_JOB_RE.exec(jobId);
+  if (m === null) return null;
+  try { return slug(m[1] as string) === m[1] ? (m[1] as string) : null; } catch { return null; }
+};
+/** The raw hand-off artifact (not a check's result: no need is called dast-raw, so the gate never reads it). */
+export const DAST_RAW_ID = 'dast-raw';
+export const dastRawArtifact = (service: string): string => resultArtifactName(DAST_RAW_ID, service);
+/** The DAST check's own result artifact (the scrub's). */
+export const dastResultArtifact = (service: string): string => resultArtifactName('dast', service);
+/** The hand-off step of a run job (one per job) and its output. */
+export const DAST_HANDOFF_STEP_ID = 'pipegen-dast-handoff';
+export const DAST_RAW_SHA_OUTPUT = 'raw-sha256';
+const DAST_RAW_SHA_VALUE = stepOutputForm(DAST_HANDOFF_STEP_ID, 'sha256');
+const isDastHandoffStep = (s: RenderedStep): boolean => s.id === DAST_HANDOFF_STEP_ID && typeof s.run === 'string' && s.uses === undefined;
+/** The scrub job's hash check of the downloaded raw result: its id names the service, its one expression is that run job's output. */
+export const dastCheckStepId = (service: string): string => `pipegen-dast-check--${slug(service)}`;
+export const DAST_CHECK_ID_RE = /^pipegen-dast-check--([a-z0-9][a-z0-9-]{0,39})$/;
+export const DAST_RAW_SHA_ENV = 'PIPEGEN_DAST_RAW_SHA256';
+export const dastRawShaRef = (slugged: string): string => `\${{ needs.${DAST_RUN}--${slugged}.outputs.${DAST_RAW_SHA_OUTPUT} }}`;
+/** The step that starts the app from its checked image archive (repo code, in a container only). */
+export const dastAppStepId = (service: string): string => `repocode-${sha16(`dast-app:${slug(service)}`)}`;
+/** The compose-up and runtime-env step ids (render-step.ts renderComposeUp / renderRuntimeEnv; spelled here, render-step imports this file). */
+const COMPOSE_UP_ID = `repocode-${sha16('compose-up')}`;
+const RUNTIME_ENV_ID_RE = /^runtime-env-[0-9a-f]{16}$/;
+
+/**
+ * G4-R1: in the job `dast-run--<slug>`, which holds no scrub and names no secret and no token, the one exception to the order rule (the twin of
+ * imageBuildTailAt): every step before it known harmless, then exactly the app start (the runtime env and compose up of pipegen's compose
+ * file, or the archive start step), the DAST tool's own steps (its installs, pull and scan, the last its scan step of this service's dast
+ * result), the hand-off step and the upload of the raw folder, as the job's last steps. The repo code runs in containers only (compose's
+ * services, or the archive's image with no capability); nothing of the repository runs on the runner. Returns the index where the tail
+ * starts, or null (the job is then held to the order rule as usual, which refuses a scanner after the app start).
+ */
+function dastRunTailAt(steps: readonly RenderedStep[], jobId: string | undefined): number | null {
+  const s = dastRunSlugOf(jobId);
+  if (s === null || steps.some(isScrubStep)) return null;
+  if (JSON.stringify(steps).match(/secrets\.|github\.token/) !== null) return null;
+  const k = steps.findIndex((x) => !isKnownHarmless(x));
+  if (k < 0) return null;
+  let i = k;
+  const at = (j: number): RenderedStep | undefined => steps[j];
+  const isRun = (x: RenderedStep | undefined): x is RenderedStep => x !== undefined && typeof x.run === 'string' && x.uses === undefined;
+  if (isRun(at(i)) && RUNTIME_ENV_ID_RE.test(at(i)?.id ?? '')) {
+    i++;
+    if (!(isRun(at(i)) && at(i)?.id === COMPOSE_UP_ID)) return null;
+    i++;
+  } else if (isRun(at(i)) && at(i)?.id === dastAppStepId(s)) i++;
+  else return null;
+  const toolFrom = i;
+  while (isRun(at(i)) && (TOOL_STEP_ID_RE.test(at(i)?.id ?? '') || CHECKER_STEP_ID_RE.test(at(i)?.id ?? ''))) i++;
+  if (i === toolFrom || !scanIdsOf(dastResultArtifact(s)).includes(at(i - 1)?.id ?? '')) return null;
+  const h = at(i);
+  const u = at(i + 1);
+  const raw = dastRawArtifact(s);
+  const folder = `\${{ runner.temp }}/pipegen-out/${raw}`;
+  if (h === undefined || !isDastHandoffStep(h) || u === undefined || i + 2 !== steps.length) return null;
+  const upload = uploadFolder(u) === raw && u.with?.name === raw && u.with?.path === folder && u.if === undefined && u['continue-on-error'] === undefined;
+  return upload ? k : null;
+}
+
 /** The hash check of a scanner job: its id names the service, and its one expression is that service's image-build output. */
 export const imageCheckStepId = (service: string): string => `pipegen-image-check--${slug(service)}`;
 const IMAGE_CHECK_ID_RE = /^pipegen-image-check--([a-z0-9][a-z0-9-]{0,39})$/;
@@ -686,6 +764,8 @@ export function jobOutputsFor(steps: readonly RenderedStep[]): Record<string, st
   for (const [name, o] of Object.entries(G_OUTPUTS)) if (steps.filter(o.is).length === 1) out[name] = stepOutputForm(o.step, name);
   // G2 (B6): the archive's sha256 of an image-build job, from its one archive step
   if (steps.filter(isImageArchiveStep).length === 1) out[IMAGE_SHA_OUTPUT] = IMAGE_SHA_VALUE;
+  // G4-R1: the raw DAST result's sha256 of a dast-run job, from its one hand-off step
+  if (steps.filter(isDastHandoffStep).length === 1) out[DAST_RAW_SHA_OUTPUT] = DAST_RAW_SHA_VALUE;
   for (const s of steps) {
     if (!isScrubStep(s) || typeof s.with?.artifact !== 'string' || s.id === undefined) continue;
     for (const n of OUTPUT_NAMES) out[`${s.with.artifact}-${n}`] = `\${{ steps.${s.id}.outputs.${n} }}`;
@@ -717,6 +797,13 @@ export function jobOutputsProblems(jobId: string, outputs: unknown, steps: reado
       if (jobId !== g.job) problems.push(`${where} include ${show(key)}, which is not one of the outputs of this job: only the job ${g.job} hands on ${key}, from its own step.`);
       else if (steps.filter(g.is).length !== 1 || steps.filter((s) => s.id === g.step).length !== 1) problems.push(`${where} include ${show(key)}, but the job does not hold exactly one ${g.step} step of its kind: ${key} comes only from its own step.`);
       else if (value !== stepOutputForm(g.step, key)) problems.push(`${where}: ${show(key)} must be exactly ${stepOutputForm(g.step, key)} (the output of its own step), nothing else.`);
+      continue;
+    }
+    if (key === DAST_RAW_SHA_OUTPUT) {
+      // G4-R1: the sha256 of the raw DAST result, only on the job dast-run--<slug>, exactly from its one hand-off step
+      if (dastRunSlugOf(jobId) === null) problems.push(`${where} include ${show(key)}, which only a dast-run--<service> job hands on (the sha256 of its raw DAST result).`);
+      else if (steps.filter(isDastHandoffStep).length !== 1 || steps.filter((s) => s.id === DAST_HANDOFF_STEP_ID).length !== 1) problems.push(`${where} include ${show(key)}, but the job does not hold exactly one ${DAST_HANDOFF_STEP_ID} step.`);
+      else if (value !== DAST_RAW_SHA_VALUE) problems.push(`${where}: ${show(key)} must be exactly ${DAST_RAW_SHA_VALUE}, nothing else.`);
       continue;
     }
     if (key === IMAGE_SHA_OUTPUT) {
@@ -816,6 +903,8 @@ export function checkExpressions(step: RenderedStep): void {
           if (VERIFY_STEP_ID_RE.test(step.id) && own(VERIFY_STEP_ENV, k) === v) continue;
           const ic = IMAGE_CHECK_ID_RE.exec(step.id);
           if (ic !== null && k === IMAGE_SHA_ENV && v === imageShaRef(ic[1] as string)) continue;
+          const dc = DAST_CHECK_ID_RE.exec(step.id);
+          if (dc !== null && k === DAST_RAW_SHA_ENV && v === dastRawShaRef(dc[1] as string)) continue;
         }
         const m = SECRET_REF_RE.exec(v);
         if (m === null || m[1] !== k || isDangerousName(k)) bad(`env value ${show(k)}`);

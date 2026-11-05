@@ -46,7 +46,7 @@ import { createdFileProblems, duplicatePathProblems, type CreatedInputs, type Cr
 import {
   ACTION_PATH_RE, CALLER_WORKFLOW, checkExpressions, createdPathProblem, checkJobOrder, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, gateResultUploadProblems, IF_VALUES,
   CALLER_TRIGGERS, IMAGE_ARCHIVE_STEP_ID, IMAGE_BUILD_NEED, imageBuildJobId, imageBuildSlugOf, imageCheckStepId, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, LOCAL_MERGE_WORKFLOW, narrowingChoiceProblem, NIGHTLY_CONCURRENCY, NIGHTLY_WORKFLOW, PR_CHECK_IF, PR_CHECK_JOB,
-  PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, renderRangeFetchStep, SECRET_REF_RE, SIGN_STEP_ID_RE, BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, BASELINE_STEP_IFS,
+  PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, renderRangeFetchStep, SECRET_REF_RE, SIGN_STEP_ID_RE, BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, DAST_HANDOFF_STEP_ID, dastAppStepId, dastCheckStepId, dastRunJobId, dastRunSlugOf, DAST_CHECK_ID_RE, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, BASELINE_STEP_IFS,
   STEP_KEYS as STEP_KEY_LIST, WORKFLOW_CONCURRENCY, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact,
 } from './job-rules.js';
 import { signingMode } from '../github/signing-mode.js';
@@ -59,6 +59,9 @@ import { projectScriptFor } from './reviewed.js';
 import { slotProblem, type SlotKind } from './slots.js';
 import { expectedSigningSteps } from './signing.js';
 import { ARCHIVE_TOOL_IDS, imageBuildTag, renderImageArchiveScan, renderImageBuild } from './image-handoff.js';
+import { dastStartOf, renderDastRun, renderDastScrub } from './dast-handoff.js';
+import { SHARED_CDN_SETS } from './egress.js';
+import { EGRESS_DOMAIN_SETS } from './egress-sets.js';
 import { allowedDomainsProblem, ARGV_POLICIES, BULLFROG_USES, CACHE_LOCKS, GATE_OPTIONAL_UPLOADS, PLAIN_REL_RE, PLATFORM_USES, RANGE_TOOL, RENDERER_INPUTS, rendererInputProblems, SCRUB_SECRET, uploadIfNoFiles } from './tool-flags.js';
 
 // ---------- the report ----------
@@ -273,7 +276,9 @@ const IMAGE_ARCHIVE_SOURCE = 'image-archive';
 const IMAGE_CHECK_SOURCE = 'image-check';
 /** A scanner of the PR's own image on its archive (B6): the head check itself, rendered another way (so it counts as the spec's step). */
 const ARCHIVE_SUFFIX = ':archive';
-const SOURCE_KIND: Readonly<Record<string, StepKind>> = Object.freeze({ [SIGN_SOURCE]: 'sign', [VERIFY_SOURCE]: 'verify', [IMAGE_ARCHIVE_SOURCE]: 'image-archive', [IMAGE_CHECK_SOURCE]: 'image-check' });
+const SOURCE_KIND: Readonly<Record<string, StepKind>> = Object.freeze({ [SIGN_SOURCE]: 'sign', [VERIFY_SOURCE]: 'verify', [IMAGE_ARCHIVE_SOURCE]: 'image-archive', [IMAGE_CHECK_SOURCE]: 'image-check',
+  // G4-R1: the raw DAST result's hash check (it reads a download and the run job's output only, like a checker)
+  'dast-check': 'tool' });
 const sourceKind = (source: string): StepKind | undefined => { const head = source.slice(0, source.indexOf(':')); return source.includes(':') ? own(SOURCE_KIND, head) : undefined; };
 /** The service slug a source of the image hand-off names (`image-archive:<slug>`, `image-check:<slug>`). */
 const sourceSlug = (source: string): string => source.slice(source.indexOf(':') + 1);
@@ -511,6 +516,33 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
       for (const n of spec.secrets ?? []) ex.declared.add(n);
       return;
     }
+    // G4-R1 (design A): a DAST check runs in its own key-free run job (dast-run--<svc>, the app in containers only) and is scrubbed in the
+    // gate's job dast--<svc> after the hash check of the handed-off raw result; it has no base twin (nothing is recorded for base-scan)
+    if (own(NEED_ID_CATEGORY as Readonly<Record<string, string>>, spec.needId) === 'dast' && typeof spec.service === 'string') {
+      try {
+        const start = dastStartOf(draft, spec.service);
+        if ('problem' in start) { notes.push(`The DAST check for ${show(spec.service)} can not run (${safeText(start.problem, 200)}), so no step may claim to be it.`); return; }
+        const need = keyOf(spec.needId, spec.service);
+        const runJob = dastRunJobId(spec.service);
+        record(`spec:${i}`, ctxs.map((c) => renderStep(spec, t, platform, { ...c, blocking }).steps), appRunning, blocking, readsWorkspace(t.id), need, runJob);
+        const run = renderDastRun(spec, t, platform, draft, start, { blocking, checkout: [] }).steps;
+        const handoff = run.filter((x) => x.id === DAST_HANDOFF_STEP_ID);
+        record(`${DAST_HANDOFF_SOURCE}:${slug(spec.service)}`, [handoff, handoff], false, true, false, undefined, undefined);
+        const app = run.filter((x) => x.id === dastAppStepId(spec.service as string));
+        if (app.length > 0) record(`${DAST_APP_SOURCE}:${slug(spec.service)}`, [app, app], false, true, false, undefined, undefined);
+        // the archive's hash check before the start: the image hand-off's own check step (its kind and rules)
+        const archiveCheck = run.filter((x) => x.id === imageCheckStepId(spec.service as string));
+        if (archiveCheck.length > 0) record(`${IMAGE_CHECK_SOURCE}:${slug(spec.service)}`, [archiveCheck, archiveCheck], false, true, false, undefined, undefined);
+        const check = renderDastScrub(spec, t, platform, draft, ex.byId.get(PIPEGEN_ACTION_IDS.gate) ?? t, start.url).steps.filter((x) => x.id === dastCheckStepId(spec.service as string));
+        record(`${DAST_CHECK_SOURCE}:${i}`, [check, check], false, true, false, undefined, undefined);
+        ex.rendered.add(`spec:${i}`);
+        for (const n of spec.secrets ?? []) ex.declared.add(n);
+      } catch (e) {
+        if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e;
+        notes.push(`The DAST step for ${show(spec.needId)} (${t.id}) can not be rendered, so no step may claim to be it: ${safeText(e.message, 200)}`);
+      }
+      return;
+    }
     try {
       const need = keyOf(spec.needId, spec.service);
       // G2 (F2-R11): rendered as the need blocks, so a narrowed scan of a blocking need is no step of pipegen's
@@ -699,6 +731,10 @@ function judgeEnv(fc: FileCtx, env: unknown, where: string): void {
 
 /** The source name of the pr-check lookup step among the expected run steps. */
 const PR_CHECK_SOURCE = 'pr-check';
+/** G4-R1: the sources of the DAST hand-off step (run job), the archive start (run job) and the raw result's hash check (scrub job). */
+const DAST_HANDOFF_SOURCE = 'dast-handoff';
+const DAST_APP_SOURCE = 'dast-app';
+const DAST_CHECK_SOURCE = 'dast-check';
 /** G4 (C9r1): the source name of the pre-push head fetch step of the secrets job. */
 const RANGE_FETCH_SOURCE = 'range-fetch';
 /** The gate job's own name (the second half of GATE_CHECK_NAME). */
@@ -991,6 +1027,8 @@ function judgeJob(fc: FileCtx, id: string, j: unknown): void {
   judgeSigningJob(fc, where, j, judged);
   if (id === 'sign') { judgeSignPermissions(fc, where, j, judged); judgeSignJobSteps(fc, where, judged); }
   judgeBaselineIfs(fc, id, where, j, judged);
+  judgeDastJobs(fc, id, where, j, judged);
+  judgeEgress(fc, id, where, j, judged);
   judgeCosignEnv(fc, where, j, judged);
   judgeImageHandoff(fc, id, where, j, judged);
   judgeRegistryWrite(fc, where, j, judged);
@@ -1104,6 +1142,58 @@ function judgeBaselineIfs(fc: FileCtx, id: string, where: string, j: Obj, judged
     const category = needId === undefined ? undefined : own(NEED_ID_CATEGORY as Readonly<Record<string, string>>, needId);
     if (category === undefined) bad('template', `${where}: the step ${show(x.step.name)} carries the baseline condition but is not part of a check's base scan (a shared step runs for every base scan of the job).`);
     else if (BASE_ALWAYS_CATEGORIES.has(category)) bad('template', `${where}: the step ${show(x.step.name)} of the ${show(category)} base scan carries the baseline condition, but dependency, licence and image scans always run on the base commit.`);
+  }
+}
+
+/**
+ * G4-R1 (design A): a DAST check's own steps (the reviewed scan) run only in its run job `dast-run--<svc>`, its hand-off step only there, its
+ * archive start only there; the run job names no secret and no token (the fingerprint key never reaches a job that runs the app: a scrub
+ * there is the order rule's keyJob refusal) and runs in no environment; the scrub job's hash check sits in `dast--<svc>`, which needs that run
+ * job (else it reads nothing, or another run's artifact).
+ */
+function judgeDastJobs(fc: FileCtx, id: string, where: string, j: Obj, judged: readonly Judged[]): void {
+  const bad = issueFor(fc);
+  for (const x of judged) {
+    const src = x.match?.source ?? '';
+    const m = /^spec:(\d+)$/.exec(src);
+    const spec = m === null ? undefined : fc.draft.steps[Number(m[1])];
+    const dast = spec !== undefined && isObj(spec) && own(NEED_ID_CATEGORY as Readonly<Record<string, string>>, spec.needId) === 'dast' && typeof spec.service === 'string';
+    if (dast && id !== safeRunId(spec.service as string)) bad('permissions', `${where}: the DAST step ${show(x.step.name)} runs only in its own job ${show(safeRunId(spec.service as string))}, which holds no key and no secret.`);
+    for (const head of [DAST_HANDOFF_SOURCE, DAST_APP_SOURCE]) {
+      if (src.startsWith(`${head}:`) && id !== `dast-run--${src.slice(head.length + 1)}`) bad('permissions', `${where}: the step ${show(x.step.name)} belongs to the DAST run job dast-run--${src.slice(head.length + 1)} only.`);
+    }
+    const c = typeof x.step.id === 'string' ? DAST_CHECK_ID_RE.exec(x.step.id) : null;
+    if (c !== null) {
+      if (id !== `dast--${c[1] as string}`) bad('permissions', `${where}: the hash check of the raw DAST result sits only in the job dast--${c[1] as string}.`);
+      if (!needsList(j.needs).includes(`dast-run--${c[1] as string}`)) bad('not-gate-readable', `${where} checks the raw DAST result of dast-run--${c[1] as string} but does not need that job.`);
+    }
+  }
+  if (dastRunSlugOf(id) !== null) {
+    const names = new Set(judged.flatMap((x) => [...x.secrets]));
+    if (names.size > 0) bad('permissions', `${where} runs the app for its DAST scan, so it names no secret (it names ${[...names].map((n) => show(n)).join(', ')}): the fingerprint key and every secret stay out of a job that runs the app.`);
+    if (JSON.stringify(j.steps ?? []).includes('github.token') || j.environment !== undefined) bad('permissions', `${where} runs the app for its DAST scan, so it gets no token and no environment.`);
+  }
+}
+const safeRunId = (service: string): string => { try { return dastRunJobId(service); } catch (e) { if (e instanceof ArtifactNameError) return '?'; throw e; } };
+
+/** G4-R1 (E3-R3): the hosts of the shared-CDN egress sets (anyone can serve from them). */
+const SHARED_CDN_HOSTS: ReadonlySet<string> = new Set([...SHARED_CDN_SETS].flatMap((s) => EGRESS_DOMAIN_SETS[s]));
+/**
+ * G4-R1 (E0d, P-3 as a referee backstop): every job pipegen writes with steps starts with exactly one reviewed egress step (Bullfrog, its
+ * template judged like any action), except the keyless sign job (its Sigstore and OIDC hosts are in no reviewed set; documented in
+ * central.ts). E3-R3: a job whose steps name a user secret (a declared app secret, not pipegen's own) has no shared-CDN set in its egress list.
+ */
+function judgeEgress(fc: FileCtx, id: string, where: string, j: Obj, judged: readonly Judged[]): void {
+  const bad = issueFor(fc);
+  const keylessSign = id === 'sign' && fc.draft.signing?.mode === 'keyless' && judged.some((x) => x.kind === 'sign' && typeof x.step.id === 'string' && SIGN_STEP_ID_RE.test(x.step.id) && ![...x.secrets].some((n) => SIGNING_KEY_SECRETS.has(n)));
+  const hardens = judged.filter((x) => x.kind === 'harden');
+  if (!keylessSign && (judged[0]?.kind !== 'harden' || hardens.length !== 1)) bad('permissions', `${where} must start with pipegen's egress step (the reviewed Bullfrog block, once, first): without it the job's network is open.`);
+  const userSecret = judged.some((x) => [...x.secrets].some((n) => fc.ex.declared.has(n) && !PIPEGEN_SECRETS.includes(n)));
+  if (!userSecret) return;
+  for (const h of hardens) {
+    const hosts = String(h.step.with?.['allowed-domains'] ?? '').split('\n').map((x) => x.trim());
+    const shared = hosts.filter((x) => SHARED_CDN_HOSTS.has(x));
+    if (shared.length > 0) bad('permissions', `${where} holds a secret of the app, but its egress list opens shared-CDN hosts (${shared.map((x) => show(x)).join(', ')}) that serve anyone's content; pipegen never gives a job with a user secret such a set (E3-R3).`);
   }
 }
 
@@ -1554,6 +1644,11 @@ function judgeJobSteps(fc: FileCtx, where: string, steps: unknown[], job: boolea
     const spec = m === null ? undefined : fc.draft.steps[Number(m[1])];
     const format = spec === undefined || !isObj(spec) || !isObj(spec.tool) ? undefined : fc.ex.byId.get(spec.tool.id)?.step.output.format;
     if (spec !== undefined && x.step.id !== undefined && (format === 'sarif' || format === 'zap-json')) scans.set(x.step.id, { tool: spec.tool.id, format });
+    // G4-R1: the hash check of a handed-off DAST result stands for its scan step (the scan ran in the run job)
+    const dc = x.match === undefined ? null : new RegExp(`^${DAST_CHECK_SOURCE}:(\\d+)$`).exec(x.match.source);
+    const dspec = dc === null ? undefined : fc.draft.steps[Number(dc[1])];
+    const dformat = dspec === undefined || !isObj(dspec) || !isObj(dspec.tool) ? undefined : fc.ex.byId.get(dspec.tool.id)?.step.output.format;
+    if (dspec !== undefined && x.step.id !== undefined && x.harmlessId && (dformat === 'sarif' || dformat === 'zap-json')) scans.set(x.step.id, { tool: dspec.tool.id, format: dformat });
     // C9: the commit-range scan, recognised by content as the range source's own step
     if (x.match?.source === 'range:secrets' && x.match.final && x.kind === 'tool' && x.harmlessId && x.step.id !== undefined) scans.set(x.step.id, { tool: RANGE_TOOL, format: 'sarif' });
   }

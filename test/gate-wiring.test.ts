@@ -57,7 +57,7 @@ function workflow(jobs: Record<string, Job>, raw = false): CreatedFile {
   doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, jobs: plain });
   for (const [id, j] of Object.entries(jobs)) {
     const steps = j.steps as RenderedStep[];
-    doc.setIn(['jobs', id, 'steps'], raw ? doc.createNode(steps.map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(steps));
+    doc.setIn(['jobs', id, 'steps'], raw ? doc.createNode(withEgress(steps).map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(withEgress(steps)));
   }
   return { path: '.github/workflows/pipegen.yml', content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: 't', repo: 'app' };
 }
@@ -833,6 +833,7 @@ describe('C5b fix round 1: the required result upload and the optional uploads t
 
 // ---------- C5b fix round 2 (review-C5b-r1 r1-1): the gate step is found once ----------
 import { gateResultUploadProblems } from '../src/engine/job-rules.js';
+import { withEgress } from './helpers/egress-step.js';
 
 describe('C5b fix round 2: the referee judges the gate step it found; an id on it is refused', () => {
   const specs = [gitleaksSpec()];

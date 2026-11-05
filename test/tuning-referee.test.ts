@@ -11,6 +11,7 @@ import { NEED_ID_CATEGORY } from '../src/engine/need-ids.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
 import type { Capabilities, CreatedFile, Need, PipelineDraft, StepSpec } from '../src/types.js';
 import { entry, gateEntry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
+import { withEgress } from './helpers/egress-step.js';
 
 const api = service({
   name: 'api', path: 'services/api', dockerfile: 'services/api/Dockerfile',
@@ -44,7 +45,7 @@ function file(jobs: Record<string, RenderedStep[]>): CreatedFile {
     name: 'pipegen', on: { pull_request: null }, permissions: {},
     jobs: Object.fromEntries(Object.keys(jobs).map((id) => [id, { 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none' }])),
   });
-  for (const [id, steps] of Object.entries(jobs)) doc.setIn(['jobs', id, 'steps'], stepsToYaml(steps));
+  for (const [id, steps] of Object.entries(jobs)) doc.setIn(['jobs', id, 'steps'], stepsToYaml(withEgress(steps)));
   return { path: '.github/workflows/pipegen.yml', content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: 'test', repo: 'app' };
 }
 const run = (f: CreatedFile, d: PipelineDraft): Promise<RefereeReport> => referee([f], d, platform(), [...reviewedList(), GATE], LINTERS, 'gh-stub', { runLinters: async () => [] });

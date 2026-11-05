@@ -18,6 +18,9 @@ import { entry, gateEntry, platform, profile, reviewedList, service, specFor, sc
 import { fake } from './helpers/secret-repo.js';
 import { renderGateUploads, renderRangeBlock, renderStage as renderStageC1c } from '../src/engine/render-step.js';
 import { ARGV_POLICIES, isStagedTool } from '../src/engine/tool-flags.js';
+import { withEgress } from './helpers/egress-step.js';
+import { dastStartOf, renderDastRun, renderDastScrub } from '../src/engine/dast-handoff.js';
+import { renderImageBuild } from '../src/engine/image-handoff.js';
 
 // ---------- builders ----------
 
@@ -78,7 +81,7 @@ function workflowText(jobs: Record<string, Job>, top: Record<string, unknown> = 
   for (const [id, j] of Object.entries(jobs)) {
     if (!Array.isArray(j.steps)) continue;
     const steps = j.steps as RenderedStep[];
-    doc.setIn(['jobs', id, 'steps'], raw ? doc.createNode(steps.map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(steps));
+    doc.setIn(['jobs', id, 'steps'], raw ? doc.createNode(withEgress(steps).map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(withEgress(steps)));
   }
   return doc.toString({ lineWidth: 0 });
 }
@@ -129,6 +132,8 @@ describe('referee: the renderer and the referee agree', () => {
     for (const t of reviewedList()) {
       if (t.id === 'pipegen-gate') continue;   // pipegen's own gate action is rendered by the gate helpers (renderScrub, renderGateStep), not as a tool job
       if (t.categories.includes('platform') && !t.categories.includes('image-build')) continue;   // the platform actions are rendered below, by their helpers
+      // G4-R1: a DAST tool runs in its own key-free run job, scrubbed in another (test/jobs-dast.test.ts holds that pair to the referee)
+      if (t.categories.includes('dast')) continue;
       const nth = (perNeed.get(needFor(t)) ?? 0) + 1;
       perNeed.set(needFor(t), nth);
       // D9: a tool that runs the service's test command (c8) runs in a service that has a test script
@@ -136,7 +141,10 @@ describe('referee: the renderer and the referee agree', () => {
       const spec = specFor(t, { needId: needFor(t), service: t.id === 'docker-build-push-action' ? 'app13' : ARGV_POLICIES[t.id]?.testCommand === true ? 'script-app' : nth === 1 ? 'app' : `app${nth}` });
       let steps: RenderedStep[];
       try {
-        steps = t.id === 'docker-build-push-action'
+        steps = t.id === 'bullfrog'
+          // G4-R1: the egress step is every job's first step (the referee's backstop), so its own check's job is just that step
+          ? renderStep(spec, t, p, ctxN).steps
+          : t.id === 'docker-build-push-action'
           ? [...prelude(), renderPlatformStep('setup-buildx', p), renderPlatformStep('docker-login', p, loginInputs(), { registry: 'ghcr.io' }), ...renderStep(spec, t, p, { ...ctxN, targets: { image: 'ghcr.io/o/app:pr-1' } }).steps]
           : toolJob(spec, ctxN);
       } catch (e) {
@@ -208,7 +216,8 @@ describe('referee: the renderer and the referee agree', () => {
     // the entries the renderer refuses are the documented ones (6c report), nothing else
     // (registry is a job service and skipped above with the platform entries)
     expect(refused.sort()).toEqual(['cosign', 'gosec', 'pypi-publish', 'schemathesis', 'scorecard-action', 'bandit', 'coverage-py', 'creosote', 'mypy', 'vulture'].sort());
-    expect(specs.length).toBeGreaterThan(30);
+    // (G4-R1: the two DAST tools are judged in their two-job form in test/jobs-dast.test.ts, not here)
+    expect(specs.length).toBeGreaterThan(28);
   });
 });
 
@@ -405,7 +414,7 @@ describe('referee: permissions by exact job id', () => {
     }
     const doc = new Document();
     doc.contents = doc.createNode({ name: 'x', on: { push: null }, jobs: { scan: { 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none' } } });
-    doc.setIn(['jobs', 'scan', 'steps'], stepsToYaml(g.steps));
+    doc.setIn(['jobs', 'scan', 'steps'], stepsToYaml(withEgress(g.steps)));
     expect(has(await run([file(doc.toString({ lineWidth: 0 }))], draftOf([g.spec])), 'permissions')).toBe(true);
   });
   it('write-all, read-all or no permissions on a job → permissions issue', async () => {
@@ -647,11 +656,29 @@ describe('referee: blocking needs (B7)', () => {
     expect(r.ok, show(r)).toBe(true);
   });
   it('referee: blocking dast with zap-json accepted; blocking hooks-ci accepted', async () => {
+    // G4-R1: DAST runs in two jobs (the app from its checked image archive, the scan, the raw hand-off; then the hash check and the scrub)
     const zap = specOf('zap-baseline', { needId: 'dast' });
     const hooks = specOf('lefthook', { needId: 'hooks-ci' });
-    const r = await run([wf({ dast: job(toolJob(zap)), hooks: job(toolJob(hooks)) })], draftOf([zap, hooks]));
+    const build: StepSpec = { ...specFor(entry('docker-build-push-action'), { needId: 'image-build', service: 'app' }), choices: { push: 'false' } };
+    const d0 = draftOf([zap, hooks, build]);
+    const d = { ...d0, profile: { ...d0.profile, services: d0.profile.services.map((x) => (x.name === 'app' ? { ...x, dockerfile: 'Dockerfile', port: 3000 } : x)) } };
+    const start = dastStartOf(d, 'app');
+    if ('problem' in start) throw new Error(start.problem);
+    const zt = entry('zap-baseline');
+    const runSteps = renderDastRun(zap, zt, platform(), d, start, { blocking: true, checkout: [] });
+    const scrub = renderDastScrub(zap, zt, platform(), d, GATE, start.url);
+    const imageBuild = renderImageBuild(build, entry('docker-build-push-action'), platform(), { profile: d.profile });
+    const r = await run([wf({
+      'image-build--app': job([...prelude(), ...imageBuild.steps], { outputs: imageBuild.outputs }),
+      'dast-run--app': job(runSteps.steps, { needs: runSteps.needs, outputs: runSteps.outputs }),
+      'dast--app': job(scrub.steps, { needs: ['dast-run--app'], outputs: jobOutputsFor(scrub.steps) }),
+      hooks: job(toolJob(hooks)),
+    })], d);
     expect(show(r)).toBe('');
     expect(r.demoted).toEqual([]);
+    // the old single-job form (the app's scan beside the fingerprint key) is refused
+    const old = await run([wf({ dast: job(toolJob(zap)), hooks: job(toolJob(hooks)) })], draftOf([zap, hooks]));
+    expect(old.ok).toBe(false);
   });
   it('referee: blocking format, type-check, coverage, workflow-lint, dependency-review kept blocking', async () => {
     const specs = [specOf('prettier', { needId: 'format' }), specOf('biome', { needId: 'format' }), specOf('vitest-coverage', { needId: 'coverage' }),
@@ -744,7 +771,7 @@ describe('referee: an edited user workflow is judged only where pipegen inserted
     const src = original.replace('  deploy:\n    runs-on: ubuntu-latest', '  deploy:\n    needs: [pipegen-verify]\n    runs-on: ubuntu-latest');
     const text = `${src}  pipegen-verify:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      actions: read\n      packages: read\n      attestations: read\n    cache-mode: none\n    steps: []\n`;
     const doc = parseDocument(text);
-    doc.setIn(['jobs', 'pipegen-verify', 'steps'], stepsToYaml(steps));
+    doc.setIn(['jobs', 'pipegen-verify', 'steps'], stepsToYaml(withEgress(steps)));
     extra(doc);
     return doc.toString({ lineWidth: 0 });
   };
@@ -1010,7 +1037,7 @@ describe('fix round 1: an edited user workflow\'s own top level is judged where 
   const build = (original: string, steps: RenderedStep[] = [verifyStep()]): CreatedFile => {
     const src = original.replace('  deploy:\n', '  deploy:\n    needs: [pipegen-verify]\n');
     const doc = parseDocument(`${src}  pipegen-verify:\n    runs-on: ubuntu-latest\n    permissions:\n${Object.entries(VERIFYP).map(([k, v]) => `      ${k}: ${v}\n`).join('')}    cache-mode: none\n    steps: []\n`);
-    doc.setIn(['jobs', 'pipegen-verify', 'steps'], stepsToYaml(steps));
+    doc.setIn(['jobs', 'pipegen-verify', 'steps'], stepsToYaml(withEgress(steps)));
     return file(doc.toString({ lineWidth: 0 }), '.github/workflows/deploy.yml', { part: 'deploy-verify', inserted: { original, jobs: ['pipegen-verify'], needs: [{ job: 'deploy', added: ['pipegen-verify'] }] } });
   };
   const userWf = (top: string, deployIf = ''): string => ['name: deploy', ...top.split('\n').filter(Boolean), 'jobs:', '  deploy:', ...(deployIf === '' ? [] : [`    if: ${deployIf}`]), '    runs-on: ubuntu-latest', '    steps:', '      - uses: actions/checkout@v4', '      - run: ./deploy.sh', ''].join('\n');
@@ -1089,7 +1116,7 @@ describe('fix round 2: the re-review probes are refused', () => {
     const text = original.replace('  deploy:\n', '  deploy:\n    needs: [pipegen-verify]\n')
       + '  pipegen-verify:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      actions: read\n      packages: read\n      attestations: read\n    cache-mode: none\n    steps: []\n';
     const doc = parseDocument(text);
-    doc.setIn(['jobs', 'pipegen-verify', 'steps'], stepsToYaml([verifyStep()]));
+    doc.setIn(['jobs', 'pipegen-verify', 'steps'], stepsToYaml(withEgress([verifyStep()])));
     const f = file(doc.toString({ lineWidth: 0 }), '.github/workflows/deploy.yml', { inserted: { original, jobs: ['pipegen-verify'], needs: [{ job: 'deploy', added: ['pipegen-verify'] }] } });
     const d = draftOf([], { profile: { ...prof, existingWorkflows: [{ path: '.github/workflows/deploy.yml', triggers: ['push'], deploys: true, [`${SEC_FIELD}Used`]: [], jobs: ['deploy'] } as unknown as ExistingWorkflow] } });
     return { f, d };

@@ -22,6 +22,7 @@ import { NUCLEI_EMPTY_SARIF } from '../src/engine/render-cli.js';
 import { stageWorkspace } from '../gate/src/stage.js';
 import { renderStage as renderStageC1c } from '../src/engine/render-step.js';
 import { isStagedTool } from '../src/engine/tool-flags.js';
+import { withEgress } from './helpers/egress-step.js';
 
 // ---------- builders ----------
 
@@ -57,7 +58,7 @@ function workflow(jobs: Record<string, Job>, raw = false): CreatedFile {
   doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, jobs: plain });
   for (const [id, j] of Object.entries(jobs)) {
     const steps = j.steps as RenderedStep[];
-    doc.setIn(['jobs', id, 'steps'], raw ? doc.createNode(steps.map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(steps));
+    doc.setIn(['jobs', id, 'steps'], raw ? doc.createNode(withEgress(steps).map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(withEgress(steps)));
   }
   return { path: '.github/workflows/pipegen.yml', content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: 't', repo: 'app' };
 }
@@ -623,7 +624,8 @@ describe('the renderer and the referee agree: a full scanner job per findings to
     // several tools share a need (two DAST tools): one result artifact is uploaded once per file, so each later tool of a need gets a service of its own
     const ctxN: RenderContext = { ...ctx, profile: { ...prof, services: [svc, ...Array.from({ length: 12 }, (_, i) => ({ ...svc, name: `app${i + 2}` }))] } };
     const perNeed = new Map<string, number>();
-    for (const t of reviewedList().filter((e) => RAW_FORMATS.includes(e.step.output.format))) {
+    // G4-R1: the DAST tools run in their own key-free run job and are scrubbed in another (test/jobs-dast.test.ts), never one job
+    for (const t of reviewedList().filter((e) => RAW_FORMATS.includes(e.step.output.format) && !e.categories.includes('dast'))) {
       const nth = (perNeed.get(needFor(t)) ?? 0) + 1;
       perNeed.set(needFor(t), nth);
       const spec = specFor(t, { needId: needFor(t), service: nth === 1 ? 'app' : `app${nth}` });
@@ -632,7 +634,7 @@ describe('the renderer and the referee agree: a full scanner job per findings to
       specs.push(spec);
       jobs[`t-${t.id}`] = job(dedupeJobSteps([...harden, ...built.steps], { scans: scansFor([...harden, ...built.steps]) }));
     }
-    expect(specs.map((s) => s.tool.id)).toEqual(expect.arrayContaining(['gitleaks', 'betterleaks', 'semgrep', 'osv-scanner', 'trivy-config', 'trivy-image', 'trivy-licence', 'hadolint', 'kube-linter', 'semgrep', 'nuclei', 'zap-baseline']));
+    expect(specs.map((s) => s.tool.id)).toEqual(expect.arrayContaining(['gitleaks', 'betterleaks', 'semgrep', 'osv-scanner', 'trivy-config', 'trivy-image', 'trivy-licence', 'hadolint', 'kube-linter', 'semgrep']));
     // without the harden step too (the job shape of Plan G's scanner jobs differs by the egress policy)
     const plain: Record<string, Job> = {};
     for (const s of specs) plain[`u-${s.tool.id}`] = job(dedupeJobSteps(scannerSteps(s, ctxN).steps, { scans: scansFor(scannerSteps(s, ctxN).steps) }));

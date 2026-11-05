@@ -16,10 +16,9 @@
 //
 // What it leaves out, each with a note (the returned draft no longer holds them, so the gate's job list, the referee and PIPEGEN.md agree):
 // - the parts skipped with --skip (tests, precommit, deploy; the others make no job); the secrets scan and the gate are never skippable;
-// - v0.2 limits: api-dast and PyPI publishing (S31); DAST (ZAP, nuclei): the app start is repo code, which no findings job may hold next to
-//   the fingerprint key (checkJobOrder, C0a fix round 1), and the app image can not be a job service yet (B6 item 52); Scorecard (PF-3: the
-//   action runs a tag-pinned image); fuzzing (v0.3); an image build that can not be rendered (a sub-folder service, ruling S8) and the scans of
-//   that image; an osv-scanner run for a service with no lockfile (G12: it exits 128).
+// - v0.2 limits: api-dast and PyPI publishing (S31); Scorecard (PF-3: the action runs a tag-pinned image); fuzzing (v0.3); an image build
+//   that can not be rendered (a sub-folder service, ruling S8) and the scans of that image; an osv-scanner run for a service with no lockfile
+//   (G12: it exits 128); a non-blocking DAST check whose app pipegen can not start in a container. A blocking one stops (G4-R1, G0-R1).
 //
 // The jobs (one per need key: the gate's job list is keyed by jobIdFor, so the estimate's JOB_GROUP grouping is not applied, see the G4 report):
 // - every job starts with the reviewed egress step (Bullfrog block, E0d per job: github-core plus the sets its tools need; P-3), then its checkout;
@@ -29,6 +28,9 @@
 //   commit-range block (C9) after a full-history checkout;
 // - job-status jobs: the tool's steps, or the project's own script first (it brings its own checkout); a test job of a service with
 //   dependencies gets the runtime env and compose up, only when the draft holds the compose file pipegen computes (D4);
+// - DAST (G4-R1, dast-handoff.ts): `dast-run--<svc>` with no key and no secret starts the app in containers only (pipegen's compose file, or
+//   the checked image archive on 127.0.0.1), runs the reviewed scan and hands the raw result on with its sha256; `dast--<svc>` (the gate's
+//   job) checks that sha256, scrubs and uploads; no base twin;
 // - image-build--<svc>: the reviewed build-push with no push on the default docker driver (no setup-buildx: with the docker-container
 //   builder the image never reaches the local store and `docker image save` fails, G2 carry), the archive step and its upload; the image scans
 //   read that archive after its sha256 check (B6), with no base twin (C-MUST-1);
@@ -47,12 +49,13 @@ import { COMPOSE_PATH, planCompose } from '../create/compose.js';
 import { ArtifactNameError, resultArtifactName, slug } from '../engine/artifact-names.js';
 import { baseImageRef, loadBaseImages, nodeBaseImageId, type BaseImage } from '../engine/base-images.js';
 import { dockerfilesOf } from '../engine/created-judges/compose.js';
-import { egressSetsForTool, renderEgressStep, type EgressSet } from '../engine/egress.js';
+import { egressSetsForTool, renderEgressStep, SHARED_CDN_SETS, type EgressSet } from '../engine/egress.js';
 import { gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES } from '../engine/gate-job-list.js';
 import { SKIPPED_PART_NEEDS } from '../engine/gate-inputs.js';
 import { ARCHIVE_TOOL_IDS, renderImageArchiveScan, renderImageBuild } from '../engine/image-handoff.js';
+import { dastStartOf, renderDastRun, renderDastScrub, type DastStart } from '../engine/dast-handoff.js';
 import {
-  BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, IMAGE_BUILD_NEED, imageBuildJobId, isReviewed,
+  BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, dastRunJobId, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, IMAGE_BUILD_NEED, imageBuildJobId, isReviewed,
   isScrubStep, jobOutputsFor, NIGHTLY_CONCURRENCY, NO_SCANS, renderRangeFetchStep, type RenderedStep, type ScanFact,
 } from '../engine/job-rules.js';
 import { NEED_ID_CATEGORY, SCHEDULED_CATEGORIES } from '../engine/need-ids.js';
@@ -65,7 +68,7 @@ import {
   renderProjectScript, renderRangeBlock, renderRuntimeEnv, renderScrub, renderStep, renderUpload, scanFactOf, scrubbedPath, type RenderContext,
 } from '../engine/render-step.js';
 import { projectScriptFor } from '../engine/reviewed.js';
-import { RANGE_TOOL } from '../engine/tool-flags.js';
+import { PLATFORM_USES, RANGE_TOOL } from '../engine/tool-flags.js';
 import type { SigningMode } from '../github/signing-mode.js';
 import { signJob, type SignJob } from './central.js';
 import type { Need, NeedCategory, PipelineDraft, ReviewedTool, Service, SkippablePart, StepSpec } from '../types.js';
@@ -86,7 +89,7 @@ export const JOB_MINUTES = 30;
  */
 export const ISOLATED_TEST_JOB: boolean = false;
 /** E3-R3 (E-b5): the egress sets whose hosts serve anyone's content (release assets, the OSV API, the Trivy DB mirror): never in a job with a user secret. */
-export const SHARED_CDN_SETS: ReadonlySet<EgressSet> = new Set<EgressSet>(['github-releases', 'osv', 'trivy-db']);
+export { SHARED_CDN_SETS };
 /** The job id prefix of the isolated starter-test job (one per service). */
 export const STARTER_TEST_JOB = 'starter-tests';
 /** The gate job's name: the required check is `pipegen / gate` (GATE_CHECK_NAME) through the caller job `pipegen`. */
@@ -95,7 +98,6 @@ const GATE_JOB_NAME = 'gate';
 /** v0.2 limits: categories pipegen does not render yet, each with the line the notes (and PIPEGEN.md) carry. */
 export const NOT_RENDERED_V02: Readonly<Partial<Record<NeedCategory, string>>> = Object.freeze({
   'api-dast': 'API testing against the API spec is not available yet: its tool (schemathesis) needs a reviewed hash-locked closure of its Python dependencies, planned for v0.4 (S31).',
-  dast: 'The scan of the running app (ZAP, nuclei) is not run yet: starting the app runs the repository\'s code, which no job that holds the result fingerprint key may run, and the app image can not be a job service yet; it needs the image hand-off as a job service first.',
   scorecard: 'OpenSSF Scorecard is not run yet: its action runs a tag-pinned container image, and pipegen runs only images pinned by digest (PF-3).',
   fuzzing: 'Fuzzing is built in v0.3.',
 });
@@ -330,6 +332,24 @@ function imageScanJob(c: Ctx, spec: StepSpec): Job {
   return job(dedupeJobSteps([egress, ...steps], { id, scans }), { needs: [imageBuildJobId(service)] });
 }
 
+/** G4-R1: the two jobs of a DAST check: the key-free run job (the app in containers, the scan, the raw hand-off) and the gate's scrub job. */
+function dastJobs(c: Ctx, spec: StepSpec, start: DastStart): { run: Job; scrub: Job } {
+  const service = spec.service as string;
+  const t = toolOf(c, spec.tool.id);
+  const runId = dastRunJobId(service);
+  const checkout = start.kind === 'compose' ? renderJobPrelude({}, c.deps.platform).steps : [];
+  const r = renderDastRun(spec, t, c.deps.platform, c.draft, start, { blocking: blocks(c.draft, spec.needId, service), checkout });
+  // the containers and the scanner's own hosts; the app's container is reached over the Docker networks (published on 127.0.0.1)
+  const sets: EgressSet[] = [...egressSetsForTool(t), 'dockerhub', ...(start.kind === 'compose' && c.compose !== null ? c.compose.images : [])];
+  const runEgress = egressStepFor(sets, { userSecret: false, dockerNetworks: true, job: runId });
+  const run = job(dedupeJobSteps([runEgress, ...r.steps], { id: runId, scans: NO_SCANS }), r.needs.length > 0 ? { needs: r.needs } : {});
+  const sc = renderDastScrub(spec, t, c.deps.platform, c.draft, c.gate, start.url);
+  const id = jobIdFor(spec.needId, service);
+  const scrubEgress = egressStepFor([], { userSecret: false, dockerNetworks: false, job: id });
+  const scrub = job(dedupeJobSteps([scrubEgress, ...sc.steps], { id, scans: new Map([[sc.scan.stepId, sc.scan.fact]]) }), { needs: [runId] });
+  return { run, scrub };
+}
+
 /**
  * base-scan (plan "Base scan", G1, G17, G21, G32): the base checkout, then the base twin of every findings check of the merge layer that runs
  * in a job of its own (not the image archive scans, which have no twin yet). Dependency and licence scans always; the others only when
@@ -367,7 +387,8 @@ export function starterTestJob(svc: Service, deps: Pick<JobsDeps, 'reviewed' | '
   if (svc.language !== 'node' || svc.packageManager !== 'npm') return fail(`The starter tests of ${show(svc.name)} run only for an npm service.`);
   const list = deps.baseImages ?? loadBaseImages();
   const prelude = renderJobPrelude({ node: { runtimeVersion: svc.runtimeVersion } }, deps.platform).steps;
-  const major = prelude[1]?.with?.['node-version'];
+  // the Node major from the setup-node step itself (its action), wherever it stands in the prelude
+  const major = prelude.find((s) => s.uses?.startsWith(`${PLATFORM_USES['setup-node']}@`) === true)?.with?.['node-version'];
   if (major === undefined) return fail('The Node setup step has no node-version.');
   const image = baseImageRef(nodeBaseImageId(svc.runtimeVersion, list).id, list);
   const run = renderStarterTestRun(svc, { vitest, image, nodeMajor: major, artifact: resultArtifactName('starter-tests', svc.name) });
@@ -379,12 +400,13 @@ export function starterTestJob(svc: Service, deps: Pick<JobsDeps, 'reviewed' | '
 // ---------- assemble ----------
 
 /** Which part of the plan a need key is, for one layer's jobs: a check job, an image build, an image scan, or nothing (handled elsewhere). */
-type Role = 'check' | 'image-build' | 'image-scan' | 'none';
+type Role = 'check' | 'image-build' | 'image-scan' | 'dast' | 'none';
 function roleOf(c: Ctx, need: Need, specs: readonly StepSpec[]): Role {
   const category = categoryOf(need.id) ?? need.category;
   if (PIPEGEN_JOB_CATEGORIES.has(category) || category === 'egress' || category === 'update-config' || SCHEDULED_CATEGORIES.has(category as NeedCategory)) return 'none';
   if (need.id === IMAGE_BUILD_NEED && specs.some((s) => s.tool.id === PLATFORM_ACTION_IDS['build-push'])) return 'image-build';
   if (specs.some((s) => ARCHIVE_TOOL_IDS.has(s.tool.id))) return 'image-scan';
+  if (category === 'dast' && specs.length > 0) return 'dast';
   return 'check';
 }
 
@@ -464,6 +486,18 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
   }
   draft = narrowed({ ...draft, steps: keep }, gone);
   c.draft = draft;
+  // G4-R1: where each DAST check's app starts (containers only); a blocking one that can not start stops, a non-blocking one leaves with a note
+  const starts = new Map<StepSpec, DastStart>();
+  const noStart = new Set<Need>();
+  for (const s of draft.steps) {
+    if (categoryOf(s.needId) !== 'dast' || s.service === undefined || !draft.needs.some((n) => n.layer === 'merge' && n.id === s.needId && n.service === s.service)) continue;
+    const st = dastStartOf(draft, s.service, list);
+    if (!('problem' in st)) { starts.set(s, st); continue; }
+    if (blocks(draft, s.needId, s.service)) fail(`The blocking check ${where(s)} can not run: ${st.problem}. pipegen never makes it warn-only or leaves it out.`);
+    addNote(notes, `The non-blocking check ${where(s)} is not run: ${st.problem}.`);
+    for (const n of draft.needs) if (n.id === s.needId && n.service === s.service) noStart.add(n);
+  }
+  if (noStart.size > 0) { draft = narrowed(draft, noStart); c.draft = draft; }
 
   // 3. the layers
   const push: Record<string, Job> = {};
@@ -476,6 +510,15 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     const id = role === 'image-build' ? imageBuildJobId(n.service as string) : jobIdFor(n.id, n.service);
     if (Object.hasOwn(into, id)) return;
     if (role === 'image-build') { const b = builds.get(n.service as string); if (b !== undefined) into[id] = b; return; }
+    if (role === 'dast') {
+      if (n.layer !== 'merge') return;
+      const spec = specs.find((s) => starts.has(s));
+      if (spec === undefined) return;
+      const jobs = dastJobs(c, spec, starts.get(spec) as DastStart);
+      into[dastRunJobId(n.service as string)] = jobs.run;
+      into[id] = jobs.scrub;
+      return;
+    }
     if (role === 'image-scan') {
       if (n.layer !== 'merge') return;
       into[id] = imageScanJob(c, specs.find((s) => ARCHIVE_TOOL_IDS.has(s.tool.id)) as StepSpec);
@@ -500,7 +543,7 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
 
   // the secrets scan is always there (the floor, never skippable)
   if (!Object.hasOwn(merge, jobIdFor('secrets'))) fail('The draft has no repository-wide secrets scan in the merge layer; it is always part of the pipeline.');
-  const baseSpecs = draft.steps.filter((s) => draft.needs.some((n) => n.layer === 'merge' && n.id === s.needId && n.service === s.service) && !ARCHIVE_TOOL_IDS.has(s.tool.id) && s.tool.id !== PLATFORM_ACTION_IDS['build-push'] && isFindings(toolOf(c, s.tool.id)) && toolOf(c, s.tool.id).candidate.kind !== 'action');
+  const baseSpecs = draft.steps.filter((s) => draft.needs.some((n) => n.layer === 'merge' && n.id === s.needId && n.service === s.service) && !ARCHIVE_TOOL_IDS.has(s.tool.id) && categoryOf(s.needId) !== 'dast' && s.tool.id !== PLATFORM_ACTION_IDS['build-push'] && isFindings(toolOf(c, s.tool.id)) && toolOf(c, s.tool.id).candidate.kind !== 'action');
   merge[BASELINE_CHECK_JOB] = job([egressStepFor([], { userSecret: false, dockerNetworks: false, job: BASELINE_CHECK_JOB }), renderBaselineCheckStep(gate)], { permissions: { contents: 'read', actions: 'read' } });
   merge['base-scan'] = baseScanJob(c, baseSpecs);
   let listJobs: string[];

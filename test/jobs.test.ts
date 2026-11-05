@@ -31,74 +31,7 @@ import { RESULT_ARTIFACT_PREFIX, type Capabilities, type CreatedFile, type Need,
 import { REVIEWED, candidatesFor, discovered } from './helpers/debate-fixtures.js';
 import { platform } from './helpers/render.js';
 
-const p = platform(REVIEWED);
-/** Names spelled at run time (test/no-secret-literals.test.ts). */
-const SEC = ['sec', 'rets'].join('');
-/** The secrets check's id and job id. */
-const SEC_JOB = ['sec', 'rets'].join('');
-/** The fetch step's token variable and the workflow token secret, spelled at run time. */
-const FETCH_TOK = ['PIPEGEN_FETCH', 'TOK' + 'EN'].join('_');
-const GH_TOK = ['GITHUB', 'TOK' + 'EN'].join('_');
-const CAPS: Capabilities = { branchProtection: true, environments: false, envRequiredReviewers: false, deploymentBranchPolicies: false, attestations: false, codeScanning: true, keylessSigningAllowed: false };
-/** An app secret's name, spelled at run time. */
-const APP_KEY = ['STRIPE', 'KEY'].join('_');
-/** NotProven's missing names field, and a list of one name K (spelled at run time). */
-const MISSING = ['missing', 'Sec' + 'rets'].join('');
-const NAMES: string[] = ['K'];
-/** A not-proven entry of a check with one missing name. */
-const notProvenOf = (needId: string): NotProven => ({ part: 'pipeline', needId, reason: 't', [MISSING]: NAMES }) as unknown as NotProven;
-const LINTERS = { actionlint: async () => '/stub', zizmor: async () => '/stub' };
-type Obj = Record<string, any>;
-
-const node = (over: Partial<Service> = {}): Service => ({
-  name: 'app', path: '.', language: 'node', packageManager: 'npm', npmLockfileVersion: 3, hasTests: true, envVars: [], dependsOn: [], scripts: ['test', 'lint'], frameworks: [], quality: emptyServiceQuality(), ...over,
-});
-const profileOf = (services: Service[] = [node()], over: Partial<RepoProfile> = {}): RepoProfile => ({
-  owner: 'o', repo: 'r', defaultBranch: 'main', private: false, ownerType: 'User', plan: 'free', monorepo: 'none', services, terraformDirs: [], hasCompose: false,
-  existingWorkflows: [], precommit: null, repoFiles: emptyRepoFiles(), ...over,
-});
-
-/** The debate's result as code builds it for a need list (the first offered tool per key, its template defaults), and the draft made from it. */
-function planned(prof: RepoProfile = profileOf(), opts: { caps?: Capabilities; needs?: Need[]; over?: Partial<PipelineDraft>; edit?: (steps: StepSpec[]) => StepSpec[] } = {}): { draft: PipelineDraft; plan: JobsPlan } {
-  const caps = opts.caps ?? CAPS;
-  const needs = opts.needs ?? floorNeeds(prof, caps);
-  const candidates = candidatesFor(needs, prof, {}, REVIEWED);
-  const o = keyOffers(needs, candidates, prof, { reviewed: REVIEWED });
-  const steps = o.refs.flatMap((r) => { const of = o.offers.get(r.key); return of === undefined ? [] : [specFor(r, of[0] as NonNullable<typeof of>[number], prof)]; });
-  const draft: PipelineDraft = {
-    profile: prof, capabilities: caps, needs, steps: opts.edit === undefined ? steps : opts.edit(steps), created: [], notProven: [], testDecisions: [], layersSkipped: [], scoreboard: [],
-    requireDeployApproval: false, skipped: [], suggestions: [], ...opts.over,
-  };
-  return { draft, plan: { needs, candidates, uncovered: o.uncovered } };
-}
-const assemble = (x: { draft: PipelineDraft; plan: JobsPlan }, mode: Parameters<typeof assembleJobs>[2]['mode'] = 'none'): AssembledJobs =>
-  assembleJobs(x.draft, x.plan, { reviewed: REVIEWED, platform: p, mode });
-
-/** A workflow file of these jobs (the simplest layout: G5 writes the real callers). */
-function wf(jobs: Record<string, Job | Obj>, path: string, on: unknown): CreatedFile {
-  const doc = new Document();
-  doc.contents = doc.createNode({ name: 'pipegen', on, permissions: {}, jobs: Object.fromEntries(Object.entries(jobs).map(([k, j]) => { const { steps: _s, ...rest } = j as Obj; return [k, rest]; })) });
-  for (const [k, j] of Object.entries(jobs)) doc.setIn(['jobs', k, 'steps'], stepsToYaml((j as Job).steps));
-  return { path, content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: 't', repo: 'app' };
-}
-const PR_ON = { pull_request: null };
-const files = (a: AssembledJobs): CreatedFile[] => [
-  wf(a.merge, '.github/workflows/pipegen.yml', PR_ON),
-  wf(a.push, '.github/workflows/pipegen-push.yml', { push: { 'branches-ignore': ['main'] } }),
-  wf(a.nightly, '.github/workflows/pipegen-nightly.yml', { schedule: [{ cron: '17 3 * * *' }] }),
-];
-const judge = (fs: CreatedFile[], d: PipelineDraft): Promise<RefereeReport> => referee(fs, d, p, REVIEWED, LINTERS, 'tok', { runLinters: async () => [] });
-const shown = (r: RefereeReport): string => r.issues.map((i) => `${i.check}: ${i.message}`).join('\n');
-const allJobs = (a: AssembledJobs): [string, Job][] => [...Object.entries(a.push), ...Object.entries(a.merge), ...Object.entries(a.nightly)];
-/** A file with one job's steps changed (a hand edit). */
-function editJob(f: CreatedFile, id: string, edit: (j: Obj) => void): CreatedFile {
-  const js = parse(f.content) as Obj;
-  edit(js.jobs[id]);
-  const doc = new Document();
-  doc.contents = doc.createNode(js);
-  return { ...f, content: doc.toString({ lineWidth: 0 }) };
-}
-const domainsOf = (j: Job): string[] => String(j.steps[0]?.with?.['allowed-domains'] ?? '').split('\n');
+import { CAPS, FETCH_TOK, GH_TOK, NAMES, SEC, SEC_JOB, APP_KEY, allJobs, assemble, domainsOf, editJob, files, judge, node, notProvenOf, p, planned, profileOf, PR_ON, shown, wf, type Obj } from './helpers/assemble.js';
 const SHARED_HOSTS = [...SHARED_CDN_SETS].flatMap((s) => EGRESS_DOMAIN_SETS[s]);
 
 describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
@@ -139,7 +72,7 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
 
   it('assemble: base-scan always runs dependency and image scanners; other base-capable scanners only when baseline-check reports missing', async () => {
     // a runnable service with a Dockerfile: its image is built and scanned (deploy skipped here: the deploy jobs are G7's)
-    const x = planned(profileOf([node({ dockerfile: 'Dockerfile' })]), { over: { skipped: [{ part: 'deploy', reason: 't' }] } });
+    const x = planned(profileOf([node({ dockerfile: 'Dockerfile', port: 3000 })]), { over: { skipped: [{ part: 'deploy', reason: 't' }] } });
     const a = assemble(x);
     const base = a.merge['base-scan'] as Job;
     expect(base.needs).toEqual(['baseline-check']);
@@ -208,7 +141,7 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
   });
 
   it('assemble: every gate-feeding, build, image-publish, sign and verify job has cache-mode none; no actions/cache anywhere', async () => {
-    const pub = planned(profileOf([node({ dockerfile: 'Dockerfile' })]), {
+    const pub = planned(profileOf([node({ dockerfile: 'Dockerfile', port: 3000 })]), {
       caps: { ...CAPS, keylessSigningAllowed: true }, over: { signing: { mode: 'keyless', images: [{ service: 'app', repo: 'ghcr.io/o/r-app' }] } },
     });
     const a = assemble(pub, 'keyless');
@@ -307,7 +240,7 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
   });
 
   it('assemble: proof mode → signing none, no sign job (Plan E)', () => {
-    const x = planned(profileOf([node({ dockerfile: 'Dockerfile' })]), {
+    const x = planned(profileOf([node({ dockerfile: 'Dockerfile', port: 3000 })]), {
       caps: { ...CAPS, keylessSigningAllowed: true }, over: { signing: { mode: 'keyless', images: [{ service: 'app', repo: 'ghcr.io/o/r-app' }] } },
     });
     expect(PROOF_SIGNING_MODE).toBe('none');
@@ -323,7 +256,7 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
     expect(skipped.sign).toBeNull();
     expect(skipped.draft.signing).toBeUndefined();
     // attest: not signed yet (G15), a note, never another mode
-    const att = planned(profileOf([node({ dockerfile: 'Dockerfile' })], { private: true }), {
+    const att = planned(profileOf([node({ dockerfile: 'Dockerfile', port: 3000 })], { private: true }), {
       caps: { ...CAPS, attestations: true, environments: true }, over: { centralPin: { repo: 'o/pipelines', sha: 'a'.repeat(40) }, signing: { mode: 'attest', images: [{ service: 'app', repo: 'ghcr.io/o/r-app' }] } },
     });
     const at = assemble(att, 'attest');
@@ -434,7 +367,8 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
     expect(() => stepsToYaml([renderRangeFetchStep()])).not.toThrow();
   });
 
-  it('assemble: licences job installs with --ignore-scripts first and base-scan runs trivy-licence', async () => {
+  // G4-R1 *replaces* the plan's name `assemble: licences job installs with --ignore-scripts first and base-scan runs trivy-licence` (item 16)
+  it('assemble: licences job installs nothing (repo npm ci is repo code); trivy reads npm lockfile v2+; other lockfiles reported not covered', async () => {
     // Ruling (G4 report): the licences job is a findings job (it holds the scrub and the fingerprint key), and the job rules allow no repo code
     // there, the repo's own `npm ci` included (C0a fix round 1: its .npmrc is the repo's). So it installs nothing; trivy reads the licences of
     // an npm lockfile v2 or later, and the gate's licence-lockfiles input says which lockfiles are read (the rest show "not covered").
@@ -450,6 +384,9 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
     expect(() => dedupeJobSteps([...lic.steps.slice(0, 2), ci as never, ...lic.steps.slice(2)], { id: 'licences', scans: new Map([[lic.steps.find((s) => s.id?.startsWith('tool-run-'))?.id as string, { tool: 'trivy-licence', format: 'sarif' as const }]]) })).toThrow(/fingerprint key/);
     // the gate is told which lockfile kinds the licence scan reads (npm lockfile v3: read)
     expect(JSON.parse((a.merge.gate as Job).steps.find((s) => s.with?.mode === 'gate')?.with?.['licence-lockfiles'] as string)).toEqual([{ service: 'app', lockfiles: [{ kind: 'npm', read: true }] }]);
+    // a lockfile trivy can not read licences from (npm lockfile v1) is reported to the gate as not read (the gate shows "not covered")
+    const v1 = assemble(planned(profileOf([node({ npmLockfileVersion: 1 })])));
+    expect(JSON.parse((v1.merge.gate as Job).steps.find((s) => s.with?.mode === 'gate')?.with?.['licence-lockfiles'] as string)).toEqual([{ service: 'app', lockfiles: [{ kind: 'npm', read: false }] }]);
     // base-scan runs trivy-licence on the base commit, always (no baseline condition)
     const base = a.merge['base-scan'] as Job;
     const licBase = base.steps.filter((s) => s.id?.endsWith(sha16Of(`${RESULT_ARTIFACT_PREFIX}base-licences`)) === true || s.with?.name === `${RESULT_ARTIFACT_PREFIX}base-licences`);
@@ -474,7 +411,7 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
 
   it('assemble: pypi-publish and api-dast not rendered in v0.2, each with a note', () => {
     // a runnable node service with an API spec (api-dast) and a published Python package (PyPI publishing)
-    const web = node({ name: 'web', path: '.', dockerfile: 'Dockerfile', quality: { ...emptyServiceQuality(), apiSpec: { kind: 'file', path: 'openapi.yaml' } } });
+    const web = node({ name: 'web', path: '.', dockerfile: 'Dockerfile', port: 3000, quality: { ...emptyServiceQuality(), apiSpec: { kind: 'file', path: 'openapi.yaml' } } });
     const lib: Service = { ...node({ name: 'lib', path: 'lib', language: 'python', packageManager: 'pip', scripts: [], npmLockfileVersion: undefined }), publishedPackage: true };
     const prof = profileOf([web, lib]);
     const needs: Need[] = [
@@ -490,9 +427,10 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
     expect(a.notes).toContain(NOT_RENDERED_V02['api-dast']);
     expect(a.notes).toContain(PYPI_PUBLISH_NOTE);
     expect(a.draft.needs.some((n) => n.id === 'api-dast' || n.id === 'publishing')).toBe(false);
-    // DAST of the running app is a v0.2 limit too (the app start is repo code; ruling in the G4 report)
-    expect(a.notes).toContain(NOT_RENDERED_V02.dast);
-    expect(text).not.toMatch(/zap|nuclei/i);
+    // DAST of the running app is no limit (G4-R1): it runs in its two jobs (test/jobs-dast.test.ts)
+    expect(NOT_RENDERED_V02.dast).toBeUndefined();
+    expect(a.merge['dast-run--web']).toBeDefined();
+    expect(a.merge['dast--web']).toBeDefined();
   });
 
   it('assemble: starter tests render in the isolated job; isolatedTestJob stays false', () => {
@@ -521,7 +459,7 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
   });
 
   it('assemble: assembled proof workflows pass checkProofWorkflows', () => {
-    const a = assemble(planned(profileOf([node({ dockerfile: 'Dockerfile' })]), { over: { skipped: [{ part: 'deploy', reason: 't' }] } }), PROOF_SIGNING_MODE);
+    const a = assemble(planned(profileOf([node({ dockerfile: 'Dockerfile', port: 3000 })]), { over: { skipped: [{ part: 'deploy', reason: 't' }] } }), PROOF_SIGNING_MODE);
     const proof = [wf(a.merge, '.github/workflows/pipegen.yml', PR_ON), wf(a.push, '.github/workflows/pipegen-push.yml', { push: null })];
     expect(() => checkProofWorkflows(proof.map((f) => ({ path: f.path, content: f.content, kind: 'proof' as const })))).not.toThrow();
     // without its egress step first, a job breaks the proof rules
@@ -561,7 +499,7 @@ describe('G4 carries', () => {
 
 
   it('referee: COSIGN_, SIGSTORE_ and TUF_ env names refused in a job that holds a cosign step', async () => {
-    const pub = planned(profileOf([node({ dockerfile: 'Dockerfile' })]), {
+    const pub = planned(profileOf([node({ dockerfile: 'Dockerfile', port: 3000 })]), {
       caps: { ...CAPS, keylessSigningAllowed: true }, over: { signing: { mode: 'keyless', images: [{ service: 'app', repo: 'ghcr.io/o/r-app' }] } },
     });
     const a = assemble(pub, 'keyless');
