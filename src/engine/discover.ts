@@ -449,8 +449,9 @@ export async function discover(need: Need, p: RepoProfile, deps: DiscoverDeps): 
 /**
  * The mention-only list (PipelineDraft.suggestions): unreviewed discovery candidates whose stats (read for that
  * same repo) pass the quality bar at `now`, each once, as exactly { name, repo, why }. A candidate without stats,
- * or whose stats fail the bar, is skipped. Never a step. name and why go through safeText; the report's Markdown
- * output uses safeMarkdown on top (Plan G/U). suggestTools is the supported way to get here.
+ * or whose stats fail the bar, is skipped. Never a step. name and why go through safeText; the audit report's Markdown
+ * output uses safeMarkdown on top (Plan U). PIPEGEN.md never does: Plan F's builder makes name and why cleanForDoc text
+ * (src/debate/builder.ts suggestionName), written as is. suggestTools is the supported way to get here.
  */
 export function toSuggestions(cands: Candidate[], why: Map<string, string>, bar: QualityBar, now: Date): PipelineDraft['suggestions'] {
   const out: PipelineDraft['suggestions'] = [];

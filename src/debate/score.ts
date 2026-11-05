@@ -3,7 +3,7 @@
 // AI. A wrong winner can loosen a blocking check, so every rule leans the safe way: a missed critical problem loses, a run that did
 // not finish loses, and a near tie goes to the judge's (safer) option. Every explanation line is built here from fixed words and the
 // planted items' fixed texts (never an id, which carries a service slug), from a plain alphabet, so it also passes the PIPEGEN.md
-// judge (it goes into that file).
+// judge as written (it goes into that file as is, never through safeMarkdown: final review I1).
 import type { PlantedItem } from './planted.js';
 
 /** What one option's proof run showed (built by decide.ts optionRunOf). Ids are the planted items' ids. */

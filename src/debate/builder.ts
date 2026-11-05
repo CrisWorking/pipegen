@@ -57,6 +57,8 @@ export const ADVISORY_TOOLS: ReadonlySet<string> = new Set(['nuclei', 'jscpd', '
 export const MAX_OFFERED_SUGGESTIONS = 20;
 /** The cap of a suggestion's `why` (ruling S4). */
 export const SUGGESTION_WHY_MAX = 200;
+/** The cap of a suggestion's name (discover.ts toSuggestions keeps at most 64 characters). */
+export const SUGGESTION_NAME_MAX = 64;
 /** The cap of the cleaned "because" in a reason. */
 export const BECAUSE_MAX = 300;
 /** The most characters of AI text the schema accepts per free-text field (the cleaner cuts further). Shared with the judge (F3). */
@@ -83,8 +85,22 @@ export interface Choice {
   by: 'ai' | 'pipegen';
 }
 
-/** A mention-only tool (PipelineDraft.suggestions): name and repo from the candidate record, only `why` from the AI (cleaned). Never run. */
+/**
+ * A mention-only tool (PipelineDraft.suggestions): name and repo from the candidate record, only `why` from the AI. Never run. `name`
+ * (GitHub discovery text) and `why` are cleanForDoc text (suggestionName; final review m1): doc-final, written into PIPEGEN.md as they
+ * are, never through safeMarkdown. `repo` passed isGitHubRepo.
+ */
 export type Suggestion = PipelineDraft['suggestions'][number];
+
+/**
+ * A suggestion's name for PIPEGEN.md (final review m1): the discovery name when cleanForDoc leaves it as it is, else the repository's
+ * own name, cleaned (so a name with a link, HTML, an @ or a cut mark is never half kept).
+ */
+export function suggestionName(name: string, repo: string): string {
+  const n = String(name);
+  if (cleanForDoc(n, SUGGESTION_NAME_MAX) === n) return n;
+  return cleanForDoc(String(repo).slice(String(repo).indexOf('/') + 1), SUGGESTION_NAME_MAX);
+}
 
 /** Why code, not the AI, covers a need (ruling S20). */
 export type ByCodeKind = 'pipegen-job' | 'project-script' | 'pipegen-egress' | 'no-reviewed-tool';
@@ -676,14 +692,14 @@ export async function buildChoices(needs: readonly Need[], candidates: ReadonlyM
         const offer = o.suggestions.find((x) => x.id === s.id);
         if (offer === undefined || seen.has(offer.id)) continue;
         seen.add(offer.id);
-        suggestions.push({ name: offer.suggestion.name, repo: offer.suggestion.repo, why: cleanForDoc(s.why, SUGGESTION_WHY_MAX) });
+        suggestions.push({ name: suggestionName(offer.suggestion.name, offer.suggestion.repo), repo: offer.suggestion.repo, why: cleanForDoc(s.why, SUGGESTION_WHY_MAX) });
       }
       done = true;
     }
     if (!done) throw new BuilderError('The builder AI answered twice with picks pipegen can not use, so pipegen stopped. Nothing it picked was used.', problems, usage);
   } else {
     // no key for the AI: no request; the suggestions keep pipegen's own text from toSuggestions
-    suggestions = o.suggestions.map((s) => ({ ...s.suggestion, why: cleanForDoc(s.suggestion.why, SUGGESTION_WHY_MAX) }));
+    suggestions = o.suggestions.map((s) => ({ ...s.suggestion, name: suggestionName(s.suggestion.name, s.suggestion.repo), why: cleanForDoc(s.suggestion.why, SUGGESTION_WHY_MAX) }));
   }
 
   const choices: Choice[] = [];

@@ -3,7 +3,7 @@
 // optionRunOf turns a variant's finished runs into the scoring input and fails safe (every item missed) on anything unclear.
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import type { Choice } from '../src/debate/builder.js';
-import { decideDisputes, MAX_PROVEN_DISPUTES, optionRunOf, PLACEMENTS_ITEM_ID, placementItem, toolsByKey, type OptionRunContext } from '../src/debate/decide.js';
+import { decideDisputes, disputeExpected, MAX_PROVEN_DISPUTES, optionRunOf, PLACEMENTS_ITEM_ID, placementItem, toolsByKey, type OptionRunContext } from '../src/debate/decide.js';
 import type { Dispute, DisputeOption } from '../src/debate/debate.js';
 import { plantedFiles, type PlantedItem } from '../src/debate/planted.js';
 import type { OptionRun } from '../src/debate/score.js';
@@ -15,6 +15,7 @@ import type { PlantedPlacement, Variant } from '../src/proof/snapshot.js';
 import { VARIANT_RE } from '../src/proof/snapshot.js';
 import { ProofStopError, ScratchGuardError } from '../src/proof/target.js';
 import { interrupting } from '../src/util/exit-hooks.js';
+import { safeMarkdown } from '../src/util/safe-text.js';
 import { choicesFor, DOC_OPTS, NEEDS, P } from './helpers/debate-fixtures.js';
 import { file, HARNESS_PATH, job, PIPEGEN, run } from './helpers/proof-eval.js';
 
@@ -68,7 +69,7 @@ const doc = (line: string): string[] => pipegenDocProblems(`# PIPEGEN\n\n- ${lin
 describe('F6 decide', () => {
   it('decide: runs each option on its own dispute-<id>-a / dispute-<id>-b variant (with the planted files) and returns winners', async () => {
     const f = fakeProve({ 'dispute-d1-a': GOOD, 'dispute-d1-b': WORSE, 'dispute-d2-a': BAD, 'dispute-d2-b': GOOD });
-    const r = await decideDisputes([d1('pipegen'), d2()], { prove: f.prove, expected: ITEMS, choices: base });
+    const r = await decideDisputes([d1('pipegen'), d2()], { prove: f.prove, expected: ITEMS, placements: [], choices: base });
     expect(f.calls.map((c) => c.variant)).toEqual(['dispute-d1-a', 'dispute-d1-b', 'dispute-d2-a', 'dispute-d2-b']);
     for (const c of f.calls) { expect(c.variant).toMatch(VARIANT_RE); expect(['main', 'planted']).not.toContain(c.variant); }
     // each run gets the debate's choices with only the dispute's key replaced by that option's choice
@@ -98,7 +99,7 @@ describe('F6 decide', () => {
   it('decide: the champion starts as the key\'s own option, wherever it is listed', async () => {
     const swapped = dispute('d1', 'sast--api', [opt('judge', 'dispute-d1-b', SAST_B), opt('builder', 'dispute-d1-a', SAST_A)]);
     const f = fakeProve({ 'dispute-d1-a': GOOD, 'dispute-d1-b': runOf(ITEMS, { durationMs: 60_000 }) });
-    const r = await decideDisputes([swapped], { prove: f.prove, expected: ITEMS, choices: base });
+    const r = await decideDisputes([swapped], { prove: f.prove, expected: ITEMS, placements: [], choices: base });
     expect(f.calls.map((c) => c.variant)).toEqual(['dispute-d1-a', 'dispute-d1-b']);
     expect(r.winners.get('sast--api')).toBe(SAST_B);   // a near tie: the judge's option
   });
@@ -108,8 +109,8 @@ describe('F6 decide', () => {
     const f = fakeProve({ 'dispute-d1-a': GOOD, 'dispute-d1-b': WORSE });
     const sk = fakeProve({});
     const lines = [
-      ...(await decideDisputes([slugged], { prove: f.prove, expected: ITEMS, choices: base })).scoreboard,
-      ...(await decideDisputes([slugged], { prove: sk.prove, expected: ITEMS, choices: base, canProve: () => false })).scoreboard,
+      ...(await decideDisputes([slugged], { prove: f.prove, expected: ITEMS, placements: [], choices: base })).scoreboard,
+      ...(await decideDisputes([slugged], { prove: sk.prove, expected: ITEMS, placements: [], choices: base, canProve: () => false })).scoreboard,
     ];
     expect(lines.length).toBeGreaterThan(8);
     for (const l of lines) { expect(l).not.toMatch(/[a-z]--[a-z]/); expect(l).not.toContain('acme'); expect(doc(l)).toEqual([]); }
@@ -120,26 +121,26 @@ describe('F6 decide', () => {
     // P1: the builder's run claims nothing missed and nothing critical missed, but caught nothing
     const liar: OptionRun = { optionLabel: 'x', durationMs: 0, caught: [], missed: [], criticalMissed: false, timedOut: false };
     const judge4 = runOf(ITEMS.filter((i) => i.id !== (ITEMS.find((x) => x.critical) as PlantedItem).id));   // one critical missed
-    const p1 = await decideDisputes([d1()], { prove: fakeProve({ 'dispute-d1-a': liar, 'dispute-d1-b': judge4 }).prove, expected: ITEMS, choices: base });
+    const p1 = await decideDisputes([d1()], { prove: fakeProve({ 'dispute-d1-a': liar, 'dispute-d1-b': judge4 }).prove, expected: ITEMS, placements: [], choices: base });
     // both missed a critical: points decide, and the judge's 4 caught beat 0
     expect(p1.winners.get('sast--api')).toBe(SAST_B);
     expect(p1.scoreboard.some((l) => /Missed a critical problem/.test(l) && l.includes("the builder's pick"))).toBe(true);
     // P2: an unreadable duration is timedOut with no time points: it loses to an equal run that finished
     for (const bad of [Infinity, Number.NaN, -60_000]) {
-      const r = await decideDisputes([d1()], { prove: fakeProve({ 'dispute-d1-a': runOf(ITEMS, { durationMs: bad }), 'dispute-d1-b': runOf(ITEMS, { durationMs: 300_000 }) }).prove, expected: ITEMS, choices: base });
+      const r = await decideDisputes([d1()], { prove: fakeProve({ 'dispute-d1-a': runOf(ITEMS, { durationMs: bad }), 'dispute-d1-b': runOf(ITEMS, { durationMs: 300_000 }) }).prove, expected: ITEMS, placements: [], choices: base });
       expect(r.winners.get('sast--api')).toBe(SAST_B);
       expect(r.scoreboard.join('\n')).toContain('Its run could not be timed.');
     }
     // a lying flag is only ever ORed in: a true flag stays
     const flagged = runOf(ITEMS, { criticalMissed: true });
-    const r3 = await decideDisputes([d1()], { prove: fakeProve({ 'dispute-d1-a': flagged, 'dispute-d1-b': runOf(ITEMS, { criticalMissed: false }) }).prove, expected: ITEMS, choices: base });
+    const r3 = await decideDisputes([d1()], { prove: fakeProve({ 'dispute-d1-a': flagged, 'dispute-d1-b': runOf(ITEMS, { criticalMissed: false }) }).prove, expected: ITEMS, placements: [], choices: base });
     expect(r3.winners.get('sast--api')).toBe(SAST_B);
   });
 
   it('decide: a dispute with only judge options proves each once and keeps the earlier objection on a near tie', async () => {
     const onlyJudges = dispute('d1', 'sast--api', [opt('judge', 'dispute-d1-1-b', SAST_B), opt('judge', 'dispute-d1-2-b', SAST_A)]);
     const f = fakeProve({ 'dispute-d1-1-b': GOOD, 'dispute-d1-2-b': GOOD });
-    const r = await decideDisputes([onlyJudges], { prove: f.prove, expected: ITEMS, choices: base });
+    const r = await decideDisputes([onlyJudges], { prove: f.prove, expected: ITEMS, placements: [], choices: base });
     expect(f.calls.map((c) => c.variant)).toEqual(['dispute-d1-1-b', 'dispute-d1-2-b']);
     expect(r.winners.get('sast--api')).toBe(SAST_B);
   });
@@ -154,7 +155,7 @@ describe('F6 decide', () => {
     const b1 = runOf(ITEMS, { durationMs: 3 * 60_000 });               // total - 3
     const b2 = runOf(ITEMS, { durationMs: 1 * 60_000 });               // total - 1, within 2 of b1
     const f = fakeProve({ 'dispute-d1-a': a, 'dispute-d1-1-b': b1, 'dispute-d1-2-b': b2 });
-    const r = await decideDisputes([merged], { prove: f.prove, expected: ITEMS, choices: base });
+    const r = await decideDisputes([merged], { prove: f.prove, expected: ITEMS, placements: [], choices: base });
     expect(f.calls.map((c) => c.variant)).toEqual(['dispute-d1-a', 'dispute-d1-1-b', 'dispute-d1-2-b']);   // once each, in order
     expect(r.winners.get('sast--api')).toBe(SAST_B);
     const text = r.scoreboard.join('\n');
@@ -164,13 +165,13 @@ describe('F6 decide', () => {
     for (const l of r.scoreboard) expect(doc(l)).toEqual([]);
     // a clear win for the later objection takes the dispute
     const f2 = fakeProve({ 'dispute-d1-a': a, 'dispute-d1-1-b': b1, 'dispute-d1-2-b': runOf(ITEMS, { durationMs: 0 }) });   // total: 3 points over b1
-    expect((await decideDisputes([merged], { prove: f2.prove, expected: ITEMS, choices: base })).winners.get('sast--api')).toBe(SAST_C);
+    expect((await decideDisputes([merged], { prove: f2.prove, expected: ITEMS, placements: [], choices: base })).winners.get('sast--api')).toBe(SAST_C);
     // a judge option that beat the builder but loses to a later one on a missed critical
     const f3 = fakeProve({ 'dispute-d1-a': BAD, 'dispute-d1-1-b': WORSE, 'dispute-d1-2-b': BAD });
-    expect((await decideDisputes([merged], { prove: f3.prove, expected: ITEMS, choices: base })).winners.get('sast--api')).toBe(SAST_B);
+    expect((await decideDisputes([merged], { prove: f3.prove, expected: ITEMS, placements: [], choices: base })).winners.get('sast--api')).toBe(SAST_B);
     // when the builder side wins against the first judge option it then meets the second one
     const f4 = fakeProve({ 'dispute-d1-a': GOOD, 'dispute-d1-1-b': BAD, 'dispute-d1-2-b': BAD });
-    const r4 = await decideDisputes([merged], { prove: f4.prove, expected: ITEMS, choices: base });
+    const r4 = await decideDisputes([merged], { prove: f4.prove, expected: ITEMS, placements: [], choices: base });
     expect(f4.calls).toHaveLength(3);
     expect(r4.winners.get('sast--api')).toBe(SAST_A);
   });
@@ -181,7 +182,7 @@ describe('F6 decide', () => {
     const script: Record<string, OptionRun> = {};
     for (let n = 1; n <= 5; n++) { script[`dispute-d${n}-a`] = GOOD; script[`dispute-d${n}-b`] = BAD; }
     const f = fakeProve(script);
-    const r = await decideDisputes([mk(1), mk(2), mk(3), mk(4), mk(5)], { prove: f.prove, expected: ITEMS, choices: base });
+    const r = await decideDisputes([mk(1), mk(2), mk(3), mk(4), mk(5)], { prove: f.prove, expected: ITEMS, placements: [], choices: base });
     // three proven (builder wins), the 4th and 5th go to the judge without a run
     expect(f.calls.map((c) => c.variant)).toEqual(['d1', 'd2', 'd3'].flatMap((d) => [`dispute-${d}-a`, `dispute-${d}-b`]));
     expect([...r.winners.values()].map((c) => c.chosen.tool.id)).toEqual(['semgrep', 'semgrep', 'semgrep', 'bandit', 'bandit']);
@@ -193,24 +194,24 @@ describe('F6 decide', () => {
     // canProve: asked once per dispute (with the number of runs it needs); false → the judge's option, no run, other disputes go on
     const asked: number[] = [];
     const f2 = fakeProve(script);
-    const r2 = await decideDisputes([mk(1), mk(2), mk(3)], { prove: f2.prove, expected: ITEMS, choices: base, canProve: async (n) => { asked.push(n); return asked.length !== 2; } });
+    const r2 = await decideDisputes([mk(1), mk(2), mk(3)], { prove: f2.prove, expected: ITEMS, placements: [], choices: base, canProve: async (n) => { asked.push(n); return asked.length !== 2; } });
     expect(asked).toEqual([2, 2, 2]);
     expect(f2.calls.map((c) => c.variant)).toEqual(['dispute-d1-a', 'dispute-d1-b', 'dispute-d3-a', 'dispute-d3-b']);
     expect([...r2.winners.values()].map((c) => c.chosen.tool.id)).toEqual(['semgrep', 'bandit', 'semgrep']);
     expect(r2.scoreboard).toContain("Dispute d2 on the sast check was decided for the judge's option (bandit) without a proof run (not enough Actions minutes are left for it).");
     // a skipped dispute does not use up the budget; a canProve that throws counts as false
     const f3 = fakeProve(script);
-    const r3 = await decideDisputes([mk(1), mk(2)], { prove: f3.prove, expected: ITEMS, choices: base, canProve: () => { throw new Error('meter broke'); } });
+    const r3 = await decideDisputes([mk(1), mk(2)], { prove: f3.prove, expected: ITEMS, placements: [], choices: base, canProve: () => { throw new Error('meter broke'); } });
     expect(f3.calls).toEqual([]);
     expect([...r3.winners.values()].map((c) => c.chosen.tool.id)).toEqual(['bandit', 'bandit']);
     // a merged dispute that is not proven goes to its first judge option (the earliest objection)
     const SAST_C = structuredClone(SAST_B);
     const merged = dispute('d1', 'sast--api', [opt('builder', 'dispute-d1-a', SAST_A), opt('judge', 'dispute-d1-1-b', SAST_B), opt('judge', 'dispute-d1-2-b', SAST_C)]);
-    const r4 = await decideDisputes([merged], { prove: f3.prove, expected: ITEMS, choices: base, canProve: () => false });
+    const r4 = await decideDisputes([merged], { prove: f3.prove, expected: ITEMS, placements: [], choices: base, canProve: () => false });
     expect(r4.winners.get('sast--api')).toBe(SAST_B);
     expect(asked).toHaveLength(3);
     // no dispute, no output
-    expect(await decideDisputes([], { prove: f3.prove, expected: ITEMS, choices: base })).toEqual({ winners: new Map(), scoreboard: [] });
+    expect(await decideDisputes([], { prove: f3.prove, expected: ITEMS, placements: [], choices: base })).toEqual({ winners: new Map(), scoreboard: [] });
     // the skipped line, as printed, passes the PIPEGEN.md judge
     for (const l of [...skipped, ...r2.scoreboard]) expect(doc(l)).toEqual([]);
   });
@@ -219,7 +220,7 @@ describe('F6 decide', () => {
     const dispute1 = d1();
     // another error in one option: that option is timedOut with every item missed, so it loses to a finished one
     const f = fakeProve({ 'dispute-d1-a': new Error('network went away'), 'dispute-d1-b': WORSE });
-    const r = await decideDisputes([dispute1], { prove: f.prove, expected: ITEMS, choices: base });
+    const r = await decideDisputes([dispute1], { prove: f.prove, expected: ITEMS, placements: [], choices: base });
     expect(r.winners.get('sast--api')).toBe(SAST_B);
     const text = r.scoreboard.join('\n');
     expect(text).toContain("the builder's pick (semgrep) scored 0 points.");
@@ -229,47 +230,47 @@ describe('F6 decide', () => {
     expect(text).not.toContain('network went away');   // an error message never reaches the scoreboard
     // the same error in the judge's option → the builder's wins
     const g = fakeProve({ 'dispute-d1-a': BAD, 'dispute-d1-b': new Error('boom') });
-    expect((await decideDisputes([dispute1], { prove: g.prove, expected: ITEMS, choices: base })).winners.get('sast--api')).toBe(SAST_A);
+    expect((await decideDisputes([dispute1], { prove: g.prove, expected: ITEMS, placements: [], choices: base })).winners.get('sast--api')).toBe(SAST_A);
     // both fail → both lost, the points tie, the judge's option wins
     const h = fakeProve({ 'dispute-d1-a': new Error('a'), 'dispute-d1-b': new Error('b') });
-    expect((await decideDisputes([dispute1], { prove: h.prove, expected: ITEMS, choices: base })).winners.get('sast--api')).toBe(SAST_B);
+    expect((await decideDisputes([dispute1], { prove: h.prove, expected: ITEMS, placements: [], choices: base })).winners.get('sast--api')).toBe(SAST_B);
     // a run of the wrong shape is a lost run too
     const w = fakeProve({ 'dispute-d1-a': { not: 'a run' } as unknown as OptionRun, 'dispute-d1-b': WORSE });
-    expect((await decideDisputes([dispute1], { prove: w.prove, expected: ITEMS, choices: base })).winners.get('sast--api')).toBe(SAST_B);
+    expect((await decideDisputes([dispute1], { prove: w.prove, expected: ITEMS, placements: [], choices: base })).winners.get('sast--api')).toBe(SAST_B);
 
     // passes through, whichever option throws it, and nothing after it runs
     const cap = new CapReachedError({ kind: 'minutes', limit: 10, used: 11 } as unknown as CapReached, [], []);
     for (const err of [new ProofStopError('stop'), cap, new ScratchGuardError('guard')]) {
       for (const where of ['dispute-d1-a', 'dispute-d1-b']) {
         const p = fakeProve({ 'dispute-d1-a': where === 'dispute-d1-a' ? err : GOOD, 'dispute-d1-b': where === 'dispute-d1-b' ? err : GOOD, 'dispute-d2-a': GOOD, 'dispute-d2-b': GOOD });
-        await expect(decideDisputes([dispute1, d2()], { prove: p.prove, expected: ITEMS, choices: base })).rejects.toBe(err);
+        await expect(decideDisputes([dispute1, d2()], { prove: p.prove, expected: ITEMS, placements: [], choices: base })).rejects.toBe(err);
         expect(p.calls.every((c) => c.variant.startsWith('dispute-d1'))).toBe(true);
       }
     }
     // an interrupt that has begun: nothing is proven; an error while interrupting is not turned into a lost run
     vi.mocked(interrupting).mockReturnValue(true);
     const i1 = fakeProve({ 'dispute-d1-a': GOOD, 'dispute-d1-b': GOOD });
-    await expect(decideDisputes([dispute1], { prove: i1.prove, expected: ITEMS, choices: base })).rejects.toBeInstanceOf(ProofStopError);
+    await expect(decideDisputes([dispute1], { prove: i1.prove, expected: ITEMS, placements: [], choices: base })).rejects.toBeInstanceOf(ProofStopError);
     expect(i1.calls).toEqual([]);
     vi.mocked(interrupting).mockReturnValue(false);
     let n = 0;
     const i2 = { prove: async (): Promise<{ run: OptionRun }> => { if (++n === 1) { vi.mocked(interrupting).mockReturnValue(true); throw new Error('killed'); } return { run: GOOD }; } };
-    await expect(decideDisputes([dispute1], { prove: i2.prove, expected: ITEMS, choices: base })).rejects.toThrow('killed');
+    await expect(decideDisputes([dispute1], { prove: i2.prove, expected: ITEMS, placements: [], choices: base })).rejects.toThrow('killed');
     vi.mocked(interrupting).mockReturnValue(false);
     // an interrupt that began between the two options of one dispute stops before the second option
     const i4 = fakeProve({ 'dispute-d1-a': GOOD, 'dispute-d1-b': GOOD });
-    await expect(decideDisputes([dispute1], { prove: async (v, c) => { const out = await i4.prove(v, c); vi.mocked(interrupting).mockReturnValue(true); return out; }, expected: ITEMS, choices: base })).rejects.toBeInstanceOf(ProofStopError);
+    await expect(decideDisputes([dispute1], { prove: async (v, c) => { const out = await i4.prove(v, c); vi.mocked(interrupting).mockReturnValue(true); return out; }, expected: ITEMS, placements: [], choices: base })).rejects.toBeInstanceOf(ProofStopError);
     expect(i4.calls.map((c) => c.variant)).toEqual(['dispute-d1-a']);
     vi.mocked(interrupting).mockReturnValue(false);
     // an interrupt stops the decision even when no dispute would be proven (budget or canProve says no)
     vi.mocked(interrupting).mockReturnValue(true);
-    await expect(decideDisputes([dispute1], { prove: i4.prove, expected: ITEMS, choices: base, canProve: () => false })).rejects.toBeInstanceOf(ProofStopError);
+    await expect(decideDisputes([dispute1], { prove: i4.prove, expected: ITEMS, placements: [], choices: base, canProve: () => false })).rejects.toBeInstanceOf(ProofStopError);
     vi.mocked(interrupting).mockReturnValue(false);
     // an interrupt between two disputes stops before the second
     let seen = 0;
     const i3 = fakeProve({ 'dispute-d1-a': GOOD, 'dispute-d1-b': GOOD, 'dispute-d2-a': GOOD, 'dispute-d2-b': GOOD });
     const wrapped = async (v: Variant, c: Choice[]) => { const out = await i3.prove(v, c); if (++seen === 2) vi.mocked(interrupting).mockReturnValue(true); return out; };
-    await expect(decideDisputes([dispute1, d2()], { prove: wrapped, expected: ITEMS, choices: base })).rejects.toBeInstanceOf(ProofStopError);
+    await expect(decideDisputes([dispute1, d2()], { prove: wrapped, expected: ITEMS, placements: [], choices: base })).rejects.toBeInstanceOf(ProofStopError);
     expect(i3.calls).toHaveLength(2);
     vi.mocked(interrupting).mockReturnValue(false);
   });
@@ -281,7 +282,7 @@ const TOOL_OF_KEY = new Map([['secrets', 'gitleaks'], ['sast--api', 'semgrep'], 
 const RUN_ID = 77;
 const t0 = Date.parse('2026-11-05T10:00:00Z');
 const at = (min: number, sec = 0): number => t0 + (min * 60 + sec) * 1000;
-const ctxOf = (over: Partial<OptionRunContext> = {}): OptionRunContext => ({ optionLabel: 'opt', expected: ITEMS, toolOfKey: TOOL_OF_KEY, ...over });
+const ctxOf = (over: Partial<OptionRunContext> = {}): OptionRunContext => ({ optionLabel: 'opt', expected: ITEMS, placements: [], toolOfKey: TOOL_OF_KEY, ...over });
 
 /** The finding the gate reports for a planted item: the item's own job (needKey), the tool of that job, the item's file. */
 const findingOf = (i: PlantedItem, over: Record<string, unknown> = {}): Record<string, unknown> => ({
@@ -469,3 +470,61 @@ function everyMissedExceptNone(r: OptionRun): void {
   expect(r.caught).toEqual([]);
   expect(r.criticalMissed).toBe(true);
 }
+
+// ---------- final review fixes (I1, m4) ----------
+
+describe('final review fixes', () => {
+  const PLACED_AT = 'gitleaks.toml/app.js';
+  const PLACEMENTS: PlantedPlacement[] = [
+    { kind: 'secret', path: PLACED_AT, pathBytes: Buffer.from(PLACED_AT), rule: 'generic-api-key', line: 1 },
+    { kind: 'integrity-warning', path: '.gitleaksignore', pathBytes: Buffer.from('.gitleaksignore'), line: 0 },
+  ];
+
+  it('m4: disputeExpected is the planted items plus the C1b placement item (once), whatever the caller already appended', () => {
+    const pItem = placementItem(PLACEMENTS) as PlantedItem;
+    expect(disputeExpected(ITEMS, PLACEMENTS)).toEqual([...ITEMS, pItem]);
+    expect(disputeExpected([...ITEMS, pItem], PLACEMENTS)).toEqual([...ITEMS, pItem]);
+    expect(disputeExpected(ITEMS, [PLACEMENTS[1] as PlantedPlacement])).toEqual(ITEMS);
+    expect(disputeExpected(ITEMS, [])).toEqual(ITEMS);
+    // an appended item stays even with no placement handed over: it is then missed (fail closed), never dropped
+    expect(disputeExpected([...ITEMS, pItem], [])).toEqual([...ITEMS, pItem]);
+    // optionRunOf judges the placements from `placements` alone: the caller need not append the item
+    const blocking = ITEMS.map((i) => findingOf(i));
+    expect(optionRunOf(variantOf(prRun(blocking)), ctxOf({ expected: ITEMS, placements: PLACEMENTS }))).toMatchObject({ missed: [PLACEMENTS_ITEM_ID], criticalMissed: true });
+  });
+
+  it('m4: a secrets dispute is judged on both the planted secrets file and the C1b placements', async () => {
+    const leakItem = ITEMS.find((i) => i.needKey === 'secrets') as PlantedItem;
+    expect(leakItem.file).not.toBe(PLACED_AT);
+    // the builder's betterleaks reports only the planted secrets file; the judge's gitleaks reports both files but runs 7 minutes longer
+    const prove = async (variant: Variant, choices: Choice[]): Promise<{ run: OptionRun }> => {
+      // the option's own tool per job; the deps jobs (no AI choice in these fixtures) keep osv-scanner
+      const tools = new Map([...TOOL_OF_KEY, ...toolsByKey(choices)]);
+      const judge = variant === 'dispute-d2-b';
+      const blocking: object[] = ITEMS.map((i) => findingOf(i, { tool: tools.get(i.needKey) }));
+      if (judge) blocking.push({ needId: 'secrets', job: 'secrets', tool: tools.get('secrets'), ruleId: 'generic-api-key', severity: 'high', file: PLACED_AT, isNew: null, ...flagged(true) });
+      const end = judge ? 16 : 9;
+      const jobs = [timedJob('pipegen / secrets', 'success', at(0), at(end - 1)), timedJob('pipegen / gate', 'failure', at(end - 1), at(end))];
+      return { run: optionRunOf(variantOf(prRun(blocking, { jobs })), { optionLabel: variant, expected: ITEMS, placements: PLACEMENTS, toolOfKey: tools }) };
+    };
+    const r = await decideDisputes([d2()], { prove, expected: ITEMS, placements: PLACEMENTS, choices: base });
+    expect(r.winners.get('secrets')?.chosen.tool.id).toBe('gitleaks');
+    expect(r.scoreboard.join('\n')).toMatch(/won because the builder's pick \(betterleaks\) missed a critical problem/);
+    expect(r.scoreboard.join('\n')).toContain('hard-coded API keys in files that path allowlists often skip');
+    // without the placements the builder's faster run would have won on points: the placements are what decide here
+    const blind = await decideDisputes([d2()], { prove: async (v, c) => { const out = await prove(v, c); return { run: { ...out.run, caught: out.run.caught.filter((id) => id !== PLACEMENTS_ITEM_ID), missed: out.run.missed.filter((id) => id !== PLACEMENTS_ITEM_ID), criticalMissed: false } }; }, expected: ITEMS, placements: [], choices: base });
+    expect(blind.winners.get('secrets')?.chosen.tool.id).toBe('betterleaks');
+  });
+
+  it('I1: a long scoreboard line (every critical item missed) passes the PIPEGEN.md judge as written; safeMarkdown would break it', async () => {
+    const f = fakeProve({ 'dispute-d1-a': BAD, 'dispute-d1-b': GOOD });
+    const r = await decideDisputes([d1()], { prove: f.prove, expected: ITEMS, placements: [], choices: base });
+    const long = r.scoreboard.filter((l) => [...l].length > 200);
+    expect(long.length).toBeGreaterThan(0);
+    for (const line of r.scoreboard) expect(doc(line), line).toEqual([]);
+    for (const line of long) {
+      expect(safeMarkdown(line)).not.toBe(line);
+      expect(doc(safeMarkdown(line))).not.toEqual([]);
+    }
+  });
+});

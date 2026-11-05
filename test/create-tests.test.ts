@@ -13,6 +13,7 @@ import type { NpmRunner } from '../src/create/npm-deps.js';
 import { SecretVault } from '../src/create/secrets.js';
 import { checkAttempt, countAssertions, countTests, createStarterTests, StarterTestsError, testsSchema, validateGeneratedTests, type StarterDeps, type TestPlan } from '../src/create/tests.js';
 import { CREATED_RULES } from '../src/engine/created-files.js';
+import { pipegenDocProblems } from '../src/engine/created-judges/pipegen-doc.js';
 import { referee, type Linters } from '../src/engine/referee.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
 import { DEFAULT_MODEL, type AiProvider, type AiRequest, type AiUsage, type Capabilities, type CreatedFile, type PipelineDraft, type RepoProfile, type Service } from '../src/types.js';
@@ -93,6 +94,12 @@ const make = (answers: unknown[], s: Service = svc(), d: StarterDeps = deps()) =
 const cf = (path: string, content = GOOD): CreatedFile => ({ path, content, part: 'tests', reason: 't', repo: 'app' });
 
 describe('tests: the plan', () => {
+  it('tests: the plan reasons pass the PIPEGEN.md judge as written (Plan F decideTests returns them as decision.reasons; final review I1)', async () => {
+    const plan = await make([ans([{ path: 'test/add.test.js', content: GOOD }])]).run();
+    expect(plan.reasons.length).toBeGreaterThanOrEqual(2);
+    for (const r of plan.reasons) expect(pipegenDocProblems(`# PIPEGEN\n\n- ${r}\n`, { owner: 'o', repo: 'r', containsKnownValue: () => false }), r).toEqual([]);
+  });
+
   it('tests: plan has framework, reasons and files under test folder', async () => {
     const m = make([ans([{ path: 'test/add.test.js', content: GOOD }, { path: 'test/helpers/h.js', content: 'export const h = (n) => n * 2;\n' }])]);
     const plan = await m.run();

@@ -31,14 +31,28 @@ const DEFAULT_PIPEGEN_WORKFLOW = '.github/workflows/pipegen.yml';
 
 /**
  * The C1b placements (secrets in paths that allowlists commonly skip) as one critical item, for a dispute on the secrets check:
- * caught only when the option's secrets scanner reported every one of them. Null when there is no secret placement. Append it to
- * the planted items before scoring.
+ * caught only when the option's secrets scanner reported every one of them. Null when there is no secret placement. Callers never
+ * append it themselves: optionRunOf and decideDisputes build their list with disputeExpected (final review m4).
  */
 export function placementItem(placements: readonly PlantedPlacement[]): PlantedItem | null {
   if (!placements.some((p) => p.kind === 'secret')) return null;
   return {
     id: PLACEMENTS_ITEM_ID, category: 'secrets', item: 'hard-coded API keys in files that path allowlists often skip', file: '', critical: true, minSeverity: 'high', needKey: 'secrets',
   };
+}
+
+/**
+ * The full list every dispute option is scored against (final review m4): the planted items (plantedFiles' `expected`) plus the
+ * placementItem when `placements` holds a secret, once. An item with the placement id that is already there is kept (never dropped:
+ * with no placement handed over it is then missed). optionRunOf and decideDisputes both build their list with this, from the same
+ * planted items and placements, so a secrets dispute is always judged on the planted file and on the placements.
+ */
+export function disputeExpected(planted: readonly PlantedItem[], placements: readonly PlantedPlacement[]): PlantedItem[] {
+  const out = [...planted];
+  if (out.some((e) => e.id === PLACEMENTS_ITEM_ID)) return out;
+  const item = placementItem(Array.isArray(placements) ? placements : []);
+  if (item !== null) out.push(item);
+  return out;
 }
 
 /** Each need key → the tool of that key in `choices` (the option's own tool per job, F5-R3). */
@@ -55,10 +69,10 @@ export function toolsByKey(choices: readonly Choice[]): Map<string, string> {
 
 export interface OptionRunContext {
   optionLabel: string;
-  /** The planted items (plantedFiles' `expected`, plus placementItem when the placements are judged). */
+  /** The planted items (plantedFiles' `expected`); the placement item is added from `placements` (disputeExpected). */
   expected: readonly PlantedItem[];
-  /** The C1b secret placements, judged only through the pseudo-item. */
-  placements?: readonly PlantedPlacement[];
+  /** The C1b placements of this variant (plantedSecretPlacements; `[]` when none): judged through the one placement item. Required, so it can't be forgotten. */
+  placements: readonly PlantedPlacement[];
   /** This option's own tool per need key (toolsByKey of the choices it ran with), not per category (F5-R3). */
   toolOfKey: ReadonlyMap<string, string>;
   /** Pipegen's own workflow files (default `.github/workflows/pipegen.yml`); runs of any other file are no source here. */
@@ -74,7 +88,7 @@ const normFile = (s: string): string => s.replace(/[^\x20-\x7e]/g, '');
  * read. durationMs = the last pull request job's completed_at - the first one's started_at on GitHub's clock.
  */
 export function optionRunOf(runs: VariantRuns, ctx: OptionRunContext): OptionRun {
-  const expected = ctx.expected;
+  const expected = disputeExpected(ctx.expected, ctx.placements);
   let why: OptionRun['why'];
   const allMissed = (timedOut: boolean, durationMs: number): OptionRun => ({
     optionLabel: ctx.optionLabel, durationMs, caught: [], missed: expected.map((e) => e.id), criticalMissed: true, timedOut, ...(timedOut && why !== undefined ? { why } : {}),
@@ -140,11 +154,13 @@ export function optionRunOf(runs: VariantRuns, ctx: OptionRunContext): OptionRun
 export interface DecideDeps {
   /**
    * Proves one option on its variant with `choices` (the debate's choices with this dispute's key set to the option's) and returns what it
-   * showed (Plan G: proveVariant, then optionRunOf with toolsByKey(choices)). The variant is never 'main' or 'planted'.
+   * showed (Plan G: proveVariant, then optionRunOf with toolsByKey(choices), the same `expected` and the same `placements`). The variant is never 'main' or 'planted'.
    */
   prove: (variant: Variant, choices: Choice[]) => Promise<{ run: OptionRun }>;
-  /** The planted items every option is scored against. */
+  /** The planted items every option is scored against (plantedFiles' `expected`); the placement item is added from `placements`. */
   expected: readonly PlantedItem[];
+  /** The C1b placements the variants carry (`[]` when none), the same list `prove` hands to optionRunOf (final review m4). */
+  placements: readonly PlantedPlacement[];
   /** The debate's choices (DebateResult.choices): each option runs with these, its dispute's key replaced by the option's choice. */
   choices: readonly Choice[];
   /** Plan G: whether the next dispute's runs (`runs` of them) fit what is left of the minutes cap. Not given: always. */
@@ -153,7 +169,11 @@ export interface DecideDeps {
 export interface Decision {
   /** need key → the winning choice, one per dispute. */
   winners: Map<string, Choice>;
-  /** Plain lines for PIPEGEN.md, built by code from a plain alphabet. */
+  /**
+   * Plain lines for PIPEGEN.md, built by code from catalog words and the planted items' fixed texts. Doc-final: written as they are,
+   * never through safeMarkdown (a line can pass 200 characters, and its cut mark U+2026 is refused by the PIPEGEN.md judge; final
+   * review I1).
+   */
   scoreboard: string[];
 }
 
@@ -200,6 +220,7 @@ const REASON_TEXT: Record<Reason, (winner: string, loser: string, gap: number) =
  * too), a scratch guard error and an interrupt pass through; any other error from prove makes that option timedOut with every item missed.
  */
 export async function decideDisputes(disputes: readonly Dispute[], deps: DecideDeps): Promise<Decision> {
+  const expected = disputeExpected(deps.expected, deps.placements);
   const winners = new Map<string, Choice>();
   const scoreboard: string[] = [];
   let proven = 0;
@@ -230,12 +251,12 @@ export async function decideDisputes(disputes: readonly Dispute[], deps: DecideD
       const choices = deps.choices.some((c) => c.key === d.key) ? deps.choices.map((c) => (c.key === d.key ? o.choice : c)) : [...deps.choices, o.choice];
       let run: OptionRun;
       try {
-        run = sane((await deps.prove(o.variant, choices)).run, plain(whoOf(d, o), 60), deps.expected);
+        run = sane((await deps.prove(o.variant, choices)).run, plain(whoOf(d, o), 60), expected);
       } catch (e) {
         if (e instanceof ProofStopError || e instanceof CapReachedError || e instanceof ScratchGuardError || interrupting()) throw e;
-        run = lostRun(plain(whoOf(d, o), 60), deps.expected);
+        run = lostRun(plain(whoOf(d, o), 60), expected);
       }
-      return { run, score: scoreOption(run, deps.expected) };
+      return { run, score: scoreOption(run, expected) };
     };
     scoreboard.push(`${head} was decided by a proof run: each option ran on its own branch with the same planted problems.`);
     let champ = start;
@@ -248,7 +269,7 @@ export async function decideDisputes(disputes: readonly Dispute[], deps: DecideD
     for (const challenger of challengers) {
       const cr = await runOf(challenger);
       report(challenger, cr);
-      const both = bothMissedLine(champRun.run, cr.run, deps.expected);
+      const both = bothMissedLine(champRun.run, cr.run, expected);
       if (both !== null) scoreboard.push(`${head}: ${both}`);
       const v = decideBetween(champRun.run, cr.run, champRun.score, cr.score, isJudge(champ) ? 'a' : 'b');
       const [w, l, wr, lr] = v.winner === 'a' ? [champ, challenger, champRun, cr] : [challenger, champ, cr, champRun];

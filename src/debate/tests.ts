@@ -6,6 +6,8 @@
 //   has tests            -> keep
 // Every sentence returned here is pipegen's own. The creator's `notes` (the first can be the AI's explanation) are never passed on, and the
 // NotProven has no needId: `unit-tests` / `full-tests` are floor needs and Plan G's gate inputs refuse them in `not-proven` (S19).
+// The notes, the decision reasons and the notProven reason are doc-final: Plan G writes them into PIPEGEN.md as they are, never through
+// safeMarkdown (TESTS_NOT_PROVEN_NOTE is over 200 characters, and safeMarkdown's cut mark U+2026 is refused by the judge; final review I1).
 import type { CodeBundle } from '../ai/redact.js';
 import { createStarterTests } from '../create/tests.js';
 import { STARTER_TESTS_NOT_ISOLATED } from '../create/test-rules.js';

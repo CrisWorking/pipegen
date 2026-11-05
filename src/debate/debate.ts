@@ -15,8 +15,9 @@
 // - Deploy approval = the rule OR the judge (ruling S8): the judge can only turn it on.
 // - At most MAX_DEBATE_CALLS AI requests (ruling S10), only the builder's first call and its repair carry the code bundle; an
 //   AiError (cost-cap included) passes through with the usage so far, so no unjudged choices are returned.
-// - Every line, argument and reason returned is cleanForDoc text (F1), fit for PIPEGEN.md as it is. Lines name checks in plain
-//   words ("the sast check for web"), never by need key or planted item id (F5-R4).
+// - Every line, argument and reason returned is cleanForDoc text (F1), doc-final: Plan G writes it into PIPEGEN.md as it is, never
+//   through safeMarkdown (its 200-character cut ends in U+2026 and its escapes are backslashes, both refused by the PIPEGEN.md judge;
+//   final review I1). Lines name checks in plain words ("the sast check for web"), never by need key or planted item id (F5-R4).
 import { z } from 'zod';
 import {
   ROUND_BUILDER_INSTRUCTIONS, ROUND_BUILDER_SYSTEM, ROUND_JUDGE_INSTRUCTIONS, ROUND_JUDGE_SYSTEM, ROUND_OBJECTIONS_TAG,
@@ -98,10 +99,17 @@ export interface DebateResult {
   /** Mention-only (PipelineDraft.suggestions), deduped by repo in any letter case. */
   suggestions: Suggestion[];
   disputes: Dispute[];
-  /** Plain-English lines for PIPEGEN.md, each cleanForDoc text. */
+  /** Plain-English lines for PIPEGEN.md, each cleanForDoc text: doc-final, written as is, never through safeMarkdown (final review I1). */
   transcript: string[];
   /** rule OR judge (ruling S8). */
   requireDeployApproval: boolean;
+  /**
+   * The final candidates map, by need key (final review m3): the caller's map (every key, the same lists) plus a reviewed list for each
+   * key the judge added. `choices`, `byCode` and `uncovered` were built from keyOffers(needs, candidates, ...); Plan G's fix loop
+   * rebuilds the offers from these two (never from its own map, which leaves an added key uncovered) to build the next ranked tool
+   * through specFor.
+   */
+  candidates: Map<string, readonly Candidate[]>;
   /** Recomputed with the final needs (F2's keyOffers). */
   byCode: ByCode[];
   uncovered: Uncovered[];
@@ -456,7 +464,7 @@ export async function debate(
 
   // 3. the rounds: accept or rebut, then withdraw or keep (no new objections, ruling S7)
   const ctx: RoundCtx = { p, caps, kv, refs, current, counterOf };
-  const budgetLine = `pipegen makes at most ${MAX_DEBATE_CALLS} AI calls in a debate, so the judge was not asked again; the open objections stay kept.`;
+  const budgetLine = `pipegen makes at most ${MAX_DEBATE_CALLS} AI calls in a debate, each retried at most once when its answer can not be read, so the judge was not asked again; the open objections stay kept.`;
   let rounds = 0;
   for (let round = 1; round <= MAX_ROUNDS; round++) {
     const open = tracked.filter((t) => t.status === 'open');
@@ -632,7 +640,7 @@ export async function debate(
     choices: choices.map(scrubChoice), needs: finalNeeds,
     suggestions: dedupeSuggestions(built.suggestions).map((s) => { const why = scrubbed(s.why, SUGGESTION_WHY_MAX); return why === s.why ? s : { ...s, why }; }),
     disputes: disputes.map((d) => ({ ...d, options: d.options.map((o) => ({ ...o, argument: scrubbed(o.argument, ARGUMENT_MAX), choice: scrubChoice(o.choice) })) })),
-    transcript, requireDeployApproval,
+    transcript, requireDeployApproval, candidates: finalCands,
     byCode: fin.byCode, uncovered: fin.uncovered, rounds, calls, usage,
   };
 }

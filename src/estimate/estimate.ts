@@ -110,13 +110,16 @@ const plural = (n: number, one: string, many: string) => `${n.toLocaleString('en
 /** The headroom over a measured request size (ruling F4-R12 m1): 1.5 × the bytes measured, and bytes are at least tokens. */
 export const DEBATE_MARGIN = 1.5;
 /**
- * The debate's AI calls (Plan F F4, rulings S10 and F4-R12 m1): the worst case of at most 9 requests (debate.ts MAX_DEBATE_CALLS),
+ * The debate's AI calls (Plan F F4, rulings S10 and F4-R12 m1): the worst case of at most 9 calls (debate.ts MAX_DEBATE_CALLS),
  * each counted at its size measured in test/debate.test.ts (7 need keys; bytes, which are at least tokens) times DEBATE_MARGIN:
  * - builder: its first call and its repair, the only 2 with the code bundle (MAX_BUNDLE_CALLS); prompt 14,201 bytes → 22k, plus the
  *   bundle at the needs row's 30k;
  * - critique: the judge's critique and its re-ask; 19,869 and 20,045 bytes → 31k;
  * - round: the 5 round requests left after both re-asks (builder answers and judge verdicts); 11,069 to 12,504 bytes → 19k.
  * Output is what one answer usually takes (the meter, not this row, bounds each request's full output limit).
+ * completeValidated retries each request once when its answer can not be read (final review m2), so the debate can bill up to
+ * 2 × 9 requests. This row counts each request once (the usual run); the cap (CAP_FACTOR × the high end) still covers the run with
+ * this row counted twice, at list price, and the spend meter reserves every attempt's own worst case before it is sent, so money stays bounded.
  * Row: input 2 × (30k + 22k) + 2 × 31k + 5 × 19k = 261k; output 2 × 6k + 2 × 4k + 5 × 3k = 35k (was 3 × 40k / 6k = 120k / 18k).
  */
 export const DEBATE_CALLS = {
@@ -132,7 +135,7 @@ const debateOutput = DEBATE_CALLS.builder.calls * DEBATE_CALLS.builder.output + 
 /** Tokens per stage of a full run (fixed table, brief; the debate row from DEBATE_CALLS). */
 const STAGE_TOKENS: readonly { stage: AiStage; input: number; output: number; times: number }[] = [
   { stage: 'needs', input: 30_000, output: 3_000, times: 1 },
-  { stage: 'debate', input: debateInput, output: debateOutput, times: 1 },   // at most 9 calls, 2 with the bundle
+  { stage: 'debate', input: debateInput, output: debateOutput, times: 1 },   // at most 9 calls (each retried at most once), 2 with the bundle
   { stage: 'creators', input: 60_000, output: 20_000, times: 1 },
   { stage: 'fix-loop', input: 15_000, output: 4_000, times: 0 },        // times set below
 ];
@@ -372,7 +375,7 @@ export function estimate(p: RepoProfile, jobs: JobCategories, variants: number, 
       return { stage: s.stage, input: s.input * times, output: s.output * times };
     });
     basis.push(
-      `AI tokens per stage (input / output): needs ${thousands(30_000)} / ${thousands(3_000)}; debate at most ${DEBATE_CALLS.builder.calls + DEBATE_CALLS.critique.calls + DEBATE_CALLS.round.calls} calls: the builder ${DEBATE_CALLS.builder.calls} with the code bundle at ${thousands(DEBATE_CALLS.builder.bundle + DEBATE_CALLS.builder.prompt)} / ${thousands(DEBATE_CALLS.builder.output)}, the judge's critique ${DEBATE_CALLS.critique.calls} at ${thousands(DEBATE_CALLS.critique.prompt)} / ${thousands(DEBATE_CALLS.critique.output)}, ${DEBATE_CALLS.round.calls} round answers at ${thousands(DEBATE_CALLS.round.prompt)} / ${thousands(DEBATE_CALLS.round.output)}; `
+      `AI tokens per stage (input / output): needs ${thousands(30_000)} / ${thousands(3_000)}; debate at most ${DEBATE_CALLS.builder.calls + DEBATE_CALLS.critique.calls + DEBATE_CALLS.round.calls} calls, each retried at most once when its answer can not be read: the builder ${DEBATE_CALLS.builder.calls} with the code bundle at ${thousands(DEBATE_CALLS.builder.bundle + DEBATE_CALLS.builder.prompt)} / ${thousands(DEBATE_CALLS.builder.output)}, the judge's critique ${DEBATE_CALLS.critique.calls} at ${thousands(DEBATE_CALLS.critique.prompt)} / ${thousands(DEBATE_CALLS.critique.output)}, ${DEBATE_CALLS.round.calls} round answers at ${thousands(DEBATE_CALLS.round.prompt)} / ${thousands(DEBATE_CALLS.round.output)}; `
         + `creators ${thousands(60_000)} / ${thousands(20_000)}; fix loop ${FIX_ATTEMPTS_PER_PART} attempts of ${thousands(15_000)} / ${thousands(4_000)} for each of ${EXPECTED_FAILING_PARTS} parts expected to need a fix.`,
     );
     const pr = priceFor(provider);

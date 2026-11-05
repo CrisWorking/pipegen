@@ -13,8 +13,16 @@
 //      ASCII forms, every other character a blank. Then each place where safeMarkdown would put a backslash or U+200B, or the judge
 //      would see a bare URL or an emoji shortcode, is broken with a blank (`//`, `www.`, `GH-1`, `:name:`, a leading list or
 //      heading marker, a trailing `!`).
-//   3. the cut (to `maxChars`, with ` ...`: the judge refuses U+2026), then safeMarkdown exactly once (S5). On this text it has
-//      nothing left to do; if it ever changed something, the placeholder is written instead (fail closed).
+//   3. the cut (to `maxChars`, with ` ...`: the judge refuses U+2026), then safeMarkdown exactly once (S5), here and only as a
+//      check: on this text it has nothing left to do; if it ever changed something, the placeholder is written instead (fail
+//      closed). Callers never pass the result, or any other text for PIPEGEN.md, through safeMarkdown (final review I1).
+//
+// The PIPEGEN.md rule for Plan G (S5 as corrected by final review I1): every string Plan F returns for PIPEGEN.md is doc-final and
+// written as is, never re-escaped: Choice.reason, Suggestion.name and .why, DisputeOption.argument, judge claims, the debate
+// transcript, the dispute scoreboard, and tests.ts's notes, decision reasons and notProven reason. safeMarkdown is never used on
+// PIPEGEN.md text: it cuts at 200 characters with U+2026 and escapes with backslashes, and the PIPEGEN.md judge refuses both, so the
+// whole file would be refused. Raw repo or external text (a service name, a discovery name) goes through cleanForDoc, never
+// safeMarkdown. Lines code builds itself are built from the doc alphabet and are tested against the judge as written.
 //
 // Every pattern below is linear: each one is either anchored, or scans a run of characters that can't hold its own start (so a
 // failed try ends at the next start), or has a bounded repeat. The round loop is bounded too (CLEAN_ROUNDS).
@@ -157,12 +165,14 @@ function docCut(s: string, max: number): string {
 
 /**
  * AI-written text made safe for PIPEGEN.md: stripForDoc, the cut to `maxChars` (default 400; ` ...` marks a cut), then
- * safeMarkdown exactly once, which leaves this text as it is; so the cap counts the output, and the output passes the PIPEGEN.md
- * judge in a list item, a table cell or a heading. Empty, or shaped like a secret token → CLEAN_DOC_PLACEHOLDER (cut to the cap
+ * safeMarkdown exactly once as a check, which leaves this text as it is; so the cap counts the output, and the output passes the
+ * PIPEGEN.md judge in a list item, a table cell or a heading. Empty, or shaped like a secret token → CLEAN_DOC_PLACEHOLDER (cut to the cap
  * too), never ''. The user's typed values (the vault) are not checked here: Plan G checks them before it writes.
  *
- * Caller rules (S5, F1-R1; for Plan G): the result goes into PIPEGEN.md as it is, never through safeMarkdown again, and never in a
- * code span or a fence. Code-built lines (scoreboard, tool names) go through safeMarkdown once and must pass the judge too.
+ * Caller rules (S5 as corrected by final review I1, F1-R1; for Plan G): the result goes into PIPEGEN.md as it is, never through
+ * safeMarkdown, and never in a code span or a fence. Code-built lines (scoreboard, transcript, reasons, tests.ts notes) are doc-final
+ * too: written as they are, never through safeMarkdown (its 200-character cut ends in U+2026, which the judge refuses); each passes
+ * the judge as written. Raw repo text (a service name) goes through cleanForDoc first.
  */
 export function cleanForDoc(text: string, maxChars: number = CLEAN_DOC_MAX): string {
   if (!Number.isInteger(maxChars) || maxChars < 1) throw new RangeError('cleanForDoc: maxChars must be a whole number of at least 1.');

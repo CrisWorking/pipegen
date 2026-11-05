@@ -226,6 +226,20 @@ describe('estimate: AI', () => {
     expect(e.aiCostCapUsd).toBeCloseTo(11.892, 6);
   });
 
+  it('estimate: the debate wording says each call is retried at most once; the cap still covers every debate call retried (final review m2)', () => {
+    const e = estimate(profile(), JOBS, 2, ACTIVITY, OPUS);
+    if (e.aiCostUsd === 'local' || e.aiCostCapUsd === null) throw new Error('expected a priced estimate');
+    expect(e.basis.join('\n')).toContain('debate at most 9 calls, each retried at most once when its answer can not be read:');
+    // completeValidated retries each request once on an unreadable answer, so the debate can bill up to 18 requests: its row twice.
+    // At list price (cost is linear in tokens) that worst case stays under the cap; the spend meter still reserves every request's
+    // own worst case before it is sent and refuses what would pass the cap, so the money is bounded either way.
+    const total = e.aiTokens.reduce((t, x) => ({ input: t.input + x.input, output: t.output + x.output }), { input: 0, output: 0 });
+    const debateRow = e.aiTokens.find((x) => x.stage === 'debate')!;
+    const listInput = e.aiCostUsd.input.high / 1.5, listOutput = e.aiCostUsd.output.high / 1.5;
+    const worst = listInput * ((total.input + debateRow.input) / total.input) + listOutput * ((total.output + debateRow.output) / total.output);
+    expect(worst).toBeLessThan(e.aiCostCapUsd);
+  });
+
   it('estimate: ollama → aiCost local, no cap', () => {
     const e = estimate(profile(), JOBS, 2, ACTIVITY, { name: 'ollama', model: 'llama3.1', host: '127.0.0.1:11434' });
     expect(e.aiCostUsd).toBe('local');

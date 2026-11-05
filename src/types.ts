@@ -6,7 +6,9 @@
 //   Patterns: workflow paths must be unchanged by safeText (else the file is skipped with a note); job ids
 //   /^[A-Za-z_][A-Za-z0-9_-]*$/; triggers /^[a-z_]+$/; secret and env var names /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 //   Service.name /^[A-Za-z0-9._@/-]{1,214}$/, else the folder name (same pattern), else 'app'.
-// - Every value is cleaned where it leaves pipegen: safeText() for the terminal, safeMarkdown() for Markdown.
+// - Every value is cleaned where it leaves pipegen: safeText() for the terminal, safeMarkdown() for Markdown. PIPEGEN.md is the
+//   exception (v0.2 Plan F, final review I1): its text is cleanForDoc output or fixed text that passes the PIPEGEN.md judge, written
+//   as is and never through safeMarkdown, whose cut mark U+2026 and backslash escapes that judge refuses (src/debate/clean.ts).
 //   Fields not validated at read time (Service.path, runtimeVersion, dockerfile, Dependency.evidence) must always
 //   go through those at output. Service.name may contain '.', '..' and '/': never use it as a path component unchecked.
 // ---------- project ----------

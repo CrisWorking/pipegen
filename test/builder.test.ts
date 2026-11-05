@@ -326,6 +326,36 @@ describe('builder (plan Task 1)', () => {
   });
 });
 
+// ---------- final review m1: the suggestion name is doc-final ----------
+
+describe('builder (final review m1)', () => {
+  it('builder: a suggestion name is cleanForDoc text (else the repo name, cleaned), on both paths, and passes the PIPEGEN.md judge as written', async () => {
+    const hostile = 'Cool [x](https://evil.example) <b>@bob</b> \\ \u200b';
+    const long = 'L'.repeat(80);
+    const cands = [
+      discovered('cool-sast', 'acme/cool-sast', 'sast', { name: hostile }),
+      discovered('plain-sast', 'acme/plain-sast', 'sast', { name: 'Plain SAST' }),
+      discovered('long-sast', 'acme/long_sast', 'sast', { name: long }),
+    ];
+    const doc = (t: string) => pipegenDocProblems(`# PIPEGEN\n\n- ${t}\n\n| Tool | Why |\n| --- | --- |\n| ${t} | x |\n`, DOC_OPTS);
+    const expectNames = (list: readonly { name: string; repo: string }[]) => {
+      expect(list.map((x) => [x.repo, x.name])).toEqual([['acme/cool-sast', 'cool-sast'], ['acme/plain-sast', 'Plain SAST'], ['acme/long_sast', 'long sast']]);
+      for (const x of list) {
+        expect(doc(x.name), x.name).toEqual([]);
+        expect(cleanForDoc(x.name, 64)).toBe(x.name);
+      }
+    };
+    // the AI path (builder.ts: the AI names the opaque ids)
+    const { ai } = scripted(ok(DEFAULT_PICKS, [{ id: 's1', why: 'a' }, { id: 's2', why: 'b' }, { id: 's3', why: 'c' }]));
+    expectNames((await buildChoices(NEEDS, candidatesFor(NEEDS, P, { 'sast--api': cands }), P, bundle, ai, deps())).suggestions);
+    // no key for the AI: pipegen's own list
+    const needs = [need('unit-tests', 'merge', 'web'), need('sast', 'merge', 'web')];
+    const none = scripted(ok());
+    expectNames((await buildChoices(needs, new Map<string, Candidate[]>([['sast--web', cands]]), P, bundle, none.ai, deps())).suggestions);
+    expect(none.calls).toHaveLength(0);
+  });
+});
+
 // ---------- added tests (pre-flight §7 F2) ----------
 
 describe('builder (added, pre-flight §7)', () => {

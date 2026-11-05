@@ -259,7 +259,6 @@ function approvalOf(a: JudgeAnswer): { requireDeployApproval: boolean; deployApp
 
 // ---------- the request ----------
 
-
 /** The answer's schema (ruling S9): keys, counter ids, added need ids, layers, categories and services are enums; nothing else. */
 function judgeSchema(j: JudgeOffers): AiSchema<JudgeAnswer> {
   return aiSchema<JudgeAnswer>(z.strictObject({
@@ -356,7 +355,6 @@ function judgeRequest(j: JudgeOffers, p: RepoProfile, caps: Capabilities, deps: 
     },
   };
 }
-
 
 // ---------- the call ----------
 

@@ -8,7 +8,7 @@ import { AiError, COST_CAP_MESSAGE } from '../src/ai/errors.js';
 import { ROUND_OBJECTIONS_TAG } from '../src/ai/prompts/debate.js';
 import { UNTRUSTED_AI_TAG } from '../src/ai/prompts/untrusted.js';
 import { bundleCode, bundleText, type CodeBundle } from '../src/ai/redact.js';
-import { builderOffers, specFor, type Choice, type Offer } from '../src/debate/builder.js';
+import { builderOffers, keyOffers, specFor, type Choice, type Offer } from '../src/debate/builder.js';
 import { cleanForDoc, stripForDoc } from '../src/debate/clean.js';
 import {
   ARGUMENT_MAX, MAX_BUNDLE_CALLS, MAX_DEBATE_CALLS, MAX_ROUNDS, ROUND_MAX_OUTPUT_TOKENS, ROUND_TIMEOUT_MS, TRANSCRIPT_LINE_MAX,
@@ -698,5 +698,45 @@ describe('debate (added)', () => {
     const r2 = await run(g.ai, { needs, p: profile(), cands: candidatesFor(needs, profile(), {}, reviewed), deps: ddeps({ reviewed }) });
     expect(r2.choices.some((c) => c.key === 'dast--web')).toBe(false);
     expect(r2.uncovered).toContainEqual(expect.objectContaining({ key: 'dast--web', blocking: true }));
+  });
+});
+
+describe('debate (final review fixes)', () => {
+  it('debate: the result carries the final candidates map (by need key) the choices were built from (m3)', async () => {
+    const before = new Map([...CANDS].map(([k, v]) => [k, structuredClone(v)]));
+    const f = routed({
+      builder: [built()],
+      judge: [critiqued([{ addNeed: { id: 'format', layer: 'push', service: 'web' }, counter: 'prettier' }])],
+      'debate-builder': [replies()],
+      'debate-judge': [verdicts()],
+    });
+    const r = await run(f.ai);
+    expect(r.needs.slice(DN.length).map((n) => [n.id, n.service])).toEqual([['format', 'web']]);
+    // every key of the caller's map, unchanged, plus the added key; the caller's map is not touched
+    expect(CANDS).toEqual(before);
+    for (const [k, v] of CANDS) expect(r.candidates.get(k)).toEqual(v);
+    expect([...r.candidates.keys()].sort()).toEqual([...CANDS.keys(), 'format--web'].sort());
+    expect((r.candidates.get('format--web') ?? []).map((c) => c.id)).toContain('prettier');
+    // Plan G rebuilds the offers from it and gets the debate's own: every choice's tool is offered, the step is the same
+    const fin = keyOffers(r.needs, r.candidates, PT, { reviewed: REVIEWED });
+    expect(fin.uncovered).toEqual(r.uncovered);
+    for (const c of r.choices) expect((fin.offers.get(c.key) ?? []).some((o) => o.entry.id === c.chosen.tool.id), c.key).toBe(true);
+    const format = byKey(r, 'format--web');
+    expect(specFor(refOf(r.needs, PT, 'format--web'), offerOf(r.needs, PT, 'format--web', 'prettier', r.candidates as Map<string, Candidate[]>), PT)).toEqual(format.chosen);
+    // the caller's map would leave the added key uncovered (the trap the field removes)
+    expect(keyOffers(r.needs, CANDS, PT, { reviewed: REVIEWED }).uncovered.map((u) => u.key)).toContain('format--web');
+  });
+
+  it('debate: the call bound is stated with its retry: at most 9 AI calls, each retried at most once (m2)', async () => {
+    const f = routed({
+      builder: [(req) => ({ ...built()(req), choices: built({ picks: { 'sast--web': 'bandit' } })(req).choices }), built()],
+      judge: [critiqued([{ key: 'secrets', counter: 'bandit' }]), critiqued([{ key: LEAK_KEY, counter: 'gitleaks' }, { key: 'iac', counter: 'trivy-config' }])],
+      'debate-builder': [replies()],
+      'debate-judge': [verdicts()],
+    });
+    const r = await run(f.ai);
+    const line = r.transcript.find((l) => /at most 9 AI calls/.test(l));
+    expect(line).toBe('pipegen makes at most 9 AI calls in a debate, each retried at most once when its answer can not be read, so the judge was not asked again; the open objections stay kept.');
+    expect(pipegenDocProblems(`# PIPEGEN\n\n- ${line}\n`, DOC_OPTS)).toEqual([]);
   });
 });
