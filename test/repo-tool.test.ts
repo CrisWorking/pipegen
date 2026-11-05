@@ -243,6 +243,12 @@ describe('G4b: the type-check through the repo\'s own tsc (ruling G4-R3)', () =>
     expect(gateJobList(a.draft)).toContainEqual({ needId: 'type-check', service: 'app', job: 'type-check--app', category: 'type-check', format: 'none', blocking: true, [NEEDS_SEC]: false });
     expect(a.merge.gate?.needs).toContain('type-check--app');
     expect(shown(await judge(files(a), a.draft))).toBe('');
+    // a non-blocking type-check still runs the repo's tsc in its own job; the gate does not list it
+    const prof = profileOf([tsNode()]);
+    const soft = assemble(planned(prof, { needs: floorNeeds(prof, CAPS).map((n) => (n.id === 'type-check' ? { ...n, blocking: false } : n)) }));
+    expect((soft.merge['type-check--app'] as Job).steps.slice(1)).toEqual(renderRepoTool(STEP, p, { profile: prof }).steps);
+    expect(gateJobList(soft.draft).map((e) => e.job)).not.toContain('type-check--app');
+    expect(shown(await judge(files(soft), soft.draft))).toBe('');
   });
 });
 
