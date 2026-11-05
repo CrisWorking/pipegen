@@ -33,7 +33,6 @@ import { ARGV_POLICIES, PIP_CLOSURES, PLAIN_REL_RE, RANGE_STEP_ENV, RANGE_TOOL, 
 
 export { sha16 };   // defined in tool-flags.ts (the job rules need it too); re-exported for the callers that import it from here
 import { EXTRA_RULES_AT, tuningEffects, type TuningEffects } from './tuning.js';
-import { REPO_TOOL_BELOW_MAJOR } from './reviewed.js';
 import type { InstallSpec, ReviewedTool, Service, StepSpec } from '../types.js';
 
 /** Test and internal hooks: the argv policies and the pip closures the renderer reads (production passes neither). */
@@ -1207,58 +1206,99 @@ export function projectScriptSteps(artifact: string, which: 'test' | 'lint', nod
 /**
  * The repo tools pipegen runs, each from its own package folder by a fixed path with fixed arguments (no AI value, no repo text). tsc
  * always reads the service's own `config` (`-p`, never a parent's, G4b-R1 m3); that config decides what is checked and how strictly (the
- * developers' own check), and `--noEmit` keeps tsc from writing anything. `belowMajor`: the first major the lockfile check refuses
- * (TypeScript 7 runs a native binary from a platform package the check does not cover, G4b-R1 m2; reviewed.ts REPO_TOOL_BELOW_MAJOR).
+ * developers' own check), and `--noEmit` keeps tsc from writing anything. `native` (G4b-R2): from that major on, the package's bin is a
+ * shim that runs a native binary from a platform package `<scope>/<base>-<platform>-<arch>` (TypeScript 7's lib/getExePath.js resolves
+ * `@typescript/typescript-${process.platform}-${process.arch}/package.json` from its own lib folder and runs `<that folder>/lib/tsc`);
+ * the lockfile check covers that package too.
  */
-export const REPO_TOOLS: Readonly<Record<string, { package: string; bin: string; config: string; args: readonly string[]; belowMajor: number }>> = Object.freeze({
-  tsc: Object.freeze({ package: 'typescript', bin: 'bin/tsc', config: 'tsconfig.json', args: Object.freeze(['--noEmit']), belowMajor: REPO_TOOL_BELOW_MAJOR.tsc as number }),
+export const REPO_TOOLS: Readonly<Record<string, { package: string; bin: string; config: string; args: readonly string[]; native: { fromMajor: number; scope: string; base: string; exe: string } }>> = Object.freeze({
+  tsc: Object.freeze({
+    package: 'typescript', bin: 'bin/tsc', config: 'tsconfig.json', args: Object.freeze(['--noEmit']),
+    native: Object.freeze({ fromMajor: 7, scope: '@typescript', base: 'typescript', exe: 'lib/tsc' }),
+  }),
 });
 
+const REL_BIN_RE = /^[a-z0-9][a-z0-9._-]{0,40}(?:\/[a-z0-9][a-z0-9._-]{0,40}){0,3}$/i;
 /** A REPO_TOOLS entry, or a refusal. */
 function repoTool(tool: string): (typeof REPO_TOOLS)[string] {
   const t = own(REPO_TOOLS, tool);
   if (t === undefined) return refuse(`${show(tool)} is not a repo tool pipegen runs.`);
-  if (!isNpmName(t.package) || !/^[a-z0-9][a-z0-9._-]{0,40}(?:\/[a-z0-9][a-z0-9._-]{0,40}){0,3}$/i.test(t.bin) || !FILE_NAME_RE.test(t.config)) return refuse('The repo tool is not a plain package with a plain bin path and config file.');
+  const n = t.native;
+  if (!isNpmName(t.package) || !REL_BIN_RE.test(t.bin) || !FILE_NAME_RE.test(t.config) || !/^@[a-z0-9][a-z0-9-]{0,40}$/.test(n.scope) || !/^[a-z0-9][a-z0-9-]{0,40}$/.test(n.base) || !REL_BIN_RE.test(n.exe) || !Number.isInteger(n.fromMajor)) {
+    return refuse('The repo tool is not a plain package with a plain bin path and config file.');
+  }
   return t;
 }
 
 /**
- * The run-time check before a repo tool runs (G4b): `package-lock.json` is a lockfile of version 2 or later whose entry for the package is
- * a plain registry package at an exact version below the tool's `belowMajor` (the registry tarball, a sha512 integrity, no link, no bundle);
- * the installed package is a real folder inside a real node_modules, at that version, installed from that tarball (npm ci's own record,
- * node_modules/.package-lock.json); its bin is a regular file inside it. The version is read when the job runs, never written into the
- * step, so a lockfile bump keeps working. This is drift protection, not a guard against hostile repo code (the job holds nothing).
+ * The run-time check before a repo tool runs (G4b, G4b-R2). Drift protection, not a guard against hostile repo code (the job holds nothing):
+ * - `package-lock.json` is a lockfile of version 2 or later, and the package's entry is a plain registry package at an exact version: the
+ *   registry tarball of that name and version (no git, codeload, file or other URL), a sha512 integrity, no link, no bundle;
+ * - the installed package is a real folder inside a real node_modules, holding that package at that version, installed from that tarball
+ *   (npm ci's own record, node_modules/.package-lock.json); its bin is a regular file inside it;
+ * - from the `native` major on: every `<scope>/<base>-*` entry of the lockfile is a registry tarball with a sha512 at the package's own
+ *   version; the one for this runner (`<base>-${process.platform}-${process.arch}`, the name the shim builds) is installed the same way,
+ *   with no nested copy the shim would find first, Node's own resolution from the shim's folder lands on it, and the binary the shim runs
+ *   (`<exe>`) is a regular file inside it.
+ * The version is read when the job runs, never written into the step, so a lockfile bump keeps working. Every value comes from REPO_TOOLS.
  */
 export function repoToolCheckJs(tool: string): string {
-  const { package: pkg, bin, belowMajor } = repoTool(tool);
+  const { package: pkg, bin, native } = repoTool(tool);
   return [
-    'const fs = require("fs"), path = require("path");',
-    `const name = ${JSON.stringify(pkg)}, bin = ${JSON.stringify(bin)}, below = ${String(belowMajor)};`,
+    'const fs = require("fs"), path = require("path"), Module = require("module");',
+    `const name = ${JSON.stringify(pkg)}, bin = ${JSON.stringify(bin)}, nat = ${JSON.stringify(native)};`,
     'const fail = (m) => { console.error("pipegen: " + m); process.exit(1); };',
     'const lstat = (f) => { try { return fs.lstatSync(f); } catch (e) { return null; } };',
     'const json = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch (e) { return null; } };',
+    `const tarball = (n, v) => ${JSON.stringify(REGISTRY_URL)} + n + "/-/" + n.slice(n.indexOf("/") + 1) + "-" + v + ".tgz";`,
     'const lock = json("package-lock.json");',
     'if (!lock || typeof lock !== "object" || !(lock.lockfileVersion >= 2) || !lock.packages || typeof lock.packages !== "object") fail("package-lock.json is not a lockfile of version 2 or later");',
-    'const p = lock.packages["node_modules/" + name];',
-    'if (!p || typeof p !== "object" || p.link || p.inBundle || typeof p.version !== "string" || !/^[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z.-]{1,40})?$/.test(p.version)) fail(name + " is not a plain package at an exact version in package-lock.json");',
-    'if (Number(p.version.split(".")[0]) >= below) fail(name + " " + p.version + " runs a native binary from a platform package pipegen does not check yet; pipegen runs " + name + " below " + below + ".0.0 only");',
-    `const tarball = ${JSON.stringify(REGISTRY_URL)} + name + "/-/" + name.slice(name.indexOf("/") + 1) + "-" + p.version + ".tgz";`,
-    'if (p.resolved !== tarball || typeof p.integrity !== "string" || !/^sha512-[A-Za-z0-9+/]{86}==$/.test(p.integrity)) fail(name + " in package-lock.json is not the registry tarball with a sha512 integrity");',
+    'const entry = (n) => {',
+    '  const e = lock.packages["node_modules/" + n];',
+    '  if (!e || typeof e !== "object" || e.link || e.inBundle || typeof e.version !== "string" || !/^[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z.-]{1,40})?$/.test(e.version)) fail(n + " is not a plain package at an exact version in package-lock.json");',
+    '  if (e.resolved !== tarball(n, e.version) || typeof e.integrity !== "string" || !/^sha512-[A-Za-z0-9+/]{86}==$/.test(e.integrity)) fail(n + " in package-lock.json is not the registry tarball with a sha512 integrity");',
+    '  return e;',
+    '};',
     'const top = lstat("node_modules");',
     'if (!top || !top.isDirectory() || top.isSymbolicLink()) fail("node_modules is not a real folder");',
     'const root = fs.realpathSync("node_modules");',
-    'const dir = path.join("node_modules", name);',
-    'const st = lstat(dir);',
-    'if (!st || !st.isDirectory() || st.isSymbolicLink()) fail(name + " is not a real folder in node_modules");',
-    'const real = fs.realpathSync(dir);',
-    'if (!real.startsWith(root + path.sep)) fail(name + " is outside node_modules");',
-    'const installed = (json(path.join(dir, "package.json")) || {}).version;',
-    'if (installed !== p.version) fail(name + " is " + installed + ", not the " + p.version + " package-lock.json pins");',
-    'const h = ((json("node_modules/.package-lock.json") || {}).packages || {})["node_modules/" + name];',
-    'if (!h || h.integrity !== p.integrity || h.resolved !== p.resolved) fail(name + " was not installed from the registry tarball package-lock.json pins");',
-    'const file = path.join(dir, bin);',
-    'const b = lstat(file);',
-    'if (!b || !b.isFile() || b.isSymbolicLink() || !fs.realpathSync(file).startsWith(real + path.sep)) fail("the " + bin + " of " + name + " is not a regular file inside its package");',
+    'const hidden = (json("node_modules/.package-lock.json") || {}).packages || {};',
+    'const installed = (n, e) => {',
+    '  const dir = path.join("node_modules", n);',
+    '  for (const d of [path.dirname(dir), dir]) { const st = lstat(d); if (!st || !st.isDirectory() || st.isSymbolicLink()) fail(n + " is not a real folder in node_modules"); }',
+    '  const real = fs.realpathSync(dir);',
+    '  if (!real.startsWith(root + path.sep)) fail(n + " is outside node_modules");',
+    '  const pj = json(path.join(dir, "package.json")) || {};',
+    '  if (pj.name !== n) fail("the folder node_modules/" + n + " holds another package");',
+    '  if (pj.version !== e.version) fail(n + " is " + pj.version + ", not the " + e.version + " package-lock.json pins");',
+    '  const h = hidden["node_modules/" + n];',
+    '  if (!h || h.integrity !== e.integrity || h.resolved !== e.resolved) fail(n + " was not installed from the registry tarball package-lock.json pins");',
+    '  return real;',
+    '};',
+    'const regular = (file, inside, what) => { const b = lstat(file); if (!b || !b.isFile() || b.isSymbolicLink() || !fs.realpathSync(file).startsWith(inside + path.sep)) fail(what + " is not a regular file inside its package"); };',
+    'const p = entry(name);',
+    'const real = installed(name, p);',
+    'regular(path.join("node_modules", name, bin), real, "the " + bin + " of " + name);',
+    'if (Number(p.version.split(".")[0]) >= nat.fromMajor) {',
+    '  const prefix = nat.scope + "/" + nat.base + "-";',
+    '  const want = prefix + process.platform + "-" + process.arch;',
+    '  if (!/^@[a-z0-9-]+\\/[a-z0-9-]+-[a-z0-9]+-[a-z0-9]+$/.test(want)) fail("the native package name " + want + " is not a plain name");',
+    '  for (const k of Object.keys(lock.packages)) {',
+    '    const i = k.lastIndexOf("node_modules/" + prefix);',
+    '    if (i < 0) continue;',
+    '    if (i !== 0) fail("package-lock.json has a nested copy " + k + "; the tsc shim would run instead of the one pipegen checks");',
+    '    const e = entry(k.slice("node_modules/".length));',
+    '    if (e.version !== p.version) fail(k.slice("node_modules/".length) + " is not at " + name + "\'s own version " + p.version);',
+    '  }',
+    '  const e = entry(want);',
+    '  const nested = path.join("node_modules", name, "node_modules", want);',
+    '  if (lstat(nested)) fail("a nested copy " + nested + " exists; the tsc shim would run instead of the one pipegen checks");',
+    '  const nreal = installed(want, e);',
+    '  let found = null;',
+    '  try { found = fs.realpathSync(Module.createRequire(path.join(real, "lib", "pipegen-resolve.js")).resolve(want + "/package.json")); } catch (err) { found = null; }',
+    '  if (found !== path.join(nreal, "package.json")) fail("Node resolves " + want + " from the tsc shim to another folder than the one pipegen checks");',
+    '  regular(path.join(nreal, nat.exe), nreal, "the native binary " + nat.exe + " of " + want);',
+    '}',
     'process.exit(0);',
   ].join('\n');
 }

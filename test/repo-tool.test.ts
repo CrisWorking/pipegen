@@ -132,7 +132,7 @@ describe('G4b: the type-check through the repo\'s own tsc (ruling G4-R3)', () =>
     expect(run.match(/node_modules\/typescript\/bin\/tsc(?! -p tsconfig\.json )/g)).toBeNull();
     expect(run).not.toMatch(/\$\{\{|secrets\.|PIPEGEN_FP_KEY|GITHUB_TOKEN/);
     expect(run).toContain(`guard=${"'"}${tsconfigGuardJs().replace(/'/g, "'\\''")}'`);
-    expect(REPO_TOOLS).toEqual({ tsc: { package: 'typescript', bin: 'bin/tsc', config: 'tsconfig.json', args: ['--noEmit'], belowMajor: 7 } });
+    expect(REPO_TOOLS).toEqual({ tsc: { package: 'typescript', bin: 'bin/tsc', config: 'tsconfig.json', args: ['--noEmit'], native: { fromMajor: 7, scope: '@typescript', base: 'typescript', exe: 'lib/tsc' } } });
     // a sub-folder service: the checked cd first, in both steps
     const sub = tsNode({ name: 'web', path: 'apps/web' });
     const subSteps = renderRepoTool({ ...STEP, service: 'web', workingDir: 'apps/web' }, p, { profile: profileOf([sub]) }).steps;
@@ -195,8 +195,8 @@ describe('G4b: the type-check through the repo\'s own tsc (ruling G4-R3)', () =>
       ['another source', { entry: { resolved: 'https://evil.example/typescript.tgz' } }],
       ['no sha512', { entry: { integrity: 'sha1-abc' } }],
       ['a range, not a version', { entry: { version: range, resolved: `https://registry.npmjs.org/typescript/-/typescript-${range}.tgz` } }],
-      // G4b-R1 m2: a bump to TypeScript 7 after the workflow was written fails closed at run time too (its native binary package is not checked)
-      ['TypeScript 7 (native binary)', { entry: { version: '7.0.2', resolved: 'https://registry.npmjs.org/typescript/-/typescript-7.0.2.tgz' } }],
+      // G4b-R2: TypeScript 7 with no native platform package installed (the shim would have nothing checked to run)
+      ['TypeScript 7 without its platform package', { entry: { version: '7.0.2', resolved: 'https://registry.npmjs.org/typescript/-/typescript-7.0.2.tgz' } }],
       ['not installed by npm ci (hidden lockfile differs)', { hidden: { 'node_modules/typescript': { version, resolved, integrity: `sha512-${'B'.repeat(86)}==` } } }],
       ['no hidden lockfile entry', { hidden: {} }],
     ];
@@ -349,15 +349,115 @@ describe('G4b fix round 1 (ruling G4b-R1)', () => {
     expect(chain(project({ compilerOptions: { ...opts, noCheck: true }, include: ['src'] }))).toBe(1);
   });
 
-  it('repo-tool: TypeScript 7 or later (its native binary package) → type-check uncovered with a plain reason', () => {
-    const seven = tsNode({ quality: { ...TS, versions: { typescript: '7.0.2' } } });
-    expect(repoToolFor(typeCheck(), seven)).toBeNull();
-    expect(repoToolProblem(typeCheck(), seven)).toBe("tsc: TypeScript 7 and later run a native binary from a platform package pipegen's lockfile check does not cover yet, so pipegen does not run it (v0.2)");
-    expect(offersOf(seven).uncovered).toContainEqual({ key: 'type-check--app', needId: 'type-check', service: 'app', blocking: true, reason: 'no-repo-tool' });
-    expect(() => assemble(planned(profileOf([seven])))).toThrow(/"type-check" for "app": tsc: TypeScript 7 and later run a native binary/);
-    // 6.x still runs; the audit keeps naming the repo's tsc whatever its version
-    expect(repoToolFor(typeCheck(), tsNode({ quality: { ...TS, versions: { typescript: '6.0.1' } } }))).toEqual({ ...STEP, version: '6.0.1' });
-    expect(chooseTools(typeCheck(), seven, profileOf([seven]), CAPS, REVIEWED).tool).toMatchObject({ kind: 'repo-tool', tool: 'tsc', version: '7.0.2' });
+  // G4b-R2 replaces fix round 1's m2 (TypeScript 7 refused): TS 7 is current, so the lockfile check covers its native platform package instead
+  it('repo-tool: TypeScript 7 (its native platform package checked) is covered like 5.x and 6.x', () => {
+    for (const version of ['5.6.3', '6.0.1', '7.0.2', '7.1.0']) {
+      const s = tsNode({ quality: { ...TS, versions: { typescript: version } } });
+      expect(repoToolProblem(typeCheck(), s), version).toBeNull();
+      expect(repoToolFor(typeCheck(), s), version).toEqual({ ...STEP, version });
+      expect(offersOf(s).byCode, version).toContainEqual({ key: 'type-check--app', needId: 'type-check', service: 'app', kind: 'repo-tool', blocking: true });
+      const a = assemble(planned(profileOf([s])));
+      expect((a.merge['type-check--app'] as Job).steps.slice(1), version).toEqual(renderRepoTool({ ...STEP, version }, p, { profile: profileOf([s]) }).steps);
+    }
+  });
+
+  it('render: the lockfile check covers TypeScript 7\'s native platform package (registry tarball, sha512, installed inside node_modules, the binary the shim runs)', () => {
+    const js = repoToolCheckJs('tsc');
+    const plat = `typescript-${process.platform}-${process.arch}`;
+    const native = `@typescript/${plat}`;
+    const reg = (name: string, v: string): string => `https://registry.npmjs.org/${name}/-/${name.slice(name.indexOf('/') + 1)}-${v}.tgz`;
+    const sri = (c: string): string => `sha512-${c.repeat(86)}==`;
+    type Fx7 = {
+      version?: string; tsEntry?: Obj; nativeEntry?: Obj | null; otherEntry?: Obj; nativeName?: string; nativeVersion?: string;
+      noNative?: boolean; nativeLink?: boolean; exeLink?: boolean; noExe?: boolean; nested?: boolean; nestedLock?: boolean; hiddenNative?: Obj | null;
+    };
+    const fixture7 = (o: Fx7 = {}): string => {
+      const d = makeTempDir();
+      const v = o.version ?? '7.0.2';
+      const ts = { version: v, resolved: reg('typescript', v), integrity: sri('A'), dev: true, bin: { tsc: 'bin/tsc' }, ...o.tsEntry };
+      const nat = { version: v, resolved: reg(native, v), integrity: sri('C'), dev: true, optional: true, ...o.nativeEntry };
+      const other = `@typescript/typescript-${process.platform === 'linux' ? 'darwin' : 'linux'}-arm64`;
+      const packages: Obj = { '': {}, 'node_modules/typescript': ts, [`node_modules/${other}`]: { version: v, resolved: reg(other, v), integrity: sri('D'), dev: true, optional: true, ...o.otherEntry } };
+      if (o.nativeEntry !== null) packages[`node_modules/${native}`] = nat;
+      if (o.nestedLock === true) packages[`node_modules/typescript/node_modules/${native}`] = nat;
+      writeFileSync(join(d, 'package-lock.json'), JSON.stringify({ lockfileVersion: 3, packages }));
+      mkdirSync(join(d, 'node_modules', 'typescript', 'bin'), { recursive: true });
+      mkdirSync(join(d, 'node_modules', 'typescript', 'lib'));
+      writeFileSync(join(d, 'node_modules', 'typescript', 'package.json'), JSON.stringify({ name: 'typescript', version: ts.version, bin: { tsc: './bin/tsc' } }));
+      writeFileSync(join(d, 'node_modules', 'typescript', 'bin', 'tsc'), '');
+      if (o.noNative !== true) {
+        const dir = o.nativeLink === true ? join(d, 'node_modules', '.store', plat) : join(d, 'node_modules', '@typescript', plat);
+        mkdirSync(join(dir, 'lib'), { recursive: true });
+        if (o.nativeLink === true) { mkdirSync(join(d, 'node_modules', '@typescript'), { recursive: true }); symlinkSync(dir, join(d, 'node_modules', '@typescript', plat)); }
+        writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: o.nativeName ?? native, version: o.nativeVersion ?? v, exports: { './package.json': './package.json' } }));
+        if (o.exeLink === true) { writeFileSync(join(d, 'outside-tsc'), ''); symlinkSync(join(d, 'outside-tsc'), join(dir, 'lib', 'tsc')); }
+        else if (o.noExe !== true) writeFileSync(join(dir, 'lib', 'tsc'), '');
+      }
+      if (o.nested === true) {
+        const n = join(d, 'node_modules', 'typescript', 'node_modules', '@typescript', plat);
+        mkdirSync(join(n, 'lib'), { recursive: true });
+        writeFileSync(join(n, 'package.json'), JSON.stringify({ name: native, version: v }));
+        writeFileSync(join(n, 'lib', 'tsc'), '');
+      }
+      const hidden: Obj = { 'node_modules/typescript': ts };
+      if (o.hiddenNative !== null) hidden[`node_modules/${native}`] = o.hiddenNative ?? nat;
+      writeFileSync(join(d, 'node_modules', '.package-lock.json'), JSON.stringify({ packages: hidden }));
+      return d;
+    };
+    const runs = (d: string): { status: number; err: string } => {
+      try { execFileSync(process.execPath, ['-e', js], { cwd: d, env: {}, stdio: 'pipe' }); return { status: 0, err: '' }; } catch (e) { const x = e as { status: number; stderr: Buffer }; return { status: x.status, err: x.stderr.toString() }; }
+    };
+    // the good shapes: TypeScript 7 with its platform package, and a later 7.x
+    expect(runs(fixture7())).toEqual({ status: 0, err: '' });
+    expect(runs(fixture7({ version: '7.1.0' }))).toEqual({ status: 0, err: '' });
+    const bad: [string, Fx7, RegExp][] = [
+      ['the platform package from codeload', { nativeEntry: { resolved: 'https://codeload.github.com/microsoft/typescript-go/tar.gz/abc' } }, new RegExp(`${native} in package-lock\\.json is not the registry tarball with a sha512 integrity`)],
+      ['the platform package as a git dependency', { nativeEntry: { resolved: 'git+ssh://git@github.com/microsoft/typescript-go.git#abc' } }, /is not the registry tarball/],
+      ['the platform package from a file', { nativeEntry: { resolved: 'file:../tsc.tgz' } }, /is not the registry tarball/],
+      ['the platform package from another registry tarball', { nativeEntry: { resolved: 'https://registry.npmjs.org/evil/-/evil-7.0.2.tgz' } }, /is not the registry tarball/],
+      ['the platform package with no integrity', { nativeEntry: { integrity: undefined } }, /is not the registry tarball with a sha512 integrity/],
+      ['the platform package with a sha1 integrity', { nativeEntry: { integrity: 'sha1-abc' } }, /is not the registry tarball with a sha512 integrity/],
+      ['the platform package as a link', { nativeEntry: { link: true } }, /is not a plain package at an exact version/],
+      ['the platform package at another version', { nativeEntry: { version: '7.0.1', resolved: reg(native, '7.0.1') } }, /is not at typescript's own version 7\.0\.2/],
+      ['the platform package not in the lockfile', { nativeEntry: null }, new RegExp(`${native} is not a plain package at an exact version in package-lock\\.json`)],
+      ['the platform package not installed', { noNative: true }, new RegExp(`${native} is not a real folder in node_modules`)],
+      ['the platform package folder a link', { nativeLink: true }, new RegExp(`${native} is not a real folder in node_modules`)],
+      ['a wrong package name in the installed folder', { nativeName: '@evil/typescript-linux-x64' }, new RegExp(`the folder node_modules/${native} holds another package`)],
+      ['the installed platform package at another version', { nativeVersion: '7.0.1' }, new RegExp(`${native} is 7\\.0\\.1, not the 7\\.0\\.2 package-lock\\.json pins`)],
+      ['the platform package not installed by npm ci', { hiddenNative: null }, new RegExp(`${native} was not installed from the registry tarball package-lock\\.json pins`)],
+      ['the binary the shim runs is a link out', { exeLink: true }, /the native binary lib\/tsc of .* is not a regular file inside its package/],
+      ['no binary for the shim', { noExe: true }, /the native binary lib\/tsc of .* is not a regular file inside its package/],
+      ['a nested copy the shim would load first', { nested: true }, /a nested copy .* the tsc shim would run instead/],
+      ['a nested copy in the lockfile', { nestedLock: true }, /a nested copy .* the tsc shim would run instead/],
+      ['another platform\'s entry from codeload', { otherEntry: { resolved: 'https://codeload.github.com/x/y/tar.gz/abc' } }, /in package-lock\.json is not the registry tarball with a sha512 integrity/],
+      ['typescript itself from codeload', { tsEntry: { resolved: 'https://codeload.github.com/microsoft/TypeScript/tar.gz/abc' } }, /^pipegen: typescript in package-lock\.json is not the registry tarball/m],
+    ];
+    for (const [why, o, re] of bad) {
+      const r = runs(fixture7(o));
+      expect(r.status, why).toBe(1);
+      expect(r.err, why).toMatch(re);
+    }
+    // the real TypeScript 7.0.2 of the worktree (offline): the check passes on its real lockfile and node_modules, then the real shim
+    // runs the checked native binary through the tsconfig guard chain: a type error fails, a clean project passes
+    const root = process.cwd();
+    const tsc = join(root, 'node_modules', 'typescript', 'bin', 'tsc');
+    if (!existsSync(join(root, 'node_modules', '@typescript', plat, 'lib', 'tsc'))) return;
+    expect(runs(root)).toEqual({ status: 0, err: '' });
+    const guard = tsconfigGuardJs();
+    const project = (code: string): string => {
+      const d = makeTempDir();
+      mkdirSync(join(d, 'src'));
+      writeFileSync(join(d, 'src', 'main.ts'), code);
+      writeFileSync(join(d, 'tsconfig.json'), JSON.stringify({ compilerOptions: { strict: true, module: 'esnext', moduleResolution: 'bundler', target: 'es2022' }, include: ['src'] }));
+      return d;
+    };
+    const chain = (d: string): number => {
+      writeFileSync(join(d, 'cfg.json'), execFileSync(process.execPath, [tsc, '-p', 'tsconfig.json', '--showConfig'], { cwd: d, stdio: 'pipe' }));
+      execFileSync(process.execPath, ['-e', guard, join(d, 'cfg.json')], { cwd: d, env: {}, stdio: 'pipe' });
+      try { execFileSync(process.execPath, [tsc, '-p', 'tsconfig.json', '--noEmit'], { cwd: d, stdio: 'pipe' }); return 0; } catch (e) { return (e as { status: number }).status; }
+    };
+    expect(chain(project('export const n: number = 1;\n'))).toBe(0);
+    expect(chain(project('export const n: number = "not a number";\n'))).not.toBe(0);
   });
 
   it('render: every npm ci pipegen renders passes --git=/usr/bin/git (a repo .npmrc git= never runs)', () => {
