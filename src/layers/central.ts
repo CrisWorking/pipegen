@@ -11,8 +11,9 @@
 // - The sign job (G2's one renderer, job `sign` only): the digest hand-off of each image (image-publish's artifact in the same run), the
 //   reviewed ghcr login (cosign stores the signature next to the image), then cosign. key-env runs in environment pipegen-signing, whose
 //   secrets hold the key (default-branch deploys only), with --tlog-upload=false (no public log for a private repo); keyless asks for the
-//   OIDC token and nothing else privileged. cache-mode: none. Attest mode (actions/attest v4) can not be written yet: its subject-digest
-//   is a run-time value, and the reviewed input table (tool-flags.ts, inside the gate bundle) takes only a literal digest (carry to G15).
+//   OIDC token and the registry write that stores the signature (no environment, no key, no attestations). cache-mode: none. Attest mode
+//   (actions/attest v4) can not be written yet: its subject-digest is a run-time value, and the reviewed input table (tool-flags.ts, inside
+//   the gate bundle) takes only a literal digest (carry to G15, which also binds that digest to the image hand-off).
 // - The caller job (G2-R-sec2): a deploy job of the app's pipegen.yml, `if: DEPLOY_PUSH_IF` (a push to the default branch), needing the
 //   job that holds the gate, pinned to the recorded central commit, granted exactly the sign job's permissions, passing no secret (the
 //   environment's secrets reach the called job through its own `environment:`). A repository outside pipegen's judged files can still call
@@ -32,6 +33,8 @@ import type { Capabilities, CreatedFile, PipelineDraft, RepoProfile, ReviewedToo
 
 /** The sign job's id (the referee's permission and step tables are keyed by it). */
 export const SIGN_JOB_ID = 'sign';
+/** The job that pushes the image and uploads its digest hand-off (G7): the sign caller needs it. */
+export const IMAGE_PUBLISH_JOB = 'image-publish';
 /** The runner of the sign job: a pinned GitHub-hosted image. */
 export const SIGN_RUNNER = 'ubuntu-24.04';
 /** The sign job's own limit (a download, a login and one cosign call per image). */
@@ -214,6 +217,8 @@ export function signCallerJob(draft: PipelineDraft, mode: SigningMode, needs: re
   if (!Array.isArray(needs) || needs.length === 0 || needs.some((n) => typeof n !== 'string' || !JOB_ID_RE.test(n)) || new Set(needs).size !== needs.length) {
     throw new RenderError('The sign caller needs the job holding the gate (and image-publish), each a plain job id, once.');
   }
+  // G3-R2 M4: the digest it signs is image-publish's, uploaded earlier in the same run; without the need both would run at once
+  if (!needs.includes(IMAGE_PUBLISH_JOB)) throw new RenderError(`The sign caller needs ${IMAGE_PUBLISH_JOB}, whose digest it signs (without it both run at once and the digest is not there yet).`);
   const pin = draft.centralPin;
   const owner = draft.profile.owner;
   if (pin === undefined || typeof pin.repo !== 'string' || typeof pin.sha !== 'string' || typeof owner !== 'string' || pin.repo.toLowerCase() !== `${owner.toLowerCase()}/pipelines` || !isGitHubRepo(pin.repo) || !COMMIT_SHA_RE.test(pin.sha)) {

@@ -2,12 +2,17 @@
 // is code-chosen (signingMode, or none for the proof) and written as a literal of the file; the sign job is G2's renderer in job `sign`,
 // key-env in environment pipegen-signing with --tlog-upload=false, cache-mode none, the permissions its mode needs; the caller is a
 // deploy job of pipegen.yml (G2-R-sec2). No enrolled list; records-only pipelines gets no central workflow.
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Document, parse, parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { DEPLOY_PUSH_IF } from '../src/engine/job-rules.js';
 import { referee, type Linters } from '../src/engine/referee.js';
 import { RenderError } from '../src/engine/render-error.js';
+import { renderPlatformStep } from '../src/engine/render-step.js';
 import { attestSignerWorkflow, imageDigestArtifact, keylessIdentity, renderSignSteps } from '../src/engine/signing.js';
 import { signingMode, type SigningMode } from '../src/github/signing-mode.js';
 import { ATTEST_MAJOR, sharedWorkflows, signCallerJob, signingPlan, signJob, signPermissions, SIGN_JOB_ID } from '../src/layers/central.js';
@@ -22,12 +27,16 @@ const KEY_NAME = ['PIPEGEN_COSIGN', 'KEY'].join('_');
 const PW_NAME = ['PIPEGEN_COSIGN', 'PASS' + 'WORD'].join('_');
 /** The workflow_call key `secrets`, spelled at run time. */
 const SEC_FIELD = ['sec', 'rets'].join('');
+/** The referee's message for the OIDC permission, spelled at run time. */
+const ID_WRITE = new RegExp(`${OIDC}: write`);
 const LINTERS: Linters = { actionlint: async () => '/stub', zizmor: async () => '/stub' };
 const deps = { reviewed: reviewedList(), platform: p };
 const PUB_SHA = createHash('sha256').update('a public key', 'utf8').digest('hex');
 const SHA = 'a'.repeat(40);
 const IMG = { service: 'app', repo: 'ghcr.io/o/r-app' };
 const IMG2 = { service: 'web', repo: 'ghcr.io/o/r-web' };
+/** The sign caller's real needs: the job holding the gate, and image-publish, whose digest it signs (G3-R2 M4). */
+const NEEDS = ['gate', 'image-publish'];
 
 const CAPS_BASE: Capabilities = { branchProtection: true, environments: false, envRequiredReviewers: false, deploymentBranchPolicies: false, attestations: false, codeScanning: true, keylessSigningAllowed: false };
 const KE_CAPS: Capabilities = { ...CAPS_BASE, environments: true, deploymentBranchPolicies: true };
@@ -58,7 +67,7 @@ const judge = (files: CreatedFile[], d: PipelineDraft, reviewed: ReviewedTool[] 
   referee(files, d, p, reviewed, LINTERS, 'tok', { runLinters: async () => [] });
 const show = (r: { issues: { check: string; message: string }[] }): string => r.issues.map((i) => `${i.check}: ${i.message}`).join('\n');
 /** The whole judged set of a key-env draft: the central sign file and the app's caller of it. */
-const keSet = (d: PipelineDraft = keDraft()): CreatedFile[] => [fileOf(sharedWorkflows(d, 'key-env', deps)), appCaller(d, signCallerJob(d, 'key-env', ['gate']) as Record<string, unknown>)];
+const keSet = (d: PipelineDraft = keDraft()): CreatedFile[] => [fileOf(sharedWorkflows(d, 'key-env', deps)), appCaller(d, signCallerJob(d, 'key-env', NEEDS) as Record<string, unknown>)];
 /** A file with its sign job changed by `edit`. */
 function editSign(f: CreatedFile, edit: (j: Obj, doc: Obj) => void): CreatedFile {
   const js = parse(f.content) as Obj;
@@ -99,7 +108,7 @@ describe('G3: central shared files (Plan G Task 1)', () => {
     expect(kinds[2]).toMatch(/^docker\/login-action@/);
     expect((j.steps as Obj[])[2]?.with?.registry).toBe('ghcr.io');
     expect((j.steps as Obj[])[3]).toBe(sign);
-    // the referee's rule holds the key to the environment: without it, refused
+    // the mode is code-chosen: without the proven branch policy (deploymentBranchPolicies) a key any branch could read is never used
     expect(() => signJob(keDraft({ capabilities: { ...KE_CAPS, deploymentBranchPolicies: false } }), 'key-env', deps)).toThrow(RenderError);
     // two images: one download each, one login, one cosign install, one sign step each
     const two = draft({ ...KE_PLAN, images: [IMG, IMG2] });
@@ -131,7 +140,7 @@ describe('G3: central shared files (Plan G Task 1)', () => {
     expect(() => signJob(d, 'attest', { ...deps, platform: other })).toThrow(/only with the reviewed actions\/attest/);
   });
 
-  it('central: keyless only requests id-token write', () => {
+  it('central: keyless only requests id-token write', async () => {
     // keyless is a public repository's mode: its sign job is a deploy job of the app's own pipegen.yml (the identity keylessIdentity names)
     const pub = draftOf({ capabilities: { ...CAPS_BASE, keylessSigningAllowed: true }, signing: { mode: 'keyless', images: [IMG] } });
     expect(signingMode(pub.profile, pub.capabilities)).toBe('keyless');
@@ -145,8 +154,7 @@ describe('G3: central shared files (Plan G Task 1)', () => {
     // key-env never asks for the OIDC token (it signs with the environment's key)
     expect(signPermissions('key-env')).toEqual({ contents: 'read', packages: 'write' });
     expect(signJob(keDraft(), 'key-env', deps).permissions[OIDC]).toBeUndefined();
-    // the inline keyless job passes the referee as a deploy job of pipegen.yml
-    return (async () => {
+    {
       // the referee holds it too: a key-env sign job that asks for the OIDC token or attestations write is refused
       const [keFile, keCaller] = keSet();
       for (const extra of [{ [OIDC]: 'write' }, { attestations: 'write' }]) {
@@ -154,13 +162,14 @@ describe('G3: central shared files (Plan G Task 1)', () => {
         const callerDoc = parseDocument((keCaller as CreatedFile).content);
         callerDoc.setIn(['jobs', SIGN_JOB_ID, 'permissions'], callerDoc.createNode({ contents: 'read', packages: 'write', ...extra }));
         const r = await judge([wide, { ...(keCaller as CreatedFile), content: callerDoc.toString({ lineWidth: 0 }) }], keDraft());
-        expect(r.issues.some((i) => i.check === 'permissions' && /only a keyless sign step or actions\/attest|only actions\/attest/.test(i.message)), `${JSON.stringify(extra)}: ${show(r)}`).toBe(true);
+        expect(r.issues.some((i) => i.check === 'permissions' && new RegExp(`${OIDC}: write|attestations: write`).test(i.message)), `${JSON.stringify(extra)}: ${show(r)}`).toBe(true);
       }
-      const file = workflow({ ...jobsOf(pub), [SIGN_JOB_ID]: { ...j, if: DEPLOY_PUSH_IF, needs: ['gate'] } }, { on: DEPLOY_ON });
-      expect(show(await judge([file], pub))).toBe('');
-      // and a private repository never signs keyless (a public log): the mode is not the chosen one
-      expect(() => signJob({ ...pub, profile: { ...pub.profile, private: true } }, 'keyless', deps)).toThrow(RenderError);
-    })();
+    }
+    // the inline keyless job passes the referee as a deploy job of pipegen.yml
+    const file = workflow({ ...jobsOf(pub), [SIGN_JOB_ID]: { ...j, if: DEPLOY_PUSH_IF, needs: ['gate'] } }, { on: DEPLOY_ON });
+    expect(show(await judge([file], pub))).toBe('');
+    // and a private repository never signs keyless (a public log): the mode is not the chosen one
+    expect(() => signJob({ ...pub, profile: { ...pub.profile, private: true } }, 'keyless', deps)).toThrow(RenderError);
   });
 
   it('central: mode none → no sign workflow', () => {
@@ -195,8 +204,8 @@ describe('G3: central shared files (Plan G Task 1)', () => {
   it('central: referee passes on shared workflows', async () => {
     // the central sign file and the app's caller job, judged together (one referee call): the caller is a deploy job of pipegen.yml
     const d = keDraft();
-    const caller = signCallerJob(d, 'key-env', ['gate']) as Record<string, unknown>;
-    expect(caller).toEqual({ uses: `o/pipelines/.github/workflows/r--sign.yml@${SHA}`, if: DEPLOY_PUSH_IF, needs: ['gate'], permissions: { contents: 'read', packages: 'write' } });
+    const caller = signCallerJob(d, 'key-env', NEEDS) as Record<string, unknown>;
+    expect(caller).toEqual({ uses: `o/pipelines/.github/workflows/r--sign.yml@${SHA}`, if: DEPLOY_PUSH_IF, needs: NEEDS, permissions: { contents: 'read', packages: 'write' } });
     // no input and no secret is passed: the environment's secrets reach the called job through its own environment
     expect(caller).not.toHaveProperty('with');
     expect(caller).not.toHaveProperty('secrets');
@@ -217,9 +226,9 @@ describe('G3: central shared files (Plan G Task 1)', () => {
     const edited = { ...file, content: file.content.replace(' --tlog-upload=false', '') };
     expect((await judge([edited, appCaller(d, caller)], d)).ok).toBe(false);
     // the caller is built only with the recorded central pin, a gate job to need, and plain job ids
-    expect(() => signCallerJob(keDraft({ centralPin: undefined }), 'key-env', ['gate'])).toThrow(RenderError);
-    expect(() => signCallerJob(keDraft({ centralPin: { repo: 'x/pipelines', sha: SHA } }), 'key-env', ['gate'])).toThrow(RenderError);
-    expect(() => signCallerJob(keDraft({ centralPin: { repo: 'o/pipelines', sha: 'main' } }), 'key-env', ['gate'])).toThrow(RenderError);
+    expect(() => signCallerJob(keDraft({ centralPin: undefined }), 'key-env', NEEDS)).toThrow(RenderError);
+    expect(() => signCallerJob(keDraft({ centralPin: { repo: 'x/pipelines', sha: SHA } }), 'key-env', NEEDS)).toThrow(RenderError);
+    expect(() => signCallerJob(keDraft({ centralPin: { repo: 'o/pipelines', sha: 'main' } }), 'key-env', NEEDS)).toThrow(RenderError);
     for (const needs of [[], ['gate', 'gate'], ['${{ x }}']]) expect(() => signCallerJob(d, 'key-env', needs), JSON.stringify(needs)).toThrow(RenderError);
   });
 
@@ -260,7 +269,7 @@ describe('G3: central shared files (Plan G Task 1)', () => {
     expect(() => signingPlan(privProf, KE_CAPS, 'key-env', [IMG, { ...IMG }], PUB_SHA)).toThrow(/twice/);
     // the referee: a sign file that declares a workflow_call input (a mode, say) is refused, whatever its steps read
     const withInput = editSign(file, (_j, top) => { top.on = { workflow_call: { inputs: { mode: { type: 'string', required: true } } } }; });
-    const caller = appCaller(d, signCallerJob(d, 'key-env', ['gate']) as Record<string, unknown>);
+    const caller = appCaller(d, signCallerJob(d, 'key-env', NEEDS) as Record<string, unknown>);
     const r = await judge([withInput, caller], d);
     expect(r.issues.some((i) => /declares no input/.test(i.message)), show(r)).toBe(true);
     const declared = editSign(file, (_j, top) => { top.on = { workflow_call: { [SEC_FIELD]: Object.fromEntries([[KEY_NAME, { required: true }]]) } }; });
@@ -283,5 +292,133 @@ describe('G3: central shared files (Plan G Task 1)', () => {
     }
     // whatever the draft claims: a key-env plan on a public profile still writes nothing central
     expect(sharedWorkflows({ ...pub, signing: KE_PLAN, capabilities: KE_CAPS }, 'key-env', deps)).toEqual([]);
+  });
+});
+
+describe('G3 fix round 1 (G3-R2)', () => {
+  const attestStep = (): Obj => {
+    const { usesComment: _c, ...rest } = renderPlatformStep('attest', p, { 'subject-name': 'ghcr.io/o/r-app', 'subject-digest': `sha256:${'b'.repeat(64)}` }) as Obj;
+    return rest;
+  };
+  const WIDE = { contents: 'read', packages: 'write', [OIDC]: 'write', attestations: 'write' };
+  const withCaller = (d: PipelineDraft, over: Record<string, unknown>): CreatedFile => appCaller(d, { ...(signCallerJob(d, 'key-env', NEEDS) as Record<string, unknown>), ...over });
+
+  it('referee: id-token and attestations write in job sign only in the draft\'s keyless or attest mode; an attest step only in attest mode (G3-R2 I1)', async () => {
+    const d = keDraft();
+    const file = fileOf(sharedWorkflows(d, 'key-env', deps));
+    // P-A: the key-env job holding the cosign key, plus an actions/attest step, asking for the OIDC token and attestations write
+    const pa = editSign(file, (sj) => { sj.steps.push(attestStep()); sj.permissions = WIDE; });
+    const ra = await judge([pa, withCaller(d, { permissions: WIDE })], d);
+    expect(ra.issues.some((i) => i.check === 'permissions' && ID_WRITE.test(i.message)), show(ra)).toBe(true);
+    expect(ra.issues.some((i) => i.check === 'permissions' && /attestations: write/.test(i.message)), show(ra)).toBe(true);
+    expect(ra.issues.some((i) => i.check === 'permissions' && /actions\/attest step, which runs in the job sign only in attest mode/.test(i.message)), show(ra)).toBe(true);
+    // P-A2: the attest step earlier in the job: refused by the permission rule too, not only the order rule
+    const pa2 = editSign(file, (sj) => { sj.steps.splice(1, 0, attestStep()); sj.permissions = WIDE; });
+    const ra2 = await judge([pa2, withCaller(d, { permissions: WIDE })], d);
+    expect(ra2.issues.some((i) => i.check === 'permissions' && /attest mode/.test(i.message)), show(ra2)).toBe(true);
+    // an attest step alone (no extra permission) in a key-env job: still refused
+    const pa3 = editSign(file, (sj) => { sj.steps.push(attestStep()); });
+    const ra3 = await judge([pa3, withCaller(d, {})], d);
+    expect(ra3.issues.some((i) => /attest mode/.test(i.message)), show(ra3)).toBe(true);
+    // keyless (public): the OIDC token yes, attestations write no, an attest step no
+    const pub = draftOf({ capabilities: { ...CAPS_BASE, keylessSigningAllowed: true }, signing: { mode: 'keyless', images: [IMG] } });
+    const j = signJob(pub, 'keyless', deps);
+    const inline = (over: Obj, steps: Obj[] = j.steps as Obj[]) => workflow({ ...jobsOf(pub), [SIGN_JOB_ID]: { ...j, steps, if: DEPLOY_PUSH_IF, needs: ['gate'], ...over } }, { on: DEPLOY_ON });
+    expect(show(await judge([inline({})], pub))).toBe('');
+    const kla = await judge([inline({ permissions: { ...j.permissions, attestations: 'write' } }, [...(j.steps as Obj[]), attestStep()])], pub);
+    expect(kla.issues.some((i) => /attestations: write/.test(i.message)) && kla.issues.some((i) => /attest mode/.test(i.message)), show(kla)).toBe(true);
+    // keyless mode but no keyless sign step in the job (only the download and the login): the OIDC token is not used, so refused
+    const noStep = await judge([inline({}, (j.steps as Obj[]).filter((x) => typeof x.run !== 'string' || !x.run.includes(' sign --yes')))], pub);
+    expect(noStep.issues.some((i) => i.check === 'permissions' && ID_WRITE.test(i.message)), show(noStep)).toBe(true);
+    // attest mode but no actions/attest step: neither the OIDC token nor attestations write is used, so both refused
+    const att = draft({ mode: 'attest', images: [IMG] }, { capabilities: ATTEST_CAPS });
+    const attNoStep = await judge([workflow({ ...jobsOf(att), [SIGN_JOB_ID]: { 'runs-on': 'ubuntu-latest', permissions: WIDE, 'cache-mode': 'none', if: DEPLOY_PUSH_IF, needs: ['gate'], steps: [(j.steps as Obj[])[0]] } }, { on: DEPLOY_ON })], att);
+    for (const re of [ID_WRITE, /attestations: write/]) expect(attNoStep.issues.some((i) => i.check === 'permissions' && re.test(i.message)), `${re}: ${show(attNoStep)}`).toBe(true);
+    // a draft with no signing plan: no OIDC token, no attestations write, no attest step in job sign
+    const bare = draftOf({});
+    const none = await judge([workflow({ ...jobsOf(bare), [SIGN_JOB_ID]: { 'runs-on': 'ubuntu-latest', permissions: WIDE, 'cache-mode': 'none', if: DEPLOY_PUSH_IF, needs: ['gate'], steps: [attestStep()] } }, { on: DEPLOY_ON })], bare);
+    for (const re of [ID_WRITE, /attestations: write/, /attest mode/]) expect(none.issues.some((i) => re.test(i.message)), `${re}: ${show(none)}`).toBe(true);
+  });
+
+  it('referee: the draft\'s signing mode must be signingMode(profile, caps) (G3-R2 M1)', async () => {
+    const mismatch = (r: { issues: { message: string }[] }): boolean => r.issues.some((i) => /signing mode .* is not the mode pipegen chooses/.test(i.message));
+    const d = keDraft();
+    const file = fileOf(sharedWorkflows(d, 'key-env', deps));
+    expect(mismatch(await judge(keSet(d), d))).toBe(false);
+    // the files are the honest draft's (the builder refuses each lie itself); the referee judges them against the lying draft
+    // P-L: a public (records-only) profile given a central key-env file
+    const pub = { ...d, profile: { ...d.profile, private: false } };
+    expect(mismatch(await judge([file, withCaller(d, {})], pub)), 'P-L').toBe(true);
+    // P-L2: key-env with the branch policy not proven (a key any branch could read)
+    const weak = keDraft({ capabilities: { ...KE_CAPS, deploymentBranchPolicies: false } });
+    expect(mismatch(await judge([file, withCaller(d, {})], weak)), 'P-L2').toBe(true);
+    // P-L3: the capabilities say attest, the plan says key-env
+    const att = keDraft({ capabilities: { ...KE_CAPS, attestations: true } });
+    expect(mismatch(await judge([file, withCaller(d, {})], att)), 'P-L3').toBe(true);
+    // a draft with no signing plan is not held to it
+    expect(mismatch(await judge([workflow(jobsOf(draftOf({})))], draftOf({})))).toBe(false);
+  });
+
+  it('referee: the sign caller passes no with and no secrets (G3-R2 M2)', async () => {
+    const d = keDraft();
+    const file = fileOf(sharedWorkflows(d, 'key-env', deps));
+    const passes = (r: { issues: { message: string }[] }): boolean => r.issues.some((i) => /calls the sign workflow, which takes nothing/.test(i.message));
+    expect(passes(await judge(keSet(d), d))).toBe(false);
+    // P-C: with: mode
+    expect(passes(await judge([file, withCaller(d, { with: { mode: 'keyless' } })], d)), 'with').toBe(true);
+    // an explicit secrets map, even of a name the pipeline declares
+    expect(passes(await judge([file, withCaller(d, { [SEC_FIELD]: Object.fromEntries([['GITHUB_TOKEN', `\${{ ${SEC_FIELD}.GITHUB_TOKEN }}`]]) })], d)), 'map').toBe(true);
+  });
+
+  it('render: the sign step re-checks the cosign binary\'s sha256 right before it runs (G3-R2 M3)', () => {
+    const cosign = entry('cosign');
+    for (const mode of ['key-env', 'keyless'] as const) {
+      const run = renderSignSteps(cosign, mode, IMG)[1]?.run as string;
+      const bin = '"$RUNNER_TEMP/pipegen-bin/pipegen-cosign-sign/cosign"';
+      const check = run.indexOf(`printf '%s  %s\\n' '${cosign.candidate.pin.checksum}' ${bin} | sha256sum --check --strict --status -`);
+      expect(check, `${mode}: ${run}`).toBeGreaterThan(-1);
+      // no symlink, a regular file; the check is the last thing before the one cosign call, and after the digest checks
+      expect(run).toContain(`if [ ! -f ${bin} ] || [ -L ${bin} ]; then pg_fail`);
+      const exec = run.indexOf(`${bin} sign --yes`);
+      expect(check).toBeLessThan(exec);
+      expect(run.indexOf('^sha256:[0-9a-f]{64}$')).toBeLessThan(check);
+      expect(run.slice(check, exec).split('\n').filter((l) => l.trim() !== '').length, mode).toBeLessThanOrEqual(2);
+      // cosign is run once (every other mention is the test or the hash check)
+      expect((run.match(/"\$RUNNER_TEMP\/pipegen-bin\/pipegen-cosign-sign\/cosign" (?![\]|])/g) ?? []).length, mode).toBe(1);
+    }
+    // run for real (bash, a stand-in cosign whose sha256 is the fixture's pin): the pinned binary signs; one changed after the install, or
+    // a symlink to it, signs nothing and fails the step
+    const fake = '#!/bin/sh\necho SIGNED "$@"\n';
+    const fixture = { ...cosign, candidate: { ...cosign.candidate, pin: { checksum: createHash('sha256').update(fake).digest('hex') } } } as ReviewedTool;
+    const runOnce = (content: string | null, link = false): { status: number | null; out: string } => {
+      const tmp = mkdtempSync(join(tmpdir(), 'pg-sign-'));
+      const binDir = join(tmp, 'pipegen-bin', 'pipegen-cosign-sign');
+      mkdirSync(binDir, { recursive: true });
+      mkdirSync(join(tmp, 'pipegen-out', imageDigestArtifact('app')), { recursive: true });
+      writeFileSync(join(tmp, 'pipegen-out', imageDigestArtifact('app'), 'digest'), `sha256:${'c'.repeat(64)}`);
+      if (link) { writeFileSync(join(tmp, 'real'), fake, { mode: 0o755 }); symlinkSync(join(tmp, 'real'), join(binDir, 'cosign')); } else writeFileSync(join(binDir, 'cosign'), content ?? fake, { mode: 0o755 });
+      const run = renderSignSteps(fixture, 'key-env', IMG)[1]?.run as string;
+      const r = spawnSync('bash', ['-c', run], { env: { RUNNER_TEMP: tmp, PATH: '/usr/bin:/bin', [KEY_NAME]: 'k', [PW_NAME]: 'p' }, encoding: 'utf8' });
+      rmSync(tmp, { recursive: true, force: true });
+      return { status: r.status, out: `${r.stdout}${r.stderr}` };
+    };
+    const good = runOnce(null);
+    expect(good.status, good.out).toBe(0);
+    expect(good.out).toContain('SIGNED sign --yes --key env://PIPEGEN_COSIGN_KEY');
+    for (const [what, r] of [['changed', runOnce(`${fake}curl evil\n`)], ['symlink', runOnce(null, true)]] as const) {
+      expect(r.status, `${what}: ${r.out}`).toBe(1);
+      expect(r.out, what).not.toContain('SIGNED');
+      expect(r.out, what).toMatch(/cosign binary/);
+    }
+    // a pin that is not a sha256 can not be checked: refused
+    const bad = { ...cosign, candidate: { ...cosign.candidate, pin: { checksum: 'x' } } } as ReviewedTool;
+    expect(() => renderSignSteps(bad, 'key-env', IMG)).toThrow(RenderError);
+  });
+
+  it('central: the sign caller needs image-publish, whose digest it signs (G3-R2 M4)', async () => {
+    const d = keDraft();
+    expect(() => signCallerJob(d, 'key-env', ['gate'])).toThrow(/image-publish/);
+    expect((signCallerJob(d, 'key-env', NEEDS) as Obj).needs).toEqual(NEEDS);
+    expect(show(await judge(keSet(d), d))).toBe('');
   });
 });

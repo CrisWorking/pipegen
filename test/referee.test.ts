@@ -192,7 +192,8 @@ describe('referee: the renderer and the referee agree', () => {
       renderProjectScript({ kind: 'project-script', needId: 'lint', service: 'script-app', script: 'lint' }, p, ctxN).steps];
     jobs['unit-tests--script-app'] = job(scripts[0] as RenderedStep[]);
     jobs['lint--script-app'] = job(scripts[1] as RenderedStep[]);
-    const d = draftOf([...specs, repoWide], { profile: profN });
+    // (G3-R2 I1/M1: the sign job's actions/attest step runs only in attest mode, which signingMode gives a private repository with attestations)
+    const d = draftOf([...specs, repoWide], { profile: { ...profN, private: true }, signing: { mode: 'attest', images: [{ service: 'app', repo: 'ghcr.io/o/app' }] } });
     d.needs.push(needOf('unit-tests', true, 'script-app'), needOf('lint', true, 'script-app'));
     // the nightly job: its step is nightlyStepInputs(draft) (final review fix round A, ruling 3)
     jobs.nightly = job([download(), renderNightlyStep(GATE, d)], { permissions: { contents: 'read', actions: 'read', issues: 'write' } });
@@ -455,8 +456,9 @@ describe('referee: permissions by exact job id', () => {
     const called = wf({ sign: job([attest], { permissions: { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' } }) }, { on: { workflow_call: null } }, '.github/workflows/sign.yml');
     const caller = (perms: unknown): CreatedFile => wf({ release: { uses: './.github/workflows/sign.yml', permissions: perms } });
     const union = { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' };
-    expect(permsBesidesRegistry(await run([caller(union), called], draftOf([g.spec])))).toBe(false);   // (G2-R-sec2: the registry-write rule aside)
-    expect(has(await run([caller({ ...union, issues: 'write' }), called], draftOf([g.spec])), 'permissions')).toBe(true);
+    const attestDraft = draftOf([g.spec], { profile: { ...draftOf([g.spec]).profile, private: true }, signing: { mode: 'attest', images: [{ service: 'app', repo: 'ghcr.io/o/app' }] } });
+    expect(permsBesidesRegistry(await run([caller(union), called], attestDraft))).toBe(false);   // (G2-R-sec2: the registry-write rule aside)
+    expect(has(await run([caller({ ...union, issues: 'write' }), called], attestDraft), 'permissions')).toBe(true);
     expect(has(await run([caller(union)], draftOf([g.spec])), 'unknown-pin')).toBe(true);   // the called file is not in files
   });
 });
@@ -972,7 +974,8 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
     expect(has(await run([wf({ t: job(scriptSteps(), { environment: 'pipegen-signing' }) })], dScripts()), 'permissions')).toBe(true);
     // (G3: the OIDC token and attestations write only with actions/attest in the job)
     const attest = renderPlatformStep('attest', platform(), { 'subject-name': 'ghcr.io/o/app', 'subject-digest': `sha256:${'a'.repeat(64)}` });
-    expect(permsBesidesRegistry(await run([wf({ sign: job([attest], { permissions: SIGNP, environment: 'pipegen-signing' }) })], draftOf([])))).toBe(false);   // (G2-R-sec2: the registry-write rule aside)
+    const attestDraft = draftOf([], { profile: { ...draftOf([]).profile, private: true }, signing: { mode: 'attest', images: [{ service: 'app', repo: 'ghcr.io/o/app' }] } });
+    expect(permsBesidesRegistry(await run([wf({ sign: job([attest], { permissions: SIGNP, environment: 'pipegen-signing' }) })], attestDraft))).toBe(false);   // (G2-R-sec2: the registry-write rule aside; G3-R2: attest mode)
   });
   it('A8: a secret value hidden by a YAML escape is found in the parsed scalars', async () => {
     const esc = fake.awsKey().replace(/^A/, '\\x41');

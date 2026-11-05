@@ -49,6 +49,7 @@ import {
   PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, SECRET_REF_RE, SIGN_STEP_ID_RE,
   STEP_KEYS as STEP_KEY_LIST, WORKFLOW_CONCURRENCY, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact,
 } from './job-rules.js';
+import { signingMode } from '../github/signing-mode.js';
 import { containerRefusal, RenderError, renderComposeUp, renderProjectScript, renderRuntimeEnv, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
 import { COMPOSE_PATH, planCompose } from '../create/compose.js';
 import { dockerfilesOf } from './created-judges/compose.js';
@@ -547,6 +548,12 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
   // G2 (B3 b, d): the sign and verify steps of the draft's signing plan, one source each per image. Keyless writes the image name and the
   // workflow identity to Sigstore's public log, so a private repository never signs keyless (S21: the mode is a literal pipegen chose)
   if (draft.signing?.mode === 'keyless' && draft.profile.private !== false) add('(draft)', 'permissions', 'The draft signs keyless, which writes the image name and the signing workflow to a public transparency log; a private repository signs with key-env or attest only.');
+  // G3-R2 M1: the plan's mode is the one pipegen chooses from the repository and its probed capabilities (signing-mode.ts), never another
+  // (key-env without the proven branch policy would use a key any branch can read; a public repository has no central signing)
+  if (draft.signing !== undefined && draft.signing !== null) {
+    const chosen = signingMode(draft.profile, draft.capabilities);
+    if (draft.signing.mode !== chosen) add('(draft)', 'permissions', `The draft's signing mode ${show(String(draft.signing.mode))} is not the mode pipegen chooses for this repository and its capabilities (${show(chosen)}).`);
+  }
   const signing = expectedSigningSteps(draft, reviewed);
   notes.push(...signing.notes.map((n) => safeText(n, 400)));
   signing.sign.forEach((steps, k) => record(`${SIGN_SOURCE}:${k}`, [steps, steps], false, true, false, undefined, undefined));
@@ -1030,18 +1037,23 @@ function judgeSigningJob(fc: FileCtx, where: string, j: Obj, judged: readonly Ju
 }
 
 /**
- * G3 (plan Global Constraints "Signing", Task 1 "permissions follow the referee table" per mode): the sign job asks only for what its own
- * steps use. The OIDC token (`id-token: write`) only with a keyless sign step (cosign signs with the job's identity) or actions/attest (GitHub's
- * signing); never for a key-env signature, which signs with the environment's key (a spare OIDC token could log in wherever the repository's
- * identity is trusted). `attestations: write` only with actions/attest.
+ * G3 (plan Global Constraints "Signing", Task 1 "permissions follow the referee table" per mode; fix round G3-R2 I1): the sign job asks only
+ * for what the draft's signing mode uses, with the step that uses it. The OIDC token (`id-token: write`) only in keyless mode with the keyless
+ * sign step (cosign signs with the job's identity) or in attest mode with actions/attest (GitHub's signing); never next to a key-env
+ * signature, which signs with the environment's key (a spare OIDC token could log in wherever the repository's identity is trusted).
+ * `attestations: write` only in attest mode with actions/attest. An actions/attest step runs in job sign only in attest mode: in any other
+ * mode it would attest a digest that is not the signed image's, and unlock the permissions above.
  */
 function judgeSignPermissions(fc: FileCtx, where: string, j: Obj, judged: readonly Judged[]): void {
   const p = isObj(j.permissions) ? j.permissions : {};
+  const mode = fc.draft.signing?.mode;
   const attest = judged.some((x) => x.kind === 'attest');
   // the sign step itself (its id; the cosign install is a sign-kind step too, with no secret either), recognised by content, naming no key
   const keyless = judged.some((x) => x.kind === 'sign' && typeof x.step.id === 'string' && SIGN_STEP_ID_RE.test(x.step.id) && ![...x.secrets].some((n) => SIGNING_KEY_SECRETS.has(n)));
-  if (p['id-token'] === 'write' && !attest && !keyless) fc.add(fc.file.path, 'permissions', `${where} asks for id-token: write, which only a keyless sign step or actions/attest uses; a key-env signature signs with the environment's key.`);
-  if (p.attestations === 'write' && !attest) fc.add(fc.file.path, 'permissions', `${where} asks for attestations: write, which only actions/attest (attest mode) uses.`);
+  if (attest && mode !== 'attest') fc.add(fc.file.path, 'permissions', `${where} holds an actions/attest step, which runs in the job sign only in attest mode (the draft signs ${mode === undefined ? 'nothing' : show(String(mode))}).`);
+  const oidcOk = (mode === 'keyless' && keyless) || (mode === 'attest' && attest);
+  if (p['id-token'] === 'write' && !oidcOk) fc.add(fc.file.path, 'permissions', `${where} asks for id-token: write, which only the keyless sign step (keyless mode) or actions/attest (attest mode) uses; a key-env signature signs with the environment's key.`);
+  if (p.attestations === 'write' && !(mode === 'attest' && attest)) fc.add(fc.file.path, 'permissions', `${where} asks for attestations: write, which only actions/attest in attest mode uses.`);
 }
 
 /** The draft's service whose slug is this, or undefined (none, or a name that has none). */
@@ -1411,6 +1423,11 @@ function judgeCaller(fc: FileCtx, id: string, j: Obj): Obj[] | undefined {
       else if (!fc.ex.allowed.has(k)) bad('permissions', `${where} passes the secret ${show(k)}, which no step of this pipeline declared.`);
       else if (called === undefined && PIPEGEN_SECRETS.includes(k)) bad('permissions', `${where} passes pipegen's secret ${show(k)} to a workflow pipegen can not judge.`);
     }
+  }
+  // G3-R2 M2 (ruling S21): the sign workflow takes nothing from its caller (no input, no secret: the key reaches the called job through its
+  // own environment), so a caller job of a workflow that holds the job sign passes no `with` and no `secrets`
+  if (called !== undefined && isObj(called.js.jobs) && Object.keys(called.js.jobs).some((cid) => cid.toLowerCase() === 'sign') && (j.with !== undefined || j.secrets !== undefined)) {
+    bad('injection', `${where} calls the sign workflow, which takes nothing from its caller: no with and no secrets (the mode, the images and the key are the file's and its environment's).`);
   }
   if (called === undefined || !isObj(called.js.jobs)) return undefined;
   return Object.values(called.js.jobs).map((cj) => (isObj(cj) && isObj(cj.permissions) ? cj.permissions : {}));

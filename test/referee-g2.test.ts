@@ -54,8 +54,14 @@ const ghEntry = (over: Partial<Candidate> = {}): ReviewedTool => {
 };
 /** A draft of only these steps (its other checks are not the point here). */
 const bare = (over: Partial<PipelineDraft> = {}): PipelineDraft => draftOf({ needs: [], steps: [], ...over });
+/** (G3-R2 M1: the referee holds the plan to signingMode(profile, caps), so each mode gets the repository and capabilities that choose it) */
+const MODE_SETUP: Record<SigningPlan['mode'], Partial<PipelineDraft>> = {
+  'key-env': { profile: { ...draftOf().profile, private: true }, capabilities: { ...draftOf().capabilities, environments: true, deploymentBranchPolicies: true, attestations: false } },
+  keyless: { capabilities: { ...draftOf().capabilities, environments: true } },
+  attest: { profile: { ...draftOf().profile, private: true }, capabilities: { ...draftOf().capabilities, environments: true, attestations: true } },
+};
 const signingDraft = (signing: SigningPlan, over: Partial<PipelineDraft> = {}): PipelineDraft =>
-  bare({ signing, capabilities: { ...draftOf().capabilities, environments: true }, centralPin: { repo: 'o/pipelines', sha: 'a'.repeat(40) }, ...over });
+  bare({ signing, ...MODE_SETUP[signing.mode], centralPin: { repo: 'o/pipelines', sha: 'a'.repeat(40) }, ...over });
 const KEY_ENV: SigningPlan = { mode: 'key-env', images: [IMG], cosignPubSha256: PUB_SHA };
 const KEYLESS: SigningPlan = { mode: 'keyless', images: [IMG] };
 const ATTEST: SigningPlan = { mode: 'attest', images: [IMG] };

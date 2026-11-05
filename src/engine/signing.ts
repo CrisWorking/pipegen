@@ -112,10 +112,18 @@ export function renderSignSteps(cosign: ReviewedTool, mode: 'key-env' | 'keyless
   const { repo, artifact } = imageRepo(image);
   const install = releaseInstallStep(cosign, 'pipegen-cosign-sign');
   const bin = `"${install.bin}"`;
+  const pinned = cosign.candidate.pin.checksum;
+  if (typeof pinned !== 'string' || !SHA256_HEX_RE.test(pinned)) throw new RenderError('The reviewed cosign entry has no sha256 pin, so the binary can not be checked before it signs.');
+  // G3-R2 M3 (carry B-T1c, in the workflow): other steps (the registry login) run between the install and this step, so the binary is a regular
+  // file at its pinned sha256 again right before the one cosign call that sees the key
+  const recheck = [
+    `if [ ! -f ${bin} ] || [ -L ${bin} ]; then pg_fail "the cosign binary is not the regular file pipegen installed"; fi`,
+    `printf '%s  %s\\n' ${q(pinned)} ${bin} | sha256sum --check --strict --status - || pg_fail "the cosign binary changed after its install (its sha256 is not the pinned one), so nothing is signed"`,
+  ];
   const sign = mode === 'key-env'
     ? [`COSIGN_PASSWORD="$PIPEGEN_COSIGN_PASSWORD" ${bin} sign --yes --key env://PIPEGEN_COSIGN_KEY --tlog-upload=false --use-signing-config=false "$ref"`]
     : [`${bin} sign --yes --oidc-provider=github-actions "$ref"`];
-  return [install.step, runStep(signStepId(repo), `pipegen: sign ${repo} (${mode})`, [...refLines(repo, artifact), ...sign], mode === 'key-env' ? { ...SIGN_STEP_ENV } : {})];
+  return [install.step, runStep(signStepId(repo), `pipegen: sign ${repo} (${mode})`, [...refLines(repo, artifact), ...recheck, ...sign], mode === 'key-env' ? { ...SIGN_STEP_ENV } : {})];
 }
 
 /**
