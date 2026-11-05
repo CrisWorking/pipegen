@@ -23,9 +23,10 @@ import type { DeployGates } from './deploy-gate.js';
 import type { Hooks } from './hooks.js';
 import { UNKNOWN_PREFIX } from './settings.js';
 import type { Ctx, Found, Hit } from './types.js';
+import { SAFE_SHA_NOTE } from './walk.js';
 
 export interface CreditOptions {
-  /** DoD run 2026-10-29: the default branch is a placeholder (rate limit); see BranchGuess. Only `narrowest` may credit. */
+  /** DoD run 2026-10-29: the default branch is a placeholder (rate limit); see BranchGuess. `narrowest` never credits (J3a, S5). */
   branchGuess?: 'widest' | 'narrowest';
   /** J3b: deployGates' answer for this repo (null or absent: no deploy-verify credit). */
   deployGates?: DeployGates | null;
@@ -54,7 +55,8 @@ function pushDefaultCredit(r: Coverage, rows: readonly Coverage[], p: RepoProfil
   const { trigger: _t, ...rest } = r;
   void _t;
   return {
-    ...rest, status: 'covered', why: `${subject} runs on every pull request into ${b} and on every push to ${b}.`,
+    // J3b fix round 1 (I3): the merge cover's stated limit for a never-listed action at a checked SHA stays with the row
+    ...rest, status: 'covered', why: `${subject} runs on every pull request into ${b} and on every push to ${b}.${merge.why.endsWith(SAFE_SHA_NOTE) ? ` ${SAFE_SHA_NOTE}` : ''}`,
     credit: `runs on every pull request into ${b} and every push to ${b}`, creditKind: 'push-default',
   };
 }

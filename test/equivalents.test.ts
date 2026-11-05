@@ -355,10 +355,10 @@ const GUARD = "github.event.workflow_run.conclusion == 'success' && github.event
 const GUARD_TURNED = "github.repository == github.event.workflow_run.head_repository.full_name && 'push' == github.event.workflow_run.event && (github.event.workflow_run.conclusion == 'success')";
 const ciFile = (name = 'CI', on = '\n  push:\n    branches: [main]\n  pull_request:', steps = '      - run: npm test\n') =>
   `name: ${name}\non:${on}\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n${CO}${steps}`;
-const CHECKS = `name: Checks\non: [push, pull_request]\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n${CO}      - run: npx eslint .\n  unit:\n    runs-on: ubuntu-latest\n    steps:\n${CO}      - run: npm test\n`;
+const CHECKS = `name: Checks\non:\n  push:\n    branches: [main]\n  pull_request:\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n${CO}      - run: npx eslint .\n  unit:\n    runs-on: ubuntu-latest\n    steps:\n${CO}      - run: npm test\n`;
 /** A commit check step: `if [ <current> != <tested> ]; then …; exit 1; fi`, the tested SHA through env var TESTED. */
 const checkStep = (o: { env?: string; current?: string; extra?: string } = {}) =>
-  `      - name: same commit as CI\n${o.extra ?? ''}        env:\n          TESTED: ${o.env ?? HEAD}\n        run: |\n          if [ "${o.current ?? '$(git rev-parse HEAD)'}" != "$TESTED" ]; then\n            echo "::error::not the commit CI tested"\n            exit 1\n          fi\n`;
+  `      - name: same commit as CI\n${o.extra ?? ''}        env:\n          TESTED: ${o.env ?? HEAD}\n        run: |\n          if [ "${o.current ?? '$(git rev-parse HEAD)'}" != "$TESTED" ]; then\n            echo ::error::not the commit CI tested\n            exit 1\n          fi\n`;
 /** Shape A: the guard and the commit check on the first job, the deploy job through needs (the evidence shape, B3). */
 const deployA = (o: { guard?: string; check?: string; on?: string; deployIf?: string; verifyExtra?: string; deploySteps?: string; workflows?: string; before?: string } = {}) =>
   `name: Deploy\non:\n  workflow_run:\n    workflows: [${o.workflows ?? 'CI'}]\n    types: [completed]\n${o.on ?? ''}jobs:\n  verify:\n    if: ${o.guard ?? GUARD}\n${o.verifyExtra ?? ''}    runs-on: ubuntu-latest\n    steps:\n${CO}${o.before ?? ''}${o.check ?? checkStep()}      - run: npm run build\n  deploy:\n    needs: verify\n${o.deployIf === undefined ? '' : `    if: ${o.deployIf}\n`}    runs-on: ubuntu-latest\n    environment: production\n    steps:\n${o.deploySteps ?? `${CO}      - run: npx wrangler deploy\n`}`;
@@ -414,7 +414,12 @@ describe('deploy gate (a): a guarded workflow_run deploy with a commit check', (
     const noRepo = "github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'";
     const noConclusion = "github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository";
     const branchOnly = "github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main'";
-    for (const guard of [noPush, noRepo, noConclusion, branchOnly]) {
+    // a `!=` term never counts as a guard (fix round 1, review I1)
+    const notPr = GUARD.replace("github.event.workflow_run.event == 'push'", "github.event.workflow_run.event != 'pull_request'");
+    const notOtherRepo = GUARD.replace('github.event.workflow_run.head_repository.full_name == github.repository', "github.event.workflow_run.head_repository.fork != true");
+    const notPush = GUARD.replace("github.event.workflow_run.event == 'push'", "github.event.workflow_run.event != 'push'");
+    const notSuccess = GUARD.replace("github.event.workflow_run.conclusion == 'success'", "github.event.workflow_run.conclusion != 'success'");
+    for (const guard of [noPush, noRepo, noConclusion, branchOnly, notPr, notOtherRepo, notPush, notSuccess]) {
       expectMissing(await gateOf({ 'ci.yml': ciFile(), 'deploy.yml': deployA({ guard }) }), guard);
       expectMissing(await gateOf({ 'checks.yml': CHECKS, 'release-site.yml': deployB({ guard }) }), guard);
     }
@@ -439,11 +444,14 @@ describe('deploy gate (a): a guarded workflow_run deploy with a commit check', (
 
   it('a job on the chain with always(), !cancelled() or || → missing', async () => {
     for (const deployIf of ['always()', '${{ !cancelled() }}', "success() || github.event_name == 'workflow_dispatch'", "${{ always() && github.event.workflow_run.event == 'push' }}",
-      'failure()', 'cancelled()', "github.event.workflow_run.event != 'pull_request'", 'success() == false', "contains(github.event.workflow_run.event, 'push')"]) {
+      'failure()', 'cancelled()', 'success() == false', "contains(github.event.workflow_run.event, 'push')", '${{ !success() }}', "${{ !(github.event.workflow_run.conclusion == 'success') }}",
+      'success() != false', "vars.TARGET != '' && always()", "${{ !cancelled() && vars.TARGET != '' }}"]) {
       expectMissing(await gateOf({ 'ci.yml': ciFile(), 'deploy.yml': deployA({ deployIf }) }), deployIf);
       expectMissing(await gateOf({ 'ci.yml': ciFile(), 'deploy.yml': deployC({ buildIf: deployIf }) }), deployIf);
     }
-    // a plain extra condition only narrows the run: still covered
+    // a plain extra condition only narrows the run: still covered (fix round 1, review I1: `!=` terms too)
+    expectGated(await gateOf({ 'ci.yml': ciFile(), 'deploy.yml': deployA({ deployIf: "vars.SITE_PROJECT != '' && vars.SITE_URL != ''" }) }));
+    expectGated(await gateOf({ 'ci.yml': ciFile(), 'deploy.yml': deployC({ buildIf: "${{ github.actor != 'release-bot' && (github.event.workflow_run.head_branch != 'wip') }}" }) }));
     expectGated(await gateOf({ 'ci.yml': ciFile(), 'deploy.yml': deployA({ deployIf: "success() && github.event.workflow_run.head_branch == 'main'" }) }));
     expectGated(await gateOf({ 'ci.yml': ciFile(), 'deploy.yml': deployC({ buildIf: 'success()' }) }));
     // continue-on-error on a job of the chain: a failed check counts as passed for the jobs that need it
@@ -460,7 +468,7 @@ describe('deploy gate (a): a guarded workflow_run deploy with a commit check', (
     expectMissing(await gateOf({ 'ci.yml': ciFile(), 'deploy.yml': after }));
     // the check after a build step, or with no exit on a mismatch, or in a shell that doesn't stop → missing
     expectMissing(await gateOf({ 'ci.yml': ciFile(), 'deploy.yml': deployA({ before: '      - run: npm run build\n' }) }));
-    const echoOnly = '      - env:\n          TESTED: ${{ github.event.workflow_run.head_sha }}\n        run: |\n          if [ "$(git rev-parse HEAD)" != "$TESTED" ]; then\n            echo "::warning::not the tested commit"\n          fi\n';
+    const echoOnly = '      - env:\n          TESTED: ${{ github.event.workflow_run.head_sha }}\n        run: |\n          if [ "$(git rev-parse HEAD)" != "$TESTED" ]; then\n            echo ::warning::not the tested commit\n          fi\n';
     expectMissing(await gateOf({ 'ci.yml': ciFile(), 'deploy.yml': deployA({ check: echoOnly }) }));
     expectMissing(await gateOf({ 'ci.yml': ciFile(), 'deploy.yml': deployA({ check: checkStep({ extra: '        shell: pwsh\n' }) }) }));
     expectMissing(await gateOf({ 'ci.yml': ciFile(), 'deploy.yml': deployC({ gateSteps: '      - run: test "$GITHUB_SHA" = "${{ github.event.workflow_run.head_sha }}" || true\n' }) }));
@@ -512,6 +520,37 @@ describe('deploy gate (a): a guarded workflow_run deploy with a commit check', (
     expectMissing(await gateOf({ 'ci.yml': ciFile(), 'deploy.yml': other }));
   });
 
+  it('ref form: CI that runs on tag pushes, or a branches filter in another letter case → missing (review M1, S-b)', async () => {
+    // a tag named like the default branch has that name as head_branch
+    const tagged = CHECKS.replace('    branches: [main]\n', "    branches: [main]\n    tags: ['*']\n");
+    expectMissing(await gateOf({ 'checks.yml': tagged, 'release-site.yml': deployB() }));
+    expectMissing(await gateOf({ 'checks.yml': CHECKS.replace('  push:\n    branches: [main]\n', '  push:\n'), 'release-site.yml': deployB() }));
+    expectMissing(await gateOf({ 'checks.yml': CHECKS, 'release-site.yml': deployB({ branches: 'Main' }) }));
+    // the check-step form doesn't depend on branch names: the run's own commit is the default branch's
+    expectGated(await gateOf({ 'ci.yml': ciFile('CI', "\n  push:\n    tags: ['*']\n    branches: [main]"), 'deploy.yml': deployA() }));
+  });
+
+  it('commit check script with an open quote or here-document → missing (security review S-a)', async () => {
+    // shape 1: an echo opens a string that runs over the check, which then never runs
+    const swallowedIf = '      - env:\n          TESTED: ${{ github.event.workflow_run.head_sha }}\n        run: |\n          echo "checking\n          if [ "$GITHUB_SHA" != "$TESTED" ]; then\n            exit 1\n          fi\n          "\n';
+    expectMissing(await gateOf({ 'ci.yml': ciFile(), 'deploy.yml': deployA({ check: swallowedIf }) }));
+    // shape 2: the exit inside the then-block is swallowed by a string opened on the echo line
+    const swallowedExit = '      - env:\n          TESTED: ${{ github.event.workflow_run.head_sha }}\n        run: |\n          if [ "$GITHUB_SHA" != "$TESTED" ]; then\n            echo \'mismatch\n            exit 1\n          fi\n          \'\n          fi\n';
+    expectMissing(await gateOf({ 'ci.yml': ciFile(), 'deploy.yml': deployA({ check: swallowedExit }) }));
+    // shape 3: a one-line test after a here-document opener, and a quote in the || block
+    expectMissing(await gateOf({ 'ci.yml': ciFile(), 'deploy.yml': deployC({ gateSteps: '      - run: |\n          cat <<EOF\n          test "$GITHUB_SHA" = "${{ github.event.workflow_run.head_sha }}"\n          EOF\n' }) }));
+    expectMissing(await gateOf({ 'ci.yml': ciFile(), 'deploy.yml': deployC({ gateSteps: '      - run: test "$GITHUB_SHA" = "${{ github.event.workflow_run.head_sha }}" || { echo "bad; exit 1; }\n' }) }));
+    // an echo line with quotes is refused even when they close, and a quote or here-document left open after the check
+    // refuses the whole script
+    expectMissing(await gateOf({ 'ci.yml': ciFile(), 'deploy.yml': deployA({ check: checkStep().replace('echo ::error::not the commit CI tested', 'echo "not the commit CI tested"') }) }));
+    expectMissing(await gateOf({ 'ci.yml': ciFile(), 'deploy.yml': deployC({ gateSteps: '      - run: |\n          test "$GITHUB_SHA" = "${{ github.event.workflow_run.head_sha }}"\n          echo "done\n' }) }));
+    expectMissing(await gateOf({ 'ci.yml': ciFile(), 'deploy.yml': deployC({ gateSteps: '      - run: |\n          test "$GITHUB_SHA" = "${{ github.event.workflow_run.head_sha }}"\n          cat <<EOF > out.txt\n          x\n          EOF\n' }) }));
+    // the same checks without quotes in the echo lines are credited
+    const plain = '      - env:\n          TESTED: ${{ github.event.workflow_run.head_sha }}\n        run: |\n          # don\'t deploy another commit\n          echo checking\n          if [ "$GITHUB_SHA" != "$TESTED" ]; then\n            echo ::error::mismatch\n            exit 1\n          fi\n';
+    expectGated(await gateOf({ 'ci.yml': ciFile(), 'deploy.yml': deployA({ check: plain }) }));
+    expectGated(await gateOf({ 'ci.yml': ciFile(), 'deploy.yml': deployC({ gateSteps: '      - run: test "$GITHUB_SHA" = "${{ github.event.workflow_run.head_sha }}" || { echo mismatch; exit 1; }\n' }) }));
+  });
+
   it('deploy job is a reusable call → missing', async () => {
     const callee = 'on: workflow_call\njobs:\n  steps:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n';
     const local = deployA().replace(/  deploy:\n[\s\S]*$/, '  deploy:\n    needs: verify\n    uses: ./.github/workflows/steps.yml\n');
@@ -557,7 +596,8 @@ describe('deploy gate (b): a deploy job inside the CI workflow', () => {
 
   it('deploy gate (b): deploy job needs every CI job and runs only on a push to main → covered', async () => {
     for (const [name, files] of [['pull request + push, guarded deploy job', { 'pipeline.yml': ci2() }], ['push to main only, chain of needs', { 'build.yml': ci3() }],
-      ['the ref guard alone', { 'pipeline.yml': ci2({ deployIf: "${{ github.ref == 'refs/heads/main' }}" }) }]] as [string, Record<string, string>][]) {
+      ['the ref guard alone', { 'pipeline.yml': ci2({ deployIf: "${{ github.ref == 'refs/heads/main' }}" }) }],
+      ['the push-event guard and a != term', { 'pipeline.yml': ci2({ deployIf: "github.event_name == 'push' && vars.HOST != ''" }) }]] as [string, Record<string, string>][]) {
       const r = await gateOf(files);
       expectGated(r, name);
       expect(r.why, name).toMatch(/deploys only on a push to main, after every other job of the same run passed/);
@@ -571,6 +611,15 @@ describe('deploy gate (b): a deploy job inside the CI workflow', () => {
     expectMissing(await gateOf({ 'pipeline.yml': ci2() }, { defaultBranch: 'trunk' }));
   });
 
+  it('deploy gate (b): a branch named like the default branch in another letter case never counts (security review S-b)', async () => {
+    // GitHub's == ignores case, so `github.ref == 'refs/heads/main'` holds for a push to `Main` too: the push trigger itself must be [main]
+    expectMissing(await gateOf({ 'pipeline.yml': ci2({ on: '\n  push:\n  pull_request:' }) }));
+    expectMissing(await gateOf({ 'pipeline.yml': ci2({ on: '\n  push:\n    branches: [main, Main]\n  pull_request:' }) }));
+    expectMissing(await gateOf({ 'pipeline.yml': ci2({ on: "\n  push:\n    branches: ['*']\n  pull_request:" }) }));
+    expectMissing(await gateOf({ 'build.yml': ci3({ on: '\n  push:\n    branches: [Main]' }) }));
+    expectMissing(await gateOf({ 'build.yml': ci3({ on: "\n  push:\n    branches-ignore: ['wip/**']" }) }));
+  });
+
   it('deploy gate (b): a CI job the deploy job does not need → missing', async () => {
     expectMissing(await gateOf({ 'pipeline.yml': ci2({ needs: 'test' }) }));
     expectMissing(await gateOf({ 'build.yml': ci3({ publishNeeds: 'unit' }) }));
@@ -580,7 +629,6 @@ describe('deploy gate (b): a deploy job inside the CI workflow', () => {
   it('deploy gate (b): no push-to-main guard, a ref_name guard, or another trigger → missing', async () => {
     expectMissing(await gateOf({ 'pipeline.yml': ci2({ deployIf: null }) }));
     expectMissing(await gateOf({ 'pipeline.yml': ci2({ deployIf: "github.ref_name == 'main'" }) }));
-    expectMissing(await gateOf({ 'pipeline.yml': ci2({ deployIf: "github.event_name == 'push'" }) }));
     expectMissing(await gateOf({ 'pipeline.yml': ci2({ deployIf: "github.ref == 'refs/heads/main' || github.event_name == 'push'" }) }));
     expectMissing(await gateOf({ 'pipeline.yml': ci2({ deployIf: "github.ref == 'refs/heads/develop'" }) }));
     expectMissing(await gateOf({ 'pipeline.yml': ci2({ on: '\n  push:\n    branches: [main]\n  pull_request:\n  workflow_dispatch:' }) }));

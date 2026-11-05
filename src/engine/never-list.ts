@@ -69,31 +69,67 @@ export const NEVER_REPOS: Readonly<Record<string, string>> = Object.freeze({
  *   (https://api.github.com/repos/aquasecurity/trivy/releases/tags/v0.76.1 and the same for v0.76.0, v0.75.0, v0.74.0:
  *   "immutable": true), so their checksums file can't be changed after publication.
  * Not listed: 38b337fff0a2f984d5be173c99e3f633438167ec (master on 2026-11-05, Trivy v0.76.2 published the same day).
+ *
+ * J3b fix round 1 (review I2): (3) holds only for the version the commit itself installs, through setup-trivy. So each
+ * commit lists the step inputs that may be set and their allowed values (`with:` names in any letter case, as GitHub
+ * reads them): `version` unset or exactly that commit's default (another version, `latest` or an expression installs a
+ * release pipegen never checked), and `skip-setup-trivy` unset or false (true runs whatever `trivy` is on PATH). Any
+ * other value, two spellings of one of them, or more inputs than pipegen reads: the step stays never-listed.
+ * Stated limit (controller ruling I3): the action's `cache` input defaults to true, and then setup-trivy restores the
+ * Trivy binary from the Actions cache without checking its checksum again. Poisoning that cache needs code already
+ * running in a default-branch run of the same repo, so pipegen accepts it; the covered row says "the action's cache
+ * isn't re-checked" (SAFE_SHA_NOTE in coverage/walk.ts). No input makes the cache safer here: none is required.
  */
-export const NEVER_SAFE_SHAS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+export interface SafeSha {
+  sha: string;
+  /** Inputs that may be set, lowercased name → the values allowed (any other input is not about which Trivy runs). */
+  inputs: Readonly<Record<string, readonly string[]>>;
+}
+const trivyAt = (sha: string, version: string): SafeSha => Object.freeze({ sha, inputs: Object.freeze({ version: Object.freeze([version]), 'skip-setup-trivy': Object.freeze(['false']) }) });
+export const NEVER_SAFE_SHAS: Readonly<Record<string, readonly SafeSha[]>> = Object.freeze({
   'aquasecurity/trivy-action': Object.freeze([
-    '8f28faec26515256b6d22074d1d2a8986f4cbd87', // 2026-10-21, Trivy v0.76.1
-    '6abccf398f78b4c337599c0656f933d91efb91a0', // 2026-10-14, Trivy v0.76.0
-    'c03d123cb480c08c69b054af418ea5e69fe6e57e', // 2026-10-01, Trivy v0.75.0
-    'd2a0b60797ff03db6132bd4e2b293f9b37081297', // 2026-08-14, Trivy v0.74.0
+    trivyAt('8f28faec26515256b6d22074d1d2a8986f4cbd87', 'v0.76.1'), // 2026-10-21
+    trivyAt('6abccf398f78b4c337599c0656f933d91efb91a0', 'v0.76.0'), // 2026-10-14
+    trivyAt('c03d123cb480c08c69b054af418ea5e69fe6e57e', 'v0.75.0'), // 2026-10-01
+    trivyAt('d2a0b60797ff03db6132bd4e2b293f9b37081297', 'v0.74.0'), // 2026-08-14
   ]),
 });
 
 /** Exactly `owner/name@<40 lowercase hex>`: no sub-path, no spaces, no escapes, no other ref form. */
 const STEP_AT_SHA = /^([A-Za-z0-9-]{1,39})\/([A-Za-z0-9._-]{1,100})@([0-9a-f]{40})$/;
 
+/** A step's `with:` inputs, lowercased (coverage/settings.ts lowerInputs): every spelling's value, and what couldn't be read. */
+export interface StepInputs { byName: ReadonlyMap<string, readonly unknown[]>; crowded: ReadonlySet<string>; unread: boolean }
+
+/** Each listed input is unset, or set once to an allowed value (a string, or a boolean read as GitHub passes it). */
+function inputsAllowed(safe: SafeSha, w: StepInputs): boolean {
+  if (w.unread) return false;
+  for (const [name, allowed] of Object.entries(safe.inputs)) {
+    if (w.crowded.has(name)) return false;
+    const vals = w.byName.get(name);
+    if (vals === undefined) continue;
+    if (vals.length !== 1) return false;
+    const v = vals[0];
+    const text = typeof v === 'string' ? v : typeof v === 'boolean' ? String(v) : null;
+    if (text === null || !allowed.includes(text)) return false;
+  }
+  return true;
+}
+
 /**
- * The coverage mapper's never-list check for a step's `uses:` (ruling S6): null when the value is exactly
- * `owner/name@<sha>` for a SHA in NEVER_SAFE_SHAS (owner and name in any letter case, as GitHub reads them); otherwise
- * neverListed's answer, so a tag, a branch, another commit, a sub-path, a fork or a look-alike stays listed. Never use
- * this outside the coverage mapper: the loader, discovery and the chooser refuse the name at any ref.
+ * The coverage mapper's never-list check for a step's `uses:` and `with:` inputs (ruling S6): null when the value is
+ * exactly `owner/name@<sha>` for a SHA in NEVER_SAFE_SHAS (owner and name in any letter case, as GitHub reads them) and
+ * the step's inputs keep it to what pipegen checked at that SHA (SafeSha.inputs); otherwise neverListed's answer, so a
+ * tag, a branch, another commit, a sub-path, a fork, a look-alike or another Trivy version stays listed. Never use this
+ * outside the coverage mapper: the loader, discovery and the chooser refuse the name at any ref.
  */
-export function neverListedStep(uses: unknown): NeverHit | null {
+export function neverListedStep(uses: unknown, inputs: StepInputs): NeverHit | null {
   if (typeof uses === 'string') {
     const m = STEP_AT_SHA.exec(uses);
     if (m !== null) {
       const key = `${m[1]}/${m[2]}`.toLowerCase();
-      if (Object.hasOwn(NEVER_SAFE_SHAS, key) && (NEVER_SAFE_SHAS[key] as readonly string[]).includes(m[3] as string)) return null;
+      const safe = Object.hasOwn(NEVER_SAFE_SHAS, key) ? (NEVER_SAFE_SHAS[key] as readonly SafeSha[]).find((x) => x.sha === m[3]) : undefined;
+      if (safe !== undefined && inputsAllowed(safe, inputs)) return null;
     }
   }
   return neverListed(uses);

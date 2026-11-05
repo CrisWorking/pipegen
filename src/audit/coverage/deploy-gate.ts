@@ -13,7 +13,8 @@
 //   `github.event.workflow_run.event == 'push'` and `github.event.workflow_run.head_repository.full_name ==
 //   github.repository` (or this repo's own `owner/name`) (g). GitHub skips a job whose needed job was skipped, so a
 //   guard on the root job guards the chain, but only when no job's `if:` on it uses a status function other than a
-//   plain `success()` term, `||` or `!` at all, and none has job-level continue-on-error (a). An `if:` pipegen can't
+//   plain `success()` term, `||` or a lone `!` (a `!=` comparison only narrows, fix round 1), and none has job-level
+//   continue-on-error (a). An `if:` pipegen can't
 //   parse to the end is none of these;
 // - for every deploying job (jobDeploys or a deploy/release/publish name; every job when none is), the tested commit is
 //   tied to what deploys, in one of two ways (b, c):
@@ -30,9 +31,11 @@
 //   repository.
 // Form (b), a deploy job inside the CI workflow: triggers only `push` (taking the default branch) and `pull_request`;
 // at least one deploying job and at least one other (CI) job, the CI jobs running a check that blocks; every deploying
-// job needs every CI job (transitively), is not a reusable call, and runs only on a push to the default branch: a
-// `github.ref == 'refs/heads/<default>'` term on its chain, or the file runs only on `push` with `branches:` exactly
-// `[<default>]` and no tag filter. The chain's `if:`s and continue-on-error as in form (a); every checkout on the chain
+// job needs every CI job (transitively), is not a reusable call, and runs only on a push to the default branch: the
+// push trigger has `branches:` exactly `[<default>]` and no tag filter (fix round 1, S-b: an `if:` comparison ignores
+// letter case, so it never proves the branch), and with `pull_request` too a `github.ref == 'refs/heads/<default>'`
+// or `github.event_name == 'push'` term on its chain keeps it off pull-request runs. A `!=` term anywhere only narrows
+// (fix round 1, I1). The chain's `if:`s and continue-on-error as in form (a); every checkout on the chain
 // takes no `ref` or `github.sha`, and no other repository.
 // Per service (h): the deploy-verify rows are covered only when the repo has a deploying workflow, every workflow with
 // `deploys: true` passes, and no listed workflow was unreadable (or past the budget). Under a rate stop only the widest
@@ -48,7 +51,7 @@ import { asObj } from '../../read/manifest.js';
 import { JOB_ID_RE, MAX_WORKFLOWS, WORKFLOW_FILE, jobDeploys, namesDeploy } from '../../read/workflows.js';
 import type { RepoProfile } from '../../types.js';
 import { safeText } from '../../util/safe-text.js';
-import { OLD_PREFIX, UNKNOWN_PREFIX, nonZeroExit } from './settings.js';
+import { nonZeroExit } from './settings.js';
 import { fitOf, parseOn, type BranchGuess } from './triggers.js';
 import type { Ctx, Hit, Obj } from './types.js';
 
@@ -65,10 +68,10 @@ export interface GateWorkflow { path: string; doc: Obj | null }
 
 type Operand = { path: string } | { lit: string };
 type Term = { kind: 'success' } | { kind: 'eq'; a: Operand; b: Operand } | { kind: 'other' };
-type Tok = { t: 'id'; v: string } | { t: 'str'; v: string } | { t: 'num'; v: string } | { t: 'op'; v: '&&' | '==' | '(' | ')' };
-type Node = { n: 'and'; parts: Node[] } | { n: 'eq'; a: Node; b: Node } | { n: 'success' } | { n: 'path'; v: string } | { n: 'lit'; v: string } | { n: 'group'; e: Node };
+type Tok = { t: 'id'; v: string } | { t: 'str'; v: string } | { t: 'num'; v: string } | { t: 'op'; v: '&&' | '==' | '!=' | '(' | ')' };
+type Node = { n: 'and'; parts: Node[] } | { n: 'eq'; a: Node; b: Node } | { n: 'ne'; a: Node; b: Node } | { n: 'success' } | { n: 'path'; v: string } | { n: 'lit'; v: string } | { n: 'group'; e: Node };
 
-/** Tokens of a GitHub expression, or null for anything outside this small grammar (`!`, `||`, `!=`, `<`, `[`, `,`, a double quote …). */
+/** Tokens of a GitHub expression, or null for anything outside this small grammar (a lone `!`, `||`, `<`, `[`, `,`, a double quote …). */
 function tokens(s: string): Tok[] | null {
   const out: Tok[] = [];
   let i = 0;
@@ -93,6 +96,8 @@ function tokens(s: string): Tok[] | null {
     }
     if (s.startsWith('&&', i)) { out.push({ t: 'op', v: '&&' }); i += 2; continue; }
     if (s.startsWith('==', i)) { out.push({ t: 'op', v: '==' }); i += 2; continue; }
+    // fix round 1 (review I1): `!=` is a comparison; a lone `!` (negation) stays outside the grammar
+    if (s.startsWith('!=', i)) { out.push({ t: 'op', v: '!=' }); i += 2; continue; }
     if (c === '(' || c === ')') { out.push({ t: 'op', v: c }); i++; continue; }
     const id = /^[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*/.exec(s.slice(i, i + 300));
     if (id !== null) { out.push({ t: 'id', v: id[0] }); i += id[0].length; continue; }
@@ -103,7 +108,7 @@ function tokens(s: string): Tok[] | null {
   return out;
 }
 
-/** and := eq ('&&' eq)* ; eq := primary ('==' primary)? ; primary := '(' and ')' | success() | path | literal. */
+/** and := eq ('&&' eq)* ; eq := primary (('==' | '!=') primary)? ; primary := '(' and ')' | success() | path | literal. */
 function parse(toks: readonly Tok[]): Node | null {
   let i = 0;
   const peek = () => toks[i];
@@ -140,11 +145,12 @@ function parse(toks: readonly Tok[]): Node | null {
   const eq = (depth: number): Node | null => {
     const a = primary(depth);
     if (a === null) return null;
-    if (!isOp('==')) return a;
+    const ne = isOp('!=');
+    if (!isOp('==') && !ne) return a;
     i++;
     const b = primary(depth);
-    if (b === null || isOp('==')) return null;
-    return { n: 'eq', a, b };
+    if (b === null || isOp('==') || isOp('!=')) return null;
+    return ne ? { n: 'ne', a, b } : { n: 'eq', a, b };
   };
   const and = (depth: number): Node | null => {
     const parts: Node[] = [];
@@ -174,16 +180,19 @@ function termsOf(node: Node, out: Term[]): boolean {
     out.push(a !== null && b !== null ? { kind: 'eq', a, b } : { kind: 'other' });
     return true;
   }
+  // fix round 1 (review I1): an `a != b` term only narrows the run (no status function in it, so GitHub's implied
+  // success() still holds); it is never a guard
+  if (node.n === 'ne' && (hasSuccess(node.a) || hasSuccess(node.b))) return false;
   out.push({ kind: 'other' });
   return true;
 }
 const hasSuccess = (x: Node): boolean => x.n === 'success' || (x.n === 'group' && hasSuccess(x.e)) || (x.n === 'and' && x.parts.some(hasSuccess))
-  || (x.n === 'eq' && (hasSuccess(x.a) || hasSuccess(x.b)));
+  || ((x.n === 'eq' || x.n === 'ne') && (hasSuccess(x.a) || hasSuccess(x.b)));
 
 /**
  * A job or step `if:` as its top-level `&&` terms: [] when there is none; null when it is anything else than a plain
- * conjunction pipegen reads to the end (a status function other than a top-level success(), `||`, `!`, another
- * function, a second `${{ }}`, a non-string value other than true).
+ * conjunction pipegen reads to the end (a status function other than a top-level success(), `||`, a lone `!`, another
+ * function, a second `${{ }}`, a non-string value other than true). A `!=` comparison is a term that never guards.
  */
 export function ifTerms(v: unknown): Term[] | null {
   if (v === undefined || v === null || v === true) return [];
@@ -200,7 +209,7 @@ export function ifTerms(v: unknown): Term[] | null {
   return termsOf(node, out) ? out : null;
 }
 
-type Guard = 'wr-success' | 'wr-push' | 'wr-same-repo' | 'ref-default';
+type Guard = 'wr-success' | 'wr-push' | 'wr-same-repo' | 'ref-default' | 'push-event';
 const isPath = (o: Operand, path: string) => 'path' in o && o.path === path;
 const isLit = (o: Operand, v: string) => 'lit' in o && o.lit.toLowerCase() === v.toLowerCase();
 
@@ -210,7 +219,10 @@ function guardOf(t: Term, p: RepoProfile): Guard | null {
     if (isPath(x, 'github.event.workflow_run.conclusion') && isLit(y, 'success')) return 'wr-success';
     if (isPath(x, 'github.event.workflow_run.event') && isLit(y, 'push')) return 'wr-push';
     if (isPath(x, 'github.event.workflow_run.head_repository.full_name') && (isPath(y, 'github.repository') || isLit(y, `${p.owner}/${p.repo}`))) return 'wr-same-repo';
+    // GitHub's == ignores letter case, so this tells a push from a pull request, never the default branch from a
+    // branch named `Main` (fix round 1, security review S-b): form (b) takes the branch from the push trigger's filter
     if (isPath(x, 'github.ref') && p.defaultBranch !== '' && isLit(y, `refs/heads/${p.defaultBranch}`)) return 'ref-default';
+    if (isPath(x, 'github.event_name') && isLit(y, 'push')) return 'push-event';
   }
   return null;
 }
@@ -293,7 +305,8 @@ type Side = 'head' | 'current' | 'rev-parse' | null;
 const OP = '"[^"\\\\`]*"';
 const S1 = new RegExp(`^(?:\\[ (${OP}) ==? (${OP}) \\]|test (${OP}) ==? (${OP})|\\[\\[ (${OP}) ==? (${OP}) \\]\\])(?: \\|\\| (.*))?$`);
 const S2 = new RegExp(`^if (?:\\[ (${OP}) != (${OP}) \\]|test (${OP}) != (${OP})|\\[\\[ (${OP}) != (${OP}) \\]\\])$`);
-const ECHO = /^echo(?: [^;&|<>()`{}\\]*)?$/;
+// fix round 1 (security review S-a): no quote character, so an echo line can't open a string that swallows the check
+const ECHO = /^echo(?: [^;&|<>()`{}\\'"]*)?$/;
 const SET = /^set(?: -[eux]{1,3}| -o (?:errexit|nounset|pipefail|xtrace)| -[eux]{0,3}o (?:errexit|nounset|pipefail|xtrace))*$/;
 const exitOf = (s: string) => {
   const m = /^exit ([0-9]{1,3})$/.exec(s);
@@ -375,13 +388,40 @@ function orBlock(s: string): boolean {
   return parts.length >= 1 && exitOf(parts[parts.length - 1] as string) && parts.slice(0, -1).every((x) => ECHO.test(x));
 }
 
-/** The script's lines, trimmed, spaces collapsed, with `if …; then …; fi` on one line split up; null past the bounds or on a continuation. */
+/**
+ * Fix round 1 (security review S-a): every quote on the line is closed on the same line, and no here-document starts
+ * (`<<` outside quotes). A string or here-document left open runs on into the next lines and can swallow the check.
+ */
+function quotesClosed(line: string): boolean {
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '\\') { i++; continue; }
+    if (c === "'") {
+      const end = line.indexOf("'", i + 1);
+      if (end < 0) return false;
+      i = end;
+    } else if (c === '"') {
+      let k = i + 1;
+      while (k < line.length && line[k] !== '"') k += line[k] === '\\' ? 2 : 1;
+      if (k >= line.length) return false;
+      i = k;
+    } else if (c === '`') return false;
+    else if (c === '<' && line[i + 1] === '<') return false;
+  }
+  return true;
+}
+
+/**
+ * The script's lines, trimmed, spaces collapsed, with `if …; then …; fi` on one line split up; null past the bounds,
+ * on a continuation, or when a line (other than a whole-line comment) leaves a quote or a here-document open.
+ */
 function lineList(run: string): string[] | null {
   const out: string[] = [];
   for (const raw of run.split('\n')) {
     if (raw.length > MAX_LINE || out.length > MAX_LINES) return null;
     const line = raw.trim().replace(/[ \t]+/g, ' ');
     if (line.endsWith('\\')) return null;
+    if (!line.startsWith('#') && !quotesClosed(line)) return null;
     if (line.startsWith('if ') && line.includes('; then')) {
       for (const part of line.split(/ ?; ?/)) {
         if (part.startsWith('then ')) out.push('then', part.slice(5));
@@ -426,12 +466,14 @@ function triggerNames(on: unknown): string[] | null {
   return null;
 }
 
-const CHECKLESS: ReadonlySet<string> = new Set(['image-build', 'sbom', 'signing', 'attestation', 'publishing', 'egress', 'deploy-verify', 'gate', 'update-config']);
+// fix round 1 (review M3): an allow-list, so a category added later never counts as a check by itself
+const CHECK_CATEGORIES: ReadonlySet<string> = new Set(['secrets', 'sast', 'deps', 'unit-tests', 'full-tests', 'lint', 'format-lint', 'hooks-ci', 'image-scan', 'dast', 'iac',
+  'format', 'type-check', 'coverage', 'dead-code', 'duplication', 'dockerfile-lint', 'workflow-lint', 'workflow-pin-check', 'dependency-review', 'licences', 'api-dast', 'fuzzing']);
 /** Whether `path` (in one of `jobIds`, when given) runs a check that blocks: a run pipegen recognises, reason null. */
 function runsCheck(hits: readonly Hit[], path: string, jobIds?: readonly string[]): boolean {
   const prefixes = jobIds === undefined ? [`${path} (job `] : jobIds.map((id) => `${path} (job ${id})`);
   return hits.some((h) => !h.opaque && h.reason === null && prefixes.some((x) => h.where.startsWith(x))
-    && h.categories.some((c) => !c.startsWith(UNKNOWN_PREFIX) && !c.startsWith(OLD_PREFIX) && !CHECKLESS.has(c)));
+    && h.categories.some((c) => CHECK_CATEGORIES.has(c)));
 }
 
 function workflowRunGate(doc: Obj, path: string, p: RepoProfile, others: readonly GateWorkflow[], hits: readonly Hit[], branch: string | BranchGuess): string | null {
@@ -455,10 +497,14 @@ function workflowRunGate(doc: Obj, path: string, p: RepoProfile, others: readonl
   if (matches.length !== 1 || (matches[0] as GateWorkflow).path === path) return null;
   const ci = matches[0] as GateWorkflow;
   const ciDoc = ci.doc as Obj;
-  if (fitOf(parseOn(ciDoc.on ?? ciDoc.true), branch, false).pushDefault !== true || !runsCheck(hits, ci.path)) return null;
-  // (c) the ref form needs branches: [<default>] exactly
+  const ciEvents = parseOn(ciDoc.on ?? ciDoc.true);
+  if (fitOf(ciEvents, branch, false).pushDefault !== true || !runsCheck(hits, ci.path)) return null;
+  // (c) the ref form needs branches: [<default>] exactly; and (fix round 1, review M1) CI's push trigger limited to
+  // branches with no tag filter, so a tag named like the default branch never runs CI (head_branch is a tag's name)
   const br = wr.branches;
-  const branchesExact = Array.isArray(br) && br.length === 1 && br[0] === p.defaultBranch && wr['branches-ignore'] === undefined;
+  const ciPush = ciEvents.get('push') ?? {};
+  const ciBranchesOnly = (ciPush.branches !== undefined || ciPush['branches-ignore'] !== undefined) && ciPush.tags === undefined && ciPush['tags-ignore'] === undefined;
+  const branchesExact = Array.isArray(br) && br.length === 1 && br[0] === p.defaultBranch && wr['branches-ignore'] === undefined && ciBranchesOnly;
   const jobs = jobsOf(doc);
   if (jobs === null) return null;
   const all = [...jobs.values()];
@@ -498,9 +544,13 @@ function ciRunGate(doc: Obj, path: string, p: RepoProfile, hits: readonly Hit[],
   if (names === null || !names.includes('push') || !names.every((n) => n === 'push' || n === 'pull_request')) return null;
   const events = parseOn(on);
   if (fitOf(events, branch, false).pushDefault !== true) return null;
+  // fix round 1 (security review S-b): the push trigger itself is limited to exactly [<default>] (filters match the
+  // branch name exactly; an `if:` comparison ignores letter case), with no tag filter
   const push = events.get('push') ?? {};
-  const pushOnly = names.length === 1 && Array.isArray(push.branches) && push.branches.length === 1 && push.branches[0] === p.defaultBranch
+  const pushExact = Array.isArray(push.branches) && push.branches.length === 1 && push.branches[0] === p.defaultBranch
     && push['branches-ignore'] === undefined && push.tags === undefined && push['tags-ignore'] === undefined;
+  if (!pushExact) return null;
+  const prToo = names.includes('pull_request');
   const jobs = jobsOf(doc);
   if (jobs === null) return null;
   const all = [...jobs.values()];
@@ -512,7 +562,8 @@ function ciRunGate(doc: Obj, path: string, p: RepoProfile, hits: readonly Hit[],
     if (chain === null || ci.some((j) => !chain.has(j.id))) return null;
     const members = [...chain].map((x) => jobs.get(x) as Job);
     if (members.some((m) => m.job.uses !== undefined)) return null;
-    if (!pushOnly && !members.some((m) => m.terms.some((t) => guardOf(t, p) === 'ref-default'))) return null;
+    // with pull_request too, a term that holds only for a push keeps the deploy job off pull-request runs
+    if (prToo && !members.some((m) => m.terms.some((t) => { const g = guardOf(t, p); return g === 'ref-default' || g === 'push-event'; }))) return null;
     const steps = members.map(stepsOf);
     if (steps.some((s) => s === null)) return null;
     if ((steps as Obj[][]).flat().filter(isCheckout).some((st) => checkoutRef(st) !== 'none')) return null;

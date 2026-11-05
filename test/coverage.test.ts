@@ -16,7 +16,7 @@ const neverOff = vi.hoisted(() => ({ on: false }));
 vi.mock('../src/engine/never-list.js', async (importOriginal) => {
   const a = await importOriginal<typeof import('../src/engine/never-list.js')>();
   // J3b (S6): the coverage mapper calls neverListedStep, which reads the never-list through neverListed
-  return { ...a, neverListed: (ref: unknown) => (neverOff.on ? null : a.neverListed(ref)), neverListedStep: (ref: unknown) => (neverOff.on ? null : a.neverListedStep(ref)) };
+  return { ...a, neverListed: (ref: unknown) => (neverOff.on ? null : a.neverListed(ref)), neverListedStep: (ref: unknown, w: Parameters<typeof a.neverListedStep>[1]) => (neverOff.on ? null : a.neverListedStep(ref, w)) };
 });
 afterEach(() => {
   neverOff.on = false;

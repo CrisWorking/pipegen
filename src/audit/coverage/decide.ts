@@ -340,7 +340,7 @@ export function ciCoverage(need: Need, ciLayer: CiLayer, d: Decide): Coverage {
   const lang = d.scope.languageOf(need.service);
   const cat = matchKeys(need.category, lang);
   const cover = d.ci.first(cat, dirs, layer, coverKinds(need));
-  if (cover) return { need, status: 'covered', ...located(cover), why: `${cover.subject} runs ${LAYER_DONE[layer]}.` };
+  if (cover) return { need, status: 'covered', ...located(cover), why: `${cover.subject} runs ${LAYER_DONE[layer]}.${cover.coveredNote === undefined ? '' : ` ${cover.coveredNote}`}` };
   const unknownRun = d.ci.first([...matchKeys(`${UNKNOWN_PREFIX}${need.category}`, lang), ...unsureKeys(`${UNKNOWN_PREFIX}${need.category}`, lang)], dirs, layer, [FN, FC, FO]);
   const unknownWhy = unknownRun?.unplaced ?? unknownRun?.partialWhy;
   if (unknownRun !== undefined && unknownWhy !== undefined) return { need, status: 'unknown', ...located(unknownRun), why: unknownWhy };

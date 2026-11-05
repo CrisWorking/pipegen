@@ -6,7 +6,7 @@ import { linkedLevel, parseYamlLimited, readTextLimitedWithReason, regexSafe } f
 import { asObj } from '../../read/manifest.js';
 import { JOB_ID_RE, MAX_WORKFLOWS, WORKFLOW_FILE } from '../../read/workflows.js';
 import { codeSecurityAvailable } from '../../github/availability.js';
-import { neverListedStep, plainNeverReason } from '../../engine/never-list.js';
+import { neverListed, neverListedStep, plainNeverReason } from '../../engine/never-list.js';
 import { safeText } from '../../util/safe-text.js';
 import { MAX_FILTER_PATTERNS, MAX_HITS, MAX_JOBS, MAX_LOCAL_FILES, MAX_SCAN_BYTES, MAX_SCRIPT_FILES, MAX_STEPS, MAX_STEP_VISITS } from './bounds.js';
 import { MAY_NOT_RUN, OPAQUE_WHY } from './decide.js';
@@ -216,7 +216,7 @@ function addFound(ctx: Ctx, found: Found[], c: StepCtx): void {
       ...(f.jobEnv === undefined ? {} : { jobEnv: f.jobEnv }),
       ...(f.langs === undefined ? {} : { langs: f.langs }), ...(f.pathArgs === undefined ? {} : { pathArgs: f.pathArgs }),
       ...(f.hookSkip === undefined ? {} : { hookSkip: f.hookSkip }), ...(f.unplaced === undefined ? {} : { unplaced: f.unplaced }),
-      ...(f.langFiles === undefined ? {} : { langFiles: f.langFiles }),
+      ...(f.langFiles === undefined ? {} : { langFiles: f.langFiles }), ...(f.coveredNote === undefined ? {} : { coveredNote: f.coveredNote }),
     });
   }
 }
@@ -237,6 +237,11 @@ function actionMatches(sigs: Compiled, uses: string): ToolSignature[] {
 
 const repoId = (ctx: Ctx): RepoId => ({ owner: ctx.p.owner, repo: ctx.p.repo });
 
+/**
+ * J3b fix round 1 (ruling I3): the stated limit of a never-listed action judged by a checked SHA (never-list.ts
+ * NEVER_SAFE_SHAS), added to the row it covers.
+ */
+export const SAFE_SHA_NOTE = "The action is pinned to a commit pipegen checked, but the action's cache isn't re-checked: a Trivy binary restored from it runs without its checksum being checked again.";
 /** Plan P Task 3: signatures listing exactly this called workflow (owner/repo/.github/workflows/<file>, letter case and @ref ignored). */
 function reusableMatches(sigs: Compiled, uses: string): ToolSignature[] {
   const at = uses.indexOf('@');
@@ -257,10 +262,13 @@ const pinnedRef = (uses: string) => {
  * Before all of these (ruling P33, final review I1): an action on pipegen's own never-list (neverListed, the loader's
  * rule: any letter case, a fork's name family under any owner, a look-alike) is partial with that reason, never covered.
  * J3b (DECISIONS #122, ruling S6): except exactly `owner/name@<sha>` for a commit pipegen checked (NEVER_SAFE_SHAS,
- * through neverListedStep), which is then judged like any other step. Only here: nothing pipegen adds uses it.
+ * through neverListedStep), with inputs that keep it to what was checked there (fix round 1, review I2), which is then
+ * judged like any other step; its covered row says the action's cache isn't re-checked (SAFE_SHA_NOTE, ruling I3).
+ * Only here: nothing pipegen adds uses it.
  */
 function actionFinds(ctx: Ctx, tools: readonly ToolSignature[], uses: string, w: Inputs, reusable: boolean, c: StepCtx): Found[] {
-  const never = neverListedStep(uses);
+  const never = neverListedStep(uses, w);
+  const exempt = never === null && neverListed(uses) !== null;
   return tools.filter((t) => !actionSkipped(t, w)).map((t) => {
     if (never !== null) {
       const f = foundOf(t, '.', 'never-listed');
@@ -298,6 +306,7 @@ function actionFinds(ctx: Ctx, tools: readonly ToolSignature[], uses: string, w:
       if (mode === 'all') f.hookRun = true;
       else if (mode !== null) f.hookRun = mode;
     }
+    if (exempt) f.coveredNote = SAFE_SHA_NOTE;
     return f;
   });
 }
@@ -361,6 +370,8 @@ async function walkStep(ctx: Ctx, step: Obj, c: StepCtx): Promise<void> {
   const cond = condition(step.if, repoId(ctx));
   if (cond === 'never') return;
   const withInputs = lowerInputs(asObj(step.with));
+  // J3b fix round 1: a `with:` that isn't a plain map (an expression) can set any input pipegen would read
+  if (step.with !== undefined && step.with !== null && (typeof step.with !== 'object' || Array.isArray(step.with))) withInputs.unread = true;
   const sc: StepCtx = {
     ...c, continueOnError: c.continueOnError || (allowedToFail(step['continue-on-error']) && c.rescued?.has(step) !== true), conditional: c.conditional || cond === 'partial',
     inputsUnread: c.inputsUnread || withInputs.unread, gate: gateOf(typeof step.run === 'string' ? [step.run] : [], [step.env], c.gate, ctx.sigs.softEnv, ctx.sigs.configFiles),

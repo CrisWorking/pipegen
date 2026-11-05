@@ -85,6 +85,8 @@ export interface Found {
    * those tools are carried as partial ('changed').
    */
   hookRun?: boolean | 'changed' | 'part';
+  /** J3b fix round 1 (ruling I3): pipegen's own sentence the covered row adds (SAFE_SHA_NOTE). */
+  coveredNote?: string;
   /**
    * P55 (batch B): `docker build`, docker/build-push-action or `docker compose build` builds these images, so the RUN lines
    * of their Dockerfiles run in CI (read by resolveScripts, docker.ts): one Dockerfile and its context, or the services of
@@ -140,6 +142,8 @@ export interface Hit {
   where: string;
   why?: string;
   hookRun?: boolean | 'changed' | 'part';
+  /** J3b fix round 1 (ruling I3): pipegen's own sentence the covered row adds (SAFE_SHA_NOTE). */
+  coveredNote?: string;
   /** Plan P Task 3 (PB5): found in a local composite action's later step, so not the first step of its job. */
   laterStep?: boolean;
   /** Fix round 1: config files the tool loads by itself (checked for after the walk), and a CI pre-commit run's job env. */
