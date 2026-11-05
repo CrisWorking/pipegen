@@ -1,0 +1,26 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+  leaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - run: |
+          curl -sSfL https://example.invalid/gitleaks_8.18.4_linux_x64.tar.gz -o g.tgz
+          echo "0000000000000000000000000000000000000000000000000000000000000000  g.tgz" | sha256sum -c -
+          tar xzf g.tgz gitleaks
+          ./gitleaks detect --redact
