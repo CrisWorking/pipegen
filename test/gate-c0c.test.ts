@@ -145,9 +145,11 @@ describe('CF2: every action of a listed check sits in its listed job', () => {
   it('the honest layout passes: the build in image-build--app (push false), the harden step in egress and in every other job', async () => {
     const script = renderProjectScript({ kind: 'project-script', needId: 'unit-tests', service: 'app', script: 'test' }, p, ctx).steps;
     const specs = [buildSpec(), specFor(entry('bullfrog'), { needId: 'egress' })];
-    const dd = draftOf(specs, [needOf('image-build', 'app'), needOf('egress'), needOf('unit-tests', 'app')]);
+    // (v0.2 Plan G G2, carry C0c: an image build builds its own service's Dockerfile, so the service has one)
+    const dfProf = { ...prof, services: prof.services.map((s) => (s.name === 'app' ? { ...s, dockerfile: 'Dockerfile' } : s)) };
+    const dd = { ...draftOf(specs, [needOf('image-build', 'app'), needOf('egress'), needOf('unit-tests', 'app')]), profile: dfProf };
     const list = gateJobList(dd);
-    const build = renderStep(buildSpec(), entry('docker-build-push-action'), p, { ...ctx, targets: { image: 'ghcr.io/o/app:pr-1' } }).steps;
+    const build = renderStep(buildSpec(), entry('docker-build-push-action'), p, { ...ctx, profile: dfProf, targets: { image: 'ghcr.io/o/app:pr-1' } }).steps;
     const jobsMap: Record<string, Job> = {
       'image-build--app': job([...prelude(), ...build]),
       egress: job([...harden(), ...prelude()]),

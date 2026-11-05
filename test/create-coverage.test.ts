@@ -124,7 +124,8 @@ describe('coverageChoice (B5)', () => {
   });
 
   it('coverage: the AI never chooses coverage-thresholds-lines or c8 lines (Plan F schema has no such choice)', () => {
-    expect(CODE_FILLED_CHOICES).toEqual({ 'vitest-coverage': 'coverage-thresholds-lines', c8: 'lines' });
+    // v0.2 Plan G G2 (F2-R11 b): coverage.py's fail-under joined the code-filled choices
+    expect(CODE_FILLED_CHOICES).toEqual({ 'vitest-coverage': 'coverage-thresholds-lines', c8: 'lines', 'coverage-py': 'fail-under' });
     const vit = entry('vitest-coverage');
     expect(Object.keys(vit.choices)).toEqual(['coverage-thresholds-lines']);
     expect(aiChoiceNames('vitest-coverage', vit.choices)).toEqual([]);

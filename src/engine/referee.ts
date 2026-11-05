@@ -31,7 +31,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { isMap, isScalar, LineCounter, visit, type Document, type Node as YamlNode, type Pair } from 'yaml';
 import { findSecretLike } from '../ai/redact.js';
 import { activeSafeText as safeText, anyString, anyYamlScalar, scrubForDisplay, vaultHolds, withActiveVault } from '../util/known-values.js';
-import { GATE_CHECK_NAME, type CreatedFile, type KnownValueCheck, type OutputFormat, type PipegenInserted, type PipelineDraft, type ReviewedTool, type RuntimeEnv, type StepSpec } from '../types.js';
+import { GATE_CHECK_NAME, type CreatedFile, type KnownValueCheck, type OutputFormat, type PipegenInserted, type PipelineDraft, type ReviewedTool, type RuntimeEnv, type Service, type StepSpec } from '../types.js';
 import { ArtifactNameError, slug } from './artifact-names.js';
 import { FINDINGS_CATEGORIES, gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES, readableFormat, type JobListEntry } from './gate-job-list.js';
 import { GATE_JSON_INPUTS, gateStepInputs, NIGHTLY_JSON_INPUTS, nightlyStepInputs } from './gate-inputs.js';
@@ -45,7 +45,7 @@ import { isObj, parseYaml, uniq, type Obj, type Parsed } from './yaml-parse.js';
 import { createdFileProblems, duplicatePathProblems, type CreatedInputs, type CreatedRule } from './created-files.js';
 import {
   ACTION_PATH_RE, CALLER_WORKFLOW, checkExpressions, createdPathProblem, checkJobOrder, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, gateResultUploadProblems, IF_VALUES,
-  CALLER_TRIGGERS, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, LOCAL_MERGE_WORKFLOW, NIGHTLY_CONCURRENCY, NIGHTLY_WORKFLOW, PR_CHECK_IF, PR_CHECK_JOB,
+  CALLER_TRIGGERS, IMAGE_ARCHIVE_STEP_ID, IMAGE_BUILD_NEED, imageBuildSlugOf, imageCheckStepId, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, LOCAL_MERGE_WORKFLOW, narrowingChoiceProblem, NIGHTLY_CONCURRENCY, NIGHTLY_WORKFLOW, PR_CHECK_IF, PR_CHECK_JOB,
   PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, SECRET_REF_RE,
   STEP_KEYS as STEP_KEY_LIST, WORKFLOW_CONCURRENCY, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact,
 } from './job-rules.js';
@@ -56,6 +56,8 @@ import { loadBaseImages } from './base-images.js';
 import { centralWorkflowFile, centralWorkflowPath } from './central-path.js';
 import { projectScriptFor } from './reviewed.js';
 import { slotProblem, type SlotKind } from './slots.js';
+import { expectedSigningSteps } from './signing.js';
+import { imageBuildTag, renderImageArchiveScan, renderImageBuild } from './image-handoff.js';
 import { allowedDomainsProblem, ARGV_POLICIES, BULLFROG_USES, CACHE_LOCKS, GATE_OPTIONAL_UPLOADS, PLAIN_REL_RE, PLATFORM_USES, RANGE_TOOL, RENDERER_INPUTS, rendererInputProblems, SCRUB_SECRET, uploadIfNoFiles } from './tool-flags.js';
 
 // ---------- the report ----------
@@ -108,7 +110,9 @@ export const JOB_PERMISSIONS: Readonly<Record<string, Readonly<Record<string, Le
 /** The environment `pipegen-verify` runs in when the plan has environments (design §19): only default-branch deploys pass. */
 export const SIGNING_ENVIRONMENT = 'pipegen-signing';
 /** pipegen's own secrets (gate fingerprint key, cosign key, Slack webhook) and the workflow token: allowed besides the draft's declared ones (S9). */
-export const PIPEGEN_SECRETS: readonly string[] = ['PIPEGEN_FP_KEY', 'PIPEGEN_COSIGN_KEY', 'PIPEGEN_SLACK_WEBHOOK', 'GITHUB_TOKEN'];
+export const PIPEGEN_SECRETS: readonly string[] = ['PIPEGEN_FP_KEY', 'PIPEGEN_COSIGN_KEY', 'PIPEGEN_COSIGN_PASSWORD', 'PIPEGEN_SLACK_WEBHOOK', 'GITHUB_TOKEN'];
+/** G2 (B3 b): the cosign key and its password (the signing environment's secrets) reach only a sign step, recognised by content (signing.ts). */
+const SIGNING_KEY_SECRETS: ReadonlySet<string> = new Set(['PIPEGEN_COSIGN_KEY', 'PIPEGEN_COSIGN_PASSWORD']);
 /** Ruling B7: the checks the gate judges by their findings; their tool must write SARIF (DAST: ZAP's JSON too). Every other category is judged by job status. */
 export { FINDINGS_CATEGORIES };   // defined in gate-job-list.ts (the job list needs the same set)
 
@@ -120,7 +124,13 @@ export { FINDINGS_CATEGORIES };   // defined in gate-job-list.ts (the job list n
 export type StepKind = 'checkout' | 'setup' | 'harden' | 'upload-artifact' | 'download-artifact' | 'upload-sarif' | 'attest' | 'docker-login' | 'setup-buildx' | 'build-push'
   | 'gate' | 'watcher' | 'tool' | 'scrub' | 'stage' | 'central' | 'repo-code' | 'unrecognised'
   /** G1 (BP-6): the pr-check lookup step, recognised by its exact content (renderPrCheckStep); only in the job pr-check */
-  | 'pr-check';
+  | 'pr-check'
+  /**
+   * G2 (B3 b, d; B6): the cosign install and sign steps (job sign only), the cosign or gh install and verify steps (job pipegen-verify only),
+   * the image archive step (its own image-build--<service> job only) and the archive's hash check of a scanner job, each recognised by its
+   * exact content (signing.ts, image-handoff.ts) for this draft
+   */
+  | 'sign' | 'verify' | 'image-archive' | 'image-check';
 /** pipegen's own actions by reviewed-entry id (Plan C adds the gate entry, Plan H the watcher entry, under these ids). */
 export const PIPEGEN_ACTION_IDS = { gate: 'pipegen-gate', watcher: 'pipegen-watcher' } as const;
 /** The step kind of each reviewed action entry that is not an ordinary tool, by entry id. The gate entry is kind `gate`, except a recognised scrub step of it (isScrubStep: judgeUses). */
@@ -141,7 +151,8 @@ const ENTRY_KIND: Readonly<Record<string, StepKind>> = Object.freeze({
  */
 export const JOB_STEP_POLICY: Readonly<Record<string, readonly StepKind[]>> = Object.freeze({
   'pr-check': ['harden', 'checkout', 'pr-check'],
-  'pipegen-verify': ['harden', 'checkout', 'download-artifact', 'gate'],
+  // G2: the verify steps of the draft's signing plan (B3 b, d), and G7's digest step later
+  'pipegen-verify': ['harden', 'checkout', 'download-artifact', 'gate', 'verify'],
   'code-scanning': ['harden', 'download-artifact', 'upload-sarif'],
   // no checkout: the gate never reads the workspace (Plan C ruling S21); it reads the event, the job outputs and the API
   // C5b: the gate's own uploads (result, baseline, clean-run marker) after the gate step, and no other upload (checkJobOrder, gateUploadProblems)
@@ -150,7 +161,8 @@ export const JOB_STEP_POLICY: Readonly<Record<string, readonly StepKind[]>> = Ob
   // no checkout: this job holds PIPEGEN_FP_KEY and reads only the API and artifacts (C3 review m9, like the gate job's S21)
   'baseline-check': ['harden', 'download-artifact', 'gate'],
   'image-publish': ['harden', 'checkout', 'setup-buildx', 'docker-login', 'build-push'],
-  sign: ['harden', 'checkout', 'download-artifact', 'docker-login', 'attest'],
+  // G2: the cosign sign steps of the draft's signing plan (B3 b); attest mode signs with the reviewed actions/attest
+  sign: ['harden', 'checkout', 'download-artifact', 'docker-login', 'attest', 'sign'],
   // no checkout: the nightly job holds PIPEGEN_FP_KEY (it verifies the baseline) and reads only the API; the identity comes from GITHUB_REPOSITORY (C7 fix round 1)
   nightly: ['harden', 'download-artifact', 'gate'],
   watch: ['harden', 'checkout', 'watcher'],
@@ -253,6 +265,23 @@ const SENTINELS = [
   { image: `ghcr.io/pipegen-referee/b@sha256:${'b'.repeat(64)}`, url: 'http://localhost:2', k8sDir: 'pipegen-referee-b' },
 ] as const;
 
+/** G2: the sources of the steps the signing plan and the image hand-off make (signing.ts, image-handoff.ts), and the step kind of each. */
+const SIGN_SOURCE = 'sign';
+const VERIFY_SOURCE = 'verify';
+const IMAGE_ARCHIVE_SOURCE = 'image-archive';
+const IMAGE_CHECK_SOURCE = 'image-check';
+/** A scanner of the PR's own image on its archive (B6): the head check itself, rendered another way (so it counts as the spec's step). */
+const ARCHIVE_SUFFIX = ':archive';
+const SOURCE_KIND: Readonly<Record<string, StepKind>> = Object.freeze({ [SIGN_SOURCE]: 'sign', [VERIFY_SOURCE]: 'verify', [IMAGE_ARCHIVE_SOURCE]: 'image-archive', [IMAGE_CHECK_SOURCE]: 'image-check' });
+const sourceKind = (source: string): StepKind | undefined => { const head = source.slice(0, source.indexOf(':')); return source.includes(':') ? own(SOURCE_KIND, head) : undefined; };
+/** The service slug a source of the image hand-off names (`image-archive:<slug>`, `image-check:<slug>`). */
+const sourceSlug = (source: string): string => source.slice(source.indexOf(':') + 1);
+/** The image tools that scan the archive (image-handoff.ts ARCHIVE_WORD) and the reviewed build-push entry. */
+const ARCHIVE_TOOLS: ReadonlySet<string> = new Set(['trivy-image', 'syft']);
+const BUILD_PUSH_ID = PLATFORM_ACTION_IDS['build-push'];
+/** The slot kinds whose base twin must scan another input than the head (C-MUST-1): an image, or the app at a URL. */
+const TWIN_SLOT_KINDS: ReadonlySet<SlotKind> = new Set(['image-digest', 'local-url']);
+
 type Add = (file: string, check: RefereeCheck, message: string, line?: number, repo?: CreatedFile['repo']) => void;
 const hasExpr = (v: unknown): boolean => (typeof v === 'string' ? v.includes(EXPR) : Array.isArray(v) ? v.some(hasExpr) : isObj(v) ? Object.entries(v).some(([k, x]) => k.includes(EXPR) || hasExpr(x)) : false);
 
@@ -345,6 +374,8 @@ interface Expectations {
   deferred: (() => void)[];
   /** every steps job judged, in every file */
   jobs: JobRecord[];
+  /** C-MUST-1 (G2): the image or URL slot value of every recognised scan step, by source, for the base-twin rule */
+  twinInputs: { source: string; value: string; file: CreatedFile }[];
 }
 
 const coreOf = (s: RenderedStep): Obj => ({ id: s.id, uses: s.uses, with: s.with, run: s.run, shell: s.shell, env: s.env, 'working-directory': s['working-directory'] });
@@ -403,9 +434,11 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
   }
   const ex: Expectations = {
     runs: [], runIds: new Set(), actions, actionPaths: new Set([...actions.keys()].map((k) => k.slice(0, k.lastIndexOf('@')))), images,
-    declared: new Set(), allowed: new Set(PIPEGEN_SECRETS), rendered: new Set(), matched: new Set(), npmPins: new Map(), byId, deferred: [], jobs: [],
+    declared: new Set(), allowed: new Set(PIPEGEN_SECRETS), rendered: new Set(), matched: new Set(), npmPins: new Map(), byId, deferred: [], jobs: [], twinInputs: [],
   };
   const ctxs: RenderContext[] = SENTINELS.map((t) => ({ profile: draft.profile, targets: { ...t } }));
+  /** G2 (B6): the services whose image build the draft holds (their archive is what the image scanners read) */
+  const imageBuilds = new Set<string>();
   const needOf = (needId: string, service: string | undefined) => draft.needs.find((n) => n.id === needId && n.service === service);
   const record = (source: string, results: RenderedStep[][], appRunning: boolean, blocking: boolean, readsWorkspace: boolean, need: string | undefined, owner: string | undefined): void => {
     const [a, b] = results as [RenderedStep[], RenderedStep[]];
@@ -437,17 +470,37 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
       add(`draft.steps[${i}]`, 'unreviewed', `The step for ${show(spec.needId)} runs ${show(t.id)}, which does not cover the check ${show(spec.needId)} (its categories are ${t.categories.map((c) => show(c)).join(', ')}); a tool of another kind would leave the check undone, so it is not run.`);
       return;
     }
+    const blocking = needOf(spec.needId, spec.service)?.blocking ?? true;
     if (t.candidate.kind === 'action') {   // actions are judged by their template (judgeAction), not by a re-render
+      // G2 (F2-R11): a blocking need's action spec never carries a narrowing value (an image build that pushes), chosen or by default
+      if (blocking) {
+        for (const [name, offered] of Object.entries(t.choices)) {
+          const given = isObj(spec.choices) ? own(spec.choices, name) : undefined;
+          const problem = narrowingChoiceProblem(name, typeof given === 'string' ? given : String(offered[0]));
+          if (problem !== null) add(`draft.steps[${i}]`, 'unreviewed', `The step for ${show(spec.needId)} (${show(t.id)}): ${problem}.`);
+        }
+      }
       for (const n of spec.secrets ?? []) ex.declared.add(n);
+      // G2 (B6): an image build for a service: its archive step, in that service's image-build job only (the build itself is judged by its binding)
+      if (t.id === BUILD_PUSH_ID && spec.needId === IMAGE_BUILD_NEED && typeof spec.service === 'string') {
+        try {
+          const archive = renderImageBuild(spec, t, platform, { profile: draft.profile }).steps.filter((x) => x.id === IMAGE_ARCHIVE_STEP_ID);
+          record(`${IMAGE_ARCHIVE_SOURCE}:${slug(spec.service)}`, [archive, archive], false, true, false, undefined, undefined);
+          imageBuilds.add(spec.service);
+        } catch (e) {
+          if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e;
+          notes.push(`The image build for ${show(spec.service)} can not be rendered, so no archive step may claim to be it: ${safeText(e.message, 200)}`);
+        }
+      }
       return;
     }
     const appRunning = t.categories.some((c) => APP_RUNNING_CATEGORIES.has(c));
     try {
-      const blocking = needOf(spec.needId, spec.service)?.blocking ?? true;
       const need = keyOf(spec.needId, spec.service);
-      record(`spec:${i}`, ctxs.map((c) => renderStep(spec, t, platform, c).steps), appRunning, blocking, readsWorkspace(t.id), need, need);
+      // G2 (F2-R11): rendered as the need blocks, so a narrowed scan of a blocking need is no step of pipegen's
+      record(`spec:${i}`, ctxs.map((c) => renderStep(spec, t, platform, { ...c, blocking }).steps), appRunning, blocking, readsWorkspace(t.id), need, need);
       // the target-branch variant (the base-scan job): the same spec, rendered into the base artifact folder
-      record(`spec:${i}:base`, ctxs.map((c) => renderStep(spec, t, platform, { ...c, base: true }).steps), appRunning, blocking, readsWorkspace(t.id), need, 'base-scan');
+      record(`spec:${i}:base`, ctxs.map((c) => renderStep(spec, t, platform, { ...c, base: true, blocking }).steps), appRunning, blocking, readsWorkspace(t.id), need, 'base-scan');
       ex.rendered.add(`spec:${i}`);
       // only a spec that rendered declares its secrets (one that did not names no step, so nothing may carry them)
       for (const n of spec.secrets ?? []) ex.declared.add(n);
@@ -457,6 +510,31 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
     }
   });
   for (const v of ex.declared) ex.allowed.add(v);
+  // G2 (B6): the scanners of the PR's own image read its archive (no base twin: there is no base build yet), after the hash check of that
+  // service's archive; only for a service whose image build is in the draft
+  draft.steps.forEach((spec: StepSpec, i) => {
+    const t = isObj(spec) && isObj(spec.tool) && typeof spec.tool.id === 'string' ? byId.get(spec.tool.id) : undefined;
+    if (t === undefined || !ARCHIVE_TOOLS.has(t.id) || !isReviewed(spec.tool) || !sameCandidate(spec.tool, t.candidate) || typeof spec.service !== 'string' || !imageBuilds.has(spec.service)) return;
+    try {
+      const blocking = needOf(spec.needId, spec.service)?.blocking ?? true;
+      const r = renderImageArchiveScan(spec, t, platform, { profile: draft.profile, blocking });
+      const check = r.steps.filter((x) => x.id === imageCheckStepId(spec.service as string));
+      const scan = r.steps.filter((x) => x.run !== undefined && !check.includes(x));
+      const need = keyOf(spec.needId, spec.service);
+      record(`${IMAGE_CHECK_SOURCE}:${slug(spec.service)}`, [check, check], false, true, false, undefined, undefined);
+      record(`spec:${i}${ARCHIVE_SUFFIX}`, [scan, scan], false, blocking, false, need, need);
+    } catch (e) {
+      if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e;
+      notes.push(`The scan of the image archive for ${show(spec.needId)} (${t.id}) can not be rendered, so no step may claim to be it: ${safeText(e.message, 200)}`);
+    }
+  });
+  // G2 (B3 b, d): the sign and verify steps of the draft's signing plan, one source each per image. Keyless writes the image name and the
+  // workflow identity to Sigstore's public log, so a private repository never signs keyless (S21: the mode is a literal pipegen chose)
+  if (draft.signing?.mode === 'keyless' && draft.profile.private !== false) add('(draft)', 'permissions', 'The draft signs keyless, which writes the image name and the signing workflow to a public transparency log; a private repository signs with key-env or attest only.');
+  const signing = expectedSigningSteps(draft, reviewed);
+  notes.push(...signing.notes.map((n) => safeText(n, 400)));
+  signing.sign.forEach((steps, k) => record(`${SIGN_SOURCE}:${k}`, [steps, steps], false, true, false, undefined, undefined));
+  signing.verify.forEach((steps, k) => record(`${VERIFY_SOURCE}:${k}`, [steps, steps], false, true, false, undefined, undefined));
   // C9: the secrets job's commit-range scan (the reviewed betterleaks entry in git mode), whichever tool scans the HEAD tree: its install and
   // its one checker step belong to the secrets job (the gate's job list has its range entry exactly when the draft has a repo-wide secrets check)
   const rangeTool = byId.get(RANGE_TOOL);
@@ -870,6 +948,67 @@ function judgeJob(fc: FileCtx, id: string, j: unknown): void {
   judgeOutputs(fc, id, where, j, judged);
   judgeStepPolicy(fc, id, where, j, judged);
   judgeGateSteps(fc, id, where, j, judged);
+  judgeSigningJob(fc, where, j, judged);
+  judgeImageHandoff(fc, id, where, j, judged);
+}
+
+/** G2 (B3 b; Plan G Task 1): a key-env sign step reads the signing key, which lives in the signing environment only, so its job runs there. */
+function judgeSigningJob(fc: FileCtx, where: string, j: Obj, judged: readonly Judged[]): void {
+  const keyed = judged.some((x) => x.kind === 'sign' && [...x.secrets].some((n) => SIGNING_KEY_SECRETS.has(n)));
+  const envName = isObj(j.environment) ? j.environment.name : j.environment;
+  if (keyed && envName !== SIGNING_ENVIRONMENT) fc.add(fc.file.path, 'permissions', `${where} signs with the cosign key, which only the environment ${SIGNING_ENVIRONMENT} holds (default-branch deploys only): the job must run in environment ${SIGNING_ENVIRONMENT}.`);
+}
+
+/** The draft's service whose slug is this, or undefined (none, or a name that has none). */
+function serviceBySlug(draft: PipelineDraft, s: string): Service | undefined {
+  return draft.profile.services.find((x) => { try { return slug(x.name) === s; } catch (e) { if (e instanceof ArtifactNameError) return false; throw e; } });
+}
+const isRootPath = (path: string): boolean => path === '.' || path === '' || path === './';
+
+/**
+ * G2 (B6, carry C0c): the image hand-off and the build binding.
+ * - build-push runs only in a job `image-build--<svc>` or `image-publish`. In `image-build--<svc>` it builds exactly that service's Dockerfile
+ *   (the template's context is the repository root, so the service must be at the root, ruling S8), never pushes, and tags the local tag its
+ *   archive step saves; in `image-publish`, it builds the Dockerfile of a service at the root.
+ * - a scanner job reads an archive only after the hash check of that service's archive, in the same job, and needs that service's image build.
+ */
+function judgeImageHandoff(fc: FileCtx, id: string, where: string, j: Obj, judged: readonly Judged[]): void {
+  const bad = issueFor(fc);
+  const buildSlug = imageBuildSlugOf(id);
+  judged.forEach((x, i) => {
+    if (x.entryId !== BUILD_PUSH_ID) return;
+    const at = `${where}, step ${i + 1}`;
+    const w = x.step.with ?? {};
+    if (id === 'image-publish') {
+      if (!fc.draft.profile.services.some((svc) => isRootPath(svc.path) && svc.dockerfile !== undefined && svc.dockerfile !== '' && w.file === svc.dockerfile)) {
+        bad('template', `${at}: build-push in image-publish builds the Dockerfile of a service at the repository root (its build context), not ${show(String(w.file ?? '(none)'))}.`);
+      }
+      return;
+    }
+    if (buildSlug === null) { bad('template', `${at}: build-push runs only in an image-build--<service> job (no push) or image-publish, so a build is always bound to one service.`); return; }
+    const svc = serviceBySlug(fc.draft, buildSlug);
+    if (svc === undefined) { bad('template', `${at}: the job ${show(id)} is the image build of no service of this repository.`); return; }
+    if (!isRootPath(svc.path)) bad('template', `${at}: the service ${show(svc.name)} is in a sub-folder, but the build context is the repository root, so pipegen can not build its image yet.`);
+    if (svc.dockerfile === undefined || svc.dockerfile === '' || w.file !== svc.dockerfile) bad('template', `${at}: an image build builds the Dockerfile of the service ${show(svc.name)} (${show(svc.dockerfile ?? '(none)')}), not ${show(String(w.file ?? '(none)'))}.`);
+    if (w.push !== 'false') bad('template', `${at}: an image build for a check never pushes (push must be false; the scanners get the image as an archive).`);
+    // with the archive (B6), the build tags exactly the image the archive step saves (a build with no archive step hands nothing on)
+    if (judged.some((y) => y.kind === 'image-archive') && w.tags !== imageBuildTag(svc.name)) bad('template', `${at}: an image build tags exactly ${show(imageBuildTag(svc.name))}, the image its archive step saves.`);
+  });
+  // the archive scans: each after the hash check of its service's archive, in this job; the job needs that service's image build
+  const needs = needsList(j.needs);
+  judged.forEach((x, i) => {
+    const src = x.match?.source;
+    if (x.kind === 'image-check' && src !== undefined && !needs.includes(`image-build--${sourceSlug(src)}`)) {
+      bad('not-gate-readable', `${where}, step ${i + 1}: the hash check reads the output of ${show(`image-build--${sourceSlug(src)}`)}, so the job must need that job (without it the check has nothing to compare and fails).`);
+    }
+    const m = src === undefined ? null : /^spec:(\d+):archive$/.exec(src);
+    if (m === null) return;
+    const service = fc.draft.steps[Number(m[1])]?.service;
+    let s: string | null = null;
+    try { s = typeof service === 'string' ? slug(service) : null; } catch (e) { if (!(e instanceof ArtifactNameError)) throw e; }
+    const checked = s !== null && judged.slice(0, i).some((y) => y.kind === 'image-check' && y.match?.source === `${IMAGE_CHECK_SOURCE}:${s}`);
+    if (!checked) bad('not-gate-readable', `${where}, step ${i + 1}: it reads the image archive before that archive's hash check in this job (the check of its sha256 against the image build must come first).`);
+  });
 }
 
 /** The job's `outputs`: only the forms of jobOutputsProblems (one rule for the renderer's jobOutputsFor and this judge), else `injection` (ruling B3). */
@@ -1043,8 +1182,10 @@ function judgeListedJobs(ex: Expectations, draft: PipelineDraft, expected: reado
   for (const e of expected) {
     // 1. the job holds the rendered tool or script of its check
     const sources = [...new Set(ex.runs.filter((r) => r.need === e.job && r.owner === e.job && !r.source.endsWith(':base') && r.step.id?.startsWith('pipegen-') !== true).map((r) => r.source))];
+    // G2 (B6): the archive scan of a spec and its registry render are one check rendered two ways: either one counts
+    const sameCheck = (a: string | undefined, src: string): boolean => a !== undefined && (a === src || a.replace(/:archive$/, '') === src.replace(/:archive$/, ''));
     for (const src of sources) {
-      if (!holds(e.job).some((x) => x.match?.source === src)) nb(`The job ${show(e.job)} is in the gate's list for the check ${show(e.needId)}, but it holds no step of the check (the rendered ${src.startsWith('script:') ? 'project script' : 'tool run'}); the gate would wait on a job that does not run it.`);
+      if (!holds(e.job).some((x) => sameCheck(x.match?.source, src))) nb(`The job ${show(e.job)} is in the gate's list for the check ${show(e.needId)}, but it holds no step of the check (the rendered ${src.startsWith('script:') ? 'project script' : 'tool run'}); the gate would wait on a job that does not run it.`);
     }
     // 1b. an action check: its action step is in the listed job and in no other job of the file
     for (const entryId of new Set(actionsOf(e.job))) {
@@ -1125,6 +1266,10 @@ function judgeStepPolicy(fc: FileCtx, id: string, where: string, j: Obj, judged:
     judged.forEach((x, i) => {
       if (x.kind === 'gate' || x.kind === 'watcher') bad('permissions', `${where}, step ${i + 1}: pipegen's ${x.kind} action runs only in its own job.`);
       else if (x.kind === 'pr-check') bad('permissions', `${where}, step ${i + 1}: pipegen's pr-check lookup runs only in the job ${PR_CHECK_JOB}.`);
+      // G2 (B3 b, d): pipegen signs only in the job sign and verifies only in the job pipegen-verify; an image archive comes only from its own image build (B6)
+      else if (x.kind === 'sign') bad('permissions', `${where}, step ${i + 1}: pipegen signs only in the job sign.`);
+      else if (x.kind === 'verify') bad('permissions', `${where}, step ${i + 1}: pipegen verifies only in the job pipegen-verify.`);
+      else if (x.kind === 'image-archive' && imageBuildSlugOf(id) !== sourceSlug(x.match?.source ?? '')) bad('permissions', `${where}, step ${i + 1}: the image archive of ${show(sourceSlug(x.match?.source ?? ''))} is made only in its own job ${show(`image-build--${sourceSlug(x.match?.source ?? '')}`)}.`);
     });
   }
   const firstRepo = judged.findIndex((x) => x.kind === 'repo-code' || x.kind === 'unrecognised' || x.kind === 'central');
@@ -1241,7 +1386,7 @@ function judgeJobSteps(fc: FileCtx, where: string, steps: unknown[], job: boolea
   // the scan steps pipegen rendered (recognised by content, so their ids can be trusted), with their reviewed tool and result format: the scrub steps must equal them
   const scans = new Map<string, ScanFact>();
   for (const x of judged) {
-    const m = x.match === undefined || !x.match.final || x.kind !== 'tool' || !x.harmlessId || x.step.id === undefined ? null : /^spec:(\d+)(?::base)?$/.exec(x.match.source);
+    const m = x.match === undefined || !x.match.final || x.kind !== 'tool' || !x.harmlessId || x.step.id === undefined ? null : /^spec:(\d+)(?::base|:archive)?$/.exec(x.match.source);
     const spec = m === null ? undefined : fc.draft.steps[Number(m[1])];
     const format = spec === undefined || !isObj(spec) || !isObj(spec.tool) ? undefined : fc.ex.byId.get(spec.tool.id)?.step.output.format;
     if (spec !== undefined && x.step.id !== undefined && (format === 'sarif' || format === 'zap-json')) scans.set(x.step.id, { tool: spec.tool.id, format });
@@ -1339,12 +1484,17 @@ function judgeStep(fc: FileCtx, where: string, raw: unknown): Judged {
     else if (r === null) { bad('unreviewed', at(`the run step ${show(raw.name ?? raw.id ?? '')} is not a step pipegen renders for this pipeline (a reviewed tool or a project script), so it is not run.`)); harmlessId = false; }
     else {
       match = r;
+      // C-MUST-1 (G2): the image or URL a scan step reads, for the base-twin rule (judgeBaseTwins)
+      for (const [k, slotKind] of r.slots) if (TWIN_SLOT_KINDS.has(slotKind) && typeof env[k] === 'string') fc.ex.twinInputs.push({ source: r.source, value: env[k] as string, file: fc.file });
+      // an archive scan reads the PR's own image with no input a base twin could be compared with (B6)
+      if (r.source.endsWith(ARCHIVE_SUFFIX)) fc.ex.twinInputs.push({ source: r.source, value: '', file: fc.file });
       if (r.source === RUNTIME_ENV_SOURCE) fc.dbPwOk += dbPwCount(JSON.stringify(raw));
-      if (r.final) fc.ex.matched.add(r.source);
+      // G2 (B6): an archive scan is the head check itself, read from the archive
+      if (r.final) fc.ex.matched.add(r.source.endsWith(ARCHIVE_SUFFIX) ? r.source.slice(0, -ARCHIVE_SUFFIX.length) : r.source);
       appRunning = r.appRunning;
       const id = r.step.id ?? '';
       kind = r.source === PR_CHECK_SOURCE ? 'pr-check'
-        : r.source.startsWith('script:') || appRunning ? 'repo-code' : /^(?:checker-run|tool-run|tool-install|tool-pull)-/.test(id) ? 'tool' : 'repo-code';
+        : sourceKind(r.source) ?? (r.source.startsWith('script:') || appRunning ? 'repo-code' : /^(?:checker-run|tool-run|tool-install|tool-pull)-/.test(id) ? 'tool' : 'repo-code');
       reads = kind === 'tool' && r.readsWorkspace;
     }
     // trivy keeps a cache between runs unless it runs with pipegen's pinned config (cache.backend: memory, ruling S3), whether
@@ -1505,6 +1655,7 @@ function judgeSecrets(fc: FileCtx, at: (m: string) => string, withs: Obj, env: O
   const scrubOk = (n: string): boolean => kind === 'scrub' && !appRunning && n === SCRUB_SECRET;
   for (const n of names) {
     if (!fc.ex.allowed.has(n)) { bad('permissions', at(`the secret ${show(n)} is neither declared by a step of this pipeline nor one of pipegen's own.`)); continue; }
+    if (SIGNING_KEY_SECRETS.has(n) && kind !== 'sign') { bad('injection', at(`the signing secret ${show(n)} reaches a step that is not pipegen's sign step; only that step names it.`)); continue; }
     if (fc.ex.declared.has(n) && !PIPEGEN_SECRETS.includes(n)) {
       if (!appRunning) bad('injection', at(`the declared secret ${show(n)} reaches a step that does not run the app (a scanner, linter, upload or setup step never gets one).`));
     } else if (!ownOk && !scrubOk(n)) bad('injection', at(`pipegen's own secret ${show(n)} reaches a step that runs code pipegen did not review as harmless.`));
@@ -1620,6 +1771,26 @@ function judgeAction(fc: FileCtx, js: Obj): void {
   judgeJobSteps(fc, 'the action', runs.steps, false);
 }
 
+// ---------- the image base twin (C-MUST-1, ruling B6) ----------
+
+/**
+ * A base twin of an image or URL scan must scan the base commit's own image (or app), never the head's: with the same input every head
+ * finding would also be a base finding, so every image CVE would look old (a wrong pass). A base-twin step is refused when its image or URL
+ * equals one a head step of the same check reads (in any file of the pipeline), when the head reads the PR's image archive (no input to
+ * compare with: B6 has no base build yet), or when no head step of the check is there at all (fail closed).
+ */
+function judgeBaseTwins(ex: Expectations, add: Add): void {
+  for (const b of ex.twinInputs) {
+    if (!b.source.endsWith(':base')) continue;
+    const head = b.source.slice(0, -':base'.length);
+    const heads = ex.twinInputs.filter((h) => h.source === head);
+    const why = ex.twinInputs.some((h) => h.source === `${head}${ARCHIVE_SUFFIX}`) ? 'the head check reads the pull request\'s own image archive, and pipegen builds no image of the base commit yet'
+      : heads.length === 0 ? 'no head step of the same check is there to compare it with'
+        : heads.some((h) => h.value === b.value) ? 'it reads the same input as the head check, so every head finding would look old (a wrong pass)' : null;
+    if (why !== null) add(b.file.path, 'not-gate-readable', `A base twin of an image or URL scan is refused: ${why}. The base twin must scan the base commit's own image or app; until pipegen builds one there is no base twin.`, undefined, b.file.repo);
+  }
+}
+
 // ---------- the blocking rule (B7) ----------
 
 /**
@@ -1719,7 +1890,11 @@ async function judgeFiles(allFiles: CreatedFile[], draft: PipelineDraft, platfor
   for (const d of duplicatePathProblems(files)) add(d.file.path, 'template', d.message, undefined, d.file.repo);
 
   // D4 I1: the compose plan is the one source. Its runtime env counts only when the file it computes is among the files judged together and passes its judge.
-  const judgeEnv0 = { reviewed, inputs: deps.createdInputs ?? {}, files };
+  // G2 (S14, D-m4): one vault input. When the created-file inputs carry no check of their own, the referee hands the judges the vault's
+  // (vaultHolds: ESC and C1 controls count as a value too), so passing only the vault never refuses PIPEGEN.md
+  const given = deps.createdInputs ?? {};
+  const inputs = given.containsKnownValue === undefined && vault !== undefined ? { ...given, containsKnownValue: (t: string) => vaultHolds(vault, t) } : given;
+  const judgeEnv0 = { reviewed, inputs, files };
   const composeFile = files.find((f) => f.repo === 'app' && f.path === COMPOSE_PATH);
   let composeEnv: RuntimeEnv | null = null;
   const composeVerdict = composeFile === undefined ? null : createdFileProblems(composeFile, draft, deps.createdRules, judgeEnv0);
@@ -1789,6 +1964,7 @@ async function judgeFiles(allFiles: CreatedFile[], draft: PipelineDraft, platfor
   }
 
   for (const check of ex.deferred) check();
+  judgeBaseTwins(ex, add);
   judgeUploadsPerFile(ex, add);
   const demoted = blockingRule(draft, ex, add, notes);
 

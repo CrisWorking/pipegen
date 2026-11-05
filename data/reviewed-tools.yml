@@ -291,6 +291,7 @@ tools:
         context: "."
         github-token: ""
         no-cache: "true"
+    # F2-R11 (G2): push true is never rendered for a blocking need (an image build for a check never pushes; image-publish pushes on the default branch only).
     choices:
       push: ["false", "true"]
     configFiles: []
@@ -489,8 +490,9 @@ tools:
       config:
         content: "# pipegen's pinned trivy config: no cache kept between runs, and no repository trivy-secret.yaml (an empty path loads none)\ncache:\n  backend: memory\nsecret:\n  config: \"\"\n"
         passAs: { flag: "--config" }
+    # F2-R11 (G2): the first value is the default the renderer takes, so it is the wide one; CRITICAL alone (and ignore-unfixed true) is never rendered for a blocking need.
     choices:
-      severity: ["CRITICAL", "HIGH,CRITICAL", "MEDIUM,HIGH,CRITICAL"]
+      severity: ["HIGH,CRITICAL", "MEDIUM,HIGH,CRITICAL", "CRITICAL"]
     # Config scope: root. trivy runs with its pinned --config (it never loads the repo's trivy.yaml), and reads .trivyignore / .trivyignore.yaml from the working folder only (--ignorefile defaults to ./.trivyignore).
     # trivy-secret.yaml (C5a CF1): the pinned config sets secret.config to "", so trivy loads none (checked live on 0.76.0: without it, a
     #   trivy-secret.yaml in the working folder with disable-rules silenced a secret finding); the name stays protected as a belt.
@@ -539,8 +541,9 @@ tools:
       config:
         content: "# pipegen's pinned trivy config: no cache kept between runs, and no repository trivy-secret.yaml (an empty path loads none)\ncache:\n  backend: memory\nsecret:\n  config: \"\"\n"
         passAs: { flag: "--config" }
+    # F2-R11 (G2): the first value is the default the renderer takes, so it is the wide one; CRITICAL alone (and ignore-unfixed true) is never rendered for a blocking need.
     choices:
-      severity: ["CRITICAL", "HIGH,CRITICAL", "MEDIUM,HIGH,CRITICAL"]
+      severity: ["HIGH,CRITICAL", "MEDIUM,HIGH,CRITICAL", "CRITICAL"]
       ignore-unfixed: ["false", "true"]
     # Config scope: root. trivy runs with its pinned --config (it never loads the repo's trivy.yaml), and reads .trivyignore / .trivyignore.yaml from the working folder only (--ignorefile defaults to ./.trivyignore).
     # trivy-secret.yaml (C5a CF1): the pinned config sets secret.config to "", so trivy loads none (checked live on 0.76.0: without it, a

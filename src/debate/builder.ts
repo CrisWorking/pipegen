@@ -29,7 +29,7 @@ import { aiSchema, type AiSchema } from '../ai/schema.js';
 import { aiChoiceNames } from '../create/coverage.js';
 import { needLanguage, toSuggestions } from '../engine/discover.js';
 import { PIPEGEN_JOB_CATEGORIES } from '../engine/gate-job-list.js';
-import { isReviewed } from '../engine/job-rules.js';
+import { isReviewed, NARROWING_CHOICES } from '../engine/job-rules.js';
 import { NEED_ID_CATEGORY, toolCoversNeed } from '../engine/need-ids.js';
 import { needWhy, promptProfile, promptText } from '../engine/needs.js';
 import type { QualityBar } from '../engine/quality-bar.js';
@@ -179,11 +179,9 @@ export class BuilderError extends Error {
  * Choices that would narrow a scanner if the AI picked them (DECISIONS #108: no ignore-unfixed, no severity above the gate's
  * high floor; image-build never pushes in a check). Only these values stay; one left → code fills it; none → the tool is not offered.
  */
-const NARROWED: Readonly<Record<string, (v: string) => boolean>> = {
-  'ignore-unfixed': (v) => v === 'false',
-  severity: (v) => { const s = v.split(','); return s.includes('HIGH') && s.includes('CRITICAL'); },
-  push: (v) => v === 'false',
-};
+const NARROWED: Readonly<Record<string, (v: string) => boolean>> = Object.fromEntries(
+  Object.entries(NARROWING_CHOICES).map(([name, narrows]) => [name, (v: string) => !narrows(v)]),   // G2: the renderer's own table (job-rules.ts), one source
+);
 
 /** The Semgrep rule folders of the services a key is for (review F2 I1): node → javascript (+ typescript with a tsconfig), python → python, … */
 function ruleFolders(ref: NeedRef, p: RepoProfile): Set<string> {

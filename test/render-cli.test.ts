@@ -283,13 +283,14 @@ describe('6b: pinned config (S4, S3)', () => {
 
 describe('6b: command (S5)', () => {
   it('command: dedicated tools get --<choice> "$V" appended, and a bool choice is --<choice>="$V"; a missing choice takes the first value', () => {
-    const r = render('trivy-image', { choices: { severity: 'HIGH,CRITICAL', 'ignore-unfixed': 'true' } }, ctx, withPolicy('trivy-image', ['slots']));
+    // (v0.2 Plan G G2, F2-R11: ignore-unfixed true renders only for a need the caller says is non-blocking; the default severity is now the wide HIGH,CRITICAL)
+    const r = render('trivy-image', { choices: { severity: 'HIGH,CRITICAL', 'ignore-unfixed': 'true' } }, { ...ctx, blocking: false }, withPolicy('trivy-image', ['slots']));
     const step = runs(r).at(-1) as RenderedStep;
     expect(step.run).toContain('--severity "$PIPEGEN_ARG_0"');
     expect(step.run).toContain('--ignore-unfixed="$PIPEGEN_ARG_1"');
     expect(step.env).toMatchObject({ PIPEGEN_ARG_0: 'HIGH,CRITICAL', PIPEGEN_ARG_1: 'true' });
     const d = runs(render('trivy-image', {}, ctx, withPolicy('trivy-image', ['slots']))).at(-1) as RenderedStep;
-    expect(d.env).toMatchObject({ PIPEGEN_ARG_0: 'CRITICAL', PIPEGEN_ARG_1: 'false' });
+    expect(d.env).toMatchObject({ PIPEGEN_ARG_0: 'HIGH,CRITICAL', PIPEGEN_ARG_1: 'false' });
   });
 
   it('command: a placeholder inside a word is a quoted variable next to the constant part', () => {

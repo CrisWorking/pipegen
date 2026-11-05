@@ -310,7 +310,8 @@ describe('referee: only reviewed tools, and only as their template', () => {
     expect(has(r2, 'template'), show(r2)).toBe(true);
     // a chosen value the draft did not choose (still an allowed value)
     const trivy = specOf('trivy-config', { needId: 'iac', service: undefined });
-    const other = toolJob({ ...trivy, choices: { severity: 'CRITICAL' } });
+    // (v0.2 Plan G G2, F2-R11: CRITICAL alone narrows a blocking scan and is no longer rendered for one, so the other allowed value is HIGH,CRITICAL)
+    const other = toolJob({ ...trivy, choices: { severity: 'HIGH,CRITICAL' } });
     const r3 = await run([wf({ iac: job(other) })], draftOf([{ ...trivy, choices: { severity: 'MEDIUM,HIGH,CRITICAL' } }]));
     expect(has(r3, 'template'), show(r3)).toBe(true);
   });

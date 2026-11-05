@@ -191,7 +191,19 @@ export interface PipelineDraft {
    * it from the strictness level; `pipegen update` removes a need when it is switched to blocking.
    */
   warnFirst?: Readonly<Record<string, { since: string }>>;
+  /**
+   * v0.2 Plan G G2 (ruling B3 b, d): how the deploy images are signed and verified, as pipegen recorded it. The sign and verify steps are
+   * rendered from it (src/engine/signing.ts) and the referee recognises them only as that render. Absent = no signing (mode none): no sign
+   * or verify step is pipegen's. Plan G fills it (G3/G7).
+   */
+  signing?: SigningPlan;
 }
+/**
+ * The signing of a draft (G2): `mode` from signingMode (Plan A; `none` is no plan); `images` the repositories pipegen publishes and signs,
+ * one per service (`<ghcr.io|docker.io>/<path>`, no tag, no digest); `cosignPubSha256` (key-env) the sha256 of the exact text of
+ * PIPEGEN_COSIGN_PUB, the literal the verify step checks the variable against before cosign reads it (DECISIONS #76; the install record keeps it too).
+ */
+export interface SigningPlan { mode: 'key-env' | 'keyless' | 'attest'; images: { service: string; repo: string }[]; cosignPubSha256?: string }
 
 // ---------- install record (written by Plan G deliver/finish, read by Plan V and `pipegen verify`) ----------
 export type EditKind = 'verify-job' | 'hooks' | 'codeowners' | 'dependabot' | 'package-json';

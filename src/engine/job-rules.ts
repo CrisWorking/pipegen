@@ -3,7 +3,7 @@
 // the referee and the linters import them from here, so no second copy can drift. It imports only the leaves render-error.ts,
 // tool-flags.ts and types.ts (test/final-fix-b.test.ts and test/module-graph.test.ts check this).
 import { EXPR, own, RenderError, show } from './render-error.js';
-import { GATE_RESULT_ARTIFACT, SECRETS_RANGE_ARTIFACT } from './artifact-names.js';
+import { GATE_RESULT_ARTIFACT, resultArtifactName, SECRETS_RANGE_ARTIFACT, slug } from './artifact-names.js';
 import { ARGV_POLICIES, BASE_CHECKOUT_REF, GATE_OPTIONAL_UPLOADS, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, isGateUploadName, CHECKER_STEP_ID_RE, GATE_USES_RE, isStagedTool, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, stagePath, stageStepId, STAGE_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
 
 /** One step of a job, as pipegen renders it. `usesComment` becomes the trailing `# <version>` comment on `uses:`. */
@@ -151,6 +151,8 @@ export function isKnownHarmless(s: RenderedStep): boolean {
   if (SCRUB_STEP_ID_RE.test(s.id)) return isScrubStep(s);   // the gate action in scrub mode: no renderer makes a scrub id on a run step
   if (STAGE_STEP_ID_RE.test(s.id)) return isStageStep(s);   // the gate action in stage mode (C1c), likewise
   if (CHECKER_STEP_ID_RE.test(s.id) || TOOL_STEP_ID_RE.test(s.id)) return s.run !== undefined && s.uses === undefined;
+  // G2 (B6): the archive's hash check of a scanner job, pipegen's own script (it reads the downloaded archive and the build's output only)
+  if (IMAGE_CHECK_ID_RE.test(s.id)) return s.run !== undefined && s.uses === undefined;
   return false;   // an unknown or renamed id
 }
 
@@ -193,7 +195,10 @@ export function checkJobOrder(steps: readonly RenderedStep[], job: Partial<JobCo
   // no repo code (checkers, installs of pinned tools, the scrub, uploads), whatever their order (C0a fix round 1, finding 1).
   const keyJob = steps.some(isScrubStep);
   const scrubbed = new Set<string>();   // the artifacts a scrub step earlier in this job rebuilt
+  // G2 (B6): the exact tail of an image-build job (archive step, then the archive's upload, right after the build) is the one exception
+  const tail = imageBuildTailAt(steps, job.id);
   steps.forEach((s, i) => {
+    if (tail !== null && i >= tail) return;
     if (isKnownHarmless(s)) {
       if (repoCode !== undefined) problems.push(`Step ${i + 1} (${show(s.name)}) comes after the repo-code step ${show(repoCode)}: code from the repository could have changed what it runs or uploads. Put it before, or in another job.`);
     } else {
@@ -505,6 +510,87 @@ const isDigestStep = (s: RenderedStep): boolean => s.id === DIGEST_STEP_ID && ty
 
 /** The one form of a job output taken from a step's output. */
 export const stepOutputForm = (stepId: string, output: string): string => `\${{ steps.${stepId}.outputs.${output} }}`;
+
+// ---------- Plan G G2: signing, verification and the image hand-off (rulings B3 b, B6; carries C0c, F-4) ----------
+// The exact forms the signing renderer (signing.ts), the image hand-off renderer (image-handoff.ts) and the referee share. As for G1's forms,
+// the renderer writes them and the referee compares by equality; a step is recognised by its whole content, these only say which expression
+// a step of that id may carry.
+
+/**
+ * F2-R11 (DECISIONS #108): the choice values that narrow a scanner, by choice name (true = narrows): a severity list without both HIGH and
+ * CRITICAL (the gate's high floor), `ignore-unfixed` on, and an image build that pushes (a check builds, it never publishes). The renderer
+ * refuses them for a blocking need (and when it is not told the need is non-blocking); the builder never offers them (debate/builder.ts).
+ */
+export const NARROWING_CHOICES: Readonly<Record<string, (v: string) => boolean>> = Object.freeze({
+  severity: (v: string) => { const s = v.split(','); return !(s.includes('HIGH') && s.includes('CRITICAL')); },
+  'ignore-unfixed': (v: string) => v !== 'false',
+  push: (v: string) => v !== 'false',
+});
+/** Why a choice value would narrow a blocking scan, or null. */
+export function narrowingChoiceProblem(name: string, value: string): string | null {
+  const narrows = Object.hasOwn(NARROWING_CHOICES, name) ? NARROWING_CHOICES[name] : undefined;
+  if (narrows === undefined || !narrows(value)) return null;
+  return `the choice ${show(name)} = ${show(value)} would narrow a blocking check (DECISIONS #108: no ignore-unfixed, no severity above the gate's high floor, and a check never pushes an image), so pipegen does not render it for a blocking need`;
+}
+
+/** The sign step (job sign only) and the verify steps (job pipegen-verify only): their ids, one per image (sha16 of the image repository). */
+export const SIGN_STEP_ID_RE = /^pipegen-sign-[0-9a-f]{16}$/;
+export const VERIFY_STEP_ID_RE = /^pipegen-verify-[0-9a-f]{16}$/;
+export const signStepId = (repo: string): string => `pipegen-sign-${sha16(`sign:${repo}`)}`;
+export const verifyStepId = (repo: string): string => `pipegen-verify-${sha16(`verify:${repo}`)}`;
+/** The key-env sign step's env (the signing environment's secrets): the only place the cosign key and its password are named. */
+export const SIGN_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_COSIGN_KEY: '${{ secrets.PIPEGEN_COSIGN_KEY }}', PIPEGEN_COSIGN_PASSWORD: '${{ secrets.PIPEGEN_COSIGN_PASSWORD }}' });
+/**
+ * The verify steps' env: the key-env public key, the variable of the signing environment (a writer can change it, so the step checks its
+ * sha256 against the literal pipegen recorded before cosign reads it, DECISIONS #76), and the attest-mode token of gh (the job's own token).
+ */
+export const VERIFY_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_COSIGN_PUB: '${{ vars.PIPEGEN_COSIGN_PUB }}', PIPEGEN_GH_TOKEN: '${{ github.token }}' });
+
+/** The PR's own image (ruling B6): `image-build--<svc>` builds it without pushing and hands it to the scanners as an archive bound by its sha256. */
+export const IMAGE_BUILD_NEED = 'image-build';
+/** The job id of a service's image build (the same as jobIdFor('image-build', service)). */
+export const imageBuildJobId = (service: string): string => `${IMAGE_BUILD_NEED}--${slug(service)}`;
+const IMAGE_BUILD_JOB_RE = /^image-build--([a-z0-9][a-z0-9-]{0,39})$/;
+/** The service slug of an image-build job id, or null. */
+export const imageBuildSlugOf = (jobId: string | undefined): string | null => {
+  const m = jobId === undefined ? null : IMAGE_BUILD_JOB_RE.exec(jobId);
+  if (m === null) return null;
+  try { return slug(m[1] as string) === m[1] ? (m[1] as string) : null; } catch { return null; }
+};
+/** The archive's artifact (not a check's result: no need is called image-archive, so no result name equals it). */
+export const IMAGE_ARCHIVE_ID = 'image-archive';
+export const imageArchiveArtifact = (service: string): string => resultArtifactName(IMAGE_ARCHIVE_ID, service);
+/** The file inside the archive's artifact folder. */
+export const IMAGE_ARCHIVE_FILE = 'image.tar';
+/** The archive step of an image-build job (one per job) and its output, the job output the scanners check the archive against. */
+export const IMAGE_ARCHIVE_STEP_ID = 'pipegen-image-archive';
+export const IMAGE_SHA_OUTPUT = 'image-sha256';
+const IMAGE_SHA_VALUE = stepOutputForm(IMAGE_ARCHIVE_STEP_ID, 'sha256');
+const isImageArchiveStep = (s: RenderedStep): boolean => s.id === IMAGE_ARCHIVE_STEP_ID && typeof s.run === 'string' && s.uses === undefined;
+/** The hash check of a scanner job: its id names the service, and its one expression is that service's image-build output. */
+export const imageCheckStepId = (service: string): string => `pipegen-image-check--${slug(service)}`;
+const IMAGE_CHECK_ID_RE = /^pipegen-image-check--([a-z0-9][a-z0-9-]{0,39})$/;
+export const IMAGE_SHA_ENV = 'PIPEGEN_IMAGE_SHA256';
+export const imageShaRef = (slugged: string): string => `\${{ needs.${IMAGE_BUILD_NEED}--${slugged}.outputs.${IMAGE_SHA_OUTPUT} }}`;
+const BUILD_PUSH_USES_RE = new RegExp(`^${PLATFORM_USES['build-push'].replace(/[/.]/g, '\\$&')}@[0-9a-f]{40}$`);
+const isBuildPushStep = (s: RenderedStep): boolean => s.run === undefined && s.uses !== undefined && BUILD_PUSH_USES_RE.test(s.uses);
+
+/**
+ * B6: in the job `image-build--<slug>` the reviewed build-push step builds the repository's Dockerfile inside BuildKit's own containers
+ * (nothing it runs reaches the runner), and right after it, as the job's last two steps, come exactly the archive step and the upload of
+ * this service's archive folder (no scrub: it is an image, not a result; the scanners check its sha256). The index where that tail starts,
+ * or null when the job is not an image build or its tail is not exactly this. Anything else in the job is held to the order rule as usual.
+ */
+function imageBuildTailAt(steps: readonly RenderedStep[], jobId: string | undefined): number | null {
+  const s = imageBuildSlugOf(jobId);
+  const n = steps.length;
+  if (s === null || n < 3) return null;
+  const [b, a, u] = [steps[n - 3], steps[n - 2], steps[n - 1]] as [RenderedStep, RenderedStep, RenderedStep];
+  const artifact = imageArchiveArtifact(s);
+  const folder = `\${{ runner.temp }}/pipegen-out/${artifact}`;
+  const upload = uploadFolder(u) === artifact && u.with?.name === artifact && u.with?.path === folder && u.if === undefined && u['continue-on-error'] === undefined;
+  return isBuildPushStep(b) && isImageArchiveStep(a) && upload ? n - 2 : null;
+}
 /** Plan G's job outputs (G22, three of four; the nested not-proven output is Plan H's): each on its own job only, from its own step only. */
 const G_OUTPUTS: Readonly<Record<string, { job: string; step: string; is: (s: RenderedStep) => boolean }>> = Object.freeze({
   found: { job: 'baseline-check', step: BASELINE_CHECK_STEP_ID, is: isBaselineCheckStep },
@@ -533,6 +619,8 @@ export function jobOutputsFor(steps: readonly RenderedStep[]): Record<string, st
   if (baseCheckouts(steps).length === 1) out[BASE_SHA_OUTPUT] = BASE_SHA_VALUE;
   // G22: found, has-pr and digest, each from its own step (the renderer puts that step in its own job only; jobOutputsProblems holds the job)
   for (const [name, o] of Object.entries(G_OUTPUTS)) if (steps.filter(o.is).length === 1) out[name] = stepOutputForm(o.step, name);
+  // G2 (B6): the archive's sha256 of an image-build job, from its one archive step
+  if (steps.filter(isImageArchiveStep).length === 1) out[IMAGE_SHA_OUTPUT] = IMAGE_SHA_VALUE;
   for (const s of steps) {
     if (!isScrubStep(s) || typeof s.with?.artifact !== 'string' || s.id === undefined) continue;
     for (const n of OUTPUT_NAMES) out[`${s.with.artifact}-${n}`] = `\${{ steps.${s.id}.outputs.${n} }}`;
@@ -564,6 +652,13 @@ export function jobOutputsProblems(jobId: string, outputs: unknown, steps: reado
       if (jobId !== g.job) problems.push(`${where} include ${show(key)}, which is not one of the outputs of this job: only the job ${g.job} hands on ${key}, from its own step.`);
       else if (steps.filter(g.is).length !== 1 || steps.filter((s) => s.id === g.step).length !== 1) problems.push(`${where} include ${show(key)}, but the job does not hold exactly one ${g.step} step of its kind: ${key} comes only from its own step.`);
       else if (value !== stepOutputForm(g.step, key)) problems.push(`${where}: ${show(key)} must be exactly ${stepOutputForm(g.step, key)} (the output of its own step), nothing else.`);
+      continue;
+    }
+    if (key === IMAGE_SHA_OUTPUT) {
+      // G2 (B6): the sha256 of the image archive, only on the job image-build--<slug>, exactly from its one archive step
+      if (imageBuildSlugOf(jobId) === null) problems.push(`${where} include ${show(key)}, which only an image-build--<service> job hands on (the sha256 of its image archive).`);
+      else if (steps.filter(isImageArchiveStep).length !== 1 || steps.filter((s) => s.id === IMAGE_ARCHIVE_STEP_ID).length !== 1) problems.push(`${where} include ${show(key)}, but the job does not hold exactly one ${IMAGE_ARCHIVE_STEP_ID} step: the sha256 comes only from its archive step.`);
+      else if (value !== IMAGE_SHA_VALUE) problems.push(`${where}: ${show(key)} must be exactly ${IMAGE_SHA_VALUE} (the sha256 its archive step wrote), nothing else.`);
       continue;
     }
     if (key === BASE_SHA_OUTPUT) {
@@ -646,6 +741,14 @@ export function checkExpressions(step: RenderedStep): void {
         if (step.id === rangeScanStepId && step.run !== undefined && step.uses === undefined && Object.hasOwn(RANGE_STEP_ENV, k) && RANGE_STEP_ENV[k] === v) continue;
         // G1 (BP-6): the pr-check lookup step, exactly as renderPrCheckStep writes it (every field that runs), carries the job's own token
         if (Object.hasOwn(PR_CHECK_STEP_ENV, k) && PR_CHECK_STEP_ENV[k] === v && isPrCheckStep(step)) continue;
+        // G2 (B3 b, B6): a run step with the sign, verify or image-check id carries exactly its own forms (the referee recognises the whole
+        // step by content and holds each kind to its job; here only which expression a step of that id may hold)
+        if (step.run !== undefined && step.uses === undefined && step.id !== undefined) {
+          if (SIGN_STEP_ID_RE.test(step.id) && own(SIGN_STEP_ENV, k) === v) continue;
+          if (VERIFY_STEP_ID_RE.test(step.id) && own(VERIFY_STEP_ENV, k) === v) continue;
+          const ic = IMAGE_CHECK_ID_RE.exec(step.id);
+          if (ic !== null && k === IMAGE_SHA_ENV && v === imageShaRef(ic[1] as string)) continue;
+        }
         const m = SECRET_REF_RE.exec(v);
         if (m === null || m[1] !== k || isDangerousName(k)) bad(`env value ${show(k)}`);
       } else if (usesPath === undefined || table === undefined || own(table, k) === undefined || rendererInputProblems(usesPath, { [k]: v }, step.with ?? {}).length > 0) {

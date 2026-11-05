@@ -27,7 +27,7 @@ import { APP_RUNNING_CATEGORIES, projectScriptSteps, renderCliTool, renderRangeS
 import { ArtifactNameError, resultArtifactName, SECRETS_RANGE_ARTIFACT } from './artifact-names.js';
 import type { ProjectScriptStep } from './reviewed.js';
 import { own, RenderError, show } from './render-error.js';
-import { BASE_CHECKOUT_ID, BASELINE_CHECK_STEP_ID, checkExpressions, checkJobOrder, isDangerousName, isReviewed, STEP_KEYS, type JobContext, type RenderedStep, type ScanFact } from './job-rules.js';
+import { BASE_CHECKOUT_ID, BASELINE_CHECK_STEP_ID, checkExpressions, checkJobOrder, isDangerousName, isReviewed, narrowingChoiceProblem, STEP_KEYS, type JobContext, type RenderedStep, type ScanFact } from './job-rules.js';
 import { GateJobListError } from './gate-job-list.js';
 import { gateStepInputs, nightlyStepInputs } from './gate-inputs.js';
 import { allowedDomainsProblem, BULLFROG_USES, egressDomains, BASE_CHECKOUT_REF, DOCKER_ACTION_USES, GATE_UPLOAD_FILES, gateUploadPath, uploadIfNoFiles, IMAGE_BUILT_ACTION_USES, isStagedTool, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath, scrubStepId, stagePath, stageStepId } from './tool-flags.js';
@@ -46,6 +46,11 @@ export interface RenderContext {
   targets?: { image?: string; url?: string; spec?: string; k8sDir?: string };
   /** Render the target-branch (baseline) variant of the check: its result goes to the `pipegen-out-base-<needId>` artifact (the `base-scan` job). */
   base?: true;
+  /**
+   * G2 (F2-R11): whether the step's need blocks. Only `false` lets a narrowing choice value through (NARROWING_CHOICES: a severity without
+   * HIGH and CRITICAL, ignore-unfixed on, a pushing image build); absent counts as blocking, so no caller narrows a gate check by forgetting it.
+   */
+  blocking?: boolean;
 }
 
 /** `output`: where the tool's RAW result will be, `${{ runner.temp }}/pipegen-raw/<artifact>/<file>` (rulings S7 and B1: never uploadable; scrubbedPath gives the copy the scrub writes); null when the step makes none. */
@@ -314,6 +319,14 @@ export function renderStepWith(given: StepSpec, tool: ReviewedTool, platform: Pl
   if (!isReviewed(tool.candidate)) throw new RenderError(`${show(tool.id)} is not a reviewed tool, and pipegen never renders a tool that isn't.`);
   const problems = validateSpec(spec, tool, ctx);
   if (problems.length > 0) throw new RenderError(`The step for ${show(spec.needId)} isn't valid: ${problems.join(' ')}`);
+  // G2 (F2-R11, DECISIONS #108): no narrowing value for a blocking need, chosen or the entry's default (its first listed value)
+  if (ctx.blocking !== false) {
+    for (const [name, offered] of Object.entries(tool.choices)) {
+      const given = own(spec.choices, name);
+      const problem = narrowingChoiceProblem(name, typeof given === 'string' ? given : String(offered[0]));
+      if (problem !== null) throw new RenderError(`The step for ${show(spec.needId)} can't be rendered: ${problem}.`);
+    }
+  }
   if (tool.candidate.kind !== 'action' || tool.step.action === undefined) {
     if (tool.step.cli === undefined) throw new RenderError(`${show(tool.id)} is neither an action nor a cli entry.`);
     const service = spec.service === undefined ? undefined : ctx.profile.services.find((s) => s.name === spec.service);

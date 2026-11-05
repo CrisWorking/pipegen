@@ -12,7 +12,8 @@ import { activeSafeText } from '../util/known-values.js';
 import { parseJsonStrict } from './package-rules.js';
 
 /** The choices pipegen fills by code; the AI schema (Plan F) must not offer them. Keyed by reviewed entry id. */
-export const CODE_FILLED_CHOICES: Readonly<Record<string, string>> = Object.freeze({ 'vitest-coverage': 'coverage-thresholds-lines', c8: 'lines' });
+// G2 (F2-R11 b): coverage.py's `fail-under` too, by name (not only because its values are the minimums: a later list must not hand it to the AI)
+export const CODE_FILLED_CHOICES: Readonly<Record<string, string>> = Object.freeze({ 'vitest-coverage': 'coverage-thresholds-lines', c8: 'lines', 'coverage-py': 'fail-under' });
 /** The AI-choosable choice names of a reviewed entry: its choices minus the one pipegen fills. */
 export const aiChoiceNames = (entryId: string, choices: Readonly<Record<string, unknown>>): string[] => Object.keys(choices).filter((k) => k !== CODE_FILLED_CHOICES[entryId]);
 
