@@ -45,13 +45,13 @@ import {
 } from '../engine/job-rules.js';
 import { COMMIT_SHA_RE, isGitHubRepo } from '../engine/names.js';
 import type { PlatformActions } from '../engine/pin.js';
+import { signingMode, type SigningMode } from '../github/signing-mode.js';
 import { JOB_PERMISSIONS, referee, SIGNING_ENVIRONMENT, type Linters, type RefereeDeps, type RefereeReport } from '../engine/referee.js';
 import { RenderError } from '../engine/render-error.js';
 import { renderFindRunStep, stepsToYaml } from '../engine/render-step.js';
 import type { BaseImage } from '../engine/base-images.js';
-import type { SigningMode } from '../github/signing-mode.js';
 import { IMAGE_PUBLISH_JOB, sharedWorkflows, signCallerJob, signPermissions, SIGN_JOB_ID } from './central.js';
-import { AssembleError, assembleJobs, egressStepFor, JOB_MINUTES, JOB_RUNNER, type Job, type JobsPlan } from './jobs.js';
+import { AssembleError, assembleJobs, egressStepFor, JOB_RUNNER, type Job, type JobsPlan } from './jobs.js';
 import type { CreatedFile, PipelineDraft, ReviewedTool } from '../types.js';
 import { safeText } from '../util/safe-text.js';
 
@@ -70,15 +70,20 @@ export const NOT_PROVEN_MARK = 'pipegen:not-proven';
 /** The verify-first job's id (the referee's permission and step tables are keyed by it). */
 export const VERIFY_JOB_ID = 'pipegen-verify';
 /**
- * How long the verify job's find-run waits for the gated run to finish (G40: longer than the run's jobs take, not only the listing grace).
- * The deepest chain of jobs pipegen writes in the merge workflow is three (baseline-check → base-scan → gate, image-build → image scan →
- * gate, dast-run → dast → gate), each with JOB_MINUTES; checkLayout holds the merge workflow to that depth.
+ * G5-R1 m1 (G40): the verify job's find-run waits until the gated push run of pipegen.yml is over, so it waits for that run's worst case:
+ * the longest chain of job limits in pipegen.yml (the merge caller counting as its called workflow's longest chain, the sign caller as its
+ * sign job, each deploy job as its own `timeout-minutes`), plus this grace for the listing and the hand-over between jobs. Queue time before a
+ * job starts is not counted (live checklist).
  */
-export const VERIFY_WAIT_MINUTES = 3 * JOB_MINUTES;
-/** The verify job's own limit: it outlives the wait, so a run that finishes at the end of the wait is still read. */
-export const VERIFY_JOB_MINUTES = VERIFY_WAIT_MINUTES + 15;
-/** The longest `needs` chain in the merge workflow VERIFY_WAIT_MINUTES is computed for. */
-const MAX_MERGE_DEPTH = 3;
+export const VERIFY_GRACE_MINUTES = 10;
+/** The verify job's own limit is its wait plus this margin, so a run that finishes at the end of the wait is still read. */
+export const VERIFY_MARGIN_MINUTES = 15;
+/** GitHub's longest job (and the find-run wait's upper bound). */
+const MAX_JOB_MINUTES = 360;
+/** The keys a deploy job (G7) may carry: those pipegen writes; `if` and `environment` are refused with their own reason. */
+const DEPLOY_JOB_KEYS: ReadonlySet<string> = new Set(['name', 'runs-on', 'timeout-minutes', 'needs', 'permissions', 'cache-mode', 'outputs', 'steps', 'if', 'environment']);
+/** G5-R1 m5: the signing secrets (the cosign key and its password, cosign's and Sigstore's own variables) reach only the sign job, through its environment. */
+const SIGNING_SECRET_RE = /^(?:PIPEGEN_COSIGN_|COSIGN_|SIGSTORE_|TUF_)/;
 /** The pr-check job's limit (one API call). */
 const PR_CHECK_MINUTES = 10;
 /** Where a new Dependabot file goes, and the two spellings GitHub reads. */
@@ -178,6 +183,7 @@ export function callerSecrets(calledJobs: Readonly<Record<string, unknown>>): Re
         const prop = SECRET_PROP_RE.exec(body.slice((w.index ?? 0) + w[0].length));
         const name = prop?.[1];
         if (name === undefined || !SECRET_NAME_RE.test(name)) fail(`A called job uses the secrets context in a form pipegen does not map (${safeText(body.trim(), 60)}): only \${{ secrets.NAME }}, NAME in upper case.`);
+        if (SIGNING_SECRET_RE.test(name as string)) fail(`A called job reads the signing secret ${show(name)}; it reaches only the sign job, through the ${SIGNING_ENVIRONMENT} environment, and no caller maps it.`);
         if (name !== 'GITHUB_TOKEN') names.add(name as string);
       }
     }
@@ -204,6 +210,8 @@ function callerOf(name: string, uses: string, called: Readonly<Record<string, Jo
 /** A job with its keys in the order pipegen writes them. */
 function ordered(j: Job): Job {
   const keys: (keyof Job)[] = ['name', 'runs-on', 'timeout-minutes', 'needs', 'if', 'permissions', 'environment', 'concurrency', 'cache-mode', 'outputs', 'steps'];
+  // G5-R1 m2: a key pipegen does not write is refused, never dropped
+  for (const k of Object.keys(j)) if (!(keys as string[]).includes(k)) fail(`A job has the key ${show(k)}, which pipegen does not write.`);
   const out: Partial<Record<keyof Job, unknown>> = {};
   for (const k of keys) if (j[k] !== undefined) out[k] = j[k];
   return out as unknown as Job;
@@ -299,10 +307,23 @@ export function assemble(input: PipelineDraft, opts: AssembleOpts): AssembledFil
   if (Object.keys(deploy).length > 0 && deploySkipped) fail('The deploy part is skipped (--skip deploy), but deploy jobs were given.');
   for (const [id, j] of Object.entries(deploy)) {
     if (!JOB_ID_RE.test(id) || RESERVED_IDS.has(id)) fail(`${show(id)} is not a deploy job id pipegen writes (or it is one of pipegen's own).`);
-    if (!isObj(j) || !Array.isArray(j.steps) || (j as unknown as Obj).uses !== undefined) fail(`The deploy job ${show(id)} is not a job of steps.`);
+    if (!isObj(j)) fail(`The deploy job ${show(id)} is not a job.`);
+    // G5-R1 m2: env, services, secrets, a container, a strategy, ... would change what runs; refused with the key's name, never dropped
+    for (const k of Object.keys(j)) if (!DEPLOY_JOB_KEYS.has(k)) fail(`The deploy job ${show(id)} has the key ${show(k)}, which pipegen does not write on a deploy job.`);
+    if (!Array.isArray(j.steps)) fail(`The deploy job ${show(id)} is not a job of steps.`);
+    const limit = j['timeout-minutes'];
+    if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1 || limit > MAX_JOB_MINUTES) fail(`The deploy job ${show(id)} has no timeout-minutes of its own (1 to ${MAX_JOB_MINUTES}); the verify job's wait is computed from it.`);
+    if (j.needs !== undefined && (!Array.isArray(j.needs) || j.needs.some((n) => typeof n !== 'string'))) fail(`The deploy job ${show(id)} has needs that are not a list of job ids.`);
+    for (const n of j.needs ?? []) if (n !== MERGE_CALLER_JOB && !Object.hasOwn(deploy, n)) fail(`The deploy job ${show(id)} needs ${show(n)}, which is not a job of ${CALLER_WORKFLOW}.`);
     if (j.environment !== undefined) fail(`The deploy job ${show(id)} runs in an environment; a job in pipegen's push run never waits for a person or holds an environment's secrets (G41), so it is not written.`);
     if (j.if !== undefined) fail(`The deploy job ${show(id)} has a condition of its own; deploy jobs run exactly on a push to the default branch, after the gate.`);
     appJobs[id] = ordered({ ...j, needs: uniq([MERGE_CALLER_JOB, ...(j.needs ?? [])]), if: DEPLOY_PUSH_IF });
+  }
+  // G5-R1 I1: a delivery that publishes images signs them with the repository's own mode; mode none (the proof's, or a caller's) is only for a
+  // repository whose own mode is none and whose draft records no signing plan (S21: no caller picks a mode, and none is a downgrade)
+  if (Object.keys(deploy).length > 0 && opts.mode === 'none') {
+    const own0 = signingMode(prof, input.capabilities);
+    if (own0 !== 'none' || input.signing !== undefined) fail(`A delivery that publishes images signs them with the repository's own signing mode (${show(input.signing?.mode ?? own0)}), never with mode none.`);
   }
   // the signing (G3): keyless inline (public), or the central sign workflow and its caller (private); both after image-publish
   if (a.sign !== null) {
@@ -363,7 +384,12 @@ export function assemble(input: PipelineDraft, opts: AssembleOpts): AssembledFil
   // 7. the verify-first job (G7 places it into the deploy workflows)
   let verify: Job | null = null;
   if (!deploySkipped) {
-    verify = verifyJob(draft, { gate: opts.gate, reviewed: opts.reviewed, platform: opts.platform });
+    const mergeMinutes = chainMinutes(a.merge, (id) => (a.merge[id] as Job)['timeout-minutes']);
+    const signMinutes = a.sign?.['timeout-minutes'] ?? 0;
+    const runMinutes = chainMinutes(appJobs as Readonly<Record<string, { needs?: string[] }>>, (id) => (id === MERGE_CALLER_JOB ? mergeMinutes : id === SIGN_JOB_ID ? signMinutes : deploy[id]?.['timeout-minutes']));
+    const waitMinutes = runMinutes + VERIFY_GRACE_MINUTES;
+    if (waitMinutes + VERIFY_MARGIN_MINUTES > MAX_JOB_MINUTES) fail(`The gated run can take ${runMinutes} minutes, longer than the verify job can wait (a job runs at most ${MAX_JOB_MINUTES} minutes).`);
+    verify = verifyJob(draft, { gate: opts.gate, reviewed: opts.reviewed, platform: opts.platform, waitMinutes });
   }
 
   // 8. Dependabot (P-6, D0b): the github-actions entry appended to the user's file, or a new file; Renovate is kept
@@ -392,19 +418,21 @@ function addNote(notes: string[], line: string): void { if (!notes.includes(line
 /**
  * The pipegen-verify job (plan "Verify-first"), as far as the layout goes: the egress step, then the gate action in find-run mode (findGatedRun:
  * the trusted push run of pipegen.yml on the default branch for the deployed commit, through the central workflow at the pin for a private
- * repository, layout inline for a public one), which waits VERIFY_WAIT_MINUTES for a run in progress. It runs in pipegen-signing whenever the
+ * repository, layout inline for a public one), which waits `waitMinutes` for a run in progress (assemble computes it from the gated run's worst case, G5-R1 m1). It runs in pipegen-signing whenever the
  * repository has environments (only default-branch deploys pass it), with exactly the verify row's read permissions, cache-mode none, and
- * outlives its wait (VERIFY_JOB_MINUTES). The deploy layer (G7) places it into the deploy workflows and adds, after the find-run step, the
+ * outlives its wait by VERIFY_MARGIN_MINUTES. The deploy layer (G7) places it into the deploy workflows and adds, after the find-run step, the
  * digest download by the found run's id, the digest check and the signature check of each image (B3 a, c, d): the referee's order rule reads
  * the gate action as a step that could change what runs after it, so those steps need G7's order exception, and none is written here.
  */
-export function verifyJob(draft: PipelineDraft, deps: { gate: ReviewedTool; reviewed: readonly ReviewedTool[]; platform: PlatformActions; sha?: 'github.sha' | 'workflow_run' }): Job {
+export function verifyJob(draft: PipelineDraft, deps: { gate: ReviewedTool; reviewed: readonly ReviewedTool[]; platform: PlatformActions; waitMinutes: number; sha?: 'github.sha' | 'workflow_run' }): Job {
+  const wait = deps.waitMinutes;
+  if (!Number.isInteger(wait) || wait < 1 || wait + VERIFY_MARGIN_MINUTES > MAX_JOB_MINUTES) fail(`The verify job's wait ${show(wait)} is not 1 to ${MAX_JOB_MINUTES - VERIFY_MARGIN_MINUTES} whole minutes.`);
   const central = draft.centralPin === undefined ? undefined : { ...centralPinOf(draft), project: draft.profile.repo };
   if (central !== undefined && draft.profile.private !== true) fail('A public repository\'s verify job looks for its gate inline, so its draft carries no central pin.');
-  const find = guard(() => renderFindRunStep(deps.gate, { ...(central === undefined ? {} : { central }), sha: deps.sha ?? 'github.sha', timeoutMinutes: VERIFY_WAIT_MINUTES }));
+  const find = guard(() => renderFindRunStep(deps.gate, { ...(central === undefined ? {} : { central }), sha: deps.sha ?? 'github.sha', timeoutMinutes: wait }));
   const steps = [egressStepFor([], { userSecret: false, dockerNetworks: false, job: VERIFY_JOB_ID }), find];
   return {
-    'runs-on': JOB_RUNNER, 'timeout-minutes': VERIFY_JOB_MINUTES, permissions: { ...VERIFY_PERMISSIONS },
+    'runs-on': JOB_RUNNER, 'timeout-minutes': wait + VERIFY_MARGIN_MINUTES, permissions: { ...VERIFY_PERMISSIONS },
     ...(draft.capabilities.environments === true ? { environment: SIGNING_ENVIRONMENT } : {}), 'cache-mode': 'none', steps,
   };
 }
@@ -415,8 +443,7 @@ export function verifyJob(draft: PipelineDraft, deps: { gate: ReviewedTool; revi
  * The checks every assembled set passes before it leaves (a second net under the referee, on what this file itself guarantees): each path is
  * a plain created path and no composite action is written (E-b9); no path twice, none the draft already holds; in every workflow each `needs`
  * names a job of the same file, no workflow_dispatch, no workflow_call input, no `secrets: inherit`, no caller `with`, no environment but the
- * signing one and only on sign and pipegen-verify (G41); the merge workflow's chain of jobs is at most MAX_MERGE_DEPTH long (the verify wait
- * is computed from it); the not-proven mark is on exactly one line, the merge file's, when the draft has a not-proven check, and nowhere else.
+ * signing one and only on sign and pipegen-verify (G41); no cycle of `needs`; the not-proven mark is on exactly one line, the merge file's, when the draft has a not-proven check, and nowhere else.
  */
 function checkLayout(files: readonly CreatedFile[], draft: PipelineDraft, layout: Layout): void {
   const seen = new Set<string>(draft.created.map((f) => `${f.repo}:${f.path}`));
@@ -449,13 +476,16 @@ function checkLayout(files: readonly CreatedFile[], draft: PipelineDraft, layout
       if (job.uses !== undefined && job.with !== undefined) fail(`The caller job ${show(id)} of ${where} passes an input.`);
       if (job.environment !== undefined && !(job.environment === SIGNING_ENVIRONMENT && (id === SIGN_JOB_ID || id === VERIFY_JOB_ID))) fail(`The job ${show(id)} of ${where} runs in an environment; only the sign and verify jobs run in ${SIGNING_ENVIRONMENT} (no job waits for a person, G41).`);
     }
-    if (key === mergeKey && depthOf(jobs as Record<string, Obj>) > MAX_MERGE_DEPTH) fail(`The merge workflow's chain of jobs is longer than ${MAX_MERGE_DEPTH}, longer than the verify job waits for.`);
+    chainMinutes(jobs as Record<string, Obj>, () => 1);   // no cycle of needs
   }
   if (marks !== (notProven ? 1 : 0)) fail(`The merge workflow has ${marks} lines marked ${NOT_PROVEN_MARK}; it has exactly one when the draft has a not-proven check, else none.`);
 }
 
-/** The longest `needs` chain among jobs (a job with no needs is 1). */
-function depthOf(jobs: Readonly<Record<string, Obj>>): number {
+/**
+ * The longest chain of `needs` among jobs, each job counting `weight(id)` minutes (a job missing its limit counts GitHub's 360). A cycle is
+ * refused.
+ */
+function chainMinutes(jobs: Readonly<Record<string, { needs?: unknown }>>, weight: (id: string) => number | undefined): number {
   const memo = new Map<string, number>();
   const at = (id: string, path: ReadonlySet<string>): number => {
     const m = memo.get(id);
@@ -463,7 +493,8 @@ function depthOf(jobs: Readonly<Record<string, Obj>>): number {
     if (path.has(id)) return fail(`The job ${show(id)} needs itself through a cycle.`);
     const j = jobs[id];
     const needs = j === undefined ? [] : Array.isArray(j.needs) ? (j.needs as string[]) : [];
-    const d = 1 + Math.max(0, ...needs.map((n) => at(n, new Set([...path, id]))));
+    const w = weight(id);
+    const d = (typeof w === 'number' && Number.isFinite(w) ? w : MAX_JOB_MINUTES) + Math.max(0, ...needs.map((n) => at(n, new Set([...path, id]))));
     memo.set(id, d);
     return d;
   };

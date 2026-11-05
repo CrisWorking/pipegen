@@ -19,7 +19,7 @@ import { protectedMatcher } from '../src/engine/protected-match.js';
 import { referee, type RefereeReport } from '../src/engine/referee.js';
 import { renderFindRunStep, renderJobPrelude, renderPlatformStep, stepsToYaml } from '../src/engine/render-step.js';
 import {
-  assemble, callerPermissions, callerSecrets, judgeAssembled, MERGE_CALLER_JOB, NIGHTLY_CRON, NOT_PROVEN_MARK, verifyJob, VERIFY_JOB_MINUTES, VERIFY_WAIT_MINUTES,
+  assemble, callerPermissions, callerSecrets, judgeAssembled, MERGE_CALLER_JOB, NIGHTLY_CRON, NOT_PROVEN_MARK, verifyJob, VERIFY_GRACE_MINUTES, VERIFY_MARGIN_MINUTES,
   type AssembledFiles, type AssembleOpts,
 } from '../src/layers/assemble.js';
 import { AssembleError, assembleJobs, egressStepFor, type Job } from '../src/layers/jobs.js';
@@ -339,24 +339,25 @@ describe('G5: the delivered files and their callers', () => {
     expect(v.steps[0]?.uses).toMatch(/^bullfrogsec\/bullfrog@/);
     const find = v.steps[1] as Obj;
     // the gate action's find-run mode (findGatedRun), central layout from the pin, through the one path helper
-    expect(find).toEqual(renderFindRunStep(GATE, { central: { repo: PIN.repo, sha: PIN.sha, project: 'r' }, sha: 'github.sha', timeoutMinutes: VERIFY_WAIT_MINUTES }));
+    // it waits for the whole gated run of pipegen.yml (G5-R1 m1): the merge chain (baseline-check → base-scan → gate, 3 × 30), then
+    // image-publish (30) and sign (15), plus the grace; and the job outlives the wait
+    const wait = 90 + 30 + 15 + VERIFY_GRACE_MINUTES;
+    expect(find).toEqual(renderFindRunStep(GATE, { central: { repo: PIN.repo, sha: PIN.sha, project: 'r' }, sha: 'github.sha', timeoutMinutes: wait }));
     expect(find.with['central-workflow']).toBe(centralWorkflowPath(PIN.repo, 'r'));
-    // it waits for the gated run to finish: longer than a gated run's jobs take, and the job outlives the wait
-    expect(VERIFY_WAIT_MINUTES).toBeGreaterThan(30);
-    expect(v['timeout-minutes']).toBe(VERIFY_JOB_MINUTES);
-    expect(VERIFY_JOB_MINUTES).toBeGreaterThan(VERIFY_WAIT_MINUTES);
+    expect(v['timeout-minutes']).toBe(wait + VERIFY_MARGIN_MINUTES);
+    expect(VERIFY_MARGIN_MINUTES).toBeGreaterThan(0);
     // nothing else yet: the digest hand-off and the signature checks come after the find-run step with the deploy layer (G7)
     expect(v.steps).toHaveLength(2);
     // public: inline find-run; no environments: no environment (the plan says so in PIPEGEN.md)
     const pv = lay(pub()).verify as Job;
-    expect(pv.steps[1]).toEqual(renderFindRunStep(GATE, { sha: 'github.sha', timeoutMinutes: VERIFY_WAIT_MINUTES }));
+    expect(pv.steps[1]).toEqual(renderFindRunStep(GATE, { sha: 'github.sha', timeoutMinutes: 90 + VERIFY_GRACE_MINUTES }));
     expect(pv.environment).toBeUndefined();
     expect(pv.steps).toHaveLength(2);
     // the referee accepts the job inserted into a user's deploy workflow (G7 places it), judged with the assembled files in one call
     const deployWf = { path: '.github/workflows/deploy.yml', triggers: ['push'], deploys: true, [['secrets', 'Used'].join('')]: [], jobs: ['deploy'] } as unknown as PipelineDraft['profile']['existingWorkflows'][number];
     const withDeploy = planned(profileOf([node()], { private: true, existingWorkflows: [deployWf] }), { needs: floorNeeds(profileOf([node()], { private: true }), CAPS), over: { centralPin: PIN } });
     const pa = lay(withDeploy);
-    expect(pa.verify).toEqual(verifyJob(pa.draft, { gate: GATE, reviewed: REVIEWED, platform: p }));
+    expect(pa.verify).toEqual(verifyJob(pa.draft, { gate: GATE, reviewed: REVIEWED, platform: p, waitMinutes: 90 + VERIFY_GRACE_MINUTES }));
     expect(shown(await judge(pa, [insertedDeploy(pa.verify as Job)]))).toBe('');
     // key-env, in pipegen-signing
     const ke = keyEnv();
@@ -495,6 +496,84 @@ describe('G5: the delivered files and their callers', () => {
     expect(alone.ok).toBe(false);
     // a file assemble writes that the draft already holds is refused (one source per path)
     expect(() => lay(planned(prof, { over: { created: [compose, { path: CALLER_WORKFLOW, content: 'x', part: 'pipeline', reason: 't', repo: 'app' }], skipped: [{ part: 'deploy', reason: 't' }] } }))).toThrow(/already/);
+  });
+});
+
+describe('G5 fix round 1 (ruling G5-R1)', () => {
+  const COSIGN_KEY = ['PIPEGEN_COSIGN', 'KEY'].join('_');
+  const COSIGN_PW = ['PIPEGEN_COSIGN', 'PASS' + 'WORD'].join('_');
+
+  it('I1: a repository whose own signing mode signs never publishes images unsigned (mode none with deploy jobs refused; the referee refuses image-publish without a sign job)', async () => {
+    // the reviewer's attack: a key-env or keyless draft assembled with mode none and image-publish
+    expect(() => lay(keyEnv(), { mode: 'none', deploy: DEPLOY })).toThrow(/signs them with the repository's own signing mode \("key-env"\)/);
+    expect(() => lay(keyless(), { mode: 'none', deploy: DEPLOY })).toThrow(/signs them with the repository's own signing mode \("keyless"\)/);
+    // the repository's own mode decides, even when the draft records no plan (a caller can not drop the plan and the mode together)
+    const ke0 = keyEnv();
+    const { signing: _s, ...noPlan } = ke0.draft;
+    expect(() => lay({ ...ke0, draft: noPlan }, { mode: 'none', deploy: DEPLOY })).toThrow(/own signing mode \("key-env"\)/);
+    const kl0 = keyless();
+    const { signing: _k, ...noPlanKl } = kl0.draft;
+    expect(() => lay({ ...kl0, draft: noPlanKl }, { mode: 'none', deploy: DEPLOY })).toThrow(/own signing mode \("keyless"\)/);
+    // a draft that records a plan while its repository's mode is none is refused too (the plan says the images are signed)
+    const freePriv = planned(profileOf([node({ dockerfile: 'Dockerfile' })], { private: true }), { needs: floorNeeds(profileOf([node()], { private: true }), CAPS), over: { centralPin: PIN } });
+    const planned0 = { ...freePriv, draft: { ...freePriv.draft, signing: { mode: 'key-env', images: [IMG], cosignPubSha256: PUB_SHA } as SigningPlan } };
+    expect(() => lay(planned0, { mode: 'none', deploy: DEPLOY })).toThrow(/signs them/);
+    // a repository whose mode is none (private Free: no environments) publishes, unsigned, as PIPEGEN.md says; the proof publishes nothing
+    const ok = lay(freePriv, { mode: 'none', deploy: DEPLOY });
+    expect(Object.keys(jobsOfFile(fileAt(ok, 'app', CALLER_WORKFLOW)))).toEqual([MERGE_CALLER_JOB, 'image-publish']);
+    expect(shown(await judge(ok))).toBe('');
+    expect(() => lay(keyEnv(), { mode: 'none' })).not.toThrow();
+    // the referee: a draft that records a signing plan, image-publish in the files, no sign job → refused
+    const ke = lay(keyEnv(), { mode: 'key-env', deploy: DEPLOY });
+    expect(shown(await judge(ke))).toBe('');
+    const caller = fileAt(ke, 'app', CALLER_WORKFLOW);
+    const doc = parse(caller.content) as Obj;
+    delete doc.jobs.sign;
+    const noSign = new Document();
+    noSign.contents = noSign.createNode(doc);
+    const stripped: AssembledFiles = { ...ke, files: ke.files.filter((f) => f !== caller && !f.path.endsWith('--sign.yml')).concat([{ ...caller, content: noSign.toString({ lineWidth: 0 }) }]) };
+    const r = await judge(stripped);
+    expect(r.issues.some((i) => i.file === '(draft)' && i.check === 'permissions' && /publishes an image.* no sign job/.test(i.message)), shown(r)).toBe(true);
+    // keyless (inline sign job) likewise
+    const kl = lay(keyless(), { mode: 'keyless', deploy: DEPLOY });
+    expect(shown(await judge(kl))).toBe('');
+    const klCaller = fileAt(kl, 'app', CALLER_WORKFLOW);
+    const kdoc = parse(klCaller.content) as Obj;
+    delete kdoc.jobs.sign;
+    const kNo = new Document();
+    kNo.contents = kNo.createNode(kdoc);
+    const kr = await judge({ ...kl, files: kl.files.map((f) => (f === klCaller ? { ...f, content: kNo.toString({ lineWidth: 0 }) } : f)) });
+    expect(kr.issues.some((i) => /publishes an image.* no sign job/.test(i.message)), shown(kr)).toBe(true);
+  });
+
+  it("m1: the verify job waits for the whole gated run's worst case (the merge chain, then the deploy chain), plus a grace", () => {
+    // the deploy chain: image-publish (30), then sbom (20) needing it, then sign (15) after image-publish: the longest is 30 + 20
+    const sbom: Job = { ...imagePublish(), 'timeout-minutes': 20, needs: ['image-publish'], permissions: { contents: 'read' } };
+    const a = lay(keyEnv(), { mode: 'key-env', deploy: { ...DEPLOY, sbom } });
+    const find = (a.verify as Job).steps[1] as Obj;
+    expect(find.with['timeout-minutes']).toBe(String(90 + 30 + 20 + VERIFY_GRACE_MINUTES));
+    expect((a.verify as Job)['timeout-minutes']).toBe(90 + 30 + 20 + VERIFY_GRACE_MINUTES + VERIFY_MARGIN_MINUTES);
+    // a longer image-publish lengthens the wait
+    const slow = lay(keyEnv(), { mode: 'key-env', deploy: { 'image-publish': { ...imagePublish(), 'timeout-minutes': 60 } } });
+    expect(((slow.verify as Job).steps[1] as Obj).with['timeout-minutes']).toBe(String(90 + 60 + 15 + VERIFY_GRACE_MINUTES));
+    // a deploy job without its own limit (GitHub's default is 360) or a run longer than a job may wait is refused
+    const { 'timeout-minutes': _t, ...noLimit } = imagePublish();
+    expect(() => lay(keyEnv(), { mode: 'key-env', deploy: { 'image-publish': noLimit as Job } })).toThrow(/timeout-minutes/);
+    expect(() => lay(keyEnv(), { mode: 'key-env', deploy: { 'image-publish': { ...imagePublish(), 'timeout-minutes': 300 } } })).toThrow(/longer than the verify job can wait/);
+  });
+
+  it('m2: a deploy job key pipegen does not write is refused with a plain reason, never dropped', () => {
+    const extra: [string, unknown][] = [['env', { A: 'b' }], ['services', { db: { image: 'x' } }], [SEC, 'inherit'], ['strategy', { matrix: { a: [1] } }], ['container', 'node:22'], ['continue-on-error', true], ['defaults', { run: { shell: 'bash' } }], ['concurrency', 'pipegen-nightly'], ['uses', './x.yml']];
+    for (const [k, v] of extra) {
+      expect(() => lay(keyEnv(), { mode: 'key-env', deploy: { 'image-publish': { ...imagePublish(), [k]: v } as unknown as Job } }), k).toThrow(new RegExp(`The deploy job "image-publish" has the key "${k}", which pipegen does not write`));
+    }
+    expect(() => lay(keyEnv(), { mode: 'key-env', deploy: DEPLOY })).not.toThrow();
+  });
+
+  it('m5: callerSecrets never maps a signing secret (it reaches only the sign job, through its environment)', () => {
+    const step = (name: string) => ({ x: { steps: [{ env: { A: ref(name) } }] } });
+    for (const n of [COSIGN_KEY, COSIGN_PW, 'PIPEGEN_COSIGN_OTHER', 'COSIGN_PASSWORD', 'SIGSTORE_ID_TOKEN']) expect(() => callerSecrets(step(n)), n).toThrow(/signing secret/);
+    expect(callerSecrets(step('COSIGNAL_KEY'))).toEqual({ COSIGNAL_KEY: ref('COSIGNAL_KEY') });
   });
 });
 

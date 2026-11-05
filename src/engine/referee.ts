@@ -2283,6 +2283,13 @@ async function judgeFiles(allFiles: CreatedFile[], draft: PipelineDraft, platfor
   }
 
   for (const check of ex.deferred) check();
+  // G5-R1 I1: a draft that records a signing plan never publishes an image unsigned: a job that pushes an image (build-push with push) needs a
+  // sign job of the judged files holding the plan's sign (or attest) step; mode none is a draft with no plan
+  if (draft.signing !== undefined && draft.signing !== null) {
+    const publishes = ex.jobs.some((j) => j.judged.some((x) => x.entryId === BUILD_PUSH_ID && x.step.with?.push !== 'false'));
+    const signs = ex.jobs.some((j) => j.id === 'sign' && j.judged.some((x) => x.kind === 'sign' || x.kind === 'attest'));
+    if (publishes && !signs) add('(draft)', 'permissions', `The draft records ${show(String(draft.signing.mode))} signing and a job publishes an image, but the judged files hold no sign job with the plan's sign step: the image would be published unsigned.`);
+  }
   judgeBaseTwins(ex, add);
   judgeUploadsPerFile(ex, add);
   const demoted = blockingRule(draft, ex, add, notes);
