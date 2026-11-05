@@ -140,7 +140,8 @@ export interface BuilderOffers {
   suggestions: SuggestionOffer[];
 }
 
-export interface BuildResult { choices: Choice[]; suggestions: Suggestion[]; byCode: ByCode[]; uncovered: Uncovered[]; usage: AiUsage }
+/** `calls`: the AI requests made (0 with no key for the AI, else 1, or 2 with the repair; completeValidated's schema retry not counted), for the debate's call bound (F4, ruling S10). */
+export interface BuildResult { choices: Choice[]; suggestions: Suggestion[]; byCode: ByCode[]; uncovered: Uncovered[]; usage: AiUsage; calls: number }
 
 /** The AI's answer, as the schema gives it. */
 export interface BuilderAnswer {
@@ -251,8 +252,8 @@ function serviceOf(ref: NeedRef, p: RepoProfile) {
 
 const workingDirOf = (path: string): string | undefined => (path === '' || path === '.' ? undefined : path);
 
-/** The tuning max of an option id (the largest over the tools that have it). */
-const tuningMax = (id: string): number => Math.max(1, ...TUNING_OPTIONS.filter((o) => o.id === id).map((o) => o.max));
+/** The tuning max of an option id (the largest over the tools that have it). Shared with the debate (F4). */
+export const tuningMax = (id: string): number => Math.max(1, ...TUNING_OPTIONS.filter((o) => o.id === id).map((o) => o.max));
 
 /**
  * The tuning enums of an entry for a key: per option, the union over every value of the entry's choices (ruling S2: semgrep's
@@ -644,12 +645,14 @@ export async function buildChoices(needs: readonly Need[], candidates: ReadonlyM
   let usage: AiUsage = { ...ZERO_USAGE };
   let picked = new Map<string, Choice>();
   let suggestions: Suggestion[] = [];
+  let calls = 0;
 
   if (o.aiKeys.length > 0) {
     const { req, schema } = builderRequest(code, p, o, deps);
     let problems: string[] = [];
     let done = false;
     for (let round = 0; round < 2 && !done; round++) {
+      calls++;
       const r = await ask(ai, round === 0 ? req : repairRequest(req, problems, kv, builderRepairText), schema, usage);
       usage = addUsage(usage, r.usage);
       const idProblems = builderAnswerProblems(r.data, o);
@@ -678,5 +681,5 @@ export async function buildChoices(needs: readonly Need[], candidates: ReadonlyM
     if (ai !== undefined) choices.push(ai);
     else if (o.codeKeys.includes(ref.key)) choices.push(codeChoice(ref, o.offers.get(ref.key) as Offer[], p));
   }
-  return { choices, suggestions, byCode: o.byCode, uncovered: o.uncovered, usage };
+  return { choices, suggestions, byCode: o.byCode, uncovered: o.uncovered, usage, calls };
 }

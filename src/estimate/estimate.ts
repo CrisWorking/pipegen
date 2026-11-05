@@ -107,10 +107,25 @@ const plural = (n: number, one: string, many: string) => `${n.toLocaleString('en
 
 // ---------- AI ----------
 
-/** Tokens per stage of a full run (fixed table, brief). */
+/**
+ * The debate's AI calls (Plan F F4, ruling S10): at most 9 requests (debate.ts MAX_DEBATE_CALLS), of which only the builder's first
+ * call and its repair carry the code bundle (MAX_BUNDLE_CALLS). Every request is counted at DEBATE_PROMPT_TOKENS for its prompt
+ * without the bundle: the judge's critique, the largest, measured about 20,000 bytes for 7 need keys, and bytes are at least tokens
+ * (the meter's own bound), so a plan up to about twice that size fits (test/debate.test.ts measures every request). A bundled call
+ * adds the code bundle at the needs call's 30k. Output is what one answer usually takes: 6k for the builder's picks, 4k otherwise.
+ * This replaces the earlier 3 × 40k / 6k row, which the 9-call bound exceeds.
+ */
+export const DEBATE_PROMPT_TOKENS = 30_000;
+export const DEBATE_CALLS = {
+  bundled: { calls: 2, input: 30_000 + DEBATE_PROMPT_TOKENS, output: 6_000 },
+  plain: { calls: 7, input: DEBATE_PROMPT_TOKENS, output: 4_000 },
+} as const;
+const debateTokens = (k: 'input' | 'output') => DEBATE_CALLS.bundled.calls * DEBATE_CALLS.bundled[k] + DEBATE_CALLS.plain.calls * DEBATE_CALLS.plain[k];
+
+/** Tokens per stage of a full run (fixed table, brief; the debate row from DEBATE_CALLS). */
 const STAGE_TOKENS: readonly { stage: AiStage; input: number; output: number; times: number }[] = [
   { stage: 'needs', input: 30_000, output: 3_000, times: 1 },
-  { stage: 'debate', input: 40_000, output: 6_000, times: 3 },          // 3 rounds
+  { stage: 'debate', input: debateTokens('input'), output: debateTokens('output'), times: 1 },   // at most 9 calls, 2 with the bundle
   { stage: 'creators', input: 60_000, output: 20_000, times: 1 },
   { stage: 'fix-loop', input: 15_000, output: 4_000, times: 0 },        // times set below
 ];
@@ -350,7 +365,7 @@ export function estimate(p: RepoProfile, jobs: JobCategories, variants: number, 
       return { stage: s.stage, input: s.input * times, output: s.output * times };
     });
     basis.push(
-      `AI tokens per stage (input / output): needs ${thousands(30_000)} / ${thousands(3_000)}; debate 3 rounds of ${thousands(40_000)} / ${thousands(6_000)}; `
+      `AI tokens per stage (input / output): needs ${thousands(30_000)} / ${thousands(3_000)}; debate at most ${DEBATE_CALLS.bundled.calls + DEBATE_CALLS.plain.calls} calls, ${DEBATE_CALLS.bundled.calls} with the code bundle at ${thousands(DEBATE_CALLS.bundled.input)} / ${thousands(DEBATE_CALLS.bundled.output)} and ${DEBATE_CALLS.plain.calls} without at ${thousands(DEBATE_CALLS.plain.input)} / ${thousands(DEBATE_CALLS.plain.output)}; `
         + `creators ${thousands(60_000)} / ${thousands(20_000)}; fix loop ${FIX_ATTEMPTS_PER_PART} attempts of ${thousands(15_000)} / ${thousands(4_000)} for each of ${EXPECTED_FAILING_PARTS} parts expected to need a fix.`,
     );
     const pr = priceFor(provider);

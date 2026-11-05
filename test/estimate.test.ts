@@ -51,9 +51,10 @@ const OPUS = { name: 'claude', model: DEFAULT_MODEL };
 /** The needs request's size (UTF-8 bytes) estimateAuditAi is given: a 50 KB bundle and the rest of the prompt. */
 const NEEDS_BYTES = 60_000;
 
-// Token totals for a full run (fixed table): needs 30k/3k, debate 3 × 40k/6k, creators 60k/20k, fix loop 2 parts × 5 × 15k/4k.
-const IN = 30_000 + 120_000 + 60_000 + 150_000; // 360k
-const OUT = 3_000 + 18_000 + 20_000 + 40_000;    // 81k
+// Token totals for a full run (fixed table): needs 30k/3k, debate at most 9 calls (Plan F F4, ruling S10: 2 with the bundle at
+// 60k/6k, 7 without at 30k/4k), creators 60k/20k, fix loop 2 parts × 5 × 15k/4k.
+const IN = 30_000 + 330_000 + 60_000 + 150_000; // 570k
+const OUT = 3_000 + 40_000 + 20_000 + 40_000;    // 103k
 
 describe('estimate: minutes', () => {
   it('estimate: cap is twice setup', () => {
@@ -161,7 +162,7 @@ describe('estimate: AI', () => {
     const e = estimate(profile(), JOBS, 2, ACTIVITY, OPUS);
     expect(e.aiTokens).toEqual([
       { stage: 'needs', input: 30_000, output: 3_000 },
-      { stage: 'debate', input: 120_000, output: 18_000 },
+      { stage: 'debate', input: 330_000, output: 40_000 },
       { stage: 'creators', input: 60_000, output: 20_000 },
       { stage: 'fix-loop', input: 150_000, output: 40_000 },
     ]);
@@ -169,14 +170,14 @@ describe('estimate: AI', () => {
 
   it('estimate: input and output priced separately with claude-opus-5-5 prices', () => {
     const e = estimate(profile(), JOBS, 2, ACTIVITY, OPUS);
-    // $4 a million in and $20 a million out give input 1.44 and output 1.62 (3.06); low ×0.5, high ×1.5
+    // $4 a million in and $20 a million out give input 2.28 and output 2.06 (4.34); low ×0.5, high ×1.5
     if (e.aiCostUsd === 'local') throw new Error('expected a priced estimate');
     expect(e.aiCostUsd.input.low).toBeCloseTo((IN / 1e6) * 4 * 0.5, 6);
     expect(e.aiCostUsd.input.high).toBeCloseTo((IN / 1e6) * 4 * 1.5, 6);
     expect(e.aiCostUsd.output.low).toBeCloseTo((OUT / 1e6) * 20 * 0.5, 6);
     expect(e.aiCostUsd.output.high).toBeCloseTo((OUT / 1e6) * 20 * 1.5, 6);
-    expect(e.aiCostUsd.low).toBeCloseTo(1.53, 6);
-    expect(e.aiCostUsd.high).toBeCloseTo(4.59, 6);
+    expect(e.aiCostUsd.low).toBeCloseTo(2.17, 6);
+    expect(e.aiCostUsd.high).toBeCloseTo(6.51, 6);
     // another priced model gives other numbers: Sonnet 5.5 at $2 / $10
     const s = estimate(profile(), JOBS, 2, ACTIVITY, { name: 'claude', model: 'claude-sonnet-5-5' });
     if (s.aiCostUsd === 'local') throw new Error('expected a priced estimate');
@@ -222,7 +223,7 @@ describe('estimate: AI', () => {
     const e = estimate(profile(), JOBS, 2, ACTIVITY, OPUS);
     if (e.aiCostUsd === 'local') throw new Error('expected a priced estimate');
     expect(e.aiCostCapUsd).toBeCloseTo(2 * e.aiCostUsd.high, 6);
-    expect(e.aiCostCapUsd).toBeCloseTo(9.18, 6);
+    expect(e.aiCostCapUsd).toBeCloseTo(13.02, 6);
   });
 
   it('estimate: ollama → aiCost local, no cap', () => {

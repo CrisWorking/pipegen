@@ -98,7 +98,8 @@ const IDENTITY = Object.freeze({ name: 'pipegen', email: 'proof@pipegen.invalid'
 const SHA_RE = /^[0-9a-f]{40}$/;
 const TOKEN_RE = /^[A-Za-z0-9_]{20,255}$/;
 const PROOF_NAME_RE = /^[a-z0-9][a-z0-9-]{0,80}$/;
-const VARIANT_RE = /^(?:main|planted|dispute-[a-z0-9][a-z0-9-]{0,40}-[ab])$/;
+/** The proof variant names buildProofBranch accepts (exported for Plan F's dispute variant names, F4). */
+export const VARIANT_RE = /^(?:main|planted|dispute-[a-z0-9][a-z0-9-]{0,40}-[ab])$/;
 const TREE_CONCURRENCY = 8;
 const BLOB_READ_CONCURRENCY = 4;
 /** The central default head copied through the API: past these it is a stop (it is pipegen's helper repo, normally small). */

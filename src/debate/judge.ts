@@ -88,6 +88,8 @@ export interface Critique {
   /** pipegen's own notes: refused or repeated additions, objections not read. Enum values and checked names only. */
   notes: string[];
   usage: AiUsage;
+  /** The AI requests made: 1, or 2 with the re-ask (completeValidated's schema retry not counted), for the debate's call bound (F4, ruling S10). */
+  calls: number;
 }
 
 /** The judge's answer, as the schema gives it. */
@@ -376,7 +378,7 @@ export async function critique(choices: readonly Choice[], needs: readonly Need[
     usage = addUsage(usage, r.usage);
     const read = readJudgeAnswer(r.data, j, needs, p, caps, deps);
     if (read.problems.length > 0) { problems = read.problems; continue; }   // the whole answer is refused (ruling S3)
-    return { agreed: r.data.agreed === true, objections: read.objections, ...approvalOf(r.data), notes: read.notes, usage };
+    return { agreed: r.data.agreed === true, objections: read.objections, ...approvalOf(r.data), notes: read.notes, usage, calls: round + 1 };
   }
   throw new JudgeError('The judge AI answered twice with picks pipegen can not use, so pipegen stopped. Nothing it said was used.', problems, usage);
 }
