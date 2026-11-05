@@ -206,8 +206,8 @@ function semgrepRules(e: ReviewedTool, ref: NeedRef, p: RepoProfile): KeyFilled 
 /** Entries whose choices and tuning code fills per key (by entry id). */
 const KEY_FILLED: Readonly<Record<string, (e: ReviewedTool, ref: NeedRef, p: RepoProfile) => KeyFilled | null>> = { semgrep: semgrepRules };
 
-/** Tools of these categories are never offered: their inputs are pipegen's own (egress, review F2 I2). */
-const NEVER_OFFERED_CATEGORIES: ReadonlySet<string> = new Set(['egress']);
+/** Tools of these categories are never offered: their inputs are pipegen's own (egress, review F2 I2). Shared with the judge (F3). */
+export const NEVER_OFFERED_CATEGORIES: ReadonlySet<string> = new Set(['egress']);
 
 const sameList = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
 
@@ -349,7 +349,7 @@ export function specFor(ref: NeedRef, offer: Offer, p: RepoProfile, picks?: Pick
 }
 
 /** The tools offered for one key (ruling B2), in the map's order, each once. */
-function offersFor(ref: NeedRef, cands: readonly Candidate[], p: RepoProfile, deps: BuilderDeps, kv: readonly string[]): Offer[] {
+function offersFor(ref: NeedRef, cands: readonly Candidate[], p: RepoProfile, deps: OfferDeps, kv: readonly string[]): Offer[] {
   if (serviceOf(ref, p) === null) return [];
   const need = ref.needs[0] as Need;
   // full mode only (proofs >= 1): never the audit list (ruling S20)
@@ -376,15 +376,21 @@ function offersFor(ref: NeedRef, cands: readonly Candidate[], p: RepoProfile, de
 const categoryOf = (id: string): string | undefined => (Object.hasOwn(NEED_ID_CATEGORY, id) ? (NEED_ID_CATEGORY as Readonly<Record<string, string>>)[id] : undefined);
 const where = (ref: NeedRef) => ({ key: ref.key, needId: ref.id, ...(ref.service === undefined ? {} : { service: ref.service }) });
 
+/** What deciding the offered tools needs (the judge passes only these, ruling B2). */
+export type OfferDeps = Pick<BuilderDeps, 'reviewed' | 'knownValues'>;
+
+/** builderOffers without the suggestions: what the builder and the judge (F3) both offer per key. */
+export type KeyOffers = Omit<BuilderOffers, 'suggestions'>;
+
 /**
- * What code decides before the AI is asked: the need keys (needRefs; refuses two services with one name), per key the offered
- * reviewed tools, the keys the AI sees, the needs code covers (`byCode`), the uncovered ones, and the suggestions the AI may name.
- * Throws NeedKeyError (need-ref.ts) on a key collision.
+ * The offered reviewed tools per need key, the keys the AI sees, the needs code covers (`byCode`) and the uncovered ones: one
+ * function for the builder and the judge (F3: a counter candidate must be one of these for its key). Throws NeedKeyError
+ * (need-ref.ts) on a key collision.
  */
-export function builderOffers(needs: readonly Need[], candidates: ReadonlyMap<string, readonly Candidate[]>, p: RepoProfile, deps: BuilderDeps): BuilderOffers {
+export function keyOffers(needs: readonly Need[], candidates: ReadonlyMap<string, readonly Candidate[]>, p: RepoProfile, deps: OfferDeps): KeyOffers {
   const kv = deps.knownValues ?? [];
   const refs = needRefs(needs, p, kv);
-  const result: BuilderOffers = { refs, offers: new Map(), aiKeys: [], codeKeys: [], byCode: [], uncovered: [], suggestions: [] };
+  const result: KeyOffers = { refs, offers: new Map(), aiKeys: [], codeKeys: [], byCode: [], uncovered: [] };
   for (const ref of refs) {
     const category = categoryOf(ref.id);
     const svc = serviceOf(ref, p);
@@ -402,6 +408,18 @@ export function builderOffers(needs: readonly Need[], candidates: ReadonlyMap<st
     result.offers.set(ref.key, offers);
     (ref.offered ? result.aiKeys : result.codeKeys).push(ref.key);
   }
+  return result;
+}
+
+/**
+ * What code decides before the AI is asked: the need keys (needRefs; refuses two services with one name), per key the offered
+ * reviewed tools, the keys the AI sees, the needs code covers (`byCode`), the uncovered ones, and the suggestions the AI may name.
+ * Throws NeedKeyError (need-ref.ts) on a key collision.
+ */
+export function builderOffers(needs: readonly Need[], candidates: ReadonlyMap<string, readonly Candidate[]>, p: RepoProfile, deps: BuilderDeps): BuilderOffers {
+  const kv = deps.knownValues ?? [];
+  const result: BuilderOffers = { ...keyOffers(needs, candidates, p, deps), suggestions: [] };
+  const refs = result.refs;
 
   // ruling S4: the suggestions are toSuggestions' (unreviewed discovery candidates that pass the bar, deduped by repo), never a reviewed tool's id or repo
   const reviewedIds = new Set(deps.reviewed.map((t) => t.id));
@@ -576,15 +594,17 @@ function reasonOf(chosen: string, others: readonly string[], because: string): s
 
 // ---------- the call ----------
 
-const ZERO: AiUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
-const addUsage = (a: AiUsage, b: AiUsage | undefined): AiUsage => (b === undefined ? a : {
+/** No usage yet. Shared with the judge (F3). */
+export const ZERO_USAGE: AiUsage = Object.freeze({ inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 });
+/** a + b, field by field (b missing → a). Shared with the judge (F3). */
+export const addUsage = (a: AiUsage, b: AiUsage | undefined): AiUsage => (b === undefined ? a : {
   inputTokens: count(a.inputTokens) + count(b.inputTokens), outputTokens: count(a.outputTokens) + count(b.outputTokens),
   cacheReadTokens: count(a.cacheReadTokens) + count(b.cacheReadTokens), cacheWriteTokens: count(a.cacheWriteTokens) + count(b.cacheWriteTokens),
 });
 const billed = (u: AiUsage) => u.inputTokens + u.outputTokens + count(u.cacheReadTokens) + count(u.cacheWriteTokens) > 0;
 
-/** completeValidated; an AiError passes through (same kind and message) with the usage of the earlier calls added. */
-async function ask(ai: AiProvider, req: AiRequest, schema: AiSchema<BuilderAnswer>, before: AiUsage): Promise<{ data: BuilderAnswer; usage: AiUsage }> {
+/** completeValidated; an AiError passes through (same kind and message) with the usage of the earlier calls added. Shared with the judge (F3). */
+export async function ask<T>(ai: AiProvider, req: AiRequest, schema: AiSchema<T>, before: AiUsage): Promise<{ data: T; usage: AiUsage }> {
   try {
     return await completeValidated(ai, req, schema.zod);
   } catch (e) {
@@ -614,7 +634,7 @@ export async function buildChoices(needs: readonly Need[], candidates: ReadonlyM
   const code = bundleText(bundle); // first: throws SecretScanRequiredError before anything else happens
   const kv = deps.knownValues ?? [];
   const o = builderOffers(needs, candidates, p, deps);
-  let usage: AiUsage = { ...ZERO };
+  let usage: AiUsage = { ...ZERO_USAGE };
   let picked = new Map<string, Choice>();
   let suggestions: Suggestion[] = [];
 
