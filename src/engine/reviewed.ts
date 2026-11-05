@@ -1421,12 +1421,16 @@ export function nodeTypeChecker(q: Service['quality']): { tool: string; pkg: 'ty
   return { tool: 'tsc', pkg: 'typescript' };
 }
 
+/** Whether a repo built-in is meant for this need of this service: today the type-check of a Node service (one guard, G4b-R1 m5). */
+const repoToolNeed = (need: Pick<Need, 'id' | 'service'>, s: Service): boolean =>
+  need.id === 'type-check' && s.language === 'node' && (need.service === undefined || need.service === s.name);
+
 /**
  * The repo's own tool for a need, as the audit names it (any version the reader found, a package.json range included), or null: only the
  * type-check of a Node service has one today, and only when its package's version is known. `workingDir` is the raw Service.path.
  */
 export function repoToolStep(need: Pick<Need, 'id' | 'service'>, s: Service): RepoToolStep | null {
-  if (need.id !== 'type-check' || s.language !== 'node' || (need.service !== undefined && need.service !== s.name)) return null;
+  if (!repoToolNeed(need, s)) return null;
   const pick = nodeTypeChecker(s.quality);
   const version = s.quality.versions[pick.pkg];
   if (version === undefined) return null;
@@ -1436,22 +1440,22 @@ export function repoToolStep(need: Pick<Need, 'id' | 'service'>, s: Service): Re
   return step;
 }
 
-/** The repo tools the pipeline runs (v0.2): the repository's own tsc. vue-tsc, svelte-check and `astro check` are named by the audit only. */
-const RUNNABLE_REPO_TOOLS: ReadonlySet<string> = new Set(['tsc']);
-
 /**
- * Why the pipeline can not run the repo's own tool for a need a repo built-in is meant to cover (a Node service's type-check), in plain
- * words built from fixed text only; null when it can (repoToolFor gives the step) or when no repo built-in covers the need (the reviewed
- * tools do, as for Python's mypy).
+ * The repo tools the pipeline runs (v0.2), each with the first major it refuses: the repository's own tsc below 7 (TypeScript 7 runs a
+ * native binary from a platform package the run-time lockfile check does not cover yet, G4b-R1 m2; render-cli.ts REPO_TOOLS reads this).
+ * vue-tsc, svelte-check and `astro check` are named by the audit only.
  */
-export function repoToolProblem(need: Pick<Need, 'id' | 'service'>, s: Service): string | null {
-  if (need.id !== 'type-check' || s.language !== 'node' || (need.service !== undefined && need.service !== s.name)) return null;
+export const REPO_TOOL_BELOW_MAJOR: Readonly<Record<string, number>> = Object.freeze({ tsc: 7 });
+
+/** The plain reason the pipeline can't run a repo step, or null (fixed text only). */
+function repoStepProblem(step: RepoToolStep | null, s: Service): string | null {
   const { tool, pkg } = nodeTypeChecker(s.quality);
-  const step = repoToolStep(need, s);
   if (step === null) return `${tool}: ${pkg} is not in the lockfile, so pipegen has no pinned type checker to run (add ${pkg} as a dev dependency and commit package-lock.json)`;
-  if (!RUNNABLE_REPO_TOOLS.has(step.tool)) return `${tool}: pipegen runs only the repository's own tsc as a type check in v0.2; ${tool} is not run yet`;
+  const below = Object.hasOwn(REPO_TOOL_BELOW_MAJOR, step.tool) ? REPO_TOOL_BELOW_MAJOR[step.tool] : undefined;
+  if (below === undefined) return `${tool}: pipegen runs only the repository's own tsc as a type check in v0.2; ${tool} is not run yet`;
   if (s.packageManager !== 'npm') return `${tool}: pipegen installs the dependencies with npm only (${s.packageManager === undefined ? 'no package manager was found' : `${s.packageManager} is not supported yet`})`;
   if (step.fromRange === true) return `${tool}: ${pkg}'s version comes from a package.json range, not from package-lock.json, so pipegen can't run the pinned version (commit package-lock.json)`;
+  if (Number((step.version ?? '').split('.')[0]) >= below) return `${tool}: TypeScript ${below} and later run a native binary from a platform package pipegen's lockfile check does not cover yet, so pipegen does not run it (v0.2)`;
   if (s.npmLockfileVersion === undefined) return `${tool}: the service has no package-lock.json, so pipegen can't install the pinned version`;
   if (s.npmLockfileVersion < 2) return `${tool}: package-lock.json is lockfile version ${String(s.npmLockfileVersion)}; pipegen reads lockfile version 2 or later (run npm install with npm 7 or later)`;
   if (!s.quality.tsconfig) return `${tool}: the service has no tsconfig.json, so ${tool} would have nothing to check`;
@@ -1459,11 +1463,21 @@ export function repoToolProblem(need: Pick<Need, 'id' | 'service'>, s: Service):
 }
 
 /**
+ * Why the pipeline can not run the repo's own tool for a need a repo built-in is meant to cover (a Node service's type-check), in plain
+ * words built from fixed text only; null when it can (repoToolFor gives the step) or when no repo built-in covers the need (the reviewed
+ * tools do, as for Python's mypy).
+ */
+export function repoToolProblem(need: Pick<Need, 'id' | 'service'>, s: Service): string | null {
+  return repoToolNeed(need, s) ? repoStepProblem(repoToolStep(need, s), s) : null;
+}
+
+/**
  * The built-in step that runs the repo's own tool for a need (G4b, DECISIONS #95), or null: the one source for the builder (byCode
  * `repo-tool`), the renderer (renderRepoTool re-derives it), the referee and the jobs. Only a step repoToolProblem has nothing against.
  */
 export function repoToolFor(need: Pick<Need, 'id' | 'service'>, s: Service): RepoToolStep | null {
-  return repoToolProblem(need, s) === null ? repoToolStep(need, s) : null;
+  const step = repoToolStep(need, s);
+  return step !== null && repoStepProblem(step, s) === null ? step : null;
 }
 
 // ---------- package existence ----------

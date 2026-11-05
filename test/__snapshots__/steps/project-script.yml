@@ -59,7 +59,7 @@
     }
     process.exit(bad);'
     "${pg_env[@]}" "PIPEGEN_NPM_EXPECT=$PIPEGEN_NPM_EXPECT" "$nodebin/node" -e "$js"
-    "${pg_env[@]}" "$nodebin/npm" ci --ignore-scripts --no-audit --no-fund --workspaces=false --registry=https://registry.npmjs.org/
+    "${pg_env[@]}" "$nodebin/npm" ci --ignore-scripts --no-audit --no-fund --workspaces=false --git=/usr/bin/git --registry=https://registry.npmjs.org/
     mkdir -p "$RUNNER_TEMP/pipegen-npm-ci"
     : > "$RUNNER_TEMP/pipegen-npm-ci/3b4e3efd29cd131b"
   shell: bash

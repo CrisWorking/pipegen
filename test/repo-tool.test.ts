@@ -3,19 +3,20 @@
 // `repo-tool`), the renderer writes the guarded `npm ci --ignore-scripts`, the run-time lockfile check and `tsc --noEmit`, the referee accepts
 // only that exact form, and the job is a blocking job-status check with no key and no secret (gate/dist unchanged).
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { parse } from 'yaml';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { chooseTools } from '../src/audit/choose.js';
 import { keyOffers } from '../src/debate/builder.js';
 import { gateJobList } from '../src/engine/gate-job-list.js';
 import { floorNeeds } from '../src/engine/needs.js';
-import { REPO_TOOLS, repoToolCheckJs } from '../src/engine/render-cli.js';
+import { REPO_TOOLS, repoToolCheckJs, tsconfigGuardJs } from '../src/engine/render-cli.js';
 import { RenderError } from '../src/engine/render-error.js';
 import { renderProjectScript, renderRepoTool } from '../src/engine/render-step.js';
 import { repoToolFor, repoToolProblem } from '../src/engine/reviewed.js';
 import { emptyServiceQuality } from '../src/read/quality.js';
-import type { Job } from '../src/layers/jobs.js';
+import { starterTestJob, type Job } from '../src/layers/jobs.js';
 import type { CreatedFile, Need, Service } from '../src/types.js';
 import type { RepoToolStep } from '../src/engine/reviewed.js';
 import { REVIEWED, candidatesFor } from './helpers/debate-fixtures.js';
@@ -108,7 +109,7 @@ describe('G4b: the type-check through the repo\'s own tsc (ruling G4-R3)', () =>
     const ps = renderProjectScript({ kind: 'project-script', needId: 'lint', service: 'app', script: 'lint' }, p, { profile: profileOf([tsNode({ scripts: ['lint'] })]) }).steps;
     expect(steps.slice(0, 2)).toEqual(ps.slice(0, 2));
     expect(steps[2]).toEqual(JSON.parse(JSON.stringify(ps[2]).replaceAll('pipegen-out-lint--app', 'pipegen-out-type-check--app')));
-    expect(steps[2]?.run).toContain('npm" ci --ignore-scripts --no-audit --no-fund --workspaces=false --registry=https://registry.npmjs.org/');
+    expect(steps[2]?.run).toContain('npm" ci --ignore-scripts --no-audit --no-fund --workspaces=false --git=/usr/bin/git --registry=https://registry.npmjs.org/');
     // the run step: env -i, the install marker, the lockfile check, then the repo's own tsc by path, with --noEmit and nothing else
     const run = steps[3]?.run as string;
     expect(steps[3]?.shell).toBe('bash');
@@ -116,13 +117,22 @@ describe('G4b: the type-check through the repo\'s own tsc (ruling G4-R3)', () =>
     expect(run).toContain('/usr/bin/env -i');
     const marker = run.indexOf('the dependencies were not installed by pipegen\'s own npm ci step');
     const check = run.indexOf('"${pg_env[@]}" "$nodebin/node" -e "$js"');
-    const tsc = run.indexOf('"${pg_env[@]}" "$nodebin/node" node_modules/typescript/bin/tsc --noEmit');
+    // G4b-R1 I3, m3: the service's own tsconfig.json (-p, never a parent's) is shown first and must select a file with noCheck off
+    const hasConfig = run.indexOf('[ -f tsconfig.json ] && [ ! -L tsconfig.json ] || pg_fail');
+    const show = run.indexOf('"${pg_env[@]}" "$nodebin/node" node_modules/typescript/bin/tsc -p tsconfig.json --showConfig > "$cfg"');
+    const guard = run.indexOf('"${pg_env[@]}" "$nodebin/node" -e "$guard" "$cfg"');
+    const tsc = run.indexOf('"${pg_env[@]}" "$nodebin/node" node_modules/typescript/bin/tsc -p tsconfig.json --noEmit');
     expect(marker).toBeGreaterThan(-1);
     expect(check).toBeGreaterThan(marker);
-    expect(tsc).toBeGreaterThan(check);
-    expect(run.trimEnd().endsWith('node_modules/typescript/bin/tsc --noEmit')).toBe(true);
+    expect(hasConfig).toBeGreaterThan(check);
+    expect(show).toBeGreaterThan(hasConfig);
+    expect(guard).toBeGreaterThan(show);
+    expect(tsc).toBeGreaterThan(guard);
+    expect(run.trimEnd().endsWith('node_modules/typescript/bin/tsc -p tsconfig.json --noEmit')).toBe(true);
+    expect(run.match(/node_modules\/typescript\/bin\/tsc(?! -p tsconfig\.json )/g)).toBeNull();
     expect(run).not.toMatch(/\$\{\{|secrets\.|PIPEGEN_FP_KEY|GITHUB_TOKEN/);
-    expect(REPO_TOOLS).toEqual({ tsc: { package: 'typescript', bin: 'bin/tsc', args: ['--noEmit'] } });
+    expect(run).toContain(`guard=${"'"}${tsconfigGuardJs().replace(/'/g, "'\\''")}'`);
+    expect(REPO_TOOLS).toEqual({ tsc: { package: 'typescript', bin: 'bin/tsc', config: 'tsconfig.json', args: ['--noEmit'], belowMajor: 7 } });
     // a sub-folder service: the checked cd first, in both steps
     const sub = tsNode({ name: 'web', path: 'apps/web' });
     const subSteps = renderRepoTool({ ...STEP, service: 'web', workingDir: 'apps/web' }, p, { profile: profileOf([sub]) }).steps;
@@ -145,7 +155,7 @@ describe('G4b: the type-check through the repo\'s own tsc (ruling G4-R3)', () =>
     for (const [step, s] of refusals) expect(() => renderRepoTool(step, p, { profile: profileOf([s]) }), JSON.stringify(step)).toThrow(RenderError);
 
     // the lockfile check itself, run with node on a fixture folder: the installed package is the one package-lock.json pins
-    const js = repoToolCheckJs('typescript', 'bin/tsc');
+    const js = repoToolCheckJs('tsc');
     expect(run).toContain(js.replace(/'/g, "'\\''"));
     const version = '5.6.3';
     const resolved = `https://registry.npmjs.org/typescript/-/typescript-${version}.tgz`;
@@ -185,6 +195,8 @@ describe('G4b: the type-check through the repo\'s own tsc (ruling G4-R3)', () =>
       ['another source', { entry: { resolved: 'https://evil.example/typescript.tgz' } }],
       ['no sha512', { entry: { integrity: 'sha1-abc' } }],
       ['a range, not a version', { entry: { version: range, resolved: `https://registry.npmjs.org/typescript/-/typescript-${range}.tgz` } }],
+      // G4b-R1 m2: a bump to TypeScript 7 after the workflow was written fails closed at run time too (its native binary package is not checked)
+      ['TypeScript 7 (native binary)', { entry: { version: '7.0.2', resolved: 'https://registry.npmjs.org/typescript/-/typescript-7.0.2.tgz' } }],
       ['not installed by npm ci (hidden lockfile differs)', { hidden: { 'node_modules/typescript': { version, resolved, integrity: `sha512-${'B'.repeat(86)}==` } } }],
       ['no hidden lockfile entry', { hidden: {} }],
     ];
@@ -198,27 +210,34 @@ describe('G4b: the type-check through the repo\'s own tsc (ruling G4-R3)', () =>
     expect(shown(await judge(files(a), a.draft))).toBe('');
     const runOf = (j: Obj): Obj => (j.steps as Obj[]).find((s) => typeof s.id === 'string' && s.id.startsWith('repocode-')) as Obj;
     const ciOf = (j: Obj): Obj => (j.steps as Obj[]).find((s) => typeof s.id === 'string' && s.id.startsWith('pipegen-npm-ci-')) as Obj;
-    const edits: [string, (j: Obj) => void][] = [
-      ['a tsc flag added', (j) => { runOf(j).run = String(runOf(j).run).replace('tsc --noEmit', 'tsc --noEmit --skipLibCheck'); }],
-      ['--noEmit dropped', (j) => { runOf(j).run = String(runOf(j).run).replace('tsc --noEmit', 'tsc'); }],
-      ['another bin', (j) => { runOf(j).run = String(runOf(j).run).replace('node_modules/typescript/bin/tsc', 'node_modules/.bin/tsc'); }],
-      ['the lockfile check dropped', (j) => { runOf(j).run = String(runOf(j).run).replace('"${pg_env[@]}" "$nodebin/node" -e "$js"', 'true'); }],
-      ['the install with scripts', (j) => { ciOf(j).run = String(ciOf(j).run).replace('ci --ignore-scripts', 'ci'); }],
-      ['an env added', (j) => { runOf(j).env = { ...runOf(j).env, NODE_OPTIONS: '--require ./x.js' }; }],
-      ['a working directory', (j) => { runOf(j)['working-directory'] = 'src'; }],
-      ['another id', (j) => { runOf(j).id = 'repocode-0000000000000000'; }],
-      ['a trailing command', (j) => { runOf(j).run = `${String(runOf(j).run)}\ncurl https://example.com`; }],
+    // G4b-R1 I2: each edit is refused for its own reason (the exact issue), and an edit that changes nothing is accepted (the control)
+    const TSC = 'node_modules/typescript/bin/tsc -p tsconfig.json --noEmit';
+    const differs = (id: string): [string, RegExp] => ['template', new RegExp(`In the job "type-check--app", step \\d+: the step "${id}" differs from what pipegen renders for it`)];
+    const RUN = differs('repocode-[0-9a-f]{16}');
+    const edits: [string, (j: Obj) => void, [string, RegExp]][] = [
+      ['a tsc flag added', (j) => { runOf(j).run = String(runOf(j).run).replace(TSC, `${TSC} --skipLibCheck`); }, RUN],
+      ['--noEmit dropped', (j) => { runOf(j).run = String(runOf(j).run).replace(TSC, TSC.replace(' --noEmit', '')); }, RUN],
+      ['-p dropped (tsc would walk up to a parent tsconfig)', (j) => { runOf(j).run = String(runOf(j).run).replaceAll(' -p tsconfig.json', ''); }, RUN],
+      ['another bin', (j) => { runOf(j).run = String(runOf(j).run).replaceAll('node_modules/typescript/bin/tsc', 'node_modules/.bin/tsc'); }, RUN],
+      ['the lockfile check dropped', (j) => { runOf(j).run = String(runOf(j).run).replace('"${pg_env[@]}" "$nodebin/node" -e "$js"', 'true'); }, RUN],
+      ['the tsconfig guard dropped', (j) => { runOf(j).run = String(runOf(j).run).replace('"${pg_env[@]}" "$nodebin/node" -e "$guard" "$cfg"', 'true'); }, RUN],
+      ['the install with scripts', (j) => { ciOf(j).run = String(ciOf(j).run).replace('ci --ignore-scripts', 'ci'); }, differs('pipegen-npm-ci-[0-9a-f]{16}')],
+      ['the install without --git', (j) => { ciOf(j).run = String(ciOf(j).run).replace(' --git=/usr/bin/git', ''); }, differs('pipegen-npm-ci-[0-9a-f]{16}')],
+      ['an env added', (j) => { runOf(j).env = { ...runOf(j).env, NODE_OPTIONS: '--require ./x.js' }; }, RUN],
+      ['a working directory', (j) => { runOf(j)['working-directory'] = 'src'; }, RUN],
+      ['another id', (j) => { runOf(j).id = 'repocode-0000000000000000'; }, ['unreviewed', /In the job "type-check--app", step \d+: the run step "pipegen: run the repository's own tsc \(its lockfile version\)" is not a step pipegen renders/]],
+      ['a trailing command', (j) => { runOf(j).run = `${String(runOf(j).run)}\ncurl https://example.com`; }, RUN],
     ];
-    for (const [why, edit] of edits) {
+    expect(shown(await judge([editJob(f, 'type-check--app', () => {}), ...files(a).slice(1)], a.draft)), 'identity control').toBe('');
+    for (const [why, edit, [check, re]] of edits) {
       const r = await judge([editJob(f, 'type-check--app', edit), ...files(a).slice(1)], a.draft);
       expect(r.ok, why).toBe(false);
+      expect(r.issues.some((i) => i.check === check && re.test(i.message)), `${why}: ${shown(r)}`).toBe(true);
     }
     // the exact step, moved into another job: refused (the gate reads the type-check job)
     const moved = editJob(f, 'lint--app', (j) => { j.steps.push(runOf(parseJob(f, 'type-check--app'))); });
-    expect((await judge([moved, ...files(a).slice(1)], a.draft)).ok).toBe(false);
-    // the gate's type-check job without its step: refused (the gate would read a job that does not type-check)
-    const empty = editJob(f, 'type-check--app', (j) => { j.steps = (j.steps as Obj[]).filter((s) => !String(s.id).startsWith('repocode-')); });
-    expect((await judge([empty, ...files(a).slice(1)], a.draft)).ok).toBe(false);
+    const mr = await judge([moved, ...files(a).slice(1)], a.draft);
+    expect(mr.issues.some((i) => i.check === 'not-gate-readable' && /belongs to the job "type-check--app" .* but sits in the job "lint--app"/.test(i.message)), shown(mr)).toBe(true);
     // a draft whose repository has no runnable tsc: the same step is no step pipegen renders (unreviewed), and the blocking need has nothing
     const noTs = { ...a.draft, profile: profileOf([tsNode({ quality: { ...TS, versions: {} } })]) };
     const r = await judge(files(a), noTs);
@@ -257,6 +276,98 @@ describe('G4b: the type-check through the repo\'s own tsc (ruling G4-R3)', () =>
     expect((soft.merge['type-check--app'] as Job).steps.slice(1)).toEqual(renderRepoTool(STEP, p, { profile: prof }).steps);
     expect(gateJobList(soft.draft).map((e) => e.job)).not.toContain('type-check--app');
     expect(shown(await judge(files(soft), soft.draft))).toBe('');
+  });
+});
+
+describe('G4b fix round 1 (ruling G4b-R1)', () => {
+  const both = (): Service => tsNode({ scripts: ['test', 'lint'] });
+  const REMOVED = /^The job "(type-check|lint|unit-tests)--app" is in the gate's list for the check "\1", but it holds no step of the check \((the rendered repo built-in|the rendered project script)\)/;
+
+  it('referee: a gate-listed type-check, lint or unit-tests job without its own step is refused (from the merge file, or from every file)', async () => {
+    const a = assemble(planned(profileOf([both()])));
+    const fs = files(a);
+    expect(shown(await judge(fs, a.draft))).toBe('');
+    const finalRun = (j: Obj): string => String((j.steps as Obj[]).filter((x) => typeof x.id === 'string' && x.id.startsWith('repocode-')).at(-1)?.id);
+    const drop = (f: CreatedFile, job: string): CreatedFile => (parse(f.content) as Obj).jobs?.[job] === undefined ? f
+      : editJob(f, job, (j) => { const id = finalRun(j); j.steps = (j.steps as Obj[]).filter((x) => x.id !== id); });
+    for (const job of ['type-check--app', 'lint--app', 'unit-tests--app']) {
+      expect(fs[0]?.content, job).toContain(`${job}:`);
+      // the identity control: the same file written again is accepted
+      expect(shown(await judge([editJob(fs[0] as CreatedFile, job, () => {}), ...fs.slice(1)], a.draft)), `${job} identity`).toBe('');
+      // the step removed from the gate's file only (the push file still holds it): refused, the gate reads this file's job
+      const mergeOnly = await judge([drop(fs[0] as CreatedFile, job), ...fs.slice(1)], a.draft);
+      expect(mergeOnly.issues.some((i) => i.check === 'not-gate-readable' && REMOVED.test(i.message)), `${job} merge only: ${shown(mergeOnly)}`).toBe(true);
+      // removed from every file: refused, and the blocking rule finds nothing that runs the check
+      const everywhere = await judge(fs.map((f) => drop(f, job)), a.draft);
+      expect(everywhere.issues.some((i) => i.check === 'not-gate-readable' && REMOVED.test(i.message)), `${job} everywhere: ${shown(everywhere)}`).toBe(true);
+      expect(everywhere.issues.some((i) => i.check === 'not-gate-readable' && /^The blocking check "(type-check|lint|unit-tests)" for "app" has no reviewed tool step, no project script and no repo built-in/.test(i.message)), `${job} blocking rule: ${shown(everywhere)}`).toBe(true);
+    }
+    // only the install left (the step that installs, not the step that checks): still refused
+    const onlyInstall = editJob(fs[0] as CreatedFile, 'type-check--app', (j) => { j.steps = (j.steps as Obj[]).filter((x) => !String(x.id).startsWith('repocode-')); });
+    expect((await judge([onlyInstall, ...fs.slice(1)], a.draft)).issues.some((i) => REMOVED.test(i.message))).toBe(true);
+  });
+
+  it('render: the tsc step reads tsc -p tsconfig.json --showConfig first and refuses a tsconfig that selects no file or sets noCheck', () => {
+    const guard = tsconfigGuardJs();
+    const runGuard = (cfg: string): { status: number; err: string } => {
+      const d = makeTempDir();
+      writeFileSync(join(d, 'cfg.json'), cfg);
+      try { execFileSync(process.execPath, ['-e', guard, join(d, 'cfg.json')], { cwd: d, env: {}, stdio: 'pipe' }); return { status: 0, err: '' }; } catch (e) { const x = e as { status: number; stderr: Buffer }; return { status: x.status, err: x.stderr.toString() }; }
+    };
+    expect(runGuard(JSON.stringify({ compilerOptions: { strict: true }, files: ['./src/main.ts'], include: ['src'] })).status).toBe(0);
+    const bad: [string, string, RegExp][] = [
+      ['a solution-style tsconfig', JSON.stringify({ compilerOptions: {}, references: [{ path: './tsconfig.app.json' }] }), /tsconfig\.json selects no file .*references.*tsc -b/],
+      ['files: []', JSON.stringify({ compilerOptions: {}, files: [] }), /tsconfig\.json selects no file/],
+      ['only files in node_modules', JSON.stringify({ compilerOptions: {}, files: ['./node_modules/x/index.d.ts'] }), /tsconfig\.json selects no file/],
+      ['noCheck', JSON.stringify({ compilerOptions: { noCheck: true }, files: ['./src/main.ts'] }), /tsconfig\.json sets noCheck/],
+      ['not JSON', 'Version 5.6.3', /did not print a config pipegen can read/],
+      ['no compilerOptions object', JSON.stringify({ compilerOptions: 'x', files: ['./a.ts'] }), /did not print a config pipegen can read/],
+    ];
+    for (const [why, cfg, re] of bad) {
+      const r = runGuard(cfg);
+      expect(r.status, why).toBe(1);
+      expect(r.err, why).toMatch(re);
+    }
+    // with a real tsc (the worktree's own, if one is installed offline): --showConfig then the guard, on the honest no-op layouts
+    const tsc = join(process.cwd(), 'node_modules', 'typescript', 'bin', 'tsc');
+    if (!existsSync(tsc)) return;
+    const project = (tsconfig: Obj): string => {
+      const d = makeTempDir();
+      mkdirSync(join(d, 'src'));
+      writeFileSync(join(d, 'src', 'main.ts'), 'const n: number = "not a number";\nexport { n };\n');
+      writeFileSync(join(d, 'tsconfig.json'), JSON.stringify(tsconfig));
+      return d;
+    };
+    const chain = (d: string): number => {
+      const cfg = execFileSync(process.execPath, [tsc, '-p', 'tsconfig.json', '--showConfig'], { cwd: d, stdio: 'pipe' }).toString();
+      writeFileSync(join(d, 'cfg.json'), cfg);
+      try { execFileSync(process.execPath, ['-e', guard, join(d, 'cfg.json')], { cwd: d, env: {}, stdio: 'pipe' }); return 0; } catch (e) { return (e as { status: number }).status; }
+    };
+    const opts = { strict: true, module: 'esnext', moduleResolution: 'bundler', target: 'es2022' };
+    expect(chain(project({ compilerOptions: opts, include: ['src'] }))).toBe(0);
+    expect(chain(project({ files: [], references: [{ path: './tsconfig.app.json' }] }))).toBe(1);
+    expect(chain(project({ compilerOptions: { ...opts, noCheck: true }, include: ['src'] }))).toBe(1);
+  });
+
+  it('repo-tool: TypeScript 7 or later (its native binary package) → type-check uncovered with a plain reason', () => {
+    const seven = tsNode({ quality: { ...TS, versions: { typescript: '7.0.2' } } });
+    expect(repoToolFor(typeCheck(), seven)).toBeNull();
+    expect(repoToolProblem(typeCheck(), seven)).toBe("tsc: TypeScript 7 and later run a native binary from a platform package pipegen's lockfile check does not cover yet, so pipegen does not run it (v0.2)");
+    expect(offersOf(seven).uncovered).toContainEqual({ key: 'type-check--app', needId: 'type-check', service: 'app', blocking: true, reason: 'no-repo-tool' });
+    expect(() => assemble(planned(profileOf([seven])))).toThrow(/"type-check" for "app": tsc: TypeScript 7 and later run a native binary/);
+    // 6.x still runs; the audit keeps naming the repo's tsc whatever its version
+    expect(repoToolFor(typeCheck(), tsNode({ quality: { ...TS, versions: { typescript: '6.0.1' } } }))).toEqual({ ...STEP, version: '6.0.1' });
+    expect(chooseTools(typeCheck(), seven, profileOf([seven]), CAPS, REVIEWED).tool).toMatchObject({ kind: 'repo-tool', tool: 'tsc', version: '7.0.2' });
+  });
+
+  it('render: every npm ci pipegen renders passes --git=/usr/bin/git (a repo .npmrc git= never runs)', () => {
+    const a = assemble(planned(profileOf([both()])));
+    const starter = starterTestJob(both(), { reviewed: REVIEWED, platform: p });
+    const runs = [...Object.values({ ...a.push, ...a.merge, ...a.nightly }), starter.job].flatMap((j) => j.steps).map((x) => x.run ?? '').filter((r) => /npm" ci\b/.test(r));
+    // the repository's own install (project scripts, the repo tool, the starter tests) and a checker's closure install
+    expect(runs.some((r) => r.includes('--userconfig'))).toBe(true);
+    expect(runs.filter((r) => !r.includes('--userconfig')).length).toBeGreaterThan(0);
+    for (const r of runs) for (const line of r.split('\n').filter((l) => /npm" ci\b/.test(l))) expect(line).toContain(' --git=/usr/bin/git ');
   });
 });
 

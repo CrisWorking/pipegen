@@ -1453,8 +1453,10 @@ function judgeListedJobs(ex: Expectations, draft: PipelineDraft, expected: reado
     const sources = [...new Set(ex.runs.filter((r) => r.need === e.job && r.owner === e.job && !r.source.endsWith(':base') && r.step.id?.startsWith('pipegen-') !== true).map((r) => r.source))];
     // G2 (B6): the archive scan of a spec and its registry render are one check rendered two ways: either one counts
     const sameCheck = (a: string | undefined, src: string): boolean => a !== undefined && (a === src || a.replace(/:archive$/, '') === src.replace(/:archive$/, ''));
+    // G4b-R1 I1: the check's own FINAL rendered step (the tool run, the project script, the repo tool), not just a shared step of it (the
+    // install): a listed job left with its checkout and install only would pass and the gate would read a check that checked nothing
     for (const src of sources) {
-      if (!holds(e.job).some((x) => sameCheck(x.match?.source, src))) nb(`The job ${show(e.job)} is in the gate's list for the check ${show(e.needId)}, but it holds no step of the check (the rendered ${src.startsWith('script:') ? 'project script' : src.startsWith(`${REPO_TOOL_SOURCE}:`) ? 'repo built-in' : 'tool run'}); the gate would wait on a job that does not run it.`);
+      if (!holds(e.job).some((x) => x.match?.final === true && sameCheck(x.match.source, src))) nb(`The job ${show(e.job)} is in the gate's list for the check ${show(e.needId)}, but it holds no step of the check (the rendered ${src.startsWith('script:') ? 'project script' : src.startsWith(`${REPO_TOOL_SOURCE}:`) ? 'repo built-in' : 'tool run'}); the gate would wait on a job that does not run it.`);
     }
     // 1b. an action check: its action step is in the listed job and in no other job of the file
     for (const entryId of new Set(actionsOf(e.job))) {
@@ -2118,8 +2120,9 @@ function blockingRule(draft: PipelineDraft, ex: Expectations, add: Add, notes: s
       const f = isObj(s) && s.needId === need.id && s.service === need.service ? formatOf(s, si) : undefined;
       return f === undefined ? [] : [f];
     });
-    // G4b: the repo's own tool counts only when it rendered (ex.rendered), the same rule as a reviewed spec
-    const script = draft.profile.services.some((s) => projectScriptFor(need, s) !== null || (repoToolFor(need, s) !== null && ex.rendered.has(`${REPO_TOOL_SOURCE}:${need.id}:${s.name}`)));
+    // G4b-R1 I1: a project script or the repo's own tool counts only when a judged file holds its final step (ex.matched), like a reviewed spec
+    const script = draft.profile.services.some((s) => (projectScriptFor(need, s) !== null && ex.matched.has(`script:${need.id}:${s.name}`))
+      || (repoToolFor(need, s) !== null && ex.rendered.has(`${REPO_TOOL_SOURCE}:${need.id}:${s.name}`) && ex.matched.has(`${REPO_TOOL_SOURCE}:${need.id}:${s.name}`)));
     if (formats.length === 0 && !script && need.layer !== 'pre-commit' && !(category !== undefined && PIPEGEN_JOB_CATEGORIES.has(category))) {
       add(`draft.needs[${i}]`, 'not-gate-readable', `The blocking check ${show(need.id)}${need.service === undefined ? '' : ` for ${show(need.service)}`} has no reviewed tool step, no project script and no repo built-in, so the gate would have nothing to read.`);
       return;

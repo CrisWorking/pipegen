@@ -30,7 +30,7 @@ pg_env=(
   "RUNNER_TEMP=$RUNNER_TEMP"
   "TMPDIR=$RUNNER_TEMP"
 )
-( cd -- "$npmdir" && "${pg_env[@]}" "$nodebin/npm" ci --ignore-scripts --no-audit --no-fund --userconfig "$npmdir/user.npmrc" --globalconfig "$npmdir/global.npmrc" --workspaces=false --registry=https://registry.npmjs.org/ )
+( cd -- "$npmdir" && "${pg_env[@]}" "$nodebin/npm" ci --ignore-scripts --no-audit --no-fund --userconfig "$npmdir/user.npmrc" --globalconfig "$npmdir/global.npmrc" --workspaces=false --git=/usr/bin/git --registry=https://registry.npmjs.org/ )
 for d in services services/api; do
   if [ -L "$d" ] || [ ! -d "$d" ]; then pg_fail "the folder $d is not a real folder inside the repository"; fi
 done

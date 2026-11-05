@@ -33,6 +33,7 @@ import { ARGV_POLICIES, PIP_CLOSURES, PLAIN_REL_RE, RANGE_STEP_ENV, RANGE_TOOL, 
 
 export { sha16 };   // defined in tool-flags.ts (the job rules need it too); re-exported for the callers that import it from here
 import { EXTRA_RULES_AT, tuningEffects, type TuningEffects } from './tuning.js';
+import { REPO_TOOL_BELOW_MAJOR } from './reviewed.js';
 import type { InstallSpec, ReviewedTool, Service, StepSpec } from '../types.js';
 
 /** Test and internal hooks: the argv policies and the pip closures the renderer reads (production passes neither). */
@@ -1032,10 +1033,14 @@ function imageOf(tool: ReviewedTool, install: InstallSpec): string {
 // the gate's checker is. A tool that RUNS REPO CODE (vitest, c8) needs the repo's own dependency tree; its result is only as
 // trustworthy as the repo code it runs anyway. It gets a static check of the lockfile entries of the tool and its plugins
 // BEFORE `npm ci`, the registry on the command line, a verification afterwards, and node directly (no npx). KNOWN LIMIT:
-// for that class the transitive dependencies, and the repo's own .npmrc, stay repo-controlled.
+// for that class the transitive dependencies, and the repo's own .npmrc, stay repo-controlled. Every npm ci pipegen renders
+// passes `--git=/usr/bin/git` (G4b-R1 m1): a repo .npmrc `git=./x.sh` would otherwise run x.sh for a git dependency during
+// the install, scripts off or not (NPM_CI_GIT).
 
 const NPM_VERSION_RE = /^\d{1,9}\.\d{1,9}\.\d{1,9}(?:-[0-9A-Za-z.-]{1,40})?$/;
 const REGISTRY_URL = 'https://registry.npmjs.org/';
+/** G4b-R1 m1: the git npm runs for a git dependency, on the command line so a repo .npmrc `git=` can't name a repo file. */
+const NPM_CI_GIT = '--git=/usr/bin/git';
 const MAX_LOCK_BYTES = 120 * 1024;
 
 /** The registry tarball of a package version: the only `resolved` value a pin may have. */
@@ -1146,7 +1151,7 @@ function checkerInstall(tool: ReviewedTool, pins: readonly (NpmPin & { resolved:
     ': > "$npmdir/user.npmrc"',
     ': > "$npmdir/global.npmrc"',
     ...allowlist(`$nodebin:${FIXED_PATH}`, []),
-    `( cd -- "$npmdir" && "\${pg_env[@]}" "$nodebin/npm" ci --ignore-scripts --no-audit --no-fund --userconfig "$npmdir/user.npmrc" --globalconfig "$npmdir/global.npmrc" --workspaces=false --registry=${REGISTRY_URL} )`,
+    `( cd -- "$npmdir" && "\${pg_env[@]}" "$nodebin/npm" ci --ignore-scripts --no-audit --no-fund --userconfig "$npmdir/user.npmrc" --globalconfig "$npmdir/global.npmrc" --workspaces=false ${NPM_CI_GIT} --registry=${REGISTRY_URL} )`,
   ];
   return { lines, env: { PIPEGEN_NPM_LOCK: compact, PIPEGEN_NPM_PACKAGE: pkg } };
 }
@@ -1167,7 +1172,7 @@ function repoInstall(pins: readonly (NpmPin & { resolved: string })[], artifact:
     ...common,
     `js=${q(NPM_PRECHECK_JS)}`,
     '"${pg_env[@]}" "PIPEGEN_NPM_EXPECT=$PIPEGEN_NPM_EXPECT" "$nodebin/node" -e "$js"',
-    `"\${pg_env[@]}" "$nodebin/npm" ci --ignore-scripts --no-audit --no-fund --workspaces=false --registry=${REGISTRY_URL}`,
+    `"\${pg_env[@]}" "$nodebin/npm" ci --ignore-scripts --no-audit --no-fund --workspaces=false ${NPM_CI_GIT} --registry=${REGISTRY_URL}`,
     'mkdir -p "$RUNNER_TEMP/pipegen-npm-ci"',
     `: > "${marker}"`,
   ]), expect, `pipegen-npm-ci-${hash}`);
@@ -1200,25 +1205,35 @@ export function projectScriptSteps(artifact: string, which: 'test' | 'lint', nod
 // ---------- the repo's own tools (G4b, DECISIONS #95) ----------
 
 /**
- * The repo tools pipegen runs, each from its own package folder by a fixed path with fixed arguments (no AI value, no repo text): the
- * repository's tsconfig decides what is checked and how strictly (the developers' own check), `--noEmit` keeps tsc from writing anything.
+ * The repo tools pipegen runs, each from its own package folder by a fixed path with fixed arguments (no AI value, no repo text). tsc
+ * always reads the service's own `config` (`-p`, never a parent's, G4b-R1 m3); that config decides what is checked and how strictly (the
+ * developers' own check), and `--noEmit` keeps tsc from writing anything. `belowMajor`: the first major the lockfile check refuses
+ * (TypeScript 7 runs a native binary from a platform package the check does not cover, G4b-R1 m2; reviewed.ts REPO_TOOL_BELOW_MAJOR).
  */
-export const REPO_TOOLS: Readonly<Record<string, { package: string; bin: string; args: readonly string[] }>> = Object.freeze({
-  tsc: Object.freeze({ package: 'typescript', bin: 'bin/tsc', args: Object.freeze(['--noEmit']) }),
+export const REPO_TOOLS: Readonly<Record<string, { package: string; bin: string; config: string; args: readonly string[]; belowMajor: number }>> = Object.freeze({
+  tsc: Object.freeze({ package: 'typescript', bin: 'bin/tsc', config: 'tsconfig.json', args: Object.freeze(['--noEmit']), belowMajor: REPO_TOOL_BELOW_MAJOR.tsc as number }),
 });
+
+/** A REPO_TOOLS entry, or a refusal. */
+function repoTool(tool: string): (typeof REPO_TOOLS)[string] {
+  const t = own(REPO_TOOLS, tool);
+  if (t === undefined) return refuse(`${show(tool)} is not a repo tool pipegen runs.`);
+  if (!isNpmName(t.package) || !/^[a-z0-9][a-z0-9._-]{0,40}(?:\/[a-z0-9][a-z0-9._-]{0,40}){0,3}$/i.test(t.bin) || !FILE_NAME_RE.test(t.config)) return refuse('The repo tool is not a plain package with a plain bin path and config file.');
+  return t;
+}
 
 /**
  * The run-time check before a repo tool runs (G4b): `package-lock.json` is a lockfile of version 2 or later whose entry for the package is
- * a plain registry package at an exact version (the registry tarball, a sha512 integrity, no link, no bundle); the installed package is a
- * real folder inside a real node_modules, at that version, installed from that tarball (npm ci's own record, node_modules/.package-lock.json);
- * its bin is a regular file inside it. The version is read when the job runs, never written into the step, so a lockfile bump keeps working.
- * `pkg` and `bin` come from REPO_TOOLS only.
+ * a plain registry package at an exact version below the tool's `belowMajor` (the registry tarball, a sha512 integrity, no link, no bundle);
+ * the installed package is a real folder inside a real node_modules, at that version, installed from that tarball (npm ci's own record,
+ * node_modules/.package-lock.json); its bin is a regular file inside it. The version is read when the job runs, never written into the
+ * step, so a lockfile bump keeps working. This is drift protection, not a guard against hostile repo code (the job holds nothing).
  */
-export function repoToolCheckJs(pkg: string, bin: string): string {
-  if (!isNpmName(pkg) || !/^[a-z0-9][a-z0-9._-]{0,40}(?:\/[a-z0-9][a-z0-9._-]{0,40}){0,3}$/i.test(bin)) return refuse('The repo tool is not a plain package with a plain bin path.');
+export function repoToolCheckJs(tool: string): string {
+  const { package: pkg, bin, belowMajor } = repoTool(tool);
   return [
     'const fs = require("fs"), path = require("path");',
-    `const name = ${JSON.stringify(pkg)}, bin = ${JSON.stringify(bin)};`,
+    `const name = ${JSON.stringify(pkg)}, bin = ${JSON.stringify(bin)}, below = ${String(belowMajor)};`,
     'const fail = (m) => { console.error("pipegen: " + m); process.exit(1); };',
     'const lstat = (f) => { try { return fs.lstatSync(f); } catch (e) { return null; } };',
     'const json = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch (e) { return null; } };',
@@ -1226,6 +1241,7 @@ export function repoToolCheckJs(pkg: string, bin: string): string {
     'if (!lock || typeof lock !== "object" || !(lock.lockfileVersion >= 2) || !lock.packages || typeof lock.packages !== "object") fail("package-lock.json is not a lockfile of version 2 or later");',
     'const p = lock.packages["node_modules/" + name];',
     'if (!p || typeof p !== "object" || p.link || p.inBundle || typeof p.version !== "string" || !/^[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z.-]{1,40})?$/.test(p.version)) fail(name + " is not a plain package at an exact version in package-lock.json");',
+    'if (Number(p.version.split(".")[0]) >= below) fail(name + " " + p.version + " runs a native binary from a platform package pipegen does not check yet; pipegen runs " + name + " below " + below + ".0.0 only");',
     `const tarball = ${JSON.stringify(REGISTRY_URL)} + name + "/-/" + name.slice(name.indexOf("/") + 1) + "-" + p.version + ".tgz";`,
     'if (p.resolved !== tarball || typeof p.integrity !== "string" || !/^sha512-[A-Za-z0-9+/]{86}==$/.test(p.integrity)) fail(name + " in package-lock.json is not the registry tarball with a sha512 integrity");',
     'const top = lstat("node_modules");',
@@ -1248,23 +1264,48 @@ export function repoToolCheckJs(pkg: string, bin: string): string {
 }
 
 /**
+ * G4b-R1 I3: the check of what `tsc -p tsconfig.json --showConfig` printed (the file named by the first argument), before tsc runs: the
+ * config selects at least one file outside node_modules, and `noCheck` is not on. Without it a solution-style tsconfig (`files: []` plus
+ * `references`, as create-vite and many monorepos write it) or `noCheck: true` makes `tsc --noEmit` exit 0 on a type error: a blocking
+ * check that checks nothing. Constant (no repo text); tsc itself resolves `extends`.
+ */
+export function tsconfigGuardJs(): string {
+  return [
+    'const fs = require("fs");',
+    'const fail = (m) => { console.error("pipegen: " + m); process.exit(1); };',
+    'let c = null;',
+    'try { c = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch (e) { c = null; }',
+    'if (!c || typeof c !== "object" || Array.isArray(c) || (c.compilerOptions !== undefined && (typeof c.compilerOptions !== "object" || c.compilerOptions === null || Array.isArray(c.compilerOptions)))) fail("tsc --showConfig did not print a config pipegen can read");',
+    'if ((c.compilerOptions || {}).noCheck === true) fail("tsconfig.json sets noCheck, so tsc would check no types; turn it off for the type check");',
+    'const files = (Array.isArray(c.files) ? c.files : []).filter((f) => typeof f === "string" && !/(^|[\\/])node_modules[\\/]/.test(f));',
+    'if (files.length === 0) fail("tsconfig.json selects no file" + (Array.isArray(c.references) && c.references.length > 0 ? " (a solution-style tsconfig with references)" : "") + "; pipegen runs tsc -p tsconfig.json --noEmit, not tsc -b, so it would check nothing: point tsconfig.json at your source files");',
+    'process.exit(0);',
+  ].join('\n');
+}
+
+/**
  * The steps of a repo tool (G4b): the guarded repo `npm ci --ignore-scripts` (shared with the project scripts and the repo-code tools: same
- * id, run and marker, so a job installs once), then ONE repo-code step (`repocode-…` id): the install marker, the lockfile check
- * (repoToolCheckJs) and the tool from its package folder, under the env -i allowlist, so nothing runs between the check and the tool.
- * `workingDir` is the already-checked service folder.
+ * id, run and marker, so a job installs once), then ONE repo-code step (`repocode-…` id), under the env -i allowlist: the install marker,
+ * the lockfile check (repoToolCheckJs), the service's own tsconfig.json (a regular file, no link), `tsc -p tsconfig.json --showConfig`
+ * and its guard (tsconfigGuardJs), then `tsc -p tsconfig.json --noEmit`. `workingDir` is the already-checked service folder.
  */
 export function repoToolSteps(artifact: string, tool: string, nodeMajor: string, workingDir: string | undefined): RenderedStep[] {
-  const t = own(REPO_TOOLS, tool);
-  if (t === undefined) return refuse(`${show(tool)} is not a repo tool pipegen runs.`);
+  const t = repoTool(tool);
   const ci = repoInstall([], artifact, nodeMajor, workingDir)[0] as RenderedStep;
   const { marker } = installMarker(workingDir);
+  const launch = `"\${pg_env[@]}" "$nodebin/node" node_modules/${t.package}/${t.bin} -p ${t.config}`;
   const run = script([
     ...prologue(artifact, { nodeMajor }), ...cdLines(workingDir),
     ...allowlist(`$nodebin:${FIXED_PATH}`, []),
     `[ -f "${marker}" ] && [ ! -L "${marker}" ] || pg_fail "the dependencies were not installed by pipegen's own npm ci step"`,
-    `js=${q(repoToolCheckJs(t.package, t.bin))}`,
+    `js=${q(repoToolCheckJs(tool))}`,
     '"${pg_env[@]}" "$nodebin/node" -e "$js"',
-    `"\${pg_env[@]}" "$nodebin/node" node_modules/${t.package}/${t.bin} ${t.args.join(' ')}`,
+    `[ -f ${t.config} ] && [ ! -L ${t.config} ] || pg_fail "the service has no ${t.config} of its own (a regular file, not a link), so ${tool} would check nothing or another project"`,
+    `cfg="$("\${sys[@]}" mktemp "$RUNNER_TEMP/pipegen-tsconfig.XXXXXX")"`,
+    `${launch} --showConfig > "$cfg" || pg_fail "${tool} could not read ${t.config}"`,
+    `guard=${q(tsconfigGuardJs())}`,
+    '"${pg_env[@]}" "$nodebin/node" -e "$guard" "$cfg"',
+    `${launch} ${t.args.join(' ')}`,
   ]);
   return [ci, runStep(`pipegen: run the repository's own ${tool} (its lockfile version)`, run, {}, `repocode-${sha16(`repo-tool:${artifact}:${tool}`)}`)];
 }

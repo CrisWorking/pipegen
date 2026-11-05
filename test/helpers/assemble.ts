@@ -1,6 +1,6 @@
 // Shared fixtures for the G4 assemble tests (test/jobs.test.ts, test/jobs-dast.test.ts): a node service and profile, the debate's result as
 // code builds it (the first offered tool per key), assembleJobs over it, the simplest file layout (G5 owns the real one) and the referee.
-import { Document, parse } from 'yaml';
+import { Document, parseDocument, Scalar, YAMLMap, YAMLSeq } from 'yaml';
 import { keyOffers, specFor } from '../../src/debate/builder.js';
 import { floorNeeds } from '../../src/engine/needs.js';
 import { referee, type RefereeReport } from '../../src/engine/referee.js';
@@ -70,12 +70,31 @@ export const files = (a: AssembledJobs): CreatedFile[] => [
 export const judge = (fs: CreatedFile[], d: PipelineDraft): Promise<RefereeReport> => referee(fs, d, p, REVIEWED, LINTERS, 'tok', { runLinters: async () => [] });
 export const shown = (r: RefereeReport): string => r.issues.map((i) => `${i.check}: ${i.message}`).join('\n');
 export const allJobs = (a: AssembledJobs): [string, Job][] => [...Object.entries(a.push), ...Object.entries(a.merge), ...Object.entries(a.nightly)];
-/** A file with one job's steps changed (a hand edit). */
+const NEEDS_QUOTES = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]|\$\{\{|^\s|\s$|\s#|:\s|^[-?:,[\]{}#&*!|>'"%@`]/;
+/** A string scalar the way stepsToYaml writes it (render-step.ts str), but with no check: a hand edit may be hostile. */
+function str(value: string, block = false): Scalar {
+  const s = new Scalar(value);
+  if (block && value.includes('\n') && !/[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029]|\s\n|^\s/.test(value)) s.type = Scalar.BLOCK_LITERAL;
+  else if (NEEDS_QUOTES.test(value)) s.type = Scalar.QUOTE_DOUBLE;
+  return s;
+}
+/** Any value as a YAML node, strings quoted like stepsToYaml's, `run` as a block. */
+function yamlNode(doc: Document, v: unknown, key?: string): unknown {
+  if (typeof v === 'string') return str(v, key === 'run');
+  if (Array.isArray(v)) { const seq = new YAMLSeq(); for (const x of v) seq.add(yamlNode(doc, x)); return seq; }
+  if (v !== null && typeof v === 'object') { const map = new YAMLMap(); for (const [k, x] of Object.entries(v)) map.set(new Scalar(k), yamlNode(doc, x, k)); return map; }
+  return doc.createNode(v);
+}
+/**
+ * A file with one job changed (a hand edit). Only that job is written again, every other node of the file stays as it was, and its strings
+ * are quoted the way stepsToYaml quotes them, so an edit that changes nothing gives a file the referee accepts (G4b-R1 I2: a plain
+ * re-serialisation folded the checker lock env onto lines the secret-value scan reads, so every edited file was refused whatever the edit).
+ */
 export function editJob(f: CreatedFile, id: string, edit: (j: Obj) => void): CreatedFile {
-  const js = parse(f.content) as Obj;
+  const doc = parseDocument(f.content);
+  const js = doc.toJS() as Obj;
   edit(js.jobs[id]);
-  const doc = new Document();
-  doc.contents = doc.createNode(js);
+  doc.setIn(['jobs', id], yamlNode(doc, js.jobs[id]));
   return { ...f, content: doc.toString({ lineWidth: 0 }) };
 }
 export const domainsOf = (j: Job): string[] => String(j.steps[0]?.with?.['allowed-domains'] ?? '').split('\n');

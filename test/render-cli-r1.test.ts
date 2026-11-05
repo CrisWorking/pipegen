@@ -113,7 +113,7 @@ describe('R-A: npm checkers install from pipegen\'s closure lock (DECISIONS #107
     expect(install.run).toContain('mkdir "$npmdir"');
     expect(install.run).toContain("printf '%s' \"$PIPEGEN_NPM_LOCK\" > \"$npmdir/package-lock.json\"");
     expect(install.run).toContain('cd -- "$npmdir"');
-    expect(install.run).toContain('ci --ignore-scripts --no-audit --no-fund --userconfig "$npmdir/user.npmrc" --globalconfig "$npmdir/global.npmrc" --workspaces=false --registry=https://registry.npmjs.org/');
+    expect(install.run).toContain('ci --ignore-scripts --no-audit --no-fund --userconfig "$npmdir/user.npmrc" --globalconfig "$npmdir/global.npmrc" --workspaces=false --git=/usr/bin/git --registry=https://registry.npmjs.org/');
     expect(install.run).toContain(': > "$npmdir/.npmrc"');
   });
 

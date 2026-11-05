@@ -687,20 +687,30 @@ export function renderProjectScript(step: ProjectScriptStep, platform: PlatformA
     throw new RenderError(`${svc.packageManager} is not supported yet: pipegen runs project scripts with npm only.`);
   }
   if (svc.language !== 'node') throw new RenderError(`The service ${show(svc.name)} is not a Node project; its scripts are not supported yet.`);
+  const b = repoCodeBase(svc, step.workingDir, step.needId, platform);
+  return { steps: [...b.prelude, ...projectScriptSteps(b.artifact, step.script, b.nodeMajor, b.workingDir)], output: null };
+}
+
+/**
+ * What a project script and a repo tool share (G4b-R1 m5): the folder must be the service's own plain path, the result artifact name, and
+ * the prelude's checkout and Node setup, found by what they are (their actions), never by their place in the prelude (G4 review m6).
+ */
+function repoCodeBase(svc: Service, workingDir: string | undefined, needId: string, platform: PlatformActions): { prelude: RenderedStep[]; nodeMajor: string; artifact: string; workingDir: string | undefined } {
   const expected = svc.path === '' || svc.path === '.' ? undefined : svc.path;
-  if (step.workingDir !== expected || (expected !== undefined && !PLAIN_REL_RE.test(expected))) throw new RenderError(`The folder ${show(step.workingDir)} is not the plain folder of the service ${show(svc.name)}.`);
+  if (workingDir !== expected || (expected !== undefined && !PLAIN_REL_RE.test(expected))) throw new RenderError(`The folder ${show(workingDir)} is not the plain folder of the service ${show(svc.name)}.`);
   let artifact: string;
   try {
-    artifact = resultArtifactName(step.needId, svc.name);
+    artifact = resultArtifactName(needId, svc.name);
   } catch (e) {
     if (e instanceof ArtifactNameError) throw new RenderError(e.message);
     throw e;
   }
   const prelude = renderJobPrelude({ node: { runtimeVersion: svc.runtimeVersion } }, platform).steps;
-  const setup = prelude[1] as RenderedStep;
-  const nodeMajor = setup.with?.['node-version'];
-  if (nodeMajor === undefined || !/^\d{1,3}$/.test(nodeMajor)) throw new RenderError('The Node setup step has no plain node-version.');
-  return { steps: [{ ...(prelude[0] as RenderedStep), id: 'pipegen-checkout' }, { ...setup, id: `pipegen-setup-node-${nodeMajor}` }, ...projectScriptSteps(artifact, step.script, nodeMajor, expected)], output: null };
+  const checkout = prelude.find((s) => s.uses?.startsWith(`${PLATFORM_USES.checkout}@`) === true);
+  const setup = prelude.find((s) => s.uses?.startsWith(`${PLATFORM_USES['setup-node']}@`) === true);
+  const nodeMajor = setup?.with?.['node-version'];
+  if (checkout === undefined || setup === undefined || nodeMajor === undefined || !/^\d{1,3}$/.test(nodeMajor)) throw new RenderError('The job prelude has no checkout or no Node setup step with a plain node-version.');
+  return { prelude: [{ ...checkout, id: 'pipegen-checkout' }, { ...setup, id: `pipegen-setup-node-${nodeMajor}` }], nodeMajor, artifact, workingDir: expected };
 }
 
 /**
@@ -715,22 +725,8 @@ export function renderRepoTool(step: RepoToolStep, platform: PlatformActions, ct
   const want = repoToolFor({ id: step.needId, service: svc.name }, svc);
   if (want === null || !isDeepStrictEqual({ ...step }, want)) throw new RenderError(`The step for ${show(step.needId)} of ${show(svc.name)} is not the repository's own tool at its lockfile version, so pipegen does not run it.`);
   if (svc.language !== 'node' || svc.packageManager !== 'npm') throw new RenderError(`The service ${show(svc.name)} is not an npm project; pipegen runs its own tools with npm only.`);
-  const expected = svc.path === '' || svc.path === '.' ? undefined : svc.path;
-  if (want.workingDir !== expected || (expected !== undefined && !PLAIN_REL_RE.test(expected))) throw new RenderError(`The folder ${show(want.workingDir)} is not the plain folder of the service ${show(svc.name)}.`);
-  let artifact: string;
-  try {
-    artifact = resultArtifactName(want.needId, svc.name);
-  } catch (e) {
-    if (e instanceof ArtifactNameError) throw new RenderError(e.message);
-    throw e;
-  }
-  const prelude = renderJobPrelude({ node: { runtimeVersion: svc.runtimeVersion } }, platform).steps;
-  // the checkout and the Node setup by what they are (their actions), never by their place in the prelude
-  const checkout = prelude.find((s) => s.uses?.startsWith(`${PLATFORM_USES.checkout}@`) === true);
-  const setup = prelude.find((s) => s.uses?.startsWith(`${PLATFORM_USES['setup-node']}@`) === true);
-  const nodeMajor = setup?.with?.['node-version'];
-  if (checkout === undefined || setup === undefined || nodeMajor === undefined || !/^\d{1,3}$/.test(nodeMajor)) throw new RenderError('The job prelude has no checkout or no Node setup step with a plain node-version.');
-  return { steps: [{ ...checkout, id: 'pipegen-checkout' }, { ...setup, id: `pipegen-setup-node-${nodeMajor}` }, ...repoToolSteps(artifact, want.tool, nodeMajor, expected)], output: null };
+  const b = repoCodeBase(svc, want.workingDir, want.needId, platform);
+  return { steps: [...b.prelude, ...repoToolSteps(b.artifact, want.tool, b.nodeMajor, b.workingDir)], output: null };
 }
 
 // ---------- the compose steps (D4, ruling B6) ----------
