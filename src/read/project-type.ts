@@ -579,7 +579,7 @@ export async function untrackedIgnoredOf(dir: string): Promise<(rel: string) => 
  * service has a Dockerfile (so a click can't drop its image scans). `service: null` names the repo's only service. Returns a new profile; throws
  * an Error with a plain-English message for an unknown name, a bare type on a repo with several services, or one service named twice.
  */
-export function applyTypeOverrides(p: RepoProfile, o: readonly TypeOverride[]): RepoProfile {
+export function applyTypeOverrides<P extends Pick<RepoProfile, 'services'>>(p: P, o: readonly TypeOverride[]): P {
   if (o.length === 0) return p;
   const chosen = new Map<number, ServiceType>();
   for (const { service, type } of o) {

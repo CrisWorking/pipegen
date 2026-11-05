@@ -260,12 +260,16 @@ describe('pipegen inspect', () => {
     expect(lines.join('\n')).toContain('express-app');
   });
 
-  it('cli: --help and no command print the usage (exit 0); an unknown command exits 1', async () => {
-    for (const argv of [['--help'], []]) {
-      const { code, out } = await inspect(makeTempDir(), {}, {}, argv);
-      expect(code).toBe(0);
-      expect(out).toContain('pipegen inspect');
-    }
+  it('cli: --help prints the usage; no command runs the audit of .; an unknown command exits 1', async () => {
+    const help = await inspect(makeTempDir(), {}, {}, ['--help']);
+    expect(help.code).toBe(0);
+    expect(help.out).toContain('pipegen inspect');
+    expect(help.out).toContain('npx pipegen');
+    // no command (DECISIONS #124): `pipegen audit` on the current folder, not the usage
+    const none = await inspect(makeTempDir(), {}, {}, []);
+    expect(none.code).toBe(1);
+    expect(none.out).not.toContain('Usage: pipegen');
+    expect(none.err).toContain('pipegen audit needs a clone of a GitHub repository');
     const bad = await inspect(makeTempDir(), {}, {}, ['frobnicate\x1b[2J']);
     expect(bad.code).toBe(1);
     expect(bad.err).toContain('Unknown command');
