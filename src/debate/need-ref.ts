@@ -12,6 +12,7 @@ export class NeedKeyError extends Error {}
 
 const COLLISION = "Two services have names that give the same id once cleaned, so pipegen can't tell their checks apart. Rename one of them.";
 const NO_KEY = 'A service name has no letters or digits, so pipegen has no id for its checks. Rename it.';
+const SAME_NAME = "Two services have the same name, so pipegen can't tell their checks apart. Rename one of them.";
 
 /** The need key of a need: its job id (need id, then `--` and the service slug). Throws NeedKeyError when the name has no slug. */
 export function needKeyOf(n: Pick<Need, 'id' | 'service'>): string {
@@ -47,10 +48,14 @@ export interface NeedRef {
 
 /**
  * The needs grouped by need key, in the order of first appearance. `p` and `knownValues` decide `offered` exactly as the
- * profile summary decides which service names it shows. Throws NeedKeyError when two pairs share a key or a service name
- * has no key; the message holds no repo text.
+ * profile summary decides which service names it shows. Throws NeedKeyError when two services have the same name, two pairs
+ * share a key or a service name has no key; the message holds no repo text.
  */
 export function needRefs(needs: readonly Need[], p: RepoProfile, knownValues: readonly string[] = []): NeedRef[] {
+  // F0 review m3 (ruling F0-R1): two services with the exact same name would share every key and be merged silently; refused.
+  // The reader makes names unique today (read/project.ts uniqueServiceNames); this does not rely on it.
+  const names = p.services.map((s) => s.name);
+  if (new Set(names).size !== names.length) throw new NeedKeyError(SAME_NAME);
   const shown = new Set(promptServiceNames(p, knownValues));
   const byKey = new Map<string, NeedRef>();
   for (const n of needs) {

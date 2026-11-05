@@ -1,0 +1,557 @@
+// The builder (v0.2 Plan F, F2; plan Task 1, builder half). For every need key the AI may see, the builder AI picks one REVIEWED
+// tool from the candidates offered for that key and says why ("X instead of Y, because Z"). Unreviewed finds that passed the
+// quality bar can only become suggestions: mention-only, never a step (spec §6, §19). This is where AI output becomes a pipeline
+// step, so (threats T1, T4, T22):
+// - What is offered is decided by code (rulings B2, S9, S20). A candidate is offered for a key only when the reviewed list has an
+//   entry with its id that reviewedFor(…, 'full') gives for the need (category, language, at least one proof), that entry is
+//   reviewed, and, for a blocking key, it is not an advisory-only tool. Needs pipegen's own jobs or the project's own scripts
+//   cover, and needs whose check has no reviewed entry at all, never reach the AI (`byCode`); a need with nothing offered is
+//   `uncovered`, never guessed and never filled from the audit list. A key the AI may not see (ruling B1) is decided by code.
+// - Every id the AI returns is an enum in the schema and is checked again by code against what was offered for THAT key
+//   (Review Focus 1, ruling S3). An id that wasn't offered refuses the whole answer; the AI is asked once more with pipegen's
+//   own problem lines; a second bad answer is a BuilderError. Nothing of a refused answer is used.
+// - The step is built by code from the reviewed entry (ruling S2): the tool is the entry's own candidate (never the map's
+//   Candidate object), the output is the template's, and needId, service and workingDir come from the need. The AI fills only
+//   the entry's open choices (aiChoiceNames, minus the ones code fills) and the tuning enums. A coverage minimum is filled by
+//   code (Plan D I4), and a choice that would narrow a scanner is never the AI's (DECISIONS #108; report ruling F2-R2).
+//   validateSpec must pass; its problems go into the one repair round; tuning still wrong after it is dropped.
+// - Prompts (ruling S6): the bundle only through bundleText (first call and its repair), the enum-only profile summary, and the
+//   offered needs and tools built from enums and reviewed-list data, all scrubbed with promptText. A need's `why` (AI text from
+//   planNeeds or the judge) never goes in: pipegen's own needWhy does. Every request sets maxOutputTokens and timeoutMs.
+// - reason and suggestion why go through cleanForDoc (Plan F F1): the reason is built by code from enum ids plus the cleaned
+//   "because", so it is fit for PIPEGEN.md as it is (ruling S5: never escaped again).
+import { z } from 'zod';
+import { AiError, count } from '../ai/errors.js';
+import { BUILDER_INSTRUCTIONS, BUILDER_NEEDS_TAG, BUILDER_SUGGESTIONS_TAG, BUILDER_SYSTEM, builderRepairText } from '../ai/prompts/builder.js';
+import { completeValidated } from '../ai/provider.js';
+import { bundleText, type CodeBundle } from '../ai/redact.js';
+import { aiSchema, type AiSchema } from '../ai/schema.js';
+import { aiChoiceNames } from '../create/coverage.js';
+import { needLanguage, toSuggestions } from '../engine/discover.js';
+import { PIPEGEN_JOB_CATEGORIES } from '../engine/gate-job-list.js';
+import { isReviewed } from '../engine/job-rules.js';
+import { NEED_ID_CATEGORY, toolCoversNeed } from '../engine/need-ids.js';
+import { needWhy, promptProfile, promptText } from '../engine/needs.js';
+import type { QualityBar } from '../engine/quality-bar.js';
+import { validateSpec } from '../engine/render-step.js';
+import { projectScriptFor, reviewedFor } from '../engine/reviewed.js';
+import { COVERAGE_MINIMUMS } from '../engine/tool-flags.js';
+import { TUNING_OPTIONS, tuningEnums } from '../engine/tuning.js';
+import { safeMarkdown, safeText } from '../util/safe-text.js';
+import {
+  NEED_CATEGORIES, type AiProvider, type AiRequest, type AiUsage, type Candidate, type Capabilities, type Need, type PipelineDraft, type RepoProfile,
+  type ReviewedCandidate, type ReviewedTool, type StepChoices, type StepSpec, type TuningPicks,
+} from '../types.js';
+import { cleanForDoc } from './clean.js';
+import { needRefs, type NeedRef } from './need-ref.js';
+
+// ---------- limits ----------
+
+/** The most output (thinking included) one builder request may produce. */
+export const BUILDER_MAX_OUTPUT_TOKENS = 32_000;
+/** How long one builder request may take. */
+export const BUILDER_TIMEOUT_MS = 180_000;
+/** Tools that may only warn (Plan C minor 7, ruling S9): offered only for needs with `blocking: false`. */
+export const ADVISORY_TOOLS: ReadonlySet<string> = new Set(['nuclei', 'jscpd', 'scorecard-action']);
+/** The most unreviewed tools offered to the AI as possible suggestions. */
+export const MAX_OFFERED_SUGGESTIONS = 20;
+/** The cap of a suggestion's `why` (ruling S4). */
+export const SUGGESTION_WHY_MAX = 200;
+/** The cap of the cleaned "because" in a reason. */
+export const BECAUSE_MAX = 300;
+/** The most characters of AI text the schema accepts per free-text field (the cleaner cuts further). */
+const AI_TEXT_MAX = 2_000;
+/** The most problem lines one repair request carries. */
+const MAX_REPAIR_PROBLEMS = 40;
+/** The most other tools a reason names after "instead of". */
+const MAX_REASON_ALTERNATIVES = 3;
+
+// ---------- types ----------
+
+/** One pick: the step for one need key (every layer of its (need id, service) pair, ruling B1). */
+export interface Choice {
+  /** The need key (needKeyOf): `<need id>` or `<need id>--<service slug>`. */
+  key: string;
+  needId: string;
+  /** Built by code from the reviewed entry; only `choices` holds AI picks. */
+  chosen: StepSpec;
+  /** Ruling S22: offered reviewed candidates only, the chosen one first, then the AI's order, no repeats. Plan G builds the fix loop's next tool from ranked[1…]. */
+  ranked: ReviewedCandidate[];
+  /** "X instead of Y, because Z": X and Y are reviewed ids, Z is cleanForDoc text. Fit for PIPEGEN.md as it is (never escaped again). */
+  reason: string;
+  /** Who picked: the AI, or pipegen's code for a key the AI may not see (ruling B1). */
+  by: 'ai' | 'pipegen';
+}
+
+/** A mention-only tool (PipelineDraft.suggestions): name and repo from the candidate record, only `why` from the AI (cleaned). Never run. */
+export type Suggestion = PipelineDraft['suggestions'][number];
+
+/** Why code, not the AI, covers a need (ruling S20). */
+export type ByCodeKind = 'pipegen-job' | 'project-script' | 'no-reviewed-tool';
+export interface ByCode { key: string; needId: string; service?: string; kind: ByCodeKind }
+/** A need with no offered reviewed candidate (ruling S20): never guessed, never filled in audit mode. */
+export interface Uncovered { key: string; needId: string; service?: string; blocking: boolean }
+
+/** What the builder needs besides the needs and the AI (ruling B2; `caps` for the profile summary, see the F2 report). */
+export interface BuilderDeps {
+  reviewed: readonly ReviewedTool[];
+  bar: QualityBar;
+  now: Date;
+  caps: Capabilities;
+  /** Values the user typed: scrubbed from every prompt part, and a key or tuning value holding one is never offered. */
+  knownValues?: readonly string[];
+}
+
+/** One reviewed tool offered for one key, with what the AI may set on it. */
+export interface Offer {
+  entry: ReviewedTool;
+  /** Choice name → the values the AI may pick (two or more). */
+  aiChoices: Readonly<Record<string, readonly string[]>>;
+  /** Choice name → the value code fills (a coverage minimum, a choice narrowed to one value). */
+  codeChoices: Readonly<Record<string, string>>;
+  /** Tuning option → the values offered for this key (empty options left out; each value unchanged by promptText). */
+  tuning: Readonly<Record<string, readonly string[]>>;
+}
+
+/** An unreviewed tool the AI may name as a suggestion, under an opaque id (`s1`, …). */
+export interface SuggestionOffer { id: string; suggestion: Suggestion; categories: string[] }
+
+/** Everything code decides before the AI is asked (exported for the judge and the debate, F3/F4). */
+export interface BuilderOffers {
+  refs: NeedRef[];
+  /** Need key → the offered tools, in the candidates map's order. Only keys with at least one. */
+  offers: Map<string, Offer[]>;
+  /** The keys the AI is asked about (the schema's need enum), in need order. */
+  aiKeys: string[];
+  /** Keys with offers that the AI may not see (ruling B1): decided by code. */
+  codeKeys: string[];
+  byCode: ByCode[];
+  uncovered: Uncovered[];
+  suggestions: SuggestionOffer[];
+}
+
+export interface BuildResult { choices: Choice[]; suggestions: Suggestion[]; byCode: ByCode[]; uncovered: Uncovered[]; usage: AiUsage }
+
+/** The AI's answer, as the schema gives it. */
+export interface BuilderAnswer {
+  choices: { key: string; candidateId: string; ranked: string[]; because: string; choices: Record<string, string | null>; tuning: Record<string, string[] | null> }[];
+  suggestions: { id: string | null; why: string }[];
+}
+
+/** The builder AI gave a bad answer twice (ruling S3), or a step it picked can't be built. The run stops (Plan G); nothing is used. */
+export class BuilderError extends Error {
+  constructor(message: string, readonly problems: readonly string[], readonly usage?: AiUsage) {
+    super(message);
+    this.name = 'BuilderError';
+  }
+}
+
+// ---------- what may be offered ----------
+
+/**
+ * Choices that would narrow a scanner if the AI picked them (DECISIONS #108: no ignore-unfixed, no severity above the gate's
+ * high floor; image-build never pushes in a check). Only these values stay; one left → code fills it; none → the tool is not offered.
+ */
+const NARROWED: Readonly<Record<string, (v: string) => boolean>> = {
+  'ignore-unfixed': (v) => v === 'false',
+  severity: (v) => { const s = v.split(','); return s.includes('HIGH') && s.includes('CRITICAL'); },
+  push: (v) => v === 'false',
+};
+
+const sameList = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
+
+/** The AI's and code's choices of an entry, or null when the entry can't be offered (a coverage minimum it can't fill, a choice with no safe value). */
+function choicePlan(e: ReviewedTool): { ai: Record<string, string[]>; code: Record<string, string> } | null {
+  const ai: Record<string, string[]> = {};
+  const code: Record<string, string> = {};
+  const aiNames = new Set(aiChoiceNames(e.id, e.choices));
+  for (const [name, raw] of Object.entries(e.choices)) {
+    const values = Array.isArray(raw) ? raw.filter((v): v is string => typeof v === 'string') : [];
+    // Plan D I4: a coverage minimum is code's, never the AI's: the CODE_FILLED_CHOICES entry, and any choice whose values are exactly the minimums (coverage.py's fail-under)
+    if (!aiNames.has(name) || sameList(values, COVERAGE_MINIMUMS)) {
+      if (!values.includes(COVERAGE_MINIMUMS[0])) return null;
+      code[name] = COVERAGE_MINIMUMS[0];
+      continue;
+    }
+    const keep = Object.hasOwn(NARROWED, name) ? values.filter(NARROWED[name] as (v: string) => boolean) : values;
+    if (keep.length === 0) return null;
+    if (keep.length === 1) code[name] = keep[0] as string;
+    else ai[name] = keep;
+  }
+  return { ai, code };
+}
+
+/** The service a key is for, or undefined (repo-wide); null when the need names a service the profile doesn't have. */
+function serviceOf(ref: NeedRef, p: RepoProfile) {
+  if (ref.service === undefined) return undefined;
+  return p.services.find((s) => s.name === ref.service) ?? null;
+}
+
+const workingDirOf = (path: string): string | undefined => (path === '' || path === '.' ? undefined : path);
+
+/** The tuning max of an option id (the largest over the tools that have it). */
+const tuningMax = (id: string): number => Math.max(1, ...TUNING_OPTIONS.filter((o) => o.id === id).map((o) => o.max));
+
+/**
+ * The tuning enums of an entry for a key: per option, the union over every value of the entry's choices (ruling S2: semgrep's
+ * extra-rules over every `rules` value; validateSpec checks the pick against the chosen one later), keeping only values that
+ * promptText leaves unchanged. Options with no value are left out.
+ */
+function tuningOffer(ref: NeedRef, e: ReviewedTool, plan: { ai: Record<string, string[]>; code: Record<string, string> }, p: RepoProfile, kv: readonly string[]): Record<string, string[]> {
+  const svc = serviceOf(ref, p);
+  const where = { ...(ref.service === undefined ? {} : { service: ref.service }), ...(svc && workingDirOf(svc.path) !== undefined ? { workingDir: svc.path } : {}) };
+  const variants: StepChoices[] = [{ ...plan.code }];
+  for (const [name, values] of Object.entries(plan.ai)) for (const v of values) variants.push({ ...plan.code, [name]: v });
+  const out: Record<string, string[]> = {};
+  for (const choices of variants) {
+    for (const [opt, values] of Object.entries(tuningEnums(e, { choices, ...where }, { profile: p }))) {
+      const list = out[opt] ?? [];
+      for (const v of values) if (!list.includes(v) && promptText(v, kv) === v) list.push(v);
+      out[opt] = list;
+    }
+  }
+  return Object.fromEntries(Object.entries(out).filter(([, v]) => v.length > 0));
+}
+
+/**
+ * The StepSpec for one key and one offered tool, built by code (ruling S2): the entry's own candidate and output template, the
+ * need's id, service and service folder, code's choices, and the AI's picks where given (else each choice's first allowed value).
+ * Exported for the debate (F4) and Plan G's fix loop (the next ranked tool with template defaults, ruling S22).
+ */
+export function specFor(ref: NeedRef, offer: Offer, p: RepoProfile, picks?: { choices?: Readonly<Record<string, string | null>>; tuning?: Readonly<Record<string, readonly string[] | null>> }): StepSpec {
+  const choices: StepChoices = {};
+  for (const [name, values] of Object.entries(offer.aiChoices)) {
+    const v = picks?.choices !== undefined && Object.hasOwn(picks.choices, name) ? picks.choices[name] : null;
+    choices[name] = typeof v === 'string' ? v : (values[0] as string);
+  }
+  for (const [name, v] of Object.entries(offer.codeChoices)) choices[name] = v;
+  const tuning: TuningPicks = {};
+  for (const [opt, v] of Object.entries(picks?.tuning ?? {})) if (Array.isArray(v) && v.length > 0) tuning[opt] = [...v];
+  if (Object.keys(tuning).length > 0) choices.tuning = tuning;
+  const svc = serviceOf(ref, p);
+  const wd = svc ? workingDirOf(svc.path) : undefined;
+  return {
+    needId: ref.id,
+    ...(ref.service === undefined ? {} : { service: ref.service }),
+    tool: structuredClone(offer.entry.candidate),
+    choices,
+    output: structuredClone(offer.entry.step.output),
+    ...(wd === undefined ? {} : { workingDir: wd }),
+  };
+}
+
+/** The tools offered for one key (ruling B2), in the map's order, each once. */
+function offersFor(ref: NeedRef, cands: readonly Candidate[], p: RepoProfile, deps: BuilderDeps, kv: readonly string[]): Offer[] {
+  if (serviceOf(ref, p) === null) return [];
+  const need = ref.needs[0] as Need;
+  // full mode only (proofs >= 1): never the audit list (ruling S20)
+  const listed = new Map(reviewedFor(need, needLanguage(need, p), [...deps.reviewed], 'full').map((t) => [t.id, t]));
+  const out: Offer[] = [];
+  const seen = new Set<string>();
+  for (const c of Array.isArray(cands) ? cands : []) {
+    // the map's Candidate only names the tool; it must say it is reviewed, and the entry decides everything else
+    if (c === null || typeof c !== 'object' || c.reviewed !== true || c.source !== 'reviewed' || typeof c.id !== 'string' || seen.has(c.id)) continue;
+    const e = listed.get(c.id);
+    if (e === undefined || !isReviewed(e.candidate) || e.candidate.id !== e.id || !toolCoversNeed(e.categories, ref.id)) continue;
+    if (ref.blocking && ADVISORY_TOOLS.has(e.id)) continue;   // ruling S9: an advisory tool never covers a blocking need
+    const plan = choicePlan(e);
+    if (plan === null) continue;
+    seen.add(c.id);
+    const offer: Offer = { entry: e, aiChoices: plan.ai, codeChoices: plan.code, tuning: tuningOffer(ref, e, plan, p, kv) };
+    // the code-filled parts must already be valid, so any later problem is the AI's pick
+    if (validateSpec(specFor(ref, offer, p), e, { profile: p }).length > 0) continue;
+    out.push(offer);
+  }
+  return out;
+}
+
+const categoryOf = (id: string): string | undefined => (Object.hasOwn(NEED_ID_CATEGORY, id) ? (NEED_ID_CATEGORY as Readonly<Record<string, string>>)[id] : undefined);
+const where = (ref: NeedRef) => ({ key: ref.key, needId: ref.id, ...(ref.service === undefined ? {} : { service: ref.service }) });
+
+/**
+ * What code decides before the AI is asked: the need keys (needRefs; refuses two services with one name), per key the offered
+ * reviewed tools, the keys the AI sees, the needs code covers (`byCode`), the uncovered ones, and the suggestions the AI may name.
+ * Throws NeedKeyError (need-ref.ts) on a key collision.
+ */
+export function builderOffers(needs: readonly Need[], candidates: ReadonlyMap<string, readonly Candidate[]>, p: RepoProfile, deps: BuilderDeps): BuilderOffers {
+  const kv = deps.knownValues ?? [];
+  const refs = needRefs(needs, p, kv);
+  const result: BuilderOffers = { refs, offers: new Map(), aiKeys: [], codeKeys: [], byCode: [], uncovered: [], suggestions: [] };
+  for (const ref of refs) {
+    const category = categoryOf(ref.id);
+    const svc = serviceOf(ref, p);
+    if (category !== undefined && PIPEGEN_JOB_CATEGORIES.has(category)) { result.byCode.push({ ...where(ref), kind: 'pipegen-job' }); continue; }
+    if (svc && projectScriptFor(ref.needs[0] as Need, svc) !== null) { result.byCode.push({ ...where(ref), kind: 'project-script' }); continue; }
+    if (!deps.reviewed.some((t) => toolCoversNeed(t.categories, ref.id))) { result.byCode.push({ ...where(ref), kind: 'no-reviewed-tool' }); continue; }
+    const offers = offersFor(ref, candidates.get(ref.key) ?? [], p, deps, kv);
+    if (offers.length === 0) { result.uncovered.push({ ...where(ref), blocking: ref.blocking }); continue; }
+    result.offers.set(ref.key, offers);
+    (ref.offered ? result.aiKeys : result.codeKeys).push(ref.key);
+  }
+
+  // ruling S4: the suggestions are toSuggestions' (unreviewed discovery candidates that pass the bar, deduped by repo), never a reviewed tool's id or repo
+  const reviewedIds = new Set(deps.reviewed.map((t) => t.id));
+  const reviewedRepos = new Set(deps.reviewed.map((t) => t.candidate.repo.toLowerCase()));
+  const pool: Candidate[] = [];
+  for (const ref of refs) {
+    for (const c of candidates.get(ref.key) ?? []) {
+      if (c === null || typeof c !== 'object' || c.reviewed !== false || reviewedIds.has(c.id) || typeof c.repo !== 'string' || reviewedRepos.has(c.repo.toLowerCase())) continue;
+      pool.push(c);
+    }
+  }
+  const allowed = toSuggestions(pool, new Map(), deps.bar, deps.now).filter((s) => promptText(s.repo, kv) === s.repo).slice(0, MAX_OFFERED_SUGGESTIONS);
+  result.suggestions = allowed.map((s, i) => {
+    const categories = [...new Set(pool.filter((c) => c.repo.toLowerCase() === s.repo.toLowerCase()).flatMap((c) => (Array.isArray(c.categories) ? c.categories : [])))]
+      .filter((x): x is string => (NEED_CATEGORIES as readonly string[]).includes(x));
+    return { id: `s${i + 1}`, suggestion: s, categories };
+  });
+  return result;
+}
+
+// ---------- the request ----------
+
+const enumOf = (xs: readonly string[]) => z.enum([...new Set(xs)] as [string, ...string[]]);
+
+/** The answer's schema: need keys, candidate ids, choice values, tuning values and suggestion ids are enums of what was offered. */
+function builderSchema(o: BuilderOffers): AiSchema<BuilderAnswer> {
+  const ids: string[] = [];
+  const choiceValues = new Map<string, string[]>();
+  const tuningValues = new Map<string, string[]>();
+  const add = (m: Map<string, string[]>, k: string, vs: readonly string[]) => { const l = m.get(k) ?? []; for (const v of vs) if (!l.includes(v)) l.push(v); m.set(k, l); };
+  for (const key of o.aiKeys) {
+    for (const offer of o.offers.get(key) ?? []) {
+      if (!ids.includes(offer.entry.id)) ids.push(offer.entry.id);
+      for (const [n, vs] of Object.entries(offer.aiChoices)) add(choiceValues, n, vs);
+      for (const [n, vs] of Object.entries(offer.tuning)) add(tuningValues, n, vs);
+    }
+  }
+  const sugIds = o.suggestions.map((s) => s.id);
+  return aiSchema<BuilderAnswer>(z.strictObject({
+    choices: z.array(z.strictObject({
+      key: enumOf(o.aiKeys),
+      candidateId: enumOf(ids),
+      ranked: z.array(enumOf(ids)).max(ids.length),
+      because: z.string().max(AI_TEXT_MAX),
+      choices: z.strictObject(Object.fromEntries([...choiceValues].map(([n, vs]) => [n, enumOf(vs).nullable()]))),
+      tuning: z.strictObject(Object.fromEntries([...tuningValues].map(([n, vs]) => [n, z.array(enumOf(vs)).max(tuningMax(n)).nullable()]))),
+    })).max(o.aiKeys.length),
+    suggestions: z.array(z.strictObject({ id: sugIds.length > 0 ? enumOf(sugIds) : z.null(), why: z.string().max(AI_TEXT_MAX) })).max(sugIds.length),
+  }) as unknown as z.ZodType<BuilderAnswer>);
+}
+
+/** The offered needs and tools as the AI sees them: enums, reviewed-list data and pipegen's own texts only. */
+function needsBlock(o: BuilderOffers): string {
+  const refs = new Map(o.refs.map((r) => [r.key, r]));
+  const summary = (opt: string, tool: string) => TUNING_OPTIONS.find((t) => t.id === opt && t.tool === tool)?.summary ?? '';
+  const items = o.aiKeys.map((key) => {
+    const ref = refs.get(key) as NeedRef;
+    return {
+      key, check: ref.id, service: ref.service ?? null, layers: ref.layers, blocking: ref.blocking,
+      why: needWhy(ref.id) ?? '',   // pipegen's own text, never Need.why (AI text from planNeeds or the judge)
+      tools: (o.offers.get(key) ?? []).map((of) => ({
+        id: of.entry.id, name: of.entry.candidate.name, kind: of.entry.candidate.kind,
+        choices: of.aiChoices,
+        tuning: Object.fromEntries(Object.entries(of.tuning).map(([opt, values]) => [opt, { values, max: tuningMax(opt), does: summary(opt, of.entry.id) }])),
+      })),
+    };
+  });
+  const sugs = o.suggestions.map((s) => ({ id: s.id, repo: s.suggestion.repo, checks: s.categories }));
+  // one value per line (redact() replaces a line over 4 KB whole)
+  return `<${BUILDER_NEEDS_TAG}>\n${JSON.stringify(items, null, 1)}\n</${BUILDER_NEEDS_TAG}>\n\n<${BUILDER_SUGGESTIONS_TAG}>\n${JSON.stringify(sugs, null, 1)}\n</${BUILDER_SUGGESTIONS_TAG}>`;
+}
+
+function builderRequest(code: string, p: RepoProfile, o: BuilderOffers, deps: BuilderDeps): { req: AiRequest; schema: AiSchema<BuilderAnswer> } {
+  const kv = deps.knownValues ?? [];
+  const schema = builderSchema(o);
+  return {
+    schema,
+    req: {
+      system: BUILDER_SYSTEM,
+      user: `${code}\n${promptProfile(p, deps.caps, kv)}\n\n${promptText(needsBlock(o), kv)}\n\n${BUILDER_INSTRUCTIONS}`,
+      schemaName: 'builder',
+      jsonSchema: schema.jsonSchema,
+      timeoutMs: BUILDER_TIMEOUT_MS,
+      maxOutputTokens: BUILDER_MAX_OUTPUT_TOKENS,
+    },
+  };
+}
+
+/** The repair request (ruling S3, S2): the first request (bundle included) plus pipegen's own problem lines, scrubbed. */
+function repairRequest(req: AiRequest, problems: readonly string[], kv: readonly string[]): AiRequest {
+  const lines = problems.slice(0, MAX_REPAIR_PROBLEMS).map((x) => safeText(x, 300));
+  return { ...req, user: `${req.user}${promptText(builderRepairText(lines), kv)}` };
+}
+
+// ---------- checking the answer ----------
+
+const shown = (v: unknown) => safeText(String(v), 60);
+
+/**
+ * pipegen's own problem lines for the ids and choice values of an answer (ruling S3): a key that wasn't offered, answered twice
+ * or not at all; a candidate or ranked id not offered for THAT key; a choice value the chosen tool doesn't allow (or a value for a
+ * choice code fills); a suggestion id that wasn't offered. Empty = every id is one that was offered. Never uses the AI's text.
+ */
+export function builderAnswerProblems(answer: BuilderAnswer, o: BuilderOffers): string[] {
+  const out: string[] = [];
+  const aiKeys = new Set(o.aiKeys);
+  const answered = new Set<string>();
+  for (const item of Array.isArray(answer?.choices) ? answer.choices : []) {
+    const key = typeof item?.key === 'string' ? item.key : '';
+    if (!aiKeys.has(key)) { out.push(`${shown(key)}: this need was not offered`); continue; }
+    if (answered.has(key)) { out.push(`${key}: answered more than once`); continue; }
+    answered.add(key);
+    const offers = o.offers.get(key) ?? [];
+    const offer = offers.find((x) => x.entry.id === item.candidateId);
+    if (offer === undefined) { out.push(`${key}: ${shown(item.candidateId)} was not offered for this need`); continue; }
+    for (const id of Array.isArray(item.ranked) ? item.ranked : []) {
+      if (!offers.some((x) => x.entry.id === id)) out.push(`${key}: ranked: ${shown(id)} was not offered for this need`);
+    }
+    const picks = item.choices !== null && typeof item.choices === 'object' ? item.choices : {};
+    for (const [name, v] of Object.entries(picks)) {
+      if (v === null || v === undefined) continue;
+      const aiValues = Object.hasOwn(offer.aiChoices, name) ? offer.aiChoices[name] : undefined;
+      if (aiValues === undefined && !Object.hasOwn(offer.codeChoices, name)) continue;   // a name the chosen tool doesn't have: not used
+      if (aiValues === undefined || !aiValues.includes(v)) out.push(`${key}: choices.${shown(name)}: ${shown(v)} is not one of the values offered for this tool`);
+    }
+  }
+  for (const key of o.aiKeys) if (!answered.has(key)) out.push(`${key}: no choice was given for this need`);
+  const sugIds = new Set(o.suggestions.map((s) => s.id));
+  for (const s of Array.isArray(answer?.suggestions) ? answer.suggestions : []) {
+    if (typeof s?.id !== 'string' || !sugIds.has(s.id)) out.push(`suggestions: ${shown(s?.id)} was not offered`);
+  }
+  return out;
+}
+
+/** The tuning picks of an item that are not in what was offered for this key and tool (validateSpec checks them against the call's own enum too). */
+function tuningOfferProblems(key: string, offer: Offer, tuning: BuilderAnswer['choices'][number]['tuning']): string[] {
+  const out: string[] = [];
+  for (const [opt, values] of Object.entries(tuning ?? {})) {
+    if (!Array.isArray(values) || values.length === 0) continue;
+    const allowed = Object.hasOwn(offer.tuning, opt) ? offer.tuning[opt] : undefined;
+    if (allowed === undefined) { out.push(`${key}: choices.tuning.${shown(opt)}: this tool has no tuning option with that name for this need`); continue; }
+    values.forEach((v, i) => { if (!allowed.includes(v)) out.push(`${key}: choices.tuning.${shown(opt)}[${i}]: ${shown(v)} is not one of the values offered`); });
+  }
+  return out;
+}
+
+const isTuningProblem = (key: string) => (x: string) => x.startsWith(`${key}: choices.tuning`);
+
+/** The Choices of an answer whose ids are all fine, or the spec problems (validateSpec, prefixed with the key). `final`: tuning still wrong → dropped. */
+function choicesFrom(answer: BuilderAnswer, o: BuilderOffers, p: RepoProfile, final: boolean): { choices: Map<string, Choice>; problems: string[] } {
+  const refs = new Map(o.refs.map((r) => [r.key, r]));
+  const choices = new Map<string, Choice>();
+  const problems: string[] = [];
+  for (const item of answer.choices) {
+    const ref = refs.get(item.key) as NeedRef;
+    const offers = o.offers.get(item.key) as Offer[];
+    const offer = offers.find((x) => x.entry.id === item.candidateId) as Offer;
+    const ctx = { profile: p };
+    let spec = specFor(ref, offer, p, { choices: item.choices, tuning: item.tuning });
+    let bad = validateSpec(spec, offer.entry, ctx).map((x) => `${item.key}: ${x}`);
+    if (bad.length === 0) bad = tuningOfferProblems(item.key, offer, item.tuning);
+    if (bad.length > 0 && final && bad.every(isTuningProblem(item.key))) {
+      // ruling S2: tuning still wrong after the repair → the tuning section is dropped (the AI does less: no added rules, no skip)
+      spec = specFor(ref, offer, p, { choices: item.choices });
+      bad = validateSpec(spec, offer.entry, ctx).map((x) => `${item.key}: ${x}`);
+    }
+    if (bad.length > 0) { problems.push(...bad); continue; }
+    const ranked: ReviewedCandidate[] = [structuredClone(offer.entry.candidate)];
+    for (const id of item.ranked) {
+      if (ranked.some((c) => c.id === id)) continue;
+      const other = offers.find((x) => x.entry.id === id);
+      if (other !== undefined) ranked.push(structuredClone(other.entry.candidate));
+    }
+    choices.set(item.key, {
+      key: item.key, needId: ref.id, chosen: spec, ranked, by: 'ai',
+      reason: reasonOf(offer.entry.id, ranked.slice(1).map((c) => c.id), cleanForDoc(item.because, BECAUSE_MAX)),
+    });
+  }
+  return { choices, problems };
+}
+
+/** "X instead of Y, because Z" from reviewed ids and already-cleaned text; fit for PIPEGEN.md as it is (else the whole line is cleaned). */
+function reasonOf(chosen: string, others: readonly string[], because: string): string {
+  const alt = others.slice(0, MAX_REASON_ALTERNATIVES);
+  const line = `${chosen}${alt.length > 0 ? ` instead of ${alt.join(' or ')}` : ''}, because ${because}`;
+  return safeMarkdown(line) === line ? line : cleanForDoc(line);
+}
+
+// ---------- the call ----------
+
+const ZERO: AiUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+const addUsage = (a: AiUsage, b: AiUsage | undefined): AiUsage => (b === undefined ? a : {
+  inputTokens: count(a.inputTokens) + count(b.inputTokens), outputTokens: count(a.outputTokens) + count(b.outputTokens),
+  cacheReadTokens: count(a.cacheReadTokens) + count(b.cacheReadTokens), cacheWriteTokens: count(a.cacheWriteTokens) + count(b.cacheWriteTokens),
+});
+const billed = (u: AiUsage) => u.inputTokens + u.outputTokens + count(u.cacheReadTokens) + count(u.cacheWriteTokens) > 0;
+
+/** completeValidated; an AiError passes through (same kind and message) with the usage of the earlier calls added. */
+async function ask(ai: AiProvider, req: AiRequest, schema: AiSchema<BuilderAnswer>, before: AiUsage): Promise<{ data: BuilderAnswer; usage: AiUsage }> {
+  try {
+    return await completeValidated(ai, req, schema.zod);
+  } catch (e) {
+    if (e instanceof AiError && billed(before)) throw new AiError(e.kind, e.message, addUsage(before, e.usage));
+    throw e;
+  }
+}
+
+/** The code-decided Choice of a key the AI may not see (ruling B1): the first offered tool, its template defaults, no tuning. */
+function codeChoice(ref: NeedRef, offers: readonly Offer[], p: RepoProfile): Choice {
+  const first = offers[0] as Offer;
+  return {
+    key: ref.key, needId: ref.id, chosen: specFor(ref, first, p), by: 'pipegen',
+    ranked: offers.map((x) => structuredClone(x.entry.candidate)),
+    reason: reasonOf(first.entry.id, [], 'pipegen picked the first reviewed tool for this check without asking the AI'),
+  };
+}
+
+/**
+ * The builder (plan Task 1; rulings B1, B2, S2-S4, S6, S9, S20, S22). `candidates` is keyed by need key (needKeyOf). One AI
+ * request (plus completeValidated's one schema retry) and at most one repair; both carry the bundle. Returns one Choice per key
+ * that has an offered reviewed tool (AI-picked, or code-picked for a key the AI may not see), the suggestions the AI named, the
+ * needs code covers and the uncovered ones. Throws SecretScanRequiredError for an unscanned bundle and NeedKeyError for a key
+ * collision before any request, BuilderError after a second bad answer, and passes AiError (cost-cap included) through with usage.
+ */
+export async function buildChoices(needs: readonly Need[], candidates: ReadonlyMap<string, readonly Candidate[]>, p: RepoProfile, bundle: CodeBundle, ai: AiProvider, deps: BuilderDeps): Promise<BuildResult> {
+  const code = bundleText(bundle); // first: throws SecretScanRequiredError before anything else happens
+  const kv = deps.knownValues ?? [];
+  const o = builderOffers(needs, candidates, p, deps);
+  let usage: AiUsage = { ...ZERO };
+  let picked = new Map<string, Choice>();
+  let suggestions: Suggestion[] = [];
+
+  if (o.aiKeys.length > 0) {
+    const { req, schema } = builderRequest(code, p, o, deps);
+    let problems: string[] = [];
+    let done = false;
+    for (let round = 0; round < 2 && !done; round++) {
+      const r = await ask(ai, round === 0 ? req : repairRequest(req, problems, kv), schema, usage);
+      usage = addUsage(usage, r.usage);
+      const idProblems = builderAnswerProblems(r.data, o);
+      if (idProblems.length > 0) { problems = idProblems; continue; }   // the whole answer is refused (ruling S3)
+      const built = choicesFrom(r.data, o, p, round === 1);
+      if (built.problems.length > 0) { problems = built.problems; continue; }
+      picked = built.choices;
+      const seen = new Set<string>();
+      for (const s of r.data.suggestions) {
+        const offer = o.suggestions.find((x) => x.id === s.id);
+        if (offer === undefined || seen.has(offer.id)) continue;
+        seen.add(offer.id);
+        suggestions.push({ name: offer.suggestion.name, repo: offer.suggestion.repo, why: cleanForDoc(s.why, SUGGESTION_WHY_MAX) });
+      }
+      done = true;
+    }
+    if (!done) throw new BuilderError('The builder AI answered twice with picks pipegen can not use, so pipegen stopped. Nothing it picked was used.', problems, usage);
+  } else {
+    // no key for the AI: no request; the suggestions keep pipegen's own text from toSuggestions
+    suggestions = o.suggestions.map((s) => ({ ...s.suggestion, why: cleanForDoc(s.suggestion.why, SUGGESTION_WHY_MAX) }));
+  }
+
+  const choices: Choice[] = [];
+  for (const ref of o.refs) {
+    const ai = picked.get(ref.key);
+    if (ai !== undefined) choices.push(ai);
+    else if (o.codeKeys.includes(ref.key)) choices.push(codeChoice(ref, o.offers.get(ref.key) as Offer[], p));
+  }
+  return { choices, suggestions, byCode: o.byCode, uncovered: o.uncovered, usage };
+}
