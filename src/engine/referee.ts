@@ -32,7 +32,7 @@ import { isMap, isScalar, LineCounter, visit, type Document, type Node as YamlNo
 import { findSecretLike } from '../ai/redact.js';
 import { activeSafeText as safeText, anyString, anyYamlScalar, scrubForDisplay, vaultHolds, withActiveVault } from '../util/known-values.js';
 import { GATE_CHECK_NAME, type CreatedFile, type KnownValueCheck, type OutputFormat, type PipegenInserted, type PipelineDraft, type ReviewedTool, type RuntimeEnv, type Service, type StepSpec } from '../types.js';
-import { ArtifactNameError, slug } from './artifact-names.js';
+import { ArtifactNameError, resultArtifactName, slug } from './artifact-names.js';
 import { FINDINGS_CATEGORIES, gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES, readableFormat, type JobListEntry } from './gate-job-list.js';
 import { GATE_JSON_INPUTS, gateStepInputs, NIGHTLY_JSON_INPUTS, nightlyStepInputs } from './gate-inputs.js';
 import { runLinters } from './linters.js';
@@ -46,7 +46,7 @@ import { createdFileProblems, duplicatePathProblems, type CreatedInputs, type Cr
 import {
   ACTION_PATH_RE, CALLER_WORKFLOW, checkExpressions, createdPathProblem, checkJobOrder, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, gateResultUploadProblems, IF_VALUES,
   CALLER_TRIGGERS, IMAGE_ARCHIVE_STEP_ID, IMAGE_BUILD_NEED, imageBuildJobId, imageBuildSlugOf, imageCheckStepId, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, LOCAL_MERGE_WORKFLOW, narrowingChoiceProblem, NIGHTLY_CONCURRENCY, NIGHTLY_WORKFLOW, PR_CHECK_IF, PR_CHECK_JOB,
-  PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, SECRET_REF_RE, SIGN_STEP_ID_RE,
+  PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, renderRangeFetchStep, SECRET_REF_RE, SIGN_STEP_ID_RE, BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, BASELINE_STEP_IFS,
   STEP_KEYS as STEP_KEY_LIST, WORKFLOW_CONCURRENCY, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact,
 } from './job-rules.js';
 import { signingMode } from '../github/signing-mode.js';
@@ -565,6 +565,8 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
     try {
       const need = keyOf('secrets', undefined);
       record('range:secrets', ctxs.map(() => renderRangeScan(rangeTool).steps), false, true, true, need, need);
+      // G4 (C9r1): the pre-push head fetch before it, pipegen's own step with the job's token (optional: without it a private repository's force-push blocks once)
+      record(RANGE_FETCH_SOURCE, ctxs.map(() => [renderRangeFetchStep()]), false, true, false, undefined, undefined);
     } catch (e) {
       if (!(e instanceof RenderError)) throw e;
       notes.push(`The commit-range secrets scan can not be rendered, so no step may claim to be it: ${safeText(e.message, 200)}`);
@@ -697,6 +699,8 @@ function judgeEnv(fc: FileCtx, env: unknown, where: string): void {
 
 /** The source name of the pr-check lookup step among the expected run steps. */
 const PR_CHECK_SOURCE = 'pr-check';
+/** G4 (C9r1): the source name of the pre-push head fetch step of the secrets job. */
+const RANGE_FETCH_SOURCE = 'range-fetch';
 /** The gate job's own name (the second half of GATE_CHECK_NAME). */
 const GATE_JOB_NAME = GATE_CHECK_NAME.split(' / ')[1] as string;
 /** How deep the layout rules follow reusable-workflow calls; a deeper chain is read as holding what they look for (fail closed). */
@@ -986,6 +990,8 @@ function judgeJob(fc: FileCtx, id: string, j: unknown): void {
   judgeGateSteps(fc, id, where, j, judged);
   judgeSigningJob(fc, where, j, judged);
   if (id === 'sign') { judgeSignPermissions(fc, where, j, judged); judgeSignJobSteps(fc, where, judged); }
+  judgeBaselineIfs(fc, id, where, j, judged);
+  judgeCosignEnv(fc, where, j, judged);
   judgeImageHandoff(fc, id, where, j, judged);
   judgeRegistryWrite(fc, where, j, judged);
 }
@@ -1066,8 +1072,50 @@ const SIGN_JOB_KINDS: ReadonlySet<StepKind> = new Set(['download-artifact', 'sig
 function judgeSignJobSteps(fc: FileCtx, where: string, judged: readonly Judged[]): void {
   if (!judged.some((x) => x.kind === 'sign' && typeof x.step.id === 'string' && SIGN_STEP_ID_RE.test(x.step.id))) return;
   judged.forEach((x, i) => {
-    if (!SIGN_JOB_KINDS.has(x.kind)) fc.add(fc.file.path, 'permissions', `${where}, step ${i + 1} (${show(String(x.step.name ?? x.step.uses ?? x.kind))}): the job holds the signing identity, so it runs only the digest download, the pinned cosign install and the sign step (which logs in with cosign itself), never another step or action.`);
+    // G4 (carry G3 ruling 5, P-3): the one exception, the reviewed egress step (Bullfrog, its template judged like any action) as the job's first step
+    if (x.kind === 'harden' && i === 0) return;
+    if (!SIGN_JOB_KINDS.has(x.kind)) fc.add(fc.file.path, 'permissions', `${where}, step ${i + 1} (${show(String(x.step.name ?? x.step.uses ?? x.kind))}): the job holds the signing identity, so it runs only the egress step (first), the digest download, the pinned cosign install and the sign step (which logs in with cosign itself), never another step or action.`);
   });
+}
+
+/**
+ * G4 (G21, carry G1→G4): a step that carries a base-scan baseline condition (BASELINE_MISSING_IF on a tool or stage step, the always() form on a
+ * scrub or an upload; judgeStep holds the kinds) sits in the job base-scan, which needs baseline-check (the output it reads), and belongs to the
+ * base twin of a check whose category may skip its base run when a trusted baseline exists: never a dependency, licence or image scan
+ * (BASE_ALWAYS_CATEGORIES), and never a shared step (the checkout, a setup) that every base scan of the job needs.
+ */
+function judgeBaselineIfs(fc: FileCtx, id: string, where: string, j: Obj, judged: readonly Judged[]): void {
+  const bad = issueFor(fc);
+  const held = judged.filter((x) => typeof x.step.if === 'string' && BASELINE_STEP_IFS.has(x.step.if));
+  if (held.length === 0) return;
+  if (id !== 'base-scan') { bad('template', `${where} has a step with the base scan's baseline condition, which only the job base-scan writes.`); return; }
+  if (!needsList(j.needs).includes(BASELINE_CHECK_JOB)) bad('template', `${where} has steps that read the output of the job ${BASELINE_CHECK_JOB}, but does not need it.`);
+  const baseNames = new Map<string, string>();
+  for (const spec of fc.draft.steps) {
+    if (!isObj(spec) || typeof spec.needId !== 'string') continue;
+    try { baseNames.set(resultArtifactName(spec.needId, spec.service, { base: true }), spec.needId); } catch (e) { if (!(e instanceof ArtifactNameError)) throw e; }
+  }
+  for (const x of held) {
+    let needId: string | undefined;
+    const m = x.match === undefined ? null : /^spec:(\d+):base$/.exec(x.match.source);
+    if (m !== null) needId = fc.draft.steps[Number(m[1])]?.needId;
+    else if (x.kind === 'scrub' || x.kind === 'stage') needId = baseNames.get(String(x.step.with?.artifact));
+    else if (x.kind === 'upload-artifact') needId = baseNames.get(String(x.step.with?.name));
+    const category = needId === undefined ? undefined : own(NEED_ID_CATEGORY as Readonly<Record<string, string>>, needId);
+    if (category === undefined) bad('template', `${where}: the step ${show(x.step.name)} carries the baseline condition but is not part of a check's base scan (a shared step runs for every base scan of the job).`);
+    else if (BASE_ALWAYS_CATEGORIES.has(category)) bad('template', `${where}: the step ${show(x.step.name)} of the ${show(category)} base scan carries the baseline condition, but dependency, licence and image scans always run on the base commit.`);
+  }
+}
+
+/** G4 (carry G3 re-review r2): no COSIGN_, SIGSTORE_ or TUF_ variable (they change what cosign verifies or trusts) in a job that holds a cosign step, at any level. */
+const COSIGN_ENV_RE = /^(?:COSIGN|SIGSTORE|TUF)_/i;
+function judgeCosignEnv(fc: FileCtx, where: string, j: Obj, judged: readonly Judged[]): void {
+  if (!judged.some((x) => x.kind === 'sign' || x.kind === 'verify')) return;
+  const levels: [string, unknown][] = [['the workflow', fc.js.env], [where, j.env], ...judged.map((x, i): [string, unknown] => [`${where}, step ${i + 1}`, x.step.env])];
+  for (const [at, env] of levels) {
+    if (!isObj(env)) continue;
+    for (const k of Object.keys(env)) if (COSIGN_ENV_RE.test(k)) fc.add(fc.file.path, 'injection', `The env of ${at} sets ${show(k)}, which changes what cosign signs, verifies or trusts; a job that holds a cosign step sets none.`);
+  }
 }
 
 /** The draft's service whose slug is this, or undefined (none, or a name that has none). */
@@ -1630,7 +1678,9 @@ function judgeStep(fc: FileCtx, where: string, raw: unknown): Judged {
   // place (job gate, after the gate step) are the shared order rule's (gateUploadProblems)
   const optionalGateUpload = kind === 'upload-artifact' && typeof withs.name === 'string' && GATE_OPTIONAL_UPLOADS.has(withs.name);
   if (raw['continue-on-error'] !== undefined && raw['continue-on-error'] !== false && !(optionalGateUpload && raw['continue-on-error'] === true)) bad('template', at('continue-on-error would let a failed step pass; pipegen sets it only on the gate\'s baseline and clean-run marker uploads.'));
-  if (raw.if !== undefined && raw.if !== 'success()' && !(raw.if === 'always()' && (kind === 'upload-artifact' || kind === 'upload-sarif' || kind === 'scrub'))) {
+  // G4 (G21): the base scan's baseline conditions, judged per job (judgeBaselineIfs): the plain form on a tool or stage step, the always() form on a scrub or an upload
+  const baselineIf = (raw.if === BASELINE_MISSING_IF && (kind === 'tool' || kind === 'stage')) || (raw.if === BASELINE_MISSING_ALWAYS_IF && (kind === 'upload-artifact' || kind === 'scrub'));
+  if (raw.if !== undefined && raw.if !== 'success()' && !baselineIf && !(raw.if === 'always()' && (kind === 'upload-artifact' || kind === 'upload-sarif' || kind === 'scrub'))) {
     bad('template', at(`if: ${safeText(String(raw.if), 20)} could skip this step while the job passes (only success(), or always() on an upload or a scrub).`));
   }
   const secrets = judgeSecrets(fc, at, withs, env, kind, appRunning);
@@ -1738,6 +1788,9 @@ function judgeTemplate(fc: FileCtx, at: (m: string) => string, t: ReviewedTool, 
   if (t.id === PIPEGEN_ACTION_IDS.gate && withs.mode === undefined) bad('template', at(`${t.id} must set its mode (scrub, stage, gate, find-run, nightly or baseline-check); the action has no reviewed default.`));
   for (const [k, values] of Object.entries(t.choices)) {
     const v = withs[k];
+    // G4: Bullfrog's allowed-ips may be left out: its default allows no IP at all (block mode lets only the allowed domains through), the tighter
+    // setting; the Docker range is written only for a job whose containers talk over the Docker networks (egress.ts renderEgressStep)
+    if (v === undefined && path.toLowerCase() === BULLFROG_USES && k === 'allowed-ips') continue;
     if (v === undefined) bad('template', at(`${t.id} must set its choice ${show(k)} (left out, the action's own default would run, which nobody reviewed).`));
     // E9 (ruling B5): Bullfrog's allowed-domains carries the hosts of whole reviewed sets, never a label (the bundled rule)
     else if (path.toLowerCase() === BULLFROG_USES && k === 'allowed-domains') {

@@ -1,0 +1,550 @@
+// v0.2 Plan G Task 2, job half (sub-task G4): the concrete jobs of each layer, built from the debate's decided steps and pipegen's own rules.
+// G5 lays them out into files and callers (triggers, the pr-check skip, the caller permissions, the central or local layout); nothing here
+// writes a file. Every job is made only of the shared renderers (render-step.ts, render-cli.ts, image-handoff.ts, signing.ts, egress.ts, the
+// G1/G2 forms of job-rules.ts), so the referee recognises each step by its content.
+//
+// What assembleJobs refuses (AssembleError, before anything is rendered):
+// - a floor need in the draft's not-proven list (the gate would block on every run, and a floor check is never optional);
+// - a blocking need the debate left uncovered (F carry 5: never guessed), with its plain reason; the v0.2 limits below are reported instead;
+// - a step that is not specFor over keyOffers(DebateResult) for its need key (F carry 5, Plan F ruling S22): an unreviewed tool, a suggestion
+//   (mention-only, never run), a tool not offered for that key, or a pick outside what was offered; `secrets` and `needsServices` are the
+//   draft's own additions (the renderer and the referee judge them);
+// - a draft whose needs are not the debate's (one source);
+// - a blocking check pipegen can not render (a pnpm service, a Python project script, ...): never dropped silently;
+// - starter tests in the draft while the isolated starter-test job is switched off (ISOLATED_TEST_JOB, ruling D7-R7, S19);
+// - a job that holds a user secret and would need a shared-CDN egress set (E3-R3, E-b5).
+//
+// What it leaves out, each with a note (the returned draft no longer holds them, so the gate's job list, the referee and PIPEGEN.md agree):
+// - the parts skipped with --skip (tests, precommit, deploy; the others make no job); the secrets scan and the gate are never skippable;
+// - v0.2 limits: api-dast and PyPI publishing (S31); DAST (ZAP, nuclei): the app start is repo code, which no findings job may hold next to
+//   the fingerprint key (checkJobOrder, C0a fix round 1), and the app image can not be a job service yet (B6 item 52); Scorecard (PF-3: the
+//   action runs a tag-pinned image); fuzzing (v0.3); an image build that can not be rendered (a sub-folder service, ruling S8) and the scans of
+//   that image; an osv-scanner run for a service with no lockfile (G12: it exits 128).
+//
+// The jobs (one per need key: the gate's job list is keyed by jobIdFor, so the estimate's JOB_GROUP grouping is not applied, see the G4 report):
+// - every job starts with the reviewed egress step (Bullfrog block, E0d per job: github-core plus the sets its tools need; P-3), then its checkout;
+//   runs on a hosted label, `timeout-minutes` 30, `cache-mode: none`, `contents: read` unless the permission table gives its id more;
+// - findings jobs: renderFindingsBlock (stage for the secrets tools, the scan, the scrub, the upload of exactly resultArtifactName), and the
+//   outputs `<artifact>-sha256|-status|-error` (jobOutputsFor). The merge layer's secrets job adds the pre-push head fetch (C9r1) and the
+//   commit-range block (C9) after a full-history checkout;
+// - job-status jobs: the tool's steps, or the project's own script first (it brings its own checkout); a test job of a service with
+//   dependencies gets the runtime env and compose up, only when the draft holds the compose file pipegen computes (D4);
+// - image-build--<svc>: the reviewed build-push with no push on the default docker driver (no setup-buildx: with the docker-container
+//   builder the image never reaches the local store and `docker image save` fails, G2 carry), the archive step and its upload; the image scans
+//   read that archive after its sha256 check (B6), with no base twin (C-MUST-1);
+// - base-scan: the base checkout (BASE_CHECKOUT_REF), the base twin of every findings check; dependency and licence scans always, the others
+//   only when baseline-check reports no trusted baseline (BASELINE_MISSING_IF, G21); it needs baseline-check and outputs base-sha;
+// - baseline-check (the gate in mode baseline-check, output `found`), gate (renderGateStep over the returned draft, its uploads, `if:
+//   always()`, needs = every job of the gate's list plus base-scan), nightly (renderNightlyStep: the warn-ending, finish-missing, update and
+//   warn-first issues; issues: write here only; no checkout, so it never pushes a file; concurrency pipegen-nightly);
+// - sign: G3's job for the delivered mode (signingMode), none for the proof (PROOF_SIGNING_MODE) or a skipped deploy; attest is "not signed
+//   yet (G15)" with a note, never another mode.
+import { isDeepStrictEqual } from 'node:util';
+import { keyOffers, specFor, BuilderError, type Offer } from '../debate/builder.js';
+import type { DebateResult } from '../debate/debate.js';
+import { needKeyOf, NeedKeyError, type NeedRef } from '../debate/need-ref.js';
+import { COMPOSE_PATH, planCompose } from '../create/compose.js';
+import { ArtifactNameError, resultArtifactName, slug } from '../engine/artifact-names.js';
+import { baseImageRef, loadBaseImages, nodeBaseImageId, type BaseImage } from '../engine/base-images.js';
+import { dockerfilesOf } from '../engine/created-judges/compose.js';
+import { egressSetsForTool, renderEgressStep, type EgressSet } from '../engine/egress.js';
+import { gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES } from '../engine/gate-job-list.js';
+import { SKIPPED_PART_NEEDS } from '../engine/gate-inputs.js';
+import { ARCHIVE_TOOL_IDS, renderImageArchiveScan, renderImageBuild } from '../engine/image-handoff.js';
+import {
+  BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, IMAGE_BUILD_NEED, imageBuildJobId, isReviewed,
+  isScrubStep, jobOutputsFor, NIGHTLY_CONCURRENCY, NO_SCANS, renderRangeFetchStep, type RenderedStep, type ScanFact,
+} from '../engine/job-rules.js';
+import { NEED_ID_CATEGORY, SCHEDULED_CATEGORIES } from '../engine/need-ids.js';
+import { parseImageRef } from '../engine/names.js';
+import { PLATFORM_ACTION_IDS, type PlatformActions } from '../engine/pin.js';
+import { APP_RUNNING_CATEGORIES, renderStarterTestRun } from '../engine/render-cli.js';
+import { RenderError } from '../engine/render-error.js';
+import {
+  dedupeJobSteps, renderBaselineCheckStep, renderComposeUp, renderFindingsBlock, renderGateStep, renderGateUploads, renderJobPrelude, renderNightlyStep,
+  renderProjectScript, renderRangeBlock, renderRuntimeEnv, renderScrub, renderStep, renderUpload, scanFactOf, scrubbedPath, type RenderContext,
+} from '../engine/render-step.js';
+import { projectScriptFor } from '../engine/reviewed.js';
+import { RANGE_TOOL } from '../engine/tool-flags.js';
+import type { SigningMode } from '../github/signing-mode.js';
+import { signJob, type SignJob } from './central.js';
+import type { Need, NeedCategory, PipelineDraft, ReviewedTool, Service, SkippablePart, StepSpec } from '../types.js';
+import { FLOOR_NEEDS } from '../types.js';
+import { safeText } from '../util/safe-text.js';
+
+// ---------- constants ----------
+
+/** The runner every job pipegen writes runs on (a hosted label, the referee's list). */
+export const JOB_RUNNER = 'ubuntu-24.04';
+/** Every job's timeout (G40: the verify job's wait must exceed it). */
+export const JOB_MINUTES = 30;
+/**
+ * Ruling D7-R7 (S19): the isolated starter-test job is rendered (starterTestJob), but the switch stays off until a reviewed change flips it after
+ * the live acceptance (probes f1b, f2, f3, o2, e1, e3 as hostile tests in that job). While it is off, no starter test is created (Plan D:
+ * createStarterTests returns a not-proven note unless the isolated-job switch is passed as true, and pipegen never passes it), and a draft that holds
+ * one is refused here.
+ */
+export const ISOLATED_TEST_JOB: boolean = false;
+/** E3-R3 (E-b5): the egress sets whose hosts serve anyone's content (release assets, the OSV API, the Trivy DB mirror): never in a job with a user secret. */
+export const SHARED_CDN_SETS: ReadonlySet<EgressSet> = new Set<EgressSet>(['github-releases', 'osv', 'trivy-db']);
+/** The job id prefix of the isolated starter-test job (one per service). */
+export const STARTER_TEST_JOB = 'starter-tests';
+/** The gate job's name: the required check is `pipegen / gate` (GATE_CHECK_NAME) through the caller job `pipegen`. */
+const GATE_JOB_NAME = 'gate';
+
+/** v0.2 limits: categories pipegen does not render yet, each with the line the notes (and PIPEGEN.md) carry. */
+export const NOT_RENDERED_V02: Readonly<Partial<Record<NeedCategory, string>>> = Object.freeze({
+  'api-dast': 'API testing against the API spec is not available yet: its tool (schemathesis) needs a reviewed hash-locked closure of its Python dependencies, planned for v0.4 (S31).',
+  dast: 'The scan of the running app (ZAP, nuclei) is not run yet: starting the app runs the repository\'s code, which no job that holds the result fingerprint key may run, and the app image can not be a job service yet. It comes with the image hand-off as a service (v0.3).',
+  scorecard: 'OpenSSF Scorecard is not run yet: its action runs a tag-pinned container image, and pipegen runs only images pinned by digest (PF-3).',
+  fuzzing: 'Fuzzing is built in v0.3.',
+});
+/** The PyPI publish action (S31): it builds or pulls a container at run time, so it is not rendered in v0.2. */
+const PYPI_PUBLISH_ID = 'pypi-publish';
+export const PYPI_PUBLISH_NOTE = 'Publishing to PyPI is not rendered yet: the publish action builds or pulls a container at run time, and pipegen runs only images pinned by digest (S31).';
+
+/**
+ * The needs a part skipped with --skip takes out of the jobs: tests the gate's own list (SKIPPED_PART_NEEDS, so the gate shows them as skipped);
+ * precommit the pre-commit layer and its CI proof (hooks-ci); deploy the deploy layer. The others (docker, compose, locks, slack, test-migration)
+ * are created files or settings, not jobs. The secrets scan and the gate are never a part (SkippablePart).
+ */
+export function skippedByPart(part: SkippablePart, n: Pick<Need, 'id' | 'layer' | 'category'>): boolean {
+  if (part === 'tests') return SKIPPED_PART_NEEDS.tests.includes(n.id);
+  if (part === 'precommit') return n.layer === 'pre-commit' || n.category === 'hooks-ci';
+  if (part === 'deploy') return n.layer === 'deploy';
+  return false;
+}
+
+// ---------- types ----------
+
+/** One job as G5 writes it (keys in this order). */
+export interface Job {
+  name?: string; 'runs-on': string; 'timeout-minutes': number; needs?: string[]; if?: string; permissions: Record<string, 'read' | 'write'>;
+  environment?: string; concurrency?: string; 'cache-mode': 'none'; outputs?: Record<string, string>; steps: RenderedStep[];
+}
+/** What the jobs are made with: the reviewed list (the gate entry included), the platform actions, and the signing mode (signingMode, or PROOF_SIGNING_MODE). */
+export interface JobsDeps { reviewed: readonly ReviewedTool[]; platform: PlatformActions; mode: SigningMode; baseImages?: readonly BaseImage[] }
+/** The parts of the debate's result the jobs come from (F carry 5): its needs, its final candidates map, its uncovered needs. */
+export type JobsPlan = Pick<DebateResult, 'needs' | 'candidates' | 'uncovered'>;
+export interface AssembledJobs {
+  /** The draft the jobs were rendered from: the input without the skipped parts and the v0.2 limits. The referee, the gate inputs and PIPEGEN.md read this one. */
+  draft: PipelineDraft;
+  /** The push layer's checks (G5 adds pr-check and the skip condition). */
+  push: Record<string, Job>;
+  /** The merge layer: its checks, the image builds and scans, baseline-check, base-scan and gate. */
+  merge: Record<string, Job>;
+  /** The nightly job (the scheduled checks of v0.2 are limits, see NOT_RENDERED_V02). */
+  nightly: Record<string, Job>;
+  /** G3's sign job for the delivered mode; null for none, the proof, a skipped deploy and attest (until G15). */
+  sign: SignJob | null;
+  notes: string[];
+}
+
+export class AssembleError extends Error {}
+
+const fail = (m: string): never => { throw new AssembleError(m); };
+const show = (s: unknown): string => JSON.stringify(safeText(String(s), 60));
+const categoryOf = (id: string): string | undefined => (Object.hasOwn(NEED_ID_CATEGORY, id) ? (NEED_ID_CATEGORY as Readonly<Record<string, string>>)[id] : undefined);
+const FLOOR: ReadonlySet<string> = new Set(FLOOR_NEEDS);
+const isFloor = (needId: string): boolean => FLOOR.has(needId) || FLOOR.has(categoryOf(needId) ?? '');
+const isFindings = (t: ReviewedTool): boolean => t.step.output.format === 'sarif' || t.step.output.format === 'zap-json';
+const keyOf = (n: { id: string; service?: string }): string => {
+  try { return needKeyOf(n); } catch (e) { if (e instanceof NeedKeyError) return fail(e.message); throw e; }
+};
+const where = (n: { id?: string; needId?: string; service?: string }): string => `${show(n.id ?? n.needId)}${n.service === undefined ? '' : ` for ${show(n.service)}`}`;
+
+// ---------- the checks before anything renders ----------
+
+/** F carry 5: every step is specFor over keyOffers of the debate's result, for its own need key (the picks only from what was offered). */
+function checkSteps(draft: PipelineDraft, plan: JobsPlan, reviewed: readonly ReviewedTool[]): void {
+  let offers: ReturnType<typeof keyOffers>;
+  try { offers = keyOffers(plan.needs, plan.candidates, draft.profile, { reviewed }); } catch (e) { if (e instanceof NeedKeyError) return fail(e.message); throw e; }
+  const refs = new Map<string, NeedRef>(offers.refs.map((r) => [r.key, r]));
+  draft.steps.forEach((spec, i) => {
+    const at = `The step ${i + 1} (${spec?.needId === undefined ? 'no check' : where(spec)})`;
+    if (spec === null || typeof spec !== 'object' || typeof spec.needId !== 'string' || spec.tool === null || typeof spec.tool !== 'object') return fail(`${at} is not a step.`);
+    const key = keyOf({ id: spec.needId, ...(spec.service === undefined ? {} : { service: spec.service }) });
+    const ref = refs.get(key);
+    const offer: Offer | undefined = (offers.offers.get(key) ?? []).find((o) => o.entry.id === spec.tool.id);
+    if (ref === undefined || offer === undefined || !isReviewed(spec.tool)) {
+      return fail(`${at} runs ${show(spec.tool.id)}, which is not a reviewed tool pipegen offered for that check (a suggestion is only mentioned, never run).`);
+    }
+    const { tuning, ...rest } = spec.choices ?? {};
+    const picks = { choices: Object.fromEntries(Object.entries(rest).filter((e): e is [string, string] => typeof e[1] === 'string')), ...(tuning === undefined ? {} : { tuning }) };
+    let built: StepSpec;
+    try { built = specFor(ref, offer, draft.profile, picks); } catch (e) { if (e instanceof BuilderError) return fail(`${at} has a pick that was not offered for it.`); throw e; }
+    const { secrets: _s, needsServices: _n, ...own } = spec;
+    if (!isDeepStrictEqual(JSON.parse(JSON.stringify(own)), JSON.parse(JSON.stringify(built)))) fail(`${at} is not the step pipegen builds for ${show(spec.tool.id)} from the debate's choice (a field was changed).`);
+  });
+}
+
+const UNCOVERED_REASON: Readonly<Record<string, string>> = Object.freeze({
+  'none-offered': 'reviewed tools exist for it, but none fits this repository',
+  'no-reviewed-tool': 'pipegen has no reviewed tool for it yet',
+});
+
+// ---------- egress ----------
+
+/** The package-registry sets a service's own install needs (npm → npm, pip/poetry/uv → pypi). */
+function packageSets(svcs: readonly (Service | undefined)[]): EgressSet[] {
+  const out = new Set<EgressSet>();
+  for (const s of svcs) {
+    if (s?.packageManager === 'npm') out.add('npm');
+    else if (s?.packageManager === 'pip' || s?.packageManager === 'poetry' || s?.packageManager === 'uv') out.add('pypi');
+  }
+  return [...out];
+}
+/** The registry set of a pinned image reference. */
+function imageSet(ref: string): EgressSet {
+  const at = ref.indexOf('@');
+  const image = parseImageRef((at === -1 ? ref : ref.slice(0, at)).replace(/:[^/:]*$/, ''));
+  if (image === null) return fail(`The image ${safeText(ref, 120)} is on a registry pipegen has no egress set for.`);
+  return image.registry === 'ghcr.io' ? 'ghcr' : 'dockerhub';
+}
+/**
+ * The egress step of a job (E0d per job): github-core plus `sets`, sorted, each once. A job that holds a user secret (a declared app secret)
+ * never gets a shared-CDN set (E3-R3): refused, never rendered without it (the job would fail at DNS) or with it (a host anyone can serve from).
+ */
+export function egressStepFor(sets: readonly EgressSet[], opts: { userSecret: boolean; dockerNetworks: boolean; job: string }): RenderedStep {
+  const list = [...new Set(sets)].sort();
+  const shared = list.filter((s) => SHARED_CDN_SETS.has(s));
+  if (opts.userSecret && shared.length > 0) fail(`The job ${show(opts.job)} holds a secret of the app, but its tools need the shared-CDN egress set ${shared.join(', ')} (hosts that serve anyone's content); pipegen never gives such a set to a job with a user secret (E3-R3).`);
+  return renderEgressStep(list, { dockerNetworks: opts.dockerNetworks });
+}
+/** The sets a job's steps need besides its tools': the repository's own npm install. */
+const installSets = (steps: readonly RenderedStep[], svc: Service | undefined): EgressSet[] => (steps.some((s) => s.id?.startsWith('pipegen-npm-ci-') === true) ? packageSets([svc]).concat(['npm']) : []);
+
+// ---------- the builder ----------
+
+interface Ctx {
+  draft: PipelineDraft; deps: JobsDeps; byId: Map<string, ReviewedTool>; gate: ReviewedTool; notes: string[];
+  /** the runtime env and the images of the compose file pipegen computes, when the draft holds exactly that file (D4) */
+  compose: { env: ReturnType<typeof planCompose>['env']; images: EgressSet[] } | null;
+}
+
+function toolOf(c: Pick<Ctx, 'byId'>, id: string): ReviewedTool {
+  const t = c.byId.get(id);
+  if (t === undefined || !isReviewed(t.candidate)) return fail(`The reviewed list has no reviewed ${show(id)} entry.`);
+  return t;
+}
+const job = (steps: RenderedStep[], over: Partial<Job> = {}): Job => {
+  const outputs = jobOutputsFor(steps);
+  return {
+    'runs-on': JOB_RUNNER, 'timeout-minutes': JOB_MINUTES, permissions: { contents: 'read' }, 'cache-mode': 'none',
+    ...(Object.keys(outputs).length > 0 ? { outputs } : {}), ...over, steps,
+  };
+};
+/** Whether any need of this need id and service blocks (the referee's rule, G2-R1 I1); none at all counts as blocking. */
+const blocks = (draft: PipelineDraft, needId: string, service: string | undefined): boolean => {
+  const m = draft.needs.filter((n) => n.id === needId && n.service === service);
+  return m.length === 0 || m.some((n) => n.blocking !== false);
+};
+const serviceNamed = (draft: PipelineDraft, name: string | undefined): Service | undefined => (name === undefined ? undefined : draft.profile.services.find((s) => s.name === name));
+
+/** A check job (findings or job status) for one need key on one layer. */
+function checkJob(c: Ctx, need: Need, specs: readonly StepSpec[], range: boolean): Job {
+  const id = jobIdFor(need.id, need.service);
+  const svc = serviceNamed(c.draft, need.service);
+  const ctx: RenderContext = { profile: c.draft.profile, blocking: blocks(c.draft, need.id, need.service) };
+  const body: RenderedStep[] = [];
+  const scans = new Map<string, ScanFact>();
+  const sets: EgressSet[] = [];
+  let fullHistory = range;
+  let userSecret = false;
+  let script = false;
+  for (const spec of specs) {
+    const t = toolOf(c, spec.tool.id);
+    sets.push(...egressSetsForTool(t));
+    if ((spec.secrets ?? []).length > 0) userSecret = true;
+    if (isFindings(t)) {
+      const b = renderFindingsBlock(spec, t, c.deps.platform, ctx, c.gate);
+      body.push(...b.steps);
+      scans.set(b.scan.stepId, b.scan.fact);
+      if (b.result.fullHistory === true) fullHistory = true;
+    } else {
+      const r = renderStep(spec, t, c.deps.platform, ctx);
+      body.push(...r.steps);
+      if (r.fullHistory === true) fullHistory = true;
+    }
+  }
+  if (specs.length === 0) {
+    const ps = svc === undefined ? null : projectScriptFor(need, svc);
+    if (ps === null) return fail(`Nothing runs the check ${where(need)}.`);
+    body.push(...renderProjectScript(ps, c.deps.platform, ctx).steps);
+    script = true;
+  }
+  if (range) {
+    const rt = toolOf(c, RANGE_TOOL);
+    const b = renderRangeBlock(rt, c.deps.platform, c.gate);
+    sets.push(...egressSetsForTool(rt));
+    // C9r1: the pre-push head fetch right before the range block (after the head scan's own steps)
+    body.push(renderRangeFetchStep(), ...b.steps);
+    scans.set(b.scan.stepId, b.scan.fact);
+  }
+  // a project script brings its own checkout and setup (item 38), so no prelude; any other job checks out first (fetch depth per its tools)
+  const prelude = script ? [] : renderJobPrelude(fullHistory ? { fetchDepth: '0' } : {}, c.deps.platform).steps;
+  let steps = [...prelude, ...body];
+  // D4: a test job of a service with dependencies starts them first (runtime env, then compose up), only with pipegen's own compose file
+  const compose = c.compose !== null && svc !== undefined && svc.dependsOn.length > 0 && APP_RUNNING_CATEGORIES.has(categoryOf(need.id) ?? '') && scans.size === 0;
+  if (compose && c.compose !== null) {
+    const at = steps.findIndex((s) => s.run !== undefined || (s.uses !== undefined && !/^pipegen-(?:checkout|setup-node-\d{1,3}|setup-python)$/.test(s.id ?? '') && s.id !== undefined));
+    const cut = at < 0 ? steps.length : at;
+    steps = [...steps.slice(0, cut), renderRuntimeEnv(c.compose.env), renderComposeUp(), ...steps.slice(cut)];
+    sets.push('dockerhub', ...c.compose.images);
+  }
+  sets.push(...installSets(steps, svc));
+  const egress = egressStepFor(sets, { userSecret, dockerNetworks: compose, job: id });
+  return job(dedupeJobSteps([egress, ...steps], { id, scans }));
+}
+
+/** image-build--<svc> (B6; G2 carry: the default docker driver, no setup-buildx, so the image reaches the local store for `docker image save`). */
+function imageBuildJob(c: Ctx, spec: StepSpec): Job {
+  const service = spec.service as string;
+  const id = imageBuildJobId(service);
+  const buildPush = c.deps.platform['build-push'];
+  if (buildPush?.id !== PLATFORM_ACTION_IDS['build-push'] || buildPush.candidate.id !== spec.tool.id) return fail(`The image build of ${show(service)} is not the reviewed build-push step.`);
+  const built = renderImageBuild(spec, buildPush, c.deps.platform, { profile: c.draft.profile, blocking: true });
+  const prelude = renderJobPrelude({}, c.deps.platform).steps;
+  // the Dockerfile's own base images and package installs (live checklist: the build's network under Bullfrog)
+  const egress = egressStepFor(['dockerhub', 'ghcr', ...packageSets([serviceNamed(c.draft, service)])], { userSecret: (spec.secrets ?? []).length > 0, dockerNetworks: true, job: id });
+  const steps = dedupeJobSteps([egress, ...prelude, ...built.steps], { id, scans: NO_SCANS });
+  return { 'runs-on': JOB_RUNNER, 'timeout-minutes': JOB_MINUTES, permissions: { contents: 'read' }, 'cache-mode': 'none', outputs: built.outputs, steps };
+}
+
+/** A scan of the PR's own image, on its archive (B6): needs its image build, no checkout, the scrub and the upload of its result. */
+function imageScanJob(c: Ctx, spec: StepSpec): Job {
+  const service = spec.service as string;
+  const id = jobIdFor(spec.needId, service);
+  const t = toolOf(c, spec.tool.id);
+  const r = renderImageArchiveScan(spec, t, c.deps.platform, { profile: c.draft.profile, blocking: blocks(c.draft, spec.needId, service) });
+  const steps: RenderedStep[] = [...r.steps];
+  const scans = new Map<string, ScanFact>();
+  if (r.output !== null && isFindings(t)) {
+    const fact = scanFactOf(r, t.id);
+    if (fact === null) return fail(`The image scan ${where(spec)} has no scan step.`);
+    const artifact = resultArtifactName(spec.needId, service);
+    steps.push(renderScrub(artifact, r.output.path, t.id, r.output.format as 'sarif' | 'zap-json', c.gate), renderUpload(artifact, scrubbedPath(r.output.path), c.deps.platform));
+    scans.set(fact.stepId, fact.fact);
+  }
+  const egress = egressStepFor(egressSetsForTool(t), { userSecret: (spec.secrets ?? []).length > 0, dockerNetworks: false, job: id });
+  return job(dedupeJobSteps([egress, ...steps], { id, scans }), { needs: [imageBuildJobId(service)] });
+}
+
+/**
+ * base-scan (plan "Base scan", G1, G17, G21, G32): the base checkout, then the base twin of every findings check of the merge layer that runs
+ * in a job of its own (not the image archive scans, which have no twin yet). Dependency and licence scans always; the others only when
+ * baseline-check reports no trusted baseline: their install and run steps carry BASELINE_MISSING_IF, their scrub and upload the always() form.
+ */
+function baseScanJob(c: Ctx, specs: readonly StepSpec[]): Job {
+  const always: RenderedStep[] = [];
+  const later: RenderedStep[] = [];
+  const scans = new Map<string, ScanFact>();
+  const sets: EgressSet[] = [];
+  let fullHistory = false;
+  for (const spec of specs) {
+    const t = toolOf(c, spec.tool.id);
+    const b = renderFindingsBlock(spec, t, c.deps.platform, { profile: c.draft.profile, base: true, blocking: blocks(c.draft, spec.needId, spec.service) }, c.gate);
+    scans.set(b.scan.stepId, b.scan.fact);
+    sets.push(...egressSetsForTool(t));
+    if (b.result.fullHistory === true) fullHistory = true;
+    if (BASE_ALWAYS_CATEGORIES.has(categoryOf(spec.needId) ?? '')) { always.push(...b.steps); continue; }
+    // the shared pipegen- steps (setup) stay unconditional: every base scan of the job may need them
+    later.push(...b.steps.map((s) => (s.id?.startsWith('pipegen-') === true ? s
+      : { ...s, if: isScrubStep(s) || s.uses?.startsWith(`${c.deps.platform['upload-artifact'].step.action?.uses ?? '\0'}`) === true ? BASELINE_MISSING_ALWAYS_IF : BASELINE_MISSING_IF })));
+  }
+  const prelude = renderJobPrelude({ baseRef: true, ...(fullHistory ? { fetchDepth: '0' as const } : {}) }, c.deps.platform).steps;
+  const body = [...prelude, ...always, ...later];
+  const egress = egressStepFor([...sets, ...installSets(body, undefined)], { userSecret: false, dockerNetworks: false, job: 'base-scan' });
+  return job(dedupeJobSteps([egress, ...body], { id: 'base-scan', scans }), { needs: [BASELINE_CHECK_JOB], permissions: { contents: 'read', actions: 'read' } });
+}
+
+/** The isolated starter-test job of one service (D7-iso, rendered while ISOLATED_TEST_JOB is off): no secret, a read-only token, egress blocked but for the install, nothing handed on. */
+export function starterTestJob(svc: Service, deps: Pick<JobsDeps, 'reviewed' | 'platform' | 'baseImages'>): { id: string; job: Job } {
+  const byId = new Map(deps.reviewed.map((t) => [t.id, t]));
+  const vitest = toolOf({ byId }, 'vitest-coverage');
+  let id: string;
+  try { id = `${STARTER_TEST_JOB}--${slug(svc.name)}`; } catch (e) { if (e instanceof ArtifactNameError) return fail(`The service ${show(svc.name)} has no letters or digits in its name.`); throw e; }
+  if (svc.language !== 'node' || svc.packageManager !== 'npm') return fail(`The starter tests of ${show(svc.name)} run only for an npm service.`);
+  const list = deps.baseImages ?? loadBaseImages();
+  const prelude = renderJobPrelude({ node: { runtimeVersion: svc.runtimeVersion } }, deps.platform).steps;
+  const major = prelude[1]?.with?.['node-version'];
+  if (major === undefined) return fail('The Node setup step has no node-version.');
+  const image = baseImageRef(nodeBaseImageId(svc.runtimeVersion, list).id, list);
+  const run = renderStarterTestRun(svc, { vitest, image, nodeMajor: major, artifact: resultArtifactName('starter-tests', svc.name) });
+  // the registry during the install, the base image's registry for the pull; the tests themselves run in a container with no network
+  const egress = egressStepFor([...egressSetsForTool(vitest), 'npm', imageSet(image)], { userSecret: false, dockerNetworks: false, job: id });
+  return { id, job: { 'runs-on': JOB_RUNNER, 'timeout-minutes': JOB_MINUTES, permissions: { contents: 'read' }, 'cache-mode': 'none', steps: [egress, ...prelude, ...run] } };
+}
+
+// ---------- assemble ----------
+
+/** Which part of the plan a need key is, for one layer's jobs: a check job, an image build, an image scan, or nothing (handled elsewhere). */
+type Role = 'check' | 'image-build' | 'image-scan' | 'none';
+function roleOf(c: Ctx, need: Need, specs: readonly StepSpec[]): Role {
+  const category = categoryOf(need.id) ?? need.category;
+  if (PIPEGEN_JOB_CATEGORIES.has(category) || category === 'egress' || category === 'update-config' || SCHEDULED_CATEGORIES.has(category as NeedCategory)) return 'none';
+  if (need.id === IMAGE_BUILD_NEED && specs.some((s) => s.tool.id === PLATFORM_ACTION_IDS['build-push'])) return 'image-build';
+  if (specs.some((s) => ARCHIVE_TOOL_IDS.has(s.tool.id))) return 'image-scan';
+  return 'check';
+}
+
+/**
+ * The jobs of every layer for a draft built from the debate's result (see the file header). Throws AssembleError for what it refuses, and lets a
+ * RenderError of a blocking check through as an AssembleError with its reason.
+ */
+export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDeps): AssembledJobs {
+  const notes: string[] = [];
+  const byId = new Map(deps.reviewed.map((t) => [t.id, t]));
+  const gate = toolOf({ byId }, 'pipegen-gate');
+  // 1. refusals that need no render
+  const floor = [...new Set(input.notProven.flatMap((n) => (typeof n.needId === 'string' && isFloor(n.needId) ? [n.needId] : [])))];
+  if (floor.length > 0) fail(`The draft marks the floor check ${floor.map(show).join(', ')} as not proven, but a floor check is always required; pipegen does not assemble it.`);
+  if (!isDeepStrictEqual(input.needs, plan.needs)) fail('The draft\'s needs are not the debate\'s needs, so its steps can not be checked against what was offered.');
+  if (input.created.some((f) => f.part === 'tests') && !ISOLATED_TEST_JOB) fail('The draft holds starter tests, but the isolated starter-test job is switched off until its live acceptance (ruling D7-R7), so no starter test runs.');
+  const skipped = (n: Need): SkippablePart | undefined => input.skipped.map((s) => s.part).find((part) => skippedByPart(part, n));
+  const limitOf = (n: Pick<Need, 'id' | 'category'>): string | undefined => {
+    const cat = (categoryOf(n.id) ?? n.category) as NeedCategory;
+    return Object.hasOwn(NOT_RENDERED_V02, cat) ? NOT_RENDERED_V02[cat] : undefined;
+  };
+  const stop: string[] = [];
+  for (const u of plan.uncovered) {
+    if (!u.blocking) continue;
+    const n = input.needs.filter((x) => keyOf(x) === u.key);
+    if (n.length > 0 && n.every((x) => skipped(x) !== undefined)) continue;
+    const limit = limitOf({ id: u.needId, category: categoryOf(u.needId) ?? u.needId });
+    if (limit !== undefined) { addNote(notes, limit); continue; }
+    stop.push(`${where(u)}: ${UNCOVERED_REASON[u.reason] ?? 'no reviewed tool covers it'}`);
+  }
+  if (stop.length > 0) fail(`pipegen stopped before writing the pipeline: these blocking checks have no tool it can run (${stop.join('; ')}). It never guesses a tool.`);
+  checkSteps(input, plan, deps.reviewed);
+
+  // 2. the draft as assembled: no skipped part, no v0.2 limit
+  const dropped = new Set<Need>();
+  for (const n of input.needs) {
+    const part = skipped(n);
+    if (part !== undefined) { dropped.add(n); continue; }
+    const limit = limitOf(n);
+    if (limit !== undefined && n.layer !== 'pre-commit') { dropped.add(n); addNote(notes, limit); }
+  }
+  for (const p of input.skipped) addNote(notes, `The part ${show(p.part)} is skipped (--skip), so it has no job.`);
+  let draft = narrowed(input, dropped);
+  const composeFile = draft.created.find((f) => f.repo === 'app' && f.path === COMPOSE_PATH);
+  const list = deps.baseImages ?? loadBaseImages();
+  let compose: Ctx['compose'] = null;
+  if (composeFile !== undefined) {
+    const cp = planCompose(draft.profile, list, dockerfilesOf(draft.created));
+    if (cp.text !== null && cp.text === composeFile.content) compose = { env: cp.env, images: list.map((b) => imageSet(`${b.image}:${b.tag}@${b.digest}`)) };
+    else addNote(notes, 'The draft\'s docker-compose.pipegen.yml is not the file pipegen computes, so no job starts it.');
+  }
+  // the PyPI publish step (S31) and the scans of an image no job builds, and osv without a lockfile (G12), are left out before the render
+  const leaveOut = new Set<StepSpec>();
+  for (const s of draft.steps) {
+    if (s.tool.id === PYPI_PUBLISH_ID) { leaveOut.add(s); addNote(notes, PYPI_PUBLISH_NOTE); }
+    if (s.tool.id === 'osv-scanner' && !hasLockfile(draft, s.service)) { leaveOut.add(s); addNote(notes, `${s.service === undefined ? 'The repository' : `The service ${show(s.service)}`} has no lockfile, so osv-scanner has nothing to read (it would fail); its ${show(s.needId)} check is not run.`); }
+  }
+  const c: Ctx = { draft, deps, byId, gate, notes, compose };
+  const builds = new Map<string, Job>();
+  for (const s of draft.steps) {
+    if (leaveOut.has(s) || s.needId !== IMAGE_BUILD_NEED || s.tool.id !== PLATFORM_ACTION_IDS['build-push'] || s.service === undefined) continue;
+    if (!draft.needs.some((n) => n.layer === 'merge' && n.id === IMAGE_BUILD_NEED && n.service === s.service)) continue;
+    try { builds.set(s.service, imageBuildJob(c, s)); } catch (e) {
+      if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e;
+      addNote(notes, `The image of ${show(s.service)} is not built or scanned yet: ${safeText(e.message, 200)}`);
+      leaveOut.add(s);
+    }
+  }
+  for (const s of draft.steps) if (ARCHIVE_TOOL_IDS.has(s.tool.id) && (s.service === undefined || !builds.has(s.service))) leaveOut.add(s);
+  // the needs whose every step was left out go too (a findings check with nothing readable is no check of the gate's list)
+  const keep = draft.steps.filter((s) => !leaveOut.has(s));
+  const gone = new Set<Need>();
+  for (const n of draft.needs) {
+    const had = draft.steps.some((s) => s.needId === n.id && s.service === n.service);
+    const has = keep.some((s) => s.needId === n.id && s.service === n.service);
+    if (had && !has) gone.add(n);
+  }
+  draft = narrowed({ ...draft, steps: keep }, gone);
+  c.draft = draft;
+
+  // 3. the layers
+  const push: Record<string, Job> = {};
+  const merge: Record<string, Job> = {};
+  const specsOf = (n: Need): StepSpec[] => draft.steps.filter((s) => s.needId === n.id && s.service === n.service);
+  const add = (into: Record<string, Job>, n: Need): void => {
+    const specs = specsOf(n);
+    const role = roleOf(c, n, specs);
+    if (role === 'none') return;
+    const id = role === 'image-build' ? imageBuildJobId(n.service as string) : jobIdFor(n.id, n.service);
+    if (Object.hasOwn(into, id)) return;
+    if (role === 'image-build') { const b = builds.get(n.service as string); if (b !== undefined) into[id] = b; return; }
+    if (role === 'image-scan') {
+      if (n.layer !== 'merge') return;
+      into[id] = imageScanJob(c, specs.find((s) => ARCHIVE_TOOL_IDS.has(s.tool.id)) as StepSpec);
+      return;
+    }
+    if (specs.length === 0 && !n.blocking) {
+      const svc = serviceNamed(draft, n.service);
+      if (svc === undefined || projectScriptFor(n, svc) === null) return;   // a non-blocking check nothing runs: no job (the gate does not list it)
+    }
+    const range = n.layer === 'merge' && n.id === 'secrets' && n.service === undefined && specs.some((s) => isFindings(toolOf(c, s.tool.id)));
+    try { into[id] = checkJob(c, n, specs, range); } catch (e) {
+      if (!(e instanceof RenderError || e instanceof ArtifactNameError || e instanceof GateJobListError)) throw e;
+      if (blocks(draft, n.id, n.service)) fail(`The blocking check ${where(n)} can not be written: ${safeText(e.message, 300)}`);
+      addNote(notes, `The non-blocking check ${where(n)} is not run: ${safeText(e.message, 200)}`);
+    }
+  };
+  for (const n of draft.needs) if (n.layer === 'push') add(push, n);
+  for (const n of draft.needs) if (n.layer === 'merge') add(merge, n);
+  // a non-blocking check that could not be written leaves the draft too, so the gate does not read a result nobody makes
+  const unwritten = new Set(draft.needs.filter((n) => n.layer === 'merge' && roleOf(c, n, specsOf(n)) === 'check' && specsOf(n).length > 0 && !Object.hasOwn(merge, jobIdFor(n.id, n.service))));
+  if (unwritten.size > 0) { draft = narrowed(draft, unwritten); c.draft = draft; }
+
+  // the secrets scan is always there (the floor, never skippable)
+  if (!Object.hasOwn(merge, jobIdFor('secrets'))) fail('The draft has no repository-wide secrets scan in the merge layer; it is always part of the pipeline.');
+  const baseSpecs = draft.steps.filter((s) => draft.needs.some((n) => n.layer === 'merge' && n.id === s.needId && n.service === s.service) && !ARCHIVE_TOOL_IDS.has(s.tool.id) && s.tool.id !== PLATFORM_ACTION_IDS['build-push'] && isFindings(toolOf(c, s.tool.id)) && toolOf(c, s.tool.id).candidate.kind !== 'action');
+  merge[BASELINE_CHECK_JOB] = job([egressStepFor([], { userSecret: false, dockerNetworks: false, job: BASELINE_CHECK_JOB }), renderBaselineCheckStep(gate)], { permissions: { contents: 'read', actions: 'read' } });
+  merge['base-scan'] = baseScanJob(c, baseSpecs);
+  let listJobs: string[];
+  try { listJobs = gateJobList(draft).map((e) => e.job); } catch (e) { if (e instanceof GateJobListError) return fail(e.message); throw e; }
+  const missing = [...new Set(listJobs)].filter((j) => !Object.hasOwn(merge, j));
+  if (missing.length > 0) fail(`The gate would wait for jobs that are not written (${missing.map(show).join(', ')}).`);
+  let gateStep: RenderedStep;
+  try { gateStep = renderGateStep(gate, draft); } catch (e) { if (e instanceof RenderError) return fail(e.message); throw e; }
+  merge.gate = {
+    name: GATE_JOB_NAME, 'runs-on': JOB_RUNNER, 'timeout-minutes': JOB_MINUTES, needs: [...new Set([...listJobs, 'base-scan'])], if: 'always()',
+    permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' }, 'cache-mode': 'none',
+    steps: [egressStepFor([], { userSecret: false, dockerNetworks: false, job: 'gate' }), gateStep, ...renderGateUploads(deps.platform)],
+  };
+  const nightly: Record<string, Job> = {
+    nightly: {
+      'runs-on': JOB_RUNNER, 'timeout-minutes': JOB_MINUTES, permissions: { contents: 'read', actions: 'read', issues: 'write' }, concurrency: NIGHTLY_CONCURRENCY, 'cache-mode': 'none',
+      steps: [egressStepFor([], { userSecret: false, dockerNetworks: false, job: 'nightly' }), renderNightlyStep(gate, draft)],
+    },
+  };
+
+  // 4. signing: G3's job for the delivered mode, none for the proof or a skipped deploy
+  let sign: SignJob | null = null;
+  if (deps.mode !== 'none' && !input.skipped.some((p) => p.part === 'deploy')) {
+    try { sign = signJob(draft, deps.mode, { reviewed: deps.reviewed, platform: deps.platform }); } catch (e) {
+      if (!(e instanceof RenderError) || deps.mode !== 'attest') throw e;
+      addNote(notes, 'The images are not signed yet: attest signing lands with the gate re-pin batch (G15), and pipegen never falls back to another mode.');
+    }
+  }
+  if (deps.mode === 'none' || input.skipped.some((p) => p.part === 'deploy')) { const { signing: _s, ...rest } = draft; draft = rest; }
+  return { draft, push, merge, nightly, sign, notes };
+}
+
+function addNote(notes: string[], line: string): void { if (!notes.includes(line)) notes.push(line); }
+
+/** The draft without these needs, and without the steps no remaining need runs (a step is per need key, every layer). */
+function narrowed(draft: PipelineDraft, drop: ReadonlySet<Need>): PipelineDraft {
+  if (drop.size === 0) return draft;
+  const needs = draft.needs.filter((n) => !drop.has(n));
+  const steps = draft.steps.filter((s) => needs.some((n) => n.id === s.needId && n.service === s.service));
+  return { ...draft, needs, steps };
+}
+
+/** Whether osv-scanner has a lockfile to read: the service's own (or, repo-wide, any service's) package manager the reader found. */
+function hasLockfile(draft: PipelineDraft, service: string | undefined): boolean {
+  const svcs = service === undefined ? draft.profile.services : draft.profile.services.filter((s) => s.name === service);
+  return svcs.some((s) => s.packageManager !== undefined || (s.alsoPackageManagers ?? []).length > 0);
+}

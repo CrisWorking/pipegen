@@ -15,6 +15,13 @@
 //   OIDC token and the registry write that stores the signature (no environment, no key, no attestations). cache-mode: none. Attest mode
 //   (actions/attest v4) can not be written yet: its subject-digest is a run-time value, and the reviewed input table (tool-flags.ts, inside
 //   the gate bundle) takes only a literal digest (carry to G15, which also binds that digest to the image hand-off).
+// - Egress (G4, carry G3 ruling 5 and P-3): the key-env job starts with the reviewed egress step (Bullfrog, block mode): github-core, the
+//   cosign release download (github-releases) and the registry the signature goes to (ghcr). It is the one step besides the three above the
+//   referee allows in a job that holds the key. key-env signs with --tlog-upload=false and --use-signing-config=false, so it needs no Sigstore
+//   host (as the proof's sign-roundtrip). The keyless job has none: it needs Sigstore's signing and log hosts and the per-run OIDC token host,
+//   which no reviewed set lists (a set is a gate-bundle change, egress-sets.ts), so a block would fail every keyless signature; it runs only
+//   pipegen's own steps (no repo code, no third-party action), and the live checklist decides its hosts. The artifact blob host of the digest
+//   download is not listable either (E0d-2; the same live item as every other job's artifacts).
 // - The caller job (G2-R-sec2): a deploy job of the app's pipegen.yml, `if: DEPLOY_PUSH_IF` (a push to the default branch), needing the
 //   job that holds the gate, pinned to the recorded central commit, granted exactly the sign job's permissions, passing no secret (the
 //   environment's secrets reach the called job through its own `environment:`). A repository outside pipegen's judged files can still call
@@ -29,6 +36,7 @@ import { SIGNING_ENVIRONMENT } from '../engine/referee.js';
 import { RenderError, show } from '../engine/render-error.js';
 import { renderPlatformStep, stepsToYaml } from '../engine/render-step.js';
 import { COSIGN_ID, imageDigestArtifact, renderSignSteps, SIGN_REGISTRY, type SignedImage } from '../engine/signing.js';
+import { egressSetsForTool, renderEgressStep } from '../engine/egress.js';
 import { signingMode, type SigningMode } from '../github/signing-mode.js';
 import type { Capabilities, CreatedFile, PipelineDraft, RepoProfile, ReviewedTool, SigningPlan } from '../types.js';
 
@@ -171,6 +179,8 @@ export function signJob(draft: PipelineDraft, mode: SigningMode, deps: { reviewe
     name: 'pipegen sign', 'runs-on': SIGN_RUNNER, 'timeout-minutes': SIGN_JOB_MINUTES, permissions: signPermissions(plan.mode),
     'cache-mode': 'none', steps: [...downloads, install, ...rendered.map((r) => r[1] as RenderedStep)],
   };
+  // G4 (carry G3 ruling 5): key-env's egress block first; keyless has none (see the header)
+  if (plan.mode === 'key-env') job.steps.unshift(renderEgressStep([...new Set([...egressSetsForTool(cosign), 'ghcr' as const])].sort(), { dockerNetworks: false }));
   if (plan.mode === 'key-env') job.environment = SIGNING_ENVIRONMENT;
   return job;
 }

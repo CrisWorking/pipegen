@@ -4,7 +4,7 @@
 // tool-flags.ts and types.ts (test/final-fix-b.test.ts and test/module-graph.test.ts check this).
 import { EXPR, own, RenderError, show } from './render-error.js';
 import { GATE_RESULT_ARTIFACT, resultArtifactName, SECRETS_RANGE_ARTIFACT, slug } from './artifact-names.js';
-import { ARGV_POLICIES, BASE_CHECKOUT_REF, GATE_OPTIONAL_UPLOADS, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, isGateUploadName, CHECKER_STEP_ID_RE, GATE_USES_RE, isStagedTool, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, stagePath, stageStepId, STAGE_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
+import { ARGV_POLICIES, BASE_CHECKOUT_REF, GATE_OPTIONAL_UPLOADS, RANGE_BEFORE_REF, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, isGateUploadName, CHECKER_STEP_ID_RE, GATE_USES_RE, isStagedTool, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, stagePath, stageStepId, STAGE_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
 
 /** One step of a job, as pipegen renders it. `usesComment` becomes the trailing `# <version>` comment on `uses:`. */
 export interface RenderedStep {
@@ -511,6 +511,65 @@ const isDigestStep = (s: RenderedStep): boolean => s.id === DIGEST_STEP_ID && ty
 /** The one form of a job output taken from a step's output. */
 export const stepOutputForm = (stepId: string, output: string): string => `\${{ steps.${stepId}.outputs.${output} }}`;
 
+// ---------- Plan G G4: the base scan's baseline condition (carry G1→G4, G21) and the pre-push head fetch (carry C9r1) ----------
+
+/** The job that looks for the stored trusted baseline (gate mode baseline-check); its one output is `found` (found | missing). */
+export const BASELINE_CHECK_JOB = 'baseline-check';
+/**
+ * G21 (carry G1→G4): the one condition of a base-scan step whose scanner runs on the base commit only when there is no trusted baseline (the
+ * baseline-check job's `found` is not `found`): on the tool's own install and run steps. Its scrub and its upload take the second form (`always()`
+ * first, so a failed scan still reports a tool error, as without a condition). With a baseline, the gate counts that tool's old findings from
+ * the baseline (decide.ts), so skipping its base run changes nothing it reads. String equality only: the renderer writes these constants and the
+ * referee compares them; no other step condition reads a job output.
+ */
+export const BASELINE_MISSING_IF = "needs.baseline-check.outputs.found != 'found'";
+export const BASELINE_MISSING_ALWAYS_IF = "always() && needs.baseline-check.outputs.found != 'found'";
+/** The two base-scan step conditions (checkExpressions accepts them on any step; the referee holds them to base-scan and the categories below). */
+export const BASELINE_STEP_IFS: ReadonlySet<string> = new Set([BASELINE_MISSING_IF, BASELINE_MISSING_ALWAYS_IF]);
+/**
+ * The categories whose base twin ALWAYS runs in base-scan (plan "Base scan"; carry G32): the dependency scanners (a vulnerability published
+ * since the baseline is old on the base, not new in the PR) and the licence scan; the image scanners too, which have no base twin yet (B6,
+ * C-MUST-1). Their base steps never carry a baseline condition (the referee refuses one).
+ */
+export const BASE_ALWAYS_CATEGORIES: ReadonlySet<string> = new Set(['deps', 'dependency-review', 'licences', 'image-scan']);
+
+/**
+ * C9r1 (Plan C final review): the pre-push head fetch of the secrets job. On a pull request's synchronize after a force-push, the range scan reads
+ * the commits the push replaced (`before`); a private repository's checkout keeps no credentials, so the range step's own fetch of `before`
+ * fails and the pull request blocks once per force-push. This separate pipegen-only step fetches `before` by sha with the job's own token
+ * (`contents: read`), handed to git through its config environment variables for that one command (never a file, never a URL, never the scanner
+ * step), and masked. It does nothing on any other event, or when the commit is already in the checkout; a failed fetch fails the step (the range
+ * scan then does not run, and its scrub reports a tool error: fail closed). A checker id, so the order rule reads it as pipegen's own.
+ */
+export const RANGE_FETCH_STEP_ID = `checker-run-${sha16('pipegen-range-fetch-before')}`;
+export const RANGE_FETCH_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_RANGE_BEFORE: RANGE_BEFORE_REF, PIPEGEN_FETCH_TOKEN: '${{ github.token }}' });
+const RANGE_FETCH_RUN = [
+  'set -euo pipefail',
+  'unset CDPATH',
+  'pg_fail() { echo "pipegen: $1" >&2; exit 1; }',
+  `zero=${'0'.repeat(40)}`,
+  'before="$PIPEGEN_RANGE_BEFORE"',
+  'token="$PIPEGEN_FETCH_TOKEN"',
+  'unset PIPEGEN_FETCH_TOKEN',
+  'case "$before" in *[!0-9a-f]*|"") pg_fail "the head before this push is not a commit sha, so it is not fetched" ;; esac',
+  '[ "${#before}" -eq 40 ] || pg_fail "the head before this push is not a commit sha, so it is not fetched"',
+  'if [ "$before" = "$zero" ]; then echo "pipegen: this event replaced no earlier head; nothing to fetch"; exit 0; fi',
+  'git=(/usr/bin/env -i "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" "HOME=$RUNNER_TEMP" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ALLOW_PROTOCOL=https GIT_NO_REPLACE_OBJECTS=1)',
+  'if "${git[@]}" /usr/bin/git cat-file -e "$before^{commit}" 2> /dev/null; then echo "pipegen: the head before this push is in the checkout already"; exit 0; fi',
+  'auth="$(printf \'x-access-token:%s\' "$token" | base64 -w0)"',
+  'unset token',
+  'echo "::add-mask::$auth"',
+  '"${git[@]}" GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader "GIT_CONFIG_VALUE_0=AUTHORIZATION: basic $auth" /usr/bin/git fetch --quiet --no-tags --no-recurse-submodules origin "$before" > /dev/null 2>&1 || pg_fail "the head before this push ($before) could not be fetched, so the commits it replaced can not be scanned"',
+  'unset auth',
+  '"${git[@]}" /usr/bin/git cat-file -e "$before^{commit}" 2> /dev/null || pg_fail "the head before this push ($before) is not in the checkout after the fetch"',
+  'echo "pipegen: fetched the head before this push, $before"',
+  '',
+].join('\n');
+/** The one pre-push head fetch step pipegen renders (C9r1), before the range scan in the secrets job; the referee recognises it by its exact content. */
+export function renderRangeFetchStep(): RenderedStep {
+  return { id: RANGE_FETCH_STEP_ID, name: 'pipegen: fetch the head this push replaced (for the commit-range scan)', run: RANGE_FETCH_RUN, shell: 'bash', env: { BASH_ENV: '', ENV: '', ...RANGE_FETCH_STEP_ENV } };
+}
+
 // ---------- Plan G G2: signing, verification and the image hand-off (rulings B3 b, B6; carries C0c, F-4) ----------
 // The exact forms the signing renderer (signing.ts), the image hand-off renderer (image-handoff.ts) and the referee share. As for G1's forms,
 // the renderer writes them and the referee compares by equality; a step is recognised by its whole content, these only say which expression
@@ -729,7 +788,8 @@ export function checkExpressions(step: RenderedStep): void {
     if (typeof v === 'string' && v.includes(EXPR)) bad(key);
   }
   if (typeof step.usesComment === 'string' && step.usesComment.includes(EXPR)) bad('usesComment');
-  if (step.if !== undefined && (typeof step.if !== 'string' || !IF_VALUES.has(step.if))) odd('if');
+  // G4 (G21): the two base-scan baseline conditions are accepted here too; the referee holds them to base-scan and its conditional categories
+  if (step.if !== undefined && (typeof step.if !== 'string' || !(IF_VALUES.has(step.if) || BASELINE_STEP_IFS.has(step.if)))) odd('if');
   const coe: unknown = step['continue-on-error'];
   if (coe !== undefined && typeof coe !== 'boolean') odd('continue-on-error');
   const tm: unknown = step['timeout-minutes'];
@@ -745,6 +805,8 @@ export function checkExpressions(step: RenderedStep): void {
       if (group === 'env') {
         // C9: the commit-range scan step (its id, a run step) carries this event's base and head commits, each exactly its form
         if (step.id === rangeScanStepId && step.run !== undefined && step.uses === undefined && Object.hasOwn(RANGE_STEP_ENV, k) && RANGE_STEP_ENV[k] === v) continue;
+        // G4 (C9r1): the pre-push head fetch step carries exactly its own forms (the event's earlier head and the job's own token)
+        if (step.id === RANGE_FETCH_STEP_ID && step.run !== undefined && step.uses === undefined && own(RANGE_FETCH_STEP_ENV, k) === v) continue;
         // G1 (BP-6): the pr-check lookup step, exactly as renderPrCheckStep writes it (every field that runs), carries the job's own token
         if (Object.hasOwn(PR_CHECK_STEP_ENV, k) && PR_CHECK_STEP_ENV[k] === v && isPrCheckStep(step)) continue;
         // G2 (B3 b, B6): a run step with the sign, verify or image-check id carries exactly its own forms (the referee recognises the whole

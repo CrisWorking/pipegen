@@ -106,12 +106,16 @@ describe('G3: central shared files (Plan G Task 1)', () => {
     expect(sign.run).toBe(g2[1]?.run);
     // the digest of each image comes from its hand-off artifact, downloaded first; then the reviewed cosign, then the sign step (which logs in
     // to ghcr.io itself, G3-R3: no third-party action in the job that holds the key)
+    // G4 (carry G3 ruling 5): the reviewed egress step first (github-core, the cosign release and ghcr.io; no Sigstore host: no public log)
     const kinds = (j.steps as Obj[]).map((s) => (s.uses ?? s.id ?? s.name) as string);
-    expect(kinds).toHaveLength(3);
-    expect(kinds[0]).toMatch(/^actions\/download-artifact@/);
-    expect((j.steps as Obj[])[0]?.with).toEqual({ name: imageDigestArtifact('app'), path: `\${{ runner.temp }}/pipegen-out/${imageDigestArtifact('app')}` });
-    expect((j.steps as Obj[])[1]?.run).toBe(g2[0]?.run);
-    expect((j.steps as Obj[])[2]).toBe(sign);
+    expect(kinds).toHaveLength(4);
+    expect(kinds[0]).toMatch(/^bullfrogsec\/bullfrog@/);
+    expect(String((j.steps as Obj[])[0]?.with?.['allowed-domains']).split('\n')).toEqual(['api.github.com', 'codeload.github.com', 'ghcr.io', 'github.com', 'objects.githubusercontent.com', 'pkg-containers.githubusercontent.com', 'release-assets.githubusercontent.com']);
+    expect((j.steps as Obj[])[0]?.with?.['allowed-ips']).toBeUndefined();
+    expect(kinds[1]).toMatch(/^actions\/download-artifact@/);
+    expect((j.steps as Obj[])[1]?.with).toEqual({ name: imageDigestArtifact('app'), path: `\${{ runner.temp }}/pipegen-out/${imageDigestArtifact('app')}` });
+    expect((j.steps as Obj[])[2]?.run).toBe(g2[0]?.run);
+    expect((j.steps as Obj[])[3]).toBe(sign);
     expect(JSON.stringify(j.steps)).not.toMatch(/login-action/);
     // the mode is code-chosen: without the proven branch policy (deploymentBranchPolicies) a key any branch could read is never used
     expect(() => signJob(keDraft({ capabilities: { ...KE_CAPS, deploymentBranchPolicies: false } }), 'key-env', deps)).toThrow(RenderError);
@@ -442,7 +446,7 @@ describe('G3 fix round 2 (G3-R3)', () => {
     const { usesComment: _c, ...rest } = renderPlatformStep('docker-login', p, { username: '${{ github.actor }}', [['pass', 'word'].join('')]: `\${{ ${SEC_FIELD}.GITHUB_TOKEN }}` }, { registry: 'ghcr.io' }) as Obj;
     return rest;
   };
-  const only = (r: { issues: { check: string; message: string }[] }): boolean => r.issues.some((i) => i.check === 'permissions' && /holds the signing identity, so it runs only the digest download, the pinned cosign install and the sign step/.test(i.message));
+  const only = (r: { issues: { check: string; message: string }[] }): boolean => r.issues.some((i) => i.check === 'permissions' && /holds the signing identity, so it runs only the egress step \(first\), the digest download, the pinned cosign install and the sign step/.test(i.message));
 
   it('render: the sign step logs in to ghcr.io itself with cosign login --password-stdin; no login action in the sign job (G3-R3)', () => {
     const cosign = entry('cosign');
@@ -457,7 +461,8 @@ describe('G3 fix round 2 (G3-R3)', () => {
       // the rendered job: only the digest download, the pinned install and the sign step
       const d = mode === 'key-env' ? keDraft() : draftOf({ capabilities: { ...CAPS_BASE, keylessSigningAllowed: true }, signing: { mode: 'keyless', images: [IMG] } });
       const j = signJob(d, mode, deps);
-      expect(j.steps.map((s) => (s.uses?.split('@')[0] ?? (s.id === step?.id ? 'sign' : s.name))), mode).toEqual(['actions/download-artifact', 'pipegen: install cosign', 'sign']);
+      // G4: key-env starts with the egress step (the one exception); keyless has none (its Sigstore and OIDC hosts are in no reviewed set)
+      expect(j.steps.map((s) => (s.uses?.split('@')[0] ?? (s.id === step?.id ? 'sign' : s.name))), mode).toEqual([...(mode === 'key-env' ? ['bullfrogsec/bullfrog'] : []), 'actions/download-artifact', 'pipegen: install cosign', 'sign']);
     }
     // the login sends the workflow token, so an image off ghcr.io is refused by the renderer itself
     expect(() => renderSignSteps(cosign, 'key-env', { service: 'app', repo: 'docker.io/o/app' })).toThrow(/ghcr\.io/);
@@ -472,10 +477,19 @@ describe('G3 fix round 2 (G3-R3)', () => {
     const extra: [string, Obj][] = [['login', loginStep()], ['checkout', (renderPlatformStep('checkout', p, {}, { 'fetch-depth': '1' }) as Obj)]];
     for (const [what, st] of extra) {
       const { usesComment: _u, ...plain } = st;
-      for (const at of [0, 2, 3]) {
+      for (const at of [0, 1, 3, 4]) {
         const f = editSign(file, (sj) => { sj.steps.splice(at, 0, plain); });
         expect(only(await judge([f, caller], d)), `${what} at ${at}`).toBe(true);
       }
+    }
+    // G4: the egress step only as the first step, and once
+    {
+      const egress = (file.content.match(/bullfrogsec\/bullfrog@/g) ?? []).length;
+      expect(egress).toBe(1);
+      const moved = editSign(file, (sj) => { const [e] = sj.steps.splice(0, 1); sj.steps.splice(2, 0, e); });
+      expect(only(await judge([moved, caller], d)), 'egress moved').toBe(true);
+      const twice = editSign(file, (sj) => { sj.steps.splice(1, 0, structuredClone(sj.steps[0])); });
+      expect(only(await judge([twice, caller], d)), 'egress twice').toBe(true);
     }
     // keyless (its job holds an OIDC token): the same allowlist
     const pub = draftOf({ capabilities: { ...CAPS_BASE, keylessSigningAllowed: true }, signing: { mode: 'keyless', images: [IMG] } });
