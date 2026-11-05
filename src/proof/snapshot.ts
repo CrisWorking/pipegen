@@ -53,6 +53,7 @@ import { safeText } from '../util/safe-text.js';
 import {
   createPushRepo, gitPush, GitTransportError, isDirty, readSnapshot, runGit, type DroppedEntry, type PushRef, type PushRepoHandle,
 } from './git.js';
+import { plantedKeyValue } from './planted-value.js';
 import { setScratchDefaultBranch, type DefaultBranchState } from './repos.js';
 import { checkProofWorkflows, isCompatCopy, type ProofCheckFile, type ProofCheckOptions, type ProofWorkflowKind } from './workflow-check.js';
 import {
@@ -859,15 +860,11 @@ export interface PlantedPlacement {
   nonUtf8?: boolean;
 }
 
-const B62 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-/** 32 base62 characters with a digit, an upper and a lower letter: gitleaks' generic rule, no provider format. */
-function plantedValue(random: (n: number) => Uint8Array): string {
-  for (;;) {
-    let v = '';
-    while (v.length < 32) for (const b of random(48)) if (b < 248 && v.length < 32) v += B62[b % 62];
-    if (/[0-9]/.test(v) && /[A-Z]/.test(v) && /[a-z]/.test(v)) return v;
-  }
-}
+/**
+ * 32 base62 characters for gitleaks' generic rule, no provider format: the one planted-value rule (planted-value.ts, F5-R2), so
+ * the scanners' stopword filter can't drop a placement at random.
+ */
+const plantedValue = (random: (n: number) => Uint8Array): string => plantedKeyValue(32, random);
 
 const NON_UTF8_NAME = Buffer.concat([Buffer.from('pipegen-c1b/k'), Buffer.from([0xe9]), Buffer.from('y.txt')]);
 /** The C1b placements (plan carry E:457): paths outside pipegen-planted/ that path allowlists commonly skip. */

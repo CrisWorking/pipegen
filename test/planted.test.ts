@@ -6,14 +6,16 @@
 // - isPlantedPath: the delivery exclusion rule (Plan G), a pipegen-planted segment at any depth.
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, expectTypeOf, it, vi } from 'vitest';
+import { beforeAll, describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { findSecretLike } from '../src/ai/redact.js';
 import {
   isPlantedPath, matchPlanted, PLANTED_CATEGORIES, PLANTED_DIR, PLANTED_FIXTURES, PLANTED_ITEM_TEXT, PLANTED_SECRET_LENGTH, PlantedError, plantedFiles, plantedSecret,
   type PlantedItem,
 } from '../src/debate/planted.js';
+import { needKeyOf } from '../src/debate/need-ref.js';
 import { floorNeeds } from '../src/engine/needs.js';
 import type { EvalContext, PlantedItem as EvalPlantedItem } from '../src/proof/evaluate.js';
+import { asFindings, type GateFinding, type SourcedFinding } from '../src/proof/gate-result.js';
 import { isWorkflowPath, plantedSecretPlacements, type ProofFile } from '../src/proof/snapshot.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
 import type { Capabilities, CreatedFile, Finding, RepoProfile, Service, Severity } from '../src/types.js';
@@ -63,14 +65,20 @@ const MONO = profile({
 });
 
 const byPath = (files: readonly ProofFile[]) => new Map(files.map((f) => [f.path as string, f.content as string]));
-const finding = (tool: string, file: string | undefined, severity: Severity = 'high', ruleId = 'r'): Finding => ({
-  tool, ruleId, severity, ...(file === undefined ? {} : { file }), message: `${ruleId} (x)`, fingerprint: `x:${tool}:${ruleId}:${file ?? ''}`,
+/** A finding as asFindings gives it: `needKey` is the job (need key) that produced it; `null` leaves the origin out. */
+const finding = (tool: string, file: string | undefined, severity: Severity = 'high', ruleId = 'r', needKey: string | null = KEY_OF_TOOL.get(tool) ?? 'x'): SourcedFinding => ({
+  tool, ruleId, severity, ...(file === undefined ? {} : { file }), message: `${ruleId} (x)`, fingerprint: `x:${needKey ?? ''}:${tool}:${ruleId}:${file ?? ''}:`,
+  ...(needKey === null ? {} : { needId: needKey.split('--')[0] as string, needKey }),
 });
 // the planted file's one line, spelled at run time (a key word before '=' in a committed file trips test/no-secret-literals)
 const KEY_LINE = new RegExp(`^${['api', 'key'].join('_')} = "[A-Za-z0-9]{40}"\\n$`);
+// GateFinding's boolean flag name, spelled at run time (a key word before ':' trips test/no-secret-literals)
+const IS_KEY = ['sec', 'ret'].join('') as 'secret';
 const TOOLS = new Map([['secrets', 'gitleaks'], ['sast', 'semgrep'], ['deps', 'osv-scanner'], ['iac', 'trivy-config']]);
-/** A finding by the right tool on every expected item's own file. */
-const allCaught = (expected: readonly PlantedItem[], severity: Severity = 'high') => expected.map((e) => finding(TOOLS.get(e.category) as string, e.file, severity));
+/** The default producing job of a hand-made finding (the root service 'web' of MONO for the per-service tools). */
+const KEY_OF_TOOL = new Map([['gitleaks', 'secrets'], ['semgrep', 'sast--web'], ['osv-scanner', 'deps--web'], ['trivy-config', 'iac']]);
+/** A finding by the right tool, from the item's own job, on every expected item's own file. */
+const allCaught = (expected: readonly PlantedItem[], severity: Severity = 'high') => expected.map((e) => finding(TOOLS.get(e.category) as string, e.file, severity, 'r', e.needKey));
 
 // ---------- placement ----------
 
@@ -99,40 +107,54 @@ describe('planted files', () => {
     const { files, expected } = plantedFiles(MONO, { random: seq() });
     const paths = files.map((f) => f.path as string).sort();
     expect(paths).toEqual([
-      'packages/lib/pipegen-planted/deps-node-packages-lib/package-lock.json',
-      'packages/lib/pipegen-planted/deps-node-packages-lib/package.json',
-      'packages/lib/pipegen-planted/sast-node-packages-lib.js',
+      'packages/lib/pipegen-planted/deps-node-lib/package-lock.json',
+      'packages/lib/pipegen-planted/deps-node-lib/package.json',
+      'packages/lib/pipegen-planted/sast-node-lib.js',
       'pipegen-planted/config.txt',
-      'pipegen-planted/deps-node/package-lock.json',
-      'pipegen-planted/deps-node/package.json',
+      'pipegen-planted/deps-node-web/package-lock.json',
+      'pipegen-planted/deps-node-web/package.json',
       'pipegen-planted/main.tf',
-      'pipegen-planted/sast-node.js',
-      'services/api/pipegen-planted/deps-python-services-api/requirements.txt',
-      'services/api/pipegen-planted/sast-python-services-api.py',
+      'pipegen-planted/sast-node-web.js',
+      'services/api/pipegen-planted/deps-python-api/requirements.txt',
+      'services/api/pipegen-planted/deps-python-worker/requirements.txt',
+      'services/api/pipegen-planted/sast-python-api.py',
+      'services/api/pipegen-planted/sast-python-worker.py',
     ]);
-    const items = Object.fromEntries(expected.filter((e) => e.category !== 'secrets').map((e) => [e.id, { category: e.category, file: e.file, critical: e.critical }]));
-    const repoWide = expected.filter((e) => e.category === 'secrets').map((e) => [e.id, e.file, e.critical]);
-    expect(repoWide).toEqual([['secret', 'pipegen-planted/config.txt', true]]);
+    const items = Object.fromEntries(expected.filter((e) => e.category !== 'secrets').map((e) => [e.id, { category: e.category, file: e.file, critical: e.critical, needKey: e.needKey }]));
+    const repoWide = expected.filter((e) => e.category === 'secrets').map((e) => [e.id, e.file, e.critical, e.needKey]);
+    expect(repoWide).toEqual([['secret', 'pipegen-planted/config.txt', true, 'secrets']]);
     expect(items).toEqual({
-      iac: { category: 'iac', file: 'pipegen-planted/main.tf', critical: false },
-      'sast-node': { category: 'sast', file: 'pipegen-planted/sast-node.js', critical: false },
-      'deps-node': { category: 'deps', file: 'pipegen-planted/deps-node/package-lock.json', critical: true },
-      'sast-python--services-api': { category: 'sast', file: 'services/api/pipegen-planted/sast-python-services-api.py', critical: false },
-      'deps-python--services-api': { category: 'deps', file: 'services/api/pipegen-planted/deps-python-services-api/requirements.txt', critical: true },
-      'sast-node--packages-lib': { category: 'sast', file: 'packages/lib/pipegen-planted/sast-node-packages-lib.js', critical: false },
-      'deps-node--packages-lib': { category: 'deps', file: 'packages/lib/pipegen-planted/deps-node-packages-lib/package-lock.json', critical: true },
+      iac: { category: 'iac', file: 'pipegen-planted/main.tf', critical: false, needKey: 'iac' },
+      'sast-node--web': { category: 'sast', file: 'pipegen-planted/sast-node-web.js', critical: false, needKey: 'sast--web' },
+      'deps-node--web': { category: 'deps', file: 'pipegen-planted/deps-node-web/package-lock.json', critical: true, needKey: 'deps--web' },
+      'sast-python--api': { category: 'sast', file: 'services/api/pipegen-planted/sast-python-api.py', critical: false, needKey: 'sast--api' },
+      'deps-python--api': { category: 'deps', file: 'services/api/pipegen-planted/deps-python-api/requirements.txt', critical: true, needKey: 'deps--api' },
+      'sast-python--worker': { category: 'sast', file: 'services/api/pipegen-planted/sast-python-worker.py', critical: false, needKey: 'sast--worker' },
+      'deps-python--worker': { category: 'deps', file: 'services/api/pipegen-planted/deps-python-worker/requirements.txt', critical: true, needKey: 'deps--worker' },
+      'sast-node--lib': { category: 'sast', file: 'packages/lib/pipegen-planted/sast-node-lib.js', critical: false, needKey: 'sast--lib' },
+      'deps-node--lib': { category: 'deps', file: 'packages/lib/pipegen-planted/deps-node-lib/package-lock.json', critical: true, needKey: 'deps--lib' },
     });
-    // the go service (no planted template for its language) gets nothing, and no file lands in its folder
+    // each item's need key is the gate job key of its own need (F0's need key: jobIdFor(category, service))
+    for (const e of expected) {
+      const s = MONO.services.find((x) => e.id.endsWith(`--${x.name}`));
+      expect(e.needKey).toBe(needKeyOf({ id: e.category, ...(s === undefined ? {} : { service: s.name }) }));
+    }
+    // the go service (no planted template for its language) gets nothing, and no file lands in its folder; a go-only repo
+    // plants only the repo-wide items (a check, not a crash: m5)
     expect(paths.some((p) => p.startsWith('tools/'))).toBe(false);
-    // two services in one folder with one language share one item; a second language in that folder gets its own
+    let goOnly: string[] = [];
+    expect(() => { goOnly = plantedFiles(profile({ services: [svc({ name: 'g', language: 'go', packageManager: undefined }), svc({ name: 'j', path: 'j', language: 'java', packageManager: undefined })] }), { random: seq() }).expected.map((e) => e.id); }).not.toThrow();
+    expect(goOnly).toEqual(['secret']);
+    // every service gets its own items, also two in one folder with one language: each service's own job must catch its own
     const two = plantedFiles(profile({ services: [svc({ name: 'a' }), svc({ name: 'b', language: 'python', packageManager: 'pip' }), svc({ name: 'c' })] }), { random: seq() });
-    expect(two.expected.map((e) => e.id)).toEqual(['secret', 'sast-node', 'deps-node', 'sast-python', 'deps-python']);
-    // folders whose slugs are the same get distinct names, so a service-relative path never names two items
-    const clash = plantedFiles(profile({ services: [svc({ name: 'x', path: 'a/b' }), svc({ name: 'y', path: 'a-b' })] }), { random: seq() });
-    const rel = clash.expected.filter((e) => e.category !== 'secrets').map((e) => e.file.slice(e.file.indexOf(PLANTED_DIR)));
+    expect(two.expected.map((e) => e.id)).toEqual(['secret', 'sast-node--a', 'deps-node--a', 'sast-python--b', 'deps-python--b', 'sast-node--c', 'deps-node--c']);
+    // names come from the service's need key, so a service-relative path never names two items
+    const rel = expected.filter((e) => e.category !== 'secrets').map((e) => e.file.slice(e.file.indexOf(PLANTED_DIR)));
     expect(new Set(rel).size).toBe(rel.length);
-    expect(new Set(clash.expected.map((e) => e.id)).size).toBe(clash.expected.length);
-    // a folder with no letters or digits still gets a name of its own
+    // two services whose names give one need key (or none) are refused, never merged
+    expect(() => plantedFiles(profile({ services: [svc({ name: 'A b', path: 'x' }), svc({ name: 'a-b', path: 'y' })] }), { random: seq() })).toThrow(PlantedError);
+    expect(() => plantedFiles(profile({ services: [svc({ name: '__', path: 'x' })] }), { random: seq() })).toThrow(PlantedError);
+    // a folder with no letters or digits is fine: the names come from the service
     const odd = plantedFiles(profile({ services: [svc({ name: 'x', path: '__' }), svc({ name: 'y', path: '_-_' })] }), { random: seq() });
     expect(new Set(odd.files.map((f) => f.path)).size).toBe(odd.files.length);
     expect(new Set(odd.expected.map((e) => e.id)).size).toBe(odd.expected.length);
@@ -149,7 +171,7 @@ describe('planted files', () => {
     const { files, expected } = plantedFiles(MONO, { random: seq() });
     const MANIFESTS = new Set(['package.json', 'package-lock.json', 'requirements.txt']);
     const deps = expected.filter((e) => e.category === 'deps');
-    expect(deps).toHaveLength(3);
+    expect(deps).toHaveLength(4);
     const oneLevel = (glob: string, folder: string) => {
       // a workspace glob of one segment ('*' or 'name'): matches exactly one folder level below the service root
       const g = glob.split('/'), f = folder.split('/');
@@ -169,7 +191,7 @@ describe('planted files', () => {
     // no manifest directly at a planted folder's top (a '*' workspace glob would take that folder into the install)
     for (const f of files) expect(f.path as string).not.toMatch(/(?:^|\/)pipegen-planted\/(?:package(?:-lock)?\.json|requirements\.txt)$/);
     // each deps item names the lockfile osv-scanner reads, in its own manifest folder
-    for (const e of deps) expect(e.file).toMatch(/\/pipegen-planted\/deps-(?:node|python)[a-z0-9-]*\/(?:package-lock\.json|requirements\.txt)$|^pipegen-planted\/deps-(?:node|python)\/(?:package-lock\.json|requirements\.txt)$/);
+    for (const e of deps) expect(e.file).toMatch(/(?:^|\/)pipegen-planted\/deps-(?:node|python)-[a-z0-9-]+\/(?:package-lock\.json|requirements\.txt)$/);
   });
 
   it('planted: files are ProofFiles, never CreatedFiles; no planted path is a workflow or bot config', () => {
@@ -197,7 +219,7 @@ describe('planted files', () => {
   it('planted: iac only when terraform present', () => {
     const withTf = plantedFiles(profile({ terraformDirs: ['infra'] }), { random: seq() });
     const iac = withTf.expected.filter((e) => e.category === 'iac');
-    expect(iac).toEqual([{ id: 'iac', category: 'iac', item: PLANTED_ITEM_TEXT.iac, file: 'pipegen-planted/main.tf', critical: false, minSeverity: 'high' }]);
+    expect(iac).toEqual([{ id: 'iac', category: 'iac', item: PLANTED_ITEM_TEXT.iac, file: 'pipegen-planted/main.tf', critical: false, minSeverity: 'high', needKey: 'iac' }]);
     const tf = byPath(withTf.files).get('pipegen-planted/main.tf') as string;
     expect(tf).toContain('resource "aws_security_group"');
     expect(tf).toMatch(/from_port\s*=\s*22\b/);
@@ -249,15 +271,15 @@ describe('planted files', () => {
       expect(e.item.length).toBeLessThanOrEqual(120);
       expect(texts.has(e.item), e.item).toBe(true);
       // fixed English: no repo text (service names, folders), unchanged by safeText, no article (evaluate writes "the planted <item>")
-      for (const s of MONO.services) { expect(e.item).not.toContain(s.name); expect(e.item).not.toContain('services/'); }
+      for (const s of MONO.services) { expect(e.item).not.toMatch(new RegExp(`\\b${s.name}\\b`)); expect(e.item).not.toContain('services/'); }
       expect(safeText(e.item, 200)).toBe(e.item);
       expect(e.item).not.toMatch(/^(?:a|an|the) /i);
     }
     expect(expected.find((e) => e.id === 'secret')?.item).toBe(PLANTED_ITEM_TEXT.secret);
-    expect(expected.find((e) => e.id === 'deps-node')?.item).toBe(PLANTED_ITEM_TEXT['deps-node']);
-    expect(expected.find((e) => e.id === 'deps-python--services-api')?.item).toBe(PLANTED_ITEM_TEXT['deps-python']);
-    expect(expected.find((e) => e.id === 'sast-node')?.item).toBe(PLANTED_ITEM_TEXT['sast-node']);
-    expect(expected.find((e) => e.id === 'sast-python--services-api')?.item).toBe(PLANTED_ITEM_TEXT['sast-python']);
+    expect(expected.find((e) => e.id === 'deps-node--web')?.item).toBe(PLANTED_ITEM_TEXT['deps-node']);
+    expect(expected.find((e) => e.id === 'deps-python--api')?.item).toBe(PLANTED_ITEM_TEXT['deps-python']);
+    expect(expected.find((e) => e.id === 'sast-node--web')?.item).toBe(PLANTED_ITEM_TEXT['sast-node']);
+    expect(expected.find((e) => e.id === 'sast-python--api')?.item).toBe(PLANTED_ITEM_TEXT['sast-python']);
     expect(expected.find((e) => e.id === 'iac')?.item).toBe(PLANTED_ITEM_TEXT.iac);
   });
 
@@ -301,7 +323,7 @@ describe('planted secret', () => {
     const body = byPath(files).get('pipegen-planted/config.txt') as string;
     expect(body).toMatch(KEY_LINE);
     expect(findSecretLike(body)).toEqual([]);
-    expect(expected.find((e) => e.id === 'secret')).toEqual({ id: 'secret', category: 'secrets', item: PLANTED_ITEM_TEXT.secret, file: 'pipegen-planted/config.txt', critical: true, minSeverity: 'high' });
+    expect(expected.find((e) => e.id === 'secret')).toEqual({ id: 'secret', category: 'secrets', item: PLANTED_ITEM_TEXT.secret, file: 'pipegen-planted/config.txt', critical: true, minSeverity: 'high', needKey: 'secrets' });
     // a fresh value per call
     expect(plantedFiles(profile()).files[0]?.content).not.toBe(plantedFiles(profile()).files[0]?.content);
   });
@@ -399,10 +421,10 @@ describe('planted fixtures', () => {
     const fx = (rel: string) => readFileSync(join(root, 'data', rel));
     const node = { 'package.json': fx('planted/node/package.json.planted'), 'package-lock.json': fx('planted/node/package-lock.json.planted') };
     const python = { 'requirements.txt': fx('planted/python/requirements.txt.planted') };
-    for (const dir of ['pipegen-planted/deps-node', 'packages/lib/pipegen-planted/deps-node-packages-lib']) {
+    for (const dir of ['pipegen-planted/deps-node-web', 'packages/lib/pipegen-planted/deps-node-lib']) {
       for (const [name, bytes] of Object.entries(node)) expect(Buffer.from(got.get(`${dir}/${name}`) as string, 'utf8').equals(bytes), `${dir}/${name}`).toBe(true);
     }
-    expect(Buffer.from(got.get('services/api/pipegen-planted/deps-python-services-api/requirements.txt') as string, 'utf8').equals(python['requirements.txt'])).toBe(true);
+    for (const f of ['services/api/pipegen-planted/deps-python-api/requirements.txt', 'services/api/pipegen-planted/deps-python-worker/requirements.txt']) expect(Buffer.from(got.get(f) as string, 'utf8').equals(python['requirements.txt']), f).toBe(true);
     // the vulnerable versions, exact
     const pkg = JSON.parse(node['package.json'].toString('utf8')) as { dependencies: Record<string, string>; private: boolean };
     expect(pkg.dependencies).toEqual({ lodash: '4.17.11' });
@@ -417,9 +439,9 @@ describe('planted fixtures', () => {
     expect(PLANTED_FIXTURES.node.map((f) => f.name)).toEqual(['package.json', 'package-lock.json']);
     expect(PLANTED_FIXTURES.python.map((f) => f.name)).toEqual(['requirements.txt']);
     // the SQL files: request input concatenated into the query (plain .js / .py, never .ts)
-    const js = got.get('pipegen-planted/sast-node.js') as string;
+    const js = got.get('pipegen-planted/sast-node-web.js') as string;
     expect(js).toMatch(/db\.query\(\s*"SELECT [^"]*'" \+ req\.query\.\w+ \+ "'"/);
-    const py = got.get('services/api/pipegen-planted/sast-python-services-api.py') as string;
+    const py = got.get('services/api/pipegen-planted/sast-python-api.py') as string;
     expect(py).toMatch(/cursor\.execute\(\s*"SELECT [^"]*'" \+ request\.args\.get\("\w+"\) \+ "'"/);
     expect(files.some((f) => /\.tsx?$/.test(f.path as string))).toBe(false);
   });
@@ -428,48 +450,103 @@ describe('planted fixtures', () => {
 // ---------- the matcher ----------
 
 describe('matchPlanted', () => {
-  const { expected } = plantedFiles(MONO, { random: seq() });
-  const ids = expected.map((e) => e.id);
+  // built in beforeAll, so a broken plantedFiles fails these tests by assertion instead of crashing collection (m5)
+  let expected: PlantedItem[] = [];
+  let ids: string[] = [];
+  const item = (id: string) => expected.find((e) => e.id === id) as PlantedItem;
+  beforeAll(() => {
+    expected = plantedFiles(MONO, { random: seq() }).expected;
+    ids = expected.map((e) => e.id);
+  });
 
   it('match: finding in planted file with severity ≥ min → caught', () => {
     expect(matchPlanted(allCaught(expected), expected, TOOLS)).toEqual({ caught: ids, missed: [] });
     expect(matchPlanted(allCaught(expected, 'critical'), expected, TOOLS)).toEqual({ caught: ids, missed: [] });
     // a per-service scanner that reports paths relative to its service folder (it ran there) still matches its own item
-    const rel = expected.map((e) => finding(TOOLS.get(e.category) as string, e.file.slice(e.file.indexOf(PLANTED_DIR)), 'high'));
+    const rel = expected.map((e) => finding(TOOLS.get(e.category) as string, e.file.slice(e.file.indexOf(PLANTED_DIR)), 'high', 'r', e.needKey));
     expect(matchPlanted(rel, expected, TOOLS)).toEqual({ caught: ids, missed: [] });
     // extra findings (other files, other tools) change nothing
-    const noise = [finding('semgrep', 'src/app.js', 'critical'), finding('eslint', 'pipegen-planted/sast-node.js', 'critical')];
+    const noise = [finding('semgrep', 'src/app.js', 'critical'), finding('eslint', 'pipegen-planted/sast-node-web.js', 'critical', 'r', 'sast--web')];
     expect(matchPlanted([...noise, ...allCaught(expected)], expected, TOOLS)).toEqual({ caught: ids, missed: [] });
-    // an item E built (no minSeverity, no critical) reads as high
-    const e: EvalPlantedItem[] = [{ id: 'x', category: 'sast', item: 'thing', file: 'pipegen-planted/sast-node.js' }];
-    expect(matchPlanted([finding('semgrep', 'pipegen-planted/sast-node.js', 'high')], e, TOOLS)).toEqual({ caught: ['x'], missed: [] });
+    // an item E built (no minSeverity, no critical, no need key) reads as high, and any job's finding may count for it
+    const e: EvalPlantedItem[] = [{ id: 'x', category: 'sast', item: 'thing', file: 'pipegen-planted/sast-node-web.js' }];
+    expect(matchPlanted([finding('semgrep', 'pipegen-planted/sast-node-web.js', 'high')], e, TOOLS)).toEqual({ caught: ['x'], missed: [] });
+    // as evaluate gives them: asFindings carries each finding's own need id and need key (the job), the fingerprint's own fields
+    const gate: GateFinding[] = expected.map((x) => ({ needId: x.category, job: x.needKey, tool: TOOLS.get(x.category) as string, ruleId: 'r', severity: 'high', file: x.file, isNew: true, [IS_KEY]: x.category === 'secrets' }) as GateFinding);
+    const read = asFindings(gate);
+    for (const [i, f] of read.entries()) {
+      expect(f.needKey).toBe(gate[i]?.job);
+      expect(f.needId).toBe(gate[i]?.needId);
+      expect(f.fingerprint.split(':').slice(0, 2)).toEqual([f.needId, f.needKey]);
+    }
+    expect(matchPlanted(read, expected, TOOLS)).toEqual({ caught: ids, missed: [] });
+  });
+
+  it("match: a root service's finding on a sub-service's planted file never counts for the sub-service's item", () => {
+    const lib = item('sast-node--lib'), libDeps = item('deps-node--lib'), web = item('sast-node--web');
+    // the root service's recursive semgrep and osv jobs (sast--web, deps--web) report lib's planted files by their repo-relative paths
+    const fromRoot = [finding('semgrep', lib.file, 'critical', 'r', 'sast--web'), finding('osv-scanner', libDeps.file, 'critical', 'r', 'deps--web')];
+    expect(matchPlanted(fromRoot, [lib, libDeps], TOOLS)).toEqual({ caught: [], missed: ['sast-node--lib', 'deps-node--lib'] });
+    // ... and by the service-relative form either
+    expect(matchPlanted([finding('semgrep', 'pipegen-planted/sast-node-lib.js', 'critical', 'r', 'sast--web')], [lib], TOOLS).caught).toEqual([]);
+    // lib's own jobs do count; the root's finding on its own file counts for the root's item only
+    expect(matchPlanted([...fromRoot, finding('semgrep', lib.file, 'high', 'r', 'sast--lib'), finding('osv-scanner', libDeps.file, 'high', 'r', 'deps--lib')], [lib, libDeps], TOOLS)).toEqual({ caught: ['sast-node--lib', 'deps-node--lib'], missed: [] });
+    expect(matchPlanted([finding('semgrep', web.file, 'high', 'r', 'sast--web'), finding('semgrep', lib.file, 'high', 'r', 'sast--web')], [web, lib], TOOLS)).toEqual({ caught: ['sast-node--web'], missed: ['sast-node--lib'] });
+    // two services in one folder: each one's own job, never the other's (worker's job reporting api's file does not count for api)
+    const api = item('sast-python--api'), worker = item('sast-python--worker');
+    expect(matchPlanted([finding('semgrep', api.file, 'high', 'r', 'sast--worker'), finding('semgrep', worker.file, 'high', 'r', 'sast--worker')], [api, worker], TOOLS)).toEqual({ caught: ['sast-python--worker'], missed: ['sast-python--api'] });
+    // a job of another category for the same service is not the item's need either
+    expect(matchPlanted([finding('semgrep', lib.file, 'high', 'r', 'deps--lib')], [lib], TOOLS).caught).toEqual([]);
+    // the same through asFindings: the gate's job id is the origin
+    const g = (job: string, file: string): GateFinding => ({ needId: job.split('--')[0] as string, job, tool: 'semgrep', ruleId: 'r', severity: 'high', file, isNew: true, [IS_KEY]: false }) as GateFinding;
+    expect(matchPlanted(asFindings([g('sast--web', lib.file)]), [lib], TOOLS).caught).toEqual([]);
+    expect(matchPlanted(asFindings([g('sast--lib', lib.file)]), [lib], TOOLS).caught).toEqual(['sast-node--lib']);
+  });
+
+  it('match: a finding with no readable origin is not caught', () => {
+    const lib = item('sast-node--lib');
+    // no need key on the finding (a Finding built elsewhere): an item that carries a key is not caught by it
+    expect(matchPlanted([finding('semgrep', lib.file, 'critical', 'r', null)], [lib], TOOLS)).toEqual({ caught: [], missed: ['sast-node--lib'] });
+    // a need key that is not a string, or empty: not readable
+    for (const bad of [7, '', null, ['sast--lib'], { toString: () => 'sast--lib' }]) {
+      const f = { ...finding('semgrep', lib.file, 'critical', 'r', null), needKey: bad } as unknown as SourcedFinding;
+      expect(matchPlanted([f], [lib], TOOLS).caught, String(bad)).toEqual([]);
+    }
+    // the fingerprint alone is not read as an origin: its text could be anything
+    const fp = { ...finding('semgrep', lib.file, 'critical', 'r', null), fingerprint: `sast:sast--lib:semgrep:r:${lib.file}:` };
+    expect(matchPlanted([fp], [lib], TOOLS).caught).toEqual([]);
+    // an item whose need key is present but not a usable string can't be matched: missed (fail-safe)
+    for (const bad of [7, '', null]) {
+      const it = { ...lib, needKey: bad } as unknown as EvalPlantedItem;
+      expect(matchPlanted([finding('semgrep', lib.file, 'critical', 'r', 'sast--lib')], [it], TOOLS), String(bad)).toEqual({ caught: [], missed: ['sast-node--lib'] });
+    }
   });
 
   it("match: a finding on another item's file or by another tool never counts", () => {
-    const sast = expected.find((e) => e.id === 'sast-node') as PlantedItem;
-    const keyItem = expected.find((e) => e.id === 'secret') as PlantedItem;
+    const sast = item('sast-node--web');
+    const keyItem = item('secret');
     // semgrep on the secret's file: not the sast item; gitleaks on the sast file: not the sast item either
-    const r = matchPlanted([finding('semgrep', keyItem.file, 'critical'), finding('gitleaks', sast.file, 'critical')], [sast, keyItem], TOOLS);
-    expect(r).toEqual({ caught: [], missed: ['sast-node', 'secret'] });
+    const r = matchPlanted([finding('semgrep', keyItem.file, 'critical', 'r', 'secrets'), finding('gitleaks', sast.file, 'critical', 'r', 'sast--web')], [sast, keyItem], TOOLS);
+    expect(r).toEqual({ caught: [], missed: ['sast-node--web', 'secret'] });
     // a file in the same planted folder or a glob-like neighbour is not the item's file
-    for (const file of ['pipegen-planted/sast-node.js.bak', 'pipegen-planted/sast-node', 'x/pipegen-planted/sast-node.js', 'pipegen-planted/./sast-node.js', './pipegen-planted/sast-node.js', 'PIPEGEN-PLANTED/sast-node.js', 'pipegen-planted/sast-node-packages-lib.js']) {
+    for (const file of ['pipegen-planted/sast-node-web.js.bak', 'pipegen-planted/sast-node-web', 'x/pipegen-planted/sast-node-web.js', 'pipegen-planted/./sast-node-web.js', './pipegen-planted/sast-node-web.js', 'PIPEGEN-PLANTED/sast-node-web.js', 'pipegen-planted/sast-node-lib.js']) {
       expect(matchPlanted([finding('semgrep', file, 'critical')], [sast], TOOLS).caught, file).toEqual([]);
     }
     // a finding with no file never counts
-    expect(matchPlanted([finding('semgrep', undefined, 'critical')], [sast], TOOLS).missed).toEqual(['sast-node']);
+    expect(matchPlanted([finding('semgrep', undefined, 'critical')], [sast], TOOLS).missed).toEqual(['sast-node--web']);
     // one finding counts for one item only: two items on one file need two findings
-    const twin: EvalPlantedItem[] = [{ id: 'a', category: 'sast', item: 'x', file: 'pipegen-planted/sast-node.js' }, { id: 'b', category: 'sast', item: 'x', file: 'pipegen-planted/sast-node.js' }];
-    expect(matchPlanted([finding('semgrep', 'pipegen-planted/sast-node.js')], twin, TOOLS)).toEqual({ caught: ['a'], missed: ['b'] });
-    expect(matchPlanted([finding('semgrep', 'pipegen-planted/sast-node.js', 'high', 'r1'), finding('semgrep', 'pipegen-planted/sast-node.js', 'high', 'r2')], twin, TOOLS)).toEqual({ caught: ['a', 'b'], missed: [] });
+    const twin: EvalPlantedItem[] = [{ id: 'a', category: 'sast', item: 'x', file: 'pipegen-planted/s.js' }, { id: 'b', category: 'sast', item: 'x', file: 'pipegen-planted/s.js' }];
+    expect(matchPlanted([finding('semgrep', 'pipegen-planted/s.js')], twin, TOOLS)).toEqual({ caught: ['a'], missed: ['b'] });
+    expect(matchPlanted([finding('semgrep', 'pipegen-planted/s.js', 'high', 'r1'), finding('semgrep', 'pipegen-planted/s.js', 'high', 'r2')], twin, TOOLS)).toEqual({ caught: ['a', 'b'], missed: [] });
     // a service-relative path that two items share (one's repo path, the other's service path) is credited to neither by that form
     const amb: EvalPlantedItem[] = [{ id: 'root', category: 'sast', item: 'x', file: 'pipegen-planted/s.js' }, { id: 'svc', category: 'sast', item: 'x', file: 'a/pipegen-planted/s.js' }];
     expect(matchPlanted([finding('semgrep', 'pipegen-planted/s.js', 'high', 'r1'), finding('semgrep', 'pipegen-planted/s.js', 'high', 'r2')], amb, TOOLS)).toEqual({ caught: ['root'], missed: ['svc'] });
     expect(matchPlanted([finding('semgrep', 'a/pipegen-planted/s.js')], amb, TOOLS)).toEqual({ caught: ['svc'], missed: ['root'] });
     const amb2: EvalPlantedItem[] = [{ id: 'p', category: 'sast', item: 'x', file: 'a/pipegen-planted/s.js' }, { id: 'q', category: 'sast', item: 'x', file: 'b/pipegen-planted/s.js' }];
     expect(matchPlanted([finding('semgrep', 'pipegen-planted/s.js', 'high', 'r1'), finding('semgrep', 'pipegen-planted/s.js', 'high', 'r2')], amb2, TOOLS)).toEqual({ caught: [], missed: ['p', 'q'] });
-    // the secret (repo-wide) is never matched by a service-relative form of another item: per-service sast findings in lib's folder
-    const lib = expected.find((e) => e.id === 'sast-node--packages-lib') as PlantedItem;
-    expect(matchPlanted([finding('semgrep', 'pipegen-planted/sast-node-packages-lib.js')], [lib, sast], TOOLS)).toEqual({ caught: ['sast-node--packages-lib'], missed: ['sast-node'] });
+    // lib's own job reporting its file service-relative counts for lib only
+    const lib = item('sast-node--lib');
+    expect(matchPlanted([finding('semgrep', 'pipegen-planted/sast-node-lib.js', 'high', 'r', 'sast--lib')], [lib, sast], TOOLS)).toEqual({ caught: ['sast-node--lib'], missed: ['sast-node--web'] });
   });
 
   it('match: a finding below minSeverity → missed; minSeverity is high for every item', () => {
@@ -479,33 +556,33 @@ describe('matchPlanted', () => {
     const odd = allCaught(expected).map((f) => ({ ...f, severity: 'HIGH' as unknown as Severity }));
     expect(matchPlanted(odd, expected, TOOLS).caught).toEqual([]);
     // the floor is high: an item that asks for less still needs high; one that asks for critical needs critical
-    const sast = expected.find((e) => e.id === 'sast-node') as PlantedItem;
+    const sast = item('sast-node--web');
     const asking = (minSeverity: Severity): PlantedItem[] => [{ ...sast, minSeverity }];
     expect(matchPlanted([finding('semgrep', sast.file, 'medium')], asking('low'), TOOLS).caught).toEqual([]);
     expect(matchPlanted([finding('semgrep', sast.file, 'high')], asking('critical'), TOOLS).caught).toEqual([]);
-    expect(matchPlanted([finding('semgrep', sast.file, 'critical')], asking('critical'), TOOLS).caught).toEqual(['sast-node']);
-    expect(matchPlanted([finding('semgrep', sast.file, 'high')], asking('bogus' as Severity), TOOLS).caught).toEqual(['sast-node']);
+    expect(matchPlanted([finding('semgrep', sast.file, 'critical')], asking('critical'), TOOLS).caught).toEqual(['sast-node--web']);
+    expect(matchPlanted([finding('semgrep', sast.file, 'high')], asking('bogus' as Severity), TOOLS).caught).toEqual(['sast-node--web']);
     expect(matchPlanted([finding('semgrep', sast.file, 'medium')], asking('bogus' as Severity), TOOLS).caught).toEqual([]);
     // a low finding on the file does not use up the item: a later high one still catches it
-    expect(matchPlanted([finding('semgrep', sast.file, 'low', 'r1'), finding('semgrep', sast.file, 'high', 'r2')], [sast], TOOLS).caught).toEqual(['sast-node']);
+    expect(matchPlanted([finding('semgrep', sast.file, 'low', 'r1'), finding('semgrep', sast.file, 'high', 'r2')], [sast], TOOLS).caught).toEqual(['sast-node--web']);
   });
 
   it('match: an expected item with no file, or ids nobody expected → missed / ignored', () => {
     const noFile: EvalPlantedItem[] = [{ id: 'n', category: 'sast', item: 'x' }, { id: 'e', category: 'sast', item: 'x', file: '' }];
-    expect(matchPlanted([finding('semgrep', 'pipegen-planted/sast-node.js', 'critical'), finding('semgrep', undefined, 'critical')], noFile, TOOLS)).toEqual({ caught: [], missed: ['n', 'e'] });
+    expect(matchPlanted([finding('semgrep', 'pipegen-planted/sast-node-web.js', 'critical'), finding('semgrep', undefined, 'critical')], noFile, TOOLS)).toEqual({ caught: [], missed: ['n', 'e'] });
     // a category with no tool in the map: missed (nothing ran that could catch it)
-    const sast = expected.find((e) => e.id === 'sast-node') as PlantedItem;
-    expect(matchPlanted(allCaught([sast]), [sast], new Map([['secrets', 'gitleaks']]))).toEqual({ caught: [], missed: ['sast-node'] });
+    const sast = item('sast-node--web');
+    expect(matchPlanted(allCaught([sast]), [sast], new Map([['secrets', 'gitleaks']]))).toEqual({ caught: [], missed: ['sast-node--web'] });
     // findings for files nobody expected, and ids nobody expected, never show up
     const r = matchPlanted([finding('semgrep', 'pipegen-planted/other.js', 'critical'), ...allCaught([sast])], [sast], TOOLS);
-    expect(r).toEqual({ caught: ['sast-node'], missed: [] });
+    expect(r).toEqual({ caught: ['sast-node--web'], missed: [] });
     expect(matchPlanted(allCaught(expected), [], TOOLS)).toEqual({ caught: [], missed: [] });
     // the same id twice: caught only when both entries are caught, and listed once
     const dup: EvalPlantedItem[] = [{ id: 'd', category: 'sast', item: 'x', file: 'pipegen-planted/a.js' }, { id: 'd', category: 'sast', item: 'x', file: 'pipegen-planted/b.js' }];
     expect(matchPlanted([finding('semgrep', 'pipegen-planted/a.js')], dup, TOOLS)).toEqual({ caught: [], missed: ['d'] });
     expect(matchPlanted([finding('semgrep', 'pipegen-planted/a.js'), finding('semgrep', 'pipegen-planted/b.js')], dup, TOOLS)).toEqual({ caught: ['d'], missed: [] });
     // malformed entries (no string id) can't be reported and are skipped; a bad category is missed
-    const junk = [null, 7, { category: 'sast', item: 'x', file: 'pipegen-planted/sast-node.js' }, { id: 'c', category: 7, item: 'x', file: 'pipegen-planted/sast-node.js' }] as unknown as EvalPlantedItem[];
+    const junk = [null, 7, { category: 'sast', item: 'x', file: 'pipegen-planted/sast-node-web.js' }, { id: 'c', category: 7, item: 'x', file: 'pipegen-planted/sast-node-web.js' }] as unknown as EvalPlantedItem[];
     expect(matchPlanted(allCaught([sast]), junk, TOOLS)).toEqual({ caught: [], missed: ['c'] });
   });
 
@@ -518,8 +595,11 @@ describe('matchPlanted', () => {
     expectTypeOf(matchPlanted).parameter(1).toEqualTypeOf<readonly EvalPlantedItem[]>();
     expectTypeOf(matchPlanted).parameter(0).toEqualTypeOf<Finding[]>();
     expectTypeOf(matchPlanted).returns.toEqualTypeOf<{ caught: string[]; missed: string[] }>();
-    // as evaluate calls it: spread copies of the items, a fresh map
-    expect(m(allCaught(expected), items.map((w) => ({ ...w })), new Map(TOOLS))).toEqual({ caught: ids, missed: [] });
+    // asFindings still gives Finding[] (the origin fields are additive), so evaluate's call compiles unchanged
+    expectTypeOf(asFindings).returns.toMatchTypeOf<Finding[]>();
+    // as evaluate calls it: asFindings of the gate's blocking list, spread copies of the items, a fresh map
+    const gate: GateFinding[] = expected.map((x) => ({ needId: x.category, job: x.needKey, tool: TOOLS.get(x.category) as string, ruleId: 'r', severity: 'high', file: x.file, isNew: true, [IS_KEY]: false }) as GateFinding);
+    expect(m(asFindings(gate), items.map((w) => ({ ...w })), new Map(TOOLS))).toEqual({ caught: ids, missed: [] });
     expect(wiring.matchPlanted).toBe(matchPlanted);
   });
 });

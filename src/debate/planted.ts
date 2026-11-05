@@ -4,13 +4,16 @@
 // them too. Each blocking scanner must catch its planted item, or the proof fails that need (evaluate.ts plantedChecks):
 //   secret       a generic high-entropy API key (never a provider format)        repo root   pipegen-planted/config.txt
 //   iac          a security group open to 0.0.0.0/0 on port 22 (Terraform only)  repo root   pipegen-planted/main.tf
-//   sast-<lang>  a SQL query built from request input (node: .js, python: .py)   per service <service>/pipegen-planted/sast-<lang>[-<tag>].<ext>
-//   deps-<lang>  a manifest with a known-vulnerable dependency (lodash 4.17.11,  per service <service>/pipegen-planted/deps-<lang>[-<tag>]/<manifest>
+//   sast-<lang>  a SQL query built from request input (node: .js, python: .py)   per service <service>/pipegen-planted/sast-<lang>-<slug>.<ext>
+//   deps-<lang>  a manifest with a known-vulnerable dependency (lodash 4.17.11,  per service <service>/pipegen-planted/deps-<lang>-<slug>/<manifest>
 //                PyYAML 5.3), copied from data/planted/*.planted
 // Per-service scanners `cd` into the service folder (render-cli.ts cdLines), so sast and deps items sit under each scanned
 // service's own pipegen-planted/ (B5). The deps manifest is two levels below the service root, so neither the service's own
-// install nor a one-level workspace glob (`*`) takes it in (Review Focus 3). A folder other than the repo root adds a tag (its
-// slug) to every name, so a path relative to a service root names one item only (the matcher accepts that form, S17).
+// install nor a one-level workspace glob (`*`) takes it in (Review Focus 3).
+// Every item carries its need key (jobIdFor(category, service), the gate job's id; ruling F5-R3), and the matcher credits it only
+// to a finding of that job: a root service's recursive scan that also reports a sub-service's planted file never proves the
+// sub-service's own scanner. So each node or python service gets its own items, named by its slug (`<slug>` above), even two
+// services in one folder; the names also keep a path relative to a service root unique (the matcher accepts that form, S17).
 //
 // Nothing planted is ever delivered: the folder name is PLANTED_DIR, and isPlantedPath (a pipegen-planted segment at any depth)
 // is the rule Plan G's delivery test uses. The C1b placements (snapshot.ts plantedSecretPlacements) are Plan E's and sit
@@ -21,8 +24,11 @@
 import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { slug } from '../engine/artifact-names.js';
+import { jobIdFor } from '../engine/gate-job-list.js';
 import { PLAIN_REL_RE } from '../engine/tool-flags.js';
 import type { PlantedItem as EvalPlantedItem } from '../proof/evaluate.js';
+import type { SourcedFinding } from '../proof/gate-result.js';
+import { PlantedError, plantedKeyValue } from '../proof/planted-value.js';
 import { isWorkflowPath, type ProofFile } from '../proof/snapshot.js';
 import type { Finding, Language, RepoProfile, Severity } from '../types.js';
 import { packageDataPath } from '../util/package-data.js';
@@ -46,9 +52,14 @@ export type PlantedItem = EvalPlantedItem & {
   critical: boolean;
   /** The lowest finding severity that counts: high for every item (the gate's block floor). */
   minSeverity: Severity;
+  /**
+   * The need key of the item's own need (jobIdFor(category, service): `secrets`, `iac`, `sast--<slug>`, `deps--<slug>`), the gate
+   * job that must catch it (F5-R3). Only a finding whose `needKey` (asFindings) equals it counts.
+   */
+  needKey: string;
 };
 
-export class PlantedError extends Error {}
+export { PlantedError };
 
 /** The fixed English evaluate prints after "didn't catch the planted" (no article, no repo text). */
 export const PLANTED_ITEM_TEXT = Object.freeze({
@@ -135,64 +146,14 @@ const TERRAFORM = [
 
 // ---------- the secret ----------
 
-const B62 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-const DIGITS = '0123456789';
-/** Largest multiple of 62 (and of 10) under 256: a byte at or above it is dropped, so every character is equally likely. */
-const B62_LIMIT = 248;
-const DIGIT_LIMIT = 250;
-/** A source that keeps failing the rules is broken (or not random): stop rather than loop. */
-const MAX_SECRET_BYTES = 1 << 16;
-const MIN_ENTROPY = 4;
 /**
- * The scanners' stopwords that a value with no 3-letter run can still hold: a value holding one is dropped by the generic rule.
- * Measured (F5) on the pinned gitleaks 8.30.1 and betterleaks 1.9.0 against every stopword with no 3-letter run: md5 (any case)
- * and six zeros. Re-measure when a pinned secrets scanner changes.
- */
-const REACHABLE_STOPWORDS = /md5|000000/i;
-
-const isLetter = (c: string): boolean => (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
-function entropy(s: string): number {
-  const counts = new Map<string, number>();
-  for (const ch of s) counts.set(ch, (counts.get(ch) ?? 0) + 1);
-  let h = 0;
-  for (const n of counts.values()) { const p = n / s.length; h -= p * Math.log2(p); }
-  return h;
-}
-
-/**
- * The planted secret (S15): 40 base62 characters from `random` (node:crypto randomBytes by default) by rejection sampling,
- * with a digit, an upper and a lower letter, and no run of 3 or more letters (after two letters the next character is a digit),
- * so a scanner's stopword filter (a dictionary word inside the value) can't drop it, and none of the stopwords that rule leaves
- * reachable (REACHABLE_STOPWORDS: md5, six zeros). Shannon entropy at least 4. Every rule is
- * met by drawing again, never by editing the value. A generic key: no provider prefix can appear (no `_` or `-`, no four letters
- * in a row). Throws PlantedError when the source gives no usable bytes.
+ * The planted secret (S15): 40 base62 characters from `random` (node:crypto randomBytes by default) under the one planted-value
+ * rule (src/proof/planted-value.ts, shared with Plan E's C1b placements): rejection sampling, a digit, an upper and a lower
+ * letter, no run of 3 letters, no reachable stopword (md5, six zeros), entropy at least 4, all by drawing again. Throws
+ * PlantedError when the source gives no usable bytes.
  */
 export function plantedSecret(random: (n: number) => Uint8Array = (n) => randomBytes(n)): string {
-  let used = 0;
-  for (;;) {
-    let v = '';
-    let letters = 0;
-    while (v.length < PLANTED_SECRET_LENGTH) {
-      const bytes = random(64);
-      if (!(bytes instanceof Uint8Array) || bytes.length === 0) throw new PlantedError('The random source for the planted secret gave no bytes.');
-      used += bytes.length;
-      if (used > MAX_SECRET_BYTES) throw new PlantedError('The random source for the planted secret never met its rules; it is not random.');
-      for (const b of bytes) {
-        if (v.length >= PLANTED_SECRET_LENGTH) break;
-        if (letters >= 2) {
-          if (b >= DIGIT_LIMIT) continue;
-          v += DIGITS[b % 10];
-          letters = 0;
-        } else {
-          if (b >= B62_LIMIT) continue;
-          const c = B62[b % 62] as string;
-          v += c;
-          letters = isLetter(c) ? letters + 1 : 0;
-        }
-      }
-    }
-    if (/[0-9]/.test(v) && /[A-Z]/.test(v) && /[a-z]/.test(v) && !REACHABLE_STOPWORDS.test(v) && entropy(v) >= MIN_ENTROPY) return v;
-  }
+  return plantedKeyValue(PLANTED_SECRET_LENGTH, random);
 }
 
 // ---------- paths ----------
@@ -211,6 +172,8 @@ export function isPlantedPath(path: string | Uint8Array): boolean {
   return segmentsOf(p).some(isPlantedSegment);
 }
 
+const NO_SLUG = 'A service name has no letters or digits, so pipegen has no id for its checks. Rename it.';
+const SAME_SLUG = "Two services have names that give the same id once cleaned, so pipegen can't tell their checks apart. Rename one of them.";
 const BAD_SERVICE_PATH = "A service folder is not a plain folder inside the repository, so pipegen can't plant its scanners' items there.";
 const IN_PLANTED = 'A service folder is inside a pipegen-planted folder, which is never delivered, so pipegen refuses to plan around it.';
 
@@ -261,50 +224,41 @@ function fixture(rel: string): string {
 export function plantedFiles(p: RepoProfile, opts: PlantedOptions = {}): { files: ProofFile[]; expected: PlantedItem[] } {
   const files: ProofFile[] = [];
   const expected: PlantedItem[] = [];
-  const item = (id: string, category: PlantedCategory, text: string, file: string, critical: boolean) => {
-    expected.push({ id, category, item: text, file, critical, minSeverity: 'high' });
+  const item = (id: string, category: PlantedCategory, text: string, file: string, critical: boolean, needKey: string) => {
+    expected.push({ id, category, item: text, file, critical, minSeverity: 'high', needKey });
   };
 
   const secret = `${PLANTED_DIR}/config.txt`;
   files.push({ path: secret, content: `api_key = "${plantedSecret(opts.random)}"\n` });
-  item('secret', 'secrets', PLANTED_ITEM_TEXT.secret, secret, true);
+  item('secret', 'secrets', PLANTED_ITEM_TEXT.secret, secret, true, jobIdFor('secrets'));
 
   if (p.terraformDirs.length > 0) {
     const tf = `${PLANTED_DIR}/main.tf`;
     files.push({ path: tf, content: TERRAFORM });
-    item('iac', 'iac', PLANTED_ITEM_TEXT.iac, tf, false);
+    item('iac', 'iac', PLANTED_ITEM_TEXT.iac, tf, false, jobIdFor('iac'));
   }
 
-  // one entry per folder (first appearance order), with its planted languages (first appearance order)
-  const folders = new Map<string, PlantedLanguage[]>();
+  // every service's slug names its jobs (jobIdFor): two services with one slug, or a name with none, can't be told apart
+  const slugs = new Set<string>();
+  for (const s of p.services) {
+    let tag: string;
+    try { tag = slug(s.name); } catch { throw new PlantedError(NO_SLUG); }
+    if (slugs.has(tag)) throw new PlantedError(SAME_SLUG);
+    slugs.add(tag);
+  }
+  // one set of items per node or python service, in profile order: its own folder, its own names, its own need keys
   for (const s of p.services) {
     const folder = serviceFolder(s.path);
     if (s.language !== 'node' && s.language !== 'python') continue;
-    const langs = folders.get(folder) ?? [];
-    if (!langs.includes(s.language)) langs.push(s.language);
-    folders.set(folder, langs);
-  }
-  const tags = new Set<string>();
-  for (const [folder, langs] of folders) {
-    let tag = '';
-    if (folder !== '') {
-      let base: string;
-      try { base = slug(folder); } catch { base = 'folder'; }
-      tag = base;
-      for (let n = 2; tags.has(tag); n++) tag = `${base}-${n}`;
-      tags.add(tag);
-    }
+    const lang: PlantedLanguage = s.language;
+    const tag = slug(s.name);
     const dir = folder === '' ? PLANTED_DIR : `${folder}/${PLANTED_DIR}`;
-    const suffix = tag === '' ? '' : `-${tag}`;
-    const idSuffix = tag === '' ? '' : `--${tag}`;
-    for (const lang of langs) {
-      const sast = `${dir}/sast-${lang}${suffix}.${SQL[lang].ext}`;
-      files.push({ path: sast, content: SQL[lang].body });
-      item(`sast-${lang}${idSuffix}`, 'sast', PLANTED_ITEM_TEXT[`sast-${lang}`], sast, false);
-      const depsDir = `${dir}/deps-${lang}${suffix}`;
-      for (const fx of PLANTED_FIXTURES[lang]) files.push({ path: `${depsDir}/${fx.name}`, content: fixture(fx.data) });
-      item(`deps-${lang}${idSuffix}`, 'deps', PLANTED_ITEM_TEXT[`deps-${lang}`], `${depsDir}/${(PLANTED_FIXTURES[lang].at(-1) as { name: string }).name}`, true);
-    }
+    const sast = `${dir}/sast-${lang}-${tag}.${SQL[lang].ext}`;
+    files.push({ path: sast, content: SQL[lang].body });
+    item(`sast-${lang}--${tag}`, 'sast', PLANTED_ITEM_TEXT[`sast-${lang}`], sast, false, jobIdFor('sast', s.name));
+    const depsDir = `${dir}/deps-${lang}-${tag}`;
+    for (const fx of PLANTED_FIXTURES[lang]) files.push({ path: `${depsDir}/${fx.name}`, content: fixture(fx.data) });
+    item(`deps-${lang}--${tag}`, 'deps', PLANTED_ITEM_TEXT[`deps-${lang}`], `${depsDir}/${(PLANTED_FIXTURES[lang].at(-1) as { name: string }).name}`, true, jobIdFor('deps', s.name));
   }
 
   for (const f of files) {
@@ -352,6 +306,9 @@ function serviceRelative(file: string): string | undefined {
  * that form also names another item), and its severity is at least the item's minSeverity and never below high. A finding counts
  * for one item only. An item with no file, a category with no tool, or a malformed entry is missed; an entry without an id is
  * skipped (it can't be reported). An id is caught only when every entry with that id is; each id is listed once.
+ * Origin (F5-R3): an item that carries a `needKey` (every item plantedFiles makes) is caught only by a finding whose own
+ * `needKey` (asFindings: the gate job that produced it) is that same string. A finding with no readable origin, or an item whose
+ * key is present but not a usable string, never matches (fail-safe). The fingerprint is never parsed for an origin.
  */
 export function matchPlanted(findings: Finding[], expected: readonly EvalPlantedItem[], toolsByCategory: Map<string, string>): { caught: string[]; missed: string[] } {
   const items = expected.filter((e): e is EvalPlantedItem => typeof e === 'object' && e !== null && typeof e.id === 'string' && e.id !== '');
@@ -375,7 +332,14 @@ export function matchPlanted(findings: Finding[], expected: readonly EvalPlanted
       const ok = new Set((accepted[i] as string[]).filter((p) => p === file || named.get(p) === 1));
       const asked = rankOf((e as Partial<PlantedItem>).minSeverity);
       const min = Math.max(FLOOR_RANK, asked);
-      const at = findings.findIndex((f, j) => !used.has(j) && typeof f === 'object' && f !== null && f.tool === tool && typeof f.file === 'string' && ok.has(f.file) && rankOf(f.severity) >= min);
+      const keyed = Object.hasOwn(e, 'needKey');
+      const key = (e as { needKey?: unknown }).needKey;
+      const origin = (f: Finding): boolean => {
+        if (!keyed) return true;
+        const from = (f as SourcedFinding).needKey;
+        return typeof key === 'string' && key !== '' && typeof from === 'string' && from === key;
+      };
+      const at = findings.findIndex((f, j) => !used.has(j) && typeof f === 'object' && f !== null && f.tool === tool && typeof f.file === 'string' && ok.has(f.file) && rankOf(f.severity) >= min && origin(f));
       if (at >= 0) { used.add(at); caught = true; }
     }
     result.set(e.id, (result.get(e.id) ?? true) && caught);

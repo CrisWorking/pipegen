@@ -127,10 +127,18 @@ export function gateResultOf(outcome: Pick<RunOutcome, 'artifacts' | 'artifactPr
   return parseGateResult(file.bytes, { runId: outcome.handle.runId, event: outcome.handle.event });
 }
 
+/**
+ * A Finding with the need that produced it (v0.2 Plan F ruling F5-R3, additive): `needId` is the need id and `needKey` the job id
+ * (the need key, jobIdFor(need id, service)) of the gate job-list entry whose result held it: the first two fields of the
+ * fingerprint. The planted matcher credits an item only to a finding of the item's own need.
+ */
+export type SourcedFinding = Finding & { needId?: string; needKey?: string };
+
 /** The gate's findings as the Finding shape the planted matcher and the fix loop use (no message: result.json carries none). */
-export function asFindings(l: readonly GateFinding[]): Finding[] {
+export function asFindings(l: readonly GateFinding[]): SourcedFinding[] {
   return l.map((f) => ({
     tool: f.tool, ruleId: f.ruleId, severity: f.severity, ...(f.file === undefined ? {} : { file: f.file }), ...(f.line === undefined ? {} : { line: f.line }),
     message: `${f.ruleId} (${f.needId})`, fingerprint: `${f.needId}:${f.job}:${f.tool}:${f.ruleId}:${f.file ?? ''}:${f.line ?? ''}`,
+    needId: f.needId, needKey: f.job,
   }));
 }
