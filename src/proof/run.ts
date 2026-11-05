@@ -55,6 +55,9 @@ export interface JobOutcome {
   attempt: number;
   status: string;
   conclusion: string | null;
+  /** GitHub's own start and end of the job (epoch ms, from the same jobs answer); absent when GitHub gave none or an unreadable one. */
+  startedAt?: number;
+  completedAt?: number;
   /** The job's log (latest attempt's failed jobs and the coverage job): the most recent 8 MiB. */
   log?: string;
   logCut?: boolean;
@@ -384,6 +387,14 @@ async function awaitStart(gh: Octokit, t: ProofTarget, q: RunQuery, opts: WaitOp
   }
 }
 
+/** A GitHub timestamp (ISO 8601 with Z or an offset) as epoch ms; anything else is undefined (a time without a zone would be read in local time). */
+const ISO_TIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+function githubTime(v: unknown): number | undefined {
+  if (typeof v !== 'string' || !ISO_TIME_RE.test(v)) return undefined;
+  const t = Date.parse(v);
+  return Number.isNaN(t) ? undefined : t;
+}
+
 async function readJobs(gh: Octokit, s: GuardedRepo, runId: number, clock: RateClock): Promise<JobOutcome[] | string> {
   const jobs: JobOutcome[] = [];
   for (let page = 1; page <= JOB_PAGES; page++) {
@@ -398,7 +409,11 @@ async function readJobs(gh: Octokit, s: GuardedRepo, runId: number, clock: RateC
     for (const j of d.jobs as unknown[]) {
       if (!isPlain(j) || !posInt(j.id) || j.run_id !== runId || typeof j.name !== 'string' || typeof j.status !== 'string') return `the jobs of run ${runId} could not be read`;
       const attempt = posInt(j.run_attempt) ? j.run_attempt : 1;
-      jobs.push({ id: j.id, name: safeText(j.name, 200), attempt, status: j.status, conclusion: typeof j.conclusion === 'string' ? j.conclusion : null });
+      const startedAt = githubTime(j.started_at), completedAt = githubTime(j.completed_at);
+      jobs.push({
+        id: j.id, name: safeText(j.name, 200), attempt, status: j.status, conclusion: typeof j.conclusion === 'string' ? j.conclusion : null,
+        ...(startedAt === undefined ? {} : { startedAt }), ...(completedAt === undefined ? {} : { completedAt }),
+      });
     }
     if (jobs.length >= d.total_count) return jobs;
     if (d.jobs.length === 0) return `the jobs of run ${runId} are cut short`;

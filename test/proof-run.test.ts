@@ -203,6 +203,25 @@ describe('E4 runs', () => {
     expect(p2.outcomes[0]?.jobs.map((j) => j.log)).toEqual([undefined, 'log of b']);
   });
 
+  it('run: JobOutcome keeps started_at and completed_at from the jobs answer (no new call)', async () => {
+    const e = env((f) => {
+      f.plans.push[PIPEGEN] = { jobs: [
+        { name: 'pipegen / a', conclusion: 'success', started_at: '2026-11-05T10:00:00Z', completed_at: '2026-11-05T10:09:40Z' },
+        { name: 'pipegen / b', conclusion: 'success', started_at: 'not a time', completed_at: '2026-11-05T10:09:40' },
+        { name: 'pipegen / c', conclusion: 'success' },
+      ] };
+    });
+    const { main } = await session(e);
+    const handles = await findRuns(e.g.gh, e.t, { headSha: main.sha, event: 'push', workflows: [PIPEGEN], branch: main.branch });
+    const out = await waitForRuns(e.g.gh, e.t, handles, e.opts);
+    // epoch ms; an unreadable time (no zone, not a date) is left out
+    const jobs = out[0]?.jobs ?? [];
+    expect(jobs[0]).toMatchObject({ startedAt: Date.parse('2026-11-05T10:00:00Z'), completedAt: Date.parse('2026-11-05T10:09:40Z') });
+    expect(jobs[1]).not.toHaveProperty('startedAt');
+    expect(jobs[1]).not.toHaveProperty('completedAt');
+    expect(jobs[2]).not.toHaveProperty('startedAt');
+  });
+
   it('run: shouldStop true → cancels runs and returns', async () => {
     const e = env((f) => { f.plans.push[PIPEGEN] = { steps: 1_000 }; f.plans.push[HARNESS] = { steps: 1_000 }; });
     const { main } = await session(e);

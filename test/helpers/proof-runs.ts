@@ -13,7 +13,7 @@ export const STORE = 'https://pipelinesghubeus22.actions.githubusercontent.com';
 export const REPO_ID = 1000 + SCRATCH.length;   // proof-github.ts world()'s id for the repo
 const R = `/repos/${OWNER}/${SCRATCH}`;
 
-export interface FakeJob { name: string; conclusion: string | null; attempt?: number; log?: string }
+export interface FakeJob { name: string; conclusion: string | null; attempt?: number; log?: string; started_at?: string; completed_at?: string }
 export interface FakeRun {
   id: number; path: string; event: 'push' | 'pull_request'; head_sha: string; head_branch: string; status: string; conclusion: string | null;
   run_attempt: number; pr?: number; jobs: FakeJob[]; artifacts: { name: string; zip: Uint8Array }[]; polls: number; steps: number;
@@ -141,7 +141,7 @@ export function runsFake(defaultBranch = 'main'): RunsFake {
       const r = f.runs.find((x) => x.id === Number(m?.[1]));
       if (r === undefined) return json(404, { message: 'Not Found' });
       const filter = q.get('filter') ?? 'latest';
-      const jobs = r.jobs.map((j, i) => ({ id: r.id * 100 + i, run_id: r.id, name: j.name, status: 'completed', conclusion: j.conclusion, run_attempt: j.attempt ?? r.run_attempt }))
+      const jobs = r.jobs.map((j, i) => ({ id: r.id * 100 + i, run_id: r.id, name: j.name, status: 'completed', conclusion: j.conclusion, run_attempt: j.attempt ?? r.run_attempt, ...(j.started_at === undefined ? {} : { started_at: j.started_at }), ...(j.completed_at === undefined ? {} : { completed_at: j.completed_at }) }))
         .filter((j) => filter === 'all' || j.run_attempt === r.run_attempt);
       const per = Number(q.get('per_page') ?? '30');
       const page = Number(q.get('page') ?? '1');
