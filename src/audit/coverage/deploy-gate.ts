@@ -503,7 +503,9 @@ function workflowRunGate(doc: Obj, path: string, p: RepoProfile, others: readonl
   // branches with no tag filter, so a tag named like the default branch never runs CI (head_branch is a tag's name)
   const br = wr.branches;
   const ciPush = ciEvents.get('push') ?? {};
-  const ciBranchesOnly = (ciPush.branches !== undefined || ciPush['branches-ignore'] !== undefined) && ciPush.tags === undefined && ciPush['tags-ignore'] === undefined;
+  // final review (J3b M1): a branch filter is a non-empty list; `branches:` with no value (null) or [] is no filter (tags may run CI)
+  const filled = (v: unknown): boolean => Array.isArray(v) && v.length > 0;
+  const ciBranchesOnly = (filled(ciPush.branches) || filled(ciPush['branches-ignore'])) && ciPush.tags === undefined && ciPush['tags-ignore'] === undefined;
   const branchesExact = Array.isArray(br) && br.length === 1 && br[0] === p.defaultBranch && wr['branches-ignore'] === undefined && ciBranchesOnly;
   const jobs = jobsOf(doc);
   if (jobs === null) return null;

@@ -530,6 +530,19 @@ describe('deploy gate (a): a guarded workflow_run deploy with a commit check', (
     expectGated(await gateOf({ 'ci.yml': ciFile('CI', "\n  push:\n    tags: ['*']\n    branches: [main]"), 'deploy.yml': deployA() }));
   });
 
+  it('ref form: CI whose push `branches:` is empty or has no value is no branch filter → missing (final review, J3b M1)', async () => {
+    // two CI shapes: the usual one, and one with a second job and a plain run list
+    const other = `name: Checks\non:\n  push:\n    branches: [main]\n  pull_request:\njobs:\n  verify:\n    runs-on: ubuntu-latest\n    steps:\n${CO}      - run: npx eslint .\n      - run: npm test\n`;
+    for (const ci of [CHECKS, other]) {
+      for (const empty of ['    branches:\n', '    branches: []\n']) {
+        expectMissing(await gateOf({ 'checks.yml': ci.replace('    branches: [main]\n', empty), 'release-site.yml': deployB() }), JSON.stringify(empty));
+      }
+      // a real list (also branches-ignore) still counts as a branch filter
+      expectGated(await gateOf({ 'checks.yml': ci, 'release-site.yml': deployB() }));
+      expectGated(await gateOf({ 'checks.yml': ci.replace('    branches: [main]\n', "    branches-ignore: ['wip/**']\n"), 'release-site.yml': deployB() }));
+    }
+  });
+
   it('commit check script with an open quote or here-document → missing (security review S-a)', async () => {
     // shape 1: an echo opens a string that runs over the check, which then never runs
     const swallowedIf = '      - env:\n          TESTED: ${{ github.event.workflow_run.head_sha }}\n        run: |\n          echo "checking\n          if [ "$GITHUB_SHA" != "$TESTED" ]; then\n            exit 1\n          fi\n          "\n';
