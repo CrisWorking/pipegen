@@ -182,6 +182,24 @@ async function checkAfterOpen(handle: FileHandle, opened: Stats, info: Stats, pa
  * `maxBytes` (default READ_LIMITS.maxFileBytes) is for a caller that must read a bigger text on purpose (the D1 guard reads package-lock.json).
  */
 export async function readTextLimitedWithReason(path: string, root?: string, maxBytes: number = READ_LIMITS.maxFileBytes): Promise<{ text: string } | { skipped: Skipped }> {
+  const result = await readCheckedBytes(path, root, maxBytes);
+  if (!('bytes' in result)) return result;
+  return isBinary(result.bytes) ? { skipped: 'binary' } : { text: result.bytes.toString('utf8') };
+}
+
+/**
+ * The raw bytes of a regular file of at most `maxBytes`, or null: missing, unreadable, a symbolic link at any level under
+ * `root`, not a regular file, or larger than `maxBytes` (Plan J ruling S11: the git index is binary and can be bigger
+ * than 1 MB). The same checks as readTextLimitedWithReason (lstat, an open that never follows a link and never blocks,
+ * the opened descriptor checked again, P46/P49), without the text and binary checks.
+ */
+export async function readBytesLimited(path: string, root: string, maxBytes: number): Promise<Buffer | null> {
+  const result = await readCheckedBytes(path, root, maxBytes);
+  return 'bytes' in result ? result.bytes : null;
+}
+
+/** The read both readers share: every check of readTextLimitedWithReason, then at most maxBytes + 1 bytes. */
+async function readCheckedBytes(path: string, root: string | undefined, maxBytes: number): Promise<{ bytes: Buffer } | { skipped: Skipped }> {
   let handle: FileHandle | undefined;
   try {
     const rel = root === undefined ? null : under(root, path);
@@ -204,7 +222,7 @@ export async function readTextLimitedWithReason(path: string, root?: string, max
     if (after !== null) return { skipped: after };
     const buf = await readAtMost(handle, opened.size, maxBytes + 1);
     if (buf.length > maxBytes) return { skipped: 'too-large' };
-    return isBinary(buf) ? { skipped: 'binary' } : { text: buf.toString('utf8') };
+    return { bytes: buf };
   } catch {
     return { skipped: 'unreadable' };
   } finally {

@@ -17,6 +17,11 @@
 //   stops here, U14), from the counting bundle (no secret scan, no child process) the plain audit already counted with, built once
 //   per run (final review M9), then the consent screen (default No). Only a yes
 //   gives the ConsentToken addAiSuggestions requires; it then downloads the secret scanner, builds the checked bundle and asks the AI.
+// - Plan J J5 (DECISIONS #124, ruling B1): before all of this, main.ts runs unsafeFolderStop (the swap-risk stop, exit
+//   EXIT_UNSAFE_FOLDER). After the local read, the --type values are checked against the services read; without them,
+//   at a terminal (CliIO.interactive) and without --json, confirmTypes asks whether the detected types are right. Both
+//   come before any GitHub call; a cancel there exits 0 with nothing read from GitHub and no report. The types chosen go
+//   to buildAudit / buildLocalAudit as data (typeOverrides).
 // - Output: the terminal report (default) or JSON (--json) on stdout; --out writes the Markdown report through
 //   writeOutFile; errors and status lines on stderr. Every output gets the run's known values (the GitHub token and
 //   the AI keys, S19/U10), so neither is ever printed, and every line passes hideToken.
@@ -27,7 +32,9 @@ import { AiError, makeProvider } from '../ai/provider.js';
 import { bundleCode, chooseSecretScanner, scrubKnownValues, SecretScanError, type ScanFound, type SecretScanner, type SecretScannerName } from '../ai/redact.js';
 import { countingSummary } from '../audit/consent-token.js';
 import { writeOutFile, OutFileError } from '../audit/out-file.js';
-import { addAiSuggestions, buildAudit, buildLocalAudit, CONSENT_INCOMPLETE, needsRequestBytes, type AuditReport } from '../audit/model.js';
+import {
+  addAiSuggestions, buildAudit, buildLocalAudit, CONSENT_INCOMPLETE, needsRequestBytes, safeRunCommand, SWAP_TEXT, SWAP_TEXT_NO_COMMAND, swapRiskWhy, type AuditReport,
+} from '../audit/model.js';
 import { renderJson, renderLocalJson, renderLocalTerminal, renderMarkdown, renderTerminal, type RenderOptions } from '../audit/render.js';
 import { isRateStop, newRateBudget, rateStopOf, type RateClock } from '../engine/github-rate.js';
 import { loadPinnedBinaries, PinnedBinaryError, PLATFORM_KEYS } from '../engine/linters.js';
@@ -40,11 +47,15 @@ import {
   getAuth, GitHubAccessError, GITHUB_TIMEOUT_MS, hideToken, makeOctokit, permissionsTable, readAccessSteps, readGitHubContext,
 } from '../github/client.js';
 import { NotGitHubRepoError, readProject } from '../read/project.js';
+import { applyTypeOverrides, type TypeOverride } from '../read/project-type.js';
 import type { AiProvider, Auth, Capabilities, RepoProfile, ReviewedTool } from '../types.js';
+import { packageVersion } from '../util/package-data.js';
 import { knownValuesFrom, makeSafeOutput, OUTPUT_CAP, usableKnownValues } from '../util/safe-output.js';
+import { safeText } from '../util/safe-text.js';
 import { askConsent, consentScreen } from './consent.js';
 import { tokenLogin } from './inspect.js';
-import type { CliIO } from './io.js';
+import type { CliIO, Prompter } from './io.js';
+import { confirmTypes } from './type-confirm.js';
 
 /** The AI providers `--ai` accepts (ruling S15). */
 export const AI_CHOICES = ['claude', 'openai', 'ollama'] as const;
@@ -62,6 +73,10 @@ export interface AuditFlags {
   model?: string;
   effort?: string;
   allowBroad: boolean;
+  /** Plan J J5: the --type values (parseTypeFlags); [] or absent: none, and at a terminal the type question is asked. */
+  types?: readonly TypeOverride[];
+  /** Plan J J5: --verbose, passed to the terminal renderer (RenderOptions.verbose: the full report; J4 makes the short one the default). */
+  verbose?: boolean;
 }
 
 /** Ruling S15: the audit's own wording (MISSING_AI_MESSAGE talks about the full job). */
@@ -89,6 +104,28 @@ const NO_CAPABILITIES: Capabilities = {
 };
 /** `pipegen audit`'s exit code when the report is complete from the files but GitHub's rate limit left GitHub facts unread. */
 export const EXIT_INCOMPLETE = 3;
+/** Plan J J5 (owner choice 7): stopped before reading anything, because this folder could change which pipegen runs. */
+export const EXIT_UNSAFE_FOLDER = 4;
+/** The line after a cancelled type question (stderr; no report follows). */
+export const TYPE_CANCELLED = 'Cancelled: nothing was read from GitHub and no report was made.';
+
+/**
+ * Plan J J5 (DECISIONS #124, ruling S8): the swap-risk stop, run by main.ts before `audit` and `inspect` do anything
+ * else (before the --ai checks, any read of the repo or any GitHub call). When swapRiskWhy finds something in the
+ * folders npm read for this start (the current folder up to the audited repo when it is inside it, and up to the
+ * current folder's own repo whatever --dir says), it prints what it found, SWAP_TEXT and the safe-mode command on
+ * stderr and returns EXIT_UNSAFE_FOLDER; else null (a risk only in the audited repo, run from outside, stays a warning).
+ */
+export async function unsafeFolderStop(io: CliIO, dir: string): Promise<number | null> {
+  const why = await swapRiskWhy(io.cwd ?? process.cwd(), dir);
+  if (why === null) return null;
+  const command = safeRunCommand(packageVersion());
+  io.err(`pipegen stopped before reading the repo: it found ${safeText(why, 500)}.`);
+  io.err(command === null ? SWAP_TEXT_NO_COMMAND : SWAP_TEXT);
+  if (command !== null) io.err(`  ${command}`);
+  io.err(`If this is your own repo, remove what was found and start pipegen again; otherwise run the command above from a folder you trust, outside the repo (replace ./repo with the repo's folder). exit code ${EXIT_UNSAFE_FOLDER}.`);
+  return EXIT_UNSAFE_FOLDER;
+}
 interface AiReady { provider: AiProvider; secretScanner: Pick<SecretScanner, 'name' | 'version'>; bar: QualityBar }
 
 /**
@@ -141,6 +178,25 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
     }
     const { owner, repo } = local;
 
+    // 2b. the types (B1): --type checked against the services read; else, at a terminal and without --json, the type
+    //     question (S9). Both before any GitHub call; a cancel reads nothing from GitHub and prints no report.
+    let typeOverrides: readonly TypeOverride[] = flags.types ?? [];
+    if (typeOverrides.length > 0) {
+      try {
+        applyTypeOverrides(local, typeOverrides);
+      } catch (e) {
+        fail(clean(e instanceof Error ? e.message : String(e)));
+        return 1;
+      }
+    } else if (io.interactive === true && !flags.json && local.services.length > 0) {
+      const answer = await confirmTypes(scrubbed(io.prompt), local.services);
+      if (answer === 'cancel') {
+        fail(TYPE_CANCELLED);
+        return 0;
+      }
+      typeOverrides = answer;
+    }
+
     // 3. GitHub, read-only, one rate budget for the whole run (S18). DoD run 2026-10-29 (Plan U: "discovery stops
     //    early, keeping what passed"): a rate stop at any point keeps what was read and goes on from the files; the
     //    report marks every check that needed the rest as unknown and exits EXIT_INCOMPLETE. Other failures are unchanged.
@@ -177,7 +233,7 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
       if (!(e instanceof GitHubAccessError) && !isRateStop(e)) throw e;
       // a token that can't see the repo: the same read-only steps as without one (never `gh auth login`)
       const steps = token !== null && e instanceof GitHubAccessError && (e.status === 404 || e.status === 403) ? ` ${readAccessSteps(owner, repo)}` : '';
-      return localOnly(dir, `${e instanceof Error ? e.message : String(e)}${steps}`, notes);
+      return localOnly(dir, `${e instanceof Error ? e.message : String(e)}${steps}`, notes, typeOverrides);
     }
 
     // 4. the reviewed tool list (B3: unusable in this build → no tools, a top warning, exit 0)
@@ -197,7 +253,7 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
     let r: AuditReport = await buildAudit(dir, {
       gh: github.gh, anonymous, context: github.context, capabilities: github.caps, unreadCapabilities: github.unread,
       permissions: permissionsTable('write', { appCreatesRepos: github.auth.canCreateRepos }),
-      reviewed, reviewedUnavailable: reviewedProblem !== null, now: Date.now, notes, budget: clock.budget, bundle: counted,
+      reviewed, reviewedUnavailable: reviewedProblem !== null, now: Date.now, notes, budget: clock.budget, bundle: counted, typeOverrides,
     });
     if (reviewedProblem !== null) r = { ...r, warnings: [{ text: reviewedUnavailableWarning(reviewedProblem) }, ...r.warnings] };
 
@@ -213,8 +269,7 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
       }
       const screen = consentScreen(r.profile, ai.provider, est, countingSummary(counted), permissionsTable('read'), [], 'audit-ai', { secretScanner: ai.secretScanner, ...(r.githubIncomplete === null ? {} : { incompleteNote: CONSENT_INCOMPLETE }) });
       // defence in depth: the screen is pipegen's own text with cleaned repo names; known values are hidden all the same
-      const scrub = (s: string) => scrubKnownValues(hideToken(s, token), usableKnownValues(knownValues));
-      const consent = await askConsent({ ...io.prompt, confirm: (msg, def) => io.prompt.confirm(scrub(msg), def) }, screen, fail);
+      const consent = await askConsent(scrubbed(io.prompt), screen, fail);
       if (consent === null) {
         fail('No consent (you said no, or the question was cancelled): nothing was sent to an AI. The report below is the plain audit.');
       } else {
@@ -226,7 +281,7 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
     }
 
     // 7. the report
-    const opts: RenderOptions = { knownValues, ...(found === undefined ? {} : { found }) };
+    const opts: RenderOptions & { verbose: boolean } = { knownValues, verbose: flags.verbose === true, ...(found === undefined ? {} : { found }) };
     say(flags.json ? renderJson(r, opts) : renderTerminal(r, opts));
     if (flags.out !== undefined) {
       try {
@@ -246,10 +301,19 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
     return 0;
   }
 
+  /**
+   * Every question's text with the run's known values hidden (defence in depth: the texts are pipegen's own, with
+   * cleaned repo names). `token` is read when a question is asked, so a question after getAuth hides it too.
+   */
+  function scrubbed(p: Prompter): Prompter {
+    const scrub = (s: string) => scrubKnownValues(hideToken(s, token), usableKnownValues(knownValues));
+    return { ...p, confirm: (msg, def) => p.confirm(scrub(msg), def), select: (msg, opts, def) => p.select(scrub(msg), opts, def) };
+  }
+
   /** GitHub couldn't be read: what is on disk only, "GitHub: not read", the reason on stderr, exit 1 (R10). */
-  async function localOnly(dir: string, why: string, notes: string[]): Promise<number> {
-    const l = await buildLocalAudit(dir, { notes });
-    const opts: RenderOptions = { knownValues };
+  async function localOnly(dir: string, why: string, notes: string[], typeOverrides: readonly TypeOverride[]): Promise<number> {
+    const l = await buildLocalAudit(dir, { notes, typeOverrides });
+    const opts: RenderOptions & { verbose: boolean } = { knownValues, verbose: flags.verbose === true };
     say(flags.json ? renderLocalJson(l, opts) : renderLocalTerminal(l, opts));
     // pipegen's own access message (repo names already cleaned): redact would cut its wording ("this token: …")
     fail(`GitHub: not read: ${clean(why, 2000)}`);

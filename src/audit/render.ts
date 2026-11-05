@@ -24,17 +24,18 @@
 // in a Markdown code block, after isOwnCommand() confirms they are exactly what the model builds (no repo data).
 // Arrays whose size depends on the repo are appended with loops, never spread into a call (a spread of ~100k lines
 // overflows the stack).
-import { excludedSummaryLines, type ScanFound } from '../ai/redact.js';
+import { excludedSummaryLines, GIT_EXCLUDED_LINES, type ScanFound } from '../ai/redact.js';
 import { SCHEDULED_CATEGORIES } from '../engine/need-ids.js';
 import { ACTIVITY_CAPPED_PREFIX } from '../estimate/estimate.js';
 import type { RepoToolStep } from '../engine/reviewed.js';
-import type { Layer, Need, Part, ReviewedTool } from '../types.js';
+import type { Layer, Need, Part, RepoProfile, ReviewedTool } from '../types.js';
 import type { SkippedGroup, WouldSet } from './choose.js';
 import { num, plural, size, usd as money } from '../util/format.js';
 import { makeSafeOutput, OUTPUT_CAP, type OutputTarget } from '../util/safe-output.js';
 import { safeMarkdown } from '../util/safe-text.js';
 import { K8S_FOLDERS } from '../read/quality.js';
 import { COVERAGE_LIMITS, type Coverage } from './coverage.js';
+import { buildShortDoc } from './render-short.js';
 import {
   buildsNoImage, isBuiltInNeed, isOwnCommand, needLabel, SECRET_CHECK, type AuditAi, type GitHubFact, type AuditReport, type LocalAudit, type WouldAddRow, type WouldAddTool,
 } from './model.js';
@@ -52,57 +53,94 @@ export interface RenderOptions {
   found?: ScanFound;
   /** Clock for the Markdown report's date; default Date.now. */
   now?: () => number;
+  /**
+   * Plan J J4 (DECISIONS #123): the terminal report is the short one unless this is true. Markdown and JSON are always
+   * in full, and so is the local-only report.
+   */
+  verbose?: boolean;
 }
 
 const L = COVERAGE_LIMITS;
 /**
- * What this audit can't see (the Plan U Task 1 parked limits), in plain words. Shown in every report, and in `--json`
- * as `cantSee`. The Plan U final review (M3) lined it up with the code: paths filters and `if:` conditions read partial,
+ * Plan J J4 (DECISIONS #123): a limit of what the audit can see, and when it matters for this repo. A repo the limit
+ * can't touch (no workflows, no Python, no Renovate...) is not told about it. Where the profile can't tell, `applies`
+ * is true: a caveat is hidden only when the facts show it is beside the point.
+ */
+export interface CantSee { readonly text: string; readonly applies: (p: RepoProfile) => boolean }
+const hasPython = (p: RepoProfile) => p.services.some((s) => s.language === 'python' || s.alsoLanguages?.includes('python') === true);
+const hasHooks = (p: RepoProfile) => p.precommit !== null || (p.otherHookManagers?.length ?? 0) > 0;
+const wf = (p: RepoProfile) => p.existingWorkflows.length > 0;
+const ci = (p: RepoProfile) => wf(p) || hasHooks(p);
+const big = (p: RepoProfile) => wf(p) || p.services.length > L.services / 2;
+const py = (p: RepoProfile) => hasPython(p) && ci(p);
+const docker = (p: RepoProfile) => p.hasCompose || p.services.some((s) => s.dockerfile !== undefined);
+const multilang = (p: RepoProfile) => p.services.some((s) => (s.alsoLanguages?.length ?? 0) > 0);
+const precommit = (p: RepoProfile) => p.precommit === 'pre-commit';
+const pypi = (p: RepoProfile) => p.existingWorkflows.some((w) => w.publishes?.includes('pypi') === true) || (hasPython(p) && wf(p));
+const scripts = (p: RepoProfile) => p.services.some((s) => s.scripts.includes('test') || s.scripts.includes('lint'));
+/** A variable that switches a check off matters where pre-commit, tox, nox or an npm publish is in play. */
+const vars = (p: RepoProfile) => wf(p) && (hasPython(p) || p.precommit === 'pre-commit' || p.existingWorkflows.some((w) => w.publishes?.includes('npm') === true));
+const jscov = (p: RepoProfile) => p.services.some((s) => (s.language === 'node' || s.alsoLanguages?.includes('node') === true) && s.hasTests);
+const renovate = (p: RepoProfile) => p.repoFiles.renovate !== null;
+const always = () => true;
+const ui = (p: RepoProfile) => p.services.some((s) => s.quality.uiFrameworks.some((u) => u === 'vue' || u === 'svelte' || u === 'astro'));
+const k8s = (p: RepoProfile) => p.repoFiles.kubernetes || p.terraformDirs.length > 0 || docker(p);
+const cs = (text: string, applies: CantSee['applies']): CantSee => ({ text, applies });
+
+/**
+ * What this audit can't see (the Plan U Task 1 parked limits), in plain words. Shown in the full reports and in `--json`
+ * as `cantSee`, each only when it applies to the repo (Plan J J4; `applies`). The Plan U final review (M3) lined it up with the code: paths filters and `if:` conditions read partial,
  * the per-run budgets (numbers from COVERAGE_LIMITS, the ones mapCoverage uses) and nested local actions read unknown,
  * and a visible TOX… / NOX… variable reads partial.
  */
-export const CANT_SEE: readonly string[] = Object.freeze([
-  "pipegen checks that a tool runs on the right trigger and can fail the build; it doesn't check the tool's other settings.",
-  "Workflows limited by `paths:` or `paths-ignore:`, and jobs or steps with an `if:` condition, show as partial: pipegen can't tell when they run.",
-  'A tool and a test joined on one line, like `{ tool; [[ … ]] } || true`, can hide a failing tool, and pipegen may still count it as covered (rare).',
-  "Commands inside `bash -c '…'` or a quoted `\"$(…)\"` aren't read, so a tool run there shows as partial or missing.",
-  "A `runs-on` set by an expression is read as Linux.",
-  'Tools inside shell functions, and jobs whose matrix includes Windows, show as partial.',
-  `Very large repos show some checks as unknown: past ${num(L.workflows)} workflow files, ${num(L.jobs)} jobs in a workflow, ${num(L.steps)} steps in a job or action, `
-    + `${num(L.localFiles)} local workflows and actions followed, ${num(L.runTextMb)} MB of run text, ${num(L.stepVisits)} steps visited in all, `
-    + `${num(L.hits)} tool findings, ${num(L.hitDirs)} folders with runs, or ${num(L.services)} services.`,
-  "Reusable workflows from other repos, and actions from your own account, can't be looked inside: those checks show as unknown.",
-  "Shell tricks such as `trap … EXIT`, `alias`, or a function named like the test tool aren't modelled, so a repo built to fool the audit could make a check look covered.",
-  "A local action or reusable workflow that calls another local one isn't followed past the first level, so those checks show as unknown.",
+export const CANT_SEE: readonly CantSee[] = Object.freeze([
+  cs("pipegen checks that a tool runs on the right trigger and can fail the build; it doesn't check the tool's other settings.", ci),
+  cs("Workflows limited by `paths:` or `paths-ignore:`, and jobs or steps with an `if:` condition, show as partial: pipegen can't tell when they run.", wf),
+  cs('A tool and a test joined on one line, like `{ tool; [[ … ]] } || true`, can hide a failing tool, and pipegen may still count it as covered (rare).', ci),
+  cs("Commands inside `bash -c '…'` or a quoted `\"$(…)\"` aren't read, so a tool run there shows as partial or missing.", wf),
+  cs("A `runs-on` set by an expression is read as Linux.", wf),
+  cs('Tools inside shell functions, and jobs whose matrix includes Windows, show as partial.', wf),
+  cs(
+    `Very large repos show some checks as unknown: past ${num(L.workflows)} workflow files, ${num(L.jobs)} jobs in a workflow, ${num(L.steps)} steps in a job or action, `
+      + `${num(L.localFiles)} local workflows and actions followed, ${num(L.runTextMb)} MB of run text, ${num(L.stepVisits)} steps visited in all, `
+      + `${num(L.hits)} tool findings, ${num(L.hitDirs)} folders with runs, or ${num(L.services)} services.`,
+    big,
+  ),
+  cs("Reusable workflows from other repos, and actions from your own account, can't be looked inside: those checks show as unknown.", wf),
+  cs("Shell tricks such as `trap … EXIT`, `alias`, or a function named like the test tool aren't modelled, so a repo built to fool the audit could make a check look covered.", wf),
+  cs("A local action or reusable workflow that calls another local one isn't followed past the first level, so those checks show as unknown.", wf),
   // Plan U Task 5 fix round 2 (review M4): limits of the checks Task 5 added, each erring toward covered
-  "`tox` counts as your own test run whatever environments its config lists: pipegen doesn't read tox's env_list.",
-  "A tox or nox run whose environments a TOX… or NOX… variable in the job picks (like TOXENV from a matrix) shows as partial: pipegen doesn't read the variable's value, so it can't tell if the tests run.",
-  "Variables that change what runs (SKIP for pre-commit, TOX… and NOX… for tox and nox, NPM_CONFIG_DRY_RUN) aren't seen when an action from another repo sets them, or when a step writes them under a name built while it runs.",
-  "Dockerfile RUN lines count only when a `docker build`, docker/build-push-action or `docker compose build` step names the Dockerfile with plain paths, and only for the stages the final stage (or the target) needs. Build arguments and ENV count only as variables the RUN lines see; a Compose `extends`, `include`, `--env-file` or COMPOSE_FILE, and a custom Dockerfile frontend, show as unknown.",
+  cs("`tox` counts as your own test run whatever environments its config lists: pipegen doesn't read tox's env_list.", py),
+  cs("A tox or nox run whose environments a TOX… or NOX… variable in the job picks (like TOXENV from a matrix) shows as partial: pipegen doesn't read the variable's value, so it can't tell if the tests run.", py),
+  cs("Variables that change what runs (SKIP for pre-commit, TOX… and NOX… for tox and nox, NPM_CONFIG_DRY_RUN) aren't seen when an action from another repo sets them, or when a step writes them under a name built while it runs.", vars),
+  cs("Dockerfile RUN lines count only when a `docker build`, docker/build-push-action or `docker compose build` step names the Dockerfile with plain paths, and only for the stages the final stage (or the target) needs. Build arguments and ENV count only as variables the RUN lines see; a Compose `extends`, `include`, `--env-file` or COMPOSE_FILE, and a custom Dockerfile frontend, show as unknown.", docker),
   // P59 (1): a command word that is a variable (`RUN $TEST_CMD`, `$CMD args`) is never credited to any tool
-  "Commands given through a variable aren't read.",
+  cs("Commands given through a variable aren't read.", wf),
   // P60 (R4), re-review 2: a folder with two languages is one service; a tool of either language covers its row
-  "A folder with more than one language (like a Python app with a package.json for its assets) is one service: a check run in either language counts for it, so pipegen can't tell if each language is checked.",
+  cs("A folder with more than one language (like a Python app with a package.json for its assets) is one service: a check run in either language counts for it, so pipegen can't tell if each language is checked.", multilang),
   // P57 (M4, C1)
-  "A Dockerfile `ENTRYPOINT` in shell form, or a compose `entrypoint:`, can ignore the command `docker compose run` or `docker run` passes, so a check run that way may not run at all: pipegen doesn't read the entrypoint.",
-  "A tool counts only for services in the languages pipegen lists for it (mypy and Ruff for Python, ESLint and tsc for JavaScript and TypeScript); a tool set up to check other languages as well isn't credited for them.",
-  "A pre-commit hook pinned to a commit SHA (`rev:`) isn't checked to be a commit of the hook's own repo, so it could come from a fork.",
-  'pipegen knows the PyPI publish action up to v1.14.3: a newer release pinned by its commit SHA shows as partial until pipegen is updated.',
-  "A test or lint script whose runner pipegen doesn't know (like `node test.js`) is trusted by its name: pipegen only lowers it when the script clearly does nothing or can't fail.",
+  cs("A Dockerfile `ENTRYPOINT` in shell form, or a compose `entrypoint:`, can ignore the command `docker compose run` or `docker run` passes, so a check run that way may not run at all: pipegen doesn't read the entrypoint.", docker),
+  cs("A tool counts only for services in the languages pipegen lists for it (mypy and Ruff for Python, ESLint and tsc for JavaScript and TypeScript); a tool set up to check other languages as well isn't credited for them.", wf),
+  cs("A pre-commit hook pinned to a commit SHA (`rev:`) isn't checked to be a commit of the hook's own repo, so it could come from a fork.", precommit),
+  cs('pipegen knows the PyPI publish action up to v1.14.3: a newer release pinned by its commit SHA shows as partial until pipegen is updated.', pypi),
+  cs("A test or lint script whose runner pipegen doesn't know (like `node test.js`) is trusted by its name: pipegen only lowers it when the script clearly does nothing or can't fail.", scripts),
   // Plan P Task 9
-  "Coverage minimums in JS or TS config files (like jest.config.js or vitest.config.ts) are read as text: pipegen finds the setting but can't run the file, so it can't confirm the minimum.",
-  "Renovate presets (`extends`) aren't followed, so a setting that comes from a shared preset isn't seen.",
-  "Repo settings on GitHub (required checks, secret scanning, the default token permissions) aren't read, so pipegen can't say whether they are already on.",
-  "A workflow without a `permissions:` block gets the repo's default token permissions, a setting pipegen can't see.",
-  "A deploy workflow that uses no secret and no write grant isn't seen as a release.",
-  'Network egress control (blocking unexpected traffic from release jobs) is only partly read on larger runners.',
-  "Environment variables set by third-party actions aren't seen, so a check one of them turns off can show as covered.",
-  "pipegen can't check yet that an ESLint config reads .vue, .svelte and .astro files (the parsers and plugins come in v0.2): such a repo never shows a clean pass for ESLint.",
+  cs("Coverage minimums in JS or TS config files (like jest.config.js or vitest.config.ts) are read as text: pipegen finds the setting but can't run the file, so it can't confirm the minimum.", jscov),
+  cs("Renovate presets (`extends`) aren't followed, so a setting that comes from a shared preset isn't seen.", renovate),
+  cs("Repo settings on GitHub (required checks, secret scanning, the default token permissions) aren't read, so pipegen can't say whether they are already on.", always),
+  cs("A workflow without a `permissions:` block gets the repo's default token permissions, a setting pipegen can't see.", wf),
+  cs("A deploy workflow that uses no secret and no write grant isn't seen as a release.", wf),
+  cs('Network egress control (blocking unexpected traffic from release jobs) is only partly read on larger runners.', wf),
+  cs("Environment variables set by third-party actions aren't seen, so a check one of them turns off can show as covered.", wf),
+  cs("pipegen can't check yet that an ESLint config reads .vue, .svelte and .astro files (the parsers and plugins come in v0.2): such a repo never shows a clean pass for ESLint.", ui),
   // hand checks 2026-10-29 (fix 1, ruling P55)
-  "The quick secret check on the files on disk looks only for a few secret formats (private keys, some token formats, JWTs, passwords in connection strings); it doesn't read `name = value` lines, such as an API key or a password set in code or in a .env file, so it is not a secret scan.",
+  cs("The quick secret check on the files on disk looks only for a few secret formats (private keys, some token formats, JWTs, passwords in connection strings); it doesn't read `name = value` lines, such as an API key or a password set in code or in a .env file, so it is not a secret scan.", always),
   // final review m1
-  `Kubernetes manifests are looked for only in YAML under folders named ${K8S_FOLDERS.slice(0, -1).join(', ')} or ${K8S_FOLDERS.at(-1)} (and a Chart.yaml anywhere), so manifests kept elsewhere, like infra/, aren't seen.`,
-]);
+  cs(`Kubernetes manifests are looked for only in YAML under folders named ${K8S_FOLDERS.slice(0, -1).join(', ')} or ${K8S_FOLDERS.at(-1)} (and a Chart.yaml anywhere), so manifests kept elsewhere, like infra/, aren't seen.`, k8s),
+].map((x) => Object.freeze(x)));
+
+/** The limits that apply to this repo, as text: what the human reports list and JSON's `cantSee` carries. */
+export const cantSeeFor = (p: RepoProfile): string[] => CANT_SEE.filter((x) => x.applies(p)).map((x) => x.text);
 
 /** Plan P Task 9: the four layers, and a fifth group for the SCHEDULED_CATEGORIES rows (merge-layer needs read on their own trigger). */
 type Group = Layer | 'scheduled';
@@ -157,11 +195,14 @@ type Block =
   | { kind: 'rows'; rows: Row[] }
   /** One of pipegen's own fixed commands, under the block before it (depth: that item's depth, or -1 under text). */
   | { kind: 'command'; command: string; depth: number };
-interface Section { title: string; blocks: Block[] }
-interface Doc { title: string; intro: string[]; /** P55: the audited commit line. */ commit: string; verdict: string | null; /** PS37: the scheduled group's own status line (not part of the verdict). */ scheduled?: string; sections: Section[] }
+export interface Section { title: string; blocks: Block[] }
+export interface Doc {
+  /** Plan J J4: the short terminal report, already cleaned and wrapped line by line (the other fields are kept for the callers that read them). When set, the terminal prints these lines and nothing else. */
+  terminal?: string[];
+  title: string; intro: string[]; /** P55: the audited commit line. */ commit: string; verdict: string | null; /** PS37: the scheduled group's own status line (not part of the verdict). */ scheduled?: string; sections: Section[] }
 
 /** How values are cleaned and amounts written for one target. */
-interface Ctx {
+export interface RenderCtx {
   target: OutputTarget;
   /** A repo, GitHub or AI string (ruling U10). */
   v(s: string, max?: number): string;
@@ -174,7 +215,8 @@ interface Ctx {
   noImage(need: Pick<Need, 'service'>): boolean;
 }
 
-function ctxFor(target: OutputTarget, opts: RenderOptions, mergeLock: boolean, services: AuditReport['profile']['services'] = []): Ctx {
+type Ctx = RenderCtx;
+export function ctxFor(target: OutputTarget, opts: RenderOptions, mergeLock: boolean, services: AuditReport['profile']['services'] = []): RenderCtx {
   const clean = makeSafeOutput(opts.knownValues, opts.found);
   return {
     target,
@@ -203,15 +245,15 @@ function command(c: Ctx, cmd: string, depth: number): Block {
 
 // ---------- layers and the verdict (ruling S14) ----------
 
-interface LayerView { layer: Group; rows: Coverage[]; needed: boolean; gaps: boolean; serious: boolean; unknown: boolean; covered: number }
+export interface LayerView { layer: Group; rows: Coverage[]; needed: boolean; gaps: boolean; serious: boolean; unknown: boolean; covered: number }
 
 /**
  * A blocking floor need (every coverage row is a floor need) that is missing or partial, and that a tool or the
  * project's own script should cover: pipegen's own checks are gaps pipegen fills, never serious (ruling U16).
  */
-const isSerious = (c: Coverage) => c.need.blocking === true && !isBuiltInNeed(c.need) && (c.status === 'missing' || c.status === 'partial');
+export const isSerious = (c: Coverage) => c.need.blocking === true && !isBuiltInNeed(c.need) && (c.status === 'missing' || c.status === 'partial');
 
-function layerViews(r: AuditReport): LayerView[] {
+export function layerViews(r: AuditReport): LayerView[] {
   return GROUPS.map((layer) => {
     // a scheduled row (a merge-layer need) is counted in its own group only, so nothing is counted twice
     const rows = r.coverage.filter((c) => (layer === 'scheduled' ? isScheduled(c.need) : c.need.layer === layer && !isScheduled(c.need)));
@@ -225,7 +267,7 @@ function layerViews(r: AuditReport): LayerView[] {
   });
 }
 
-function verdictOf(views: LayerView[]): string {
+export function verdictOf(views: LayerView[]): string {
   const needed = views.filter((v) => v.needed);
   const m = needed.length;
   const g = needed.filter((v) => v.gaps).length;
@@ -258,13 +300,13 @@ function row(c: Ctx, cov: Coverage, services: readonly string[] = []): Row {
   const where = cov.where === undefined ? null : c.v(cov.where, OUTPUT_CAP.path);
   const label = services.length > 1 ? groupLabel(c, cov.need, services) : checkLabel(c, cov.need);
   return {
-    serious: isSerious(cov), status: cov.status, check: `${label}${cov.need.blocking ? '' : ` (${WARNING_ONLY})`}`, why: c.v(cov.why, OUTPUT_CAP.text),
+    serious: isSerious(cov), status: cov.status, check: `${label}${cov.need.blocking ? '' : ` (${WARNING_ONLY})`}`, why: c.v(cov.credit ?? cov.why, OUTPUT_CAP.text),
     found: by !== null && where !== null ? `${by} in ${where}` : by ?? where,
   };
 }
 
 /** "a", "a and b", "a, b and c". */
-const andList = (xs: readonly string[]) => (xs.length <= 1 ? xs.join('') : `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1] as string}`);
+export const andList = (xs: readonly string[]) => (xs.length <= 1 ? xs.join('') : `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1] as string}`);
 /** A check's name for several services at once: "Lint for frontend and backend". */
 const groupLabel = (c: Ctx, need: Need, services: readonly string[]) =>
   `${needLabel(need.id, { noImage: c.noImage(need) }) ?? c.v(need.id)} for ${andList(services.map((s) => c.v(s)))}`;
@@ -294,6 +336,35 @@ function groupByService<T extends { need: Need }>(c: Ctx, items: readonly T[], k
     out.push(fresh);
   }
   return out;
+}
+
+// ---------- the project type (Plan J J4, DECISIONS #121, #123) ----------
+
+/** How many evidence pieces the short report shows for one service. */
+const MAX_TYPE_EVIDENCE = 3;
+
+/**
+ * "<service>: <types> — <evidence>" for one service, or null when its type isn't known (a hand-built profile). Unsure
+ * adds the reason; the evidence is pipegen's own wording plus plain paths (read/project-type.ts), cleaned like any repo value.
+ * `all`: every piece of evidence (full reports); else the first few.
+ */
+export function typeText(c: RenderCtx, s: AuditReport['profile']['services'][number], all = false): string | null {
+  const t = s.projectType;
+  if (t === undefined) return null;
+  const ev = t.evidence.map((e) => c.v(e, OUTPUT_CAP.text));
+  const shown = all ? ev : ev.slice(0, MAX_TYPE_EVIDENCE);
+  const more = ev.length - shown.length;
+  const types = t.types.length === 0 ? 'unknown' : t.types.join(', ');
+  // a library or not-standalone folder is not treated as a server, so the line must not say it is (final review, minor 2)
+  const unsure = !t.unsure ? '' : t.types.includes('server') ? ' (unsure: pipegen treats it as a server; --type sets it)' : ' (unsure: --type sets it)';
+  const set = t.overridden === true ? ' (set by you)' : '';
+  const why = shown.length === 0 ? '' : ` — ${shown.join('; ')}${more > 0 ? `; and ${num(more)} more (--verbose)` : ''}`;
+  return `${c.v(s.name)}: ${types}${unsure}${set}${why}`;
+}
+
+function typeSection(r: Pick<AuditReport, 'profile'>, c: RenderCtx): Section | null {
+  const lines = r.profile.services.map((s) => typeText(c, s, true)).filter((x): x is string => x !== null);
+  return lines.length === 0 ? null : { title: 'What kind of project this is', blocks: lines.map((l) => item(l)) };
 }
 
 // ---------- sections ----------
@@ -477,7 +548,7 @@ function aiBlocks(ai: AuditAi, reviewedUnavailable: boolean, c: Ctx): Block[] {
 }
 
 /** About what the AI step cost: the meter's per-attempt list costs, summed (AuditAi.costUsd). */
-function aiCostText(ai: AuditAi, c: Ctx): string {
+export function aiCostText(ai: AuditAi, c: Ctx): string {
   const calls = ai.attempts.length;
   if (ai.local === true) {
     return `no cost counted: Ollama runs the model itself, not a paid API (${plural(calls, 'AI call', 'AI calls')}).`;
@@ -563,6 +634,7 @@ function bundleSection(r: Pick<AuditReport, 'aiBundle'>, c: Ctx): Section {
   } else {
     blocks.push(text('Never sent (every pattern; one that starts with ! keeps a file):'));
     for (const p of b.excludedPatterns) blocks.push(item(c.v(p, OUTPUT_CAP.path)));
+    for (const line of GIT_EXCLUDED_LINES) blocks.push(item(c.own(line.replace(/^- /, ''))));
   }
   blocks.push(text('These are counts only, never file contents. They were made without the secret scan; before anything is sent, '
     + 'a secret scan (betterleaks, or gitleaks as the fallback) checks every file and secret-looking values are hidden, so the '
@@ -590,20 +662,20 @@ function nextSection(r: AuditReport, c: Ctx): Section {
 const dedupe = (xs: string[]) => [...new Set(xs)];
 
 /** P55 (hand checks fix 10): the commit the audit read, so two runs (or a hand check) can be compared. */
-function commitLine(r: Pick<AuditReport, 'commit'>, c: Ctx): string {
+export function commitLine(r: Pick<AuditReport, 'commit'>, c: Ctx): string {
   const k = r.commit;
   if (k === null || k === undefined) return "Audited commit: pipegen couldn't read it from .git (it reads the files on disk as they are now).";
   return `Audited commit: ${c.v(k.short)}${k.branch === null ? ' (detached HEAD, no branch)' : ` on branch ${c.v(k.branch, OUTPUT_CAP.path)}`}.`;
 }
 
-function buildDoc(r: AuditReport, c: Ctx): Doc {
+export function buildDoc(r: AuditReport, c: Ctx): Doc {
   const views = layerViews(r);
   const sched = views.find((v) => v.layer === 'scheduled');
   const intro = ['pipegen changed nothing in the repo or on GitHub.'];
   intro.push(r.ai === undefined ? 'Nothing was sent to an AI.' : 'You ran it with --ai: the AI part below says what the AI step found.');
   const sections = [
-    warningsSection(r, c), quickSecretSection(r, c), planSection(r, c), layersSection(c, views), skippedSection(r, c), addSection(r, c), wouldSetSection(r, c),
-    costsSection(r, c), bundleSection(r, c), permissionsSection(r, c), notesSection(r, c), { title: "What this audit can't see", blocks: CANT_SEE.map((l) => item(l)) }, nextSection(r, c),
+    warningsSection(r, c), quickSecretSection(r, c), typeSection(r, c), planSection(r, c), layersSection(c, views), skippedSection(r, c), addSection(r, c), wouldSetSection(r, c),
+    costsSection(r, c), bundleSection(r, c), permissionsSection(r, c), notesSection(r, c), { title: "What this audit can't see", blocks: cantSeeFor(r.profile).map((l) => item(l)) }, nextSection(r, c),
   ].filter((s): s is Section => s !== null);
   return { title: `pipegen audit: ${c.v(`${r.profile.owner}/${r.profile.repo}`, OUTPUT_CAP.path)}`, intro, commit: commitLine(r, c), verdict: verdictOf(views.filter((v) => v.layer !== 'scheduled')),
     ...(sched === undefined || !sched.needed ? {} : { scheduled: `Scheduled and repo-file checks: ${layerStatus(sched)}.` }), sections };
@@ -612,7 +684,7 @@ function buildDoc(r: AuditReport, c: Ctx): Doc {
 // ---------- terminal ----------
 
 /** Words wrapped to WIDTH code points; a word longer than a line is cut across lines. */
-function wrap(s: string, first: string, rest: string = ' '.repeat([...first].length)): string[] {
+export function wrap(s: string, first: string, rest: string = ' '.repeat([...first].length)): string[] {
   const out: string[] = [];
   let line = first;
   let len = [...first].length;
@@ -669,10 +741,12 @@ function terminalBlocks(blocks: Block[], out: string[]): void {
 
 /** The report for the terminal: plain text, no colours, lines wrapped at 100 characters. */
 export function renderTerminal(r: AuditReport, opts: RenderOptions): string {
-  return terminalDoc(buildDoc(r, ctxFor('terminal', opts, r.capabilities.branchProtection === true, r.profile.services)));
+  const c = ctxFor('terminal', opts, r.capabilities.branchProtection === true, r.profile.services);
+  return terminalDoc(opts.verbose === true ? buildDoc(r, c) : buildShortDoc(r, c));
 }
 
 function terminalDoc(doc: Doc): string {
+  if (doc.terminal !== undefined) return doc.terminal.join('\n');
   const lines: string[] = [];
   append(lines, wrap(doc.title, ''));
   append(lines, wrap(doc.commit, ''));
@@ -738,7 +812,7 @@ export function renderMarkdown(r: AuditReport, opts: RenderOptions): string {
 // ---------- JSON (ruling S13) ----------
 
 /** Keys whose strings are prose (why texts, notes, basis lines): the long cap. */
-const PROSE_KEYS: ReadonlySet<string> = new Set(['why', 'note', 'notes', 'basis', 'reasons', 'text', 'limits', 'nextStep', 'testsNote', 'message', 'cantSee', 'looksFor', 'doesNotLookFor', 'fullScans']);
+const PROSE_KEYS: ReadonlySet<string> = new Set(['why', 'note', 'notes', 'basis', 'reasons', 'text', 'limits', 'nextStep', 'testsNote', 'message', 'cantSee', 'looksFor', 'doesNotLookFor', 'fullScans', 'credit']);
 /** Keys that hold one of pipegen's own fixed commands: written as they are when isOwnCommand holds (U17). */
 const COMMAND_KEYS: ReadonlySet<string> = new Set(['command', 'nextCommand']);
 /** Keys whose strings are paths (or lists of paths): a larger cap than names. */
@@ -806,7 +880,7 @@ export function renderJson(r: AuditReport, opts: RenderOptions): string {
     const fact = k === 'deploymentBranchPolicies' ? 'deployment-branch-policies' : CAPABILITY_FACT[k];
     if (unread.includes('repo') || (fact !== undefined && unread.includes(fact))) capabilities[k] = null;
   }
-  const slim = { ...r, profile, capabilities, wouldAdd: r.wouldAdd.map((w) => ({ ...w, tool: slimTool(w.tool), also: w.also.map(slimTool) })), cantSee: CANT_SEE };
+  const slim = { ...r, profile, capabilities, aiBundle: { ...r.aiBundle, gitExcluded: GIT_EXCLUDED_LINES.map((l) => l.replace(/^- /, '')) }, wouldAdd: r.wouldAdd.map((w) => ({ ...w, tool: slimTool(w.tool), also: w.also.map(slimTool) })), cantSee: cantSeeFor(r.profile) };
   return JSON.stringify(deepClean(slim, '', 0, false, makeSafeOutput(opts.knownValues, opts.found), new Set()), null, 2);
 }
 
@@ -820,7 +894,11 @@ function localDoc(l: LocalAudit, c: Ctx): Doc {
   const p = l.profile;
   const found: Block[] = [];
   found.push(text(p.services.length === 0 ? 'Services: none found.' : `Services (${num(p.services.length)}):`));
-  for (const s of p.services) found.push(item(`${c.v(s.name)} (${c.v(s.language)}, in ${c.v(s.path, OUTPUT_CAP.path)})`));
+  for (const s of p.services) {
+    found.push(item(`${c.v(s.name)} (${c.v(s.language)}, in ${c.v(s.path, OUTPUT_CAP.path)})`));
+    const type = typeText(c, s, true);
+    if (type !== null) found.push(item(`Type: ${type}`, 1));
+  }
   found.push(text(p.existingWorkflows.length === 0 ? 'Workflows: none found.' : `Workflows (${num(p.existingWorkflows.length)}):`));
   for (const w of p.existingWorkflows) found.push(item(c.v(w.path, OUTPUT_CAP.path)));
   const sections = [

@@ -39,6 +39,7 @@
     "execa": "^10.2.0",
     "fast-glob": "^3.3.3",
     "fast-xml-parser": "5.11.2",
+    "ignore": "7.0.14",
     "libsodium-wrappers": "0.8.4",
     "picomatch": "^4.0.7",
     "smol-toml": "^1.9.1",

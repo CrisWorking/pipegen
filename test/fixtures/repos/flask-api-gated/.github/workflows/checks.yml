@@ -1,0 +1,34 @@
+name: Checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - run: pip install uv && uv run pytest
+  leaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - run: |
+          curl -sSfL https://example.invalid/gitleaks_8.18.4_linux_x64.tar.gz -o g.tgz
+          echo "1111111111111111111111111111111111111111111111111111111111111111  g.tgz" | sha256sum -c -
+          tar xzf g.tgz gitleaks
+          ./gitleaks git --redact
+  vulns:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: aquasecurity/trivy-action@6abccf398f78b4c337599c0656f933d91efb91a0
+        with:
+          scan-type: fs
+          scanners: vuln
+          version: v0.76.0
+          exit-code: '1'

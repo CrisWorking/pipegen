@@ -9,33 +9,46 @@ import { safeRunCommand } from '../audit/model.js';
 import { hideToken, permissionsTable } from '../github/client.js';
 import { packageVersion } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
-import { AI_CHOICES, audit, normalizeAiFlag, type AiChoice } from './audit.js';
+import { AI_CHOICES, audit, normalizeAiFlag, unsafeFolderStop, type AiChoice } from './audit.js';
 import { inspect } from './inspect.js';
 import { processIO, type CliIO } from './io.js';
+import { parseTypeFlags } from './type-confirm.js';
 
-/** The help text. The run command carries the running version, exactly (ruling S30), or no command at all (U18). */
+/**
+ * The help text. `npx pipegen` inside the project folder comes first (DECISIONS #124, ruling S10); the safe mode for a
+ * repo you don't trust carries the running version, exactly (ruling S30), or no command at all (U18).
+ */
 function usage(): string[] {
   const command = safeRunCommand(packageVersion());
   return [
-    'Usage: pipegen <command> [options]',
+    'Usage: pipegen [command] [options]',
+    '',
+    'In your project folder:',
+    '  npx pipegen        Audit this folder (the same as pipegen audit). pipegen shows the type it found for each',
+    '                     service and asks "Is this right? (Y/n)" before it reads GitHub.',
     '',
     'Commands:',
     '  pipegen audit      Report which checks your CI already runs, what is missing at each layer, and what the full',
     '                     setup would add, cost and need. Read-only: it changes nothing; no AI unless --ai.',
     '  pipegen inspect    Read this repo and its GitHub settings and print a summary. Read-only; no AI.',
     '',
-    'Run pipegen from OUTSIDE the repo you audit, with an exact version and npm\'s own registry, so the repo\'s',
-    '.npmrc or node_modules can\'t change which pipegen runs:',
+    'Safe mode, for a repo you don\'t trust: run pipegen from OUTSIDE it, with an exact version and npm\'s own registry,',
+    'so the repo\'s .npmrc or node_modules can\'t change which pipegen runs:',
     ...(command === null ? ['  (use npm\'s registry and an exact pipegen version)'] : [`  ${command}`]),
+    'Inside a folder whose .npmrc, node_modules/.bin/pipegen or committed node_modules could change which pipegen runs,',
+    `pipegen stops before reading anything and prints that command (exit code 4).`,
     '',
     'Options:',
     '  --dir <folder>        The repo folder (default: the current folder).',
+    '  --type <type>         audit: set the type of the repo\'s only service, or --type <service>=<type> (give it once',
+    '                        per service): static-site, library, cli, server or container. No question is asked then.',
+    '  --verbose             audit: the full report in the terminal.',
     '  --out <file>          audit: also write the report as Markdown. A relative path is read from the current folder,',
     '                        never from --dir. pipegen never follows a symbolic link; it replaces a file or writes',
     '                        inside the repo only with --force.',
     '  --force               audit, with --out: replace an existing regular file, or write inside the repo (never',
     '                        through a symbolic link). Not available on Windows.',
-    '  --json                audit: print the report as JSON.',
+    '  --json                audit: print the report as JSON (no question is asked).',
     '  --ai [claude|openai|ollama]',
     '                        audit: also ask an AI which checks and tools to mention. pipegen first shows what it would',
     '                        send and what it may cost, and asks you (default No). Needs Linux or macOS (WSL works).',
@@ -52,7 +65,9 @@ function usage(): string[] {
 }
 
 /** Options only `pipegen audit` takes. */
-const AUDIT_ONLY = ['out', 'force', 'json', 'ai', 'model', 'effort'] as const;
+const AUDIT_ONLY = ['out', 'force', 'json', 'ai', 'model', 'effort', 'type', 'verbose'] as const;
+/** Ruling S10: options that may be given more than once (each --type names one service). */
+const REPEATABLE: ReadonlySet<string> = new Set(['type']);
 
 /** Runs one pipegen command. Returns the exit code; output goes through io.out, errors and usage-on-error through io.err. */
 export async function run(argv: string[], io: CliIO): Promise<number> {
@@ -60,7 +75,7 @@ export async function run(argv: string[], io: CliIO): Promise<number> {
   const fail = (s: string) => { io.err(s); };
   let values: {
     dir?: string; out?: string; force?: boolean; json?: boolean; ai?: string; model?: string; effort?: string;
-    'allow-broad-token'?: boolean; help?: boolean; version?: boolean;
+    type?: string[]; verbose?: boolean; 'allow-broad-token'?: boolean; help?: boolean; version?: boolean;
   };
   let positionals: string[];
   let tokens: { kind: string; name?: string }[];
@@ -78,6 +93,8 @@ export async function run(argv: string[], io: CliIO): Promise<number> {
         ai: { type: 'string' },
         model: { type: 'string' },
         effort: { type: 'string' },
+        type: { type: 'string', multiple: true },
+        verbose: { type: 'boolean' },
         'allow-broad-token': { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
         version: { type: 'boolean', short: 'v' },
@@ -91,7 +108,7 @@ export async function run(argv: string[], io: CliIO): Promise<number> {
   // a repeated option would silently use the last value (`--ai claude --ai ollama` runs Ollama): refused (review M8)
   const seen = new Set<string>();
   for (const t of tokens) {
-    if (t.kind !== 'option' || t.name === undefined) continue;
+    if (t.kind !== 'option' || t.name === undefined || REPEATABLE.has(t.name)) continue;
     if (seen.has(t.name)) {
       fail(`--${t.name} was given more than once. Give each option once.`);
       return 1;
@@ -102,11 +119,13 @@ export async function run(argv: string[], io: CliIO): Promise<number> {
     say(`pipegen ${packageVersion() ?? 'unknown'}`);
     return 0;
   }
-  const [command, ...rest] = positionals;
-  if (values.help || command === undefined) {
+  // DECISIONS #124: no command is `pipegen audit` (on --dir or the current folder); --help alone prints the usage
+  const [given, ...rest] = positionals;
+  if (values.help) {
     for (const line of usage()) say(line);
     return 0;
   }
+  const command = given ?? 'audit';
   if (command !== 'inspect' && command !== 'audit') {
     fail(`Unknown command "${safeText(command, 60)}".`);
     for (const line of usage()) fail(line);
@@ -117,6 +136,7 @@ export async function run(argv: string[], io: CliIO): Promise<number> {
     return 1;
   }
   const cwd = io.cwd ?? process.cwd();
+  const dir = resolve(cwd, values.dir ?? '.');
 
   if (command === 'inspect') {
     const extra = AUDIT_ONLY.find((o) => values[o] !== undefined);
@@ -124,8 +144,10 @@ export async function run(argv: string[], io: CliIO): Promise<number> {
       fail(`--${extra} works with pipegen audit only.`);
       return 1;
     }
+    const stopped = await stopIfUnsafe(io, dir);
+    if (stopped !== null) return stopped;
     try {
-      return await inspect(resolve(cwd, values.dir ?? '.'), io, { allowBroad: values['allow-broad-token'] === true });
+      return await inspect(dir, io, { allowBroad: values['allow-broad-token'] === true });
     } catch (e) {
       // Anything unexpected: one cleaned line, never a token, never a stack trace.
       fail(`pipegen inspect failed: ${safeText(hideToken(e instanceof Error ? e.message : String(e)), 500)}`);
@@ -145,6 +167,14 @@ export async function run(argv: string[], io: CliIO): Promise<number> {
     fail('--force only works with --out.');
     return 1;
   }
+  const types = parseTypeFlags(values.type ?? []);
+  if (typeof types === 'string') {
+    fail(types);
+    return 1;
+  }
+  // the stop comes before anything audit does: the --ai checks (an Ollama call), the repo read, any GitHub call
+  const stopped = await stopIfUnsafe(io, dir);
+  if (stopped !== null) return stopped;
   return audit(io, {
     dir: values.dir,
     out: values.out,
@@ -154,7 +184,19 @@ export async function run(argv: string[], io: CliIO): Promise<number> {
     model: values.model,
     effort: values.effort,
     allowBroad: values['allow-broad-token'] === true,
+    types,
+    verbose: values.verbose === true,
   });
+}
+
+/** unsafeFolderStop, with an unexpected error as one cleaned line and exit 1 (never a stack trace). */
+async function stopIfUnsafe(io: CliIO, dir: string): Promise<number | null> {
+  try {
+    return await unsafeFolderStop(io, dir);
+  } catch (e) {
+    io.err(`pipegen stopped: it couldn't check this folder: ${safeText(e instanceof Error ? e.message : String(e), 300)}`);
+    return 1;
+  }
 }
 
 /** True when node was started on this file (directly or through the npm bin link), not when it is imported. */

@@ -4,6 +4,8 @@ import { chmod, lstat, mkdtemp, readFile, realpath, rm, writeFile } from 'node:f
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import picomatch from 'picomatch';
+import { readGitIndexPaths } from '../read/git-index.js';
+import { loadIgnore } from '../read/gitignore.js';
 import { IGNORED_DIRS, MAX_FILES_TEXT, listFiles, readTextLimitedWithReason, regexSafe, type Skipped } from '../read/limits.js';
 import { onExit } from '../util/exit-hooks.js';
 import { PATH_SHOWN_MAX, safeText } from '../util/safe-text.js';
@@ -138,12 +140,22 @@ export const EXCLUDED_KEPT: readonly string[] = Object.freeze(
 );
 
 /**
+ * Plan J J1 (DECISIONS #126, ruling S12): what git says is not part of the repo is never sent either. Not globs (they
+ * come from the repo's own .gitignore files and git's index), so they are lines of the summary, not EXCLUDED_PATTERNS.
+ */
+export const GIT_EXCLUDED_LINES: readonly string[] = Object.freeze([
+  '- files your .gitignore lists',
+  "- files that aren't committed, when pipegen can read git's file list (.git/index)",
+]);
+
+/**
  * What is never sent to the AI, in plain words for the terminal (ruling S29): one `- label: summary` line per group,
  * binary files, then the files kept. Shared by the consent screen and the audit report, which indent it themselves.
  */
 export function excludedSummaryLines(): string[] {
   return [
     ...EXCLUDED_PATTERN_GROUPS.map((g) => `- ${g.label}: ${g.summary}`),
+    ...GIT_EXCLUDED_LINES,
     '- binary files (images, archives, compiled programs), found by their content',
     `kept: ${EXCLUDED_KEPT.join(', ')}`,
   ];
@@ -431,7 +443,8 @@ const insideDir = (base: string, target: string) => {
 
 /**
  * Collects the repo's code for the AI: lists files (symlinks never followed), drops EXCLUDED_PATTERNS
- * matches and binaries, reads within the read limits, then scrubKnownValues → redact() → scrubKnownValues
+ * matches, then (Plan J J1, DECISIONS #126, ruling S12) every file not in git's index when the index can be read and
+ * every file the repo's .gitignore rules match (committed or not), and binaries, reads within the read limits, then scrubKnownValues → redact() → scrubKnownValues
  * (known values only when given) → the secret scan (if opts.secretScanner; it also removes every secret it
  * found from all files, and the known values again) → cuts to maxBytes by priority (whole files, lowest
  * priority first, sized as the final bundleText). Without opts.secretScanner the result is for counting only:
@@ -473,14 +486,27 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
 
   const only = opts.onlyPaths ?? null;
   const links = found.links.filter((p) => inRoots(p) && (only === null || only.has(p)));
+  // J1: the same rule for the counting and the checked bundle (the consent token compares them)
+  const index = await readGitIndexPaths(dir);
+  const ignore = await loadIgnore(dir, { whenUnsure: 'ignored' }); // unsure → never sent (review J1, I1)
   let excluded = 0;
   let secretNames = 0;
+  let notCommitted = 0;
+  let gitIgnored = 0;
   const candidates: { path: string; rank: number }[] = [];
   for (const path of listing.files) {
     if (!inRoots(path)) continue;
     if (only !== null && !only.has(path)) continue;
     if (isExcludedPath(path)) {
       excluded++;
+      continue;
+    }
+    if (index !== null && !index.has(path)) {
+      notCommitted++;
+      continue;
+    }
+    if (ignore.ignored(path)) {
+      gitIgnored++;
       continue;
     }
     if (nameHidden(path)) {
@@ -533,6 +559,9 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
   notes.addPaths('Skipped files that could not be read:', skipped.unreadable, show);
   if (excluded > 0) notes.add(`Left out ${plural(excluded, 'file that matches', 'files that match')} the excluded patterns (files that may hold secrets, lockfiles, dependency and build folders).`);
   if (secretNames > 0) notes.add(`Left out ${plural(secretNames, 'file whose name looks', 'files whose names look')} like a secret.`);
+  if (notCommitted > 0) notes.add(`Left out ${plural(notCommitted, "file that isn't", "files that aren't")} committed (not in git's file list).`);
+  if (gitIgnored > 0) notes.add(`Left out ${plural(gitIgnored, 'file', 'files')} your .gitignore lists.`);
+  for (const n of ignore.notes) notes.add(n);
 
   let secretScanChecked = false;
   if (opts.secretScanner !== undefined) {

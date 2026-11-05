@@ -1,6 +1,6 @@
 import { lstatSync } from 'node:fs';
 import { join } from 'node:path';
-import type { ExistingWorkflow, RepoProfile } from '../types.js';
+import type { ExistingWorkflow, RepoProfile, StaticHost } from '../types.js';
 import { PATH_SHOWN_MAX, safeText } from '../util/safe-text.js';
 import { SKIP_REASON, listFiles, parseYamlLimited, readTextLimitedWithReason, regexLines, regexSafe } from './limits.js';
 import { NAME_RE, asObj } from './manifest.js';
@@ -25,6 +25,24 @@ const NPM_PUBLISH_LINE = /^\s*(?:npx\s+)?(?:npm(?:\s+stage)?|pnpm|bun|yarn(?:\s+
 const PYPI_PUBLISH_LINE = /^\s*(?:(?:python3?\s+-m\s+)?twine\s+upload|(?:uv|poetry|flit|hatch|pdm)\s+publish)(?:\s|$)/;
 /** The PyPI publish action (any ref): https://github.com/pypa/gh-action-pypi-publish */
 const PYPI_ACTION = /^pypa\/gh-action-pypi-publish(?:@|$)/i;
+/**
+ * Plan J J2: a run line that STARTS with a static host's deploy command (after optional spaces and npx / bunx / pnpm exec / pnpm dlx /
+ * yarn), as NPM_PUBLISH_LINE does, so an echo or a comment never counts. Firebase counts only with `--only` naming hosting. Linear.
+ */
+const RUNNER = String.raw`^\s*(?:(?:npx(?:\s+--yes|\s+-y)?|bunx|pnpm\s+(?:exec|dlx)|yarn(?:\s+dlx)?)\s+)?`;
+const STATIC_HOST_LINES: readonly [RegExp, StaticHost][] = [
+  [new RegExp(`${RUNNER}wrangler\\s+pages\\s+deploy(?:\\s|$)`), 'cloudflare-pages'],
+  [new RegExp(`${RUNNER}netlify\\s+deploy(?:\\s|$)`), 'netlify'],
+  [new RegExp(`${RUNNER}firebase\\s+deploy\\b[^#\\n]{0,200}?\\s--only[=\\s]+['"]?[A-Za-z0-9:,_-]{0,100}?\\bhosting\\b`), 'firebase-hosting'],
+];
+/** Plan J J2: actions that deploy to a static host (any ref), by their exact owner/name. */
+const STATIC_HOST_ACTIONS: readonly [RegExp, StaticHost][] = [
+  [/^actions\/deploy-pages(?:@|$)/i, 'github-pages'],
+  [/^peaceiris\/actions-gh-pages(?:@|$)/i, 'github-pages'],
+];
+/** cloudflare/wrangler-action runs its `command` input: a static host only when that starts with `pages deploy`. */
+const WRANGLER_ACTION = /^cloudflare\/wrangler-action(?:@|$)/i;
+const WRANGLER_PAGES_COMMAND = /^\s*pages\s+deploy(?:\s|$)/;
 const EXPRESSION_RE = /\$\{\{([^}]*)\}\}/g;
 const SECRET_REF_RE = /\bsecrets(?:\.([A-Za-z_][A-Za-z0-9_]*)(?![\w-])|\[\s*['"]([^'"]*)['"]\s*\])/g;
 
@@ -107,6 +125,23 @@ function publishesOf(doc: Record<string, unknown>): ('npm' | 'pypi')[] {
         if (!npmDry && !r.toLowerCase().includes('npm_config_dry_run') && lines.some((l) => NPM_PUBLISH_LINE.test(l))) out.add('npm');
         if (lines.some((l) => PYPI_PUBLISH_LINE.test(l))) out.add('pypi');
       }
+    }
+  }
+  return [...out].sort();
+}
+
+/** Plan J J2: the static hosts a workflow's steps deploy to (top-level job steps only), sorted. Evidence for a static site, never a type. */
+function staticHostsOf(doc: Record<string, unknown>): StaticHost[] {
+  const out = new Set<StaticHost>();
+  for (const job of Object.values(asObj(doc.jobs))) {
+    for (const step of Array.isArray(asObj(job).steps) ? asObj(job).steps as unknown[] : []) {
+      const s = asObj(step);
+      for (const u of strings(s.uses)) {
+        if (!regexSafe(u)) continue;
+        for (const [re, host] of STATIC_HOST_ACTIONS) if (re.test(u.trim())) out.add(host);
+        if (WRANGLER_ACTION.test(u.trim()) && strings(asObj(s.with).command).some((c) => regexLines(c).some((l) => WRANGLER_PAGES_COMMAND.test(l)))) out.add('cloudflare-pages');
+      }
+      for (const r of strings(s.run)) for (const line of regexLines(r)) for (const [re, host] of STATIC_HOST_LINES) if (re.test(line)) out.add(host);
     }
   }
   return [...out].sort();
@@ -195,6 +230,7 @@ export async function readWorkflows(dir: string, files?: string[], notes: string
       secretsUsed: secretsOf(read.text),
       jobs: Object.keys(asObj(doc.jobs)).filter((j) => regexSafe(j) && JOB_ID_RE.test(j)),
       ...publishesField(publishesOf(doc)),
+      ...(() => { const h = staticHostsOf(doc); return h.length > 0 ? { staticHosts: h } : {}; })(),
       ...tagPinnedField(tagPinnedOf(doc)),
     });
   }

@@ -78,8 +78,11 @@ export function applyLastRuns(rows: readonly Coverage[], runs: ReadonlyMap<strin
     const run = wf === null ? undefined : runs.get(wf);
     if (wf === null || run === undefined || run.state !== 'read' || !FAILED.has(run.conclusion)) return r;
     const day = run.createdAt === null ? null : run.createdAt.slice(0, 10);
+    // a credit (DECISIONS #122) belongs to a covered row: once the run failed, the row is partial and has none
+    const { credit: _c, creditKind: _k, ...rest } = r;
+    void _c; void _k;
     return {
-      ...r, status: 'partial' as const, why: `The last run of ${wf} on ${branch} failed${day === null ? '' : ` (${day})`}, so this check may not be running.`,
+      ...rest, status: 'partial' as const, why: `The last run of ${wf} on ${branch} failed${day === null ? '' : ` (${day})`}, so this check may not be running.`,
       lastRun: { workflow: wf, branch, conclusion: run.conclusion, date: day },
     };
   });

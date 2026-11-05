@@ -11,6 +11,7 @@ import { aiSchema, type AiSchema } from '../ai/schema.js';
 import { codeSecurityAvailable } from '../github/availability.js';
 import { signingMode } from '../github/signing-mode.js';
 import { SERVER_FRAMEWORKS, SERVICE_NAME_RE } from '../read/project.js';
+import { baseRunnable } from '../read/service-kind.js';
 import { NEEDS_MAX_OUTPUT_TOKENS } from './discovery-limits.js';
 import { NEED_ID_CATEGORY, NEED_IDS, REPO_WIDE_CATEGORIES, type NeedId } from './need-ids.js';
 import {
@@ -29,7 +30,6 @@ export { AI_ONLY_IDS, NEED_ID_CATEGORY, NEED_IDS, REPO_WIDE_CATEGORIES, SCHEDULE
  */
 const NIGHTLY: ReadonlySet<string> = new Set(['secrets', 'sast', 'deps', 'iac', 'image-scan', 'dast', 'image-build', 'scorecard']);
 const FLOOR: ReadonlySet<string> = new Set(FLOOR_NEEDS);
-const RUN_SCRIPTS = ['start', 'dev', 'serve'];
 const NEEDS_TIMEOUT_MS = 120_000;
 
 /** Bounds on what is read from one AI answer (in code, not in the schema: Claude's structured outputs don't take maxItems). */
@@ -102,15 +102,25 @@ export interface NeedsPlan {
 }
 
 /**
- * A start, dev or serve script, a server framework, a port, or a Dockerfile. A library with only build/test scripts isn't.
- * Plan U Task 5: a package the repo publishes (Service.publishedPackage) needs a real server entry (a script, a
- * framework or a Dockerfile); a port number in its code alone (Flask's `app.run(port=5000)` default) doesn't make it one.
+ * A start, dev or serve script, a server framework, a port, or a Dockerfile (baseRunnable). A library with only build/test scripts isn't.
+ * Plan J J2 (DECISIONS #121, ruling S1): a static site that isn't also a container isn't, whatever its scripts say, so image build and scan,
+ * DAST, API DAST and the created Dockerfile drop out through the table; a service of type `server` is (fix round 1: an unsure static site is a
+ * server even with no run script). A service with no projectType (a hand-built profile) keeps today's rule.
  */
 export function isRunnable(s: Service): boolean {
-  if (s.notStandalone !== undefined) return false; // P55 (batch B): a one-shot script, built into another image, or an email-template package
-  return s.scripts.some((n) => RUN_SCRIPTS.includes(n)) || s.frameworks.length > 0 || (s.port !== undefined && s.publishedPackage !== true)
-    || (s.dockerfile ?? '') !== '';
+  const types = s.projectType?.types;
+  if (types !== undefined && types.includes('static-site') && !types.includes('container')) return false;
+  // fix round 1 (controller ruling, review J2 ⚠️1): the `server` type runs, also an unsure static site with no run script
+  // fix round 2 (review J2 r1 N1): never for a folder that isn't standalone (P55), whatever its type says
+  return ((types?.includes('server') ?? false) && s.notStandalone === undefined) || baseRunnable(s);
 }
+export { baseRunnable };
+
+/**
+ * The fixed minimum of every repo (DECISIONS #121, ruling S3): no project type and no override removes one of these. FLOOR_NEEDS is
+ * unchanged (it is the not-proven floor); a test pins that every type keeps all six.
+ */
+export const MINIMUM_CATEGORIES = Object.freeze(['secrets', 'deps', 'sast', 'workflow-lint', 'workflow-pin-check', 'gate'] as const satisfies readonly NeedCategory[]);
 
 const deploysExist = (p: RepoProfile) => p.existingWorkflows.some((w) => w.deploys);
 
@@ -141,6 +151,12 @@ export interface CheckRule {
 }
 
 const NO_SERVICES = 'no services found';
+/** Plan J J2 (ruling S2): why a static site gets no image, DAST or API DAST check. */
+export const STATIC_SKIP = 'this service is a static site: nothing runs as a server or in a container';
+/** Ruling S2: why a service that doesn't run gets no image or DAST check (today's "doesn't run as a server" wording). */
+const NOT_RUNNABLE_SKIP = "this service doesn't run as a server, so there is no image to build or running app to scan";
+/** A static site that isn't also a container (the case isRunnable turns off). */
+const isStaticSite = (s: Service): boolean => (s.projectType?.types.includes('static-site') ?? false) && !s.projectType?.types.includes('container');
 const hasPackageManager = (p: RepoProfile) => p.services.some((s) => s.packageManager !== undefined);
 /** A service with a package.json or Python project has dependencies to review whether or not a lockfile is committed. */
 const hasManifest = (p: RepoProfile) => hasPackageManager(p) || p.services.some((s) => s.language === 'node' || s.language === 'python');
@@ -182,7 +198,7 @@ export const CHECKS: readonly CheckRule[] = [
     label: 'Licence check', why: 'Checks dependency licences, so a package the project may not use is caught before merge.' },
   { category: 'api-dast', layers: ['merge'], scope: 'runnable', blocking: true,
     skip: (_p, _c, s) => {
-      if (s === undefined || !isRunnable(s)) return "this service doesn't run as a server, so there is nothing to call";
+      if (s === undefined || !isRunnable(s)) return s !== undefined && isStaticSite(s) ? STATIC_SKIP : "this service doesn't run as a server, so there is nothing to call";
       return s.quality.apiSpec !== null ? null : 'no API spec found: export an OpenAPI file to turn on API testing';
     },
     label: 'API scan against the spec (API DAST)', why: 'Calls every API endpoint with unexpected input, following the API spec, to find crashes and security bugs.' },
@@ -239,7 +255,10 @@ function mainDeployTargets(p: RepoProfile): (string | undefined)[] | null {
   const names = p.services.map((s) => s.name);
   const runnable = p.services.filter(isRunnable).map((s) => s.name);
   if (runnable.length === 0 && !deploysExist(p)) return null;
-  return runnable.length > 0 ? runnable : names.length > 0 ? names : [undefined];
+  // Final review I3: with a deploy workflow, a static site is a target next to the services that run (it is deployed, and sbom,
+  // deploy-verify, signing and egress apply to its files); with no deploy workflow it stays out, and a lone static site keeps no layer.
+  if (runnable.length > 0) return deploysExist(p) ? p.services.filter((s) => isRunnable(s) || isStaticSite(s)).map((s) => s.name) : runnable;
+  return names.length > 0 ? names : [undefined];
 }
 
 /** PS7: the service a publishing workflow publishes (publishedPackage), else repo-wide. */
@@ -298,6 +317,12 @@ function planChecks(p: RepoProfile, caps: Capabilities): { needs: Need[]; skippe
 /** The checks the plan leaves out, with a plain-English reason each. Decided by the same table as floorNeeds. */
 export function skippedChecks(p: RepoProfile, caps: Capabilities): SkippedCheck[] {
   const out = planChecks(p, caps).skipped;
+  // Ruling S2: the older floor's image and DAST checks, per service that doesn't run (the floor gives them to every runnable one)
+  for (const s of p.services) {
+    if (isRunnable(s)) continue;
+    const why = isStaticSite(s) ? STATIC_SKIP : NOT_RUNNABLE_SKIP;
+    for (const category of IMAGE_IDS) out.push({ category: category as NeedCategory, service: s.name, why });
+  }
   const iac = iacSkip(p);
   if (iac !== null) out.push({ category: 'iac', why: iac });
   return out;
@@ -317,12 +342,15 @@ function makeNeed(layer: Layer, id: NeedCategory, service?: string, blocking: bo
   };
 }
 
+/** Plan J J2: the why of the warning-only signing need of a deploy that builds no image. */
+const NO_IMAGE_SIGNING_WHY = 'Signs the files each deploy ships, so what was deployed can be traced back to a gated build.';
+
 /** The security floor. Per service unless repo-wide (hooks, hooks-ci, secrets, gate, iac). */
 export function floorNeeds(p: RepoProfile, caps: Capabilities): Need[] {
   const out: Need[] = [];
   const seen = new Set<string>();
-  const add = (layer: Layer, id: NeedCategory, service?: string) => {
-    const n = makeNeed(layer, id, service);
+  const add = (layer: Layer, id: NeedCategory, service?: string, over: Partial<Pick<Need, 'blocking' | 'why'>> = {}) => {
+    const n = { ...makeNeed(layer, id, service), ...over };
     if (seen.has(needKey(n))) return;
     seen.add(needKey(n));
     out.push(n);
@@ -353,6 +381,8 @@ export function floorNeeds(p: RepoProfile, caps: Capabilities): Need[] {
   if (iacSkip(p) === null) add('merge', 'iac');
 
   const targets = mainDeployTargets(p);
+  /** Whether a deploy target builds an image: a runnable service (repo-wide: any runnable service). */
+  const targetRuns = (t: string | undefined) => (t === undefined ? runnable.length > 0 : runnable.includes(t));
   if (targets !== null) {
     const mode = signingMode(p, caps);
     for (const s of targets) {
@@ -360,6 +390,9 @@ export function floorNeeds(p: RepoProfile, caps: Capabilities): Need[] {
       // Ruling S8: attest mode → an attestation need only (it is the signing there); keyless or key-env → signing,
       // plus attestation when keyless and the repo has attestations ("attestation where the plan allows").
       if (mode === 'keyless' || mode === 'key-env') add('deploy', 'signing', s);
+      // Plan J J2 (owner choice 2): a deploy that ships no image, on a repo with no signing mode, gets a warning-only signing need, so
+      // signing its files (cosign sign-blob) shows; pipegen itself sets no signing up there.
+      else if (mode === 'none' && !targetRuns(s)) add('deploy', 'signing', s, { blocking: false, why: NO_IMAGE_SIGNING_WHY });
       if (mode === 'attest' || (mode === 'keyless' && caps.attestations)) add('deploy', 'attestation', s);
       add('deploy', 'deploy-verify', s);
     }
@@ -537,7 +570,8 @@ export function acceptAddedNeed(a: AddedNeed, ctx: AddedNeedContext): { ok: true
   // A floor id only extends what the floor already has (another layer or service): never signing on a repo
   // that can't sign, attestation without the capability, or an image scan for a repo with nothing to run.
   // PS9: and never a check this repo's plan skipped on purpose; the note says why it was skipped.
-  const skip = isFloorId(a.id) ? ctx.skipped.find((k) => k.category === a.id && (k.service === undefined || k.service === (a.service ?? undefined))) : undefined;
+  // Image checks keep their own rule below (notRunnable), so the skips ruling S2 added for them don't change a refusal's reason.
+  const skip = isFloorId(a.id) && !IMAGE_IDS.has(a.id) ? ctx.skipped.find((k) => k.category === a.id && (k.service === undefined || k.service === (a.service ?? undefined))) : undefined;
   if (skip !== undefined) return refuse('notInFloor', `${item} (${skip.why})`);
   if (isFloorId(a.id) && !ctx.floorIds.has(a.id)) return refuse('notInFloor');
   // A scheduled check runs only in the merge layer; a repo-wide check has no service.

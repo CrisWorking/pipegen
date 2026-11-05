@@ -7,10 +7,11 @@ import { build } from 'tsup';
 import { tsupOptions } from '../tsup.config.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
-  bundleCode, bundleText, EXCLUDED_PATTERNS, SCAN_CHUNK_SAFE_BYTES, SecretScanError, SecretScanRequiredError, secretScanArgv, secretScanConfigPath,
+  bundleCode, bundleText, EXCLUDED_PATTERNS, excludedSummaryLines, SCAN_CHUNK_SAFE_BYTES, SecretScanError, SecretScanRequiredError, secretScanArgv, secretScanConfigPath,
   decodedNamePieces, encodedSpans, highEntropyRuns, isBinary, MAX_NAME_LINES, NOTHING_FOUND, redact, scrubKnownValues, type CodeBundle,
 } from '../src/ai/redact.js';
 import { skippedByDefaultPaths } from '../src/ai/secret-scan-config.js';
+import { ignoreBudgetNote, ignoreSkippedNote, ignoreUnreadableNote } from '../src/read/gitignore.js';
 import { isBinary as limitsIsBinary } from '../src/read/limits.js';
 import { BETTERLEAKS_FORBIDDEN_FLAGS, BETTERLEAKS_SUBCOMMANDS } from '../src/engine/tool-flags.js';
 import { betterleaksAt, CHECKED_KEY, CLEAN, gitleaksAt, makeStub, scanWith } from './helpers/gitleaks-stub.js';
@@ -144,6 +145,82 @@ describe('bundle: exclusions', () => {
     await expect(bundleCode(dir, { roots: ['../x'] })).rejects.toThrow(/root/i);
     await expect(bundleCode(dir, { roots: ['api/../../x'] })).rejects.toThrow(/root/i);
     await expect(bundleCode(dir, { roots: ['/etc'] })).rejects.toThrow(/root/i);
+  });
+});
+
+describe('bundle: git ignore rules and the index (Plan J J1, DECISIONS #126)', () => {
+  /** git with no user or system config; test setup only (pipegen never runs git). */
+  const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', HOME: '/nonexistent' };
+  const git = (dir: string, ...args: string[]) => execFileSync('git', args, { cwd: dir, stdio: 'pipe', env: GIT_ENV });
+
+  it('bundle: a committed file .gitignore lists is left out, with a note; the excluded list says so', async () => {
+    const dir = makeTempDir();
+    // two invented shapes: a root folder rule (generated client code) and a nested folder rule (test fixtures)
+    writeIn(dir, '.gitignore', 'generated/\n');
+    writeIn(dir, 'src/app.ts', 'export const a = 1;\n');
+    writeIn(dir, 'generated/client.ts', 'export const b = 2;\n');
+    writeIn(dir, 'pkg/.gitignore', 'fixtures/\n');
+    writeIn(dir, 'pkg/main.ts', 'export const m = 1;\n');
+    writeIn(dir, 'pkg/fixtures/big.json', '{ "rows": [] }\n');
+    git(dir, 'init', '-q');
+    git(dir, 'add', '.');
+    git(dir, 'add', '-f', 'generated/client.ts', 'pkg/fixtures/big.json');
+    const b = await bundleCode(dir);
+    expect(paths(b)).toEqual(['.gitignore', 'pkg/.gitignore', 'pkg/main.ts', 'src/app.ts']);
+    expect(b.notes).toContain('Left out 2 files your .gitignore lists.');
+    expect(excludedSummaryLines()).toEqual(expect.arrayContaining(['- files your .gitignore lists']));
+  });
+
+  it("bundle: untracked, not-ignored file left out when the index is known; kept when it isn't", async () => {
+    const dir = makeTempDir();
+    writeIn(dir, 'src/app.ts', 'export const a = 1;\n');
+    // two invented shapes of local, never-committed work: a draft source file and a notes folder with a scratch script
+    writeIn(dir, 'src/local-draft.ts', 'export const draft = 1;\n');
+    writeIn(dir, 'notes/todo.md', '- try the cache\n');
+    writeIn(dir, 'notes/scratch.py', 'print(1)\n');
+    writeIn(dir, 'out/index.html', '<p>built</p>\n');
+    writeIn(dir, '.gitignore', 'out/\n');
+    git(dir, 'init', '-q');
+    // no index yet (nothing added): ignored files are left out, untracked ones are kept
+    const unknown = await bundleCode(dir);
+    expect(paths(unknown)).toEqual(['.gitignore', 'notes/scratch.py', 'notes/todo.md', 'src/app.ts', 'src/local-draft.ts']);
+    expect(unknown.notes.join('\n')).not.toMatch(/committed/);
+    git(dir, 'add', '--', '.gitignore', 'src/app.ts');
+    const known = await bundleCode(dir);
+    expect(paths(known)).toEqual(['.gitignore', 'src/app.ts']);
+    expect(known.notes).toContain("Left out 4 files that aren't committed (not in git's file list).");
+    // the checked bundle uses the same rule as the counting one
+    const checked = await bundleCode(dir, scanWith(gitleaksAt(makeStub(CLEAN).bin)));
+    expect(paths(checked)).toEqual(paths(known));
+  });
+
+  it("bundle: with no index, a .gitignore rule pipegen can't use as written still keeps its files out (two `**`, too long, unreadable)", async () => {
+    const dir = makeTempDir();
+    writeIn(dir, '.gitignore', 'reports/**/tmp/**/*.json\n'); // used as reports/**/*.json
+    writeIn(dir, 'tools/.gitignore', `${'a'.repeat(1001)}*\n`); // too long: everything under tools/ is left out
+    writeIn(dir, 'vendored/.gitignore', `${'#'.repeat(1_000_001)}\n*.gen.js\n`); // over 1 MB: everything under vendored/
+    writeIn(dir, 'src/app.ts', 'export const a = 1;\n');
+    writeIn(dir, 'reports/x/tmp/y/run.json', '{}\n');
+    writeIn(dir, 'reports/summary.md', '# summary\n'); // not a .json: kept
+    writeIn(dir, 'tools/build.js', 'var b = 1;\n');
+    writeIn(dir, 'vendored/lib.js', 'var l = 1;\n');
+    writeIn(dir, 'vendored/x.gen.js', 'var g = 1;\n');
+    const b = await bundleCode(dir);
+    expect(paths(b)).toEqual(['.gitignore', 'reports/summary.md', 'src/app.ts']);
+    expect(b.notes).toContain(ignoreSkippedNote(2, 'ignored'));
+    expect(b.notes).toContain(ignoreUnreadableNote(1, 'ignored'));
+  });
+
+  it('bundle: past the matching work budget, the remaining files are left out (with no index too)', async () => {
+    const dir = makeTempDir();
+    // 10,000 rules and a folder 150 levels deep: matching the first deep path costs more than the budget
+    const deep = Array.from({ length: 150 }, (_, i) => `d${String(i).padStart(18, '0')}`).join('/');
+    writeIn(dir, '.gitignore', `${Array.from({ length: 10_000 }, (_, i) => `r${i}.cache`).join('\n')}\n`);
+    writeIn(dir, 'src/app.ts', 'export const a = 1;\n');
+    writeIn(dir, `${deep}/a.ts`, 'export const d = 1;\n'); // no rule lists it: git would send it; pipegen can't tell in time
+    const b = await bundleCode(dir);
+    expect(paths(b).some((p) => p.startsWith('d000'))).toBe(false);
+    expect(b.notes).toContain(ignoreBudgetNote('ignored'));
   });
 });
 

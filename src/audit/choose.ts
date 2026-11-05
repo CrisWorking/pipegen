@@ -202,7 +202,20 @@ function deadCodeRule(c: Ctx): Choice {
   return generic(c);
 }
 
-const RISKY_TRIGGERS: readonly string[] = ['pull_request_target', 'workflow_run', 'issue_comment'];
+/**
+ * Triggers that run a workflow on input an outsider controls (a fork's pull request code, a comment): the property
+ * poutine checks for. `workflow_run` is not one of them by itself: zizmor already reports the risky uses of it.
+ */
+const RISKY_TRIGGERS: readonly string[] = ['pull_request_target', 'issue_comment'];
+
+/** The CI line for each hook manager's own runner. husky runs free shell, so there is no one command to give. */
+function hooksCiRule(c: Ctx): Choice {
+  const manager = c.p.precommit;
+  if (manager === 'pre-commit') return builtIn("run the repo's own hooks in CI: `pre-commit run --all-files`");
+  if (manager === 'lefthook') return builtIn("run the repo's own hooks in CI: `lefthook run pre-commit --all-files`");
+  if (manager === 'husky') return none("husky's hooks are shell scripts, so there is no one command to run them in CI (suggestion only: call the same script from a workflow step)");
+  return generic(c);
+}
 
 function dependencyReviewRule(c: Ctx): Choice {
   const available = codeSecurityAvailable(c.p, c.caps);
@@ -240,18 +253,19 @@ function generic(c: Ctx): Choice {
 
 type Rule = (c: Ctx) => Choice;
 const RULES: Readonly<Record<string, Rule>> = {
-  lint: lintRule, format: formatRule,
+  lint: lintRule, format: formatRule, 'hooks-ci': hooksCiRule,
   // P55 (batch B): the pre-commit hook runs the repo's own XO (a repo with XO never gets Biome suggested next to it); other repos keep the first reviewed entry
   'format-lint': (c) => (c.lang === 'node' && c.q.eslintConfig === 'none' && c.q.configs.includes('xo') ? lintRule(c) : generic(c)), 'type-check': typeCheckRule, coverage: coverageRule, 'dead-code': deadCodeRule,
   duplication: (c) => reviewed(c, T.jscpd, 'jscpd: finds copy-pasted code', [], '; warning only; new copy-paste in the pull request only'),
   'dockerfile-lint': (c) => reviewed(c, T.hadolint, 'Hadolint: lints the Dockerfile', [], "; Trivy config's Dockerfile checks stay on"),
   'workflow-lint': (c) => {
-    const risky = c.p.existingWorkflows.some((w) => w.triggers.some((t) => RISKY_TRIGGERS.includes(t)));
+    const riskyOn = RISKY_TRIGGERS.filter((t) => c.p.existingWorkflows.some((w) => w.triggers.includes(t)));
+    const risky = riskyOn.length > 0;
+    // owner choice 3 / #122: zizmor alone; poutine only for triggers that take untrusted input; actionlint is not picked
     return reviewed(
-      c, T.actionlint,
-      (found) => (found.has(T.zizmor) ? 'actionlint and zizmor: check the workflows for mistakes and risky patterns' : 'actionlint: checks the workflows for mistakes'),
-      risky ? [T.zizmor, T.poutine] : [T.zizmor],
-      (found) => (risky && found.has(T.poutine) ? '; poutine too, because a workflow runs on untrusted pull request input' : ''),
+      c, T.zizmor, 'zizmor: checks the workflows for mistakes and risky patterns',
+      risky ? [T.poutine] : [],
+      (found) => (risky && found.has(T.poutine) ? `; poutine too, because a workflow runs on ${riskyOn.join(' and ')}, which takes untrusted input` : ''),
     );
   },
   'workflow-pin-check': (c) => reviewed(c, T.pinact, 'pinact: checks that every action is pinned to a commit', [], c.p.repoFiles.actionsLock ? "; an actions.lock exists, so pinact won't rewrite its pins" : ''),

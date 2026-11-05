@@ -1,6 +1,8 @@
 // pipegen's never-list (catalogue §4 "Remove / never add"), in one leaf module (no imports) so every rule that reads it
 // uses the same list: the reviewed-list loader, discovery and the chooser (reviewed.ts re-exports it), and the audit's
-// coverage mapper (Plan P ruling P33: a step that uses a never-listed action never makes a check "covered").
+// coverage mapper (Plan P ruling P33: a step that uses a never-listed action never makes a check "covered"). J3b (ruling
+// S6): the coverage mapper alone judges a step pinned to a checked commit SHA by that SHA (NEVER_SAFE_SHAS,
+// neverListedStep); everything pipegen adds still goes through neverListed, which refuses the name at any ref.
 
 const lower = (s: string) => s.toLowerCase();
 /**
@@ -34,6 +36,104 @@ export const NEVER_REPOS: Readonly<Record<string, string>> = Object.freeze({
   'portswigger/dastardly-github-action': 'Dastardly: unmaintained action with a mutable :latest image (catalogue §4, ruling PS21)',
   'portswigger/dastardly': 'Dastardly: a mutable :latest image from an unmaintained product (catalogue §4, ruling PS21)',
 });
+
+/**
+ * DECISIONS #122, ruling S6 (J3b): never-listed actions pipegen judges by a commit SHA instead of by name, lowercased
+ * `owner/name` → commits checked against upstream. Used ONLY by the coverage mapper (neverListedStep, for a step the repo
+ * already has); the reviewed-list loader, discovery and the chooser keep refusing the name at any ref (neverListed).
+ * NEVER_REPOS keeps its type. Only aquasecurity/trivy-action is here (owner choice 8: gitleaks-action's reasons don't
+ * depend on the pin; setup-trivy had every tag replaced and is never exempt).
+ *
+ * A trivy-action commit is listed only when, checked on the day, (1) it is on the action's default branch, (2) its
+ * action.yaml pins aquasecurity/setup-trivy by a commit SHA that is itself on setup-trivy's default branch and whose
+ * action.yaml was read, and (3) that install checks the Trivy binary by checksum. Commits younger than 7 days are not
+ * listed (the cooldown pipegen uses for new releases). The upstream state checked on 2026-11-05:
+ * - trivy-action commits, master: https://api.github.com/repos/aquasecurity/trivy-action/commits?sha=master and
+ *   https://api.github.com/repos/aquasecurity/trivy-action/compare/<sha>...master ("ahead": the commit is on master).
+ * - action.yaml at each listed commit: https://raw.githubusercontent.com/aquasecurity/trivy-action/<sha>/action.yaml,
+ *   identical at the four commits but for the default `version` (v0.74.0, v0.75.0, v0.76.0, v0.76.1); each pins
+ *   `aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567` (v0.3.1) and actions/cache by SHA. entrypoint.sh
+ *   (same URL, /entrypoint.sh) is the same file at all four; it downloads nothing (its one network call is the optional
+ *   dependency-snapshot upload to GitHub).
+ * - setup-trivy 81e514348e19b6112ce2a7e3ecbafe19c1e1f567 is setup-trivy's main
+ *   (https://api.github.com/repos/aquasecurity/setup-trivy/compare/81e514348e19b6112ce2a7e3ecbafe19c1e1f567...main:
+ *   "identical"); its action.yaml
+ *   (https://raw.githubusercontent.com/aquasecurity/setup-trivy/81e514348e19b6112ce2a7e3ecbafe19c1e1f567/action.yaml)
+ *   pins actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 and actions/cache/{restore,save}@9255dc7a253b0ccc959486e2bca901246202afeb
+ *   (both on their repos' main) and runs Trivy's install script from aquasecurity/trivy at
+ *   75c4dc0f45c5d7ffd05ae26df1e0c666787bdf2a (on trivy's main:
+ *   https://api.github.com/repos/aquasecurity/trivy/compare/75c4dc0f45c5d7ffd05ae26df1e0c666787bdf2a...main).
+ * - that install script (https://raw.githubusercontent.com/aquasecurity/trivy/75c4dc0f45c5d7ffd05ae26df1e0c666787bdf2a/contrib/install.sh)
+ *   downloads the archive and the release's checksums file and refuses an archive whose sha256 differs
+ *   (hash_sha256_verify); the four default versions are immutable GitHub releases
+ *   (https://api.github.com/repos/aquasecurity/trivy/releases/tags/v0.76.1 and the same for v0.76.0, v0.75.0, v0.74.0:
+ *   "immutable": true), so their checksums file can't be changed after publication.
+ * Not listed: 38b337fff0a2f984d5be173c99e3f633438167ec (master on 2026-11-05, Trivy v0.76.2 published the same day).
+ *
+ * J3b fix round 1 (review I2): (3) holds only for the version the commit itself installs, through setup-trivy. So each
+ * commit lists the step inputs that may be set and their allowed values (`with:` names in any letter case, as GitHub
+ * reads them): `version` unset or exactly that commit's default (another version, `latest` or an expression installs a
+ * release pipegen never checked), and `skip-setup-trivy` unset or false (true runs whatever `trivy` is on PATH). Any
+ * other value, two spellings of one of them, or more inputs than pipegen reads: the step stays never-listed.
+ * Stated limit (controller ruling I3): the action's `cache` input defaults to true, and then setup-trivy restores the
+ * Trivy binary from the Actions cache without checking its checksum again. Poisoning that cache needs code already
+ * running in a default-branch run of the same repo, so pipegen accepts it; the covered row says "the action's cache
+ * isn't re-checked" (SAFE_SHA_NOTE in coverage/walk.ts). No input makes the cache safer here: none is required.
+ */
+export interface SafeSha {
+  sha: string;
+  /** Inputs that may be set, lowercased name → the values allowed (any other input is not about which Trivy runs). */
+  inputs: Readonly<Record<string, readonly string[]>>;
+}
+const trivyAt = (sha: string, version: string): SafeSha => Object.freeze({ sha, inputs: Object.freeze({ version: Object.freeze([version]), 'skip-setup-trivy': Object.freeze(['false']) }) });
+export const NEVER_SAFE_SHAS: Readonly<Record<string, readonly SafeSha[]>> = Object.freeze({
+  'aquasecurity/trivy-action': Object.freeze([
+    trivyAt('8f28faec26515256b6d22074d1d2a8986f4cbd87', 'v0.76.1'), // 2026-10-21
+    trivyAt('6abccf398f78b4c337599c0656f933d91efb91a0', 'v0.76.0'), // 2026-10-14
+    trivyAt('c03d123cb480c08c69b054af418ea5e69fe6e57e', 'v0.75.0'), // 2026-10-01
+    trivyAt('d2a0b60797ff03db6132bd4e2b293f9b37081297', 'v0.74.0'), // 2026-08-14
+  ]),
+});
+
+/** Exactly `owner/name@<40 lowercase hex>`: no sub-path, no spaces, no escapes, no other ref form. */
+const STEP_AT_SHA = /^([A-Za-z0-9-]{1,39})\/([A-Za-z0-9._-]{1,100})@([0-9a-f]{40})$/;
+
+/** A step's `with:` inputs, lowercased (coverage/settings.ts lowerInputs): every spelling's value, and what couldn't be read. */
+export interface StepInputs { byName: ReadonlyMap<string, readonly unknown[]>; crowded: ReadonlySet<string>; unread: boolean }
+
+/** Each listed input is unset, or set once to an allowed value (a string, or a boolean read as GitHub passes it). */
+function inputsAllowed(safe: SafeSha, w: StepInputs): boolean {
+  if (w.unread) return false;
+  for (const [name, allowed] of Object.entries(safe.inputs)) {
+    if (w.crowded.has(name)) return false;
+    const vals = w.byName.get(name);
+    if (vals === undefined) continue;
+    if (vals.length !== 1) return false;
+    const v = vals[0];
+    const text = typeof v === 'string' ? v : typeof v === 'boolean' ? String(v) : null;
+    if (text === null || !allowed.includes(text)) return false;
+  }
+  return true;
+}
+
+/**
+ * The coverage mapper's never-list check for a step's `uses:` and `with:` inputs (ruling S6): null when the value is
+ * exactly `owner/name@<sha>` for a SHA in NEVER_SAFE_SHAS (owner and name in any letter case, as GitHub reads them) and
+ * the step's inputs keep it to what pipegen checked at that SHA (SafeSha.inputs); otherwise neverListed's answer, so a
+ * tag, a branch, another commit, a sub-path, a fork, a look-alike or another Trivy version stays listed. Never use this
+ * outside the coverage mapper: the loader, discovery and the chooser refuse the name at any ref.
+ */
+export function neverListedStep(uses: unknown, inputs: StepInputs): NeverHit | null {
+  if (typeof uses === 'string') {
+    const m = STEP_AT_SHA.exec(uses);
+    if (m !== null) {
+      const key = `${m[1]}/${m[2]}`.toLowerCase();
+      const safe = Object.hasOwn(NEVER_SAFE_SHAS, key) ? (NEVER_SAFE_SHAS[key] as readonly SafeSha[]).find((x) => x.sha === m[3]) : undefined;
+      if (safe !== undefined && inputsAllowed(safe, inputs)) return null;
+    }
+  }
+  return neverListed(uses);
+}
 
 /**
  * Repo names refused under ANY owner (fix round 1): a fork or a copy shares the code and often the commit network of

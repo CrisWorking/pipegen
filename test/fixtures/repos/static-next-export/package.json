@@ -1,0 +1,4 @@
+{ "name": "docs-site", "version": "0.1.0", "private": true,
+  "scripts": { "build": "next build", "test": "vitest run", "lint": "eslint ." },
+  "dependencies": { "next": "15.0.0", "react": "19.0.0", "react-dom": "19.0.0" },
+  "devDependencies": { "vitest": "2.0.0", "eslint": "9.0.0" } }

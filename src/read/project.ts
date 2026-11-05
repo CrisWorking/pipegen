@@ -4,9 +4,10 @@ import picomatch from 'picomatch';
 import { parse as parseToml } from 'smol-toml';
 import type { Language, Monorepo, OtherHookManager, PackageManager, RepoProfile, Service } from '../types.js';
 import { PATH_SHOWN_MAX, safeText } from '../util/safe-text.js';
-import { CODE_FILE_RE, REQUIREMENTS_FILE_RE, asObj, asString, asStrings, baseOf, dirOf, inDir, isTestFile, pythonNames, readPyproject, requirementLines, type Obj } from './manifest.js';
+import { CODE_FILE_RE, PLAIN_PATH_RE, PORT_RULES, REQUIREMENTS_FILE_RE, asObj, asString, asStrings, baseOf, dirOf, inDir, isTestFile, pythonNames, readPyproject, requirementLines, type Obj } from './manifest.js';
 import { readEnv } from './env.js';
 import { copySources, dockerfilesOf, notStandaloneOf, type DockerCopy } from './service-kind.js';
+import { finishProjectTypes, projectTypeOf, untrackedIgnoredOf } from './project-type.js';
 import { newQualityRun, npmLockfileVersion as npmLockfileVersionOf, readRepoFiles, readServiceQuality, type QualityRun } from './quality.js';
 import { readPrecommit, readWorkflows } from './workflows.js';
 import { IGNORED_DIRS, MAX_FILES_TEXT, SKIP_REASON, listFiles, parseYamlLimited, readTextLimitedWithReason, regexLines, regexSafe } from './limits.js';
@@ -15,8 +16,6 @@ export class NotGitHubRepoError extends Error {}
 
 type Profile = Omit<RepoProfile, 'private' | 'ownerType' | 'plan'>;
 
-/** A plain repo-relative path: letters, digits and . _ / - only, no leading / or -, no `..` segment (the same rule as the renderer's PLAIN_REL_RE, which the reader may not import). */
-const PLAIN_PATH_RE = /^(?![-/])(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/-]{1,200}$/;
 /**
  * Plan B 6d (DECISIONS #108): names of folders that are vendored or generated. Looked for at the top of the root and of each
  * service folder (listFiles leaves node_modules, vendor, dist and target out of the file list on purpose), plus any folder
@@ -199,7 +198,13 @@ export async function readOrigin(root: string): Promise<{ owner: string; repo: s
   return { owner, repo };
 }
 
-interface Shared { repo: string; serviceDirs: string[]; quality: QualityRun; copies: DockerCopy[] }
+interface Shared {
+  repo: string; serviceDirs: string[]; quality: QualityRun; copies: DockerCopy[];
+  /** Plan J J2: git's untracked-and-ignored test (J1's rule), loaded once and only when a static generator is found. */
+  untrackedIgnored: () => Promise<(rel: string) => boolean>;
+  /** Fix round 1 (review J2 I1): the file listing was cut at the read limit or left out paths too long to check. */
+  listingIncomplete: boolean;
+}
 
 async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Service> {
   const files = [...ctx.fileSet];
@@ -286,14 +291,17 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
   const env = await readEnv(ctx.root, { path: dir, name }, owned, { pkg, py, requirements });
   const quality = await readServiceQuality(ctx.root, { path: dir, language, frameworks }, ctx.notes, shared.quality);
   // P55 (batch B): a folder that runs only by its start script, but is a one-shot script, is built into another image, or is an email-template package
-  const notStandalone = await notStandaloneOf({
-    dir, read: (rel) => readFile(ctx, rel), fileSet: ctx.fileSet, copies: shared.copies, scripts: pkgScripts, deps, devDeps, frameworks,
+  const kind = {
+    dir, read: (rel: string) => readFile(ctx, rel), fileSet: ctx.fileSet, copies: shared.copies, scripts: pkgScripts, deps, devDeps, frameworks,
     hasDockerfile: dockerfile !== undefined, port, language, serviceDirs: shared.serviceDirs,
-  });
+  };
+  const notStandalone = await notStandaloneOf(kind);
+  // Plan J J2 (ruling B2): the type from the service's own files; finishProjectTypes completes it after the workflow pass
+  const projectType = await projectTypeOf({ ...kind, manifest: pkg ?? {}, untrackedIgnored: shared.untrackedIgnored, alsoLanguages, listingIncomplete: shared.listingIncomplete });
   return {
     name, path: dir, language, ...(alsoLanguages.length === 0 ? {} : { alsoLanguages }), ...(alsoPackageManagers.length === 0 ? {} : { alsoPackageManagers }), packageManager,
     ...(npmLockfileVersion === undefined ? {} : { npmLockfileVersion }), runtimeVersion, dockerfile, port, hasTests, testFramework, ...env, scripts, frameworks, quality,
-    ...(notStandalone === undefined ? {} : { notStandalone }),
+    ...(notStandalone === undefined ? {} : { notStandalone }), projectType,
   };
 }
 
@@ -319,11 +327,10 @@ async function exposedPort(ctx: Ctx, dockerfile: string): Promise<number | undef
 /** A PORT default in the code: `process.env.PORT || 3000`, `port=8000`. Looks at the shallowest source files first. */
 async function codePort(ctx: Ctx, files: string[]): Promise<number | undefined> {
   const sources = files.filter((f) => CODE_FILE_RE.test(f)).sort((a, b) => a.split('/').length - b.split('/').length || a.localeCompare(b)).slice(0, MAX_PORT_SCAN_FILES);
-  const rules = [/\bPORT\b[^\n]{0,40}?(?:\|\||\?\?)\s*['"]?(\d{2,5})\b/, /\bport\s*=\s*(\d{2,5})\b/i, /\bPORT['"]\s*,\s*['"]?(\d{2,5})\b/];
   for (const f of sources) {
     const text = await readFile(ctx, f);
     for (const line of text === null ? [] : regexLines(text)) {
-      for (const rule of rules) {
+      for (const rule of PORT_RULES) {
         const port = validPort(rule.exec(line)?.[1]);
         if (port) return port;
       }
@@ -366,6 +373,7 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
   const ignore = IGNORED_DIRS.map((d) => `**/${d}/**`);
   const listing = await listFiles(dir, ['**/*'], ignore);
   const ctx: Ctx = { root: dir, fileSet: new Set(listing.files.filter(regexSafe)), notes };
+  const listingIncomplete = listing.truncated || ctx.fileSet.size < listing.files.length;
   if (listing.truncated) note(ctx, `Only the first ${MAX_FILES_TEXT} files were read. Results may be incomplete.`);
   for (const name of ROOT_FILES) if (!ctx.fileSet.has(name) && (await lstat(joinOs(dir, name)).catch(() => null))) ctx.fileSet.add(name);
 
@@ -409,7 +417,12 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
   else if (dirs.length > 1) monorepo = 'folders';
 
   // Plan P Task 1: one run for the quality facts, so each lockfile is read once and the read budgets hold for the repo.
-  const shared: Shared = { repo, serviceDirs: dirs, quality: newQualityRun(dir, [...ctx.fileSet], dirs, workspaceMembers), copies: [] };
+  let untracked: Promise<(rel: string) => boolean> | undefined;
+  const shared: Shared = {
+    repo, serviceDirs: dirs, quality: newQualityRun(dir, [...ctx.fileSet], dirs, workspaceMembers), copies: [],
+    untrackedIgnored: () => (untracked ??= untrackedIgnoredOf(dir)),
+    listingIncomplete,
+  };
   // P55 (batch B): what each Dockerfile copies into its image (read once; a folder it copies is part of that image)
   const known = new Set<string>(ctx.fileSet);
   for (const f of ctx.fileSet) for (let d = dirOf(f); d !== '.' && !known.has(d); d = dirOf(d)) known.add(d);
@@ -427,6 +440,8 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
   const only = services.length === 1 ? services[0] : undefined;
   const registry = only?.language === 'node' ? 'npm' : only?.language === 'python' ? 'pypi' : undefined;
   if (only !== undefined && only.path === '.' && registry !== undefined && existingWorkflows.some((w) => w.publishes?.includes(registry))) only.publishedPackage = true;
+  // Plan J J2 (ruling B2): library for a published package, server by baseRunnable, static-host evidence
+  finishProjectTypes(services, existingWorkflows);
   // a detected folder is never a whole service (a workspace package called `generated`) nor one that holds a service: skipping it would skip code pipegen was asked to check
   const detected = await readGeneratedDirs(dir, dirs, files);
   const generatedDirs = detected.filter((g) => {

@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { AiError } from '../src/ai/provider.js';
 import { bundleCode, bundleText, SecretScanRequiredError, type CodeBundle } from '../src/ai/redact.js';
 import {
-  deployApprovalRule, floorNeeds, isRunnable, jobCategories, jobCounts, JOB_GROUP, NEED_ID_CATEGORY, NEED_IDS, needsSchema, needWhy, planNeeds, skippedChecks,
+  acceptAddedNeed, addedNeedContext, deployApprovalRule, floorNeeds, isRunnable, jobCategories, jobCounts, JOB_GROUP, MINIMUM_CATEGORIES, NEED_ID_CATEGORY, NEED_IDS, needsSchema, needWhy, planNeeds, skippedChecks,
 } from '../src/engine/needs.js';
 import { CHECKS } from '../src/engine/needs.js';
 import { AI_ONLY_IDS, REPO_WIDE_CATEGORIES, SCHEDULED_CATEGORIES } from '../src/engine/need-ids.js';
@@ -1019,5 +1019,101 @@ describe('planNeeds: Plan P rules', () => {
     expect(added.map(key)).toEqual(['merge|migration-check|web']);
     const dead = await run(profile({ services: [web()] }), [addNeed({ id: 'dead-code', category: 'dead-code', layer: 'push', service: null, blocking: true })]);
     expect(dead.needs.find((n) => n.layer === 'push' && n.id === 'dead-code' && n.service === undefined)).toMatchObject({ blocking: false, floor: false }); // no knip config
+  });
+});
+
+// ---------- Plan J J2 (DECISIONS #121): static sites ----------
+
+describe('floor: project types (J2)', () => {
+  const staticType = { types: ['static-site' as const], evidence: [], unsure: false };
+  const IMAGE_AND_DAST = ['image-build', 'image-scan', 'dast', 'api-dast'];
+
+  it('static-site service → no image-build, image-scan, dast, api-dast, dockerfile need; minimum present', () => {
+    const shapes: RepoProfile[] = [
+      // a generator site with dev/start scripts and an API spec (a framework would make it runnable today)
+      profile({ services: [web({ name: 'site', scripts: ['dev', 'start', 'build'], frameworks: ['next'], port: 3000, quality: withQuality({ tsconfig: true, apiSpec: { kind: 'file', path: 'openapi.yaml' } }), projectType: staticType })] }),
+      // a docs site next to a server in a monorepo, with a deploy workflow
+      profile({ monorepo: 'folders', existingWorkflows: [deployWorkflow], services: [web(), svc({ name: 'docs', path: 'docs', scripts: ['serve'], projectType: { ...staticType, types: ['static-site', 'library'] } })] }),
+    ];
+    for (const p of shapes) {
+      const site = p.services.find((s) => s.projectType !== undefined) as Service;
+      expect(isRunnable(site)).toBe(false);
+      for (const caps of [PUBLIC, capsFor('free'), capsFor('team')]) {
+        const needs = floorNeeds(p, caps);
+        const mine = needs.filter((n) => n.service === site.name).map((n) => n.id);
+        for (const id of IMAGE_AND_DAST) expect(mine, id).not.toContain(id);
+        expect(mine).not.toContain('dockerfile-lint');
+        for (const c of MINIMUM_CATEGORIES) expect(needs.some((n) => n.category === c), c).toBe(true);
+        for (const c of ['sast', 'deps']) expect(mine, c).toContain(c);
+        // the model would offer no Dockerfile for it (wouldCreate keys on isRunnable)
+      }
+    }
+    // the same service without a type keeps today's image checks (projectType absent = today's rules)
+    const { projectType: _t, ...untyped } = shapes[0]!.services[0] as Service;
+    expect(floorNeeds(profile({ services: [untyped as Service] }), PUBLIC).some((n) => n.id === 'image-scan')).toBe(true);
+  });
+
+  it('static deploy target → signing need, blocking false', () => {
+    const shapes: RepoProfile[] = [
+      profile({ private: true, plan: 'free', existingWorkflows: [deployWorkflow], services: [web({ name: 'site', scripts: ['dev', 'build'], frameworks: ['next'], projectType: staticType })] }),
+      profile({ private: true, plan: 'pro', existingWorkflows: [workflow('.github/workflows/pages.yml', true)], services: [lib({ name: 'docs' }), svc({ name: 'blog', path: 'blog', scripts: ['start'], projectType: staticType })] }),
+    ];
+    for (const p of shapes) {
+      const needs = floorNeeds(p, capsFor('free'));
+      const signing = needs.filter((n) => n.id === 'signing');
+      expect(signing.length).toBe(p.services.length);
+      for (const n of signing) expect(n).toMatchObject({ layer: 'deploy', category: 'signing', blocking: false, floor: false });
+      expect(signing[0]!.why).not.toMatch(/image/);
+      // a signing mode that signs keeps today's blocking signing need
+      expect(floorNeeds({ ...p, private: false }, PUBLIC).filter((n) => n.id === 'signing').every((n) => n.blocking)).toBe(true);
+    }
+    // a runnable target on a private Free repo: still no signing need (image signing needs a signing mode)
+    expect(floorNeeds(profile({ private: true, plan: 'free', existingWorkflows: [deployWorkflow] }), capsFor('free')).some((n) => n.id === 'signing')).toBe(false);
+  });
+
+  it('final review I3: a deployed static site beside a server is a deploy target; with no deploy workflow, or alone, it is not', () => {
+    const shapes: [string, RepoProfile, string][] = [
+      ['a monorepo with a static frontend and an API', profile({ monorepo: 'folders', existingWorkflows: [deployWorkflow], services: [web({ name: 'api' }), svc({ name: 'frontend', path: 'frontend', scripts: ['dev', 'build'], frameworks: ['next'], projectType: staticType })] }), 'frontend'],
+      ['a static docs site beside a server', profile({ monorepo: 'folders', existingWorkflows: [workflow('.github/workflows/pages.yml', true)], services: [svc({ name: 'docs', path: 'docs', scripts: ['serve'], projectType: staticType }), web({ name: 'backend' })] }), 'docs'],
+    ];
+    for (const [label, p, site] of shapes) {
+      const server = p.services.find((s) => s.name !== site) as Service;
+      for (const caps of [PUBLIC, capsFor('free')]) {
+        const needs = floorNeeds(p, caps);
+        const deployFor = (name: string) => needs.filter((n) => n.layer === 'deploy' && n.service === name).map((n) => n.id);
+        for (const id of ['sbom', 'deploy-verify']) {
+          expect(deployFor(site), `${label}: ${id}`).toContain(id);
+          expect(deployFor(server.name), `${label}: ${id} on the server`).toContain(id);
+        }
+        // the static site still builds no image and runs no DAST
+        const mine = needs.filter((n) => n.service === site).map((n) => n.id);
+        for (const id of IMAGE_AND_DAST) expect(mine, `${label}: ${id}`).not.toContain(id);
+      }
+      // a signing mode that signs reaches the static site; private Free repo: the warning-only no-image signing need
+      expect(floorNeeds({ ...p, private: false }, PUBLIC).some((n) => n.id === 'signing' && n.service === site)).toBe(true);
+      const freePrivate = floorNeeds({ ...p, private: true, plan: 'free' }, capsFor('free')).filter((n) => n.id === 'signing');
+      expect(freePrivate.find((n) => n.service === site)).toMatchObject({ blocking: false });
+      expect(freePrivate.some((n) => n.service === server.name)).toBe(false);
+      // egress follows the deploy targets
+      expect(floorNeeds(p, PUBLIC).filter((n) => n.id === 'egress').map((n) => n.service)).toContain(site);
+      // no deploy workflow: the static site is out of the deploy layer, the server keeps it
+      const noDeploy = floorNeeds({ ...p, existingWorkflows: [] }, PUBLIC);
+      expect(noDeploy.some((n) => n.layer === 'deploy' && n.service === site)).toBe(false);
+      expect(noDeploy.some((n) => n.layer === 'deploy' && n.service === server.name)).toBe(true);
+    }
+    // a lone static site with no deploy workflow keeps no deploy layer (earlier ruling)
+    for (const lone of [web({ name: 'site', scripts: ['dev', 'build'], frameworks: ['next'], projectType: staticType }), svc({ name: 'pages', path: 'pages', scripts: ['serve'], projectType: staticType })]) {
+      expect(floorNeeds(profile({ services: [lone] }), PUBLIC).some((n) => n.layer === 'deploy')).toBe(false);
+    }
+  });
+
+  it('an AI image addition for a static site is refused as before (notRunnable), so refusal notes do not change', () => {
+    const p = profile({ services: [web(), svc({ name: 'site', path: 'site', scripts: ['dev'], frameworks: ['next'], projectType: staticType })] });
+    const ctx = addedNeedContext(p, PUBLIC);
+    for (const id of ['image-scan', 'dast', 'image-build'] as const) {
+      const res = acceptAddedNeed({ id, layer: 'merge', category: id, service: 'site', why: '', blocking: true }, ctx);
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.reason).toBe('notRunnable');
+    }
   });
 });

@@ -49,7 +49,12 @@ export type CiLayer = Exclude<Layer, 'pre-commit'>;
  * trigger for the scheduled checks (SCHEDULED_CATEGORIES), which are merge-layer needs.
  */
 export type Slot = CiLayer | 'scheduled';
-export type Fit = Record<Slot, boolean>;
+/**
+ * `pushDefault` (J3a, ruling S5): the workflow's `push` trigger takes the default branch (no paths filter, no tag-only
+ * filter, and its branch filter lets the default branch through; under a BranchGuess, as that bound reads it). Not a
+ * slot: no check is read on it by itself.
+ */
+export type Fit = Record<Slot, boolean> & { pushDefault?: boolean };
 
 /** One Dockerfile a command builds (repo-relative, plain paths), its build context, and the --target stage ('' = none). */
 export interface DockerBuild {
@@ -80,6 +85,8 @@ export interface Found {
    * those tools are carried as partial ('changed').
    */
   hookRun?: boolean | 'changed' | 'part';
+  /** J3b fix round 1 (ruling I3): pipegen's own sentence the covered row adds (SAFE_SHA_NOTE). */
+  coveredNote?: string;
   /**
    * P55 (batch B): `docker build`, docker/build-push-action or `docker compose build` builds these images, so the RUN lines
    * of their Dockerfiles run in CI (read by resolveScripts, docker.ts): one Dockerfile and its context, or the services of
@@ -135,6 +142,8 @@ export interface Hit {
   where: string;
   why?: string;
   hookRun?: boolean | 'changed' | 'part';
+  /** J3b fix round 1 (ruling I3): pipegen's own sentence the covered row adds (SAFE_SHA_NOTE). */
+  coveredNote?: string;
   /** Plan P Task 3 (PB5): found in a local composite action's later step, so not the first step of its job. */
   laterStep?: boolean;
   /** Fix round 1: config files the tool loads by itself (checked for after the walk), and a CI pre-commit run's job env. */
@@ -180,7 +189,7 @@ export interface Ctx {
    */
   releaseJobs: { start: number; first: number; where: string }[];
   releaseUnread: boolean;
-  precommitConfig?: Promise<{ readable: boolean; found: Found[] }>;
+  precommitConfig?: Promise<{ readable: boolean; found: Found[]; unrecognised: string[] }>;
   /** P57 (C4): prek.toml, which prek reads before .pre-commit-config.yaml: absent, unreadable, or its hooks. */
   prekConfig?: Promise<'absent' | 'unreadable' | Found[]>;
   /** P55 (batch B): each compose file set's services, worked out once (docker.ts). */

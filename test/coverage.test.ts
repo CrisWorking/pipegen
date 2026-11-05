@@ -15,7 +15,8 @@ import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
 const neverOff = vi.hoisted(() => ({ on: false }));
 vi.mock('../src/engine/never-list.js', async (importOriginal) => {
   const a = await importOriginal<typeof import('../src/engine/never-list.js')>();
-  return { ...a, neverListed: (ref: unknown) => (neverOff.on ? null : a.neverListed(ref)) };
+  // J3b (S6): the coverage mapper calls neverListedStep, which reads the never-list through neverListed
+  return { ...a, neverListed: (ref: unknown) => (neverOff.on ? null : a.neverListed(ref)), neverListedStep: (ref: unknown, w: Parameters<typeof a.neverListedStep>[1]) => (neverOff.on ? null : a.neverListedStep(ref, w)) };
 });
 afterEach(() => {
   neverOff.on = false;
@@ -1361,11 +1362,12 @@ describe('mapCoverage (Task 5, item 3: pre-commit hook contents)', () => {
     wf(dir, 'pre-commit.yaml', `on:\n  pull_request:\n  push:\n    branches: [main, stable]\n${job(run(FLASK_PRECOMMIT))}`);
     const rows = await coverage(dir, pyApp);
     expect(row(rows, 'merge', 'hooks-ci')).toMatchObject({ status: 'covered', by: 'pre-commit' });
-    expect(row(rows, 'push', 'hooks-ci').status).toBe('partial'); // feature-branch pushes don't run it
+    // feature-branch pushes don't run it, but every pull request and every push to the default branch do (J3a, credit 1)
+    expect(row(rows, 'push', 'hooks-ci')).toMatchObject({ status: 'covered', creditKind: 'push-default', by: 'pre-commit' });
     const lint = row(rows, 'merge', 'lint', 'app');
     expect(lint).toMatchObject({ status: 'covered', by: 'ruff', where: '.github/workflows/pre-commit.yaml (job scan) → .pre-commit-config.yaml' });
     expect(lint.why).toBe('The ruff check in the pre-commit hooks runs on every pull request.');
-    expect(row(rows, 'push', 'lint', 'app').status).toBe('partial');
+    expect(row(rows, 'push', 'lint', 'app')).toMatchObject({ status: 'covered', creditKind: 'push-default' });
     // the pre-commit/action runs `pre-commit run --all-files` by default
     const dir2 = makeTempDir();
     writeIn(dir2, '.pre-commit-config.yaml', hookConfig('      - id: ruff\n'));
@@ -3214,7 +3216,7 @@ describe('coverage: one condition analyzer for scripts, steps and package script
   });
 
   it('(3) what the audit can\'t see names the shell tricks it doesn\'t model', async () => {
-    const { CANT_SEE } = await import('../src/audit/render.js');
+    const CANT_SEE = (await import('../src/audit/render.js')).CANT_SEE.map((x) => x.text);
     expect(CANT_SEE.some((l) => /trap … EXIT/.test(l) && /alias/.test(l) && /function named like the test tool/.test(l))).toBe(true);
   });
 });
@@ -3690,7 +3692,7 @@ describe('coverage: ruling P59 (round 2)', () => {
     expect(await st({ Dockerfile: `${BODY}ARG TEST_CMD=pytest\nRUN $TEST_CMD\n` }, run('docker build .'))).toBe('missing');
     for (const cmd of ['$CMD pytest', '${RUNNER} pytest', '"$PY" -m pytest', '$TOOL']) expect(await st({}, run(cmd)), cmd).toBe('missing');
     expect(await st({ 'package.json': JSON.stringify({ name: 'a', scripts: { ci: '$X pytest' } }) }, run('npm run ci'))).toBe('missing');
-    const { CANT_SEE } = await import('../src/audit/render.js');
+    const CANT_SEE = (await import('../src/audit/render.js')).CANT_SEE.map((x) => x.text);
     expect(CANT_SEE).toContain("Commands given through a variable aren't read.");
     // re-review 2: a service with two languages (P60 R4) is covered by a tool of either language
     expect(CANT_SEE.some((l) => /two languages|more than one language/.test(l))).toBe(true);

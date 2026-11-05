@@ -8,7 +8,7 @@ import type { Coverage } from '../src/audit/coverage.js';
 import { CHECKS } from '../src/engine/needs.js';
 import type { RepoToolStep } from '../src/engine/reviewed.js';
 import type { Layer } from '../src/types.js';
-import { CANT_SEE, renderJson, renderLocalJson, renderLocalTerminal, renderMarkdown, renderTerminal, type RenderOptions } from '../src/audit/render.js';
+import { CANT_SEE as CANT_SEE_ALL, renderJson, renderLocalJson, renderLocalTerminal, renderMarkdown, renderTerminal, type RenderOptions } from '../src/audit/render.js';
 import { K8S_FOLDERS } from '../src/read/quality.js';
 import { safeMarkdown } from '../src/util/safe-text.js';
 import { EMPTY_PLACEHOLDER, safeOutput, TOO_LONG } from '../src/util/safe-output.js';
@@ -19,8 +19,25 @@ import { fake } from './helpers/secret-repo.js';
 const NOW = Date.UTC(2026, 9, 27, 9, 30);
 const ANON = { text: 'Without a GitHub token, pipegen reads public data only and is rate-limited.' };
 const SWAP = { text: 'This repo could change which pipegen runs. Run pipegen from outside the repo, from the npm registry, with:', command: safeRunCommand('0.1.0')! };
-const OPTS: RenderOptions = { knownValues: [], now: () => NOW };
+/** The full terminal report (J4: the short one is the default and has its own tests in audit-render-short.test.ts). */
+const OPTS: RenderOptions = { knownValues: [], now: () => NOW, verbose: true };
+/** Every caveat's text, whether it applies to a repo or not (J4: CANT_SEE rows carry `applies`). */
+const CANT_SEE = CANT_SEE_ALL.map((x) => x.text);
 const report = (): AuditReport => freePrivateReport(EXCLUDED_PATTERNS);
+/** J4: a report whose repo every caveat applies to (a Python + JS service with a Dockerfile, pre-commit, Renovate, Kubernetes, a Vue UI, a PyPI publish). */
+const everyCaveat = (): AuditReport => {
+  const r = report();
+  const svc = r.profile.services[0] as AuditReport['profile']['services'][number];
+  return {
+    ...r,
+    profile: {
+      ...r.profile, precommit: 'pre-commit', hasCompose: true,
+      repoFiles: { ...r.profile.repoFiles, renovate: 'renovate.json', kubernetes: true },
+      existingWorkflows: r.profile.existingWorkflows.map((w) => ({ ...w, publishes: ['pypi' as const] })),
+      services: [{ ...svc, language: 'python', alsoLanguages: ['node'], dockerfile: 'Dockerfile', quality: { ...svc.quality, uiFrameworks: ['vue'] } }],
+    },
+  };
+};
 const term = (r: AuditReport, o: RenderOptions = OPTS) => renderTerminal(r, o);
 /** Terminal text with the 100-column wrapping undone, for content checks. */
 const flat = (t: string) => t.replace(/\n {2,}(?![-⚠] )/g, ' ');
@@ -315,6 +332,9 @@ describe('rulings', () => {
     const lines = excludedSummaryLines();
     expect(lines).toEqual([
       ...EXCLUDED_PATTERN_GROUPS.map((g) => `- ${g.label}: ${g.summary}`),
+      // Plan J J1 (DECISIONS #126, ruling S12)
+      '- files your .gitignore lists',
+      "- files that aren't committed, when pipegen can read git's file list (.git/index)",
       '- binary files (images, archives, compiled programs), found by their content',
       `kept: ${EXCLUDED_KEPT.join(', ')}`,
     ]);
@@ -418,7 +438,7 @@ describe('rulings', () => {
   });
 
   it('notes are shown deduplicated, and the fixed "what this audit can\'t see" list comes just before the next step', () => {
-    const r = { ...report(), notes: ['Same note.', 'Same note.', 'Same\u200b note.', 'Other note.'] };
+    const r = { ...everyCaveat(), notes: ['Same note.', 'Same note.', 'Same\u200b note.', 'Other note.'] };
     const t = tflat(r);
     expect(t.split('Same note.').length - 1).toBe(1);
     expect(t).toContain('Other note.');
@@ -931,7 +951,7 @@ describe('Plan P Task 9: the report shows every catalogue check', () => {
       "pipegen can't check yet that an ESLint config reads .vue, .svelte and .astro files",
     ]) expect(all, part).toContain(part);
     expect(all).not.toMatch(/public/i);
-    for (const text of [term(report()), md(report())]) expect(flat(text)).toContain('Renovate presets');
+    for (const text of [term(everyCaveat()), md(everyCaveat())]) expect(flat(text)).toContain('Renovate presets');
   });
 });
 

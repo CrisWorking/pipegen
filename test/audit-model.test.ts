@@ -5,16 +5,17 @@ import { join, resolve } from 'node:path';
 import type { Octokit } from '@octokit/rest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as childProcess from 'node:child_process';
-import { COUNTING_ONLY_NOTE, EXCLUDED_PATTERNS, redact } from '../src/ai/redact.js';
+import { bundleCode, COUNTING_ONLY_NOTE, EXCLUDED_PATTERNS, redact } from '../src/ai/redact.js';
+import { ignoreBudgetNote } from '../src/read/gitignore.js';
 import { mapCoverage } from '../src/audit/coverage.js';
-import { buildAudit, CURRENT_MILESTONE, type AuditDeps, type AuditReport } from '../src/audit/model.js';
+import { buildAudit, buildsNoImage, CURRENT_MILESTONE, needLabel, type AuditDeps, type AuditReport } from '../src/audit/model.js';
 import { renderJson, renderMarkdown, renderTerminal } from '../src/audit/render.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { floorNeeds, jobCategories } from '../src/engine/needs.js';
 import { estimate } from '../src/estimate/estimate.js';
 import { readProject } from '../src/read/project.js';
 import { skippedWorkflowCount } from '../src/read/workflows.js';
-import { DEFAULT_MODEL, type Capabilities, type RepoProfile, type ReviewedTool } from '../src/types.js';
+import { DEFAULT_MODEL, type Capabilities, type RepoProfile, type ReviewedTool, type Service } from '../src/types.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 import { fake } from './helpers/secret-repo.js';
 
@@ -273,11 +274,11 @@ describe('buildAudit (brief, Task 2a)', () => {
     ];
     for (const r of reports) {
       expect(r.support.nextCommand).toBeNull();
-      for (const text of [renderTerminal(r, { knownValues: [] }), renderMarkdown(r, { knownValues: [] }), renderJson(r, { knownValues: [] })]) {
+      for (const text of [renderTerminal(r, { knownValues: [], verbose: true }), renderMarkdown(r, { knownValues: [] }), renderJson(r, { knownValues: [] })]) {
         expect(text).not.toMatch(/npx\s+pipegen/);
       }
     }
-    const t = renderTerminal(reports[0] as AuditReport, { knownValues: [] });
+    const t = renderTerminal(reports[0] as AuditReport, { knownValues: [], verbose: true });
     expect(t.split('\n')).toContain(`    ${SWAP_WARNING.command}`);
   });
 
@@ -675,7 +676,7 @@ describe('buildAudit (Plan U final review)', () => {
     'package.json': JSON.stringify({ name: 'lib', version: '1.0.0', scripts: { test: 'vitest run' }, devDependencies: { vitest: '1.0.0' } }),
     'package-lock.json': '{}\n', 'index.js': 'module.exports = 1;\n', '.github/workflows/release.yml': RELEASE,
   });
-  const flatTerm = (r: AuditReport) => renderTerminal(r, { knownValues: [] }).replace(/\s+/g, ' ');
+  const flatTerm = (r: AuditReport) => renderTerminal(r, { knownValues: [], verbose: true }).replace(/\s+/g, ' ');
 
   it('M4: a package with nothing runnable gets release wording for signing and attestation, never image wording', async () => {
     const r = await buildAudit(repo(pkgFiles()), deps());
@@ -705,7 +706,7 @@ describe('buildAudit (Plan U final review)', () => {
     expect(r.aiBundle.files).toBe(3);
     expect(r.aiBundle.topFolders).toEqual(['src']);
     for (const p of ['**/.env*', '**/*.tfstate', '**/.npmrc']) expect(r.aiBundle.excludedPatterns).toContain(p);
-    const term = renderTerminal(r, { knownValues: [] });
+    const term = renderTerminal(r, { knownValues: [], verbose: true });
     const md = renderMarkdown(r, { knownValues: [] });
     const json = renderJson(r, { knownValues: [] });
     for (const out of [term, md, json]) {
@@ -817,7 +818,7 @@ describe('buildAudit: Plan P final review I1 (ruling P33)', () => {
     for (const c of rows) expect(c.status, c.need.layer).not.toBe('covered');
     const why = "this action is on pipegen's never-use list (proprietary licence, needs a licence key and phones home); pin a reviewed alternative.";
     expect(rows.some((c) => c.status === 'partial' && c.why?.endsWith(why))).toBe(true);
-    for (const out of [renderTerminal(r, { knownValues: [] }), renderMarkdown(r, { knownValues: [] }), renderJson(r, { knownValues: [] })]) {
+    for (const out of [renderTerminal(r, { knownValues: [], verbose: true }), renderMarkdown(r, { knownValues: [] }), renderJson(r, { knownValues: [] })]) {
       expect(out.replace(/\s+/g, ' ')).toContain("never-use list (proprietary licence, needs a licence key and phones home); pin a reviewed alternative");
     }
   });
@@ -1024,11 +1025,11 @@ describe('buildAudit: the audited commit (hand checks fix 10, P55)', () => {
 
   it('all three outputs print the commit (short SHA and branch), and say so when it could not be read', async () => {
     const r = await buildAudit(repo({ ...nodeApp(), '.git/HEAD': 'ref: refs/heads/main\n', '.git/refs/heads/main': `${SHA}\n` }), deps());
-    expect(renderTerminal(r, { knownValues: [] })).toContain('Audited commit: 3541888 on branch main');
+    expect(renderTerminal(r, { knownValues: [], verbose: true })).toContain('Audited commit: 3541888 on branch main');
     expect(renderMarkdown(r, { knownValues: [] })).toContain('Audited commit: 3541888 on branch main');
     expect((JSON.parse(renderJson(r, { knownValues: [] })) as { commit: unknown }).commit).toEqual({ sha: SHA, short: '3541888', branch: 'main' });
     const none = await buildAudit(repo(nodeApp()), deps());
-    expect(renderTerminal(none, { knownValues: [] })).toContain("Audited commit: pipegen couldn't read it from .git");
+    expect(renderTerminal(none, { knownValues: [], verbose: true })).toContain("Audited commit: pipegen couldn't read it from .git");
     expect((JSON.parse(renderJson(none, { knownValues: [] })) as { commit: unknown }).commit).toBeNull();
   });
 });
@@ -1090,5 +1091,226 @@ describe('applyDefaultSetup: a language CodeQL can\'t scan (P57 M5)', () => {
     const rows = applyDefaultSetup(['php', 'other', 'python'].map((s) => ({ need: need(s), status: 'missing' as const, why: 'x' })), { state: 'on', languages: null, source: 'workflow' }, { services, defaultBranch: 'main' });
     expect(rows.map((r) => r.status)).toEqual(['missing', 'missing', 'partial']);
     expect(rows[0]?.why).toContain("doesn't scan PHP code");
+  });
+});
+
+describe('buildAudit: the audit respects .gitignore (Plan J J1, DECISIONS #126)', () => {
+  /** git with no user or system config; test setup only (pipegen itself never runs git). */
+  const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', HOME: '/nonexistent' };
+  const git = (dir: string, ...args: string[]) => childProcess.execFileSync('git', args, { cwd: dir, stdio: 'pipe', env: GIT_ENV });
+  /** A real git repo with a GitHub origin: `git add .` (so .gitignore decides what is tracked), then `git add -f` of `force`. */
+  function gitRepo(files: Record<string, string>, force: string[] = []): string {
+    const dir = makeTempDir();
+    for (const [rel, body] of Object.entries(files)) writeIn(dir, rel, body);
+    git(dir, 'init', '-q');
+    git(dir, 'remote', 'add', 'origin', 'https://github.com/o/r.git');
+    git(dir, 'add', '.');
+    if (force.length > 0) git(dir, 'add', '-f', '--', ...force);
+    vi.clearAllMocks(); // the setup's git calls are not the audit's
+    return dir;
+  }
+  const skippedNote = (n: number) => `The quick secret check skipped ${n === 1 ? '1 file' : `${n} files`} git ignores (not committed).`;
+
+  it('tracked but ignored file → secret check reads it, bundle drops it', async () => {
+    const stripe = fake.stripeKey();
+    const gh = fake.githubClassic();
+    const aws1 = fake.awsKey();
+    const aws2 = 'AK' + 'IA' + 'F'.repeat(16);
+    // three force-added files .gitignore lists; only .env.production is also an excluded pattern, the other three
+    // reach the bundle's rules only through .gitignore: a root folder rule, a root name rule, a nested folder rule
+    const dir = gitRepo({
+      ...nodeApp(),
+      '.gitignore': '.env.production\ngenerated/\n*.local.json\n',
+      '.env.production': `STRIPE=${stripe}\n`,
+      'generated/keys.ts': `export const t = '${gh}';\n`,
+      'config/settings.local.json': `{ "key": "${aws1}" }\n`,
+      'pkg/.gitignore': 'fixtures/\n',
+      'pkg/fixtures/sample.json': `{ "key": "${aws2}" }\n`,
+      'pkg/index.ts': 'export const p = 1;\n',
+      'src/a.ts': 'export const a = 1;\n',
+    }, ['.env.production', 'generated/keys.ts', 'config/settings.local.json', 'pkg/fixtures/sample.json']);
+    const r = await buildAudit(dir, deps());
+    // committed, so the quick secret check reads them all although .gitignore lists them
+    expect(r.secretsInTree).toEqual(expect.arrayContaining([
+      { file: '.env.production', rule: 'stripe-key', note: EXCLUDED_NOTE },
+      { file: 'generated/keys.ts', rule: 'github-token' },
+      { file: 'config/settings.local.json', rule: 'aws-access-key' },
+      { file: 'pkg/fixtures/sample.json', rule: 'aws-access-key' },
+    ]));
+    expect(r.notes.some((n) => n.includes('git ignores'))).toBe(false);
+    // never in the AI bundle: package.json, index.js, .gitignore, pkg/.gitignore, pkg/index.ts, src/a.ts
+    expect(r.aiBundle.topFolders).toEqual(['pkg', 'src']);
+    expect(r.aiBundle.files).toBe(6);
+    const b = await bundleCode(dir);
+    expect(b.files.map((f) => f.path).sort()).toEqual(['.gitignore', 'index.js', 'package.json', 'pkg/.gitignore', 'pkg/index.ts', 'src/a.ts']);
+    for (const v of [stripe, gh, aws1, aws2]) expect(anyContains(r, v), v.slice(0, 4)).toBe(false);
+    expect(childProcess.execFile).not.toHaveBeenCalled();
+    expect(childProcess.execFileSync).not.toHaveBeenCalled();
+    expect(childProcess.spawn).not.toHaveBeenCalled();
+  });
+
+  it("static export shape: .next/ and out/ ignored, not tracked → never in the bundle's top folders", async () => {
+    const aws = fake.awsKey();
+    // two invented shapes: a static-export site (build cache and built pages) and a Python package (bytecode, test
+    // environments, coverage pages); both have more build files than source files
+    const shapes: { files: Record<string, string>; source: string[]; built: string[]; skipped: number }[] = [
+      {
+        files: {
+          'package.json': JSON.stringify({ name: 'site', scripts: { build: 'next build', test: 'vitest run' }, dependencies: { next: '15.0.0' } }),
+          'next.config.mjs': "export default { output: 'export' };\n",
+          '.gitignore': '/.next/\n/out/\n',
+          'src/pages/index.tsx': 'export default function Home() { return null; }\n',
+          'src/pages/about.tsx': 'export default function About() { return null; }\n',
+          'docs/readme.md': '# site\n',
+          ...Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`.next/cache/webpack/chunk${i}.js`, `var c${i} = ${i};\n`])),
+          ...Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`out/_next/static/page${i}.js`, `var p${i} = ${i};\n`])),
+          'out/index.html': `<script>var k = '${aws}';</script>\n`,
+        },
+        source: ['docs', 'src'], built: ['.next', 'out'], skipped: 21,
+      },
+      {
+        files: {
+          'pyproject.toml': '[project]\nname = "tool"\n',
+          '.gitignore': '__pycache__/\n.tox/\nhtmlcov/\n*.egg-info/\n',
+          'tool/main.py': 'print(1)\n',
+          'tests/test_main.py': 'def test_x():\n    assert True\n',
+          ...Object.fromEntries(Array.from({ length: 6 }, (_, i) => [`tool/__pycache__/m${i}.cpython-312.pyc`, `cache ${i}\n`])),
+          ...Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`.tox/py312/lib/site${i}.py`, `x = ${i}\n`])),
+          'tool.egg-info/PKG-INFO': 'Name: tool\n',
+          'htmlcov/index.html': `<p>${aws}</p>\n`,
+        },
+        source: ['tests', 'tool'], built: ['.tox', 'htmlcov', 'tool.egg-info', '__pycache__'], skipped: 17,
+      },
+    ];
+    for (const shape of shapes) {
+      const dir = gitRepo(shape.files);
+      const r = await buildAudit(dir, deps());
+      for (const b of shape.built) expect(r.aiBundle.topFolders).not.toContain(b);
+      expect([...r.aiBundle.topFolders].sort()).toEqual(shape.source);
+      // not committed and ignored: the quick secret check skips them, and says so
+      expect(r.secretsInTree).toEqual([]);
+      expect(r.notes).toContain(skippedNote(shape.skipped));
+      expect(anyContains(r, aws)).toBe(false);
+    }
+  });
+
+  it('no index → secret check unchanged', async () => {
+    const aws = fake.awsKey();
+    const stripe = fake.stripeKey();
+    const gh = fake.githubClassic();
+    // repo(): .git/config written by hand, no .git/index
+    const dir = repo({
+      ...nodeApp(), '.gitignore': 'out/\n.env\n', 'out/app.js': `var k = '${aws}';\n`, '.env': `STRIPE=${stripe}\n`, 'src/a.ts': 'export const a = 1;\n',
+      'pkg/.gitignore': '*.log\n', 'pkg/debug.log': `token ${gh}\n`,
+    });
+    const r = await buildAudit(dir, deps());
+    expect(r.secretsInTree).toEqual(expect.arrayContaining([
+      { file: 'out/app.js', rule: 'aws-access-key' },
+      { file: '.env', rule: 'stripe-key', note: EXCLUDED_NOTE },
+      { file: 'pkg/debug.log', rule: 'github-token' },
+    ]));
+    expect(r.notes.some((n) => n.includes('git ignores'))).toBe(false);
+    // the bundle still leaves out what .gitignore lists (index or not)
+    expect([...r.aiBundle.topFolders].sort()).toEqual(['pkg', 'src']);
+  });
+
+  it("a .gitignore rule pipegen can't use as written (two `**`, too long, unreadable): the secret check reads the file, the bundle leaves it out", async () => {
+    const keys = Array.from({ length: 6 }, (_, i) => 'AK' + 'IA' + String.fromCharCode(71 + i).repeat(16));
+    const dir = gitRepo({
+      ...nodeApp(),
+      '.gitignore': 'reports/**/tmp/**/*.json\n',
+      'tools/.gitignore': `${'a'.repeat(1001)}*\n`,
+      // over 1 MB, so pipegen can't read it; git does, and its rule ignores vendored/x.gen.js
+      'vendored/.gitignore': `${'#'.repeat(1_000_001)}\n*.gen.js\n`,
+      'src/a.ts': 'export const a = 1;\n',
+      // untracked (git ignores them, so `git add .` leaves them out): read by the secret check, whose unsure side is "not ignored"
+      'reports/x/tmp/y/run.json': `{ "k": "${keys[0]}" }\n`,
+      'vendored/x.gen.js': `var k = '${keys[1]}';\n`,
+      // committed (force-added): the bundle's unsure side is "ignored", so they are left out
+      'reports/q/tmp/r/kept.json': `{ "k": "${keys[2]}" }\n`,
+      'tools/build.js': `var k = '${keys[3]}';\n`,
+      'vendored/lib.js': `var k = '${keys[4]}';\n`,
+    }, ['reports/q/tmp/r/kept.json', 'tools/build.js', 'vendored/lib.js']);
+    // what git did: the two-`**` rule and the rule past 1 MB left these out of the index (a 1,001-character rule can't
+    // match a file name, so the long rule is tested on the bundle side only)
+    const tracked = String(git(dir, 'ls-files')).split('\n');
+    expect(tracked).not.toContain('reports/x/tmp/y/run.json');
+    expect(tracked).not.toContain('vendored/x.gen.js');
+    expect(tracked).toContain('tools/build.js');
+    vi.clearAllMocks();
+    const r = await buildAudit(dir, deps());
+    expect(r.secretsInTree).toEqual(expect.arrayContaining([
+      { file: 'reports/x/tmp/y/run.json', rule: 'aws-access-key' },
+      { file: 'vendored/x.gen.js', rule: 'aws-access-key' },
+      { file: 'reports/q/tmp/r/kept.json', rule: 'aws-access-key' },
+      { file: 'tools/build.js', rule: 'aws-access-key' },
+      { file: 'vendored/lib.js', rule: 'aws-access-key' },
+    ]));
+    const b = await bundleCode(dir);
+    const sent = b.files.map((f) => f.path);
+    for (const p of ['reports/q/tmp/r/kept.json', 'tools/build.js', 'vendored/lib.js', 'reports/x/tmp/y/run.json', 'vendored/x.gen.js']) expect(sent, p).not.toContain(p);
+    expect(sent).toContain('src/a.ts');
+    expect(r.aiBundle.topFolders).toEqual(['src']);
+  });
+
+  it('past the matching work budget: the secret check reads the remaining files, the bundle leaves them out', async () => {
+    const keys = ['AK' + 'IA' + 'M'.repeat(16), 'AK' + 'IA' + 'N'.repeat(16)];
+    // 10,000 rules (the S11 maximum) and a folder 150 levels deep: matching one deep path costs more than the budget
+    const deep = Array.from({ length: 150 }, (_, i) => `d${String(i).padStart(18, '0')}`).join('/');
+    const dir = gitRepo({
+      ...nodeApp(),
+      '.gitignore': `${Array.from({ length: 9_999 }, (_, i) => `r${i}.cache`).join('\n')}\n*.tmp\n`,
+      'src/a.ts': 'export const a = 1;\n',
+      [`${deep}/a.tmp`]: `var k = '${keys[0]}';\n`, // untracked: *.tmp
+      [`${deep}/b.tmp`]: `var k = '${keys[1]}';\n`, // force-added below
+    }, [`${deep}/b.tmp`]);
+    const r = await buildAudit(dir, deps());
+    expect(r.secretsInTree).toEqual(expect.arrayContaining([
+      { file: `${deep}/a.tmp`, rule: 'aws-access-key' },
+      { file: `${deep}/b.tmp`, rule: 'aws-access-key' },
+    ]));
+    expect(r.notes).toContain(ignoreBudgetNote('not-ignored'));
+    const b = await bundleCode(dir);
+    expect(b.files.map((f) => f.path).some((p) => p.startsWith('d000'))).toBe(false);
+    expect(b.notes).toContain(ignoreBudgetNote('ignored'));
+  });
+});
+
+describe('buildAudit: a static site gets no image, DAST or Dockerfile checks (Plan J J2, DECISIONS #121)', () => {
+  const deployWf = (run: string) => `name: deploy\non:\n  push:\n    branches: [main]\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm ci && npm run build\n      - run: ${run}\n`;
+  const shapes: Record<string, string>[] = [
+    {
+      'package.json': JSON.stringify({ name: 'site', scripts: { dev: 'next dev', build: 'next build', test: 'vitest run' }, dependencies: { next: '15.0.0', react: '19.0.0' }, devDependencies: { vitest: '1.0.0' } }),
+      'next.config.ts': "import type { NextConfig } from 'next';\nconst nextConfig: NextConfig = { output: 'export' };\nexport default nextConfig;\n",
+      'app/page.tsx': 'export default function Page() { return null; }\n',
+      '.github/workflows/deploy.yml': deployWf('npx wrangler pages deploy out'),
+    },
+    {
+      'package.json': JSON.stringify({ name: 'docs', scripts: { dev: 'vite', build: 'vite build', preview: 'vite preview' }, devDependencies: { vite: '7.0.0' } }),
+      'src/main.ts': 'document.body.textContent = "hi";\n',
+      '.github/workflows/pages.yml': deployWf('netlify deploy --prod --dir dist'),
+    },
+  ];
+  it('static-site service: no image, DAST, API DAST or Dockerfile rows, the skipped list says why, and a private repo gets a warning-only release signing row', async () => {
+    for (const files of shapes) {
+      for (const priv of [false, true]) {
+        const r = await buildAudit(repo(files), deps(priv ? { context: { private: true, ownerType: 'User', plan: 'free', defaultBranch: 'main' }, capabilities: bareCaps } : {}));
+        const s = r.profile.services[0] as Service;
+        expect(s.projectType?.types).toEqual(['static-site']);
+        expect(s.projectType?.evidence.join('\n')).toMatch(/deploys with/);
+        const cats = r.coverage.map((c) => c.need.category);
+        for (const c of ['image-build', 'image-scan', 'dast', 'api-dast', 'dockerfile-lint']) expect(cats, c).not.toContain(c);
+        for (const c of ['secrets', 'deps', 'sast', 'workflow-lint', 'workflow-pin-check', 'gate']) expect(cats, c).toContain(c);
+        expect(r.wouldCreate.map((w) => w.what)).not.toContain('docker');
+        const skipped = r.skipped.find((g) => g.why === 'this service is a static site: nothing runs as a server or in a container');
+        expect(skipped?.categories).toEqual(expect.arrayContaining(['image-build', 'image-scan', 'dast', 'api-dast']));
+        const signing = r.coverage.filter((c) => c.need.category === 'signing');
+        if (priv) {
+          expect(signing).toHaveLength(1);
+          expect(signing[0]?.need.blocking).toBe(false);
+          expect(needLabel('signing', { noImage: buildsNoImage(signing[0]!.need, r.profile) })).toBe('Release signing');
+        } else expect(signing.every((c) => c.need.blocking)).toBe(true);
+      }
+    }
   });
 });
