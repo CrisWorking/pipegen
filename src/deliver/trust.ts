@@ -40,28 +40,37 @@ async function readFor(gh: Octokit, central: RepoRef, appRepo: string, branch: s
   }
 }
 
-const MAX_LISTED = 15;
-const list = (label: string, names: readonly string[]): string | null => {
-  if (names.length === 0) return null;
-  const shown = names.slice(0, MAX_LISTED).map((n) => safeText(n, 120)).join(', ');
-  return `  ${label}: ${shown}${names.length > MAX_LISTED ? ` and ${names.length - MAX_LISTED} more` : ''}`;
-};
+/** The most entries the typed question lists (G10-R-sec7): a record that claims more is never trusted by typing (never a partial list). */
+export const MAX_CONFIRM_ENTRIES = 200;
 
-/** What a record claims as pipegen's own, names only: the files and edits it lists, and the secrets, environments and rulesets it says pipegen created. */
-export function recordClaims(r: InstallRecord): string[] {
-  return [
-    list('files', [...r.files.filter((f) => f.adopted !== true).map((f) => `${f.repo === 'central' ? 'central ' : ''}${f.path}`), ...r.edits.map((e) => `${e.repo === 'central' ? 'central ' : ''}${e.path} (edit)`)]),
-    list('secrets', r.secrets.filter((s) => s.created).map((s) => `${s.name}${s.scope === 'repo' ? '' : ` (${s.scope})`}`)),
-    list('environments', r.environments.filter((e) => e.created).map((e) => e.name)),
-    list('rulesets', r.rulesets.map((x) => x.name)),
-  ].filter((x): x is string => x !== null);
+/**
+ * Every entry of a record that pipegen's ownership checks act on (G10-R-sec7: the same entries, nothing filtered, nothing cut), one name per
+ * line group, each through safeText: the files (adopted ones tagged), the edits, the secrets and variables (created or not), the environments
+ * and the rulesets. Returns null when there are more than MAX_CONFIRM_ENTRIES.
+ */
+export function recordClaims(r: InstallRecord): string[] | null {
+  const repo = (x: { repo: string }): string => (x.repo === 'central' ? 'central ' : '');
+  const groups: [string, string[]][] = [
+    ['files', r.files.map((f) => `${repo(f)}${f.path}${f.adopted === true ? ' (adopted)' : ''}`)],
+    ['edits', r.edits.map((e) => `${repo(e)}${e.path} (${e.kind})`)],
+    ['secrets', r.secrets.map((x) => `${x.name} (${x.scope}${x.created ? ', created' : ', not created'})`)],
+    ['variables', r.variables.map((x) => `${x.name} (${x.scope}${x.created ? ', created' : ', not created'})`)],
+    ['environments', r.environments.map((x) => `${x.name}${x.created ? ' (created)' : ' (not created)'}`)],
+    ['rulesets', r.rulesets.map((x) => `${x.name} (${x.kind})`)],
+  ];
+  if (groups.reduce((n, [, xs]) => n + xs.length, 0) > MAX_CONFIRM_ENTRIES) return null;
+  return groups.filter(([, xs]) => xs.length > 0).map(([label, xs]) => `  ${label}: ${xs.map((x) => safeText(x, 300)).join(', ')}`);
 }
 
 /** Step 2's question; true only for the exact app repo name (letter case and surrounding spaces ignored). No terminal is a no. */
-async function askToTrust(confirm: RecordConfirm | undefined, app: RepoRef, central: RepoRef, branch: string, r: InstallRecord): Promise<boolean> {
+async function askToTrust(confirm: RecordConfirm | undefined, app: RepoRef, central: RepoRef, branch: string, r: InstallRecord, notes: string[]): Promise<boolean> {
   if (confirm === undefined || confirm.interactive !== true) return false;
   const name = `${app.owner}/${app.repo}`;
   const claims = recordClaims(r);
+  if (claims === null) {
+    notes.push(`The install record for ${safeText(name, 140)} lists more than ${MAX_CONFIRM_ENTRIES} entries, too many to confirm by typing, so pipegen doesn't ask about it.`);
+    return false;
+  }
   const msg = [
     `pipegen found an install record for ${safeText(name, 140)} on the default branch ${safeText(branch, 100)} of ${safeText(`${central.owner}/${central.repo}`, 120)}, and this machine can't check it (it has no local record file for it). If you trust it, pipegen treats these as its own: it may replace them, and uninstalling pipegen may delete them.`,
     ...(claims.length === 0 ? ['  (it claims nothing as created)'] : claims),
@@ -85,7 +94,7 @@ export async function trustedPrevious(gh: Octokit, app: RepoRef, central: RepoRe
   // 1. vouched by this machine's local record file: the newest such record, the central PR branch first (it was built on the default one)
   for (const r of [onBranch, onDefault]) if (file !== null && r !== null && r !== 'unreadable' && r.hash === file.recordHash) return { record: r.record, exists };
   // 2. no local file: the user confirms the default branch's record by typing the repo name; it is then vouched into the local file
-  if (file === null && onDefault !== null && onDefault !== 'unreadable' && await askToTrust(confirm, app, central, centralBranch, onDefault.record)) {
+  if (file === null && onDefault !== null && onDefault !== 'unreadable' && await askToTrust(confirm, app, central, centralBranch, onDefault.record, notes)) {
     await writeLocalRecord(app, { recordHash: onDefault.hash, updatedAt: new Date().toISOString() }, local);
     return { record: onDefault.record, exists };
   }

@@ -761,6 +761,36 @@ describe('G10 fix round 1 (review-G10, ruling G10-R2)', () => {
     expect((await deliverCentral(w4.g.octokit(), p, centralFiles(' # v2'), cdeps(w4, '  O/R  '))).kind).toBe('central-pr');
   });
 
+  it('fix 1: the trust question lists every entry the record claims, adopted ones tagged; over the cap it isn\'t asked (G10-R-sec7)', async () => {
+    const p = profile();
+    const make = async (edit: (r: Rec) => void): Promise<World> => {
+      const w = world();
+      await firstRun(w);
+      const r = structuredClone(await record(w) as Rec);
+      edit(r);
+      w.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: JSON.stringify(r) });
+      rmSync(localFile(w));
+      return w;
+    };
+    // every name in the record is in the question, the adopted file tagged
+    const w = await make((r) => {
+      r.files.push({ repo: 'app', path: 'docs/adopted.md', part: 'docs', shas: [gitBlobSha('x\n')], adopted: true });
+      r.variables.push({ name: 'PIPEGEN_BLOCK_FROM', scope: 'repo', created: true });
+      r.rulesets.push({ kind: 'gate', id: 4, name: 'pipegen', githubCreatedAt: '2026-11-06T00:00:00Z' });
+    });
+    await deliverCentral(w.g.octokit(), p, centralFiles(' # v2'), cdeps(w, 'o/r'));
+    const q = w.asked.find((x) => /to trust it/.test(x)) as string;
+    const r = await record(w) as Rec;
+    for (const f of r.files) expect(q, f.path).toContain(f.path);
+    for (const e of r.edits) expect(q, e.path).toContain(e.path);
+    for (const x of [...r.secrets, ...r.variables, ...r.environments, ...r.rulesets]) expect(q, x.name).toContain(x.name);
+    expect(q).toContain('docs/adopted.md (adopted)');
+    // more entries than the cap: no question, untrusted, and said so
+    const big = await make((r) => { for (let i = 0; i < 210; i++) r.files.push({ repo: 'app', path: `gen/f${i}.txt`, part: 'docs', shas: [gitBlobSha(`${i}\n`)] }); });
+    await expect(deliverCentral(big.g.octokit(), p, centralFiles(' # v2'), cdeps(big, 'o/r'))).rejects.toThrow(/more than 200 entries/);
+    expect(big.asked.filter((x) => /to trust it/.test(x))).toEqual([]);
+  });
+
   it('fix 1: a local record file that matches no record is untrusted, and no question is asked (G10-R-sec6)', async () => {
     const w = world();
     await firstRun(w);
