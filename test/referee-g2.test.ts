@@ -592,6 +592,9 @@ describe('G2 fix round 1 (ruling G2-R1)', () => {
     const pushBuild: Need = { id: 'image-build', layer: 'push', category: 'image-build', service: 'app', why: 't', blocking: false, floor: false };
     const r7 = await runWith([], draftOf({ profile: imgProf, needs: [pushBuild, needOf('image-build', 'app')], steps: [buildSpec('app', { push: 'true' })] }));
     expect(has(r7, 'unreviewed', /narrow/), show(r7)).toBe(true);
+    // a spec with no need at all counts as blocking (fail closed)
+    const orphan = await runWith([workflow({ iac: job([...renderJobPrelude({}, p).steps, ...narrowSteps]) })], draftOf({ profile: imgProf, needs: [], steps: [spec] }));
+    expect(orphan.notes.some((n) => /narrow a blocking check/.test(n)), orphan.notes.join('\n')).toBe(true);
     // control: every copy non-blocking, the value may stand
     const r8 = await runWith([], draftOf({ profile: imgProf, needs: [pushBuild, needOf('image-build', 'app', false)], steps: [buildSpec('app', { push: 'true' })] }));
     expect(r8.issues.some((i) => /narrow/.test(i.message)), show(r8)).toBe(false);
@@ -633,6 +636,8 @@ describe('G2 fix round 1 (ruling G2-R1)', () => {
       const r = await runWith([f], pubDraft);
       expect(refused(r), `${name}: ${show(r)}`).toBe(true);
     }
+    // a pushing build with no packages permission is still a registry write attempt
+    expect(refused(await runWith([imageFile({ release: job([...renderJobPrelude({}, p).steps, bp]) })], pubDraft))).toBe(true);
     // packages: write alone (a login with no push) is a registry write too; a no-push build without it is not
     const login = renderPlatformStep('docker-login', p, { username: '${{ github.actor }}', [['pass', 'word'].join('')]: `${'$'}{{ secrets.${['GITHUB', 'TOK' + 'EN'].join('_')} }}` }, { registry: 'ghcr.io' });
     expect(refused(await runWith([imageFile({ 'image-publish': job([login], { permissions: { contents: 'read', packages: 'write' } }) })], pubDraft))).toBe(true);
