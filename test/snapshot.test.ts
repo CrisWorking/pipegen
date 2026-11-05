@@ -1366,3 +1366,19 @@ describe('E2 fix round 2 (review-E2-r1)', () => {
     await f.close();
   });
 });
+
+describe('Plan G G0 (E-F2 m3): the scratch default branch after the base push', () => {
+  it('pushProofSetup: a scratch repo with another default branch gets the app\'s, set at the base commit pipegen built', async () => {
+    const f = await fixture({ appDefault: 'develop' });   // the scratch repo holds main (README) and no develop yet
+    const r = await pushProofSetup(input(f, { defaultBranchState: 'pending' }), deps(f).d);
+    expect(r.defaultBranchState).toBe('set');
+    expect(git(f.scratchGit, 'symbolic-ref', '--short', 'HEAD')).toBe('develop');
+    expect(heads(f.scratchGit).develop).toBe(r.base.sha);
+    // never a branch made through the API: the base push made develop, then one PATCH set it as the default
+    expect(f.calls.filter((c) => c.method === 'POST' && c.url.pathname.endsWith('/git/refs'))).toEqual([]);
+    expect(f.events.filter((e) => e === `PATCH ${SCRATCH}/`)).toHaveLength(1);
+    expect(f.events.indexOf(`PATCH ${SCRATCH}/`)).toBeGreaterThan(f.events.indexOf('push pipegen-proof-shop +develop'));
+    await r.session.remove();
+    await f.close();
+  });
+});

@@ -209,6 +209,7 @@ describe('G0 (E-F2 m3): the scratch default branch', () => {
     const foreign = world({ repos: { pipelines: { private: true }, [SCRATCH]: { private: true, refs: { main: SHA_MAIN, develop: OTHER_SHA } } } });
     expect(await setScratchDefaultBranch(foreign.gh, scratchOf(foreign))).toBe('pending');
     expect(writes(foreign)).toEqual([]);
+    expect(foreign.seen().filter((x) => x.includes('/git/ref'))).toEqual([]);   // without a built commit nothing is even looked up
     // the same with the base commit's sha: develop is not at it, so still nothing
     expect(await setScratchDefaultBranch(foreign.gh, scratchOf(foreign), undefined, BUILT)).toBe('pending');
     expect(writes(foreign)).toEqual([]);
@@ -300,6 +301,11 @@ describe('G0 (F-2, F-3): planted items judged per job; coverage without a plante
     const r = await evaluate(d, [greenMain(d), plantedOf(d, expected)], ctx);
     expect(pipeline(r)?.status, pipeline(r)?.detail).toBe('proven');
     expect(r.parts.filter((p) => p.status === 'failed')).toEqual([]);
+    // an item that names no job (rebuilt without its needKey) can't be judged: failed, never skipped
+    const keyless = expected.map((e) => (e.needKey === 'sast--worker' ? (({ needKey: _k, ...rest }) => rest)(e) : e));
+    const rk = await evaluate(d, [greenMain(d), plantedOf(d, expected)], { ...ctx, plantedItems: keyless });
+    expect(pipeline(rk)?.status).toBe('failed');
+    expect(pipeline(rk)?.detail).toMatch(/a planted item names no check it belongs to/);
     // the worker's item missed: named with the worker job's own tool (bandit), never semgrep's
     const missed = await evaluate(d, [greenMain(d), plantedOf(d, expected, (i) => i.needKey !== 'sast--worker')], ctx);
     expect(pipeline(missed)?.status).toBe('failed');
