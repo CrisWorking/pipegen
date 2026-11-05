@@ -200,7 +200,7 @@ export function jobNameMatches(name: string, id: string): boolean {
 }
 interface Hit { job: JobOutcome; run: RunOutcome }
 /** The latest attempt of each distinct job name of a run (filter=all lists every attempt). */
-function latest(jobs: readonly JobOutcome[]): JobOutcome[] {
+export function latest(jobs: readonly JobOutcome[]): JobOutcome[] {
   const best = new Map<string, JobOutcome>();
   for (const j of jobs) {
     if (!isRec(j) || typeof j.name !== 'string') continue;

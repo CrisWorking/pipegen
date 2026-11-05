@@ -124,13 +124,19 @@ describe('F6 scoring', () => {
     expect(s.explanation).toEqual([
       `Caught ${ITEMS.length - 1} of ${ITEMS.length} planted problems.`,
       `Missed a critical problem: ${crit.item}.`,
-      'Did not finish in time, so this option counts as lost.',
+      'Its run did not finish in time.',
       'Took 9 min 40 s (-9 points).',
     ]);
     expect(s.optionLabel).not.toMatch(/[<>@\[\]`]/);
     expect(scoreOption(runOf(ITEMS, { durationMs: 40_000 }), ITEMS).explanation).toEqual([
       `Caught ${ITEMS.length} of ${ITEMS.length} planted problems (all critical ones).`, 'Took 40 s (no points lost).',
     ]);
+    // the wording follows the cause, and a run with no time prints no "Took" line
+    expect(scoreOption(runOf([], { timedOut: true, why: 'untimed' }), ITEMS).explanation).toContain('Its run could not be timed.');
+    const failed = scoreOption(runOf([], { timedOut: true, why: 'error' }), ITEMS).explanation;
+    expect(failed).toContain('Its run failed with an error.');
+    expect(failed.some((l) => l.startsWith('Took'))).toBe(false);
+    expect(failed.join(' ')).not.toContain('counts as lost');
     expect(scoreOption(runOf(ITEMS, { durationMs: 60_000 }), ITEMS).explanation.at(-1)).toBe('Took 1 min 0 s (-1 point).');
     // never an item id (it carries a service slug), whatever the run holds
     const lines = [...s.explanation, ...scoreOption(runOf([]), ITEMS).explanation];

@@ -9,7 +9,7 @@
 // rerunProof with the new files before the merge. Plan G implements `canProve` from the minutes meter.
 import { interrupting } from '../util/exit-hooks.js';
 import { CapReachedError } from '../proof/caps.js';
-import { jobNameMatches, type PlantedItem as EvalItem, type VariantRuns } from '../proof/evaluate.js';
+import { jobNameMatches, latest, type PlantedItem as EvalItem, type VariantRuns } from '../proof/evaluate.js';
 import { asFindings, gateResultOf } from '../proof/gate-result.js';
 import { HARNESS_PATH } from '../proof/harness.js';
 import type { JobOutcome, RunOutcome } from '../proof/run.js';
@@ -19,7 +19,7 @@ import type { Finding } from '../types.js';
 import type { Choice } from './builder.js';
 import type { Dispute, DisputeOption } from './debate.js';
 import { matchPlanted, type PlantedItem } from './planted.js';
-import { NEAR_TIE, bothMissedLine, decideBetween, plain, scoreOption, type OptionRun, type Reason, type Score } from './score.js';
+import { NEAR_TIE, bothMissedLine, decideBetween, missedItems, plain, scoreOption, type OptionRun, type Reason, type Score } from './score.js';
 
 /** At most this many disputes get a proof run; the rest go to the judge's option (S13). */
 export const MAX_PROVEN_DISPUTES = 3;
@@ -66,17 +66,6 @@ export interface OptionRunContext {
 }
 
 const normFile = (s: string): string => s.replace(/[^\x20-\x7e]/g, '');
-/** The latest attempt of each distinct job name (filter=all lists every attempt). */
-function latestJobs(jobs: readonly JobOutcome[]): JobOutcome[] {
-  const best = new Map<string, JobOutcome>();
-  for (const j of jobs) {
-    if (typeof j !== 'object' || j === null || typeof j.name !== 'string') continue;
-    const have = best.get(j.name);
-    if (have === undefined || (typeof j.attempt === 'number' ? j.attempt : 0) >= (typeof have.attempt === 'number' ? have.attempt : 0)) best.set(j.name, j);
-  }
-  return [...best.values()];
-}
-
 /**
  * What one dispute variant's runs showed. Fail-safe (S12): the variant stopped, no pull request run of pipegen's workflow, the gate
  * job not `failure` (a pass, a cancel, a skip or an unfinished gate is not "blocked"), an unreadable report or one that says pass →
@@ -86,8 +75,9 @@ function latestJobs(jobs: readonly JobOutcome[]): JobOutcome[] {
  */
 export function optionRunOf(runs: VariantRuns, ctx: OptionRunContext): OptionRun {
   const expected = ctx.expected;
+  let why: OptionRun['why'];
   const allMissed = (timedOut: boolean, durationMs: number): OptionRun => ({
-    optionLabel: ctx.optionLabel, durationMs, caught: [], missed: expected.map((e) => e.id), criticalMissed: true, timedOut,
+    optionLabel: ctx.optionLabel, durationMs, caught: [], missed: expected.map((e) => e.id), criticalMissed: true, timedOut, ...(timedOut && why !== undefined ? { why } : {}),
   });
   const pipegen = new Set(ctx.pipegenWorkflows ?? [DEFAULT_PIPEGEN_WORKFLOW]);
   const outcomes: RunOutcome[] = Array.isArray(runs?.outcomes) ? runs.outcomes.filter((o) => typeof o === 'object' && o !== null && typeof o.handle === 'object' && o.handle !== null && Array.isArray(o.jobs) && o.artifacts instanceof Map && o.artifactProblems instanceof Map) : [];
@@ -95,18 +85,20 @@ export function optionRunOf(runs: VariantRuns, ctx: OptionRunContext): OptionRun
 
   // timedOut
   const stopped = runs?.stopped === true || outcomes.some((o) => o.stopped === true);
-  let timedOut = stopped || outcomes.some((o) => (pipegen.has(o.handle.workflow) || o.handle.workflow === HARNESS_PATH) && (o.conclusion === 'timed_out' || o.conclusion === 'cancelled'));
+  const unfinished = stopped || outcomes.some((o) => (pipegen.has(o.handle.workflow) || o.handle.workflow === HARNESS_PATH) && (o.conclusion === 'timed_out' || o.conclusion === 'cancelled'));
+  let timedOut = unfinished;
+  if (unfinished) why = 'unfinished';
   // the duration, from GitHub's own job times (a job that never ran has none and is left out)
-  const timed = pr.flatMap((o) => latestJobs(o.jobs)).filter((j) => j.conclusion !== 'skipped');
+  const timed = pr.flatMap((o) => latest(o.jobs)).filter((j) => j.conclusion !== 'skipped');
   let durationMs = 0;
-  if (timed.length === 0 || timed.some((j) => typeof j.startedAt !== 'number' || typeof j.completedAt !== 'number' || !Number.isFinite(j.startedAt) || !Number.isFinite(j.completedAt))) timedOut = true;
+  if (timed.length === 0 || timed.some((j) => typeof j.startedAt !== 'number' || typeof j.completedAt !== 'number' || !Number.isFinite(j.startedAt) || !Number.isFinite(j.completedAt))) { timedOut = true; why ??= 'untimed'; }
   else {
     durationMs = Math.max(...timed.map((j) => j.completedAt as number)) - Math.min(...timed.map((j) => j.startedAt as number));
-    if (durationMs < 0) { timedOut = true; durationMs = 0; }
+    if (durationMs < 0) { timedOut = true; durationMs = 0; why ??= 'untimed'; }
   }
 
   if (stopped || pr.length === 0) return allMissed(timedOut, durationMs);
-  const gateHits = pr.flatMap((run) => latestJobs(run.jobs).filter((job) => jobNameMatches(job.name, 'gate')).map((job) => ({ run, job })));
+  const gateHits = pr.flatMap((run) => latest(run.jobs).filter((job) => jobNameMatches(job.name, 'gate')).map((job) => ({ run, job })));
   if (gateHits.length === 0 || gateHits.some((h) => h.job.conclusion !== 'failure')) return allMissed(timedOut, durationMs);
   const read = gateResultOf((gateHits[0] as { run: RunOutcome }).run);
   if (!read.ok || read.doc.pass) return allMissed(timedOut, durationMs);
@@ -140,7 +132,7 @@ export function optionRunOf(runs: VariantRuns, ctx: OptionRunContext): OptionRun
   }
   const caught = expected.filter((e) => caughtIds.has(e.id)).map((e) => e.id);
   const missed = expected.filter((e) => !caughtIds.has(e.id));
-  return { optionLabel: ctx.optionLabel, durationMs, caught, missed: missed.map((e) => e.id), criticalMissed: missed.some((e) => e.critical === true), timedOut };
+  return { optionLabel: ctx.optionLabel, durationMs, caught, missed: missed.map((e) => e.id), criticalMissed: missed.some((e) => e.critical === true), timedOut, ...(timedOut && why !== undefined ? { why } : {}) };
 }
 
 // ---------- the decision ----------
@@ -178,13 +170,17 @@ const cap = (s: string): string => s.charAt(0).toUpperCase() + s.slice(1);
 
 /** A run the prove call failed to give: every item missed, timed out. */
 function lostRun(label: string, expected: readonly PlantedItem[]): OptionRun {
-  return { optionLabel: label, durationMs: 0, caught: [], missed: expected.map((e) => e.id), criticalMissed: true, timedOut: true };
+  return { optionLabel: label, durationMs: 0, caught: [], missed: expected.map((e) => e.id), criticalMissed: true, timedOut: true, why: 'error' };
 }
 /** A run from prove that cannot be trusted as given (wrong shape) is a lost run. */
 function sane(run: unknown, label: string, expected: readonly PlantedItem[]): OptionRun {
   const r = run as Partial<OptionRun> | null | undefined;
   if (typeof r !== 'object' || r === null || !Array.isArray(r.caught) || !Array.isArray(r.missed) || typeof r.criticalMissed !== 'boolean' || typeof r.timedOut !== 'boolean' || typeof r.durationMs !== 'number') return lostRun(label, expected);
-  return { optionLabel: label, durationMs: r.durationMs, caught: r.caught as string[], missed: r.missed as string[], criticalMissed: r.criticalMissed, timedOut: r.timedOut };
+  // the reported flags are never trusted: a critical item not caught is a critical miss, and a time that is not a time is no time
+  const out: OptionRun = { optionLabel: label, durationMs: r.durationMs, caught: r.caught as string[], missed: r.missed as string[], criticalMissed: r.criticalMissed, timedOut: r.timedOut, ...(r.why === undefined ? {} : { why: r.why }) };
+  if (missedItems(out, expected).some((i) => i.critical === true)) out.criticalMissed = true;
+  if (!Number.isFinite(out.durationMs) || out.durationMs < 0) { out.timedOut = true; out.durationMs = 0; out.why ??= 'untimed'; }
+  return out;
 }
 
 function stopped(): ProofStopError { return new ProofStopError('pipegen is stopping, so the disputes are not decided.'); }
@@ -212,9 +208,10 @@ export async function decideDisputes(disputes: readonly Dispute[], deps: DecideD
     const first = d.options.find(isJudge);
     const start = d.options.find((o) => !isJudge(o)) ?? d.options[0];
     if (start === undefined) continue;
-    const head = `Dispute ${plain(d.id, 20)} on ${plain(d.key, 80)}`;
+    // catalog words only: the need key carries the service slug (repo text), which never goes into PIPEGEN.md
+    const head = `Dispute ${plain(d.id, 20)} on the ${plain(d.needId, 40)} check`;
     if (first === undefined) { winners.set(d.key, start.choice); scoreboard.push(`${head} had no judge option, so ${named(d, start)} stays.`); continue; }
-    const challengers = d.options.filter(isJudge);
+    const challengers = d.options.filter((o) => isJudge(o) && o !== start);
     let skip: string | null = null;
     if (proven >= MAX_PROVEN_DISPUTES) skip = `at most ${MAX_PROVEN_DISPUTES} disputes are proven`;
     else {

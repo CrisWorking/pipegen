@@ -90,9 +90,9 @@ describe('F6 decide', () => {
     expect(text).toContain('Missed a critical problem: hard-coded API key in a config file');
     for (const i of ITEMS) expect(text).not.toMatch(new RegExp(`(?<![\\w-])${i.id}(?![\\w-])`));
     expect(r.scoreboard.some((l) => /won because .* missed a critical problem/.test(l))).toBe(true);
-    for (const l of r.scoreboard) expect(doc(l)).toEqual([]);
+    for (const l of r.scoreboard) { expect(doc(l)).toEqual([]); expect(l).not.toMatch(/[a-z]--[a-z]/); }
     // d1: the pipegen-labelled option is the champion that starts, and a 10-point gap decides (not a near tie)
-    expect(r.scoreboard.some((l) => l === "Dispute d1 on sast--api: Pipegen's pick (semgrep) won by 10 points.")).toBe(true);
+    expect(r.scoreboard.some((l) => l === "Dispute d1 on the sast check: Pipegen's pick (semgrep) won by 10 points.")).toBe(true);
   });
 
   it('decide: the champion starts as the key\'s own option, wherever it is listed', async () => {
@@ -101,6 +101,47 @@ describe('F6 decide', () => {
     const r = await decideDisputes([swapped], { prove: f.prove, expected: ITEMS, choices: base });
     expect(f.calls.map((c) => c.variant)).toEqual(['dispute-d1-a', 'dispute-d1-b']);
     expect(r.winners.get('sast--api')).toBe(SAST_B);   // a near tie: the judge's option
+  });
+
+  it('decide: no line prints a need key, a service slug or an item id (the check is named from catalog words)', async () => {
+    const slugged = dispute('d1', 'sast--acme-internal-billing', [opt('builder', 'dispute-d1-a', SAST_A), opt('judge', 'dispute-d1-b', SAST_B)]);
+    const f = fakeProve({ 'dispute-d1-a': GOOD, 'dispute-d1-b': WORSE });
+    const sk = fakeProve({});
+    const lines = [
+      ...(await decideDisputes([slugged], { prove: f.prove, expected: ITEMS, choices: base })).scoreboard,
+      ...(await decideDisputes([slugged], { prove: sk.prove, expected: ITEMS, choices: base, canProve: () => false })).scoreboard,
+    ];
+    expect(lines.length).toBeGreaterThan(8);
+    for (const l of lines) { expect(l).not.toMatch(/[a-z]--[a-z]/); expect(l).not.toContain('acme'); expect(doc(l)).toEqual([]); }
+    expect(lines[0]).toBe('Dispute d1 on the sast check was decided by a proof run: each option ran on its own branch with the same planted problems.');
+  });
+
+  it('decide: a run from prove is reconciled with the expected items (criticalMissed recomputed; a bad duration is timedOut with no time points)', async () => {
+    // P1: the builder's run claims nothing missed and nothing critical missed, but caught nothing
+    const liar: OptionRun = { optionLabel: 'x', durationMs: 0, caught: [], missed: [], criticalMissed: false, timedOut: false };
+    const judge4 = runOf(ITEMS.filter((i) => i.id !== (ITEMS.find((x) => x.critical) as PlantedItem).id));   // one critical missed
+    const p1 = await decideDisputes([d1()], { prove: fakeProve({ 'dispute-d1-a': liar, 'dispute-d1-b': judge4 }).prove, expected: ITEMS, choices: base });
+    // both missed a critical: points decide, and the judge's 4 caught beat 0
+    expect(p1.winners.get('sast--api')).toBe(SAST_B);
+    expect(p1.scoreboard.some((l) => /Missed a critical problem/.test(l) && l.includes("the builder's pick"))).toBe(true);
+    // P2: an unreadable duration is timedOut with no time points: it loses to an equal run that finished
+    for (const bad of [Infinity, Number.NaN, -60_000]) {
+      const r = await decideDisputes([d1()], { prove: fakeProve({ 'dispute-d1-a': runOf(ITEMS, { durationMs: bad }), 'dispute-d1-b': runOf(ITEMS, { durationMs: 300_000 }) }).prove, expected: ITEMS, choices: base });
+      expect(r.winners.get('sast--api')).toBe(SAST_B);
+      expect(r.scoreboard.join('\n')).toContain('Its run could not be timed.');
+    }
+    // a lying flag is only ever ORed in: a true flag stays
+    const flagged = runOf(ITEMS, { criticalMissed: true });
+    const r3 = await decideDisputes([d1()], { prove: fakeProve({ 'dispute-d1-a': flagged, 'dispute-d1-b': runOf(ITEMS, { criticalMissed: false }) }).prove, expected: ITEMS, choices: base });
+    expect(r3.winners.get('sast--api')).toBe(SAST_B);
+  });
+
+  it('decide: a dispute with only judge options proves each once and keeps the earlier objection on a near tie', async () => {
+    const onlyJudges = dispute('d1', 'sast--api', [opt('judge', 'dispute-d1-1-b', SAST_B), opt('judge', 'dispute-d1-2-b', SAST_A)]);
+    const f = fakeProve({ 'dispute-d1-1-b': GOOD, 'dispute-d1-2-b': GOOD });
+    const r = await decideDisputes([onlyJudges], { prove: f.prove, expected: ITEMS, choices: base });
+    expect(f.calls.map((c) => c.variant)).toEqual(['dispute-d1-1-b', 'dispute-d1-2-b']);
+    expect(r.winners.get('sast--api')).toBe(SAST_B);
   });
 
   it('decide: merged dispute → each option proven once (champion order); variants dispute-dN-a, dispute-dN-<j>-b', async () => {
@@ -119,7 +160,7 @@ describe('F6 decide', () => {
     const text = r.scoreboard.join('\n');
     expect(text).toContain("the judge's option 1 (bandit)");
     expect(text).toContain("the judge's option 2 (cool-sast)");
-    expect(text).toContain("Dispute d1 on sast--api: The judge's option 1 (bandit) stays because the scores were within 2 points of each other and it was objected first.");
+    expect(text).toContain("Dispute d1 on the sast check: The judge's option 1 (bandit) stays because the scores were within 2 points of each other and it was objected first.");
     for (const l of r.scoreboard) expect(doc(l)).toEqual([]);
     // a clear win for the later objection takes the dispute
     const f2 = fakeProve({ 'dispute-d1-a': a, 'dispute-d1-1-b': b1, 'dispute-d1-2-b': runOf(ITEMS, { durationMs: 0 }) });   // total: 3 points over b1
@@ -146,8 +187,8 @@ describe('F6 decide', () => {
     expect([...r.winners.values()].map((c) => c.chosen.tool.id)).toEqual(['semgrep', 'semgrep', 'semgrep', 'bandit', 'bandit']);
     const skipped = r.scoreboard.filter((l) => l.includes('without a proof run'));
     expect(skipped).toEqual([
-      "Dispute d4 on sast--s4 was decided for the judge's option (bandit) without a proof run (at most 3 disputes are proven).",
-      "Dispute d5 on sast--s5 was decided for the judge's option (bandit) without a proof run (at most 3 disputes are proven).",
+      "Dispute d4 on the sast check was decided for the judge's option (bandit) without a proof run (at most 3 disputes are proven).",
+      "Dispute d5 on the sast check was decided for the judge's option (bandit) without a proof run (at most 3 disputes are proven).",
     ]);
     // canProve: asked once per dispute (with the number of runs it needs); false → the judge's option, no run, other disputes go on
     const asked: number[] = [];
@@ -156,7 +197,7 @@ describe('F6 decide', () => {
     expect(asked).toEqual([2, 2, 2]);
     expect(f2.calls.map((c) => c.variant)).toEqual(['dispute-d1-a', 'dispute-d1-b', 'dispute-d3-a', 'dispute-d3-b']);
     expect([...r2.winners.values()].map((c) => c.chosen.tool.id)).toEqual(['semgrep', 'bandit', 'semgrep']);
-    expect(r2.scoreboard).toContain("Dispute d2 on sast--s2 was decided for the judge's option (bandit) without a proof run (not enough Actions minutes are left for it).");
+    expect(r2.scoreboard).toContain("Dispute d2 on the sast check was decided for the judge's option (bandit) without a proof run (not enough Actions minutes are left for it).");
     // a skipped dispute does not use up the budget; a canProve that throws counts as false
     const f3 = fakeProve(script);
     const r3 = await decideDisputes([mk(1), mk(2)], { prove: f3.prove, expected: ITEMS, choices: base, canProve: () => { throw new Error('meter broke'); } });
@@ -182,8 +223,8 @@ describe('F6 decide', () => {
     expect(r.winners.get('sast--api')).toBe(SAST_B);
     const text = r.scoreboard.join('\n');
     expect(text).toContain("the builder's pick (semgrep) scored 0 points.");
-    expect(text).toContain("Dispute d1 on sast--api, the builder's pick (semgrep): Did not finish in time, so this option counts as lost.");
-    expect(text).toContain("Dispute d1 on sast--api, the builder's pick (semgrep): Caught 0 of ");
+    expect(text).toContain("Dispute d1 on the sast check, the builder's pick (semgrep): Its run failed with an error.");
+    expect(text).toContain("Dispute d1 on the sast check, the builder's pick (semgrep): Caught 0 of ");
     expect(text).toContain('Missed a critical problem: hard-coded API key in a config file');
     expect(text).not.toContain('network went away');   // an error message never reaches the scoreboard
     // the same error in the judge's option → the builder's wins
@@ -271,6 +312,7 @@ describe('F6 optionRunOf', () => {
   beforeAll(() => { expect(ITEMS.length).toBeGreaterThanOrEqual(5); expect(ITEMS.some((i) => i.critical)).toBe(true); });
 
   it('optionRun: caught/missed from the gate\'s blocking findings through matchPlanted, with the option\'s own tool per category', () => {
+    // the name says "per category" (required verbatim), but the tool is looked up per job (needKey), as F5-R3 requires
     const r = optionRunOf(variantOf(prRun(ALL)), ctxOf());
     expect(r).toMatchObject({ optionLabel: 'opt', criticalMissed: false, timedOut: false, missed: [] });
     expect([...r.caught].sort()).toEqual(ITEMS.map((i) => i.id).sort());

@@ -14,6 +14,8 @@ export interface OptionRun {
   missed: string[];
   criticalMissed: boolean;
   timedOut: boolean;
+  /** Why it timed out, for the wording only: the run did not finish in time (default), GitHub gave no usable times, or the proof call failed. */
+  why?: 'unfinished' | 'untimed' | 'error';
 }
 export interface Score { optionLabel: string; points: number; explanation: string[] }
 
@@ -71,10 +73,10 @@ export function scoreOption(r: OptionRun, expected: readonly PlantedItem[]): Sco
     const named = missedItems(r, expected).filter((i) => i.critical === true).map(textOf);
     lines.push(named.length > 0 ? `Missed a critical problem: ${named.join(', ')}.` : 'Missed a critical problem: the run could not be read as a block.');
   }
-  if (r.timedOut === true) lines.push('Did not finish in time, so this option counts as lost.');
+  if (r.timedOut === true) lines.push(r.why === 'error' ? 'Its run failed with an error.' : r.why === 'untimed' ? 'Its run could not be timed.' : 'Its run did not finish in time.');
   const secs = Math.floor((typeof r.durationMs === 'number' && Number.isFinite(r.durationMs) && r.durationMs > 0 ? r.durationMs : 0) / 1000);
   const took = minutes > 0 ? `${minutes} min ${secs - minutes * 60} s` : `${secs} s`;
-  lines.push(`Took ${took} (${minutes === 0 ? 'no points lost' : `-${minutes} point${minutes === 1 ? '' : 's'}`}).`);
+  if (r.timedOut !== true || secs > 0) lines.push(`Took ${took} (${minutes === 0 ? 'no points lost' : `-${minutes} point${minutes === 1 ? '' : 's'}`}).`);
   return { optionLabel: plain(String(r.optionLabel), 60), points, explanation: lines };
 }
 
