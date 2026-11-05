@@ -189,16 +189,11 @@ export async function openOrUpdatePr(gh: Octokit, r: RepoRef, pr: { head: string
   return { number: d.number as number, url: typeof d.html_url === 'string' ? d.html_url : '', opened: true };
 }
 
-/**
- * Where a commit for pipegen's central pull request branch goes (fix round 1, m8): a branch whose commits are all on the default branch
- * (merged, or stale) is moved onto a commit on the default head; a branch holding commits not on the default branch (an unmerged record
- * or central-files commit) is never force-moved over them: the new commit goes on top of the branch head instead.
- */
-export async function prBranchBase(gh: Octokit, r: RepoRef, branch: string, defaultBranch: string, defaultHead: string, clock: RateClock): Promise<{ parent: string; tree: string; entries: Map<string, TreeEntry>; force: boolean; carried: boolean }> {
-  const head = await readHead(gh, r, branch, clock);
-  const status = head === null ? 'missing' : await compareStatus(gh, r, defaultBranch, head, clock);
-  const onTop = head !== null && status !== 'identical' && status !== 'behind';
-  const parent = onTop ? head : defaultHead;
-  const t = await readTree(gh, r, parent, clock);
-  return { parent, tree: t.tree, entries: t.entries, force: !onTop, carried: onTop };
+
+/** The paths `head` changes against `base` (GitHub's compare), or null when GitHub can't list them all (300 or more files). */
+export async function compareFiles(gh: Octokit, r: RepoRef, base: string, head: string, clock: RateClock): Promise<{ status: string; files: string[] | null }> {
+  const d = obj(await ghRead(gh, 'GET /repos/{owner}/{repo}/compare/{basehead}', r, { basehead: `${checkBranch(base)}...${head}`, per_page: 100 }, clock));
+  if (typeof d.status !== 'string') throw new DeliverError('GitHub\'s compare answer could not be read.');
+  const list = Array.isArray(d.files) ? d.files.map(obj).map((f) => f.filename).filter((x): x is string => typeof x === 'string') : null;
+  return { status: d.status, files: list === null || list.length >= 300 ? null : list };
 }

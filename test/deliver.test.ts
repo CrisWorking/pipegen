@@ -688,7 +688,14 @@ describe('G10 delivery: secrets and settings before the merge', () => {
 describe('G10 fix round 1 (review-G10, ruling G10-R2)', () => {
   const upd = `pipegen/update-${centralProjectName('r')}`;
   const localFile = (w: World): string => join(w.home, '.config', 'pipegen', 'records', 'o__r.json');
-  const fresh = (...names: string[]): SecretVault => { const v = new SecretVault(); v.set(KEY, KEY_VALUE); for (const n of names) v.set(n, 'n'.repeat(30)); return v; };
+  const N_VALUE = 'n'.repeat(30);
+  /** A new vault with the app key (and `names`, each holding N_VALUE). */
+  function fresh(...names: string[]): SecretVault {
+    const v = new SecretVault();
+    v.set(KEY, KEY_VALUE);
+    for (const n of names) v.set(n, N_VALUE);
+    return v;
+  }
   type Rec = NonNullable<Awaited<ReturnType<typeof record>>>;
 
   it('fix 1: a record on the central default branch that nothing vouches for, before finish, is claimed from nothing (I1, A4)', async () => {
@@ -865,6 +872,54 @@ describe('G10 fix round 1 (review-G10, ruling G10-R2)', () => {
     const co = cf('.github/CODEOWNERS', '# pipegen:begin\n.github/workflows/** @a @b\n# pipegen:end\n', 'codeowners', { repo: 'central', edited: { original: '' } });
     await expect(deliver(w.g.octokit(), p, planDelivery(input(p, pin, { files: [...centralFiles(), co, ...appFiles(pin)] })), fresh(), deps(w))).rejects.toThrow(/holds another \.github\/CODEOWNERS than the default branch/);
     expect(w.g.filesAt('o/pipelines', w.g.head('o/pipelines', upd)).get('.github/CODEOWNERS')).toBe('* @mallory\n');
+  });
+
+  it('fix 1: the central PR branch is carried only when it is ahead, touches only this project\'s files and holds the trusted record (G10-R-sec4)', async () => {
+    const p = profile();
+    /** Run 1 (record on main), run 2 (record on the central PR branch, vouched by the local file); returns the branch's record commit. */
+    const twoRuns = async (): Promise<{ w: World; pin: string; rec: string }> => {
+      const w = world();
+      const first = await firstRun(w);
+      await deliver(w.g.octokit(), p, planDelivery(input(p, first.pin)), fresh(), deps(w));
+      return { w, pin: first.pin, rec: w.g.head('o/pipelines', upd) };
+    };
+    const forced = (w: World): unknown => w.g.calls.filter((c) => c.route === 'PATCH /repos/{owner}/{repo}/git/refs/{ref}' && c.params.ref === `heads/${upd}`).at(-1)?.params.force;
+    // only own paths + the trusted record: carried (no force, no note)
+    const a = await twoRuns();
+    const ca = await deliverCentral(a.w.g.octokit(), p, centralFiles(' # v2'), cdeps(a.w));
+    expect(ca.kind === 'central-pr' && ca.message).not.toMatch(/not reused/);
+    expect(a.w.g.history('o/pipelines', a.w.g.head('o/pipelines', upd)).map((x) => x.sha)).toContain(a.rec);
+    expect(forced(a.w)).toBe(false);
+    // a foreign path on the branch: not carried, started fresh from the default head, and said so
+    const b = await twoRuns();
+    b.w.g.commitOn('o/pipelines', upd, { 'evil.txt': 'x\n' });
+    const cb = await deliverCentral(b.w.g.octokit(), p, centralFiles(' # v2'), cdeps(b.w));
+    expect(cb.kind === 'central-pr' && cb.message).toMatch(/pipegen\/update-r.*not reused.*evil\.txt/);
+    const headB = b.w.g.head('o/pipelines', upd);
+    expect(b.w.g.filesAt('o/pipelines', headB).has('evil.txt')).toBe(false);
+    expect(b.w.g.history('o/pipelines', headB)[0]?.parents).toEqual([b.w.g.head('o/pipelines')]);
+    expect(forced(b.w)).toBe(true);
+    // diverged from the default branch: not carried
+    const c = await twoRuns();
+    c.w.g.commitOn('o/pipelines', 'main', { 'notes.md': 'x\n' });
+    const cc = await deliverCentral(c.w.g.octokit(), p, centralFiles(' # v2'), cdeps(c.w));
+    expect(cc.kind === 'central-pr' && cc.message).toMatch(/not reused.*diverged/);
+    expect(c.w.g.history('o/pipelines', c.w.g.head('o/pipelines', upd)).map((x) => x.sha)).not.toContain(c.rec);
+    // GitHub can't list all of the branch's changes: not carried
+    const e = await twoRuns();
+    e.w.g.hooks.push((x) => (x.route === 'GET /repos/{owner}/{repo}/compare/{basehead}' && String(x.params.basehead).endsWith(e.w.g.head('o/pipelines', upd)) ? { status: 200, data: { status: 'ahead' } } : undefined));
+    const ce = await deliverCentral(e.w.g.octokit(), p, centralFiles(' # v2'), cdeps(e.w));
+    expect(ce.kind === 'central-pr' && ce.message).toMatch(/not reused.*could not list/);
+    // a record on the branch that the local file doesn't vouch for: not carried (the delivery writes a fresh record, and says why)
+    const d = await twoRuns();
+    const planted = structuredClone(await record(d.w, upd) as Rec);
+    planted.files.push({ repo: 'app', path: 'README.md', part: 'docs', shas: [gitBlobSha('hi\n')] });
+    d.w.g.commitOn('o/pipelines', upd, { [recordPath('r')]: JSON.stringify(planted) });
+    const res = await deliver(d.w.g.octokit(), p, planDelivery(input(p, d.pin)), fresh(), deps(d.w, {}, { replace: true }));
+    expect(res.notes.join('\n')).toMatch(/pipegen\/update-r.*not reused.*record/);
+    const headD = d.w.g.head('o/pipelines', upd);
+    expect(d.w.g.history('o/pipelines', headD)[0]?.parents).toEqual([d.w.g.head('o/pipelines')]);
+    expect((await record(d.w, upd))?.files.some((f) => f.path === 'README.md')).toBe(false);
   });
 
   it('fix 1: the central PR branch is never force-moved over an unmerged record commit (m8)', async () => {

@@ -201,7 +201,11 @@ export class FakeGitHub {
         const h = repo.refs.get(`heads/${head}`) ?? head;
         if (!repo.commits.has(b) || !repo.commits.has(h)) fail(404);
         const status = b === h ? 'identical' : this.#ancestor(repo, h, b) ? 'behind' : this.#ancestor(repo, b, h) ? 'ahead' : 'diverged';
-        return ok({ status });
+        // the files the head changed against the base (exact when head is ahead; a diverged answer lists both sides' changes)
+        const tb = repo.trees.get(repo.commits.get(b)?.tree as string) as Map<string, Entry>;
+        const th = repo.trees.get(repo.commits.get(h)?.tree as string) as Map<string, Entry>;
+        const files = [...new Set([...tb.keys(), ...th.keys()])].filter((x) => tb.get(x)?.sha !== th.get(x)?.sha).map((filename) => ({ filename, status: 'modified' }));
+        return ok({ status, files });
       }
       case 'GET /repos/{owner}/{repo}/rules/branches/{branch}':
         return ok(repo.rules);

@@ -46,9 +46,9 @@ import type { CreatedFile, EnvSettings, InstallEdit, InstallPlanned, InstallReco
 import { packageVersion } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
 import {
-  commitFiles, compareStatus, DeliverError, ghRead, ghWrite, ISO_RE, openOrUpdatePr, prBranchBase, readHead, readRepo, readTree, refusedMove, setBranch, statusOf, type RepoRef, type TreeEntry,
+  commitFiles, compareStatus, DeliverError, ghRead, ghWrite, ISO_RE, openOrUpdatePr, readHead, readRepo, readTree, refusedMove, setBranch, statusOf, type RepoRef, type TreeEntry,
 } from './git-data.js';
-import { addLocalLeftovers, centralUpdateBranch, RecordError, writeRecord, type Leftover, type LocalRecordDeps } from './record.js';
+import { addLocalLeftovers, centralPrBase, centralUpdateBranch, readLocalRecord, recordPath, RecordError, writeRecord, type Leftover, type LocalRecordDeps } from './record.js';
 import { trustedPrevious } from './trust.js';
 
 export { DeliverError };
@@ -348,11 +348,13 @@ export async function deliverCentral(gh: Octokit, p: RepoProfile, files: readonl
     }
   }
   // m8: an unmerged commit on the pull request branch (a record) is kept: the new commit goes on top of it, the branch is never force-moved over it
-  const b = await prBranchBase(gh, c, branch, defaultBranch, head, clock);
+  const ownPaths = new Set([recordPath(p.repo), ...files.map((f) => f.path), ...(prev.record?.files ?? []).filter((f) => f.repo === 'central').map((f) => f.path), ...(prev.record?.edits ?? []).filter((e) => e.repo === 'central').map((e) => e.path)]);
+  const local = await readLocalRecord({ owner: p.owner, repo: p.repo }, deps.local ?? {}).catch(() => null);
+  const b = await centralPrBase(gh, c, p.repo, branch, defaultBranch, head, { own: ownPaths, trustedHash: local?.recordHash ?? null }, clock);
   const commit = await commitOn(b.parent, b.tree);
   await setBranch(gh, c, branch, commit, b.force, clock);
   const pr = await openOrUpdatePr(gh, c, { head: branch, base: defaultBranch, title: `pipegen: central workflows and install record for ${p.repo}`, body: `pipegen's central files for ${show(`${p.owner}/${p.repo}`)}. The setup pull request in that repo pins a commit on this repo's default branch only, so merge this pull request first, then run pipegen again.` }, clock);
-  return { kind: 'central-pr', url: pr.url, message: `pipegen ${pr.opened ? 'opened' : 'updated'} the central pull request ${pr.url}. Merge the central PR, then run pipegen again: the setup pull request pins only a central commit on the default branch.` };
+  return { kind: 'central-pr', url: pr.url, message: `pipegen ${pr.opened ? 'opened' : 'updated'} the central pull request ${pr.url}. Merge the central PR, then run pipegen again: the setup pull request pins only a central commit on the default branch.${b.note === undefined ? '' : ` ${b.note}`}` };
 }
 
 // ---------- the N4 signing environment (S11) ----------
@@ -801,6 +803,7 @@ export async function deliver(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vaul
     const record = buildRecord({ d, prev, delivered, appRepo, centralSha, secrets, env, now, version });
     const via = trusted.exists || updateExists || await centralHasRules(gh, central, centralBranch, clock) ? 'pr' : 'direct';
     const w = await writeRecord(gh, { record, setupPr: pr.number, via, files: follow.filter((f) => followChanged.has(f)).map((f) => ({ path: f.path, content: f.content })), base: centralHead, clock, now: () => now, ...(deps.local === undefined ? {} : { local: deps.local }) });
+    notes.push(...w.notes);
     done.push(w.via === 'direct' ? `install record committed to ${p.owner}/${CENTRAL_REPO}` : `install record in the central pull request ${w.centralPr?.url ?? ''}`);
     return { prUrl: pr.url, prNumber: pr.number, centralSha, recordHash: w.recordHash, ...(w.centralPr === undefined ? {} : { centralPrUrl: w.centralPr.url }), done, skipped, notes };
     } catch (e) {

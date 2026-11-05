@@ -26,7 +26,7 @@ import { CENTRAL_REPO } from '../proof/target.js';
 import type { InstallRecord } from '../types.js';
 import { prepareTrustedDir, type TrustedDirKind } from '../util/trusted-dir.js';
 import { safeText } from '../util/safe-text.js';
-import { commitFiles, DeliverError, ghRead, ghWrite, ISO_RE, openOrUpdatePr, prBranchBase, readBlobText, readHead, readRepo, readTree, refusedMove, setBranch, type RepoRef } from './git-data.js';
+import { commitFiles, compareFiles, DeliverError, ghRead, ghWrite, ISO_RE, openOrUpdatePr, readBlobText, readHead, readRepo, readTree, refusedMove, setBranch, type RepoRef, type TreeEntry } from './git-data.js';
 
 export const RECORD_SCHEMA = 2;
 /** The largest record pipegen writes or reads (Plan V §4.2). */
@@ -373,7 +373,32 @@ export interface WriteRecordArgs {
   base?: string;
   clock?: RateClock; now?: () => Date; local?: LocalRecordDeps;
 }
-export interface WriteRecordResult { recordHash: string; commit: string; via: 'direct' | 'pr'; centralPr?: { number: number; url: string } }
+export interface WriteRecordResult { recordHash: string; commit: string; via: 'direct' | 'pr'; centralPr?: { number: number; url: string }; notes: string[] }
+
+/**
+ * Where a commit for pipegen's central pull request branch goes (fix round 1 m8, ruling G10-R-sec4). The existing branch's commits are kept
+ * (the new commit goes on top, the ref moves without force) ONLY when all of these hold: the branch is 'ahead' of the default head (never
+ * diverged); its changes touch only `own` (installs/<name>.json and this project's central files); and the record on it is the one this
+ * machine's local record file vouches for. Otherwise the branch is not reused: the commit goes on the default head, the branch is moved
+ * there, and `note` says which branch and why (never silently). A branch already merged (identical, behind) or missing just starts fresh.
+ */
+export async function centralPrBase(gh: Octokit, central: RepoRef, appRepo: string, branch: string, defaultBranch: string, defaultHead: string, guard: { own: ReadonlySet<string>; trustedHash: string | null }, clock: RateClock): Promise<{ parent: string; tree: string; entries: Map<string, TreeEntry>; force: boolean; carried: boolean; note?: string }> {
+  const fresh = async (note?: string) => { const t = await readTree(gh, central, defaultHead, clock); return { parent: defaultHead, tree: t.tree, entries: t.entries, force: true, carried: false, ...(note === undefined ? {} : { note }) }; };
+  const head = await readHead(gh, central, branch, clock);
+  if (head === null) return fresh();
+  const cmp = await compareFiles(gh, central, defaultBranch, head, clock);
+  if (cmp.status === 'identical' || cmp.status === 'behind') return fresh();
+  const not = (why: string): string => `The central pull request branch ${safeText(branch, 100)} was not reused (${why}); pipegen started it again from the default branch, so what was on it is no longer in that pull request.`;
+  if (cmp.status !== 'ahead') return fresh(not(`it has diverged from the default branch ${safeText(defaultBranch, 100)}`));
+  if (cmp.files === null) return fresh(not('GitHub could not list all of its changes'));
+  const foreign = cmp.files.filter((f) => !guard.own.has(f));
+  if (foreign.length > 0) return fresh(not(`it changes files that are not this project's: ${foreign.slice(0, 5).map((f) => safeText(f, 120)).join(', ')}`));
+  let onBranch: string | null = null;
+  try { const r = await readRecord(gh, central, appRepo, { branch, clock }); onBranch = r === null ? null : r.hash; } catch (e) { if (!(e instanceof RecordError)) throw e; }
+  if (guard.trustedHash === null || onBranch !== guard.trustedHash) return fresh(not('the install record on it is not the one this machine\'s local record file vouches for'));
+  const t = await readTree(gh, central, head, clock);
+  return { parent: head, tree: t.tree, entries: t.entries, force: false, carried: true };
+}
 
 /**
  * Writes the record to all three places in one call: the central repo (a direct commit, or the central pull request; a direct commit the
@@ -402,6 +427,7 @@ export async function writeRecord(gh: Octokit, args: WriteRecordArgs): Promise<W
 
   let via = args.via;
   let commit = '';
+  const notes: string[] = [];
   let centralPr: { number: number; url: string } | undefined;
   if (via === 'direct') {
     const { tree } = await readTree(gh, central, head, clock);
@@ -414,7 +440,10 @@ export async function writeRecord(gh: Octokit, args: WriteRecordArgs): Promise<W
   if (via === 'pr') {
     const branch = centralUpdateBranch(app.repo);
     // m8: an unmerged commit on the branch is kept (the new commit goes on top); its central files must not differ from what was checked
-    const b = await prBranchBase(gh, central, branch, repo.defaultBranch, head, clock);
+    const own = new Set([recordPath(app.repo), ...record.files.filter((f) => f.repo === 'central').map((f) => f.path), ...record.edits.filter((e) => e.repo === 'central').map((e) => e.path), ...extra.map((f) => f.path)]);
+    const trusted = await readLocalRecord(app, args.local ?? {}).catch(() => null);
+    const b = await centralPrBase(gh, central, app.repo, branch, repo.defaultBranch, head, { own, trustedHash: trusted?.recordHash ?? null }, clock);
+    if (b.note !== undefined) notes.push(b.note);
     if (b.carried && extra.length > 0) {
       const { entries } = await readTree(gh, central, head, clock);
       for (const f of extra) if (b.entries.get(f.path)?.sha !== entries.get(f.path)?.sha) throw new DeliverError(`The central pull request branch ${safeText(branch, 100)} holds another ${safeText(f.path, 120)} than the default branch; merge or close that pull request, then run pipegen again.`);
@@ -431,6 +460,6 @@ export async function writeRecord(gh: Octokit, args: WriteRecordArgs): Promise<W
   await ghWrite(gh, 'PATCH /repos/{owner}/{repo}/pulls/{pull_number}', app, { pull_number: args.setupPr, body: withRecordMarker(body, hash) }, clock);
 
   await writeLocalRecord(app, { recordHash: hash, setupPr: args.setupPr, updatedAt: (args.now?.() ?? new Date()).toISOString() }, args.local ?? {});
-  return { recordHash: hash, commit, via, ...(centralPr === undefined ? {} : { centralPr }) };
+  return { recordHash: hash, commit, via, ...(centralPr === undefined ? {} : { centralPr }), notes };
 }
 
