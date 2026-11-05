@@ -28,6 +28,8 @@ export const GH_ID = 'gh';
 const COSIGN_REPO = 'sigstore/cosign';
 const GH_REPO = 'cli/cli';
 /** GitHub's OIDC issuer: the only issuer a keyless signature is accepted from. */
+/** The one registry the sign step logs in to (G3-R3): the workflow token never goes to another registry. */
+export const SIGN_REGISTRY = 'ghcr.io';
 export const GITHUB_OIDC_ISSUER = 'https://token.actions.githubusercontent.com';
 /** The keyless sign job lives in the app's caller workflow (ruling B2: the deploy jobs of pipegen.yml), so its certificate names that file. */
 export const KEYLESS_SIGN_WORKFLOW = '.github/workflows/pipegen.yml';
@@ -110,20 +112,33 @@ export function renderSignSteps(cosign: ReviewedTool, mode: 'key-env' | 'keyless
   reviewedRelease(cosign, COSIGN_ID, COSIGN_REPO, 'cosign');
   if (mode !== 'key-env' && mode !== 'keyless') throw new RenderError(`cosign signs only in key-env or keyless mode (attest mode signs with actions/attest), not ${show(String(mode))}.`);
   const { repo, artifact } = imageRepo(image);
+  // G3-R3: the step logs in with the job's token, which only ever goes to ghcr.io
+  if (!repo.startsWith(`${SIGN_REGISTRY}/`)) throw new RenderError(`The image ${show(repo)} is not on ${SIGN_REGISTRY}: the sign step logs in with the workflow token, which goes to ${SIGN_REGISTRY} only.`);
   const install = releaseInstallStep(cosign, 'pipegen-cosign-sign');
   const bin = `"${install.bin}"`;
   const pinned = cosign.candidate.pin.checksum;
   if (typeof pinned !== 'string' || !SHA256_HEX_RE.test(pinned)) throw new RenderError('The reviewed cosign entry has no sha256 pin, so the binary can not be checked before it signs.');
-  // G3-R2 M3 (carry B-T1c, in the workflow): other steps (the registry login) run between the install and this step, so the binary is a regular
-  // file at its pinned sha256 again right before the one cosign call that sees the key
+  // G3-R2 M3 (carry B-T1c, in the workflow): the binary is a regular file at its pinned sha256 again right before the first cosign call of
+  // this step (a tripwire: since G3-R3 no other step of the job runs anything that is not pipegen's, see the referee's sign-job allowlist)
   const recheck = [
     `if [ ! -f ${bin} ] || [ -L ${bin} ]; then pg_fail "the cosign binary is not the regular file pipegen installed"; fi`,
     `printf '%s  %s\\n' ${q(pinned)} ${bin} | sha256sum --check --strict --status - || pg_fail "the cosign binary changed after its install (its sha256 is not the pinned one), so nothing is signed"`,
   ];
+  // G3-R3: the registry login is cosign's own, in this step (no third-party action runs in the job that holds the key or the OIDC token): a
+  // fresh config folder under RUNNER_TEMP, the job's token on stdin only (never on a command line), unset once used; the folder is removed
+  // when the step ends, whatever happens
+  const login = [
+    'DOCKER_CONFIG="$(mktemp -d "$RUNNER_TEMP/pipegen-docker.XXXXXX")"',
+    'export DOCKER_CONFIG',
+    'trap \'rm -rf -- "$DOCKER_CONFIG"\' EXIT',
+    `printf '%s' "$PIPEGEN_REGISTRY_TOKEN" | ${bin} login ${SIGN_REGISTRY} -u "$GITHUB_ACTOR" --password-stdin > /dev/null`,
+    'unset PIPEGEN_REGISTRY_TOKEN',
+  ];
   const sign = mode === 'key-env'
     ? [`COSIGN_PASSWORD="$PIPEGEN_COSIGN_PASSWORD" ${bin} sign --yes --key env://PIPEGEN_COSIGN_KEY --tlog-upload=false --use-signing-config=false "$ref"`]
     : [`${bin} sign --yes --oidc-provider=github-actions "$ref"`];
-  return [install.step, runStep(signStepId(repo), `pipegen: sign ${repo} (${mode})`, [...refLines(repo, artifact), ...recheck, ...sign], mode === 'key-env' ? { ...SIGN_STEP_ENV } : {})];
+  const env = mode === 'key-env' ? { ...SIGN_STEP_ENV } : { PIPEGEN_REGISTRY_TOKEN: SIGN_STEP_ENV.PIPEGEN_REGISTRY_TOKEN as string };
+  return [install.step, runStep(signStepId(repo), `pipegen: sign ${repo} (${mode})`, [...refLines(repo, artifact), ...recheck, ...login, ...sign], env)];
 }
 
 /**

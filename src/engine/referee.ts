@@ -985,7 +985,7 @@ function judgeJob(fc: FileCtx, id: string, j: unknown): void {
   judgeStepPolicy(fc, id, where, j, judged);
   judgeGateSteps(fc, id, where, j, judged);
   judgeSigningJob(fc, where, j, judged);
-  if (id === 'sign') judgeSignPermissions(fc, where, j, judged);
+  if (id === 'sign') { judgeSignPermissions(fc, where, j, judged); judgeSignJobSteps(fc, where, judged); }
   judgeImageHandoff(fc, id, where, j, judged);
   judgeRegistryWrite(fc, where, j, judged);
 }
@@ -1054,6 +1054,20 @@ function judgeSignPermissions(fc: FileCtx, where: string, j: Obj, judged: readon
   const oidcOk = (mode === 'keyless' && keyless) || (mode === 'attest' && attest);
   if (p['id-token'] === 'write' && !oidcOk) fc.add(fc.file.path, 'permissions', `${where} asks for id-token: write, which only the keyless sign step (keyless mode) or actions/attest (attest mode) uses; a key-env signature signs with the environment's key.`);
   if (p.attestations === 'write' && !(mode === 'attest' && attest)) fc.add(fc.file.path, 'permissions', `${where} asks for attestations: write, which only actions/attest in attest mode uses.`);
+}
+
+/**
+ * G3-R3: a job that holds a cosign sign step holds the signing identity (key-env: the environment's cosign key; keyless: the job's OIDC
+ * token), so nothing runs in it but pipegen's own steps: the digest download, the pinned cosign install and the sign step (recognised by
+ * content; the step logs in to the registry with cosign itself). No action besides the download (a registry login action, a checkout, an
+ * egress step, actions/attest) and no other run step: any of them could read the key or the token, or swap what the sign step runs.
+ */
+const SIGN_JOB_KINDS: ReadonlySet<StepKind> = new Set(['download-artifact', 'sign']);
+function judgeSignJobSteps(fc: FileCtx, where: string, judged: readonly Judged[]): void {
+  if (!judged.some((x) => x.kind === 'sign' && typeof x.step.id === 'string' && SIGN_STEP_ID_RE.test(x.step.id))) return;
+  judged.forEach((x, i) => {
+    if (!SIGN_JOB_KINDS.has(x.kind)) fc.add(fc.file.path, 'permissions', `${where}, step ${i + 1} (${show(String(x.step.name ?? x.step.uses ?? x.kind))}): the job holds the signing identity, so it runs only the digest download, the pinned cosign install and the sign step (which logs in with cosign itself), never another step or action.`);
+  });
 }
 
 /** The draft's service whose slug is this, or undefined (none, or a name that has none). */

@@ -9,7 +9,8 @@
 //   is written: the install records list the projects (S21).
 // - Records-only `pipelines` (a public app: keyless signing in the app's own pipegen.yml, ruling B2) gets no central workflow.
 // - The sign job (G2's one renderer, job `sign` only): the digest hand-off of each image (image-publish's artifact in the same run), the
-//   reviewed ghcr login (cosign stores the signature next to the image), then cosign. key-env runs in environment pipegen-signing, whose
+//   pinned cosign install, then each sign step, which logs in to ghcr.io with cosign itself (cosign stores the signature next to the image;
+//   G3-R3: no third-party action in a job that holds the key or the OIDC token, the referee holds it to that). key-env runs in environment pipegen-signing, whose
 //   secrets hold the key (default-branch deploys only), with --tlog-upload=false (no public log for a private repo); keyless asks for the
 //   OIDC token and the registry write that stores the signature (no environment, no key, no attestations). cache-mode: none. Attest mode
 //   (actions/attest v4) can not be written yet: its subject-digest is a run-time value, and the reviewed input table (tool-flags.ts, inside
@@ -27,7 +28,7 @@ import type { PlatformActions } from '../engine/pin.js';
 import { SIGNING_ENVIRONMENT } from '../engine/referee.js';
 import { RenderError, show } from '../engine/render-error.js';
 import { renderPlatformStep, stepsToYaml } from '../engine/render-step.js';
-import { COSIGN_ID, imageDigestArtifact, renderSignSteps, type SignedImage } from '../engine/signing.js';
+import { COSIGN_ID, imageDigestArtifact, renderSignSteps, SIGN_REGISTRY, type SignedImage } from '../engine/signing.js';
 import { signingMode, type SigningMode } from '../github/signing-mode.js';
 import type { Capabilities, CreatedFile, PipelineDraft, RepoProfile, ReviewedTool, SigningPlan } from '../types.js';
 
@@ -37,10 +38,8 @@ export const SIGN_JOB_ID = 'sign';
 export const IMAGE_PUBLISH_JOB = 'image-publish';
 /** The runner of the sign job: a pinned GitHub-hosted image. */
 export const SIGN_RUNNER = 'ubuntu-24.04';
-/** The sign job's own limit (a download, a login and one cosign call per image). */
+/** The sign job's own limit (a download, the cosign install, and per image a cosign login and sign). */
 export const SIGN_JOB_MINUTES = 15;
-/** The one registry the sign job logs in to: the reviewed login sends the workflow token, which never goes to another registry. */
-const SIGN_REGISTRY = 'ghcr.io';
 /** The reviewed actions/attest major the attest mode is written for (plan Global Constraints). */
 export const ATTEST_MAJOR = 'v4';
 
@@ -163,15 +162,14 @@ export function signJob(draft: PipelineDraft, mode: SigningMode, deps: { reviewe
     const name = imageDigestArtifact(i.service);
     return renderPlatformStep('download-artifact', deps.platform, { name, path: `\${{ runner.temp }}/pipegen-out/${name}` });
   });
-  const login = renderPlatformStep('docker-login', deps.platform, { username: '${{ github.actor }}', password: '${{ secrets.GITHUB_TOKEN }}' }, { registry: SIGN_REGISTRY });
-  // one cosign install (the same reviewed release for every image), before the login (the order rule: nothing installs after a step it can
-  // not see into), then each image's sign step
+  // one cosign install (the same reviewed release for every image), then each image's sign step, which logs in to ghcr.io itself (G3-R3: no
+  // third-party action runs in the job that holds the key or the OIDC token)
   const rendered = plan.images.map((i) => renderSignSteps(cosign, plan.mode as 'key-env' | 'keyless', i));
   const install = rendered[0]?.[0] as RenderedStep;
   for (const r of rendered) if (r.length !== 2 || JSON.stringify(r[0]) !== JSON.stringify(install)) throw new RenderError('The cosign install differs between images, so the sign job can not be written.');
   const job: SignJob = {
     name: 'pipegen sign', 'runs-on': SIGN_RUNNER, 'timeout-minutes': SIGN_JOB_MINUTES, permissions: signPermissions(plan.mode),
-    'cache-mode': 'none', steps: [...downloads, install, login, ...rendered.map((r) => r[1] as RenderedStep)],
+    'cache-mode': 'none', steps: [...downloads, install, ...rendered.map((r) => r[1] as RenderedStep)],
   };
   if (plan.mode === 'key-env') job.environment = SIGNING_ENVIRONMENT;
   return job;

@@ -538,8 +538,11 @@ export const SIGN_STEP_ID_RE = /^pipegen-sign-[0-9a-f]{16}$/;
 export const VERIFY_STEP_ID_RE = /^pipegen-verify-[0-9a-f]{16}$/;
 export const signStepId = (repo: string): string => `pipegen-sign-${sha16(`sign:${repo}`)}`;
 export const verifyStepId = (repo: string): string => `pipegen-verify-${sha16(`verify:${repo}`)}`;
-/** The key-env sign step's env (the signing environment's secrets): the only place the cosign key and its password are named. */
-export const SIGN_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_COSIGN_KEY: '${{ secrets.PIPEGEN_COSIGN_KEY }}', PIPEGEN_COSIGN_PASSWORD: '${{ secrets.PIPEGEN_COSIGN_PASSWORD }}' });
+/**
+ * The sign step's env: the key-env signing environment's secrets (the only place the cosign key and its password are named), and (G3-R3)
+ * the job's own token, which the step's cosign login reads from stdin (key-env and keyless).
+ */
+export const SIGN_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_COSIGN_KEY: '${{ secrets.PIPEGEN_COSIGN_KEY }}', PIPEGEN_COSIGN_PASSWORD: '${{ secrets.PIPEGEN_COSIGN_PASSWORD }}', PIPEGEN_REGISTRY_TOKEN: '${{ secrets.GITHUB_TOKEN }}' });
 /**
  * The verify steps' env: the key-env public key, the variable of the signing environment (a writer can change it, so the step checks its
  * sha256 against the literal pipegen recorded before cosign reads it, DECISIONS #76), and the attest-mode token of gh (the job's own token).

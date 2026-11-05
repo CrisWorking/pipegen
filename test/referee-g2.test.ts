@@ -22,6 +22,7 @@ import { entry, profile, reviewedList, service, specFor } from './helpers/render
 const OIDC = ['id', 'token'].join('-');
 const PW_NAME = ['PIPEGEN_COSIGN', 'PASS' + 'WORD'].join('_');
 const GHT_NAME = ['PIPEGEN_GH', 'TOK' + 'EN'].join('_');
+const REG_TOK_NAME = ['PIPEGEN_REGISTRY', 'TOK' + 'EN'].join('_');
 const LINTERS: Linters = { actionlint: async () => '/stub', zizmor: async () => '/stub' };
 const runWith = (files: CreatedFile[], d: PipelineDraft, reviewed: ReviewedTool[] = reviewedList(), deps: Parameters<typeof referee>[6] = {}) =>
   referee(files, d, p, reviewed, LINTERS, 'tok', { runLinters: async () => [], ...deps });
@@ -103,12 +104,14 @@ describe('G2: signing and verification steps (B3 b, d)', () => {
     }
     const ke = lastRun(keyEnv);
     expect(ke.run).toContain('sign --yes --key env://PIPEGEN_COSIGN_KEY --tlog-upload=false --use-signing-config=false "$ref"');
-    expect(ke.env).toEqual({ BASH_ENV: '', ENV: '', PIPEGEN_COSIGN_KEY: '${{ secrets.PIPEGEN_COSIGN_KEY }}', [PW_NAME]: `${'$'}{{ secrets.${PW_NAME} }}` });
+    // (G3-R3: both modes also carry the job's own token, which the step's cosign login reads from stdin)
+    const regTok = { [REG_TOK_NAME]: `${'$'}{{ ${['sec', 'rets'].join('')}.GITHUB_TOKEN }}` };
+    expect(ke.env).toEqual({ BASH_ENV: '', ENV: '', PIPEGEN_COSIGN_KEY: '${{ secrets.PIPEGEN_COSIGN_KEY }}', [PW_NAME]: `${'$'}{{ secrets.${PW_NAME} }}`, ...regTok });
     const kl = lastRun(keyless);
     // keyless: the GitHub OIDC identity of the job, a public transparency-log entry, no key, no secret
     expect(kl.run).toContain('sign --yes --oidc-provider=github-actions "$ref"');
     expect(kl.run).not.toMatch(/--key|tlog-upload|COSIGN_PASSWORD/);
-    expect(kl.env).toEqual({ BASH_ENV: '', ENV: '' });
+    expect(kl.env).toEqual({ BASH_ENV: '', ENV: '', ...regTok });
     // what renders it: only the reviewed cosign entry; renderStep still refuses cosign (the sign job owns its flags, BP-3)
     expect(() => renderStep(specFor(COSIGN, { needId: 'signing' }), COSIGN, p, { profile: prof })).toThrow(RenderError);
     expect(() => renderSignSteps({ ...COSIGN, id: 'cosign-fork' }, 'key-env', IMG)).toThrow(RenderError);

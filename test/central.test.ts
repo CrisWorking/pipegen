@@ -4,7 +4,7 @@
 // deploy job of pipegen.yml (G2-R-sec2). No enrolled list; records-only pipelines gets no central workflow.
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Document, parse, parseDocument } from 'yaml';
@@ -29,6 +29,10 @@ const PW_NAME = ['PIPEGEN_COSIGN', 'PASS' + 'WORD'].join('_');
 const SEC_FIELD = ['sec', 'rets'].join('');
 /** The referee's message for the OIDC permission, spelled at run time. */
 const ID_WRITE = new RegExp(`${OIDC}: write`);
+/** The sign step's registry token variable (G3-R3), spelled at run time. */
+const TOK_NAME = ['PIPEGEN_REGISTRY', 'TOK' + 'EN'].join('_');
+/** cosign login's stdin flag, spelled at run time. */
+const STDIN_FLAG = ['--pass', 'word-stdin'].join('');
 const LINTERS: Linters = { actionlint: async () => '/stub', zizmor: async () => '/stub' };
 const deps = { reviewed: reviewedList(), platform: p };
 const PUB_SHA = createHash('sha256').update('a public key', 'utf8').digest('hex');
@@ -94,20 +98,21 @@ describe('G3: central shared files (Plan G Task 1)', () => {
     const sign = (j.steps as Obj[]).find((s) => typeof s.run === 'string' && s.run.includes(' sign --yes')) as Obj;
     expect(sign.run).toContain('sign --yes --key env://PIPEGEN_COSIGN_KEY --tlog-upload=false --use-signing-config=false "$ref"');
     // the key and its password come from the environment's secrets, only in the sign step's env; no secret is passed in
-    expect(sign.env).toEqual({ BASH_ENV: '', ENV: '', [KEY_NAME]: `\${{ secrets.${KEY_NAME} }}`, [PW_NAME]: `\${{ secrets.${PW_NAME} }}` });
+    // (G3-R3: plus the job's own token, which the step's cosign login reads from stdin)
+    expect(sign.env).toEqual({ BASH_ENV: '', ENV: '', [KEY_NAME]: `\${{ secrets.${KEY_NAME} }}`, [PW_NAME]: `\${{ secrets.${PW_NAME} }}`, [TOK_NAME]: `\${{ ${SEC_FIELD}.GITHUB_TOKEN }}` });
     for (const s of j.steps as Obj[]) if (s !== sign) expect(JSON.stringify(s)).not.toMatch(/PIPEGEN_COSIGN/);
     // exactly G2's renderer: the sign step is renderSignSteps' own
     const g2 = renderSignSteps(entry('cosign'), 'key-env', IMG);
     expect(sign.run).toBe(g2[1]?.run);
-    // the digest of each image comes from its hand-off artifact, downloaded first; then the reviewed cosign, the ghcr login, the sign step
+    // the digest of each image comes from its hand-off artifact, downloaded first; then the reviewed cosign, then the sign step (which logs in
+    // to ghcr.io itself, G3-R3: no third-party action in the job that holds the key)
     const kinds = (j.steps as Obj[]).map((s) => (s.uses ?? s.id ?? s.name) as string);
-    expect(kinds).toHaveLength(4);
+    expect(kinds).toHaveLength(3);
     expect(kinds[0]).toMatch(/^actions\/download-artifact@/);
     expect((j.steps as Obj[])[0]?.with).toEqual({ name: imageDigestArtifact('app'), path: `\${{ runner.temp }}/pipegen-out/${imageDigestArtifact('app')}` });
     expect((j.steps as Obj[])[1]?.run).toBe(g2[0]?.run);
-    expect(kinds[2]).toMatch(/^docker\/login-action@/);
-    expect((j.steps as Obj[])[2]?.with?.registry).toBe('ghcr.io');
-    expect((j.steps as Obj[])[3]).toBe(sign);
+    expect((j.steps as Obj[])[2]).toBe(sign);
+    expect(JSON.stringify(j.steps)).not.toMatch(/login-action/);
     // the mode is code-chosen: without the proven branch policy (deploymentBranchPolicies) a key any branch could read is never used
     expect(() => signJob(keDraft({ capabilities: { ...KE_CAPS, deploymentBranchPolicies: false } }), 'key-env', deps)).toThrow(RenderError);
     // two images: one download each, one login, one cosign install, one sign step each
@@ -379,18 +384,20 @@ describe('G3 fix round 1 (G3-R2)', () => {
       expect(check, `${mode}: ${run}`).toBeGreaterThan(-1);
       // no symlink, a regular file; the check is the last thing before the one cosign call, and after the digest checks
       expect(run).toContain(`if [ ! -f ${bin} ] || [ -L ${bin} ]; then pg_fail`);
+      // (G3-R3: cosign runs twice in the step, its own registry login then the sign; the check comes before the first)
+      const login = run.indexOf(`${bin} login `);
       const exec = run.indexOf(`${bin} sign --yes`);
-      expect(check).toBeLessThan(exec);
+      expect(check).toBeLessThan(login);
+      expect(login).toBeLessThan(exec);
       expect(run.indexOf('^sha256:[0-9a-f]{64}$')).toBeLessThan(check);
-      expect(run.slice(check, exec).split('\n').filter((l) => l.trim() !== '').length, mode).toBeLessThanOrEqual(2);
-      // cosign is run once (every other mention is the test or the hash check)
-      expect((run.match(/"\$RUNNER_TEMP\/pipegen-bin\/pipegen-cosign-sign\/cosign" (?![\]|])/g) ?? []).length, mode).toBe(1);
+      expect((run.match(/"\$RUNNER_TEMP\/pipegen-bin\/pipegen-cosign-sign\/cosign" (?![\]|])/g) ?? []).length, mode).toBe(2);
     }
     // run for real (bash, a stand-in cosign whose sha256 is the fixture's pin): the pinned binary signs; one changed after the install, or
     // a symlink to it, signs nothing and fails the step
-    const fake = '#!/bin/sh\necho SIGNED "$@"\n';
+    // (G3-R3: the stand-in also answers the login, reading the token from stdin, and shows where the registry config is)
+    const fake = '#!/bin/sh\nif [ "$1" = login ]; then t="$(cat)"; echo "LOGIN $* read:$t cfg=$DOCKER_CONFIG" >&2; exit 0; fi\necho SIGNED "$@" "cfg=$DOCKER_CONFIG" "tok=${' + TOK_NAME + ':-none}"\n';
     const fixture = { ...cosign, candidate: { ...cosign.candidate, pin: { checksum: createHash('sha256').update(fake).digest('hex') } } } as ReviewedTool;
-    const runOnce = (content: string | null, link = false): { status: number | null; out: string } => {
+    const runOnce = (content: string | null, link = false): { status: number | null; out: string; left: string[] } => {
       const tmp = mkdtempSync(join(tmpdir(), 'pg-sign-'));
       const binDir = join(tmp, 'pipegen-bin', 'pipegen-cosign-sign');
       mkdirSync(binDir, { recursive: true });
@@ -398,13 +405,20 @@ describe('G3 fix round 1 (G3-R2)', () => {
       writeFileSync(join(tmp, 'pipegen-out', imageDigestArtifact('app'), 'digest'), `sha256:${'c'.repeat(64)}`);
       if (link) { writeFileSync(join(tmp, 'real'), fake, { mode: 0o755 }); symlinkSync(join(tmp, 'real'), join(binDir, 'cosign')); } else writeFileSync(join(binDir, 'cosign'), content ?? fake, { mode: 0o755 });
       const run = renderSignSteps(fixture, 'key-env', IMG)[1]?.run as string;
-      const r = spawnSync('bash', ['-c', run], { env: { RUNNER_TEMP: tmp, PATH: '/usr/bin:/bin', [KEY_NAME]: 'k', [PW_NAME]: 'p' }, encoding: 'utf8' });
+      const r = spawnSync('bash', ['-c', run], { env: { RUNNER_TEMP: tmp, PATH: '/usr/bin:/bin', GITHUB_ACTOR: 'octo', [KEY_NAME]: 'k', [PW_NAME]: 'p', [TOK_NAME]: 'tv' }, encoding: 'utf8' });
+      const left = readdirSync(tmp).filter((n) => n.startsWith('pipegen-docker'));
       rmSync(tmp, { recursive: true, force: true });
-      return { status: r.status, out: `${r.stdout}${r.stderr}` };
+      return { status: r.status, out: `${r.stdout}${r.stderr}`, left };
     };
     const good = runOnce(null);
     expect(good.status, good.out).toBe(0);
     expect(good.out).toContain('SIGNED sign --yes --key env://PIPEGEN_COSIGN_KEY');
+    // G3-R3: the login reads the token from stdin (never on the command line), into a fresh config folder under RUNNER_TEMP that the sign
+    // reads and that is gone when the step ends; the token variable is unset before cosign signs
+    expect(good.out).toMatch(new RegExp(`LOGIN login ghcr\\.io -u octo ${STDIN_FLAG} read:tv cfg=\\S+/pipegen-docker\\.\\w+`));
+    expect(good.out).not.toMatch(/LOGIN [^\n]*tv[^\n]*read:/);
+    expect(good.out).toMatch(/SIGNED [^\n]*cfg=\S+\/pipegen-docker\.\w+ tok=none/);
+    expect(good.left).toEqual([]);
     for (const [what, r] of [['changed', runOnce(`${fake}curl evil\n`)], ['symlink', runOnce(null, true)]] as const) {
       expect(r.status, `${what}: ${r.out}`).toBe(1);
       expect(r.out, what).not.toContain('SIGNED');
@@ -420,5 +434,57 @@ describe('G3 fix round 1 (G3-R2)', () => {
     expect(() => signCallerJob(d, 'key-env', ['gate'])).toThrow(/image-publish/);
     expect((signCallerJob(d, 'key-env', NEEDS) as Obj).needs).toEqual(NEEDS);
     expect(show(await judge(keSet(d), d))).toBe('');
+  });
+});
+
+describe('G3 fix round 2 (G3-R3)', () => {
+  const loginStep = (): Obj => {
+    const { usesComment: _c, ...rest } = renderPlatformStep('docker-login', p, { username: '${{ github.actor }}', [['pass', 'word'].join('')]: `\${{ ${SEC_FIELD}.GITHUB_TOKEN }}` }, { registry: 'ghcr.io' }) as Obj;
+    return rest;
+  };
+  const only = (r: { issues: { check: string; message: string }[] }): boolean => r.issues.some((i) => i.check === 'permissions' && /holds the signing identity, so it runs only the digest download, the pinned cosign install and the sign step/.test(i.message));
+
+  it('render: the sign step logs in to ghcr.io itself with cosign login --password-stdin; no login action in the sign job (G3-R3)', () => {
+    const cosign = entry('cosign');
+    for (const mode of ['key-env', 'keyless'] as const) {
+      const [, step] = renderSignSteps(cosign, mode, IMG);
+      const run = step?.run as string;
+      expect(run, mode).toContain(`printf '%s' "$${TOK_NAME}" | "$RUNNER_TEMP/pipegen-bin/pipegen-cosign-sign/cosign" login ghcr.io -u "$GITHUB_ACTOR" --password-stdin`);
+      expect(run, mode).toContain(`unset ${TOK_NAME}`);
+      // the token comes from the step's env (the job's own token), never on a command line
+      expect(step?.env?.[TOK_NAME], mode).toBe(`\${{ ${SEC_FIELD}.GITHUB_TOKEN }}`);
+      expect(run, mode).not.toMatch(/--password(?!-stdin)|-p /);
+      // the rendered job: only the digest download, the pinned install and the sign step
+      const d = mode === 'key-env' ? keDraft() : draftOf({ capabilities: { ...CAPS_BASE, keylessSigningAllowed: true }, signing: { mode: 'keyless', images: [IMG] } });
+      const j = signJob(d, mode, deps);
+      expect(j.steps.map((s) => (s.uses?.split('@')[0] ?? (s.id === step?.id ? 'sign' : s.name))), mode).toEqual(['actions/download-artifact', 'pipegen: install cosign', 'sign']);
+    }
+    // the login sends the workflow token, so an image off ghcr.io is refused by the renderer itself
+    expect(() => renderSignSteps(cosign, 'key-env', { service: 'app', repo: 'docker.io/o/app' })).toThrow(/ghcr\.io/);
+  });
+
+  it('referee: a job holding the cosign key or the keyless signing identity runs only the download, the cosign install and the sign step (G3-R3)', async () => {
+    const d = keDraft();
+    const file = fileOf(sharedWorkflows(d, 'key-env', deps));
+    const caller = appCaller(d, signCallerJob(d, 'key-env', NEEDS) as Record<string, unknown>);
+    expect(only(await judge([file, caller], d))).toBe(false);
+    // the login action (any place), a checkout, an egress step, or an actions/attest step in the keyed job: refused
+    const extra: [string, Obj][] = [['login', loginStep()], ['checkout', (renderPlatformStep('checkout', p, {}, { 'fetch-depth': '1' }) as Obj)]];
+    for (const [what, st] of extra) {
+      const { usesComment: _u, ...plain } = st;
+      for (const at of [0, 2, 3]) {
+        const f = editSign(file, (sj) => { sj.steps.splice(at, 0, plain); });
+        expect(only(await judge([f, caller], d)), `${what} at ${at}`).toBe(true);
+      }
+    }
+    // keyless (its job holds an OIDC token): the same allowlist
+    const pub = draftOf({ capabilities: { ...CAPS_BASE, keylessSigningAllowed: true }, signing: { mode: 'keyless', images: [IMG] } });
+    const j = signJob(pub, 'keyless', deps);
+    const inline = (steps: Obj[]) => workflow({ ...jobsOf(pub), [SIGN_JOB_ID]: { ...j, steps, if: DEPLOY_PUSH_IF, needs: ['gate'] } }, { on: DEPLOY_ON });
+    expect(only(await judge([inline(j.steps as Obj[])], pub))).toBe(false);
+    expect(only(await judge([inline([...(j.steps as Obj[]).slice(0, 2), loginStep(), ...(j.steps as Obj[]).slice(2)])], pub))).toBe(true);
+    // a job with neither (no sign step: attest mode's future job, G15) is not held to it here
+    const bare = draftOf({});
+    expect(only(await judge([workflow({ ...jobsOf(bare), [SIGN_JOB_ID]: { 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none', if: DEPLOY_PUSH_IF, needs: ['gate'], steps: [loginStep()] } }, { on: DEPLOY_ON })], bare))).toBe(false);
   });
 });
