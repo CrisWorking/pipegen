@@ -206,18 +206,63 @@ export interface PipelineDraft {
 export interface SigningPlan { mode: 'key-env' | 'keyless' | 'attest'; images: { service: string; repo: string }[]; cosignPubSha256?: string }
 
 // ---------- install record (written by Plan G deliver/finish, read by Plan V and `pipegen verify`) ----------
-export type EditKind = 'verify-job' | 'hooks' | 'codeowners' | 'dependabot' | 'package-json';
+// v0.2 Plan G G10 (rulings S13, S14; Plan V pre-flight §5, binding): schema 2. One module serializes, hashes, reads and writes it
+// (src/deliver/record.ts: InstallRecordSchema, canonicalRecordJson, recordHash, recordPath, readRecord, writeRecord); nobody else does.
+// Uninstall (Plan V) deletes only what the record proves pipegen made: GitHub's created_at / id must equal the recorded one, so an object
+// recorded without them (`unconfirmed`, a read-back that failed) is asked about, never deleted blind.
+export type EditKind = 'verify-job' | 'hooks' | 'codeowners' | 'dependabot' | 'package-json' | 'package-lock';
+export type RecordRepo = 'app' | 'central';
+/** An environment's settings as GitHub reports them (the PUT form plus its branch policies), kept as `previous` so uninstall can restore them. */
+export interface EnvSettings {
+  wait_timer: number; prevent_self_review: boolean; reviewers: { type: 'User' | 'Team'; id: number }[]; can_admins_bypass: boolean;
+  deployment_branch_policy: { protected_branches: boolean; custom_branch_policies: boolean } | null; branch_policies: { name: string; type: 'branch' | 'tag' }[];
+}
+/**
+ * One edit to a file pipegen didn't write whole, in the one form of its kind. `originalSha`: the blob sha of the file before pipegen's first edit
+ * (null: the file was new); `writtenShas`: every blob sha pipegen wrote there, newest last. `inserted` is the exact bytes pipegen added, its
+ * separator included (the `anchor` of schema 1 is gone). package-json `lock` and package-lock `json` name the pair's other path.
+ */
+export type InstallEdit =
+  | { repo: RecordRepo; path: string; kind: 'codeowners' | 'hooks' | 'dependabot'; inserted: string; originalSha: string | null; writtenShas: string[] }
+  | { repo: 'app'; path: string; kind: 'verify-job'; jobs: string[]; needs: { job: string; added: string[] }[]; originalSha: string; writtenShas: string[] }
+  | { repo: 'app'; path: string; kind: 'package-json'; add: Record<string, string>; setTest: boolean; previousTest?: string; lock?: string; originalSha: string; writtenShas: string[] }
+  | { repo: 'app'; path: string; kind: 'package-lock'; json: string; originalSha: string; writtenShas: string[] };
+/** A GitHub API call planned now and sent by `finish` (the shape of src/layers/locks.ts ApiRequest). */
+export interface RecordApiRequest { method: 'POST' | 'PUT'; route: string; params: Record<string, string>; body: Record<string, unknown> }
+/** What `finish` applies after the merge, persisted so it can run later in a new process (S13). */
+export interface InstallPlanned {
+  rulesets?: { gate: RecordApiRequest; reviews?: RecordApiRequest };   // the app's `pipegen` and `pipegen-reviews` rulesets
+  classic?: RecordApiRequest;                                          // the fallback where rulesets can't be created
+  centralRuleset?: RecordApiRequest;
+  orgRequiredWorkflow?: { path: string; rule: RecordApiRequest };
+  shaPinning?: { request: RecordApiRequest; previous: boolean };
+  signingMode: 'key-env' | 'keyless' | 'attest' | 'none';
+  environments: { name: string; reviewers: boolean }[];
+  /** The code owners of each repo where a code-owner review rule is planned (empty where none is: G8-R3, no owners copied without a rule). */
+  owners: { app: string[]; central: string[] };
+  codeOwners: string[];                                                // = owners.app (the app's code-owner rule)
+}
 export interface InstallRecord {
-  pipegenVersion: string; cosignPubSha256?: string; blockFrom?: string;
-  planned: { ruleset?: object; centralRuleset?: object; environments: { name: string; reviewers: boolean }[]; codeOwners: string[] };   // persisted so `finish` can run later
-  repo: string; createdAt: string; mergedAt?: string; centralSha: string;
-  files: { path: string; part: Part; sha: string; created: boolean }[];          // sha = blob sha at delivery
-  edits: { path: string; kind: EditKind; inserted: string; anchor: string }[];   // exact text pipegen inserted, for precise revert
-  secrets: { name: string; scope: 'repo' | 'central' | `env:${string}`; created: boolean }[];
-  environments: { name: string; created: boolean; previous?: object }[];         // previous settings restored on uninstall
-  variables: string[]; rulesetId?: number; classicProtection?: boolean; orgRequiredWorkflowId?: number;
-  central?: { rulesetId?: number; codeowners?: { path: string; created: boolean } };   // central-repo locks (set by Plan G `finish` in every project's record, whether it created them or found pipegen's own); Plan V removes them when no project remains
-  protectedPaths: string[];                                                      // used by the gate's integrity rule and `pipegen verify`
+  schema: 2;                                                           // Plan V refuses any other version
+  pipegenVersion: string; createdAt: string; mergedAt?: string;
+  centralSha: string | null;                                           // the central commit the app pins (null: a public app, local layout)
+  app: { owner: string; repo: string; repoId: number; defaultBranch: string; private: boolean; ownerType: 'User' | 'Organization' };
+  name: string;                                                        // centralProjectName(app.repo); the record is installs/<name>.json
+  serviceRoots: string[];                                              // to re-check CREATED_RULES path claims
+  files: { repo: RecordRepo; path: string; part: Part; shas: string[]; aiEdited?: true }[];   // written whole; every blob sha pipegen wrote, newest last
+  edits: InstallEdit[];
+  secrets: { name: string; scope: 'repo' | 'central' | `env:${string}`; created: boolean; overwritten?: true; githubCreatedAt?: string; unconfirmed?: true }[];
+  variables: { name: string; scope: 'repo' | `env:${string}`; created: boolean; previous?: string; githubCreatedAt?: string; unconfirmed?: true }[];
+  environments: { name: string; created: boolean; githubCreatedAt?: string; previous?: EnvSettings; changed: (keyof EnvSettings)[]; branchPolicyIds: number[]; unconfirmed?: true }[];
+  rulesets: { kind: 'gate' | 'reviews'; id: number; name: 'pipegen' | 'pipegen-reviews'; githubCreatedAt: string }[];
+  classicProtection?: { branch: string; previous: Record<string, unknown> | null };   // the PUT-form body as it was before; null = none
+  orgRuleset?: { org: string; id: number; name: string; githubCreatedAt: string };
+  repoSettings?: Partial<Record<'shaPinningRequired' | 'vulnerabilityAlerts' | 'secretScanning' | 'pushProtection', { previous: boolean }>>;
+  central?: { repoId?: number; createdByPipegen: boolean; rulesetId?: number; rulesetCreatedAt?: string; codeowners?: { path: string; created: boolean }; actionsAccess?: { previous: string } };
+  scratch?: { repoId?: number; createdByPipegen: boolean };
+  planned: InstallPlanned;
+  protectedPaths: string[];                                            // used by the gate's integrity rule and `pipegen verify`
+  cosignPubSha256?: string; blockFrom?: string;
 }
 
 // ---------- constants ----------

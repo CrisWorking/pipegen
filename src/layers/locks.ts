@@ -33,7 +33,7 @@ import { CENTRAL_PROTECTED_PATHS, codeownersBlock, codeownersFile, codeownersOwn
 import { CALLER_WORKFLOW, REQUIRED_JOB, requiredWorkflowForm } from '../engine/job-rules.js';
 import { COMMIT_SHA_RE, isGitHubRepo } from '../engine/names.js';
 import type { ShaPinningRead } from '../github/lock-probes.js';
-import { GATE_CHECK_INTEGRATION_ID, GATE_CHECK_NAME, type Capabilities, type CreatedFile, type InstallRecord, type RepoProfile } from '../types.js';
+import { GATE_CHECK_INTEGRATION_ID, GATE_CHECK_NAME, type Capabilities, type CreatedFile, type RepoProfile } from '../types.js';
 import { safeText } from '../util/safe-text.js';
 import { MERGE_CALLER_JOB } from './assemble.js';
 
@@ -64,7 +64,8 @@ export interface ApiRequest { method: 'POST' | 'PUT'; route: string; params: Rea
  * (`isSymlink`), and the block the install record owns in it.
  */
 export interface ExistingCodeowners { original: string; isSymlink: boolean; inserted: string | null }
-export type CodeownersEdit = InstallRecord['edits'][number];
+/** The CODEOWNERS edit as planned (the delivery turns it into the install record's `codeowners` edit form, G10). */
+export interface CodeownersEdit { path: string; kind: 'codeowners'; inserted: string; anchor: string }
 
 export interface LockInputs {
   /** owner, repo, private, ownerType, plan (readGitHubContext), defaultBranch, repoFiles.codeowners (the app's CODEOWNERS path GitHub reads). */

@@ -35,13 +35,18 @@ import { CREATED_RULES } from '../engine/created-files.js';
 import { createdPathProblem } from '../engine/job-rules.js';
 import { CODE_FILE_RE, isTestFile } from '../read/manifest.js';
 import { readTextLimitedWithReason, SKIP_REASON, READ_LIMITS } from '../read/limits.js';
-import type { CreatedFile, InstallRecord, KnownValueCheck, PipelineDraft, RepoProfile } from '../types.js';
+import type { CreatedFile, KnownValueCheck, Part, PipelineDraft, RepoProfile } from '../types.js';
 import { anyString, scrubActive, scrubForDisplay, vaultHolds, withActiveVault } from '../util/known-values.js';
 import { lockProblems, packageJsonProblems } from './package-rules.js';
 import type { ReviewedClosure } from './reviewed-closure.js';
 import { MAX_TEST_FILES, packageModuleType, STARTER_TEST_FILE_NOT_ISOLATED, starterOwner, starterTestFileProblems } from './test-rules.js';
 
 /** One entry of the delivery base tree (the default branch head): its git mode (`100644`, `120000` symlink, `160000` submodule), blob sha and text (null: not readable as text). */
+/**
+ * What the guard reads from the install record (G10): the app files pipegen wrote whole, each with the blob sha it wrote last.
+ * src/deliver/record.ts guardRecordOf builds it from a record that readRecord verified (D1-r1: verified input only).
+ */
+export interface GuardInstallRecord { files: readonly { path: string; part: Part; sha: string; created: boolean }[] }
 export interface BaseEntry { sha: string; mode: string; read(): Promise<string | null> }
 /**
  * The delivery base tree: blob path to entry (Plan G builds it from `GET /git/trees/<head>?recursive=1`; submodules and symlinks are entries too).
@@ -54,7 +59,7 @@ export interface GuardCtx {
   root: string;
   baseTree: BaseTree;
   /** What pipegen wrote before (a re-run, #97); null when it never installed here. */
-  installRecord: Pick<InstallRecord, 'files'> | null;
+  installRecord: GuardInstallRecord | null;
   profile: RepoProfile;
   /** Which repository `root` is; files of the other repo are refused. Default `app`. */
   repo?: 'app' | 'central';
