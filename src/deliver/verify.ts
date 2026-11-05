@@ -16,6 +16,7 @@
 // It also warns (G29) about CODEOWNERS rules after pipegen's block that name only teams (the workflow's own token can't read a team's
 // members, so the gate can't check those approvals), and says (G26) that a key rotation resets the baseline.
 import type { Octokit } from '@octokit/rest';
+import { validDate } from '../../gate/src/date.js';
 import { CENTRAL_PROTECTED_PATHS, CODEOWNERS_END } from '../engine/created-builders.js';
 import type { RateClock } from '../engine/github-rate.js';
 import { protectedMatcher } from '../engine/protected-match.js';
@@ -94,6 +95,8 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
     const v = await api.readOr404('GET /repos/{owner}/{repo}/actions/variables/{name}', { owner: app.owner, repo: app.repo, name: 'PIPEGEN_BLOCK_FROM' });
     const actual = isObj(v) && typeof v.value === 'string' ? v.value : null;
     if (actual !== r.blockFrom) drift.push({ what: 'PIPEGEN_BLOCK_FROM', expected: r.blockFrom, actual: actual === null ? null : show(actual, 40) });
+    // G11-R3 N3-1: a recorded date the gate reads as no date (year 0000) leaves the gate in warn mode even when the variable matches it
+    else if (validDate(r.blockFrom) !== r.blockFrom) drift.push({ what: 'PIPEGEN_BLOCK_FROM', expected: 'a real calendar date the gate reads', actual: show(actual, 40) });
   }
   if (r.cosignPubSha256 !== undefined) {
     const v = await api.readOr404('GET /repos/{owner}/{repo}/environments/{environment_name}/variables/{name}', { owner: app.owner, repo: app.repo, environment_name: SIGNING_ENVIRONMENT, name: 'PIPEGEN_COSIGN_PUB' });

@@ -1470,6 +1470,67 @@ describe('G11 exception round 3 (G11-R3)', () => {
     expect(r.environments.find((x) => x.name === 'production')).toMatchObject({ created: false, previous: PROD_WAS, githubCreatedAt: '2026-01-01T00:00:00Z' });
     expect(r.variables.find((v) => v.name === 'PIPEGEN_BLOCK_FROM')).toMatchObject({ created: false, previous: '2026-12-31', githubCreatedAt: '2026-02-02T00:00:00Z' });
   });
+
+  it('finish: an unvouched blockFrom in year 0000 (no date to the gate) never replaces a typed run\'s date, kept or deleted (N3-1)', async () => {
+    for (const day of ['0000-01-01', '0000-02-29']) {
+      for (const del of [false, true]) {
+        const s = await seed();
+        await finish(s.g.octokit(), app, {}, s.deps());
+        const r = await recordOn(s);
+        await writeRecord(s.g.octokit(), { record: { ...r, blockFrom: day }, setupPr: s.pr, via: 'direct', files: [], base: s.g.head('o/pipelines'), clock: clock(), now: () => new Date('2026-11-08T12:00:00Z'), local: { home: s.home, env: {} } });
+        try { s.g.merge('o/pipelines', 'pipegen/update-r'); } catch { /* recorded directly */ }
+        expect((await recordOn(s)).blockFrom).toBe(day);
+        if (del) s.g.x('o/r').variables.delete('PIPEGEN_BLOCK_FROM');
+        await typedRun(s);
+        expect(varOf(s, 'PIPEGEN_BLOCK_FROM')?.value, `${day} ${del}`).toBe(BLOCK_FROM);
+        expect((await latest(s)).blockFrom, `${day} ${del}`).toBe(BLOCK_FROM);
+      }
+    }
+  });
+
+  it('finish: a variable already at 0000-01-01 is not kept or recorded; verify reports it as drift (N3-1: I2-f)', async () => {
+    const s = await seed();
+    s.g.x('o/r').variables.set('PIPEGEN_BLOCK_FROM', { value: '0000-01-01', created_at: '2026-02-02T00:00:00Z' } as never);
+    await finish(s.g.octokit(), app, {}, s.deps());
+    expect(varOf(s, 'PIPEGEN_BLOCK_FROM')?.value).toBe(BLOCK_FROM);
+    expect((await recordOn(s)).blockFrom).toBe(BLOCK_FROM);
+    expect((await vfy(s)).drift).toEqual([]);
+    (varOf(s, 'PIPEGEN_BLOCK_FROM') as B).value = '0000-01-01';
+    expect((await vfy(s)).drift).toContainEqual({ what: 'PIPEGEN_BLOCK_FROM', expected: BLOCK_FROM, actual: '0000-01-01' });
+    // a record that holds the same gate-invalid date as the variable (an older pipegen wrote it) is drift too
+    const r = await recordOn(s);
+    await writeRecord(s.g.octokit(), { record: { ...r, blockFrom: '0000-01-01' }, setupPr: s.pr, via: 'direct', files: [], base: s.g.head('o/pipelines'), clock: clock(), now: () => new Date('2026-11-08T12:00:00Z'), local: { home: s.home, env: {} } });
+    try { s.g.merge('o/pipelines', 'pipegen/update-r'); } catch { /* recorded directly */ }
+    expect((await recordOn(s)).blockFrom).toBe('0000-01-01');
+    expect((await vfy(s)).drift).toContainEqual({ what: 'PIPEGEN_BLOCK_FROM', expected: 'a real calendar date the gate reads', actual: '0000-01-01' });
+  });
+
+  it('finish: an ISO-shaped created_at that is no real instant is unknown, so the previous value is kept (N3-2)', async () => {
+    for (const at of ['2026-02-30T00:00:00Z', '2026-13-45T25:61:61Z', '2026-01-01T24:00:00Z']) {
+      const s = await seed();
+      userProd(s);
+      prod(s).created_at = at;
+      expect((await readEnv(s.g.octokit(), app, clock(), 'production'))?.createdAt, at).toBeNull();
+      prod(s).created_at = '2026-01-01T00:00:00Z';
+      await finish(s.g.octokit(), app, {}, s.deps());
+      prod(s).created_at = at;
+      prod(s).wait_timer = 9;
+      await finish(s.g.octokit(), app, {}, s.deps());
+      const e = (await latest(s)).environments.find((x) => x.name === 'production');
+      expect(e, at).toMatchObject({ created: false, previous: PROD_WAS, unconfirmed: true });
+      expect(e, at).not.toHaveProperty('githubCreatedAt');
+    }
+    // a variable's created_at the same way
+    const s = await seed();
+    s.g.x('o/r').variables.set('PIPEGEN_BLOCK_FROM', { value: '2026-12-31', created_at: '2026-02-02T00:00:00Z' } as never);
+    await finish(s.g.octokit(), app, {}, s.deps());
+    (varOf(s, 'PIPEGEN_BLOCK_FROM') as B).created_at = '2026-02-30T00:00:00Z';
+    (varOf(s, 'PIPEGEN_BLOCK_FROM') as B).value = '2026-12-30';
+    await finish(s.g.octokit(), app, {}, s.deps());
+    const v = (await latest(s)).variables.find((x) => x.name === 'PIPEGEN_BLOCK_FROM');
+    expect(v).toMatchObject({ created: false, previous: '2026-12-31' });
+    expect(v).not.toHaveProperty('githubCreatedAt');
+  });
 });
 
 /** Runs one printed command against the fake (gh api with a JSON body, gh variable set), as the user would. */

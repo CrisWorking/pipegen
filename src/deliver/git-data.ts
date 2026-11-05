@@ -5,6 +5,7 @@
 import type { Octokit } from '@octokit/rest';
 import { isRateStop, withRateLimit, type RateClock } from '../engine/github-rate.js';
 import { clockOf, githubTokenRejected, isAnonymousClient } from '../github/client.js';
+import { validDate } from '../../gate/src/date.js';
 import { safeText } from '../util/safe-text.js';
 
 /** A delivery that stops: a plain reason, never a secret value or a server message. */
@@ -16,6 +17,16 @@ export class DeliverError extends Error {
 
 /** GitHub's created_at form, the one the record keeps. */
 export const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
+/**
+ * G11-R3 N3-2: a created_at in GitHub's form that names a real instant. The form alone is not enough: JS Date rolls `2026-02-30` over to
+ * March 2 and rejects `25:61`, so an impossible one would read as a known date that differs from the recorded one (the previous value lost).
+ * The day is held to the gate's one date definition, the time to 00:00:00 to 23:59:59.
+ */
+export function isoAt(s: unknown): s is string {
+  if (typeof s !== 'string' || !ISO_RE.test(s) || validDate(s.slice(0, 10)) === undefined) return false;
+  const [h, m, sec] = s.slice(11, 19).split(':').map(Number) as [number, number, number];
+  return h < 24 && m < 60 && sec < 60;
+}
 
 export interface RepoRef { owner: string; repo: string }
 export interface TreeEntry { sha: string; mode: string; type: string }

@@ -36,6 +36,7 @@ import type { Octokit } from '@octokit/rest';
 import type { Prompter } from '../cli/io.js';
 import { gitBlobSha } from '../create/guard.js';
 import { COSIGN_KEY_SECRET, SecretStoreError, storeCosignKey, storeEnvSecret } from '../create/secrets.js';
+import { validDate } from '../../gate/src/date.js';
 import { centralWorkflowFile } from '../engine/central-path.js';
 import { CODEOWNERS_BEGIN, CODEOWNERS_END } from '../engine/created-builders.js';
 import { isRateStop, type RateClock } from '../engine/github-rate.js';
@@ -55,7 +56,7 @@ import { PROTECTED_PATHS_BASE, type Capabilities, type CreatedFile, type EnvSett
 import { safeText } from '../util/safe-text.js';
 import { makeCosignKeyPair, type CosignExec, type CosignResolver } from './cosign-keys.js';
 import { ensureSigningEnvironment, plannedOfLocks, readEnv, SETUP_BRANCH } from './deliver.js';
-import { DeliverError, ISO_RE, readBlobText, readHead, readRepo, readTree, statusOf, type RepoRef, type TreeEntry } from './git-data.js';
+import { DeliverError, isoAt, readBlobText, readHead, readRepo, readTree, statusOf, type RepoRef, type TreeEntry } from './git-data.js';
 import { centralOf, centralUpdateBranch, localFinishPendingPath, readFinishPending, readLocalRecord, RecordError, writeFinishPending, writeRecord, type FinishPending, type LocalRecordDeps } from './record.js';
 import { classicPutForm, holdsWanted, isObj, PLANNED_ROUTES, refusedAsUnavailable, SettingsApi } from './settings-api.js';
 import { trustedPrevious } from './trust.js';
@@ -171,9 +172,12 @@ function priorOf<T extends { githubCreatedAt?: string; previous?: unknown }>(lis
   for (const l of lists) { const e = l.find((p) => match(p) && (p.githubCreatedAt === undefined || at === null) && p.previous !== undefined); if (e !== undefined) return { kind: 'maybe', entry: e }; }
   return undefined;
 }
-/** A real calendar day written YYYY-MM-DD (2026-02-30 is not one). */
-const realDay = (d: string): boolean => /^\d{4}-\d{2}-\d{2}$/.test(d) && !Number.isNaN(Date.parse(`${d}T00:00:00Z`)) && new Date(`${d}T00:00:00Z`).toISOString().slice(0, 10) === d;
-const atOf = (at: string | null): { githubCreatedAt: string } | { unconfirmed: true } => (at !== null && ISO_RE.test(at) ? { githubCreatedAt: at } : { unconfirmed: true as const });
+/**
+ * A real calendar day written YYYY-MM-DD (2026-02-30 is not one), by the gate's one date definition (G11-R3 N3-1): JS Date takes year 0000,
+ * which the gate reads as no date (warn mode), so a day the gate refuses is never kept, recorded or set.
+ */
+const realDay = (d: string): boolean => validDate(d) === d;
+const atOf = (at: string | null): { githubCreatedAt: string } | { unconfirmed: true } => (at !== null && isoAt(at) ? { githubCreatedAt: at } : { unconfirmed: true as const });
 const pendingPath = (x: Ctx): string => localFinishPendingPath(x.app, x.deps.local ?? {});
 /** I1: the pending file saved with `change` applied, BEFORE the write it guards; a file that can't be saved: that write isn't made. */
 async function keepPending(x: Ctx, change: (p: FinishPending) => void): Promise<void> {
@@ -275,7 +279,7 @@ async function upsertRuleset(x: Ctx, t: Target, name: string, want: Record<strin
   }
   const back = await getRuleset(x, t, id);
   if (back === null || !holdsWanted(want, back)) throw new StepError(`The ruleset ${show(name, 100)} doesn't read back as pipegen set it.`);
-  return { id, createdAt: typeof back.created_at === 'string' && ISO_RE.test(back.created_at) ? back.created_at : null, wrote };
+  return { id, createdAt: isoAt(back.created_at) ? back.created_at : null, wrote };
 }
 /**
  * How a ruleset finish wrote is recorded: an earlier entry for it kept (captured once); one pipegen made now recorded with GitHub's created_at,
@@ -538,7 +542,7 @@ async function environments(x: Ctx): Promise<void> {
       // captured once: an earlier entry for this environment (the record's, else one an earlier run saved before it stopped, I1), adopted
       // only when it is the same object; a maybe-same one gives only its previous value (G11-R2 d)
       // G11-R3 (R2-4): an ISO-Z created_at, else unknown (as setVariable reads it): an empty or offset one never hides the earlier entry
-      const curAt = cur !== null && cur.createdAt !== null && ISO_RE.test(cur.createdAt) ? cur.createdAt : null;
+      const curAt = cur !== null && isoAt(cur.createdAt) ? cur.createdAt : null;
       const m = cur === null ? undefined : priorOf([x.rec.environments, x.pending.environments], (p) => p.name === e.name, curAt);
       const prior = m?.kind === 'same' ? m.entry : undefined;
       const kept = m?.kind === 'maybe' ? m.entry : undefined;
@@ -589,7 +593,7 @@ async function setVariable(x: Ctx, scope: 'repo' | `env:${string}`, name: string
     const d = await x.api.readOr404(`GET ${one}`, { ...p, name });
     if (d === null) return null;
     if (!isObj(d) || typeof d.value !== 'string') throw new StepError(`GitHub's answer about ${name} could not be read.`);
-    return { value: d.value, createdAt: typeof d.created_at === 'string' && ISO_RE.test(d.created_at) ? d.created_at : null };
+    return { value: d.value, createdAt: isoAt(d.created_at) ? d.created_at : null };
   };
   const cur = await read();
   if (cur !== null && cur.value !== value && cur.value.length > 10_000) throw new StepError(`${name} holds a value too long for pipegen to keep for uninstall, so pipegen leaves it; remove it, then run finish again.`);
@@ -690,7 +694,7 @@ async function signing(x: Ctx): Promise<void> {
           throw new StepError(`pipegen stored the new ${COSIGN_KEY_SECRET} but couldn't store ${name} (${whyOf(e)}). The key and its password no longer match, so signing is broken until you run \`npx pipegen finish --rotate-key\` again to store a new pair.`);
         }
         const after = await secretAt(x, name).catch((e: unknown) => { if (isStop(e)) throw e; return null; });
-        const at = after !== null && ISO_RE.test(after) ? { githubCreatedAt: after } : { unconfirmed: true as const };
+        const at = after !== null && isoAt(after) ? { githubCreatedAt: after } : { unconfirmed: true as const };
         const prior = x.rec.secrets.find((s) => s.name === name && s.scope === SIGNING_SCOPE);
         const own = before !== null && prior?.created === true && prior.githubCreatedAt === before;
         x.secrets.push(before === null || own ? { name, scope: SIGNING_SCOPE, created: true, ...at } : { name, scope: SIGNING_SCOPE, created: false, overwritten: true, ...at });
@@ -822,7 +826,7 @@ async function setupPr(x: { api: SettingsApi; app: RepoRef; branch: string }, lo
   if (!isObj(d) || !isObj(d.head) || d.head.ref !== SETUP_BRANCH) throw new FinishError(`Pull request #${num} of ${show(`${x.app.owner}/${x.app.repo}`)} is not pipegen's setup pull request, so pipegen applies nothing.`);
   // m9: only a merge into the default branch is the merge finish waits for
   if (!isObj(d.base) || d.base.ref !== x.branch) throw new FinishError(`The setup pull request #${num} of ${show(`${x.app.owner}/${x.app.repo}`)} is not merged into the default branch ${show(x.branch, 100)} (it targets ${isObj(d.base) && typeof d.base.ref === 'string' ? show(d.base.ref, 100) : 'another branch'}), so pipegen applies nothing. Run pipegen again to open a new one.`);
-  const merged = typeof d.merged_at === 'string' && ISO_RE.test(d.merged_at) ? d.merged_at : null;
+  const merged = isoAt(d.merged_at) ? d.merged_at : null;
   return { number: num, mergedAt: merged, state: typeof d.state === 'string' ? d.state : '' };
 }
 
@@ -934,8 +938,9 @@ export async function finish(gh: Octokit, app: RepoRef, opts: FinishOpts, deps: 
     // with no blockFrom; a finish that set the variable may have stopped before its record was written)
     const mergeDay = new Date(Date.parse(`${p.mergedAt.slice(0, 10)}T00:00:00Z`) + 7 * DAY_MS).toISOString().slice(0, 10);
     blockFrom = mergeDay;
-    if (rec.blockFrom !== undefined && rec.blockFrom < blockFrom) blockFrom = rec.blockFrom;
-    // G11-R3 (R2-6): a typed run also counts the blockFrom of the record behind the typed view (unvouched: it can only make the date earlier)
+    if (rec.blockFrom !== undefined && realDay(rec.blockFrom) && rec.blockFrom < blockFrom) blockFrom = rec.blockFrom;
+    // G11-R3 (R2-6): a typed run also counts the blockFrom of the record behind the typed view (unvouched: it can only make the date earlier;
+    // N3-1: only a day the gate reads as a date, so year 0000 never turns the block date off)
     const unvouched = typed ? trusted.unvouchedBlockFrom ?? '' : '';
     if (realDay(unvouched) && unvouched < blockFrom) blockFrom = unvouched;
     const v = await api.readOr404('GET /repos/{owner}/{repo}/actions/variables/{name}', { owner: app.owner, repo: app.repo, name: BLOCK_FROM_VAR });

@@ -47,7 +47,7 @@ import { cosignKeyProblem, cosignPubProblem } from '../util/cosign-pem.js';
 import { packageVersion } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
 import {
-  commitFiles, compareStatus, DeliverError, ghRead, ghWrite, ISO_RE, openOrUpdatePr, readHead, readRepo, readTree, refusedMove, setBranch, statusOf, type RepoRef, type TreeEntry,
+  commitFiles, compareStatus, DeliverError, ghRead, ghWrite, isoAt, openOrUpdatePr, readHead, readRepo, readTree, refusedMove, setBranch, statusOf, type RepoRef, type TreeEntry,
 } from './git-data.js';
 import { addLocalLeftovers, centralPrBase, centralUpdateBranch, localRecordPath, RecordError, writeRecord, type Leftover, type LocalRecordDeps } from './record.js';
 import { trustedPrevious } from './trust.js';
@@ -401,7 +401,7 @@ export async function readEnv(gh: Octokit, app: RepoRef, clock: RateClock, name:
     policies = list.map((x) => ({ id: Number.isSafeInteger(x.id) ? x.id as number : 0, name: typeof x.name === 'string' ? x.name : '', type: x.type === 'tag' ? 'tag' as const : 'branch' as const }));
   }
   // G11-R3 (R2-4): normalised as setVariable does: an ISO-Z created_at, else null (unknown)
-  return { createdAt: typeof env.created_at === 'string' && ISO_RE.test(env.created_at) ? env.created_at : null, settings, policies };
+  return { createdAt: isoAt(env.created_at) ? env.created_at : null, settings, policies };
 }
 
 const defaultOnly = (e: EnvRead, branch: string): boolean => e.settings.deployment_branch_policy?.protected_branches === false && e.settings.deployment_branch_policy.custom_branch_policies === true
@@ -451,7 +451,7 @@ export async function ensureSigningEnvironment(gh: Octokit, app: RepoRef, defaul
   const policyIds = ids.length > 0 ? ids : cur === null ? back.policies.map((x) => x.id).filter((x) => x > 0) : [];
   const own = known !== undefined && known.githubCreatedAt !== undefined && known.githubCreatedAt === back.createdAt;
   if (own) return { ...known, changed: [...new Set([...known.changed, ...changed])], branchPolicyIds: [...new Set([...known.branchPolicyIds, ...policyIds])] };
-  const at = back.createdAt !== null && ISO_RE.test(back.createdAt) ? { githubCreatedAt: back.createdAt } : { unconfirmed: true as const };
+  const at = isoAt(back.createdAt) ? { githubCreatedAt: back.createdAt } : { unconfirmed: true as const };
   if (cur === null) return { name: SIGNING_ENVIRONMENT, created: true, ...at, changed: [], branchPolicyIds: policyIds };
   return { name: SIGNING_ENVIRONMENT, created: false, ...at, previous: { ...cur.settings, branch_policies: cur.policies.map((x) => ({ name: x.name, type: x.type })) }, changed, branchPolicyIds: policyIds };
 }
@@ -486,7 +486,7 @@ async function storeOne(x: SecretCtx, scope: Scope, name: string, put: () => Pro
   const readBack = async (): Promise<Pick<SecretEntry, 'githubCreatedAt' | 'unconfirmed'>> => {
     try {
       const back = await secretAt(x.gh, x.app, scope, name, x.clock);
-      return back !== null && ISO_RE.test(back) ? { githubCreatedAt: back } : { unconfirmed: true };
+      return back !== null && isoAt(back) ? { githubCreatedAt: back } : { unconfirmed: true };
     } catch { return { unconfirmed: true }; }
   };
   if (at === null) {
