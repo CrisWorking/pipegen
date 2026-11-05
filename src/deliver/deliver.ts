@@ -298,7 +298,7 @@ async function holds(gh: Octokit, c: RepoRef, branch: string, sha: string, files
  * opens/updates the central pull request and stops (S26). `files`: the central workflows to pin (never the required workflow, which names
  * this commit). Only this project's own central files are accepted.
  */
-export async function deliverCentral(gh: Octokit, p: RepoProfile, files: readonly CreatedFile[], deps: { clock?: RateClock; local?: LocalRecordDeps } = {}): Promise<CentralResult> {
+export async function deliverCentral(gh: Octokit, p: RepoProfile, files: readonly CreatedFile[], deps: { clock?: RateClock; local?: LocalRecordDeps; io?: Prompter; interactive?: boolean } = {}): Promise<CentralResult> {
   const clock = deps.clock ?? clockOf(gh);
   if (p.private !== true) throw new DeliverError('A public repository has no central workflows.');
   const own = `.github/workflows/${centralProjectName(p.repo)}--`;
@@ -318,7 +318,7 @@ export async function deliverCentral(gh: Octokit, p: RepoProfile, files: readonl
   const branch = centralUpdateBranch(p.repo);
   const updateExists = await readHead(gh, c, branch, clock) !== null;
   const notes: string[] = [];
-  const prev = await trustedPrevious(gh, { owner: p.owner, repo: p.repo }, c, defaultBranch, updateExists ? branch : null, deps.local ?? {}, clock, notes);
+  const prev = await trustedPrevious(gh, { owner: p.owner, repo: p.repo }, c, defaultBranch, updateExists ? branch : null, deps.local ?? {}, clock, notes, deps.io === undefined ? undefined : { io: deps.io, interactive: deps.interactive === true });
   // I2: a central file that is already there is replaced (or kept and claimed) only when the trusted record shows pipegen wrote it
   for (const f of files) {
     const e = entries.get(f.path);
@@ -328,7 +328,7 @@ export async function deliverCentral(gh: Octokit, p: RepoProfile, files: readonl
     if (mine || e.sha === gitBlobSha(f.content)) continue;
     const wayOn = prev.why === 'mismatch'
       ? `This machine's local record file doesn't match any install record pipegen can trust. If pipegen ran on another machine since, remove ${localRecordPath({ owner: p.owner, repo: p.repo }, deps.local ?? {})} and run pipegen again (it then checks the record on the default branch); otherwise rename or remove that file.`
-      : 'If pipegen did write it, run pipegen on the machine that set it up, or once its install record was merged through a reviewed pull request under the central merge rule (which `npx pipegen finish` adds); otherwise rename or remove that file.';
+      : 'If pipegen did write it, run pipegen on the machine that set it up, or run it interactively and confirm the install record by typing the repo name; otherwise rename or remove that file.';
     throw new DeliverError(`${show(f.path)} already exists in ${show(`${p.owner}/${CENTRAL_REPO}`)} and no install record pipegen trusts shows pipegen wrote it, so pipegen won't replace or claim it.${notes.length > 0 ? ` ${notes.join(' ')}` : ''} ${wayOn}`);
   }
   const changed = files.filter((f) => entries.get(f.path)?.sha !== gitBlobSha(f.content));
@@ -606,6 +606,8 @@ export interface DeliverDeps {
   signingKey?: () => Promise<SigningKey>;
   /** Default: this pipegen's version (package.json). */
   pipegenVersion?: string;
+  /** G10-R-sec6: an interactive run (a terminal, no --yes, not CI) may ask the user to confirm an earlier record this machine can't check. */
+  interactive?: boolean;
 }
 export interface DeliverResult {
   prUrl: string; prNumber: number; centralSha: string | null; recordHash: string; centralPrUrl?: string;
@@ -725,7 +727,7 @@ export async function deliver(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vaul
     const { ref: central, defaultBranch: centralBranch } = await centralRepoOf(gh, p, clock);
     const updateBranch = centralUpdateBranch(p.repo);
     const updateExists = await readHead(gh, central, updateBranch, clock) !== null;
-    const trusted = await trustedPrevious(gh, app, central, centralBranch, updateExists ? updateBranch : null, deps.local ?? {}, clock, notes);
+    const trusted = await trustedPrevious(gh, app, central, centralBranch, updateExists ? updateBranch : null, deps.local ?? {}, clock, notes, { io: deps.io, interactive: deps.interactive === true });
     const prev = trusted.record;
     if (prev !== null && (prev.app.repoId !== appRepo.id || prev.app.owner.toLowerCase() !== p.owner.toLowerCase() || prev.app.repo.toLowerCase() !== p.repo.toLowerCase() || prev.name !== centralProjectName(p.repo))) {
       throw new DeliverError(`The install record at ${show(`installs/${centralProjectName(p.repo)}.json`)} is not this repository's (another repo id or name), so pipegen won't build on it. Move it away, then run pipegen again.`);

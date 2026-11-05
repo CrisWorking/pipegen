@@ -245,9 +245,10 @@ export function guardRecordOf(r: InstallRecord): GuardInstallRecord {
 
 // ---------- the local record file ----------
 
-export interface LocalRecord { recordHash: string; setupPr: number; updatedAt: string }
+/** setupPr is absent when the hash was vouched by the user's typed confirmation before any setup PR of this run (G10-R-sec6). */
+export interface LocalRecord { recordHash: string; setupPr?: number; updatedAt: string }
 export interface LocalRecordDeps { home?: string; env?: NodeJS.ProcessEnv; uid?: number }
-const LOCAL = z.strictObject({ recordHash: SHA256, setupPr: ID, updatedAt: z.string().max(40) });
+const LOCAL = z.strictObject({ recordHash: SHA256, setupPr: ID.optional(), updatedAt: z.string().max(40) });
 const KIND: TrustedDirKind = {
   noun: 'record', keeping: 'its install records', risk: 'change what `pipegen verify` compares against',
   error: (message, cause) => new RecordError(message, cause === undefined ? undefined : { cause }),

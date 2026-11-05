@@ -12,7 +12,7 @@ import { HOOK_FILES } from '../src/engine/created-builders.js';
 import { centralProjectName } from '../src/engine/central-path.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { pubKeySha256 } from '../src/engine/signing.js';
-import type { Prompter } from '../src/cli/io.js';
+import { PromptCancelledError, type Prompter } from '../src/cli/io.js';
 import { deliver, deliverCentral, PART_ORDER, planDelivery, previewText, SETUP_BRANCH, type DeliveryInput, type DeliverDeps, type SigningKey } from '../src/deliver/deliver.js';
 import { DeliverError, ghRead, ghWrite } from '../src/deliver/git-data.js';
 import { readRecord, recordHash, recordMarker, recordPath, writeRecord } from '../src/deliver/record.js';
@@ -95,7 +95,8 @@ interface World { g: FakeGitHub; home: string; vault: SecretVault; asked: string
 /** The world input() reads the central file list from (the last one made); a test with several worlds passes the list itself. */
 let current: World | null = null;
 const centralList = (w: World): string[] => [...w.g.filesAt('o/pipelines', w.g.head('o/pipelines')).keys()].sort();
-const cdeps = (w: World) => ({ local: { home: w.home, env: {} } });
+/** deliverCentral's deps; `typed`: an interactive run whose user types that answer to a question. */
+const cdeps = (w: World, typed?: string) => ({ local: { home: w.home, env: {} }, ...(typed === undefined ? {} : { io: io(w, { typed }), interactive: true }) });
 /** The notes about trust and settings, without G10-R-sec5's "branch replaced" line (a re-run over an unmerged central PR always gets it). */
 const trustNotes = (notes: readonly string[]): string[] => notes.filter((n) => !/pipegen replaced it with a fresh commit/.test(n));
 const homes: string[] = [];
@@ -111,11 +112,12 @@ function world(opts: { appPrivate?: boolean; centralPrivate?: boolean; appFiles?
   current = { g, home, vault, asked: [] };
   return current;
 }
-function io(w: World, answers: { confirmRunCode?: boolean; replace?: boolean } = {}): Prompter {
+function io(w: World, answers: { confirmRunCode?: boolean; replace?: boolean; typed?: string } = {}): Prompter {
   return {
     confirm: async (msg) => { w.asked.push(msg); return /run code/i.test(msg) ? answers.confirmRunCode ?? true : /already has/i.test(msg) ? answers.replace ?? false : false; },
     select: async () => { throw new Error('no select'); },
-    text: async () => { throw new Error('no text'); },
+    // a typed answer, or (none given) what the real prompter does without a terminal
+    text: async (msg) => { w.asked.push(msg); if (answers.typed === undefined) throw new PromptCancelledError('no terminal'); return answers.typed; },
   };
 }
 const deps = (w: World, over: Partial<DeliverDeps> = {}, answers: Parameters<typeof io>[1] = {}): DeliverDeps => ({
@@ -728,54 +730,43 @@ describe('G10 fix round 1 (review-G10, ruling G10-R2)', () => {
     expect(JSON.parse(readFileSync(localFile(w), 'utf8')).recordHash).toBe(recordHash(after));
   });
 
-  it('fix 1: with no local record file, the default-branch record is trusted only when it was merged through a PR after pipegen\'s central ruleset existed (G10-R-sec3)', async () => {
-    const RULESET_AT = '2026-11-20T00:00:00Z';
-    /** The record commit on main, and how it got there: `pr` a merged PR at that server time, or null (pushed directly). */
-    interface Make {
-      local?: 'none' | 'mismatch'; bypass?: unknown[]; pr?: string | null; base?: string;
-      /** G10-R3 (N1): the live rule's parameters, the central CODEOWNERS, and the PR's reviews (default: 1 approval + code owners, installs/** owned, approved by another user). */
-      params?: Record<string, unknown>; codeowners?: string | null; reviews?: { user: string; state: string }[];
-    }
-    const make = async (o: Make): Promise<World> => {
+  it('fix 1: with no local record file, the default-branch record is trusted only when the user types the repo name (G10-R-sec6)', async () => {
+    const make = async (): Promise<World> => {
       const w = world();
-      await firstRun(w);   // the record commit is the head of the central default branch
-      const central = w.g.repo('o/pipelines');
-      const recordCommit = w.g.head('o/pipelines');
-      if (o.pr !== null && o.pr !== undefined) central.commitPulls.set(recordCommit, [{ number: 3, merged_at: o.pr, base: { ref: o.base ?? 'main' }, user: { login: 'alice' } }]);
-      central.pullReviews.set(3, (o.reviews ?? [{ user: 'bob', state: 'APPROVED' }]).map((r) => ({ user: { login: r.user }, state: r.state })));
-      const co = o.codeowners === undefined ? '/.github/workflows/ @a @b\n/installs/ @a @b\n' : o.codeowners;
-      if (co !== null) w.g.commitOn('o/pipelines', 'main', { '.github/CODEOWNERS': co });
-      if ((o.local ?? 'none') === 'none') rmSync(localFile(w));
-      else writeFileSync(localFile(w), JSON.stringify({ ...JSON.parse(readFileSync(localFile(w), 'utf8')), recordHash: 'e'.repeat(64) }));
-      central.rules = [{ type: 'pull_request', ruleset_id: 9, parameters: o.params ?? { required_approving_review_count: 1, require_code_owner_review: true } }];
-      central.rulesets.set(9, { name: 'pipegen', enforcement: 'active', bypass_actors: o.bypass ?? [], created_at: RULESET_AT });
+      await firstRun(w);
+      rmSync(localFile(w));
       return w;
     };
     const p = profile();
-    // merged through a PR after the ruleset was created: trusted
-    const w = await make({ pr: '2026-12-01T00:00:00Z' });
-    const pin = (await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w)) as { sha: string }).sha;
-    const files = [...centralFiles(), ...appFiles(pin).map((f) => (f.path === 'Dockerfile' ? { ...f, content: 'FROM node:26\n' } : f))];
-    const res = await deliver(w.g.octokit(), p, planDelivery(input(p, pin, { files })), fresh(), deps(w));
-    expect(trustNotes(res.notes)).toEqual([]);
-    expect((await record(w, upd))?.files.find((f) => f.path === 'Dockerfile')?.shas).toEqual([gitBlobSha('FROM node:24\n'), gitBlobSha('FROM node:26\n')]);
-    expect(w.g.calls.some((c) => c.route === 'GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls')).toBe(true);
-    // pushed directly (no PR), merged before the ruleset existed, a ruleset with a bypass actor, or a local file that matches neither: untrusted
-    const after = '2026-12-01T00:00:00Z';
-    // G10-R3 (N1): the live rule must require a review and code-owner review, the central CODEOWNERS must own installs/**, and the PR must
-    // carry an approval by someone other than its author
-    for (const o of [
-      { pr: after, params: { required_approving_review_count: 0, require_code_owner_review: true } }, { pr: after, params: { required_approving_review_count: 1, require_code_owner_review: false } },
-      { pr: after, params: {} }, { pr: after, codeowners: null }, { pr: after, codeowners: '/.github/workflows/ @a @b\n' }, { pr: after, codeowners: '/installs/ @a @b\ninstalls/r.json\n' },
-      { pr: after, reviews: [] }, { pr: after, reviews: [{ user: 'alice', state: 'APPROVED' }] }, { pr: after, reviews: [{ user: 'bob', state: 'COMMENTED' }] },
-    ] as Make[]) {
-      const w3 = await make(o);
-      await expect(deliverCentral(w3.g.octokit(), p, centralFiles(' # v2'), cdeps(w3)), JSON.stringify(o)).rejects.toThrow(/can't be checked from this machine/);
+    const trustQ = (w: World): string[] => w.asked.filter((q) => /Type o\/r to trust it/.test(q));
+    // typed correctly: trusted, and vouched into the local file (no second question in the same run)
+    const w = await make();
+    const c = await deliverCentral(w.g.octokit(), p, centralFiles(' # v2'), cdeps(w, 'o/r'));
+    expect(c.kind).toBe('central-pr');
+    expect(trustQ(w).length).toBe(1);
+    expect(trustQ(w)[0]).toMatch(/files: .*Dockerfile/);
+    expect(trustQ(w)[0]).toMatch(new RegExp(`${['sec', 'rets'].join('')}: .*${FP}`));
+    expect(JSON.parse(readFileSync(localFile(w), 'utf8')).recordHash).toBe(recordHash(await record(w) as Rec));
+    await deliverCentral(w.g.octokit(), p, centralFiles(' # v3'), cdeps(w, 'o/r'));
+    expect(trustQ(w).length).toBe(1);
+    // wrong text, a non-interactive run (--yes, CI), or no terminal: untrusted, and nothing vouched
+    for (const how of ['wrong', 'non-interactive', 'no terminal'] as const) {
+      const w2 = await make();
+      const d2 = how === 'wrong' ? cdeps(w2, 'o/other') : how === 'no terminal' ? { ...cdeps(w2), io: io(w2), interactive: true } : { ...cdeps(w2, 'o/r'), interactive: false };
+      await expect(deliverCentral(w2.g.octokit(), p, centralFiles(' # v2'), d2), how).rejects.toThrow(/can't be checked from this machine/);
+      expect(() => readFileSync(localFile(w2)), how).toThrow();
     }
-    for (const o of [{ pr: null }, { pr: '2026-11-10T00:00:00Z' }, { pr: '2026-12-01T00:00:00Z', base: 'side' }, { pr: '2026-12-01T00:00:00Z', bypass: [{ actor_id: 1, actor_type: 'RepositoryRole', bypass_mode: 'always' }] }, { pr: '2026-12-01T00:00:00Z', local: 'mismatch' as const }]) {
-      const w2 = await make(o);
-      await expect(deliverCentral(w2.g.octokit(), p, centralFiles(' # v2'), cdeps(w2)), JSON.stringify(o)).rejects.toThrow(o.local === 'mismatch' ? /doesn't match the hash in this machine's local record file/ : /can't be checked from this machine/);
-    }
+    // the typed name is matched without letter case or spaces around it
+    const w4 = await make();
+    expect((await deliverCentral(w4.g.octokit(), p, centralFiles(' # v2'), cdeps(w4, '  O/R  '))).kind).toBe('central-pr');
+  });
+
+  it('fix 1: a local record file that matches no record is untrusted, and no question is asked (G10-R-sec6)', async () => {
+    const w = world();
+    await firstRun(w);
+    writeFileSync(localFile(w), JSON.stringify({ ...JSON.parse(readFileSync(localFile(w), 'utf8')), recordHash: 'e'.repeat(64) }));
+    await expect(deliverCentral(w.g.octokit(), profile(), centralFiles(' # v2'), cdeps(w, 'o/r'))).rejects.toThrow(/doesn't match the hash in this machine's local record file/);
+    expect(w.asked.filter((q) => /to trust it/.test(q))).toEqual([]);
   });
 
   for (const merged of [false, true]) {
@@ -1048,17 +1039,14 @@ describe('G10 fix round 2 (review-G10-r1, ruling G10-R3)', () => {
     const keep = readFileSync(localFile(w), 'utf8');
     const newer = structuredClone(await record(w) as Rec);
     newer.createdAt = '2026-12-02T00:00:00Z';
-    ruleset(w, '2026-11-20T00:00:00Z');
-    w.g.commitOn('o/pipelines', 'main', { '.github/CODEOWNERS': '/installs/ @a @b\n' });
-    const sha = w.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: JSON.stringify(newer) });   // machine B's record, merged and reviewed
-    w.g.repo('o/pipelines').commitPulls.set(sha, [{ number: 7, merged_at: '2026-12-02T00:00:00Z', base: { ref: 'main' }, user: { login: 'alice' } }]);
-    w.g.repo('o/pipelines').pullReviews.set(7, [{ user: { login: 'bob' }, state: 'APPROVED' }]);
+    w.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: JSON.stringify(newer) });   // machine B's newer record
     writeFileSync(localFile(w), keep);
     const p = profile();
     const err = await deliverCentral(w.g.octokit(), p, centralFiles(' # v2'), cdeps(w)).then(() => null, (e: unknown) => e) as Error;
     expect(err.message).toContain(`remove ${localFile(w)}`);
     expect(err.message).not.toMatch(/npx pipegen finish/);
+    // with the stale file removed, the user is asked to confirm the record (G10-R-sec6), and the run goes on
     rmSync(localFile(w));
-    expect((await deliverCentral(w.g.octokit(), p, centralFiles(' # v2'), cdeps(w))).kind).toBe('central-pr');
+    expect((await deliverCentral(w.g.octokit(), p, centralFiles(' # v2'), cdeps(w, 'o/r'))).kind).toBe('central-pr');
   });
 });
