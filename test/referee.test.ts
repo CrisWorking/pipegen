@@ -450,7 +450,9 @@ describe('referee: permissions by exact job id', () => {
     expect(JOB_PERMISSIONS['code-scanning']).toEqual({ 'security-events': 'write', actions: 'read' });
   });
   it('a reusable-workflow caller may have the union of the called file\'s jobs (when that file is in files)', async () => {
-    const called = wf({ sign: job([], { permissions: { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' } }) }, { on: { workflow_call: null } }, '.github/workflows/sign.yml');
+    // (G3: the sign job asks for the OIDC token and attestations write only with the step that uses them, here actions/attest)
+    const attest = renderPlatformStep('attest', platform(), { 'subject-name': 'ghcr.io/o/app', 'subject-digest': `sha256:${'a'.repeat(64)}` });
+    const called = wf({ sign: job([attest], { permissions: { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' } }) }, { on: { workflow_call: null } }, '.github/workflows/sign.yml');
     const caller = (perms: unknown): CreatedFile => wf({ release: { uses: './.github/workflows/sign.yml', permissions: perms } });
     const union = { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' };
     expect(permsBesidesRegistry(await run([caller(union), called], draftOf([g.spec])))).toBe(false);   // (G2-R-sec2: the registry-write rule aside)
@@ -968,7 +970,9 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
   });
   it('A22: environment pipegen-signing only on sign and pipegen-verify', async () => {
     expect(has(await run([wf({ t: job(scriptSteps(), { environment: 'pipegen-signing' }) })], dScripts()), 'permissions')).toBe(true);
-    expect(permsBesidesRegistry(await run([wf({ sign: job([], { permissions: SIGNP, environment: 'pipegen-signing' }) })], draftOf([])))).toBe(false);   // (G2-R-sec2: the registry-write rule aside)
+    // (G3: the OIDC token and attestations write only with actions/attest in the job)
+    const attest = renderPlatformStep('attest', platform(), { 'subject-name': 'ghcr.io/o/app', 'subject-digest': `sha256:${'a'.repeat(64)}` });
+    expect(permsBesidesRegistry(await run([wf({ sign: job([attest], { permissions: SIGNP, environment: 'pipegen-signing' }) })], draftOf([])))).toBe(false);   // (G2-R-sec2: the registry-write rule aside)
   });
   it('A8: a secret value hidden by a YAML escape is found in the parsed scalars', async () => {
     const esc = fake.awsKey().replace(/^A/, '\\x41');

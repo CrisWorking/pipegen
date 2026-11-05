@@ -64,7 +64,8 @@ const digestDownload = (): RenderedStep => {
   const name = imageDigestArtifact('app');
   return renderPlatformStep('download-artifact', p, { name, path: `\${{ runner.temp }}/pipegen-out/${name}` });
 };
-const SIGN_PERMS = { contents: 'read', [OIDC]: 'write', packages: 'write' };
+// (G3: a key-env sign job asks for no OIDC permission, since it signs with the environment's key; only keyless or actions/attest use it)
+const SIGN_PERMS = { contents: 'read', packages: 'write' };
 const VERIFY_PERMS = { contents: 'read', actions: 'read', packages: 'read', attestations: 'read' };
 /** A signing draft with the honest pipeline's checks too, so a caller file of jobsOf(draft) passes. */
 const withPipeline = (d: PipelineDraft): PipelineDraft => ({ ...d, needs: draftOf().needs, steps: draftOf().steps });
@@ -73,7 +74,7 @@ const DEPLOY_ON_SIGN = { push: { branches: ['main'] }, pull_request: null, pull_
 function deployCaller(d: PipelineDraft, uses: string, over: Record<string, unknown> = {}, on: unknown = DEPLOY_ON_SIGN, path = '.github/workflows/pipegen.yml'): CreatedFile {
   const base = workflow(jobsOf(d), { on });
   const doc = parseDocument(base.content);
-  doc.setIn(['jobs', 'signing'], doc.createNode({ uses, if: "github.event_name == 'push'", needs: ['gate'], permissions: { contents: 'read', [OIDC]: 'write', packages: 'write' }, ...over }));
+  doc.setIn(['jobs', 'signing'], doc.createNode({ uses, if: "github.event_name == 'push'", needs: ['gate'], permissions: SIGN_PERMS, ...over }));
   return { ...base, path, content: doc.toString({ lineWidth: 0 }) };
 }
 const signFile = (jobs: Record<string, Job>): CreatedFile => ({ ...workflow(jobs, { on: { workflow_call: null } }), path: '.github/workflows/sign.yml' });
@@ -178,10 +179,11 @@ describe('G2: signing and verification steps (B3 b, d)', () => {
     expect(ghSteps[0]?.env?.PIPEGEN_DL_URL).toBe('https://github.com/cli/cli/releases/download/v2.80.0/gh_2.80.0_linux_amd64.tar.gz');
     expect(ghSteps[0]?.env?.PIPEGEN_DL_SHA256).toBe('c'.repeat(64));
     const ghRun = lastRun(ghSteps).run as string;
-    expect(attestSignerWorkflow('o/pipelines')).toBe('o/pipelines/.github/workflows/pipegen--sign.yml');
+    // (G3 ruling: the sign workflow is the project's own central file, <project>--sign.yml, since its content is the draft's plan)
+    expect(attestSignerWorkflow('o/pipelines', 'r')).toBe('o/pipelines/.github/workflows/r--sign.yml');
     // G2-R-sec 2: bound like keyless: the source is the app's default branch, the signer is the central sign workflow AT the central commit
     // pipegen pinned (a reusable workflow called at a commit signs with that commit), on a GitHub-hosted runner
-    expect(ghRun).toContain(`"$RUNNER_TEMP/pipegen-bin/pipegen-gh-verify/gh" attestation verify "oci://$ref" --repo 'o/r' --source-ref 'refs/heads/main' --signer-workflow 'o/pipelines/.github/workflows/pipegen--sign.yml' --signer-digest '${'a'.repeat(40)}' --deny-self-hosted-runners`);
+    expect(ghRun).toContain(`"$RUNNER_TEMP/pipegen-bin/pipegen-gh-verify/gh" attestation verify "oci://$ref" --repo 'o/r' --source-ref 'refs/heads/main' --signer-workflow 'o/pipelines/.github/workflows/r--sign.yml' --signer-digest '${'a'.repeat(40)}' --deny-self-hosted-runners`);
     for (const defaultBranch of ['-x', 'a..b', "ma'in", 'ma in', '']) {
       expect(() => renderVerifySteps(gh, { ...at, profile: { ...at.profile, defaultBranch } }, IMG), defaultBranch).toThrow(RenderError);
     }

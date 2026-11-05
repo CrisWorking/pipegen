@@ -14,6 +14,7 @@
 // Every value written into a script is checked first (the image repository, the hash, the repository names); each is single-quoted.
 import { createHash } from 'node:crypto';
 import { resultArtifactName, slug } from './artifact-names.js';
+import { centralWorkflowFile } from './central-path.js';
 import { SIGN_STEP_ENV, signStepId, VERIFY_STEP_ENV, verifyStepId, type RenderedStep } from './job-rules.js';
 import { isGitHubRepo } from './names.js';
 import { pipegenScriptStep } from './pipegen-script.js';
@@ -30,8 +31,11 @@ const GH_REPO = 'cli/cli';
 export const GITHUB_OIDC_ISSUER = 'https://token.actions.githubusercontent.com';
 /** The keyless sign job lives in the app's caller workflow (ruling B2: the deploy jobs of pipegen.yml), so its certificate names that file. */
 export const KEYLESS_SIGN_WORKFLOW = '.github/workflows/pipegen.yml';
-/** The central shared sign workflow (Plan G Task 1): the attest-mode signer. */
-export const CENTRAL_SIGN_WORKFLOW = '.github/workflows/pipegen--sign.yml';
+/**
+ * The project's central sign workflow (Plan G Task 1, built by src/layers/central.ts; G3 ruling: one file per project, `<project>--sign.yml`,
+ * because its content is the draft's own plan): the attest-mode signer.
+ */
+export const centralSignWorkflow = (project: string): string => centralWorkflowFile(project, 'sign');
 /** The digest hand-off: image-publish writes `sha256:<64 hex>` to this file of the service's digest artifact (B3 a; G7 brings it to the verify job). */
 export const IMAGE_DIGEST_ID = 'image-digest';
 export const DIGEST_FILE = 'digest';
@@ -60,10 +64,11 @@ export function keylessIdentity(p: Pick<RepoProfile, 'owner' | 'repo' | 'default
   return `https://github.com/${repo}/${KEYLESS_SIGN_WORKFLOW}@refs/heads/${p.defaultBranch}`;
 }
 
-/** The attest-mode signer workflow: the central repository's shared sign workflow. */
-export function attestSignerWorkflow(centralRepo: string): string {
+/** The attest-mode signer workflow: the project's sign workflow in the central repository. */
+export function attestSignerWorkflow(centralRepo: string, project: string): string {
   if (!isGitHubRepo(centralRepo) || !centralRepo.endsWith('/pipelines')) throw new RenderError(`The central repository ${show(centralRepo)} is not <owner>/pipelines.`);
-  return `${centralRepo}/${CENTRAL_SIGN_WORKFLOW}`;
+  if (!isGitHubRepo(`${centralRepo.split('/')[0]}/${project}`)) throw new RenderError(`The project ${show(String(project))} is not a plain GitHub repository name.`);
+  return `${centralRepo}/${centralSignWorkflow(project)}`;
 }
 
 function imageRepo(image: SignedImage): { repo: string; artifact: string } {
@@ -128,7 +133,7 @@ export function renderVerifySteps(tool: ReviewedTool, draft: PipelineDraft, imag
     reviewedRelease(tool, GH_ID, GH_REPO, 'gh');
     const central = draft.centralPin?.repo;
     if (central === undefined) throw new RenderError('Attest mode verifies against the central sign workflow, and the draft has no central pin.');
-    const signer = attestSignerWorkflow(central);
+    const signer = attestSignerWorkflow(central, draft.profile.repo);
     // controller ruling G2-R-sec 2: bound like keyless. The source is the app's default branch; the signer is the central sign workflow at
     // the commit pipegen pinned (a reusable workflow called at a commit signs with that commit, so --signer-digest binds its ref; gh's
     // --signer-workflow takes no ref); never a self-hosted runner. Flags checked against gh 2.87.3's help; the pinned entry's version: live checklist.

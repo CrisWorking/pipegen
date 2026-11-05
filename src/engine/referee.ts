@@ -46,7 +46,7 @@ import { createdFileProblems, duplicatePathProblems, type CreatedInputs, type Cr
 import {
   ACTION_PATH_RE, CALLER_WORKFLOW, checkExpressions, createdPathProblem, checkJobOrder, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, gateResultUploadProblems, IF_VALUES,
   CALLER_TRIGGERS, IMAGE_ARCHIVE_STEP_ID, IMAGE_BUILD_NEED, imageBuildJobId, imageBuildSlugOf, imageCheckStepId, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, LOCAL_MERGE_WORKFLOW, narrowingChoiceProblem, NIGHTLY_CONCURRENCY, NIGHTLY_WORKFLOW, PR_CHECK_IF, PR_CHECK_JOB,
-  PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, SECRET_REF_RE,
+  PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, SECRET_REF_RE, SIGN_STEP_ID_RE,
   STEP_KEYS as STEP_KEY_LIST, WORKFLOW_CONCURRENCY, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact,
 } from './job-rules.js';
 import { containerRefusal, RenderError, renderComposeUp, renderProjectScript, renderRuntimeEnv, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
@@ -656,6 +656,19 @@ function judgeTop(fc: FileCtx, js: Obj): void {
   }
   judgeEnv(fc, js.env, 'the workflow');
   judgeLayout(fc, js, triggers);
+  judgeSignCall(fc, js, triggers);
+}
+
+/**
+ * G3 (ruling S21): a called workflow that holds the sign job declares nothing under workflow_call (no input, secret or output). The signing
+ * mode, the image names and the digest hand-off are literals of the file, and the key reaches the job through its own environment, so no
+ * value a caller passes can choose what is signed or how (the sign steps can not read an input anyway: checkExpressions refuses it).
+ */
+function judgeSignCall(fc: FileCtx, js: Obj, triggers: readonly string[] | null): void {
+  if (triggers === null || !triggers.includes('workflow_call') || !isObj(js.jobs) || !Object.keys(js.jobs).some((id) => id.toLowerCase() === 'sign')) return;
+  const call = isObj(js.on) ? js.on.workflow_call : undefined;
+  if (call === undefined || call === null || (isObj(call) && Object.keys(call).length === 0)) return;
+  issueFor(fc)('injection', 'A called workflow that holds the job sign declares no input, secret or output under workflow_call: the signing mode, the images and the key are literals of the file and its environment, never values a caller passes (ruling S21).');
 }
 
 /** A workflow- or job-level env: plain values only (no expression, no secret) and no name that changes how code runs. */
@@ -965,6 +978,7 @@ function judgeJob(fc: FileCtx, id: string, j: unknown): void {
   judgeStepPolicy(fc, id, where, j, judged);
   judgeGateSteps(fc, id, where, j, judged);
   judgeSigningJob(fc, where, j, judged);
+  if (id === 'sign') judgeSignPermissions(fc, where, j, judged);
   judgeImageHandoff(fc, id, where, j, judged);
   judgeRegistryWrite(fc, where, j, judged);
 }
@@ -1013,6 +1027,21 @@ function judgeSigningJob(fc: FileCtx, where: string, j: Obj, judged: readonly Ju
   const keyed = judged.some((x) => x.kind === 'sign' && [...x.secrets].some((n) => SIGNING_KEY_SECRETS.has(n)));
   const envName = isObj(j.environment) ? j.environment.name : j.environment;
   if (keyed && envName !== SIGNING_ENVIRONMENT) fc.add(fc.file.path, 'permissions', `${where} signs with the cosign key, which only the environment ${SIGNING_ENVIRONMENT} holds (default-branch deploys only): the job must run in environment ${SIGNING_ENVIRONMENT}.`);
+}
+
+/**
+ * G3 (plan Global Constraints "Signing", Task 1 "permissions follow the referee table" per mode): the sign job asks only for what its own
+ * steps use. The OIDC token (`id-token: write`) only with a keyless sign step (cosign signs with the job's identity) or actions/attest (GitHub's
+ * signing); never for a key-env signature, which signs with the environment's key (a spare OIDC token could log in wherever the repository's
+ * identity is trusted). `attestations: write` only with actions/attest.
+ */
+function judgeSignPermissions(fc: FileCtx, where: string, j: Obj, judged: readonly Judged[]): void {
+  const p = isObj(j.permissions) ? j.permissions : {};
+  const attest = judged.some((x) => x.kind === 'attest');
+  // the sign step itself (its id; the cosign install is a sign-kind step too, with no secret either), recognised by content, naming no key
+  const keyless = judged.some((x) => x.kind === 'sign' && typeof x.step.id === 'string' && SIGN_STEP_ID_RE.test(x.step.id) && ![...x.secrets].some((n) => SIGNING_KEY_SECRETS.has(n)));
+  if (p['id-token'] === 'write' && !attest && !keyless) fc.add(fc.file.path, 'permissions', `${where} asks for id-token: write, which only a keyless sign step or actions/attest uses; a key-env signature signs with the environment's key.`);
+  if (p.attestations === 'write' && !attest) fc.add(fc.file.path, 'permissions', `${where} asks for attestations: write, which only actions/attest (attest mode) uses.`);
 }
 
 /** The draft's service whose slug is this, or undefined (none, or a name that has none). */
