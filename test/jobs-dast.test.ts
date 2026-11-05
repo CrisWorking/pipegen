@@ -10,14 +10,14 @@ import { EGRESS_DOMAIN_SETS } from '../src/engine/egress-sets.js';
 import { SHARED_CDN_SETS } from '../src/engine/egress.js';
 import { gateJobList } from '../src/engine/gate-job-list.js';
 import {
-  checkJobOrder, DAST_HANDOFF_STEP_ID, DAST_RAW_SHA_ENV, DAST_RAW_SHA_OUTPUT, dastAppStepId, dastCheckStepId, dastRawArtifact, dastRunJobId, NO_SCANS,
+  checkJobOrder, jobOutputsProblems, scrubChainProblems, DAST_HANDOFF_STEP_ID, DAST_RAW_SHA_ENV, DAST_RAW_SHA_OUTPUT, dastAppStepId, dastCheckStepId, dastRawArtifact, dastRunJobId, NO_SCANS,
 } from '../src/engine/job-rules.js';
 import { keyOffers, specFor } from '../src/debate/builder.js';
 import { floorNeeds } from '../src/engine/needs.js';
-import { renderComposeUp, renderJobPrelude, renderProjectScript } from '../src/engine/render-step.js';
+import { renderComposeUp, renderJobPrelude, renderProjectScript, renderStep, stepsToYaml } from '../src/engine/render-step.js';
 import { egressDomains } from '../src/engine/tool-flags.js';
 import { AssembleError, starterTestJob, type Job } from '../src/layers/jobs.js';
-import type { CreatedFile, Need } from '../src/types.js';
+import type { CreatedFile, Need, StepSpec } from '../src/types.js';
 import { APP_KEY, allJobs, assemble, CAPS, domainsOf, editJob, files, judge, node, p, planned, profileOf, SEC, shown, wf, type Obj } from './helpers/assemble.js';
 import { REVIEWED } from './helpers/debate-fixtures.js';
 
@@ -51,6 +51,7 @@ describe('G4 fix round 1: DAST in two jobs (G4-R1, design A)', () => {
     expect(JSON.stringify(scrub.steps)).not.toMatch(/actions\/checkout@|zap-baseline\.py|docker run/);
     const check = scrub.steps.find((s) => s.id === dastCheckStepId('app'));
     expect(check?.env?.[DAST_RAW_SHA_ENV]).toBe('${{ needs.dast-run--app.outputs.raw-sha256 }}');
+    expect(check?.run).toMatch(/sha256sum --check --strict -/);
     const sc = scrub.steps.find((s) => s.with?.mode === 'scrub');
     expect(sc?.with).toMatchObject({ artifact: 'pipegen-out-dast--app', tool: 'zap-baseline', format: 'zap-json', raw: '${{ runner.temp }}/pipegen-raw/pipegen-out-dast--app/zap.json' });
     expect(scrub.steps.indexOf(check as never)).toBeLessThan(scrub.steps.indexOf(sc as never));
@@ -144,6 +145,18 @@ describe('G4 fix round 1: DAST in two jobs (G4-R1, design A)', () => {
     expect(checkJobOrder([...run.slice(0, h), ...run.slice(h + 1)], { id: 'dast-run--app', scans: NO_SCANS }).length).toBeGreaterThan(0);
     const up = run[run.length - 1] as unknown as Obj;
     expect(checkJobOrder([...run.slice(0, -1), { ...up, with: { ...up.with, name: 'pipegen-out-dast--app', path: '${{ runner.temp }}/pipegen-out/pipegen-out-dast--app' } } as never], { id: 'dast-run--app', scans: NO_SCANS }).length).toBeGreaterThan(0);
+    // a credential anywhere in the run job: the exception does not apply (the scan after the app start is refused)
+    const tok = run.map((x) => (x.id?.startsWith('tool-run-') === true ? { ...x, env: { ...x.env, PIPEGEN_T: '${{ github.token }}' } } : x));
+    expect(checkJobOrder(tok, { id: 'dast-run--app', scans: NO_SCANS }).length).toBeGreaterThan(0);
+    // the hash check's expression only on its own id; the raw sha256 output only on a dast-run job; a check stands only for its own service's result
+    const chk = (a.merge['dast--app'] as Job).steps.find((x) => x.id === dastCheckStepId('app')) as never as Obj;
+    expect(() => stepsToYaml([{ ...chk, id: 'pipegen-image-check--app' } as never])).toThrow(/expression/);
+    expect(() => stepsToYaml([{ ...chk, env: { ...chk.env, [DAST_RAW_SHA_ENV]: '${{ needs.dast-run--web.outputs.raw-sha256 }}' } } as never])).toThrow(/expression/);
+    expect(jobOutputsProblems('sast--app', { [DAST_RAW_SHA_OUTPUT]: `\${{ steps.${DAST_HANDOFF_STEP_ID}.outputs.sha256 }}` }, run).join(' ')).toMatch(/only a dast-run--<service> job/);
+    expect(jobOutputsProblems('dast-run--app', { [DAST_RAW_SHA_OUTPUT]: `\${{ steps.${DAST_HANDOFF_STEP_ID}.outputs.sha256 }}` }, run)).toEqual([]);
+    const sj = (a.merge['dast--app'] as Job).steps;
+    expect(scrubChainProblems(sj)).toEqual([]);
+    expect(scrubChainProblems(sj.map((x) => (x.id === dastCheckStepId('app') ? { ...x, id: dastCheckStepId('web') } : x))).join(' ')).toMatch(/no scan step of that result comes before it/);
     // with a scrub (the key) in the job: the exception does not apply, and the key job rule refuses the app start
     const scrub = (a.merge['dast--app'] as Job).steps.find((s) => s.with?.mode === 'scrub') as never;
     expect(checkJobOrder([...run.slice(0, 1), scrub, ...run.slice(1)], { id: 'dast-run--app', scans: NO_SCANS }).join(' ')).toMatch(/fingerprint key/);
@@ -167,19 +180,36 @@ describe('G4 fix round 1: DAST in two jobs (G4-R1, design A)', () => {
     // the key: a scrub step, the fingerprint key in a step's env, or any secret in the run job
     await bad((jobs) => { const sc = (jobs['dast--app'].steps as Obj[]).find((s) => s.with?.mode === 'scrub'); runOf(jobs).splice(1, 0, structuredClone(sc) as Obj); });
     await bad((jobs) => { (runOf(jobs)[1] as Obj).env = { ...(runOf(jobs)[1] as Obj).env, X: `\${{ ${SEC}.PIPEGEN_FP_KEY }}` }; });
-    await bad((jobs) => { const z = runOf(jobs).find((s) => String(s.id).startsWith('tool-run-')) as Obj; z.env = { ...z.env, [APP_KEY]: `\${{ ${SEC}.${APP_KEY} }}` }; });
+    await bad((jobs) => { const z = runOf(jobs).find((s) => String(s.id).startsWith('tool-run-')) as Obj; z.env = { ...z.env, [APP_KEY]: `\${{ ${SEC}.${APP_KEY} }}` }; }, /runs the app for its DAST scan, so it names no secret/);
     await bad((jobs) => { jobs['dast-run--app'].permissions = { contents: 'read', actions: 'read' }; });
     // the DAST step in the scrub job (beside the key), or in any other job
     await bad((jobs) => { const z = runOf(jobs).find((s) => String(s.id).startsWith('tool-run-')); (jobs["dast--app"].steps as Obj[]).splice(1, 0, structuredClone(z) as Obj); });
     await bad((jobs) => { const z = runOf(jobs).find((s) => String(s.id).startsWith('tool-run-')); (jobs["sast--app"].steps as Obj[]).push(structuredClone(z) as Obj); });
     // a DAST base twin in base-scan: there is none to recognise
     await bad((jobs) => { const z = runOf(jobs).find((s) => String(s.id).startsWith('tool-run-')) as Obj; (jobs['base-scan'].steps as Obj[]).push({ ...structuredClone(z), if: undefined }); });
+    // the base render of the DAST spec itself is not a step pipegen renders either (no base twin is recorded)
+    {
+      const spec = a.draft.steps.find((st) => st.needId === 'dast') as StepSpec;
+      const base = renderStep(spec, REVIEWED.find((t) => t.id === spec.tool.id) as never, p, { profile: a.draft.profile, targets: { url: 'http://127.0.0.1:3000' }, base: true }).steps;
+      await bad((jobs) => { (jobs['base-scan'].steps as Obj[]).push(...base.map(({ usesComment: _u, ...rest }) => rest)); }, /is not a step pipegen renders for this pipeline/);
+    }
+    // the scan in a job of a file without the gate (no job list to hold it): its own rule refuses it
+    {
+      const push = files(a)[1] as CreatedFile;
+      const { parse, Document } = await import('yaml');
+      const js = parse(push.content) as Obj;
+      const z = runOf(parse(f.content).jobs as Obj).filter((s) => String(s.id).startsWith('tool-'));
+      js.jobs['lint--app'].steps.splice(1, 0, ...structuredClone(z));
+      const doc = new Document();
+      doc.contents = doc.createNode(js);
+      expect(shown(await judge([{ ...push, content: doc.toString({ lineWidth: 0 }) }], a.draft))).toMatch(/runs only in its own job "dast-run--app"/);
+    }
     // the hand-off check: another expression, or none; the raw sha256 output on another job
     await bad((jobs) => { const c = (jobs['dast--app'].steps as Obj[]).find((s) => s.id === dastCheckStepId('app')) as Obj; c.env[DAST_RAW_SHA_ENV] = '${{ needs.image-build--app.outputs.image-sha256 }}'; });
     await bad((jobs) => { jobs['dast--app'].steps = (jobs['dast--app'].steps as Obj[]).filter((s) => s.id !== dastCheckStepId('app')); });
     await bad((jobs) => { jobs['sast--app'].outputs = { ...jobs['sast--app'].outputs, [DAST_RAW_SHA_OUTPUT]: `\${{ steps.${DAST_HANDOFF_STEP_ID}.outputs.sha256 }}` }; });
     // the scrub job without the need of its run job (it would read nothing, or an old artifact)
-    await bad((jobs) => { delete jobs['dast--app'].needs; });
+    await bad((jobs) => { delete jobs['dast--app'].needs; }, /does not need that job/);
     // the app started on the runner (a project script) in the run job
     await bad((jobs) => {
       const ps = renderProjectScript({ kind: 'project-script', needId: 'unit-tests', service: 'app', script: 'test' }, p, { profile: a.draft.profile }).steps;
@@ -197,6 +227,8 @@ describe('G4 fix round 1: the referee egress backstop (G4-R1)', () => {
       const none = editJob(f, id, (j) => { (j.steps as Obj[]).shift(); });
       expect((await judge([none], a.draft)).issues.some((i) => i.message.includes(id) && /egress step/.test(i.message)), id).toBe(true);
       // the egress step not first: refused too
+      const twice = editJob(f, id, (j) => { (j.steps as Obj[]).splice(1, 0, structuredClone((j.steps as Obj[])[0])); });
+      expect((await judge([twice], a.draft)).issues.some((i) => /egress step \(the reviewed Bullfrog block, once, first\)/.test(i.message)), `${id} twice`).toBe(true);
       const moved = editJob(f, id, (j) => { const [e] = (j.steps as Obj[]).splice(0, 1); (j.steps as Obj[]).push(e); });
       expect((await judge([moved], a.draft)).issues.some((i) => /egress step/.test(i.message)), `${id} moved`).toBe(true);
     }
