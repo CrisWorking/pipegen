@@ -15,6 +15,8 @@ import sodium from 'libsodium-wrappers';
 import { knownValueScrubber } from '../ai/redact.js';
 import type { Prompter } from '../cli/io.js';
 import { dockerfilesOf } from '../engine/created-judges/compose.js';
+import { isRateStop, withRateLimit, type RateClock } from '../engine/github-rate.js';
+import { clockOf } from '../github/client.js';
 import { isDangerousName } from '../engine/job-rules.js';
 import { NAME_RE } from '../read/manifest.js';
 import type { CreatedFile, Dependency, KnownValueCheck, RepoProfile } from '../types.js';
@@ -248,7 +250,7 @@ function checkKey(data: unknown): PublicKey {
 
 async function fetchKey(fn: () => Promise<{ data: unknown }>): Promise<PublicKey> {
   let reply: { data: unknown };
-  try { reply = await fn(); } catch (e) { throw new SecretStoreError(`Could not read GitHub's public key for secrets${statusOf(e)}.`); }
+  try { reply = await fn(); } catch (e) { if (isRateStop(e)) throw e; throw new SecretStoreError(`Could not read GitHub's public key for secrets${statusOf(e)}.`); }
   await sodium.ready;
   return checkKey(reply.data);
 }
@@ -261,7 +263,7 @@ function seal(value: string, key: Uint8Array): string {
 }
 
 async function put(fn: () => Promise<unknown>, name: string): Promise<void> {
-  try { await fn(); } catch (e) { throw new SecretStoreError(`Could not store the secret ${safeText(name, 80)}${statusOf(e)}.`); }
+  try { await fn(); } catch (e) { if (isRateStop(e)) throw e; throw new SecretStoreError(`Could not store the secret ${safeText(name, 80)}${statusOf(e)}.`); }
 }
 
 /**
@@ -274,22 +276,24 @@ export interface SecretSink {
   put(name: string, encryptedValue: string, keyId: string): Promise<unknown>;
 }
 
-function repoSink(gh: Octokit, repo: { owner: string; repo: string }): SecretSink {
+/** The plain repo's sink. Every call goes through the run's rate clock (G10, ruling S17): a short rate limit waits, a long one stops. */
+function repoSink(gh: Octokit, repo: { owner: string; repo: string }, clock: RateClock): SecretSink {
   if (!PART_RE.test(String(repo?.owner)) || !PART_RE.test(String(repo?.repo))) throw new SecretStoreError('the repository owner or name is not a plain name');
   const { owner, repo: name } = repo;
   return {
-    publicKey: () => gh.request('GET /repos/{owner}/{repo}/actions/secrets/public-key', { owner, repo: name }),
-    put: (secretName, encrypted, keyId) => gh.request('PUT /repos/{owner}/{repo}/actions/secrets/{secret_name}', { owner, repo: name, secret_name: secretName, encrypted_value: encrypted, key_id: keyId }),
+    publicKey: () => withRateLimit(() => gh.request('GET /repos/{owner}/{repo}/actions/secrets/public-key', { owner, repo: name }), clock),
+    put: (secretName, encrypted, keyId) => withRateLimit(() => gh.request('PUT /repos/{owner}/{repo}/actions/secrets/{secret_name}', { owner, repo: name, secret_name: secretName, encrypted_value: encrypted, key_id: keyId }), clock),
   };
 }
 
 /**
  * Stores the vault's `names` as repo secrets: GET the repo's public key, seal each value (crypto_box_seal), PUT `encrypted_value` + `key_id`.
  * Names are upper-cased; GITHUB_* is refused. All names are checked before anything is sent. Does NOT wipe the vault (the caller wipes after delivery).
- * Environment secrets never go through here (storeEnvSecret). Returns the stored (upper-case) names.
+ * Environment secrets never go through here (storeEnvSecret). Returns the stored (upper-case) names. `clock`: the run's rate clock (S17;
+ * default the client's own). It PUTs whatever is there: whether a same-name secret may be replaced is the caller's question (G10 asks first).
  */
-export async function storeSecrets(gh: Octokit, repo: { owner: string; repo: string }, vault: SecretVault, names: readonly string[]): Promise<string[]> {
-  return storeSecretsVia(repoSink(gh, repo), vault, names);
+export async function storeSecrets(gh: Octokit, repo: { owner: string; repo: string }, vault: SecretVault, names: readonly string[], clock: RateClock = clockOf(gh)): Promise<string[]> {
+  return storeSecretsVia(repoSink(gh, repo, clock), vault, names);
 }
 
 /** storeSecrets through a sink (the proof's scratch sink, E4). The same checks, in the same order, before anything is sent. */
@@ -312,8 +316,8 @@ export async function storeSecretsVia(sink: SecretSink, vault: SecretVault, name
  * Ruling S14: stores one value that is NOT the user's (a placeholder, or the proof's throwaway PIPEGEN_FP_KEY) as a repo secret, sealed the
  * same way. The name rules (upper-cased, never GITHUB_*) and valueProblem apply. These values never go through the vault.
  */
-export async function storeRepoSecret(gh: Octokit, repo: { owner: string; repo: string }, name: string, value: string): Promise<void> {
-  await storeRepoSecretsVia(repoSink(gh, repo), [{ name, value }]);
+export async function storeRepoSecret(gh: Octokit, repo: { owner: string; repo: string }, name: string, value: string, clock: RateClock = clockOf(gh)): Promise<void> {
+  await storeRepoSecretsVia(repoSink(gh, repo, clock), [{ name, value }]);
 }
 
 /** storeRepoSecret for several values through a sink (one public-key read). Every name and value is checked before anything is sent. */
@@ -339,18 +343,18 @@ export async function storeRepoSecretsVia(sink: SecretSink, entries: readonly { 
 /**
  * THE way to store an environment secret (for example PIPEGEN_COSIGN_KEY in `pipegen-signing`): GET the environment's public key
  * (/repos/{owner}/{repo}/environments/{env}/secrets/public-key, the path in GitHub's current API description; S8 amended, DECISIONS #105),
- * seal, PUT. `owner`, `repo`, `env` and `name` are validated first; Octokit URL-encodes the path parts.
+ * seal, PUT. `owner`, `repo`, `env` and `name` are validated first; Octokit URL-encodes the path parts. Both calls go through `clock` (S17).
  */
-export async function storeEnvSecret(gh: Octokit, repo: { owner: string; repo: string }, env: string, name: string, value: string): Promise<void> {
+export async function storeEnvSecret(gh: Octokit, repo: { owner: string; repo: string }, env: string, name: string, value: string, clock: RateClock = clockOf(gh)): Promise<void> {
   if (!PART_RE.test(String(repo?.owner)) || !PART_RE.test(String(repo?.repo))) throw new SecretStoreError('the repository owner or name is not a plain name');
   if (typeof env !== 'string' || !ENV_RE.test(env)) throw new SecretStoreError('the environment name is not a plain name');
   const up = secretName(name);
   const problem = valueProblem(value);
   if (problem !== null) throw new SecretStoreError(`the value for ${safeText(up, 80)} ${problem}`);
   const params = { owner: repo.owner, repo: repo.repo, environment_name: env };
-  const key = await fetchKey(() => gh.request('GET /repos/{owner}/{repo}/environments/{environment_name}/secrets/public-key', params));
+  const key = await fetchKey(() => withRateLimit(() => gh.request('GET /repos/{owner}/{repo}/environments/{environment_name}/secrets/public-key', params), clock));
   const encrypted = seal(value, key.key);
-  await put(() => gh.request('PUT /repos/{owner}/{repo}/environments/{environment_name}/secrets/{secret_name}', { ...params, secret_name: up, encrypted_value: encrypted, key_id: key.keyId }), up);
+  await put(() => withRateLimit(() => gh.request('PUT /repos/{owner}/{repo}/environments/{environment_name}/secrets/{secret_name}', { ...params, secret_name: up, encrypted_value: encrypted, key_id: key.keyId }), clock), up);
 }
 
 // ---------- the fingerprint key ----------
