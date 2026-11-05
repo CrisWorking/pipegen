@@ -102,6 +102,39 @@ describe('push credit: every pull request + every push to the default branch', (
     const sameFileOtherJob = await partial((dir) => wf(dir, 'ci.yml', `on:\n  pull_request:\n  push:\n    branches: [main]\njobs:\n  one:\n    runs-on: x\n    if: github.event_name == 'push'\n    steps:\n${gl}  two:\n    runs-on: x\n    steps:\n${run('gitleaks detect --redact')}`));
     expect(sameFileOtherJob.credit).toBeUndefined();
   });
+  it('push credit: a pull_request branches filter that excludes the default branch → no credit', async () => {
+    for (const filter of ["branches: [develop]", "branches-ignore: [main]", "branches: ['release/**']"]) {
+      const r = await partial((dir) => wf(dir, 'ci.yml', `on:\n  pull_request:\n    ${filter}\n  push:\n    branches: [main]\n${job(gl)}`));
+      expect(r.status, filter).toBe('partial');
+      expect(r.credit, filter).toBeUndefined();
+    }
+  });
+  it('push credit: pull_request types without synchronize → no credit', async () => {
+    for (const types of ['[opened]', '[opened, reopened]', '[labeled]']) {
+      const r = await partial((dir) => wf(dir, 'ci.yml', `on:\n  pull_request:\n    types: ${types}\n  push:\n    branches: [main]\n${job(gl)}`));
+      expect(r.status, types).toBe('partial');
+      expect(r.credit, types).toBeUndefined();
+    }
+  });
+  it('push credit: an if: on the job or on the step → no credit', async () => {
+    const cond = "github.actor != 'bot'";
+    const shapes = [
+      job(gl, 'scan', `    if: ${cond}\n`),
+      job(run('gitleaks detect --redact', `        if: ${cond}\n`)),
+      job(run('gitleaks detect --redact', "        if: github.event_name == 'push'\n")),
+      job(gl, 'scan', "    if: github.event_name == 'pull_request'\n"),
+    ];
+    for (const body of shapes) {
+      const r = await partial((dir) => wf(dir, 'ci.yml', `on:\n  pull_request:\n  push:\n    branches: [main]\n${body}`));
+      expect(r.credit, body).toBeUndefined();
+      expect(r.status, body).not.toBe('covered');
+    }
+  });
+  it('push credit: same file, the pull-request run is another job than the push hit → no credit', async () => {
+    // the push-only job comes AFTER the pull-request one, so this fails on the `where` check, not on ordering
+    const r = await partial((dir) => wf(dir, 'ci.yml', `on:\n  pull_request:\n  push:\n    branches: [main]\njobs:\n  one:\n    runs-on: x\n    if: github.event_name == 'pull_request'\n    steps:\n${gl}  two:\n    runs-on: x\n    if: github.event_name == 'push'\n    steps:\n${gl}`));
+    expect(r.credit).toBeUndefined();
+  });
   it('push credit: a run that can pass while failing (continue-on-error) → no credit', async () => {
     const r = await partial((dir) => wf(dir, 'ci.yml', `on:\n  pull_request:\n  push:\n    branches: [main]\n${job(run('gitleaks detect --redact', '        continue-on-error: true\n'))}`));
     expect(r.status).toBe('partial');
