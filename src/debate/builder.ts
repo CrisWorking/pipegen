@@ -36,7 +36,7 @@ import type { QualityBar } from '../engine/quality-bar.js';
 import { validateSpec } from '../engine/render-step.js';
 import { projectScriptFor, reviewedFor } from '../engine/reviewed.js';
 import { COVERAGE_MINIMUMS } from '../engine/tool-flags.js';
-import { LANGUAGE_FOLDERS, TUNING_OPTIONS, tuningEnums } from '../engine/tuning.js';
+import { LANGUAGE_FOLDERS, SEMGREP_RULE_FOLDERS, TUNING_OPTIONS, tuningEnums } from '../engine/tuning.js';
 import { safeMarkdown, safeText } from '../util/safe-text.js';
 import {
   NEED_CATEGORIES, type AiProvider, type AiRequest, type AiUsage, type Candidate, type Capabilities, type Need, type PipelineDraft, type RepoProfile,
@@ -117,8 +117,10 @@ export interface Offer {
   aiChoices: Readonly<Record<string, readonly string[]>>;
   /** Choice name → the value code fills (a coverage minimum, a choice narrowed to one value). */
   codeChoices: Readonly<Record<string, string>>;
-  /** Tuning option → the values offered for this key (empty options left out; each value unchanged by promptText). */
+  /** Tuning option → the values offered for this key (empty options left out; each value unchanged by promptText; never code's own). */
   tuning: Readonly<Record<string, readonly string[]>>;
+  /** Tuning option → the values code always fills (F2-R13: Semgrep's other rule sets the service needs). The AI can only add to them. */
+  codeTuning: Readonly<Record<string, readonly string[]>>;
 }
 
 /** An unreviewed tool the AI may name as a suggestion, under an opaque id (`s1`, …). */
@@ -180,41 +182,65 @@ function ruleFolders(ref: NeedRef, p: RepoProfile): Set<string> {
   return out;
 }
 
+/** What code fills for an entry on a key: choices and tuning values the AI can't change or remove. */
+interface KeyFilled { code: Record<string, string>; tuning: Record<string, string[]> }
+
 /**
- * Choices whose safe values depend on the key (review F2 I1): another language's Semgrep rules would leave the service's own code
- * unscanned, so `rules` keeps only the service's own folders, for the AI and for every code default alike.
+ * Semgrep's rule sets for a key (review F2 I1, ruling F2-R13: scan more, never less). `rules` is always code's: the main folder of
+ * the service's own language (node → javascript, python → python; for a repo-wide key, the first listed main folder of its
+ * services). Every other folder the services need (typescript with a tsconfig, the folder's other languages, the other services'
+ * languages) is a code-filled `extra-rules` set. The AI may only add more sets from the offered enum. null: the entry has none of
+ * the main folders, so it is not offered.
  */
-const KEY_NARROWED: Readonly<Record<string, Readonly<Record<string, (ref: NeedRef, p: RepoProfile) => (v: string) => boolean>>>> = {
-  semgrep: { rules: (ref, p) => { const ok = ruleFolders(ref, p); return (v) => ok.has(v); } },
-};
+function semgrepRules(e: ReviewedTool, ref: NeedRef, p: RepoProfile): KeyFilled | null {
+  const listed = Array.isArray(e.choices.rules) ? e.choices.rules : [];
+  const svc = serviceOf(ref, p);
+  const scope = svc === null ? [] : svc === undefined ? p.services : [svc];
+  const mains = new Set(scope.map((s) => (Object.hasOwn(LANGUAGE_FOLDERS, s.language) ? LANGUAGE_FOLDERS[s.language]?.[0] : undefined)));
+  const base = listed.find((v) => mains.has(v));
+  if (base === undefined) return null;
+  const extras = [...ruleFolders(ref, p)].filter((f) => f !== base && SEMGREP_RULE_FOLDERS.includes(f));
+  return { code: { rules: base }, tuning: extras.length > 0 ? { 'extra-rules': extras } : {} };
+}
+
+/** Entries whose choices and tuning code fills per key (by entry id). */
+const KEY_FILLED: Readonly<Record<string, (e: ReviewedTool, ref: NeedRef, p: RepoProfile) => KeyFilled | null>> = { semgrep: semgrepRules };
 
 /** Tools of these categories are never offered: their inputs are pipegen's own (egress, review F2 I2). */
 const NEVER_OFFERED_CATEGORIES: ReadonlySet<string> = new Set(['egress']);
 
 const sameList = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
 
+interface ChoicePlan { ai: Record<string, string[]>; code: Record<string, string>; codeTuning: Record<string, string[]> }
+
 /** The AI's and code's choices of an entry for a key, or null when it can't be offered (a coverage minimum it can't fill, a choice with no safe value). */
-function choicePlan(e: ReviewedTool, ref: NeedRef, p: RepoProfile): { ai: Record<string, string[]>; code: Record<string, string> } | null {
+function choicePlan(e: ReviewedTool, ref: NeedRef, p: RepoProfile): ChoicePlan | null {
   if (e.categories.some((c) => NEVER_OFFERED_CATEGORIES.has(c))) return null;
   const ai: Record<string, string[]> = {};
   const code: Record<string, string> = {};
   const aiNames = new Set(aiChoiceNames(e.id, e.choices));
-  const perKey = Object.hasOwn(KEY_NARROWED, e.id) ? KEY_NARROWED[e.id] : undefined;
+  const filled = Object.hasOwn(KEY_FILLED, e.id) ? (KEY_FILLED[e.id] as (x: ReviewedTool, r: NeedRef, q: RepoProfile) => KeyFilled | null)(e, ref, p) : { code: {}, tuning: {} };
+  if (filled === null) return null;
   for (const [name, raw] of Object.entries(e.choices)) {
     const values = Array.isArray(raw) ? raw.filter((v): v is string => typeof v === 'string') : [];
+    if (Object.hasOwn(filled.code, name)) {
+      const v = filled.code[name] as string;
+      if (!values.includes(v)) return null;
+      code[name] = v;
+      continue;
+    }
     // Plan D I4: a coverage minimum is code's, never the AI's: the CODE_FILLED_CHOICES entry, and any choice whose values are exactly the minimums (coverage.py's fail-under)
     if (!aiNames.has(name) || sameList(values, COVERAGE_MINIMUMS)) {
       if (!values.includes(COVERAGE_MINIMUMS[0])) return null;
       code[name] = COVERAGE_MINIMUMS[0];
       continue;
     }
-    let keep = Object.hasOwn(NARROWED, name) ? values.filter(NARROWED[name] as (v: string) => boolean) : values;
-    if (perKey !== undefined && Object.hasOwn(perKey, name)) keep = keep.filter((perKey[name] as (r: NeedRef, q: RepoProfile) => (v: string) => boolean)(ref, p));
+    const keep = Object.hasOwn(NARROWED, name) ? values.filter(NARROWED[name] as (v: string) => boolean) : values;
     if (keep.length === 0) return null;
     if (keep.length === 1) code[name] = keep[0] as string;
     else ai[name] = keep;
   }
-  return { ai, code };
+  return { ai, code, codeTuning: filled.tuning };
 }
 
 /** The service a key is for, or undefined (repo-wide); null when the need names a service the profile doesn't have. */
@@ -233,7 +259,7 @@ const tuningMax = (id: string): number => Math.max(1, ...TUNING_OPTIONS.filter((
  * extra-rules over every `rules` value; validateSpec checks the pick against the chosen one later), keeping only values that
  * promptText leaves unchanged. Options with no value are left out.
  */
-function tuningOffer(ref: NeedRef, e: ReviewedTool, plan: { ai: Record<string, string[]>; code: Record<string, string> }, p: RepoProfile, kv: readonly string[]): Record<string, string[]> {
+function tuningOffer(ref: NeedRef, e: ReviewedTool, plan: ChoicePlan, p: RepoProfile, kv: readonly string[]): Record<string, string[]> {
   const svc = serviceOf(ref, p);
   const where = { ...(ref.service === undefined ? {} : { service: ref.service }), ...(svc && workingDirOf(svc.path) !== undefined ? { workingDir: svc.path } : {}) };
   const variants: StepChoices[] = [{ ...plan.code }];
@@ -242,7 +268,8 @@ function tuningOffer(ref: NeedRef, e: ReviewedTool, plan: { ai: Record<string, s
   for (const choices of variants) {
     for (const [opt, values] of Object.entries(tuningEnums(e, { choices, ...where }, { profile: p }))) {
       const list = out[opt] ?? [];
-      for (const v of values) if (!list.includes(v) && promptText(v, kv) === v) list.push(v);
+      // code's own sets are not the AI's to offer (it can't remove them; giving one back is harmless)
+      for (const v of values) if (!list.includes(v) && !(plan.codeTuning[opt] ?? []).includes(v) && promptText(v, kv) === v) list.push(v);
       out[opt] = list;
     }
   }
@@ -276,7 +303,9 @@ export function offeredPickProblems(key: string, offer: Offer, picks: Picks): { 
     if (values === null || values === undefined) continue;
     if (!Array.isArray(values)) { tuning.push(`${key}: choices.tuning.${shown(opt)}: must be a list of values`); continue; }
     if (values.length === 0) continue;
-    const allowed = Object.hasOwn(offer.tuning, opt) ? offer.tuning[opt] : undefined;
+    const offered = Object.hasOwn(offer.tuning, opt) ? offer.tuning[opt] : undefined;
+    const filled = Object.hasOwn(offer.codeTuning, opt) ? offer.codeTuning[opt] : undefined;
+    const allowed = offered === undefined && filled === undefined ? undefined : [...(offered ?? []), ...(filled ?? [])];
     if (allowed === undefined) { tuning.push(`${key}: choices.tuning.${shown(opt)}: this tool has no tuning option with that name for this need`); continue; }
     values.forEach((v, i) => { if (!allowed.includes(v)) tuning.push(`${key}: choices.tuning.${shown(opt)}[${i}]: ${JSON.stringify(shown(v))} is not one of the values offered`); });
   }
@@ -298,8 +327,14 @@ export function specFor(ref: NeedRef, offer: Offer, p: RepoProfile, picks?: Pick
     choices[name] = typeof v === 'string' ? v : (values[0] as string);
   }
   for (const [name, v] of Object.entries(offer.codeChoices)) choices[name] = v;
+  // code's own tuning first (F2-R13: never removed), then the AI's additions (a code value given back is not repeated)
   const tuning: TuningPicks = {};
-  for (const [opt, v] of Object.entries(picks?.tuning ?? {})) if (Array.isArray(v) && v.length > 0) tuning[opt] = [...v];
+  for (const [opt, v] of Object.entries(offer.codeTuning)) if (v.length > 0) tuning[opt] = [...v];
+  for (const [opt, v] of Object.entries(picks?.tuning ?? {})) {
+    if (!Array.isArray(v) || v.length === 0) continue;
+    const filled = Object.hasOwn(offer.codeTuning, opt) ? (offer.codeTuning[opt] as readonly string[]) : [];
+    tuning[opt] = [...(tuning[opt] ?? []), ...v.filter((x) => !filled.includes(x))];
+  }
   if (Object.keys(tuning).length > 0) choices.tuning = tuning;
   const svc = serviceOf(ref, p);
   const wd = svc ? workingDirOf(svc.path) : undefined;
@@ -330,7 +365,7 @@ function offersFor(ref: NeedRef, cands: readonly Candidate[], p: RepoProfile, de
     const plan = choicePlan(e, ref, p);
     if (plan === null) continue;
     seen.add(c.id);
-    const offer: Offer = { entry: e, aiChoices: plan.ai, codeChoices: plan.code, tuning: tuningOffer(ref, e, plan, p, kv) };
+    const offer: Offer = { entry: e, aiChoices: plan.ai, codeChoices: plan.code, tuning: tuningOffer(ref, e, plan, p, kv), codeTuning: plan.codeTuning };
     // the code-filled parts must already be valid, so any later problem is the AI's pick
     if (validateSpec(specFor(ref, offer, p), e, { profile: p }).length > 0) continue;
     out.push(offer);

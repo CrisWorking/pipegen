@@ -7,7 +7,7 @@ import { AiError } from '../src/ai/errors.js';
 import { BUILDER_NEEDS_TAG } from '../src/ai/prompts/builder.js';
 import { bundleCode, bundleText, type CodeBundle } from '../src/ai/redact.js';
 import {
-  ADVISORY_TOOLS, BuilderError, buildChoices, builderAnswerProblems, builderOffers, specFor, type BuilderDeps, type Choice,
+  ADVISORY_TOOLS, BuilderError, buildChoices, builderAnswerProblems, builderOffers, offeredPickProblems, specFor, type BuilderDeps, type Choice,
 } from '../src/debate/builder.js';
 import { BUILDER_SYSTEM } from '../src/ai/prompts/builder.js';
 import { cleanForDoc } from '../src/debate/clean.js';
@@ -237,13 +237,13 @@ describe('builder (plan Task 1)', () => {
   });
 
   it('builder: invalid step spec → retry with problems listed', async () => {
-    // javascript is in web's offered union (over every rules value), but with rules javascript it adds nothing: validateSpec refuses, the AI is asked once more
-    const bad = DEFAULT_PICKS.map((p) => (p.key === 'sast--web' ? { ...p, tuning: { 'extra-rules': ['javascript'] } } : p));
+    // an offered folder listed twice: validateSpec refuses, the AI is asked once more with its problem
+    const bad = DEFAULT_PICKS.map((p) => (p.key === 'sast--web' ? { ...p, tuning: { 'skip-generated': ['web/dist', 'web/dist'] } } : p));
     const { ai, calls } = scripted(ok(bad), ok());
     const r = await buildChoices(NEEDS, candidatesFor(NEEDS), P, bundle, ai, deps());
     expect(calls).toHaveLength(2);
-    expect(calls[1]!.user).toMatch(/sast--web: choices\.tuning\.extra-rules\[0\]: "javascript" is not one of the values/);
-    expect(byKey(r.choices, 'sast--web').chosen.choices.tuning).toBeUndefined();
+    expect(calls[1]!.user).toMatch(/sast--web: choices\.tuning\.skip-generated\[1\]: "web\/dist" is listed twice/);
+    expect(byKey(r.choices, 'sast--web').chosen.choices.tuning).toEqual({ 'extra-rules': ['typescript'] });   // only code's own rule set
   });
 
   it('builder: security-relevant inputs come from the template, AI values for them ignored', async () => {
@@ -378,34 +378,40 @@ describe('builder (added, pre-flight §7)', () => {
   });
 
   it('builder: tuning enum per candidate; empty enum → no tuning field; extra-rules checked against the chosen rules; tuning still wrong after the repair → tuning dropped', async () => {
-    const offers = builderOffers(NEEDS, candidatesFor(NEEDS), P, deps());
+    // a Compose file makes Semgrep's yaml rules an optional extra for every key
+    const PC = profile({ hasCompose: true });
+    const offers = builderOffers(NEEDS, candidatesFor(NEEDS, PC), PC, deps());
     const webSemgrep = offers.offers.get('sast--web')!.find((o) => o.entry.id === 'semgrep')!;
-    // extra-rules: the union over every `rules` value (javascript and typescript for a TypeScript node service); the generated folder of web only
-    expect(webSemgrep.tuning).toEqual({ 'extra-rules': ['typescript', 'javascript'], 'skip-generated': ['web/dist'] });
+    // extra-rules: built against code's own rules (javascript), so it never holds the base; typescript is code's (F2-R13), yaml is the AI's to add
+    expect(webSemgrep.codeChoices).toEqual({ rules: 'javascript' });
+    expect(webSemgrep.codeTuning).toEqual({ 'extra-rules': ['typescript'] });
+    expect(webSemgrep.tuning).toEqual({ 'extra-rules': ['yaml'], 'skip-generated': ['web/dist'] });
+    expect(offeredPickProblems('sast--web', webSemgrep, { tuning: { 'extra-rules': ['javascript'] } }).tuning)
+      .toEqual(['sast--web: choices.tuning.extra-rules[0]: "javascript" is not one of the values offered']);
     const apiSemgrep = offers.offers.get('sast--api')!.find((o) => o.entry.id === 'semgrep')!;
-    expect(apiSemgrep.tuning).toEqual({});   // python rules are the base set (I1): nothing extra; no generated folder under api: skip-generated left out
+    expect(apiSemgrep.tuning).toEqual({ 'extra-rules': ['yaml'] });   // python is the base set; no generated folder under api: skip-generated left out
     const bandit = offers.offers.get('sast--api')!.find((o) => o.entry.id === 'bandit')!;
     expect(bandit.tuning).toEqual({});
     const zap = offers.offers.get('dast--web')!.find((o) => o.entry.id === 'zap-baseline')!;
     expect(zap.tuning).toEqual({ 'start-script': ['start'] });
 
-    // a good tuning pick is kept; a null pick leaves no tuning field
-    const good = scripted(ok(DEFAULT_PICKS.map((p) => (p.key === 'sast--web' ? { ...p, tuning: { 'extra-rules': ['typescript'], 'skip-generated': ['web/dist'] } } : p))));
-    const r = await buildChoices(NEEDS, candidatesFor(NEEDS), P, bundle, good.ai, deps());
-    expect(byKey(r.choices, 'sast--web').chosen.choices.tuning).toEqual({ 'extra-rules': ['typescript'], 'skip-generated': ['web/dist'] });
+    // a good tuning pick is kept (added to code's own sets); a null pick leaves no tuning field
+    const good = scripted(ok(DEFAULT_PICKS.map((p) => (p.key === 'sast--web' ? { ...p, tuning: { 'extra-rules': ['yaml'], 'skip-generated': ['web/dist'] } } : p))));
+    const r = await buildChoices(NEEDS, candidatesFor(NEEDS, PC), PC, bundle, good.ai, deps());
+    expect(byKey(r.choices, 'sast--web').chosen.choices.tuning).toEqual({ 'extra-rules': ['typescript', 'yaml'], 'skip-generated': ['web/dist'] });
     expect(byKey(r.choices, 'sast--api').chosen.choices.tuning).toBeUndefined();
     expect('tuning' in byKey(r.choices, 'secrets').chosen.choices).toBe(false);
 
-    // extra-rules equal to the chosen rules: refused by validateSpec, the one repair; the same answer again → tuning dropped, the rest kept
-    const same = DEFAULT_PICKS.map((p) => (p.key === 'sast--web' ? { ...p, choices: { rules: 'typescript' }, tuning: { 'extra-rules': ['typescript'], 'skip-generated': ['web/dist'] } } : p));
+    // tuning wrong (a folder listed twice), the one repair, the same answer again → the AI's tuning dropped, code's own rule set kept
+    const same = DEFAULT_PICKS.map((p) => (p.key === 'sast--web' ? { ...p, tuning: { 'extra-rules': ['yaml'], 'skip-generated': ['web/dist', 'web/dist'] } } : p));
     const twice = scripted(ok(same), ok(same));
-    const r2 = await buildChoices(NEEDS, candidatesFor(NEEDS), P, bundle, twice.ai, deps());
+    const r2 = await buildChoices(NEEDS, candidatesFor(NEEDS, PC), PC, bundle, twice.ai, deps());
     expect(twice.calls).toHaveLength(2);
-    expect(twice.calls[1]!.user).toMatch(/sast--web: choices\.tuning\.extra-rules\[0\]: "typescript" is not one of the values/);
+    expect(twice.calls[1]!.user).toMatch(/sast--web: choices\.tuning\.skip-generated\[1\]: "web\/dist" is listed twice/);
     const web = byKey(r2.choices, 'sast--web').chosen;
-    expect(web.choices.rules).toBe('typescript');
-    expect(web.choices.tuning).toBeUndefined();
-    expect(validateSpec(web, entry('semgrep'), { profile: P })).toEqual([]);
+    expect(web.choices.rules).toBe('javascript');
+    expect(web.choices.tuning).toEqual({ 'extra-rules': ['typescript'] });
+    expect(validateSpec(web, entry('semgrep'), { profile: PC })).toEqual([]);
   });
 
   it("builder: the step's tool is the reviewed list entry by id, never the map's Candidate object", async () => {
@@ -609,7 +615,8 @@ describe('builder (added, pre-flight §7)', () => {
   it('builder: a tuning value or a key the scrub would change is never offered, and known values never reach the prompt', async () => {
     const known = 'web/dist';
     const offers = builderOffers(NEEDS, candidatesFor(NEEDS), P, deps({ knownValues: [known] }));
-    expect(offers.offers.get('sast--web')!.find((o) => o.entry.id === 'semgrep')!.tuning).toEqual({ 'extra-rules': ['typescript', 'javascript'] });
+    expect(offers.offers.get('sast--web')!.find((o) => o.entry.id === 'semgrep')!.tuning).toEqual({});   // skip-generated scrubbed out
+    expect(builderOffers(NEEDS, candidatesFor(NEEDS), P, deps()).offers.get('sast--web')!.find((o) => o.entry.id === 'semgrep')!.tuning).toEqual({ 'skip-generated': [known] });
     const { ai, calls } = scripted(ok());
     await buildChoices(NEEDS, candidatesFor(NEEDS), P, bundle, ai, deps({ knownValues: [known] }));
     expect(calls[0]!.user).not.toContain(known);
@@ -706,7 +713,9 @@ describe('builder (fix round 1)', () => {
     const semgrep = (key: string) => o.offers.get(key)!.find((x) => x.entry.id === 'semgrep')!;
     expect(semgrep('sast--api').aiChoices).toEqual({});
     expect(semgrep('sast--api').codeChoices).toEqual({ rules: 'python' });
-    expect(semgrep('sast--web').aiChoices).toEqual({ rules: ['javascript', 'typescript'] });   // TypeScript service: both node folders
+    expect(semgrep('sast--web').aiChoices).toEqual({});   // F2-R13: rules is always code's
+    expect(semgrep('sast--web').codeChoices).toEqual({ rules: 'javascript' });
+    expect(semgrep('sast--web').codeTuning).toEqual({ 'extra-rules': ['typescript'] });
     expect(semgrep('sast--plain').codeChoices).toEqual({ rules: 'javascript' });
     // the code defaults (specFor, the code-decided path, Plan G's next tool) take the service's language
     const ref = (key: string) => o.refs.find((r) => r.key === key)!;
@@ -716,14 +725,13 @@ describe('builder (fix round 1)', () => {
     const item = (key: string, rules: string) => ({ key, candidateId: 'semgrep', ranked: [], because: 'x', choices: { rules }, tuning: {} });
     expect(builderAnswerProblems({ choices: [item('sast--web', 'python'), item('sast--api', 'python'), item('sast--plain', 'javascript')], suggestions: [] }, o))
       .toEqual(['sast--web: choices.rules: python is not one of the values offered for this tool']);
+    expect(builderAnswerProblems({ choices: [item('sast--web', 'typescript'), item('sast--api', 'python'), item('sast--plain', 'javascript')], suggestions: [] }, o))
+      .toEqual(['sast--web: choices.rules: typescript is not one of the values offered for this tool']);
     expect(builderAnswerProblems({ choices: [item('sast--web', 'javascript'), item('sast--api', 'typescript'), item('sast--plain', 'javascript')], suggestions: [] }, o))
       .toEqual(['sast--api: choices.rules: typescript is not one of the values offered for this tool']);
     const { ai, calls } = scripted((req) => answerFor(req, [{ key: 'sast--api', candidateId: 'semgrep' }, { key: 'sast--web', candidateId: 'semgrep' }, { key: 'sast--plain', candidateId: 'semgrep' }]));
     const r = await buildChoices(needs, candidatesFor(needs, p), p, bundle, ai, deps());
-    expect(schemaNames(calls[0]!).choices).toEqual(['rules']);
-    const enumOfRules = ((calls[0]!.jsonSchema as { properties: { choices: { items: { properties: { choices: { properties: { rules: { anyOf?: { enum?: string[] }[]; enum?: string[] } } } } } } } })
-      .properties.choices.items.properties.choices.properties.rules);
-    expect(JSON.stringify(enumOfRules)).not.toContain('python');
+    expect(schemaNames(calls[0]!).choices).not.toContain('rules');
     expect(byKey(r.choices, 'sast--api').chosen.choices.rules).toBe('python');
     expect(byKey(r.choices, 'sast--web').chosen.choices.rules).toBe('javascript');
     expect(byKey(r.choices, 'sast--plain').chosen.choices.rules).toBe('javascript');
@@ -731,7 +739,9 @@ describe('builder (fix round 1)', () => {
     const mixed = profile({ services: [svc({ name: 'mix', path: 'mix', language: 'python', packageManager: 'pip', alsoLanguages: ['node'] })] });
     const mixNeeds = [need('sast', 'merge', 'mix')];
     const mixOffer = builderOffers(mixNeeds, candidatesFor(mixNeeds, mixed), mixed, deps()).offers.get('sast--mix')!.find((x) => x.entry.id === 'semgrep')!;
-    expect(mixOffer.aiChoices).toEqual({ rules: ['javascript', 'python'] });
+    expect(mixOffer.aiChoices).toEqual({});
+    expect(mixOffer.codeChoices).toEqual({ rules: 'python' });
+    expect(mixOffer.codeTuning).toEqual({ 'extra-rules': ['javascript'] });
     const nodeOnly = profile({ services: [plainNode, svc({ name: 'other', path: 'other' })] });
     const wide = [need('sast', 'merge', undefined)];
     const wideOffer = builderOffers(wide, candidatesFor(wide, nodeOnly), nodeOnly, deps()).offers.get('sast')!.find((x) => x.entry.id === 'semgrep')!;
@@ -785,8 +795,10 @@ describe('builder (fix round 1)', () => {
     // offered picks, and the code value given back as it is, are fine
     expect(specFor(ref('image-scan--web'), trivy, P, { choices: { severity: 'MEDIUM,HIGH,CRITICAL', 'ignore-unfixed': 'false' } }).choices)
       .toEqual({ severity: 'MEDIUM,HIGH,CRITICAL', 'ignore-unfixed': 'false' });
-    expect(specFor(ref('sast--web'), offer('sast--web', 'semgrep'), P, { choices: { rules: 'typescript' }, tuning: { 'extra-rules': ['javascript'], 'skip-generated': null } }).choices)
-      .toEqual({ rules: 'typescript', tuning: { 'extra-rules': ['javascript'] } });
+    expect(() => specFor(ref('sast--web'), offer('sast--web', 'semgrep'), P, { choices: { rules: 'typescript' } })).toThrow(BuilderError);
+    expect(() => specFor(ref('sast--web'), offer('sast--web', 'semgrep'), P, { tuning: { 'extra-rules': ['javascript'] } })).toThrow(BuilderError);
+    expect(specFor(ref('sast--web'), offer('sast--web', 'semgrep'), P, { choices: { rules: 'javascript' }, tuning: { 'skip-generated': ['web/dist'], 'extra-rules': null } }).choices)
+      .toEqual({ rules: 'javascript', tuning: { 'extra-rules': ['typescript'], 'skip-generated': ['web/dist'] } });
   });
 
   it('builder: a tuning value offered for another key is refused by the fence and repaired, never built', async () => {
@@ -803,5 +815,73 @@ describe('builder (fix round 1)', () => {
     expect(BUILDER_SYSTEM).toMatch(/folder/);
     expect(BUILDER_SYSTEM).toMatch(/suggest/);
     expect(BUILDER_SYSTEM).toMatch(/untrusted|data only/);
+  });
+});
+
+// ---------- fix round 2 (review-F2-r1.md, controller ruling F2-R13) ----------
+
+describe('builder (fix round 2)', () => {
+  const semgrepOf = (o: ReturnType<typeof builderOffers>, key: string) => o.offers.get(key)!.find((x) => x.entry.id === 'semgrep')!;
+  const runsBoth = (spec: { choices: Record<string, unknown> }, base: string, extra: string) => {
+    expect(spec.choices.rules).toBe(base);
+    expect((spec.choices.tuning as Record<string, string[]> | undefined)?.['extra-rules']).toContain(extra);
+  };
+
+  it('builder: a TypeScript service always runs the javascript rules; typescript is added, never instead (F2-R13 a)', async () => {
+    const hiddenTs = svc({ ...WEB, name: fake.githubClassic(), path: 'hts' });
+    const p = profile({ services: [API, WEB, hiddenTs] });
+    const needs = [need('sast', 'merge', 'web'), need('sast', 'merge', hiddenTs.name)];
+    const o = builderOffers(needs, candidatesFor(needs, p), p, deps());
+    // the AI can't set rules at all, and an answer naming typescript is refused
+    const item = { key: 'sast--web', candidateId: 'semgrep', ranked: [], because: 'x', choices: { rules: 'typescript' }, tuning: {} };
+    expect(builderAnswerProblems({ choices: [item], suggestions: [] }, o)).toEqual(['sast--web: choices.rules: typescript is not one of the values offered for this tool']);
+    // AI null pick, the code-decided key, specFor defaults: javascript + typescript every time
+    const { ai, calls } = scripted((req) => answerFor(req, [{ key: 'sast--web', candidateId: 'semgrep' }]));
+    const r = await buildChoices(needs, candidatesFor(needs, p), p, bundle, ai, deps());
+    expect(schemaNames(calls[0]!).choices).not.toContain('rules');
+    runsBoth(byKey(r.choices, 'sast--web').chosen, 'javascript', 'typescript');
+    const code = r.choices.find((c) => c.chosen.service === hiddenTs.name)!;
+    expect(code.by).toBe('pipegen');
+    runsBoth(code.chosen, 'javascript', 'typescript');
+    const ref = o.refs.find((x) => x.key === 'sast--web')!;
+    runsBoth(specFor(ref, semgrepOf(o, 'sast--web'), p), 'javascript', 'typescript');
+    for (const c of r.choices) expect(validateSpec(c.chosen, entry('semgrep'), { profile: p })).toEqual([]);
+  });
+
+  it('builder: a Python service with Node code always runs both rule sets, on every path (F2-R13 b)', async () => {
+    const mix = svc({ name: 'mix', path: 'mix', language: 'python', packageManager: 'pip', alsoLanguages: ['node'] });
+    const hiddenMix = svc({ ...mix, name: fake.githubClassic(), path: 'hmix' });
+    const p = profile({ services: [mix, hiddenMix] });
+    const needs = [need('sast', 'merge', 'mix'), need('sast', 'merge', hiddenMix.name)];
+    const o = builderOffers(needs, candidatesFor(needs, p), p, deps());
+    expect(semgrepOf(o, 'sast--mix').aiChoices).toEqual({});
+    const { ai } = scripted((req) => answerFor(req, [{ key: 'sast--mix', candidateId: 'semgrep' }]));
+    const r = await buildChoices(needs, candidatesFor(needs, p), p, bundle, ai, deps());
+    runsBoth(byKey(r.choices, 'sast--mix').chosen, 'python', 'javascript');
+    const code = r.choices.find((c) => c.chosen.service === hiddenMix.name)!;
+    expect(code.by).toBe('pipegen');
+    runsBoth(code.chosen, 'python', 'javascript');
+    runsBoth(specFor(o.refs.find((x) => x.key === 'sast--mix')!, semgrepOf(o, 'sast--mix'), p), 'python', 'javascript');
+    for (const c of r.choices) expect(validateSpec(c.chosen, entry('semgrep'), { profile: p })).toEqual([]);
+  });
+
+  it('builder: the AI cannot remove a code-filled rule set', async () => {
+    const PC = profile({ hasCompose: true });
+    const needs = [need('sast', 'merge', 'web')];
+    const o = builderOffers(needs, candidatesFor(needs, PC), PC, deps());
+    const off = semgrepOf(o, 'sast--web');
+    const ref = o.refs[0]!;
+    // null, an empty list, only another folder, the code folder given back: typescript always stays, once
+    for (const extra of [null, [], ['yaml'], ['typescript'], ['typescript', 'yaml']] as (string[] | null)[]) {
+      expect(offeredPickProblems('sast--web', off, { tuning: { 'extra-rules': extra } }).tuning).toEqual([]);
+      const t = specFor(ref, off, PC, { tuning: { 'extra-rules': extra } }).choices.tuning as Record<string, string[]>;
+      expect(t['extra-rules']!.filter((x) => x === 'typescript')).toEqual(['typescript']);
+    }
+    // the whole flow: an answer that leaves extra-rules out, or a bad tuning dropped after the repair, still runs typescript
+    for (const tuning of [{ 'extra-rules': [] }, { 'skip-generated': ['web/dist', 'web/dist'] }] as Record<string, string[]>[]) {
+      const { ai } = scripted((req) => answerFor(req, [{ key: 'sast--web', candidateId: 'semgrep', tuning }]));
+      const r = await buildChoices(needs, candidatesFor(needs, PC), PC, bundle, ai, deps());
+      runsBoth(byKey(r.choices, 'sast--web').chosen, 'javascript', 'typescript');
+    }
   });
 });
