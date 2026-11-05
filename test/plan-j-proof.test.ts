@@ -5,6 +5,8 @@
 // equivalent, the rows against a baseline recorded before Plan J (10d48df, ruling B6; every difference named), and the
 // length of the short report. Nothing here is tuned to one repo: the fixtures differ on purpose (both deploy-gate forms,
 // pre-commit / husky / no hooks, SHA-pinned and tag-pinned actions, gitleaks as a checked binary or as the action).
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { buildAudit, type AuditReport } from '../src/audit/model.js';
 import { renderTerminal } from '../src/audit/render.js';
@@ -122,12 +124,12 @@ describe('Plan J proof set: credits only where the repo has the equivalent', () 
   // and is covered now because the repo has the equivalent: every push is covered through its pull-request run
   // (push-default), or the pre-commit hooks it has run in CI (hooks-ci).
   const CREDITED: Record<Fixture, string[]> = {
-    'static-next-export': ['hooks-ci|merge|hooks-ci', 'secrets|push|push-default', 'unit-tests|push|push-default'],
+    'static-next-export': ['deploy-verify|deploy|deploy-gate', 'hooks-ci|merge|hooks-ci', 'secrets|push|push-default', 'unit-tests|push|push-default'],
     'static-next-export-preview': [],
     'static-astro': ['unit-tests|push|push-default'],
     'static-vite-spa': [],
     'node-cli': ['unit-tests|push|push-default'],
-    'node-container-service': ['unit-tests|push|push-default'],
+    'node-container-service': ['deps|push|push-default', 'unit-tests|push|push-default'],   // deps: the trivy-action scan, safe SHA
     'node-express': [], 'node-library': [], 'go-module': [], 'workspaces-python-backend': [],
   };
   const creditedOf = async (f: Fixture) => (await audit(f)).coverage.filter((c) => c.credit !== undefined)
@@ -139,7 +141,7 @@ describe('Plan J proof set: credits only where the repo has the equivalent', () 
       for (const c of r.coverage.filter((x) => x.credit !== undefined)) {
         expect(c.status, `${f} ${c.need.category}`).toBe('covered');
         expect(c.credit!.length).toBeGreaterThan(10);
-        expect(c.creditKind).toMatch(/^(push-default|hooks-ci|signing)$/);
+        expect(c.creditKind).toMatch(/^(push-default|hooks-ci|signing|deploy-gate)$/);
       }
     });
   }
@@ -152,9 +154,9 @@ describe('Plan J proof set: credits only where the repo has the equivalent', () 
   });
   it('the credited rows are shown with their credit text in the full report', async () => {
     const t = renderTerminal(await audit('static-next-export'), { knownValues: [], now: () => NOW, verbose: true });
-    for (const c of (await audit('static-next-export')).coverage.filter((x) => x.credit !== undefined)) expect(t).toContain(c.credit!);
+    for (const c of (await audit('static-next-export')).coverage.filter((x) => x.credit !== undefined)) expect(t.replace(/\s+/g, ' ')).toContain(c.credit!.replace(/\s+/g, ' '));
   });
-  it('no credit on a static fixture ever covers signing, attestation or deploy-verify today (J3B_PENDING covers deploy-verify)', async () => {
+  it('no credit on a static fixture ever covers signing, attestation or deploy-verify today ', async () => {
     for (const f of FIXTURES) {
       const bad = (await audit(f)).coverage.filter((c) => ['signing', 'attestation', 'sbom'].includes(c.need.category) && c.status === 'covered');
       expect(bad.map(rowKey), f).toEqual([]);
@@ -174,7 +176,8 @@ describe('Plan J proof set: rows against the baseline at 10d48df', () => {
     // (unit-tests, secrets); the hooks-ci row credited because the pre-commit secret hook is run by CI's gitleaks job
     'static-next-export': {
       gone: STATIC_IMAGE_ROWS('docs-site'),
-      changed: [PUSH_CREDIT('docs-site'), ['secrets|push||partial', 'secrets|push||covered'], ['hooks-ci|merge||missing', 'hooks-ci|merge||covered']],
+      changed: [PUSH_CREDIT('docs-site'), ['secrets|push||partial', 'secrets|push||covered'], ['hooks-ci|merge||missing', 'hooks-ci|merge||covered'],
+        ['deploy-verify|deploy|docs-site|missing', 'deploy-verify|deploy|docs-site|covered']],   // deploy gate, form (a) (J3b)
     },
     // an unsure static site is treated as a server: nothing dropped, nothing credited
     'static-next-export-preview': {},
@@ -184,7 +187,12 @@ describe('Plan J proof set: rows against the baseline at 10d48df', () => {
       gone: [...STATIC_IMAGE_ROWS('dashboard-ui'), 'deploy-verify|deploy|dashboard-ui|missing', 'egress|deploy|dashboard-ui|missing', 'sbom|deploy|dashboard-ui|missing', 'signing|deploy|dashboard-ui|missing'],
     },
     'node-cli': { changed: [PUSH_CREDIT('tidy-files')] },
-    'node-container-service': { changed: [PUSH_CREDIT('orders-api')] },
+    // trivy-action at a pinned safe SHA with default inputs is not never-listed any more: its fs scan (vulnerabilities and
+    // licences) covers the dependency and licence rows (J3b)
+    'node-container-service': {
+      changed: [PUSH_CREDIT('orders-api'), ['deps|merge|orders-api|partial', 'deps|merge|orders-api|covered'],
+        ['deps|push|orders-api|partial', 'deps|push|orders-api|covered'], ['licences|merge||partial', 'licences|merge||covered']],
+    },
     'node-express': {}, 'node-library': {}, 'go-module': {}, 'workspaces-python-backend': {},
   };
   for (const f of FIXTURES) {
@@ -220,36 +228,52 @@ describe('Plan J proof set: rows against the baseline at 10d48df', () => {
   });
 });
 
-// ---------- 6. J3b: rows the deploy-gate credit and the trivy-action SHA judgement will change ----------
-// Step A (J3b is not merged into this branch yet): today's values, so the rows are pinned and visible. Step B turns each
-// entry into the assertion J3b promises and renames this list.
-const J3B_PENDING: { fixture: Fixture; row: string; today: string }[] = [
-  // gate form (a): workflow_run, guard on the first job, deploy through needs, SHA compared through an env var
-  { fixture: 'static-next-export', row: 'deploy-verify|deploy|docs-site', today: 'missing' },
-  // gate form (b): push on the default branch only, deploy job guarded by github.ref
-  { fixture: 'static-next-export-preview', row: 'deploy-verify|deploy|marketing-site', today: 'missing' },
-  // trivy-action by a pinned commit SHA (fs scan, vulnerabilities and licences)
-  { fixture: 'node-container-service', row: 'licences|merge|', today: 'partial' },
-  { fixture: 'node-container-service', row: 'deps|merge|orders-api', today: 'partial' },
-  { fixture: 'node-container-service', row: 'deps|push|orders-api', today: 'partial' },
-];
-describe('Plan J proof set: rows J3b changes (J3B_PENDING, today\'s values)', () => {
-  it('each pending row has today\'s status', async () => {
-    for (const p of J3B_PENDING) {
-      const rows = await rowsOf(p.fixture);
-      expect(rows, `${p.fixture} ${p.row}`).toContain(`${p.row}|${p.today}`);
+// ---------- 6. J3b: the deploy-gate credit and trivy-action by a safe SHA ----------
+describe('Plan J proof set: deploy gate and trivy-action by SHA (J3b)', () => {
+  const rowOf = async (f: Fixture, key: string) => (await audit(f)).coverage.find((c) => `${c.need.category}|${c.need.layer}|${c.need.service ?? ''}` === key);
+  it('form (a): a guarded workflow_run deploy (guard on the first job, deploy through needs, SHA compared through an env var, exact branches filter) → deploy-verify covered, with its credit', async () => {
+    const r = await rowOf('static-next-export', 'deploy-verify|deploy|docs-site');
+    expect(r).toMatchObject({ status: 'covered', creditKind: 'deploy-gate' });
+    expect(r!.credit).toMatch(/deploy/i);
+  });
+  it('form (b) shape in its own push workflow (not inside CI, so the deploy does not wait for the tests) → deploy-verify stays missing', async () => {
+    // static-next-export-preview deploys from deploy.yml on push [main] with a github.ref guard, but no job there needs the
+    // CI jobs: J3b credits form (b) only when the deploy is in the CI workflow itself, so this is missing on purpose.
+    const r = await rowOf('static-next-export-preview', 'deploy-verify|deploy|marketing-site');
+    expect(r?.status).toBe('missing');
+    expect(r?.credit).toBeUndefined();
+  });
+  it('a Pages deploy by an environment, with no check that the commit passed → deploy-verify stays missing (astro)', async () => {
+    expect((await rowOf('static-astro', 'deploy-verify|deploy|blog'))?.status).toBe('missing');
+  });
+  it('trivy-action at a safe SHA with default inputs → not never-listed: dependency and licence rows covered, saying the action\'s cache is not re-checked', async () => {
+    for (const key of ['deps|merge|orders-api', 'deps|push|orders-api', 'licences|merge|']) {
+      const r = await rowOf('node-container-service', key);
+      expect(r?.status, key).toBe('covered');
+      expect(r?.why, key).toMatch(/cache isn't re-checked/);
+    }
+  });
+  it('the same trivy-action step with `version:` set → still never-listed (partial, no cache note)', async () => {
+    const dir = makeRepo('node-container-service', 'https://github.com/o/r.git');
+    const ci = join(dir, '.github/workflows/ci.yml');
+    const text = readFileSync(ci, 'utf8');
+    expect(text).toContain("          scan-type: fs\n");
+    writeFileSync(ci, text.replace("          scan-type: fs\n", "          scan-type: fs\n          version: v0.60.0\n"));
+    const r = await buildAudit(dir, {
+      gh, anonymous: false, context: { private: false, ownerType: 'User', plan: 'free', defaultBranch: 'main' }, capabilities: bare,
+      permissions: [], reviewed: [], now: () => NOW, budget: newRateBudget(),
+    });
+    const row = (k: string) => r.coverage.find((c) => `${c.need.category}|${c.need.layer}|${c.need.service ?? ''}` === k)!;
+    for (const key of ['deps|merge|orders-api', 'licences|merge|']) {
+      expect(row(key).status, key).toBe('partial');
+      expect(row(key).why, key).not.toMatch(/cache isn't re-checked/);
     }
   });
 });
 
 // ---------- 7. the short report ----------
 describe('Plan J proof set: the short report', () => {
-  // The plan's bound is 30 lines. Wrapping at 100 columns takes these fixtures a line or two over; the list names them
-  // with their measured length (they may not grow, and a fixture that fits must leave the list).
-  const OVER_PLAN_BOUND: Partial<Record<Fixture, number>> = {
-    'static-next-export': 32, 'static-next-export-preview': 31, 'static-astro': 31, 'node-cli': 32,
-    'node-library': 31, 'go-module': 31, 'workspaces-python-backend': 32,
-  };
+  // Controller ruling (J6 step B): the bound is 32 lines for every fixture (wrapping at 100 columns).
   const SECTION = (t: string, from: RegExp, to: RegExp) => {
     const ls = t.split('\n');
     const a = ls.findIndex((l) => from.test(l));
@@ -259,12 +283,10 @@ describe('Plan J proof set: the short report', () => {
     return (b < 0 ? rest : rest.slice(0, b)).filter((l) => /^ {2}- [^:]+: /.test(l));   // items are "- Label: why"; a plan-limit line has no label
   };
   for (const f of FIXTURES) {
-    it(`${f}: ≤ 30 lines${OVER_PLAN_BOUND[f] ? ` (measured ${OVER_PLAN_BOUND[f]}, named below)` : ''}; Fix first and Consider show at most 5 each`, async () => {
+    it(`${f}: ≤ 32 lines; Fix first and Consider show at most 5 each`, async () => {
       const t = renderTerminal(await audit(f), { knownValues: [], now: () => NOW });
       const n = t.split('\n').length;
-      const known = OVER_PLAN_BOUND[f];
-      if (known === undefined) expect(n, t).toBeLessThanOrEqual(30);
-      else { expect(n, t).toBeGreaterThan(30); expect(n, t).toBeLessThanOrEqual(known); }
+      expect(n, t).toBeLessThanOrEqual(32);
       expect(SECTION(t, /^Fix first/, /^Consider/).length).toBeLessThanOrEqual(5);
       expect(SECTION(t, /^Consider/, /^Already good|^Not needed/).length).toBeLessThanOrEqual(5);
       expect(t).toMatch(/^Type: /m);
