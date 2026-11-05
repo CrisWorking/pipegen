@@ -3,7 +3,7 @@
 // scanners as an archive bound by its sha256 (no registry write), the image base twin, the build-push binding, the created-path
 // alphabet, the vault fallback for PIPEGEN.md, and the reviewed-list values that could narrow a blocking scan (F2-R11).
 import { createHash } from 'node:crypto';
-import { Document } from 'yaml';
+import { Document, parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { aiChoiceNames, CODE_FILLED_CHOICES } from '../src/create/coverage.js';
 import { builderOffers } from '../src/debate/builder.js';
@@ -66,6 +66,16 @@ const digestDownload = (): RenderedStep => {
 };
 const SIGN_PERMS = { contents: 'read', [OIDC]: 'write', packages: 'write' };
 const VERIFY_PERMS = { contents: 'read', actions: 'read', packages: 'read', attestations: 'read' };
+/** A signing draft with the honest pipeline's checks too, so a caller file of jobsOf(draft) passes. */
+const withPipeline = (d: PipelineDraft): PipelineDraft => ({ ...d, needs: draftOf().needs, steps: draftOf().steps });
+const DEPLOY_ON_SIGN = { push: { branches: ['main'] }, pull_request: null, pull_request_review: { types: ['submitted', 'dismissed'] } };
+/** pipegen.yml with the honest pipeline and one caller job of `uses` (deploy condition and needs gate unless `over` says otherwise). */
+function deployCaller(d: PipelineDraft, uses: string, over: Record<string, unknown> = {}, on: unknown = DEPLOY_ON_SIGN, path = '.github/workflows/pipegen.yml'): CreatedFile {
+  const base = workflow(jobsOf(d), { on });
+  const doc = parseDocument(base.content);
+  doc.setIn(['jobs', 'signing'], doc.createNode({ uses, if: "github.event_name == 'push'", needs: ['gate'], permissions: { contents: 'read', [OIDC]: 'write', packages: 'write' }, ...over }));
+  return { ...base, path, content: doc.toString({ lineWidth: 0 }) };
+}
 const signFile = (jobs: Record<string, Job>): CreatedFile => ({ ...workflow(jobs, { on: { workflow_call: null } }), path: '.github/workflows/sign.yml' });
 
 describe('G2: signing and verification steps (B3 b, d)', () => {
@@ -103,7 +113,9 @@ describe('G2: signing and verification steps (B3 b, d)', () => {
     // the referee: the sign steps pass in the job sign (key-env in the signing environment), and nowhere else
     const keDraft = signingDraft(KEY_ENV);
     const signJob = (steps: RenderedStep[], over: Job = {}): Job => job([digestDownload(), ...steps], { permissions: SIGN_PERMS, environment: 'pipegen-signing', ...over });
-    expect(show(await runWith([signFile({ sign: signJob(keyEnv) })], keDraft))).toBe('');
+    // (G2-R-sec2: a sign job that writes to the registry is reached only from a deploy caller of pipegen.yml on a default-branch push)
+    const keFull = withPipeline(keDraft);
+    expect(show(await runWith([signFile({ sign: signJob(keyEnv) }), deployCaller(keFull, './.github/workflows/sign.yml')], keFull))).toBe('');
     for (const id of ['image-publish', 'pipegen-verify', 'deploy', 'base-scan']) {
       const perms = id === 'pipegen-verify' ? VERIFY_PERMS : SIGN_PERMS;
       const r = await runWith([signFile({ [id]: signJob(keyEnv, { permissions: perms, ...(id === 'pipegen-verify' ? {} : { environment: undefined }) }) })], keDraft);
@@ -661,5 +673,36 @@ describe('G2 fix round 1 (ruling G2-R1)', () => {
       const r = await runWith([action([...steps])], d);
       expect(has(r, 'permissions', /composite action/), `${name}: ${show(r)}`).toBe(true);
     }
+  });
+});
+
+describe('G2-R-sec2 (controller ruling): the sign job is held to the default-push rule', () => {
+  it('referee: a sign job with packages write outside a default-push context → refused', async () => {
+    const d = withPipeline(signingDraft(KEY_ENV));
+    const keyEnv = renderSignSteps(COSIGN, 'key-env', IMG);
+    const signJob = (over: Job = {}): Job => job([digestDownload(), ...keyEnv], { permissions: SIGN_PERMS, environment: 'pipegen-signing', ...over });
+    const refused = (r: { issues: { check: string; message: string }[] }): boolean => has(r, 'permissions', /writes to the image registry/);
+    const SIGN = './.github/workflows/sign.yml';
+    // allowed: reached only from a deploy caller of pipegen.yml; or the sign job itself a deploy job of pipegen.yml
+    expect(show(await runWith([signFile({ sign: signJob() }), deployCaller(d, SIGN)], d))).toBe('');
+    const inline = workflow({ ...jobsOf(d), sign: signJob({ if: DEPLOY_PUSH_IF, needs: ['gate'] }) }, { on: DEPLOY_ON_SIGN });
+    expect(show(await runWith([inline], d))).toBe('');
+    const cases: [string, CreatedFile[]][] = [
+      ['a called file nobody judged calls', [signFile({ sign: signJob() })]],
+      ['a caller without the deploy condition', [signFile({ sign: signJob() }), deployCaller(d, SIGN, { if: undefined })]],
+      ['a caller in a pull_request-only pipegen.yml', [signFile({ sign: signJob() }), deployCaller(d, SIGN, {}, { pull_request: null })]],
+      ['a second caller in another file', [signFile({ sign: signJob() }), deployCaller(d, SIGN), deployCaller(d, SIGN, { if: undefined, needs: [] }, { pull_request: null }, '.github/workflows/ci.yml')]],
+      ['the called file runs on its own trigger too', [{ ...workflow({ sign: signJob() }, { on: { workflow_call: null, push: { branches: ['main'] } } }), path: '.github/workflows/sign.yml' }, deployCaller(d, SIGN)]],
+      ['in pipegen.yml without the deploy condition', [workflow({ ...jobsOf(d), sign: signJob({ needs: ['gate'] }) }, { on: DEPLOY_ON_SIGN })]],
+      ['in a pull_request-only pipegen.yml', [workflow({ ...jobsOf(d), sign: signJob() })]],
+    ];
+    for (const [name, files] of cases) {
+      const r = await runWith(files, d);
+      expect(r.issues.some((i) => i.check === 'permissions' && /writes to the image registry/.test(i.message) && /the job "sign"/.test(i.message)), `${name}: ${show(r)}`).toBe(true);
+    }
+    // a sign job with no registry write (keyless, id-token only) is not held to it
+    const kl = withPipeline(signingDraft(KEYLESS));
+    const klJob = job([digestDownload(), ...renderSignSteps(COSIGN, 'keyless', IMG)], { permissions: { contents: 'read', [OIDC]: 'write' } });
+    expect(refused(await runWith([signFile({ sign: klJob })], kl))).toBe(false);
   });
 });

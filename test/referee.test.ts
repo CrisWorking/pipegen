@@ -93,6 +93,8 @@ const run = (files: CreatedFile[], d: PipelineDraft, opts: { list?: ReviewedTool
   referee(files, d, platform(), opts.list ?? [...reviewedList(), GATE], LINTERS, 'gh-stub', opts.deps ?? quiet);
 const checks = (r: RefereeReport): string[] => [...new Set(r.issues.map((i) => i.check))].sort();
 const has = (r: RefereeReport, check: RefereeIssue['check']): boolean => r.issues.some((i) => i.check === check);
+/** v0.2 Plan G G2-R-sec2: a permissions issue other than the registry-write placement rule (tests of the permission table itself use it). */
+const permsBesidesRegistry = (r: RefereeReport): boolean => r.issues.some((i) => i.check === 'permissions' && !/writes to the image registry/.test(i.message));
 const show = (r: RefereeReport): string => r.issues.map((i) => `${i.check}: ${i.message}`).join('\n');
 
 /** A small clean pipeline: gitleaks in its own job. */
@@ -168,7 +170,8 @@ describe('referee: the renderer and the referee agree', () => {
       co, download(),
       renderPlatformStep('docker-login', p, loginInputs(), { registry: 'ghcr.io' }),
       renderPlatformStep('attest', p, { 'subject-name': 'ghcr.io/o/app', 'subject-digest': `sha256:${'a'.repeat(64)}` }),
-    ], { permissions: { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' }, environment: 'pipegen-signing' });
+    // (v0.2 Plan G G2-R-sec2: a sign job that writes to the registry is a deploy job of the default-push pipegen.yml)
+    ], { permissions: { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' }, environment: 'pipegen-signing', if: DEPLOY_PUSH_IF, needs: ['gate'] });
     jobs['pipegen-verify'] = job([co, download(), gateAct('find-run')], { permissions: { contents: 'read', actions: 'read', packages: 'read', attestations: 'read' }, environment: 'pipegen-signing' });
     jobs.watch = job([co, watchAct], { permissions: { contents: 'read', issues: 'write', actions: 'read' } });
     jobs.notify = job([download()], { permissions: { contents: 'read', 'pull-requests': 'read', checks: 'read' } });
@@ -320,7 +323,8 @@ describe('referee: only reviewed tools, and only as their template', () => {
   it('referee: a renderer-filled input is judged by its own checker and condition (S15, whenWith)', async () => {
     const p = platform();
     const login = renderPlatformStep('docker-login', p, loginInputs(), { registry: 'ghcr.io' });
-    const perms = { permissions: { contents: 'read', packages: 'write' } };
+    // (G2-R-sec2: no packages: write here, which would make it a registry write outside a deploy job; the login's whenWith is the subject)
+    const perms = { permissions: { contents: 'read' } };
     // (v0.2 Plan G G2-R1 I3: image-publish writes to the registry only from a deploy job on a default-branch push, so the login is judged in the sign job, the other row that holds it)
     expect(show(await run([wf({ sign: job([login], perms) })], draftOf([])))).toBe('');
     const elsewhere = { ...login, with: { ...login.with, registry: 'evil.example' } };
@@ -411,7 +415,8 @@ describe('referee: permissions by exact job id', () => {
   });
   it('referee: job with packages: write outside sign job → permissions issue', async () => {
     expect(has(await withPerms('scan', { contents: 'read', packages: 'write' }), 'permissions')).toBe(true);
-    expect(has(await withPerms('sign', { contents: 'read', packages: 'write' }), 'permissions')).toBe(false);
+    // (G2-R-sec2: the sign job's packages: write is within its row; outside a deploy context it is a registry write, a rule of its own)
+    expect(permsBesidesRegistry(await withPerms('sign', { contents: 'read', packages: 'write' }))).toBe(false);
   });
   it('referee: base-scan with actions: read allowed; pipegen-verify with packages: read and attestations: read allowed; gate with pull-requests: read allowed; pr-check with pull-requests: read allowed', async () => {
     for (const [id, p] of [['base-scan', { contents: 'read', actions: 'read' }], ['pipegen-verify', { contents: 'read', actions: 'read', packages: 'read', attestations: 'read' }],
@@ -448,7 +453,7 @@ describe('referee: permissions by exact job id', () => {
     const called = wf({ sign: job([], { permissions: { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' } }) }, { on: { workflow_call: null } }, '.github/workflows/sign.yml');
     const caller = (perms: unknown): CreatedFile => wf({ release: { uses: './.github/workflows/sign.yml', permissions: perms } });
     const union = { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' };
-    expect(has(await run([caller(union), called], draftOf([g.spec])), 'permissions')).toBe(false);
+    expect(permsBesidesRegistry(await run([caller(union), called], draftOf([g.spec])))).toBe(false);   // (G2-R-sec2: the registry-write rule aside)
     expect(has(await run([caller({ ...union, issues: 'write' }), called], draftOf([g.spec])), 'permissions')).toBe(true);
     expect(has(await run([caller(union)], draftOf([g.spec])), 'unknown-pin')).toBe(true);   // the called file is not in files
   });
@@ -963,7 +968,7 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
   });
   it('A22: environment pipegen-signing only on sign and pipegen-verify', async () => {
     expect(has(await run([wf({ t: job(scriptSteps(), { environment: 'pipegen-signing' }) })], dScripts()), 'permissions')).toBe(true);
-    expect(has(await run([wf({ sign: job([], { permissions: SIGNP, environment: 'pipegen-signing' }) })], draftOf([])), 'permissions')).toBe(false);
+    expect(permsBesidesRegistry(await run([wf({ sign: job([], { permissions: SIGNP, environment: 'pipegen-signing' }) })], draftOf([])))).toBe(false);   // (G2-R-sec2: the registry-write rule aside)
   });
   it('A8: a secret value hidden by a YAML escape is found in the parsed scalars', async () => {
     const esc = fake.awsKey().replace(/^A/, '\\x41');

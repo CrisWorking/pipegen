@@ -966,21 +966,46 @@ function judgeJob(fc: FileCtx, id: string, j: unknown): void {
   judgeGateSteps(fc, id, where, j, judged);
   judgeSigningJob(fc, where, j, judged);
   judgeImageHandoff(fc, id, where, j, judged);
-  judgeRegistryWrite(fc, id, where, j, judged);
+  judgeRegistryWrite(fc, where, j, judged);
 }
 
 /**
- * G2-R1 I3 (B6: image-publish on a default-branch push only): a job that writes to the image registry (a build that pushes, or
- * `packages: write`) runs only as a deploy job of pipegen.yml with the deploy condition, so a pull request or a feature-branch push never
- * publishes the PR's code. The condition's own rules (deployIfProblem: pipegen.yml, a default-only push, needs the gate) hold it there.
- * The sign job's registry write (signatures) is reached through its caller job (G3 carry).
+ * G2-R1 I3 (B6: image-publish on a default-branch push only) and controller ruling G2-R-sec2: a job that writes to the image registry (a
+ * build that pushes, or `packages: write`, the sign job included) runs only in a default-branch-push context:
+ * - a deploy job of pipegen.yml with the deploy condition (deployIfProblem holds it to pipegen.yml, a default-only push and the gate); or
+ * - a job of a workflow whose only trigger is workflow_call and whose every caller among the judged files is a caller job of pipegen.yml
+ *   with the deploy condition and needs, in a pipegen.yml whose push is default-only (one level; at least one caller).
+ * Anything else, a context pipegen can not verify included, is refused (fail closed).
  */
-function judgeRegistryWrite(fc: FileCtx, id: string, where: string, j: Obj, judged: readonly Judged[]): void {
+function judgeRegistryWrite(fc: FileCtx, where: string, j: Obj, judged: readonly Judged[]): void {
   const pushes = judged.some((x) => x.entryId === BUILD_PUSH_ID && x.step.with?.push !== 'false');
-  const packages = id !== 'sign' && isObj(j.permissions) && j.permissions.packages === 'write';
+  const packages = isObj(j.permissions) && j.permissions.packages === 'write';
   if (!pushes && !packages) return;
   if (isCallerFile(fc) && j.if === DEPLOY_PUSH_IF) return;
-  fc.add(fc.file.path, 'permissions', `${where} writes to the image registry (${pushes ? 'a build that pushes' : 'packages: write'}), which pipegen does only in a deploy job of ${CALLER_WORKFLOW} with if: ${DEPLOY_PUSH_IF} (a push to the default branch), never on a pull request or a feature-branch push.`);
+  if (reachedOnlyFromDeployCallers(fc)) return;
+  fc.add(fc.file.path, 'permissions', `${where} writes to the image registry (${pushes ? 'a build that pushes' : 'packages: write'}), which pipegen does only in a deploy job of ${CALLER_WORKFLOW} with if: ${DEPLOY_PUSH_IF} (a push to the default branch), or in a called workflow reached only from such a caller job, never on a pull request or a feature-branch push.`);
+}
+
+/** G2-R-sec2: the file runs only on workflow_call, and every judged job that calls it is a caller job of pipegen.yml with the deploy condition. */
+function reachedOnlyFromDeployCallers(fc: FileCtx): boolean {
+  const triggers = triggersOf(fc.js.on);
+  if (triggers === null || triggers.length !== 1 || triggers[0] !== 'workflow_call') return false;
+  const me = fileKey(fc.file).toLowerCase();
+  let callers = 0;
+  for (const [key, parsed] of fc.others) {
+    const repo = key.slice(0, key.indexOf(':')) as CreatedFile['repo'];
+    const path = key.slice(key.indexOf(':') + 1);
+    const jobs = isObj(parsed.js.jobs) ? parsed.js.jobs : {};
+    for (const cj of Object.values(jobs)) {
+      if (!isObj(cj) || cj.uses === undefined) continue;
+      if (calledFileOf(fc, repo, cj.uses)?.key.toLowerCase() !== me) continue;
+      callers++;
+      // the caller job carries the deploy condition, in pipegen.yml whose push is default-only, and needs a job (deployIfProblem: the gate)
+      const defaultOnly = isObj(parsed.js.on) && isDefaultOnlyPush(parsed.js.on.push, fc.draft.profile.defaultBranch);
+      if (!(repo === 'app' && path === CALLER_WORKFLOW && cj.if === DEPLOY_PUSH_IF && defaultOnly && needsList(cj.needs).length > 0)) return false;
+    }
+  }
+  return callers > 0;
 }
 
 /** G2 (B3 b; Plan G Task 1): a key-env sign step reads the signing key, which lives in the signing environment only, so its job runs there. */
