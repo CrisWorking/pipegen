@@ -118,3 +118,28 @@ describe('the local record file (Plan V §5 item 2)', () => {
     await expect(writeLocalRecord({ owner: 'o', repo: 'r' }, { recordHash: 'f'.repeat(64), setupPr: 1, updatedAt: 'x' }, { home: h, env: {} })).rejects.toThrow(/symbolic link/);
   });
 });
+
+describe('install record schema, fix round 1 (m1-m3)', () => {
+  const API_BODY = (body: string): string => JSON.stringify(sampleRecord({ planned: { signingMode: 'none', environments: [], owners: { app: [], central: [] }, codeOwners: [], rulesets: { gate: { method: 'POST', route: '/repos/{owner}/{repo}/rulesets', params: { owner: 'o', repo: 'r' }, body: { name: 'pipegen' } } } } })).replace('"body":{"name":"pipegen"}', body);
+  it('m1: a prototype key in a free-form field is refused, never dropped', () => {
+    expect(() => parseRecord(API_BODY('"body":{"name":"pipegen"}'))).not.toThrow();
+    for (const k of ['__proto__', 'constructor', 'prototype']) expect(() => parseRecord(API_BODY(`"body":{"${k}":{"x":1},"name":"pipegen"}`)), k).toThrow(RecordError);
+  });
+  it('m2: a hostile nesting depth is a plain record error', () => {
+    for (const depth of [40, 2000, 20000]) {
+      const deep = '['.repeat(depth) + ']'.repeat(depth);
+      expect(() => parseRecord(API_BODY(`"body":{"d":${deep},"name":"pipegen"}`)), String(depth)).toThrow(/nests deeper/);
+    }
+  });
+  it('m3: duplicate entries, a name that is not the project\'s, and paths outside the repo are refused', () => {
+    const r = sampleRecord();
+    expect(() => parseRecord(JSON.stringify({ ...r, files: [...r.files, r.files[0]] }))).toThrow(RecordError);
+    expect(() => parseRecord(JSON.stringify({ ...r, [SEC]: [...r.secrets, r.secrets[0]] }))).toThrow(RecordError);
+    expect(() => parseRecord(JSON.stringify({ ...r, name: 'other' }))).toThrow(RecordError);
+    for (const bad of ['../../etc', '/abs', 'a/../b', 'a\\b']) {
+      expect(() => parseRecord(JSON.stringify({ ...r, serviceRoots: [bad] })), bad).toThrow(RecordError);
+      expect(() => parseRecord(JSON.stringify({ ...r, protectedPaths: [bad] })), bad).toThrow(RecordError);
+    }
+    expect(parseRecord(JSON.stringify({ ...r, serviceRoots: ['.', 'api', 'svc/web'], protectedPaths: ['.github/workflows/**', '**/x.yml'] })).serviceRoots).toEqual(['.', 'api', 'svc/web']);
+  });
+});

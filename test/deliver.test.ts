@@ -92,6 +92,10 @@ function locks(over: Partial<LockPlan> = {}): LockPlan {
 }
 
 interface World { g: FakeGitHub; home: string; vault: SecretVault; asked: string[] }
+/** The world input() reads the central file list from (the last one made); a test with several worlds passes the list itself. */
+let current: World | null = null;
+const centralList = (w: World): string[] => [...w.g.filesAt('o/pipelines', w.g.head('o/pipelines')).keys()].sort();
+const cdeps = (w: World) => ({ local: { home: w.home, env: {} } });
 const homes: string[] = [];
 afterEach(() => { for (const d of homes.splice(0)) rmSync(d, { recursive: true, force: true }); });
 function world(opts: { appPrivate?: boolean; centralPrivate?: boolean; appFiles?: Record<string, string>; modes?: Record<string, string>; repo?: string } = {}): World {
@@ -102,7 +106,8 @@ function world(opts: { appPrivate?: boolean; centralPrivate?: boolean; appFiles?
   homes.push(home);
   const vault = new SecretVault();
   vault.set(KEY, KEY_VALUE);
-  return { g, home, vault, asked: [] };
+  current = { g, home, vault, asked: [] };
+  return current;
 }
 function io(w: World, answers: { confirmRunCode?: boolean; replace?: boolean } = {}): Prompter {
   return {
@@ -118,13 +123,14 @@ function input(p: RepoProfile, pin: string | null, over: Partial<DeliveryInput> 
   return {
     draft: draftOf(p, pin, draftOver), files: [...(pin === null ? [] : centralFiles()), ...appFiles(pin)], locks: locks(), ...({ [['secret', 'Names'].join('')]: NAMES_IN } as unknown as Pick<DeliveryInput, 'secretNames'>),
     protectedPaths: ['.github/workflows/**', 'CODEOWNERS'], environments: [{ name: 'production', reviewers: true }],
-    proofRepos: { central: { repoId: 77, createdByPipegen: true }, scratch: { createdByPipegen: true } }, ...over,
+    proofRepos: { central: { repoId: 77, createdByPipegen: true }, scratch: { createdByPipegen: true } },
+    ...(current === null ? {} : { centralFileList: centralList(current) }), ...over,
   };
 }
 /** The first run of a private app: the central commit, then the app delivery. */
 async function firstRun(w: World, over: Partial<DeliveryInput> = {}, dOver: Partial<DeliverDeps> = {}, answers: Parameters<typeof io>[1] = {}, draftOver: Partial<PipelineDraft> = {}) {
   const p = profile();
-  const c = await deliverCentral(w.g.octokit(), p, centralFiles(), { clock: { budget: newRateBudget(), sleep: async () => {} } });
+  const c = await deliverCentral(w.g.octokit(), p, centralFiles(), { clock: { budget: newRateBudget(), sleep: async () => {} }, ...cdeps(w) });
   if (c.kind !== 'pinned') throw new Error('expected a pin');
   const plan = planDelivery(input(p, c.sha, over, draftOver));
   const res = await deliver(w.g.octokit(), p, plan, w.vault, deps(w, dOver, answers));
@@ -205,7 +211,7 @@ describe('G10 delivery: what goes out', () => {
     const p = profile();
     const v2 = new SecretVault();
     v2.set(KEY, KEY_VALUE);
-    const pin = (await deliverCentral(w.g.octokit(), p, centralFiles(), {}) as { sha: string }).sha;
+    const pin = (await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w)) as { sha: string }).sha;
     const again = appFiles(pin, { withPkg: false }).filter((f) => f.edited === undefined && f.inserted === undefined).map((f) => (f.path === 'Dockerfile' ? { ...f, content: 'FROM node:26\n' } : f));
     await deliver(w.g.octokit(), p, planDelivery(input(p, pin, { files: [...centralFiles(), ...again], locks: locks({ codeowners: undefined }) })), v2, deps(w));
     const hist2 = w.g.history('o/r', w.g.head('o/r', SETUP_BRANCH), merged);
@@ -216,7 +222,7 @@ describe('G10 delivery: what goes out', () => {
     const w = world();
     const extra = [cf('pipegen-planted/secrets.py', 'x = 1\n', 'pipeline'), cf(HARNESS_PATH, 'on: push\n', 'pipeline'), cf(`${COMPAT_PREFIX}ci.yml`, 'on: push\n', 'pipeline')];
     const p = profile();
-    const c = await deliverCentral(w.g.octokit(), p, centralFiles(), {});
+    const c = await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w));
     if (c.kind !== 'pinned') throw new Error('pin');
     const base = input(p, c.sha);
     const plan = planDelivery({ ...base, files: [...base.files, ...extra] });
@@ -286,7 +292,7 @@ describe('G10 delivery: central and the pin (S26)', () => {
     await expect(deliver(w.g.octokit(), p, planDelivery(input(p, side)), w.vault, deps(w))).rejects.toThrow(/not on the default branch/);
     expect(w.g.calls.slice(before).filter((c) => !c.route.startsWith('GET '))).toEqual([]);
     // on the default branch, but its tree doesn't hold the central files that were judged
-    const c = await deliverCentral(w.g.octokit(), p, centralFiles(), {});
+    const c = await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w));
     if (c.kind !== 'pinned') throw new Error('pin');
     const other = input(p, c.sha);
     await expect(deliver(w.g.octokit(), p, planDelivery({ ...other, files: [...centralFiles(' # changed'), ...appFiles(c.sha)] }), w.vault, deps(w))).rejects.toThrow(/doesn't hold/);
@@ -307,7 +313,7 @@ describe('G10 delivery: central and the pin (S26)', () => {
     const v2 = new SecretVault();
     v2.set(KEY, KEY_VALUE);
     const p = profile();
-    const c2 = await deliverCentral(w.g.octokit(), p, centralFiles(), {});
+    const c2 = await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w));
     expect(c2).toEqual({ kind: 'pinned', sha: first.pin, done: [] });
     const res2 = await deliver(w.g.octokit(), p, planDelivery(input(p, first.pin)), v2, deps(w));
     expect(res2.prNumber).toBe(first.res.prNumber);
@@ -315,7 +321,7 @@ describe('G10 delivery: central and the pin (S26)', () => {
     expect(res2.centralPrUrl).toMatch(/o\/pipelines\/pull\/1$/);
     // a third run with changed central files: a central PR first, and a stop before the app PR
     const before = w.g.calls.length;
-    const c3 = await deliverCentral(w.g.octokit(), p, centralFiles(' # v2'), {});
+    const c3 = await deliverCentral(w.g.octokit(), p, centralFiles(' # v2'), cdeps(w));
     expect(c3.kind).toBe('central-pr');
     if (c3.kind === 'central-pr') expect(c3.message).toMatch(/merge the central PR, then run (pipegen )?again/i);
     expect(w.g.calls.slice(before).some((x) => x.params.repo === 'r' && !x.route.startsWith('GET '))).toBe(false);
@@ -328,7 +334,7 @@ describe('G10 delivery: central and the pin (S26)', () => {
     // G8 carry: the required workflow calls the merge workflow AT the pinned commit, so it can't be in that commit; it goes in the next one
     const w = world();
     const p = profile();
-    const c = await deliverCentral(w.g.octokit(), p, centralFiles(), {});
+    const c = await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w));
     if (c.kind !== 'pinned') throw new Error('pin');
     const reqFile = cf('.github/workflows/r--required.yml', `on: { pull_request: null }\njobs:\n  pipegen-required: { uses: o/pipelines/.github/workflows/r--merge.yml@${c.sha} }\n`, 'pipeline', { repo: 'central' });
     const coFile = cf('.github/CODEOWNERS', '# pipegen:begin\n.github/workflows/** @a @b\n# pipegen:end\n', 'codeowners', { repo: 'central', edited: { original: '' } });
@@ -367,7 +373,7 @@ describe('G10 delivery: central and the pin (S26)', () => {
   it('deliver: record written through a central PR once the central ruleset exists', async () => {
     const w = world();
     const p = profile();
-    const c = await deliverCentral(w.g.octokit(), p, centralFiles(), {});
+    const c = await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w));
     if (c.kind !== 'pinned') throw new Error('pin');
     w.g.repo('o/pipelines').rules = [{ type: 'pull_request', ruleset_id: 9 }];
     const centralHead = w.g.head('o/pipelines');
@@ -398,7 +404,7 @@ describe('G10 delivery: the record', () => {
     const noRule = locks({ codeowners: undefined, rulesets: { gate: req('/repos/{owner}/{repo}/rulesets', 'pipegen'), reviews: req('/repos/{owner}/{repo}/rulesets', 'pipegen-reviews', { rules: [{ type: 'pull_request', parameters: { require_code_owner_review: false } }] }) }, owners: { app: [], central: ['@a', '@b'] } });
     const w2 = world();
     const p = profile();
-    const c = await deliverCentral(w2.g.octokit(), p, centralFiles(), {});
+    const c = await deliverCentral(w2.g.octokit(), p, centralFiles(), cdeps(w2));
     if (c.kind !== 'pinned') throw new Error('pin');
     const plan2 = planDelivery(input(p, c.sha, { locks: noRule, files: [...centralFiles(), ...appFiles(c.sha).filter((f) => f.path !== 'CODEOWNERS')] }));
     expect(previewText(plan2)).not.toContain('@a');
@@ -432,7 +438,7 @@ describe('G10 delivery: the record', () => {
     const p = profile();
     const v2 = new SecretVault();
     v2.set(KEY, KEY_VALUE);
-    const pin = (await deliverCentral(w.g.octokit(), p, centralFiles(), {}) as { sha: string }).sha;
+    const pin = (await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w)) as { sha: string }).sha;
     const plan2 = planDelivery(input(p, pin, { files: [...centralFiles(), ...appFiles(pin).map((f) => (f.path === 'Dockerfile' ? { ...f, content: 'FROM node:26\n' } : f))] }));
     await deliver(w.g.octokit(), p, plan2, v2, deps(w));
     const r2 = await record(w, `pipegen/update-${centralProjectName('r')}`);
@@ -592,19 +598,23 @@ describe('G10 delivery: secrets and settings before the merge', () => {
 
   it('deliver: a record found only on the central PR branch is trusted only when its hash matches the local record file (G10-R-sec, G10-R-sec2)', async () => {
     const upd = `pipegen/update-${centralProjectName('r')}`;
-    const rerun = async (w: World): Promise<Awaited<ReturnType<typeof deliver>>> => {
+    const pins = new Map<World, string>();
+    /** A re-run; `untrusted`: deliverCentral must refuse (it can't show the central files are pipegen's), and the delivery uses the earlier pin. */
+    const rerun = async (w: World, untrusted = false): Promise<Awaited<ReturnType<typeof deliver>>> => {
       const p = profile();
       const v = new SecretVault();
       v.set(KEY, KEY_VALUE);
-      const pin = (await deliverCentral(w.g.octokit(), p, centralFiles(), {}) as { sha: string }).sha;
+      if (untrusted) await expect(deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w))).rejects.toThrow(/no install record pipegen trusts/);
+      const pin = untrusted ? pins.get(w) as string : (await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w)) as { sha: string }).sha;
       const files = [...centralFiles(), ...appFiles(pin).map((f) => (f.path === 'Dockerfile' ? { ...f, content: 'FROM node:26\n' } : f))];
-      return deliver(w.g.octokit(), p, planDelivery(input(p, pin, { files })), v, deps(w, {}, { replace: true }));
+      return deliver(w.g.octokit(), p, planDelivery(input(p, pin, { files, centralFileList: centralList(w) })), v, deps(w, {}, { replace: true }));
     };
     const setup = async (): Promise<World> => {
       const w = world();
       const p = profile();
-      const c = await deliverCentral(w.g.octokit(), p, centralFiles(), {});
+      const c = await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w));
       w.g.repo('o/pipelines').rules = [{ type: 'pull_request' }];   // the record goes to the central PR branch only
+      pins.set(w, (c as { sha: string }).sha);
       await deliver(w.g.octokit(), p, planDelivery(input(p, (c as { sha: string }).sha)), w.vault, deps(w));
       expect(await record(w)).toBeUndefined();
       return w;
@@ -624,7 +634,7 @@ describe('G10 delivery: secrets and settings before the merge', () => {
     // the PR marker is never a trust source (any app writer can edit the body): no local file + a matching marker → untrusted
     const w2 = await setup();
     rmSync(join(w2.home, '.config', 'pipegen', 'records', 'o__r.json'));
-    const res2 = await rerun(w2);
+    const res2 = await rerun(w2, true);
     expect(res2.notes.join('\n')).toMatch(/can't be checked from this machine/);
     expect((await record(w2, upd))?.files.find((f) => f.path === 'Dockerfile')?.shas).toEqual([gitBlobSha('FROM node:26\n')]);
     // a local file whose hash differs + a matching marker → untrusted
@@ -632,14 +642,14 @@ describe('G10 delivery: secrets and settings before the merge', () => {
     const file = join(w5.home, '.config', 'pipegen', 'records', 'o__r.json');
     writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf8')), recordHash: 'e'.repeat(64) }));
     expect(w5.g.repo('o/r').pulls[0]?.body.split('\n').at(-1)).toMatch(/record-sha256=/);
-    expect((await rerun(w5)).notes.join('\n')).toMatch(/doesn't match/);
+    expect((await rerun(w5, true)).notes.join('\n')).toMatch(/doesn't match/);
     expect((await record(w5, upd))?.secrets.find((s) => s.name === KEY)).toMatchObject({ created: false, overwritten: true });
     // a record planted on the branch (someone with write on the central repo changed it): claims nothing
     const w3 = await setup();
     const planted = { ...(await record(w3, upd) as NonNullable<Awaited<ReturnType<typeof record>>>) };
     planted.files.push({ repo: 'app', path: 'README.md', part: 'docs', shas: [gitBlobSha('hi\n')] });
     w3.g.commitOn('o/pipelines', upd, { [recordPath('r')]: JSON.stringify(planted) });
-    const res3 = await rerun(w3);
+    const res3 = await rerun(w3, true);
     expect(res3.notes.join('\n')).toMatch(/central pull request branch.*doesn't match/i);
     const r3 = await record(w3, upd);
     expect(r3?.files.some((f) => f.path === 'README.md')).toBe(false);
@@ -672,5 +682,205 @@ describe('G10 delivery: secrets and settings before the merge', () => {
     expect(slept).toEqual([3000]);   // retry-after 2 s plus the reset margin
     expect(budget.remainingMs).toBe(117_000);
     expect(w.g.repo('o/r').stored.has(KEY)).toBe(true);
+  });
+});
+
+describe('G10 fix round 1 (review-G10, ruling G10-R2)', () => {
+  const upd = `pipegen/update-${centralProjectName('r')}`;
+  const localFile = (w: World): string => join(w.home, '.config', 'pipegen', 'records', 'o__r.json');
+  const fresh = (...names: string[]): SecretVault => { const v = new SecretVault(); v.set(KEY, KEY_VALUE); for (const n of names) v.set(n, 'n'.repeat(30)); return v; };
+  type Rec = NonNullable<Awaited<ReturnType<typeof record>>>;
+
+  it('fix 1: a record on the central default branch that nothing vouches for, before finish, is claimed from nothing (I1, A4)', async () => {
+    const w = world();
+    const first = await firstRun(w);
+    const planted = structuredClone(await record(w) as Rec);
+    planted.files.push({ repo: 'app', path: 'README.md', part: 'docs', shas: [gitBlobSha('hi\n')] });
+    const co = planted.edits.find((e) => e.path === 'CODEOWNERS') as { originalSha: string | null };
+    co.originalSha = 'a'.repeat(40);
+    planted.secrets.push({ name: 'PROD_DB', scope: 'repo', created: true, githubCreatedAt: '2025-01-01T00:00:00Z' });
+    w.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: JSON.stringify(planted) });
+    const p = profile();
+    // the central step can't show its files are pipegen's any more: a stop, nothing written
+    const before = w.g.calls.length;
+    await expect(deliverCentral(w.g.octokit(), p, centralFiles(' # v2'), cdeps(w))).rejects.toThrow(/no install record pipegen trusts/);
+    expect(w.g.calls.slice(before).filter((c) => !c.route.startsWith('GET '))).toEqual([]);
+    const res = await deliver(w.g.octokit(), p, planDelivery(input(p, first.pin)), fresh(), deps(w, {}, { replace: true }));
+    expect(res.notes.join('\n')).toMatch(/default branch main of o\/pipelines doesn't match the hash in this machine's local record file.*claims nothing/);
+    const after = await record(w, upd) as Rec;
+    expect(after.files.some((f) => f.path === 'README.md')).toBe(false);
+    expect(after.edits.find((e) => e.path === 'CODEOWNERS')?.originalSha).toBe(gitBlobSha(CO_ORIG));
+    expect(after.secrets.some((s) => s.name === 'PROD_DB')).toBe(false);
+    // what pipegen vouches for next holds only what this run proved
+    expect(JSON.parse(readFileSync(localFile(w), 'utf8')).recordHash).toBe(recordHash(after));
+  });
+
+  it('fix 1: with no local record file, the default-branch record is trusted only when it was merged through a PR after pipegen\'s central ruleset existed (G10-R-sec3)', async () => {
+    const RULESET_AT = '2026-11-20T00:00:00Z';
+    /** The record commit on main, and how it got there: `pr` a merged PR at that server time, or null (pushed directly). */
+    const make = async (o: { local?: 'none' | 'mismatch'; bypass?: unknown[]; pr?: string | null; base?: string }): Promise<World> => {
+      const w = world();
+      await firstRun(w);   // the record commit is the head of the central default branch
+      const central = w.g.repo('o/pipelines');
+      if (o.pr !== null && o.pr !== undefined) central.commitPulls.set(w.g.head('o/pipelines'), [{ number: 3, merged_at: o.pr, base: { ref: o.base ?? 'main' } }]);
+      if ((o.local ?? 'none') === 'none') rmSync(localFile(w));
+      else writeFileSync(localFile(w), JSON.stringify({ ...JSON.parse(readFileSync(localFile(w), 'utf8')), recordHash: 'e'.repeat(64) }));
+      central.rules = [{ type: 'pull_request', ruleset_id: 9 }];
+      central.rulesets.set(9, { name: 'pipegen', enforcement: 'active', bypass_actors: o.bypass ?? [], created_at: RULESET_AT });
+      return w;
+    };
+    const p = profile();
+    // merged through a PR after the ruleset was created: trusted
+    const w = await make({ pr: '2026-12-01T00:00:00Z' });
+    const pin = (await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w)) as { sha: string }).sha;
+    const files = [...centralFiles(), ...appFiles(pin).map((f) => (f.path === 'Dockerfile' ? { ...f, content: 'FROM node:26\n' } : f))];
+    const res = await deliver(w.g.octokit(), p, planDelivery(input(p, pin, { files })), fresh(), deps(w));
+    expect(res.notes).toEqual([]);
+    expect((await record(w, upd))?.files.find((f) => f.path === 'Dockerfile')?.shas).toEqual([gitBlobSha('FROM node:24\n'), gitBlobSha('FROM node:26\n')]);
+    expect(w.g.calls.some((c) => c.route === 'GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls')).toBe(true);
+    // pushed directly (no PR), merged before the ruleset existed, a ruleset with a bypass actor, or a local file that matches neither: untrusted
+    for (const o of [{ pr: null }, { pr: '2026-11-10T00:00:00Z' }, { pr: '2026-12-01T00:00:00Z', base: 'side' }, { pr: '2026-12-01T00:00:00Z', bypass: [{ actor_id: 1, actor_type: 'RepositoryRole', bypass_mode: 'always' }] }, { pr: '2026-12-01T00:00:00Z', local: 'mismatch' as const }]) {
+      const w2 = await make(o);
+      await expect(deliverCentral(w2.g.octokit(), p, centralFiles(), cdeps(w2)), JSON.stringify(o)).rejects.toThrow(o.local === 'mismatch' ? /doesn't match the hash in this machine's local record file/ : /can't be checked from this machine/);
+    }
+  });
+
+  for (const merged of [false, true]) {
+    it(`fix 1: a newer record the local file vouches for wins over an older one on the default branch (I3, B1${merged ? ', setup PR merged' : ''})`, async () => {
+      const w = world();
+      await firstRun(w);   // run 1: the record committed on the central default branch
+      const p = profile();
+      const run = async (docker: string) => {
+        const pin = (await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w)) as { sha: string }).sha;
+        const files = [...centralFiles(), ...appFiles(pin, { withPkg: false }).filter((f) => f.edited === undefined && f.inserted === undefined).map((f) => (f.path === 'Dockerfile' ? { ...f, content: docker } : f))];
+        return deliver(w.g.octokit(), p, planDelivery(input(p, pin, { files, locks: locks({ codeowners: undefined }), ...({ [['secret', 'Names'].join('')]: [KEY, 'NEW_ONE'] } as unknown as Pick<DeliveryInput, 'secretNames'>) })), fresh('NEW_ONE'), deps(w, {}, { replace: true }));
+      };
+      await run('FROM node:26\n');   // run 2: the record through the central PR; NEW_ONE created
+      expect((await record(w, upd))?.secrets.find((s) => s.name === 'NEW_ONE')?.created).toBe(true);
+      if (merged) w.g.repo('o/r').refs.set('heads/main', w.g.head('o/r', SETUP_BRANCH));
+      const res3 = await run('FROM node:28\n');
+      expect(res3.notes).toEqual([]);
+      const r3 = await record(w, upd) as Rec;
+      expect(r3.secrets.find((s) => s.name === 'NEW_ONE')?.created).toBe(true);
+      expect(r3.files.find((f) => f.path === 'Dockerfile')?.shas).toEqual(['FROM node:24\n', 'FROM node:26\n', 'FROM node:28\n'].map(gitBlobSha));
+    });
+  }
+
+  it('fix 1: a central workflow pipegen didn\'t write is never replaced or claimed (I2, A5)', async () => {
+    const w = world();
+    w.g.commitOn('o/pipelines', 'main', { '.github/workflows/r--merge.yml': 'name: the user own workflow\n' });
+    const p = profile();
+    const before = w.g.calls.length;
+    await expect(deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w))).rejects.toThrow(/r--merge\.yml already exists in o\/pipelines/);
+    expect(w.g.calls.slice(before).filter((c) => !c.route.startsWith('GET '))).toEqual([]);
+    // a pin someone else made over the user's file: deliver won't record it as pipegen's
+    const pin = w.g.commitOn('o/pipelines', 'main', Object.fromEntries(centralFiles().map((f) => [f.path, f.content])));
+    const b2 = w.g.calls.length;
+    await expect(deliver(w.g.octokit(), p, planDelivery(input(p, pin)), w.vault, deps(w))).rejects.toThrow(/pinned central commit holds .*r--merge\.yml.*no install record pipegen trusts/);
+    expect(w.g.calls.slice(b2).filter((c) => !c.route.startsWith('GET '))).toEqual([]);
+  });
+
+  it('fix 1: the judged central file list must be given, not empty, and the central tree it is written on (I4)', async () => {
+    const w = world();
+    const p = profile();
+    const c = await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w));
+    const pin = (c as { sha: string }).sha;
+    const base = input(p, pin);
+    const { centralFileList: _l, ...without } = base;
+    expect(() => planDelivery(without)).toThrow(/file list.*missing or empty/);
+    expect(() => planDelivery({ ...base, centralFileList: [] })).toThrow(/file list.*missing or empty/);
+    // a public app delivering no central file needs none
+    const pub = profile({ private: false });
+    const { centralFileList: _m, ...pubIn } = input(pub, null);
+    expect(planDelivery(pubIn).centralFileList).toBeNull();
+    const before = w.g.calls.length;
+    await expect(deliver(w.g.octokit(), p, planDelivery({ ...base, centralFileList: [...centralList(w), 'other.txt'] }), w.vault, deps(w))).rejects.toThrow(/central repo's files changed since its CODEOWNERS was checked/);
+    expect(w.g.calls.slice(before).filter((c2) => !c2.route.startsWith('GET '))).toEqual([]);
+    await deliver(w.g.octokit(), p, planDelivery(base), fresh(), deps(w));
+  });
+
+  it('fix 1: declining to replace an existing signing key pair stops before any write (m4, A7)', async () => {
+    const w = world();
+    w.g.repo('o/r').envs.set('pipegen-signing', { id: 5, created_at: '2026-01-01T00:00:00Z', wait_timer: 0, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: { protected_branches: false, custom_branch_policies: true }, policies: [{ id: 1, name: 'main', type: 'branch' }], stored: new Map([['PIPEGEN_COSIGN_KEY', '2026-01-01T00:00:00Z']]) });
+    const signing = { signing: { mode: 'key-env' as const, images: [], cosignPubSha256: pubKeySha256(SIGNING.pub) } };
+    const before = w.g.calls.length;
+    await expect(firstRun(w, {}, { signingKey: async () => SIGNING }, { replace: false }, signing)).rejects.toThrow(/stopped before writing anything.*PIPEGEN_COSIGN_KEY/);
+    expect(w.g.calls.slice(before).filter((c) => !c.route.startsWith('GET ') && c.params.repo === 'r')).toEqual([]);
+    // a yes replaces the pair, asked once
+    const w2 = world();
+    w2.g.repo('o/r').envs.set('pipegen-signing', { id: 5, created_at: '2026-01-01T00:00:00Z', wait_timer: 0, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: { protected_branches: false, custom_branch_policies: true }, policies: [{ id: 1, name: 'main', type: 'branch' }], stored: new Map([['PIPEGEN_COSIGN_KEY', '2026-01-01T00:00:00Z']]) });
+    await firstRun(w2, {}, { signingKey: async () => SIGNING }, { replace: true }, signing);
+    expect(w2.asked.filter((q) => q.includes('PIPEGEN_COSIGN_KEY')).length).toBe(1);
+    expect(w2.g.calls.filter((c) => c.route.startsWith('PUT ') && String(nameOf(c)).startsWith('PIPEGEN_COSIGN')).length).toBe(2);
+  });
+
+  it('fix 1: a central change that runs code is left out on a no, as the preview says (m5)', async () => {
+    const w = world();
+    const p = profile();
+    const pin = (await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w)) as { sha: string }).sha;
+    const co = cf('.github/CODEOWNERS', '# pipegen:begin\n.github/workflows/** @a @b\n# pipegen:end\n', 'codeowners', { repo: 'central', edited: { original: '' }, needsConfirm: true });
+    const plan = planDelivery(input(p, pin, { files: [...centralFiles(), co, ...appFiles(pin)] }));
+    expect(previewText(plan).slice(previewText(plan).indexOf('Changes that run code'))).toContain('.github/CODEOWNERS');
+    await deliver(w.g.octokit(), p, plan, w.vault, deps(w, {}, { confirmRunCode: false }));
+    expect(w.g.filesAt('o/pipelines', w.g.head('o/pipelines')).has('.github/CODEOWNERS')).toBe(false);
+    expect((await record(w))?.edits.some((e) => e.repo === 'central')).toBe(false);
+  });
+
+  it('fix 1: what was stored before a stop is named, and kept in the local leftovers file (m6)', async () => {
+    const w = world();
+    w.g.hooks.push((c) => (c.route === 'POST /repos/{owner}/{repo}/pulls' && c.params.repo === 'r' ? { status: 500 } : undefined));
+    const err = await firstRun(w).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(DeliverError);
+    const leftovers = (err as DeliverError).leftovers;
+    expect(leftovers).toEqual(expect.arrayContaining([`secret repo ${FP}`, `secret repo ${KEY}`, `branch ${SETUP_BRANCH}`]));
+    expect((err as DeliverError).message).toMatch(/Before it stopped, pipegen had stored: .*leftovers\.json/);
+    const text = readFileSync(join(w.home, '.config', 'pipegen', 'records', 'o__r.leftovers.json'), 'utf8');
+    const items = JSON.parse(text).items as { kind: string; name: string; githubCreatedAt?: string }[];
+    expect(items.map((x) => x.name)).toEqual(expect.arrayContaining([FP, KEY, SETUP_BRANCH]));
+    expect(items.find((x) => x.name === KEY)?.githubCreatedAt).toBe(w.g.repo('o/r').stored.get(KEY));
+    expect(text).not.toContain(KEY_VALUE);
+    expect(w.vault.names()).toEqual([]);
+  });
+
+  it('fix 1: the central CODEOWNERS is written only onto the head its original was checked against (m7)', async () => {
+    const w = world();
+    const p = profile();
+    const pin = (await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w)) as { sha: string }).sha;
+    const co = cf('.github/CODEOWNERS', '# pipegen:begin\n.github/workflows/** @a @b\n# pipegen:end\n', 'codeowners', { repo: 'central', edited: { original: '' } });
+    // someone adds a central CODEOWNERS after pipegen checked the central tree
+    w.g.hooks.push((c) => { if (c.route === 'POST /repos/{owner}/{repo}/pulls' && c.params.repo === 'r') w.g.commitOn('o/pipelines', 'main', { '.github/CODEOWNERS': '* @mallory\n' }); return undefined; });
+    await expect(deliver(w.g.octokit(), p, planDelivery(input(p, pin, { files: [...centralFiles(), co, ...appFiles(pin)] })), w.vault, deps(w))).rejects.toThrow(/changed while pipegen was delivering/);
+    expect(w.g.filesAt('o/pipelines', w.g.head('o/pipelines')).get('.github/CODEOWNERS')).toBe('* @mallory\n');
+  });
+
+  it('fix 1: a central file is never written onto an unmerged central PR branch that holds another version of it (m8)', async () => {
+    const w = world();
+    await firstRun(w);
+    // someone's unmerged commit on the central PR branch adds its own central CODEOWNERS
+    const central = w.g.repo('o/pipelines');
+    central.refs.set(`heads/${upd}`, w.g.head('o/pipelines'));
+    w.g.commitOn('o/pipelines', upd, { '.github/CODEOWNERS': '* @mallory\n' });
+    const p = profile();
+    const pin = (await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w)) as { sha: string }).sha;
+    const co = cf('.github/CODEOWNERS', '# pipegen:begin\n.github/workflows/** @a @b\n# pipegen:end\n', 'codeowners', { repo: 'central', edited: { original: '' } });
+    await expect(deliver(w.g.octokit(), p, planDelivery(input(p, pin, { files: [...centralFiles(), co, ...appFiles(pin)] })), fresh(), deps(w))).rejects.toThrow(/holds another \.github\/CODEOWNERS than the default branch/);
+    expect(w.g.filesAt('o/pipelines', w.g.head('o/pipelines', upd)).get('.github/CODEOWNERS')).toBe('* @mallory\n');
+  });
+
+  it('fix 1: the central PR branch is never force-moved over an unmerged record commit (m8)', async () => {
+    const w = world();
+    await firstRun(w);
+    const p = profile();
+    const pin = (await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w)) as { sha: string }).sha;
+    await deliver(w.g.octokit(), p, planDelivery(input(p, pin)), fresh(), deps(w));   // run 2: the record on the central PR branch
+    const recordCommit = w.g.head('o/pipelines', upd);
+    const c3 = await deliverCentral(w.g.octokit(), p, centralFiles(' # v2'), cdeps(w));
+    expect(c3.kind).toBe('central-pr');
+    const hist = w.g.history('o/pipelines', w.g.head('o/pipelines', upd));
+    expect(hist.map((x) => x.sha)).toContain(recordCommit);
+    expect(w.g.calls.filter((c) => c.route === 'PATCH /repos/{owner}/{repo}/git/refs/{ref}' && c.params.ref === `heads/${upd}`).at(-1)?.params.force).toBe(false);
+    const files = w.g.filesAt('o/pipelines', w.g.head('o/pipelines', upd));
+    expect(files.get('.github/workflows/r--merge.yml')).toContain('# v2');
+    expect(files.has(recordPath('r'))).toBe(true);
   });
 });

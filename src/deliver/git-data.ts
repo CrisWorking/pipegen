@@ -9,8 +9,13 @@ import { safeText } from '../util/safe-text.js';
 
 /** A delivery that stops: a plain reason, never a secret value or a server message. */
 export class DeliverError extends Error {
-  constructor(message: string, options?: { cause?: unknown }) { super(message, options); this.name = 'DeliverError'; }
+  /** What pipegen had already stored when it stopped (names only, never a value; also in the local leftovers file). */
+  leftovers: string[] = [];
+  constructor(message: string, options?: { cause?: unknown; leftovers?: string[] }) { super(message, options); this.name = 'DeliverError'; this.leftovers = [...(options?.leftovers ?? [])]; }
 }
+
+/** GitHub's created_at form, the one the record keeps. */
+export const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
 
 export interface RepoRef { owner: string; repo: string }
 export interface TreeEntry { sha: string; mode: string; type: string }
@@ -38,6 +43,8 @@ export const statusOf = (e: unknown): number | undefined => {
   const s = typeof e === 'object' && e !== null ? (e as { status?: unknown }).status : undefined;
   return typeof s === 'number' ? s : undefined;
 };
+/** A ref move the branch refused (its rules, not a fast forward): the caller goes through a pull request instead. */
+export const refusedMove = (e: unknown): boolean => { const s = statusOf(e); return s === 422 || s === 409 || s === 403; };
 const said = (e: unknown): string => { const s = statusOf(e); return s === undefined ? 'no answer' : `HTTP ${s}`; };
 
 function checkRepo(r: RepoRef): void {
@@ -102,9 +109,11 @@ export async function readHead(gh: Octokit, r: RepoRef, branch: string, clock: R
 }
 
 /** A commit's whole tree (recursive), blobs and links only. A truncated answer is refused: an edit is never checked against a part of a tree. */
-export async function readTree(gh: Octokit, r: RepoRef, commit: string, clock: RateClock): Promise<{ tree: string; entries: Map<string, TreeEntry> }> {
+export async function readTree(gh: Octokit, r: RepoRef, commit: string, clock: RateClock): Promise<{ tree: string; entries: Map<string, TreeEntry>; parents: string[] }> {
   if (!SHA_RE.test(commit)) throw new DeliverError('A commit id is not a full sha.');
-  const tree = obj(obj(await ghRead(gh, 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}', r, { commit_sha: commit }, clock)).tree).sha;
+  const c = obj(await ghRead(gh, 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}', r, { commit_sha: commit }, clock));
+  const tree = obj(c.tree).sha;
+  const parents = (Array.isArray(c.parents) ? c.parents : []).map((x) => obj(x).sha).filter((x): x is string => typeof x === 'string' && SHA_RE.test(x));
   if (typeof tree !== 'string' || !SHA_RE.test(tree)) throw new DeliverError('GitHub\'s answer about a commit could not be read.');
   const d = obj(await ghRead(gh, 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}', r, { tree_sha: tree, recursive: '1' }, clock));
   if (d.truncated !== false || !Array.isArray(d.tree) || d.tree.length > MAX_TREE_ENTRIES) throw new DeliverError(`The file list of ${safeText(`${r.owner}/${r.repo}`, 120)} is too large for GitHub to give whole, so pipegen can't check what it changes there.`);
@@ -113,7 +122,7 @@ export async function readTree(gh: Octokit, r: RepoRef, commit: string, clock: R
     if (typeof e.path !== 'string' || typeof e.sha !== 'string' || typeof e.mode !== 'string' || typeof e.type !== 'string') throw new DeliverError('GitHub\'s file list could not be read.');
     if (e.type !== 'tree') entries.set(e.path, { sha: e.sha, mode: e.mode, type: e.type });
   }
-  return { tree, entries };
+  return { tree, entries, parents };
 }
 
 /** A blob's text (UTF-8), at most `maxBytes`. */
@@ -178,4 +187,18 @@ export async function openOrUpdatePr(gh: Octokit, r: RepoRef, pr: { head: string
   const d = obj(await ghWrite(gh, 'POST /repos/{owner}/{repo}/pulls', r, { head: pr.head, base: checkBranch(pr.base), title: pr.title, body: pr.body }, clock));
   if (!Number.isSafeInteger(d.number)) throw new DeliverError('GitHub\'s answer to the new pull request could not be read.');
   return { number: d.number as number, url: typeof d.html_url === 'string' ? d.html_url : '', opened: true };
+}
+
+/**
+ * Where a commit for pipegen's central pull request branch goes (fix round 1, m8): a branch whose commits are all on the default branch
+ * (merged, or stale) is moved onto a commit on the default head; a branch holding commits not on the default branch (an unmerged record
+ * or central-files commit) is never force-moved over them: the new commit goes on top of the branch head instead.
+ */
+export async function prBranchBase(gh: Octokit, r: RepoRef, branch: string, defaultBranch: string, defaultHead: string, clock: RateClock): Promise<{ parent: string; tree: string; entries: Map<string, TreeEntry>; force: boolean; carried: boolean }> {
+  const head = await readHead(gh, r, branch, clock);
+  const status = head === null ? 'missing' : await compareStatus(gh, r, defaultBranch, head, clock);
+  const onTop = head !== null && status !== 'identical' && status !== 'behind';
+  const parent = onTop ? head : defaultHead;
+  const t = await readTree(gh, r, parent, clock);
+  return { parent, tree: t.tree, entries: t.entries, force: !onTop, carried: onTop };
 }
