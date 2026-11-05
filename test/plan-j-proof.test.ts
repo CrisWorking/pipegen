@@ -38,7 +38,7 @@ const gh = {
 
 const FIXTURES = [
   'static-next-export', 'static-next-export-preview', 'static-astro', 'static-vite-spa', 'node-cli', 'node-container-service',
-  'node-express', 'node-library', 'go-module', 'workspaces-python-backend',
+  'node-express', 'node-library', 'go-module', 'workspaces-python-backend', 'node-api-ci-deploy',
 ] as const;
 type Fixture = typeof FIXTURES[number];
 
@@ -69,6 +69,7 @@ describe('Plan J proof set: project type', () => {
     'node-cli': [{ types: ['cli'], unsure: false }],
     'node-container-service': [{ types: ['server', 'container'], unsure: false }],
     'node-express': [{ types: ['server'], unsure: false }],
+    'node-api-ci-deploy': [{ types: ['server'], unsure: false }],
     'node-library': [{ types: ['library'], unsure: false }],
     // not a Node project: today's rule (no type found, nothing dropped)
     'go-module': [{ types: [], unsure: false }],
@@ -131,6 +132,8 @@ describe('Plan J proof set: credits only where the repo has the equivalent', () 
     'node-cli': ['unit-tests|push|push-default'],
     'node-container-service': ['deps|push|push-default', 'unit-tests|push|push-default'],   // deps: the trivy-action scan, safe SHA
     'node-express': [], 'node-library': [], 'go-module': [], 'workspaces-python-backend': [],
+    // gate form (b): the deploy job is in the CI workflow, needs every CI job, runs on a push to exactly [main]
+    'node-api-ci-deploy': ['deploy-verify|deploy|deploy-gate'],
   };
   const creditedOf = async (f: Fixture) => (await audit(f)).coverage.filter((c) => c.credit !== undefined)
     .map((c) => `${c.need.category}|${c.need.layer}|${c.creditKind}`).sort();
@@ -194,6 +197,7 @@ describe('Plan J proof set: rows against the baseline at 10d48df', () => {
         ['deps|push|orders-api|partial', 'deps|push|orders-api|covered'], ['licences|merge||partial', 'licences|merge||covered']],
     },
     'node-express': {}, 'node-library': {}, 'go-module': {}, 'workspaces-python-backend': {},
+    'node-api-ci-deploy': { changed: [['deploy-verify|deploy|notes-api|missing', 'deploy-verify|deploy|notes-api|covered']] },   // deploy gate, form (b) (J3b)
   };
   for (const f of FIXTURES) {
     it(`${f}: today's rows = the 10d48df rows minus ${DIFFS[f].gone?.length ?? 0} gone, with ${DIFFS[f].changed?.length ?? 0} changed`, async () => {
@@ -233,6 +237,11 @@ describe('Plan J proof set: deploy gate and trivy-action by SHA (J3b)', () => {
   const rowOf = async (f: Fixture, key: string) => (await audit(f)).coverage.find((c) => `${c.need.category}|${c.need.layer}|${c.need.service ?? ''}` === key);
   it('form (a): a guarded workflow_run deploy (guard on the first job, deploy through needs, SHA compared through an env var, exact branches filter) → deploy-verify covered, with its credit', async () => {
     const r = await rowOf('static-next-export', 'deploy-verify|deploy|docs-site');
+    expect(r).toMatchObject({ status: 'covered', creditKind: 'deploy-gate' });
+    expect(r!.credit).toMatch(/deploy/i);
+  });
+  it('form (b): the deploy job inside CI, needing every CI job, on a push to exactly [main] → deploy-verify covered, with its credit', async () => {
+    const r = await rowOf('node-api-ci-deploy', 'deploy-verify|deploy|notes-api');
     expect(r).toMatchObject({ status: 'covered', creditKind: 'deploy-gate' });
     expect(r!.credit).toMatch(/deploy/i);
   });
