@@ -40,7 +40,7 @@ import { Document, isMap, isScalar, isSeq, parse, type Scalar } from 'yaml';
 import { centralWorkflowFile, centralWorkflowPath, type CentralLayer } from '../engine/central-path.js';
 import { dependabotFile } from '../engine/created-builders.js';
 import {
-  CALLER_WORKFLOW, createdPathProblem, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, jobOutputsFor, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PR_CHECK_IF, PR_CHECK_JOB,
+  CALLER_WORKFLOW, createdPathProblem, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, jobOutputsFor, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PR_CHECK_IF, PR_CHECK_JOB, SCORECARD_CRON, SCORECARD_IF, SCORECARD_JOB,
   PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, WORKFLOW_CONCURRENCY, type RenderedStep,
 } from '../engine/job-rules.js';
 import { COMMIT_SHA_RE, isGitHubRepo } from '../engine/names.js';
@@ -71,6 +71,7 @@ export const NIGHTLY_CALLER_JOB = 'pipegen-nightly';
 const CALLER_NAME: Readonly<Record<'merge' | 'push' | 'nightly', string>> = Object.freeze({ merge: 'pipegen', push: 'pipegen push', nightly: 'pipegen nightly' });
 /** The nightly schedule (plan "Caller triggers"). */
 export const NIGHTLY_CRON = '17 3 * * *';
+export { SCORECARD_CRON, SCORECARD_IF };
 /** The comment that marks the not-proven line of the merge file (G-S2): `not-proven: '[...]' # pipegen:not-proven`. */
 export const NOT_PROVEN_MARK = 'pipegen:not-proven';
 /** The verify-first job's id (the referee's permission and step tables are keyed by it). */
@@ -397,7 +398,8 @@ export function assemble(input: PipelineDraft, opts: AssembleOpts): AssembledFil
 
   // 6. nightly (B5): the nightly job on schedule; no merge workflow, no not-proven list
   {
-    const nightlyOn = { schedule: [{ cron: NIGHTLY_CRON }] };
+    // G15a round 3 (PF-3): the weekly Scorecard entry, only when the scorecard job is written (its job runs on that entry alone)
+    const nightlyOn = { schedule: [{ cron: NIGHTLY_CRON }, ...(Object.hasOwn(a.nightly, SCORECARD_JOB) ? [{ cron: SCORECARD_CRON }] : [])] };
     const nightlyJobs = orderedAll(a.nightly);
     const comment = 'pipegen: the nightly issues (warn-ending, finish-missing, updates); written by pipegen. It never pushes a file.';
     const reason = 'Opens the nightly issues: the warning period ending, finish not run, pipegen updates.';

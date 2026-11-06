@@ -7,7 +7,7 @@ import {
   BUILD_PUSH_STEP_ID, DIGEST_STEP_ENV, DIGEST_STEP_ID, FIND_RUN_STEP_ID, HEAD_CHECK_DIR, HEAD_CHECK_ENV, HEAD_CHECK_STEP_ID, imageDigestArtifact, PUBLISH_DIGEST_ENV, PUBLISH_DIGEST_STEP_ID,
 } from './deploy-steps.js';
 import { GATE_RESULT_ARTIFACT, resultArtifactName, SECRETS_RANGE_ARTIFACT, slug } from './artifact-names.js';
-import { ARGV_POLICIES, ATTEST_DIGEST_STEP_ID_RE, attestDigestRef, attestDigestStepId, BASE_CHECKOUT_REF, GATE_OPTIONAL_UPLOADS, RANGE_BEFORE_REF, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, isGateUploadName, CHECKER_STEP_ID_RE, GATE_USES_RE, isStagedTool, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, stagePath, stageStepId, STAGE_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
+import { ARGV_POLICIES, ATTEST_DIGEST_STEP_ID_RE, DOCKER_STEP_IMAGES, attestDigestRef, attestDigestStepId, BASE_CHECKOUT_REF, GATE_OPTIONAL_UPLOADS, RANGE_BEFORE_REF, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, isGateUploadName, CHECKER_STEP_ID_RE, GATE_USES_RE, isStagedTool, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, stagePath, stageStepId, STAGE_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
 
 /** One step of a job, as pipegen renders it. `usesComment` becomes the trailing `# <version>` comment on `uses:`. */
 export interface RenderedStep {
@@ -155,6 +155,8 @@ export function isFindRunStep(s: RenderedStep): boolean {
  */
 export function isKnownHarmless(s: RenderedStep): boolean {
   if (isPrCheckStep(s)) return true;   // G1 (BP-6): the exact pr-check lookup reads the API with the job's token, never the workspace
+  // G15a round 3 (PF-3): a reviewed container action as a docker step by digest (DOCKER_STEP_IMAGES; the referee holds it to the entry's digest)
+  if (s.id === undefined && s.run === undefined && isDockerStepUses(s.uses)) return true;
   const pinnedAction = s.uses !== undefined && s.run === undefined && TRUSTED_ACTION_RE.test(s.uses);
   if (isFindRunStep(s)) return true;
   if (s.id === undefined) return pinnedAction || isGateDecideStep(s);
@@ -350,7 +352,7 @@ export function scrubChainProblems(steps: readonly RenderedStep[], scans?: Reado
     if (first.has(artifact)) problems.push(`${at} is a second scrub step for the result ${show(artifact)} in this job: a result has exactly one scrub.`);
     else first.set(artifact, i);
     const tool = w.tool;
-    if (typeof tool === 'string' && tool !== '' && !Object.hasOwn(ARGV_POLICIES, tool)) problems.push(`${at} scrubs for the tool ${show(tool)}, which is not a tool pipegen reviewed.`);
+    if (typeof tool === 'string' && tool !== '' && !Object.hasOwn(ARGV_POLICIES, tool) && !SCRUB_ONLY_TOOLS.has(tool)) problems.push(`${at} scrubs for the tool ${show(tool)}, which is not a tool pipegen reviewed.`);
     // G4-R1: a scrub of a handed-off DAST result follows its hash check (the scan ran in the dast-run job), in place of a scan step
     const scanAt = steps.findIndex((x) => x.run !== undefined && x.id !== undefined && (scanIdsOf(artifact).includes(x.id) || dastCheckFor(x.id) === artifact));
     if (scanAt < 0 || scanAt > i) {
@@ -468,6 +470,22 @@ export const CONCURRENCY_GROUP = "${{ github.ref == format('refs/heads/{0}', git
 export const WORKFLOW_CONCURRENCY: Readonly<{ group: string; 'cancel-in-progress': true }> = Object.freeze({ group: CONCURRENCY_GROUP, 'cancel-in-progress': true });
 /** The nightly job's own concurrency (ruling B5, carry C7n: no overlapping nightly runs): the one job-level concurrency, on the job nightly only. */
 export const NIGHTLY_CONCURRENCY = 'pipegen-nightly';
+/**
+ * G15a round 3 (PF-3): Scorecard runs weekly from the nightly file, on its own cron entry; its job runs only on that entry (the one job
+ * condition of the nightly file). The scorecard job and its code-scanning upload are the jobs that may follow it.
+ */
+export const SCORECARD_CRON = '23 4 * * 1';
+export const SCORECARD_IF = `github.event.schedule == '${SCORECARD_CRON}'`;
+export const SCORECARD_JOB = 'scorecard';
+export const CODE_SCANNING_JOB = 'code-scanning';
+/** G15a round 3 (PF-3): the reviewed tools whose result a scrub reads but that run as a docker step (no argv policy): Scorecard. */
+export const SCRUB_ONLY_TOOLS: ReadonlySet<string> = new Set(['scorecard-action']);
+/** A `docker://<image>@sha256:<64 hex>` uses of an image in DOCKER_STEP_IMAGES (the shape only; the referee checks the reviewed digest). */
+export function isDockerStepUses(uses: unknown): boolean {
+  if (typeof uses !== 'string' || !uses.startsWith('docker://')) return false;
+  const m = /^docker:\/\/([a-z0-9./-]{1,200})@sha256:[0-9a-f]{64}$/.exec(uses);
+  return m !== null && Object.values(DOCKER_STEP_IMAGES).includes(m[1] as string);
+}
 /** The app's nightly workflow (ruling B2): schedule only. */
 export const NIGHTLY_WORKFLOW = '.github/workflows/pipegen-nightly.yml';
 /** The app's local merge workflow of the public layout (G2/G43): called by pipegen.yml, so workflow_call only. */

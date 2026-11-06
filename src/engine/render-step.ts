@@ -30,7 +30,7 @@ import { own, RenderError, show } from './render-error.js';
 import { BASE_CHECKOUT_ID, BASELINE_CHECK_STEP_ID, checkExpressions, checkJobOrder, isDangerousName, isReviewed, narrowingChoiceProblem, STEP_KEYS, type JobContext, type RenderedStep, type ScanFact } from './job-rules.js';
 import { GateJobListError } from './gate-job-list.js';
 import { gateStepInputs, nightlyStepInputs } from './gate-inputs.js';
-import { allowedDomainsProblem, BULLFROG_USES, egressDomains, BASE_CHECKOUT_REF, DOCKER_ACTION_USES, GATE_UPLOAD_FILES, gateUploadPath, uploadIfNoFiles, IMAGE_BUILT_ACTION_USES, isStagedTool, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath, scrubStepId, stagePath, stageStepId } from './tool-flags.js';
+import { allowedDomainsProblem, BULLFROG_USES, egressDomains, BASE_CHECKOUT_REF, DOCKER_ACTION_USES, DOCKER_STEP_IMAGES, DOCKER_STEP_INPUTS, GATE_UPLOAD_FILES, gateUploadPath, uploadIfNoFiles, IMAGE_BUILT_ACTION_USES, isStagedTool, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath, scrubStepId, stagePath, stageStepId } from './tool-flags.js';
 
 export { RenderError };
 // the job rules live in job-rules.ts (one copy for the renderer, the emitter, the referee and the linters); re-exported for the callers that import them here
@@ -562,6 +562,57 @@ export function renderRangeBlock(tool: ReviewedTool, platform: PlatformActions, 
   const artifact = SECRETS_RANGE_ARTIFACT;
   const scrub = renderScrub(artifact, out.path, tool.id, 'sarif', gate);
   return { steps: [...result.steps, scrub, renderUpload(artifact, scrubbedPath(out.path), platform)], artifact, scan, result };
+}
+
+/** G15a round 3 (PF-3): the Scorecard result's artifact and the id of the step that moves its raw file under the runner temp folder. */
+export const SCORECARD_ARTIFACT = resultArtifactName('scorecard');
+/** The move step is the scan step of the Scorecard result (the run step that writes its raw file), so its id is the checker-run id of it. */
+export const SCORECARD_MOVE_STEP_ID = `checker-run-${sha16(SCORECARD_ARTIFACT)}`;
+/** The code-scanning category of the Scorecard upload. */
+export const SCORECARD_CATEGORY = 'pipegen-scorecard';
+
+/**
+ * A container action as a `docker://<image>@<digest>` step (G15a round 3, PF-3): only for a reviewed entry in DOCKER_STEP_IMAGES whose
+ * wrappedImage is that image at a tag, with the digest it recorded. Its inputs are the entry's fixed inputs plus DOCKER_STEP_INPUTS (a
+ * docker step gets no action.yml default), and nothing the AI chose. Throws RenderError for anything else.
+ */
+export function renderDockerActionStep(tool: ReviewedTool): RenderedStep {
+  if (!isReviewed(tool.candidate) || tool.candidate.kind !== 'action' || tool.step.action === undefined) throw new RenderError(`${show(tool.id)} is not a reviewed action.`);
+  const { path } = usesOf(tool);
+  const image = own(DOCKER_STEP_IMAGES, path);
+  const w = tool.wrappedImage;
+  if (image === undefined || w === undefined) throw new RenderError(`${show(tool.id)} is not a container action pipegen runs as a docker step.`);
+  if (!w.ref.startsWith(`${image}:`) || !/^sha256:[0-9a-f]{64}$/.test(w.digest)) throw new RenderError(`${show(tool.id)}'s recorded image is not ${image} at a tag with its digest.`);
+  if (Object.keys(tool.choices).length > 0) throw new RenderError(`${show(tool.id)} has choices; a docker step takes only its fixed inputs.`);
+  const fixed = tool.fixedInputs.with ?? {};
+  if (!same(tool.step.action.with ?? {}, fixed)) throw new RenderError(`The reviewed entry ${show(tool.id)} has a step template that disagrees with its fixed inputs.`);
+  const step: RenderedStep = { name: `pipegen: ${path} (its image, by digest)`, uses: `docker://${image}@${w.digest}`, with: { ...fixed, ...(own(DOCKER_STEP_INPUTS, path) ?? {}) } };
+  checkExpressions(step);
+  return step;
+}
+
+/**
+ * The Scorecard block of the weekly scorecard job (G15a round 3, PF-3): the docker step (its result file is fixed, scorecard.sarif in the
+ * workspace, which holds no checkout), pipegen's move step (a regular file only, never a link, to the raw result folder), the scrub and
+ * the upload. publish_results is false (the entry's fixed input). Throws RenderError for any tool but the reviewed Scorecard entry.
+ */
+export function renderScorecardBlock(tool: ReviewedTool, platform: PlatformActions, gate: ReviewedTool): RenderedStep[] {
+  if (usesOf(tool).path !== 'ossf/scorecard-action' || tool.step.output.format !== 'sarif' || tool.step.output.path !== 'scorecard.sarif') throw new RenderError(`${show(tool.id)} is not the reviewed Scorecard entry.`);
+  const docker = renderDockerActionStep(tool);
+  const raw = `\${{ runner.temp }}/pipegen-raw/${SCORECARD_ARTIFACT}/scorecard.sarif`;
+  const move: RenderedStep = {
+    id: SCORECARD_MOVE_STEP_ID, name: 'pipegen: move the Scorecard result under the runner temp folder',
+    run: [
+      'set -euo pipefail',
+      'src="$GITHUB_WORKSPACE/scorecard.sarif"',
+      `dst="$RUNNER_TEMP/pipegen-raw/${SCORECARD_ARTIFACT}"`,
+      'if [ -L "$src" ] || [ ! -f "$src" ]; then echo "::error::Scorecard wrote no regular result file"; exit 1; fi',
+      'mkdir -p -- "$dst"',
+      'mv -- "$src" "$dst/scorecard.sarif"',
+    ].join('\n'),
+  };
+  checkExpressions(move);
+  return [docker, move, renderScrub(SCORECARD_ARTIFACT, raw, tool.id, 'sarif', gate), renderUpload(SCORECARD_ARTIFACT, scrubbedPath(raw), platform)];
 }
 
 /**

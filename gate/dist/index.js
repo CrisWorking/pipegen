@@ -2672,6 +2672,8 @@ var RENDERER_INPUTS = Object.freeze({
   },
   "actions/download-artifact": { name: ARTIFACT_NAME, path: OWN_FOLDER_PATH },
   "github/codeql-action/upload-sarif": { sarif_file: RUNNER_TEMP_PATH, category: rx(/^pipegen-[a-z0-9][a-z0-9-]{0,100}$/, "a category starting pipegen-") },
+  // G15a round 3 (PF-3): the Scorecard docker step reads the job's own token (contents and actions read), never a secret
+  "docker://ghcr.io/ossf/scorecard-action": { repo_token: { describe: "the job's own token (${{ github.token }})", check: (v) => v === "${{ github.token }}" } },
   // G15a (carry C10): the digest is the run-time output of pipegen's digest step of the same image (the hand-off file image-publish uploaded,
   // checked as sha256:<64 hex>), never a literal and never another step's output
   "actions/attest": {
@@ -2739,6 +2741,10 @@ var RENDERER_INPUTS = Object.freeze({
     // the warn-first checks and their dates (final review fix round A, ruling 3): the nightly's "switch to blocking" issues
     "warn-first": literalInput(["nightly"], warnFirstListProblem, "a JSON list of { needId, since }")
   }
+});
+var DOCKER_STEP_IMAGES = Object.freeze({ "ossf/scorecard-action": "ghcr.io/ossf/scorecard-action" });
+var DOCKER_STEP_INPUTS = Object.freeze({
+  "ossf/scorecard-action": Object.freeze({ repo_token: "${{ github.token }}" })
 });
 
 // src/util/safe-text.ts

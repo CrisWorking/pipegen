@@ -155,7 +155,9 @@ describe('G5: the delivered files and their callers', () => {
       const def = x.draft.profile.defaultBranch;
       expect(js(fileAt(a, 'app', CALLER_WORKFLOW)).on).toEqual({ push: { branches: [def] }, pull_request: null, pull_request_review: { types: ['submitted', 'dismissed'] } });
       expect(js(fileAt(a, 'app', PUSH_WORKFLOW)).on).toEqual({ push: { 'branches-ignore': [def] } });
-      expect(js(fileAt(a, 'app', NIGHTLY_WORKFLOW)).on).toEqual({ schedule: [{ cron: NIGHTLY_CRON }] });
+      // G15a round 3 (PF-3): the weekly Scorecard entry only when the plan has its job (Scorecard needs code scanning: public here)
+      const weekly = a.draft.needs.some((n) => n.id === 'scorecard') ? [{ cron: '23 4 * * 1' }] : [];
+      expect(js(fileAt(a, 'app', NIGHTLY_WORKFLOW)).on).toEqual({ schedule: [{ cron: NIGHTLY_CRON }, ...weekly] });
       expect(NIGHTLY_CRON).toBe('17 3 * * *');
       for (const f of workflows(a)) {
         const on = js(f).on as Obj;
@@ -306,7 +308,7 @@ describe('G5: the delivered files and their callers', () => {
     expect(workflows(a).map((f) => f.path).sort()).toEqual([CALLER_WORKFLOW, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PUSH_WORKFLOW].sort());
     // the push and nightly jobs are inline in their own files (a local push or nightly callee would be the file itself)
     for (const path of [PUSH_WORKFLOW, NIGHTLY_WORKFLOW]) for (const [id, j] of Object.entries(jobsOfFile(fileAt(a, 'app', path)))) expect(j.uses, `${path} ${id}`).toBeUndefined();
-    expect(Object.keys(jobsOfFile(fileAt(a, 'app', NIGHTLY_WORKFLOW)))).toEqual(['nightly']);
+    expect(Object.keys(jobsOfFile(fileAt(a, 'app', NIGHTLY_WORKFLOW)))).toEqual(['nightly', 'scorecard', 'code-scanning']);   // G15a round 3: weekly Scorecard
     // no uses anywhere names the central repo
     expect(a.files.map((f) => f.content).join('\n')).not.toMatch(/\/pipelines\//);
     // a public draft with a central pin is refused (its find-run would look for a central workflow that is not there)

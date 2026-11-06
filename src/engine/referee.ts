@@ -46,12 +46,12 @@ import { docRecomputeProblem } from '../deliver/docs.js';
 import { createdFileProblems, duplicatePathProblems, type CreatedInputs, type CreatedRule } from './created-files.js';
 import {
   ACTION_PATH_RE, CALLER_WORKFLOW, checkExpressions, createdPathProblem, checkJobOrder, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, gateResultUploadProblems, IF_VALUES,
-  CALLER_TRIGGERS, IMAGE_ARCHIVE_STEP_ID, IMAGE_BUILD_NEED, imageBuildJobId, imageBuildSlugOf, imageCheckStepId, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, LOCAL_MERGE_WORKFLOW, narrowingChoiceProblem, NIGHTLY_CONCURRENCY, NIGHTLY_WORKFLOW, PR_CHECK_IF, PR_CHECK_JOB,
+  CALLER_TRIGGERS, IMAGE_ARCHIVE_STEP_ID, IMAGE_BUILD_NEED, imageBuildJobId, imageBuildSlugOf, imageCheckStepId, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, LOCAL_MERGE_WORKFLOW, narrowingChoiceProblem, NIGHTLY_CONCURRENCY, NIGHTLY_WORKFLOW, SCORECARD_IF, SCORECARD_JOB, PR_CHECK_IF, PR_CHECK_JOB,
   PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, REQUIRED_JOB, REQUIRED_NAME, requiredWorkflowForm, renderRangeFetchStep, SECRET_REF_RE, SIGN_STEP_ID_RE, ATTEST_DIGEST_STEP_ID_RE, attestDigestRef, attestDigestStepId, BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, DAST_HANDOFF_STEP_ID, dastAppStepId, dastCheckStepId, dastRunJobId, dastRunSlugOf, DAST_CHECK_ID_RE, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, BASELINE_STEP_IFS,
   STEP_KEYS as STEP_KEY_LIST, WORKFLOW_CONCURRENCY, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact,
 } from './job-rules.js';
 import { signingMode } from '../github/signing-mode.js';
-import { containerRefusal, RenderError, renderComposeUp, renderProjectScript, renderRepoTool, renderRuntimeEnv, renderStep, sameDedupeContent, stepsToYaml, type RenderContext } from './render-step.js';
+import { containerRefusal, RenderError, renderComposeUp, renderDockerActionStep, renderScorecardBlock, SCORECARD_MOVE_STEP_ID, renderProjectScript, renderRepoTool, renderRuntimeEnv, renderStep, sameDedupeContent, stepsToYaml, type RenderContext } from './render-step.js';
 import { COMPOSE_PATH, planCompose } from '../create/compose.js';
 import { dockerfilesOf } from './created-judges/compose.js';
 import { loadBaseImages } from './base-images.js';
@@ -111,6 +111,8 @@ export const JOB_PERMISSIONS: Readonly<Record<string, Readonly<Record<string, Le
   'image-publish': { packages: 'write' },
   sign: { 'id-token': 'write', packages: 'write', attestations: 'write' },
   nightly: { actions: 'read', issues: 'write' },
+  // G15a round 3 (PF-3): the weekly Scorecard job (its docker step reads the job token; publish_results false needs no id-token)
+  scorecard: { actions: 'read' },
   watch: { issues: 'write', actions: 'read' },
   notify: { 'pull-requests': 'read', checks: 'read' },
   'merged-red': { 'pull-requests': 'read', checks: 'read' },
@@ -140,7 +142,9 @@ export type StepKind = 'checkout' | 'setup' | 'harden' | 'upload-artifact' | 'do
    */
   | 'sign' | 'verify' | 'image-archive' | 'image-check'
   /** G7 (B3 a): image-publish's digest step (job image-publish only), recognised by its exact content (deploy-steps.ts) */
-  | 'publish-digest';
+  | 'publish-digest'
+  /** G15a round 3 (PF-3): a reviewed container action as a docker step at its recorded digest (renderDockerActionStep), job scorecard only */
+  | 'docker-step';
 /** pipegen's own actions by reviewed-entry id (Plan C adds the gate entry, Plan H the watcher entry, under these ids). */
 export const PIPEGEN_ACTION_IDS = { gate: 'pipegen-gate', watcher: 'pipegen-watcher' } as const;
 /** The step kind of each reviewed action entry that is not an ordinary tool, by entry id. The gate entry is kind `gate`, except a recognised scrub step of it (isScrubStep: judgeUses). */
@@ -178,6 +182,9 @@ export const JOB_STEP_POLICY: Readonly<Record<string, readonly StepKind[]>> = Ob
   sign: ['harden', 'download-artifact', 'attest', 'sign'],
   // no checkout: the nightly job holds PIPEGEN_FP_KEY (it verifies the baseline) and reads only the API; the identity comes from GITHUB_REPOSITORY (C7 fix round 1)
   nightly: ['harden', 'download-artifact', 'gate'],
+  // G15a round 3 (PF-3): Scorecard's docker step, pipegen's move step of its result (a recognised run, kind tool), the scrub and the upload;
+  // no checkout (Scorecard reads the repository through the API) and no upload-sarif (the code-scanning job holds security-events: write)
+  scorecard: ['harden', 'docker-step', 'tool', 'scrub', 'upload-artifact'],
   watch: ['harden', 'checkout', 'watcher'],
   notify: ['harden', 'download-artifact'],
   'merged-red': ['harden', 'download-artifact'],
@@ -530,6 +537,16 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
         }
       }
       for (const n of spec.secrets ?? []) ex.declared.add(n);
+      // G15a round 3 (PF-3): Scorecard's block: its move step is pipegen's run step of this spec (the docker step is judged by judgeUses)
+      if (t.id === 'scorecard-action') {
+        try {
+          const move = renderScorecardBlock(t, platform, ex.byId.get(PIPEGEN_ACTION_IDS.gate) ?? t).filter((x) => x.id === SCORECARD_MOVE_STEP_ID);
+          record(`spec:${i}`, [move, move], false, false, false, undefined, undefined);
+        } catch (e) {
+          if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e;
+          notes.push(`The Scorecard check can not be rendered, so no step may claim to be it: ${safeText(e.message, 200)}`);
+        }
+      }
       // G2 (B6): an image build for a service: its archive step, in that service's image-build job only (the build itself is judged by its binding)
       if (t.id === BUILD_PUSH_ID && spec.needId === IMAGE_BUILD_NEED && typeof spec.service === 'string') {
         try {
@@ -1028,12 +1045,22 @@ function judgeLayoutJobs(fc: FileCtx, on: unknown, triggers: readonly string[] |
  * push-layer job of the push file, and the deploy condition on a deploy job of pipegen.yml that needs the gate. Anything else: refused.
  */
 function judgeJobIf(fc: FileCtx, id: string, j: Obj, where: string): void {
-  if (j.if === undefined) return;
   const bad = issueFor(fc);
+  // G15a round 3 (PF-3): the weekly condition, exactly, on the job scorecard of the nightly file only; that job never runs without it
+  const scorecardJob = id === SCORECARD_JOB && isNightlyFile(fc);
+  if (scorecardJob && j.if !== SCORECARD_IF) { bad('template', `${where} is the weekly Scorecard job: it runs only on its own cron entry (if: ${SCORECARD_IF}), never on every nightly run.`); return; }
+  if (j.if === SCORECARD_IF) { if (!scorecardJob) bad('template', `${where}: the weekly condition (if: ${SCORECARD_IF}) is written only on the job ${SCORECARD_JOB} of the nightly file.`); return; }
+  if (j.if === undefined) return;
   if (j.if === PR_CHECK_IF) { const p = prCheckIfProblem(fc, id, j); if (p !== null) bad('template', `${where}: ${p}`); return; }
   if (j.if === DEPLOY_PUSH_IF) { const p = deployIfProblem(fc, id, j); if (p !== null) bad('template', `${where}: ${p}`); return; }
   if (typeof j.if !== 'string' || !IF_VALUES.has(j.if)) bad('injection', `${where} has an if: pipegen does not write.`);
   else if (!(id === 'gate' && j.if === 'always()')) bad('template', `${where} has if: ${safeText(j.if, 20)}; a job that feeds the gate runs whenever its workflow does (a skipped job counts as passed).`);
+}
+
+/** The nightly file: the app's pipegen-nightly.yml, or the project's central nightly workflow (called by it only). */
+function isNightlyFile(fc: FileCtx): boolean {
+  if (fc.file.repo === 'app') return fc.file.path === NIGHTLY_WORKFLOW;
+  return fc.file.repo === 'central' && typeof fc.draft.profile.repo === 'string' && fc.file.path === centralWorkflowFile(fc.draft.profile.repo, 'nightly');
 }
 
 function prCheckIfProblem(fc: FileCtx, id: string, j: Obj): string | null {
@@ -1710,6 +1737,7 @@ function judgeStepPolicy(fc: FileCtx, id: string, where: string, j: Obj, judged:
   const secrets = new Set(judged.flatMap((x) => [...x.secrets].filter((n) => mixed || !(x.kind === 'scrub' && n === SCRUB_SECRET))));
   const row = own(JOB_STEP_POLICY, id);
   const power = privileged(j, secrets, fc.ex);
+  if (id === SCORECARD_JOB && !isNightlyFile(fc)) bad('permissions', `${where}: the job ${SCORECARD_JOB} is the weekly Scorecard job of the nightly file only.`);
   if (power && row === undefined) bad('permissions', `${where} holds power (a permission beyond contents: read, an environment or pipegen's own secret) but is not one of pipegen's jobs (${Object.keys(JOB_STEP_POLICY).join(', ')}).`);
   if (row !== undefined) {
     judged.forEach((x, i) => {
@@ -1723,6 +1751,7 @@ function judgeStepPolicy(fc: FileCtx, id: string, where: string, j: Obj, judged:
       else if (x.kind === 'sign') bad('permissions', `${where}, step ${i + 1}: pipegen signs only in the job sign.`);
       else if (x.kind === 'verify') bad('permissions', `${where}, step ${i + 1}: pipegen verifies only in the job pipegen-verify.`);
       else if (x.kind === 'publish-digest') bad('permissions', `${where}, step ${i + 1}: the published image's digest is written only in the job image-publish.`);
+      else if (x.kind === 'docker-step') bad('permissions', `${where}, step ${i + 1}: a reviewed container action's docker step runs only in the weekly job ${SCORECARD_JOB} of the nightly file.`);
       else if (x.kind === 'image-archive' && imageBuildSlugOf(id) !== sourceSlug(x.match?.source ?? '')) bad('permissions', `${where}, step ${i + 1}: the image archive of ${show(sourceSlug(x.match?.source ?? ''))} is made only in its own job ${show(imageBuildJobId(sourceSlug(x.match?.source ?? '')))}.`);
     });
   }
@@ -2016,6 +2045,17 @@ function judgeUses(fc: FileCtx, at: (m: string) => string, uses: string, withs: 
   const other = { appRunning: false, kind: 'unrecognised' as StepKind };
   if (uses.startsWith('docker://')) {
     const image = uses.slice('docker://'.length);
+    // G15a round 3 (PF-3): a reviewed container action, as the docker step of its entry at the digest it recorded, with exactly its inputs
+    const dockerEntry = [...fc.ex.actions.values()].find((t) => {
+      try { return renderDockerActionStep(t).uses === uses; } catch (e) { if (e instanceof RenderError) return false; throw e; }
+    });
+    if (dockerEntry !== undefined) {
+      const want = renderDockerActionStep(dockerEntry);
+      if (!isDeepStrictEqual(withs, want.with ?? {})) bad('template', at(`the docker step of ${dockerEntry.id} takes exactly its reviewed inputs (${Object.keys(want.with ?? {}).join(', ')}) at their reviewed values (publish_results false, the job's own token).`));
+      if (Object.keys(env).length > 0) bad('template', at(`the docker step of ${dockerEntry.id} takes no env.`));
+      for (const k of ['working-directory', 'id', 'if', 'continue-on-error']) if (raw[k] !== undefined) bad('template', at(`the docker step of ${dockerEntry.id} takes no ${k}.`));
+      return { appRunning: false, kind: 'docker-step', entryId: dockerEntry.id };
+    }
     if (!/@sha256:[0-9a-f]{64}$/.test(image)) bad('unpinned', at(`${show(uses)} runs an image by tag; whoever controls the tag controls what runs.`));
     else if (!fc.ex.images.has(image)) bad('unknown-pin', at(`${show(uses)} is not a reviewed image at its reviewed digest.`));
     else bad('template', at('pipegen runs a reviewed image with its own docker step, never as a docker:// action.'));

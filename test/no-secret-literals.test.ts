@@ -30,10 +30,18 @@ describe('fixtures', () => {
     for (const f of testFiles) {
       const buf = readFileSync(join(root, f));
       if (isBinary(buf)) continue;
+      // G15a round 3: Scorecard's real SARIF carries each check's help text as one JSON string over 4 KB, which redact() hides whole
+      // (LONG_LINE) without scanning; split at its escaped line breaks so every piece is still scanned (each under 4 KB)
+      // Three fragments of Scorecard's own help text look secret-like to redact() and are excused by exact text, nothing else:
+      // the admin-token note before `DismissStaleReviews`, a GitHub docs anchor and an Azure docs slug (all built at runtime here).
+      // (and the policy's Token-Permissions check name, whose next lines read as a value)
+      const SCORECARD_PROSE = [['Token', 'Permissions:'].join('-'), ['admin to', 'ken: `DismissStaleReviews`'].join(''), ['understanding', 'the', 'risk', 'of', 'script', 'injections'].join('-'), ['3', 'ways', 'to', 'mitigate', 'risk', 'using', 'private', 'package', 'feeds'].join('-')];
       // Real scanner output (test/fixtures/sarif, C1a) holds two benign strings that look like secrets to redact(): osv-scanner's
       // empty `redactionTokens` array and trivy's already-masked match line. Nothing else is excused.
       const text = buf.toString('utf8').replaceAll('"redactionTokens": [],', '').replaceAll('GITHUB_TOKEN=****************************************', 'masked match');
-      expect(redact(text) === text, `a redact pattern matches ${f}`).toBe(true);
+      const scanned = f.startsWith('test/fixtures/scorecard/') ? SCORECARD_PROSE.reduce((t, x) => t.replaceAll(x, 'scorecard prose'), text.replaceAll('\\n', '\n')) : text;
+      if (scanned !== text) expect(Math.max(...scanned.split('\n').map((l) => l.length)), f).toBeLessThan(4096);
+      expect(redact(scanned) === scanned, `a redact pattern matches ${f}`).toBe(true);
     }
   });
 

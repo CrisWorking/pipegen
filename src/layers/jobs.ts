@@ -66,7 +66,7 @@ import { ARCHIVE_TOOL_IDS, renderImageArchiveScan, renderImageBuild } from '../e
 import { dastStartOf, renderDastRun, renderDastScrub, type DastStart } from '../engine/dast-handoff.js';
 import {
   BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, dastRunJobId, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, IMAGE_BUILD_NEED, imageBuildJobId, isReviewed,
-  isScrubStep, jobOutputsFor, NIGHTLY_CONCURRENCY, NO_SCANS, renderRangeFetchStep, type RenderedStep, type ScanFact,
+  isScrubStep, jobOutputsFor, CODE_SCANNING_JOB, NIGHTLY_CONCURRENCY, NO_SCANS, SCORECARD_IF, SCORECARD_JOB, renderRangeFetchStep, type RenderedStep, type ScanFact,
 } from '../engine/job-rules.js';
 import { NEED_ID_CATEGORY, SCHEDULED_CATEGORIES } from '../engine/need-ids.js';
 import { MINIMUM_CATEGORIES, NO_HOOKS_CI_MANAGERS, NO_IMAGE_CATEGORIES, noImageServices, riskyTriggersOf, WORKFLOW_LINT_EXTRA, WORKFLOW_LINT_TOOL, workflowLintTools } from '../engine/needs.js';
@@ -76,7 +76,8 @@ import { APP_RUNNING_CATEGORIES, renderStarterTestRun } from '../engine/render-c
 import { RenderError } from '../engine/render-error.js';
 import {
   dedupeJobSteps, renderBaselineCheckStep, renderComposeUp, renderFindingsBlock, renderGateStep, renderGateUploads, renderJobPrelude, renderNightlyStep,
-  renderProjectScript, renderRangeBlock, renderRepoTool, renderRuntimeEnv, renderScrub, renderStep, renderUpload, scanFactOf, scrubbedPath, type RenderContext,
+  renderPlatformStep, renderProjectScript, renderRangeBlock, renderRepoTool, renderRuntimeEnv, renderScorecardBlock, renderScrub, renderStep, renderUpload, scanFactOf, scrubbedPath,
+  SCORECARD_ARTIFACT, SCORECARD_CATEGORY, type RenderContext,
 } from '../engine/render-step.js';
 import { projectScriptFor, repoToolFor, repoToolProblem, type RepoToolStep } from '../engine/reviewed.js';
 import { PLATFORM_USES, RANGE_TOOL } from '../engine/tool-flags.js';
@@ -110,7 +111,6 @@ const GATE_JOB_NAME = 'gate';
 /** v0.2 limits: categories pipegen does not render yet, each with the line the notes (and PIPEGEN.md) carry. */
 export const NOT_RENDERED_V02: Readonly<Partial<Record<NeedCategory, string>>> = Object.freeze({
   'api-dast': 'API testing against the API spec is not available yet: its tool (schemathesis) needs a reviewed hash-locked closure of its Python dependencies, planned for v0.4.',
-  scorecard: 'OpenSSF Scorecard is not run yet: its action runs a tag-pinned container image, and pipegen runs only images pinned by digest.',
   fuzzing: 'Fuzzing is built in v0.3.',
 });
 /** The PyPI publish action (S31): it builds or pulls a container at run time, so it is not rendered in v0.2. */
@@ -637,6 +637,34 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
       steps: [egressStepFor([], { userSecret: false, dockerNetworks: false, job: 'nightly' }), renderNightlyStep(gate, draft)],
     },
   };
+
+  // G15a round 3 (PF-3): Scorecard weekly, reported and never gated (a scheduled category: never on the gate's list). Its image runs as a
+  // docker step by the reviewed digest, with the job's read token and no secret; the scrubbed result goes to code scanning from its own job
+  // (security-events: write is never in the job that runs the image)
+  for (const n of draft.needs.filter((x) => x.layer === 'merge' && (categoryOf(x.id) ?? x.category) === 'scorecard')) {
+    const spec = specsOf(n).find((s) => toolOf(c, s.tool.id).id === 'scorecard-action');
+    if (spec === undefined) continue;
+    try {
+      const tool = toolOf(c, spec.tool.id);
+      const steps = renderScorecardBlock(tool, deps.platform, gate);
+      nightly[SCORECARD_JOB] = {
+        'runs-on': JOB_RUNNER, 'timeout-minutes': JOB_MINUTES, if: SCORECARD_IF, permissions: { contents: 'read', actions: 'read' }, 'cache-mode': 'none',
+        steps: [egressStepFor(egressSetsForTool(tool), { userSecret: false, dockerNetworks: false, job: SCORECARD_JOB }), ...steps],
+      };
+      const scrubbed = `\${{ runner.temp }}/pipegen-out/${SCORECARD_ARTIFACT}`;
+      nightly[CODE_SCANNING_JOB] = {
+        'runs-on': JOB_RUNNER, 'timeout-minutes': JOB_MINUTES, needs: [SCORECARD_JOB], permissions: { contents: 'read', 'security-events': 'write', actions: 'read' }, 'cache-mode': 'none',
+        steps: [
+          egressStepFor([], { userSecret: false, dockerNetworks: false, job: CODE_SCANNING_JOB }),
+          { ...renderPlatformStep('download-artifact', deps.platform, { name: SCORECARD_ARTIFACT, path: scrubbed }), name: 'Download the scrubbed Scorecard result' },
+          { ...renderPlatformStep('upload-sarif', deps.platform, { sarif_file: `${scrubbed}/scorecard.sarif`, category: SCORECARD_CATEGORY }), name: 'Upload the Scorecard result to code scanning' },
+        ],
+      };
+    } catch (e) {
+      if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e;
+      addNote(notes, `OpenSSF Scorecard is not run: ${safeText(e.message, 200)}`);
+    }
+  }
 
   // 4. signing: G3's job for the delivered mode, none for the proof or a skipped deploy. GJ: a signing or attestation need on a service that
   // builds no image is report-only (its image leaves the plan; with no service building an image there is nothing to sign at all)

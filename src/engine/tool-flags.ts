@@ -940,6 +940,8 @@ export const RENDERER_INPUTS: Readonly<Record<string, Readonly<Record<string, Re
   },
   'actions/download-artifact': { name: ARTIFACT_NAME, path: OWN_FOLDER_PATH },
   'github/codeql-action/upload-sarif': { sarif_file: RUNNER_TEMP_PATH, category: rx(/^pipegen-[a-z0-9][a-z0-9-]{0,100}$/, 'a category starting pipegen-') },
+  // G15a round 3 (PF-3): the Scorecard docker step reads the job's own token (contents and actions read), never a secret
+  'docker://ghcr.io/ossf/scorecard-action': { repo_token: { describe: "the job's own token (${{ github.token }})", check: (v) => v === '${{ github.token }}' } },
   // G15a (carry C10): the digest is the run-time output of pipegen's digest step of the same image (the hand-off file image-publish uploaded,
   // checked as sha256:<64 hex>), never a literal and never another step's output
   'actions/attest': {
@@ -1029,8 +1031,20 @@ export function rendererInputProblems(usesPath: string, inputs: Readonly<Record<
 /**
  * Actions whose action.yml runs a docker image (`runs.using: docker`), by `uses` path (ruling S13). Their reviewed entry
  * must record the image in `wrappedImage` (the loader checks it), and a render runs them only when that image is pinned
- * by digest. scorecard-action's is by tag today, so it stays refused.
+ * by digest. scorecard-action's action.yml runs it by tag, so as an action it stays refused; it runs as a docker step instead
+ * (DOCKER_STEP_IMAGES).
  */
 export const DOCKER_ACTION_USES: ReadonlySet<string> = new Set(['ossf/scorecard-action']);
+/**
+ * G15a round 3 (PF-3): the container actions pipegen runs as a `docker://<image>@<digest>` step, by `uses` path → the image (no tag, no
+ * digest). The digest is the one the reviewed entry recorded (wrappedImage.digest), and wrappedImage.ref must be this image at a tag: the
+ * step skips action.yml (which runs the image by tag), so no action.yml default applies and every input is written (the entry's fixed
+ * inputs and DOCKER_STEP_INPUTS). The referee accepts a docker:// step only in this form.
+ */
+export const DOCKER_STEP_IMAGES: Readonly<Record<string, string>> = Object.freeze({ 'ossf/scorecard-action': 'ghcr.io/ossf/scorecard-action' });
+/** The inputs a docker step gets besides its entry's fixed inputs (action.yml's defaults, written out): Scorecard reads the job's own token. */
+export const DOCKER_STEP_INPUTS: Readonly<Record<string, Readonly<Record<string, string>>>> = Object.freeze({
+  'ossf/scorecard-action': Object.freeze({ repo_token: '${{ github.token }}' }),
+});
 /** Actions that build an image from a Dockerfile at run time (a composite that generates one): what runs can not be pinned, so they are refused. */
 export const IMAGE_BUILT_ACTION_USES: ReadonlySet<string> = new Set(['pypa/gh-action-pypi-publish']);
