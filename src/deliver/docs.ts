@@ -367,7 +367,7 @@ function setupSection(d: Doc, draft: PipelineDraft, data: DocData): void {
   d.li(p.private
     ? `This repository is private, so its checks run from central workflows in the pipelines repository of the same owner, pinned to one commit. The caller file in this repository is \`${CALLER_WORKFLOW}\`.`
     : `This repository is public, so its checks are written inline in this repository: \`${CALLER_WORKFLOW}\`, \`${LOCAL_MERGE_WORKFLOW}\`, \`${PUSH_WORKFLOW}\` and \`${NIGHTLY_WORKFLOW}\`. Its install record is kept in a private pipelines repository.`);
-  d.li('pipegen does not change what or how you deploy. It adds a verify job and `needs` entries to your existing deploy jobs, and nothing else in them.');
+  d.li('pipegen does not change what or how you deploy. It adds a verify job, `needs` entries on your existing deploy jobs, and its head check as the first step of each of those jobs (so a deploy that waited for an approval, or a re-run, stops once a newer commit is on the default branch), and nothing else in them. Two kinds of deploy job get no head check: a job that calls another workflow (it has no steps of its own), and one pipegen gates only for its runner or vars that can not start with the check; the notes below say which jobs and what that leaves open.');
   d.li(`pipegen offers three strictness levels, Starter, Standard (the default) and Strict. They decide which checks block a pull request and which only warn.${data.est?.strictness === undefined ? '' : ` This setup uses ${data.est.strictness}.`}`);
   if (data.est !== null) {
     const incl = p.private ? (data.est.includedMinutes === null ? ' pipegen could not tell how many minutes your plan includes.' : ` Your plan includes ${data.est.includedMinutes} minutes a month for private repositories.`) : ' Actions minutes on a public repository are free.';
@@ -713,7 +713,7 @@ function notProvenSection(d: Doc, draft: PipelineDraft, data: DocData, reviewed:
     const label = Object.hasOwn(CATEGORY_TEXT, e.category) ? (CATEGORY_TEXT[e.category] as readonly [string, string])[0] : 'A check pipegen added';
     d.li(`${label}${need?.service === undefined ? '' : `, service ${q(need.service)}`}, tool ${fit(spec?.tool.name ?? ZAP_TOOL, 80)}: ZAP results are not verified yet, so the gate judges this check as not proven. It only warns and never blocks a pull request.`);
   }
-  for (const f of edits) d.li(`Part deploy-verify: pipegen edited ${q(f.path, 160)} (it added the verify job and \`needs\` entries). Check the edit by hand before you rely on it.`);
+  for (const f of edits) d.li(`Part deploy-verify: pipegen edited ${q(f.path, 160)} (it added the verify job, \`needs\` entries and its head check as the first step of each deploy job, except a job that calls another workflow, or one pipegen gates only for its runner or vars and can not start with the check (see the notes)). Check the edit by hand before you rely on it.`);
   const link = secretsLink(p.owner, p.repo);
   d.p(`Set a missing secret in the repository settings: Settings, Secrets and variables, Actions${link === null ? '' : ` (${link})`}. When the key exists, the nightly run opens an issue with the exact patch: run \`npx pipegen update\` and it applies the change as a pull request. CI never edits workflow files itself.`);
   const where = p.private ? `\`.github/workflows/${centralProjectName(p.repo)}--merge.yml\` in the pipelines repository` : `\`${LOCAL_MERGE_WORKFLOW}\``;

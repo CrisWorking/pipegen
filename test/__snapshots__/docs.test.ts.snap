@@ -30,7 +30,7 @@ This section comes first so that no limit is hidden.
 
 - pipegen v0.2 is for repositories owned by CrisWorking. A public repository uses the gate in the normal way.
 - This repository is private, so its checks run from central workflows in the pipelines repository of the same owner, pinned to one commit. The caller file in this repository is \`.github/workflows/pipegen.yml\`.
-- pipegen does not change what or how you deploy. It adds a verify job and \`needs\` entries to your existing deploy jobs, and nothing else in them.
+- pipegen does not change what or how you deploy. It adds a verify job, \`needs\` entries on your existing deploy jobs, and its head check as the first step of each of those jobs (so a deploy that waited for an approval, or a re-run, stops once a newer commit is on the default branch), and nothing else in them. Two kinds of deploy job get no head check: a job that calls another workflow (it has no steps of its own), and one pipegen gates only for its runner or vars that can not start with the check; the notes below say which jobs and what that leaves open.
 - pipegen offers three strictness levels, Starter, Standard (the default) and Strict. They decide which checks block a pull request and which only warn.
 - Estimated monthly Actions minutes: about 120, counted from the activity of the last 30 days. Your plan includes 3000 minutes a month for private repositories.
 
@@ -320,7 +320,7 @@ This section comes first so that no limit is hidden.
 
 - pipegen v0.2 is for repositories owned by CrisWorking. A public repository uses the gate in the normal way.
 - This repository is public, so its checks are written inline in this repository: \`.github/workflows/pipegen.yml\`, \`.github/workflows/pipegen-merge.yml\`, \`.github/workflows/pipegen-push.yml\` and \`.github/workflows/pipegen-nightly.yml\`. Its install record is kept in a private pipelines repository.
-- pipegen does not change what or how you deploy. It adds a verify job and \`needs\` entries to your existing deploy jobs, and nothing else in them.
+- pipegen does not change what or how you deploy. It adds a verify job, \`needs\` entries on your existing deploy jobs, and its head check as the first step of each of those jobs (so a deploy that waited for an approval, or a re-run, stops once a newer commit is on the default branch), and nothing else in them. Two kinds of deploy job get no head check: a job that calls another workflow (it has no steps of its own), and one pipegen gates only for its runner or vars that can not start with the check; the notes below say which jobs and what that leaves open.
 - pipegen offers three strictness levels, Starter, Standard (the default) and Strict. They decide which checks block a pull request and which only warn.
 - Estimated monthly Actions minutes: about 120, counted from the activity of the last 30 days. Actions minutes on a public repository are free.
 

@@ -222,7 +222,7 @@ const UNCOVERED_REASON: Readonly<Record<string, string>> = Object.freeze({
 // ---------- egress ----------
 
 /** The package-registry sets a service's own install needs (npm → npm, pip/poetry/uv → pypi). */
-function packageSets(svcs: readonly (Service | undefined)[]): EgressSet[] {
+export function packageSets(svcs: readonly (Service | undefined)[]): EgressSet[] {
   const out = new Set<EgressSet>();
   for (const s of svcs) {
     if (s?.packageManager === 'npm') out.add('npm');
@@ -680,6 +680,13 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     suggestions.push({ name: u.tool.name, repo: u.tool.repo, why: u.why });
   }
   if (suggestions.length !== draft.suggestions.length) draft = { ...draft, suggestions };
+  // G7 (carry G4→G7, ruling S31's pattern): the deploy layer's sbom and egress needs have no job of pipegen's in v0.2. pipegen never changes
+  // the user's own deploy jobs, so their network is not locked (pipegen's image-publish and verify jobs start with the egress block; the
+  // keyless sign job has none until Sigstore's hosts are a reviewed set, G15), and no reviewed job makes the published image's SBOM yet.
+  // Neither is counted as covered: each leaves the draft with a plain note.
+  const release = new Set(draft.needs.filter((n) => n.layer === 'deploy' && RELEASE_ONLY_NOTES.has(categoryOf(n.id) ?? n.category)));
+  for (const n of release) addNote(notes, RELEASE_ONLY_NOTES.get(categoryOf(n.id) ?? n.category) as string);
+  if (release.size > 0) draft = narrowed(draft, release);
   return { draft, push, merge, nightly, sign, notes, uncoveredMinimum: [...uncoveredMinimum.values()] };
 }
 
@@ -699,6 +706,12 @@ function withLintSteps(draft: PipelineDraft, plan: JobsPlan, reviewed: readonly 
   const code = offers.refs.filter((r) => categoryOf(r.id) === 'workflow-lint').flatMap((r) => (offers.offers.get(r.key) ?? []).map((o) => specFor(r, o, draft.profile)));
   return { ...draft, steps: [...draft.steps.filter((s) => !isLintStep(s)), ...code] };
 }
+
+/** G7: the deploy-layer needs pipegen writes no job for in v0.2, each with its note (and PIPEGEN.md line, G9): never counted as covered. */
+export const RELEASE_ONLY_NOTES: ReadonlyMap<string, string> = new Map([
+  ['sbom', 'The SBOM of the published image is not made yet: no reviewed job of pipegen\'s builds it after the image is published (v0.2). The image checks of pull requests still run.'],
+  ['egress', 'Your own deploy jobs keep their open network: pipegen never changes them (it only adds the pipegen-verify job they wait for). pipegen\'s own image publish and verify jobs run behind the network lock; a keyless signing job does not (Sigstore\'s hosts are not in a reviewed network set yet).'],
+]);
 
 /** GJ: the note (and the PIPEGEN.md line, G9) of a signing or attestation need on a service that builds no image. */
 const reportOnlyNote = (service: string): string => `The service ${show(service)} builds no image, so its signing is report-only: pipegen signs nothing for it (sign its deployed files with cosign sign-blob yourself if you need it).`;

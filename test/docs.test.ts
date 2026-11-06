@@ -1215,7 +1215,7 @@ describe('doc: fix round 1 (ruling G9-R1)', () => {
     const two: CreatedFile = { ...inserted, path: '.github/workflows/site.yml' };
     const d = shapeB({ created: [inserted, two], notProven: [] });
     const sec = headingAt(docOf(d), 'Not proven yet');
-    expect(sec).toContain('Part deploy-verify: pipegen edited ".github/workflows/deploy.yml" (it added the verify job and `needs` entries). Check the edit by hand before you rely on it.');
+    expect(sec).toContain('Part deploy-verify: pipegen edited ".github/workflows/deploy.yml" (it added the verify job, `needs` entries and its head check as the first step of each deploy job, except a job that calls another workflow, or one pipegen gates only for its runner or vars and can not start with the check (see the notes)). Check the edit by hand before you rely on it.');
     expect(sec).toContain('".github/workflows/site.yml"');
     expect(sec).not.toContain('Every check pipegen set up is proven.');
     expect(headingAt(docOf(base), 'Not proven yet')).toContain('Every check pipegen set up is proven.');

@@ -384,7 +384,9 @@ describe('referee: the gate job (rulings S4 and S21)', () => {
     expect(has(r2, 'permissions', /checkout step/), show(r2)).toBe(true);
     // the other rows that read a workspace keep their checkout
     expect(JOB_STEP_POLICY.nightly).not.toContain('checkout');   // C7 fix round 1: the nightly job holds PIPEGEN_FP_KEY
-    expect(JOB_STEP_POLICY['pipegen-verify']).toContain('checkout');
+    // G7-R1 sec M3: the verify job reads the digest through the API by the gated run's id, so it has no checkout and no artifact download
+    expect(JOB_STEP_POLICY['pipegen-verify']).not.toContain('checkout');
+    expect(JOB_STEP_POLICY['pipegen-verify']).not.toContain('download-artifact');
   });
 });
 

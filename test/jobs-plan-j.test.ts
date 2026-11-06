@@ -11,6 +11,7 @@ import { AssembleError, assembleJobs, HOOKS_CI_NOTES, type Job } from '../src/la
 import { RenderError } from '../src/engine/render-error.js';
 import type { Capabilities, ExistingWorkflow, Need, PipelineDraft, ProjectType, ReviewedTool, Service, ServiceType } from '../src/types.js';
 import { REVIEWED } from './helpers/debate-fixtures.js';
+import { HEAD_CHECK_STEP_ID } from '../src/engine/deploy-steps.js';
 import { CAPS, LINTERS, assemble, editJob, files, judge, node, p, planned, profileOf, shown } from './helpers/assemble.js';
 import { POUTINE_NOT_RUN } from '../src/layers/jobs.js';
 
@@ -230,8 +231,10 @@ describe('GJ: G2/G3, G4 and G5 follow Plan J (a project type per service, fewer 
     const a = lay(x, 'keyless');
     expect(a.verify).not.toBeNull();
     const steps = (a.verify as Job).steps;
-    expect(steps).toHaveLength(2);
+    // find-run and the head check (G7), no digest step and no signature check: a static site publishes no image
+    expect(steps).toHaveLength(3);
     expect(steps[1]?.with?.mode).toBe('find-run');
+    expect(steps[2]?.id).toBe(HEAD_CHECK_STEP_ID);
     expect(JSON.stringify(steps)).not.toMatch(/digest|cosign/);
     expect(a.files.map((f) => f.content).join('\n')).not.toMatch(/image-build--|image-scan--|dast--/);
     expect(shown(await judgeAssembled(a, JD))).toBe('');

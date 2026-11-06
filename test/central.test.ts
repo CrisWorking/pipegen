@@ -97,7 +97,7 @@ describe('G3: central shared files (Plan G Task 1)', () => {
     expect(j.environment).toBe('pipegen-signing');
     expect(j['runs-on']).toBe('ubuntu-24.04');
     const sign = (j.steps as Obj[]).find((s) => typeof s.run === 'string' && s.run.includes(' sign --yes')) as Obj;
-    expect(sign.run).toContain('sign --yes --key env://PIPEGEN_COSIGN_KEY --tlog-upload=false --use-signing-config=false "$ref"');
+    expect(sign.run).toContain('sign --yes --key env://PIPEGEN_COSIGN_KEY --tlog-upload=false --use-signing-config=false -a pipegen.commit="$GITHUB_SHA" "$ref"');
     // the key and its password come from the environment's secrets, only in the sign step's env; no secret is passed in
     // (G3-R3: plus the job's own token, which the step's cosign login reads from stdin)
     expect(sign.env).toEqual({ BASH_ENV: '', ENV: '', [KEY_NAME]: `\${{ secrets.${KEY_NAME} }}`, [PW_NAME]: `\${{ secrets.${PW_NAME} }}`, [TOK_NAME]: `\${{ ${SEC_FIELD}.GITHUB_TOKEN }}` });
@@ -410,7 +410,7 @@ describe('G3 fix round 1 (G3-R2)', () => {
       writeFileSync(join(tmp, 'pipegen-out', imageDigestArtifact('app'), 'digest'), `sha256:${'c'.repeat(64)}`);
       if (link) { writeFileSync(join(tmp, 'real'), fake, { mode: 0o755 }); symlinkSync(join(tmp, 'real'), join(binDir, 'cosign')); } else writeFileSync(join(binDir, 'cosign'), content ?? fake, { mode: 0o755 });
       const run = renderSignSteps(fixture, 'key-env', IMG)[1]?.run as string;
-      const r = spawnSync('bash', ['-c', run], { env: { RUNNER_TEMP: tmp, PATH: '/usr/bin:/bin', GITHUB_ACTOR: 'octo', [KEY_NAME]: 'k', [PW_NAME]: 'p', [TOK_NAME]: 'tv' }, encoding: 'utf8' });
+      const r = spawnSync('bash', ['-c', run], { env: { RUNNER_TEMP: tmp, PATH: '/usr/bin:/bin', GITHUB_ACTOR: 'octo', GITHUB_SHA: 'd'.repeat(40), [KEY_NAME]: 'k', [PW_NAME]: 'p', [TOK_NAME]: 'tv' }, encoding: 'utf8' });
       const left = readdirSync(tmp).filter((n) => n.startsWith('pipegen-docker'));
       rmSync(tmp, { recursive: true, force: true });
       return { status: r.status, out: `${r.stdout}${r.stderr}`, left };
@@ -418,6 +418,8 @@ describe('G3 fix round 1 (G3-R2)', () => {
     const good = runOnce(null);
     expect(good.status, good.out).toBe(0);
     expect(good.out).toContain('SIGNED sign --yes --key env://PIPEGEN_COSIGN_KEY');
+    // G7-R1 sec M1: the signature names the run's commit
+    expect(good.out).toContain(`-a pipegen.commit=${'d'.repeat(40)}`);
     // G3-R3: the login reads the token from stdin (never on the command line), into a fresh config folder under RUNNER_TEMP that the sign
     // reads and that is gone when the step ends; the token variable is unset before cosign signs
     expect(good.out).toMatch(new RegExp(`LOGIN login ghcr\\.io -u octo ${STDIN_FLAG} read:tv cfg=\\S+/pipegen-docker\\.\\w+`));

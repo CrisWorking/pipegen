@@ -28,7 +28,7 @@
 //   SARIF; findSecretLike runs over every file (S18). The workflow linters (actionlint, zizmor) run through `deps.runLinters`
 //   (default: linters.ts runLinters, 7b), which tests replace with a stub.
 import { isDeepStrictEqual } from 'node:util';
-import { isMap, isScalar, LineCounter, visit, type Document, type Node as YamlNode, type Pair } from 'yaml';
+import { isMap, isScalar, isSeq, LineCounter, visit, type Document, type Node as YamlNode, type Pair } from 'yaml';
 import { findSecretLike } from '../ai/redact.js';
 import { activeSafeText as safeText, anyString, anyYamlScalar, scrubForDisplay, vaultHolds, withActiveVault } from '../util/known-values.js';
 import { GATE_CHECK_NAME, type CreatedFile, type KnownValueCheck, type OutputFormat, type PipegenInserted, type PipelineDraft, type ReviewedTool, type RuntimeEnv, type Service, type StepSpec } from '../types.js';
@@ -51,7 +51,7 @@ import {
   STEP_KEYS as STEP_KEY_LIST, WORKFLOW_CONCURRENCY, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact,
 } from './job-rules.js';
 import { signingMode } from '../github/signing-mode.js';
-import { containerRefusal, RenderError, renderComposeUp, renderProjectScript, renderRepoTool, renderRuntimeEnv, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
+import { containerRefusal, RenderError, renderComposeUp, renderProjectScript, renderRepoTool, renderRuntimeEnv, renderStep, sameDedupeContent, stepsToYaml, type RenderContext } from './render-step.js';
 import { COMPOSE_PATH, planCompose } from '../create/compose.js';
 import { dockerfilesOf } from './created-judges/compose.js';
 import { loadBaseImages } from './base-images.js';
@@ -59,7 +59,9 @@ import { centralWorkflowFile, centralWorkflowPath } from './central-path.js';
 import { projectScriptFor, repoToolFor } from './reviewed.js';
 import { slotProblem, type SlotKind } from './slots.js';
 import { expectedSigningSteps, signedImageOwner } from './signing.js';
-import { NO_IMAGE_CATEGORIES, noImageServices, WORKFLOW_LINT_TOOL } from './needs.js';
+import { NO_IMAGE_CATEGORIES, noImageServices, publishedImageServices, WORKFLOW_LINT_TOOL } from './needs.js';
+import { FIND_RUN_STEP_ID, renderDigestStep, renderHeadCheckStep, renderPublishDigestStep } from './deploy-steps.js';
+import { strongReason } from './deploy-gating.js';
 import { ARCHIVE_TOOL_IDS, imageBuildTag, renderImageArchiveScan, renderImageBuild } from './image-handoff.js';
 import { dastStartOf, renderDastRun, renderDastScrub } from './dast-handoff.js';
 import { SHARED_CDN_SETS } from './egress.js';
@@ -136,7 +138,9 @@ export type StepKind = 'checkout' | 'setup' | 'harden' | 'upload-artifact' | 'do
    * the image archive step (its own image-build--<service> job only) and the archive's hash check of a scanner job, each recognised by its
    * exact content (signing.ts, image-handoff.ts) for this draft
    */
-  | 'sign' | 'verify' | 'image-archive' | 'image-check';
+  | 'sign' | 'verify' | 'image-archive' | 'image-check'
+  /** G7 (B3 a): image-publish's digest step (job image-publish only), recognised by its exact content (deploy-steps.ts) */
+  | 'publish-digest';
 /** pipegen's own actions by reviewed-entry id (Plan C adds the gate entry, Plan H the watcher entry, under these ids). */
 export const PIPEGEN_ACTION_IDS = { gate: 'pipegen-gate', watcher: 'pipegen-watcher' } as const;
 /** The step kind of each reviewed action entry that is not an ordinary tool, by entry id. The gate entry is kind `gate`, except a recognised scrub step of it (isScrubStep: judgeUses). */
@@ -157,8 +161,9 @@ const ENTRY_KIND: Readonly<Record<string, StepKind>> = Object.freeze({
  */
 export const JOB_STEP_POLICY: Readonly<Record<string, readonly StepKind[]>> = Object.freeze({
   'pr-check': ['harden', 'checkout', 'pr-check'],
-  // G2: the verify steps of the draft's signing plan (B3 b, d), and G7's digest step later
-  'pipegen-verify': ['harden', 'checkout', 'download-artifact', 'gate', 'verify'],
+  // G2: the verify steps of the draft's signing plan (B3 b, d); G7: the head check and the digest step are verify steps too (deploy-steps.ts).
+  // G7-R1 sec M3: no checkout and no artifact download: the digest comes through the API by the gated run's id, and nothing may overwrite it
+  'pipegen-verify': ['harden', 'gate', 'verify'],
   'code-scanning': ['harden', 'download-artifact', 'upload-sarif'],
   // no checkout: the gate never reads the workspace (Plan C ruling S21); it reads the event, the job outputs and the API
   // C5b: the gate's own uploads (result, baseline, clean-run marker) after the gate step, and no other upload (checkJobOrder, gateUploadProblems)
@@ -166,7 +171,8 @@ export const JOB_STEP_POLICY: Readonly<Record<string, readonly StepKind[]>> = Ob
   'base-scan': ['harden', 'checkout', 'setup', 'stage', 'tool', 'scrub', 'upload-artifact'],
   // no checkout: this job holds PIPEGEN_FP_KEY and reads only the API and artifacts (C3 review m9, like the gate job's S21)
   'baseline-check': ['harden', 'download-artifact', 'gate'],
-  'image-publish': ['harden', 'checkout', 'setup-buildx', 'docker-login', 'build-push'],
+  // G7 (B3 a): the publish digest step and the upload of the digest folder, after the build (job-rules.ts publishTailAt)
+  'image-publish': ['harden', 'checkout', 'setup-buildx', 'docker-login', 'build-push', 'publish-digest', 'upload-artifact'],
   // G2: the cosign sign steps of the draft's signing plan (B3 b); attest mode signs with the reviewed actions/attest
   sign: ['harden', 'checkout', 'download-artifact', 'docker-login', 'attest', 'sign'],
   // no checkout: the nightly job holds PIPEGEN_FP_KEY (it verifies the baseline) and reads only the API; the identity comes from GITHUB_REPOSITORY (C7 fix round 1)
@@ -280,7 +286,12 @@ const IMAGE_CHECK_SOURCE = 'image-check';
 const REPO_TOOL_SOURCE = 'repotool';
 /** A scanner of the PR's own image on its archive (B6): the head check itself, rendered another way (so it counts as the spec's step). */
 const ARCHIVE_SUFFIX = ':archive';
+/** G7: the deploy layer's own steps (deploy-steps.ts): the verify job's head check and digest step, image-publish's digest step. */
+const DEPLOY_HEAD_SOURCE = 'deploy-head';
+const DEPLOY_DIGEST_SOURCE = 'deploy-digest';
+const PUBLISH_DIGEST_SOURCE = 'publish-digest';
 const SOURCE_KIND: Readonly<Record<string, StepKind>> = Object.freeze({ [SIGN_SOURCE]: 'sign', [VERIFY_SOURCE]: 'verify', [IMAGE_ARCHIVE_SOURCE]: 'image-archive', [IMAGE_CHECK_SOURCE]: 'image-check',
+  [DEPLOY_HEAD_SOURCE]: 'verify', [DEPLOY_DIGEST_SOURCE]: 'verify', [PUBLISH_DIGEST_SOURCE]: 'publish-digest',
   // G4-R1: the raw DAST result's hash check (it reads a download and the run job's output only, like a checker)
   'dast-check': 'tool' });
 const sourceKind = (source: string): StepKind | undefined => { const head = source.slice(0, source.indexOf(':')); return source.includes(':') ? own(SOURCE_KIND, head) : undefined; };
@@ -328,6 +339,13 @@ export function pipegenLines(file: CreatedFile): ReadonlySet<number> | null {
   for (const id of mark.jobs) {
     const p = jobPair(doc, id);
     if (p?.key?.range && p.value?.range) linesOf(lines, p.key.range[0], p.value.range[1], out);
+  }
+  // G7-R1 sec I1: the head check pipegen put first in a gated job is its line too
+  for (const id of Array.isArray(mark.headCheck) ? mark.headCheck : []) {
+    const p = typeof id === 'string' ? jobPair(doc, id) : undefined;
+    const steps = isMap(p?.value) ? p.value.get('steps', true) : undefined;
+    const first = isSeq(steps) ? (steps.items[0] as YamlNode | undefined) : undefined;
+    if (first?.range) linesOf(lines, first.range[0], first.range[1], out);
   }
   for (const n of mark.needs) {
     const p = jobPair(doc, n.job);
@@ -622,6 +640,19 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
   notes.push(...signing.notes.map((n) => safeText(n, 400)));
   signing.sign.forEach((steps, k) => record(`${SIGN_SOURCE}:${k}`, [steps, steps], false, true, false, undefined, undefined));
   signing.verify.forEach((steps, k) => record(`${VERIFY_SOURCE}:${k}`, [steps, steps], false, true, false, undefined, undefined));
+  // G7 (B3 a, carry G1→G7): the verify job's head check, and per published image its digest step and image-publish's digest step
+  try {
+    const head = [renderHeadCheckStep(draft.profile.defaultBranch)];
+    record(`${DEPLOY_HEAD_SOURCE}:head`, [head, head], false, true, false, undefined, undefined);
+  } catch (e) { if (!(e instanceof RenderError)) throw e; notes.push(`The head check of the verify job can not be rendered, so no step may claim to be it: ${safeText(e.message, 200)}`); }
+  for (const service of publishedImageServices(draft.profile, draft.capabilities)) {
+    try {
+      const digest = [renderDigestStep(service)];
+      const published = [renderPublishDigestStep(service)];
+      record(`${DEPLOY_DIGEST_SOURCE}:${slug(service)}`, [digest, digest], false, true, false, undefined, undefined);
+      record(`${PUBLISH_DIGEST_SOURCE}:${slug(service)}`, [published, published], false, true, false, undefined, undefined);
+    } catch (e) { if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e; notes.push(`The digest steps of ${show(service)} can not be rendered, so no step may claim to be them: ${safeText(e.message, 200)}`); }
+  }
   // C9: the secrets job's commit-range scan (the reviewed betterleaks entry in git mode), whichever tool scans the HEAD tree: its install and
   // its one checker step belong to the secrets job (the gate's job list has its range entry exactly when the draft has a repo-wide secrets check)
   const rangeTool = byId.get(RANGE_TOOL);
@@ -700,7 +731,7 @@ interface FileCtx {
 const issueFor = (fc: FileCtx) => (check: RefereeCheck, message: string): void => fc.add(fc.file.path, check, message);
 
 /** The event names of an `on:` value (a name, a list of names, or a map by name); null when it is none of those. */
-function triggersOf(on: unknown): string[] | null {
+export function triggersOf(on: unknown): string[] | null {
   if (typeof on === 'string') return [on];
   if (Array.isArray(on)) return on.every((x) => typeof x === 'string') ? (on as string[]) : null;
   if (isObj(on)) return Object.keys(on);
@@ -1098,6 +1129,44 @@ function judgeJob(fc: FileCtx, id: string, j: unknown): void {
   judgeCosignEnv(fc, where, j, judged);
   judgeImageHandoff(fc, id, where, j, judged);
   judgeRegistryWrite(fc, where, j, judged);
+  if (id === 'pipegen-verify') judgeVerifyJob(fc, where, j, judged);
+}
+
+/**
+ * G7 (B3 a, c, e; carries G1→G7, G5→G7 2 and 3, G40): what the verify job must hold, in this order after its egress step: the gate's
+ * find-run step (exactly one; its wait shorter than the job's own limit, G40), the head check (the deploy is a push to the default branch
+ * and its commit is still that branch's head), and for each image pipegen publishes here its digest step (the gated run's digest artifact by
+ * run id, DIGEST_RE-checked) and, whenever the repository's own signing mode signs (re-derived from the repository and its capabilities,
+ * never the draft's recorded plan, carry G5→G7 1), that image's signature check after the digest. A verify job assembled in mode none for a
+ * signing repository, or in attest mode before the reviewed gh entry exists (G15), has no signature check and is refused.
+ */
+function judgeVerifyJob(fc: FileCtx, where: string, j: Obj, judged: readonly Judged[]): void {
+  // `template`: a verify job that is not the form pipegen writes (each part below is what makes it a proof)
+  const bad = (m: string): void => fc.add(fc.file.path, 'template', `${where} ${m}`);
+  const finds = judged.flatMap((x, i) => (x.kind === 'gate' && x.step.with?.mode === 'find-run' ? [i] : []));
+  if (finds.length !== 1 || judged.some((x) => x.kind === 'gate' && x.step.with?.mode !== 'find-run')) { bad('holds exactly one gate step, in mode find-run (it proves the commit passed the gate in the trusted run).'); return; }
+  const find = finds[0] as number;
+  if (judged[find]?.step.id !== FIND_RUN_STEP_ID) bad(`gives its find-run step the id ${FIND_RUN_STEP_ID} (the digest step reads its run id).`);
+  const wait = Number(judged[find]?.step.with?.['timeout-minutes'] ?? 30);
+  const limit = j['timeout-minutes'];
+  if (typeof limit !== 'number' || !Number.isInteger(wait) || limit <= wait) bad(`must outlive its find-run wait (${wait} minutes): its timeout-minutes ${show(limit)} is not longer, so a run that ends near the wait's end would be cut (G40).`);
+  const at = (source: string): number => judged.findIndex((x) => x.match?.source === source && x.match.final);
+  const head = at(`${DEPLOY_HEAD_SOURCE}:head`);
+  if (head < 0 || head < find) bad('holds the head check after its find-run step (the deployed commit must still be the head of the default branch, so an older commit never deploys after a newer one).');
+  const mode = signingMode(fc.draft.profile, fc.draft.capabilities);
+  const plan = fc.draft.signing;
+  for (const service of publishedImageServices(fc.draft.profile, fc.draft.capabilities)) {
+    let s: string;
+    try { s = slug(service); } catch (e) { if (e instanceof ArtifactNameError) continue; throw e; }
+    const digest = at(`${DEPLOY_DIGEST_SOURCE}:${s}`);
+    if (digest < 0 || digest < find) { bad(`holds the digest step of ${show(service)} after its find-run step (the image is published here, so its digest comes from the gated run's artifact, checked as sha256:<64 hex>).`); continue; }
+    if (mode === 'none') continue;
+    const k = plan === undefined || plan === null || !Array.isArray(plan.images) ? -1 : plan.images.findIndex((i) => { try { return slug(String(i?.service)) === s; } catch { return false; } });
+    const verify = k < 0 ? -1 : at(`${VERIFY_SOURCE}:${k}`);
+    if (verify < 0 || verify < digest) bad(`must check the signature of the image of ${show(service)} after its digest step: this repository signs in mode ${mode}, so a deploy of an image pipegen did not sign (or one verified in mode none) is never let through.`);
+  }
+  // nothing of the verify job's own may come before the find-run step but its egress block
+  judged.slice(0, find).forEach((x, i) => { if (x.kind !== 'harden') bad(`step ${i + 1} comes before its find-run step; only the egress block may.`); });
 }
 
 /**
@@ -1586,6 +1655,7 @@ function judgeStepPolicy(fc: FileCtx, id: string, where: string, j: Obj, judged:
       // G2 (B3 b, d): pipegen signs only in the job sign and verifies only in the job pipegen-verify; an image archive comes only from its own image build (B6)
       else if (x.kind === 'sign') bad('permissions', `${where}, step ${i + 1}: pipegen signs only in the job sign.`);
       else if (x.kind === 'verify') bad('permissions', `${where}, step ${i + 1}: pipegen verifies only in the job pipegen-verify.`);
+      else if (x.kind === 'publish-digest') bad('permissions', `${where}, step ${i + 1}: the published image's digest is written only in the job image-publish.`);
       else if (x.kind === 'image-archive' && imageBuildSlugOf(id) !== sourceSlug(x.match?.source ?? '')) bad('permissions', `${where}, step ${i + 1}: the image archive of ${show(sourceSlug(x.match?.source ?? ''))} is made only in its own job ${show(imageBuildJobId(sourceSlug(x.match?.source ?? '')))}.`);
     });
   }
@@ -2047,7 +2117,40 @@ function judgeEdited(fc: FileCtx, parsed: Parsed, mark: PipegenInserted): void {
     else if (typeof before === 'string' && kept.length === 1) j.needs = kept[0];
     else j.needs = kept;
   }
-  if (!isDeepStrictEqual(rest, orig.parsed.js)) bad('template', 'The edit changes the user\'s workflow beyond the job and needs pipegen inserted.');
+  // G7-R1 sec I1: every job that waits for pipegen-verify and has steps starts with pipegen's head check (the verify job's own, of this
+  // repository's default branch, exactly), so the check runs in the deploy job after an approval wait and on every re-run of that job
+  if (mark.jobs.includes('pipegen-verify')) {
+    const heads: unknown[] = mark.headCheck === undefined ? [] : Array.isArray(mark.headCheck) ? mark.headCheck : [null];
+    let want: unknown = null;
+    try { want = stepsToYaml([renderHeadCheckStep(fc.draft.profile.defaultBranch)]).toJSON()[0]; } catch (e) { if (!(e instanceof RenderError)) throw e; }
+    // G7-R3: a job may wait without the head check (needsOnly) only when its one reason to wait is WEAK (its runner or vars): a job with a
+    // STRONG reason (a deploy, an environment, a secret, a write or OIDC permission, unset permissions, a call) always starts with the check
+    const only: unknown[] = mark.needsOnly === undefined ? [] : Array.isArray(mark.needsOnly) ? mark.needsOnly : [null];
+    for (const id of only) {
+      const o = typeof id === 'string' && isObj(origJobs[id]) ? origJobs[id] : undefined;
+      if (typeof id !== 'string' || o === undefined || !mark.needs.some((n) => isObj(n) && n.job === id) || heads.includes(id)) { bad('template', `The job ${show(id)} marked to wait without a head check is not a job pipegen gates without one.`); continue; }
+      const strong = strongReason(o, orig.parsed.js.permissions);
+      if (strong !== null) bad('template', `The job ${show(id)} may not wait without pipegen's head check: ${strong}.`);
+    }
+    for (const n of mark.needs) {
+      const j = isObj(n) && typeof n.job === 'string' ? restJobs[n.job] : undefined;
+      if (isObj(j) && j.uses === undefined && !heads.includes(n.job) && !only.includes(n.job)) bad('template', `The job ${show(n.job)} waits for pipegen-verify but does not start with pipegen's head check, so a re-run of that job alone, or one that waited for an approval, would not be checked.`);
+    }
+    for (const id of heads) {
+      const j = typeof id === 'string' ? restJobs[id] : undefined;
+      if (typeof id !== 'string' || !isObj(j) || !mark.needs.some((n) => isObj(n) && n.job === id)) { bad('template', `The head check pipegen added is on ${show(id)}, which is not a job it gates.`); continue; }
+      const steps = Array.isArray(j.steps) ? j.steps : [];
+      const p = jobPair(parsed.doc, id);
+      const stepsNode = isMap(p?.value) ? p.value.get('steps', true) : undefined;
+      const first = isSeq(stepsNode) ? stepsNode.items[0] : undefined;
+      if (hasAnchorOrAlias(first)) bad('injection', `The head check pipegen added to ${show(id)} uses a YAML anchor or alias.`);
+      if (want === null || !isDeepStrictEqual(steps[0], want)) { bad('template', `The job ${show(id)} does not start with pipegen's head check exactly (the step pipegen writes for the default branch, first).`); continue; }
+      // G7-R-sec1: no later step may run once the head check failed (a status function or a top-level || in its if:)
+      steps.forEach((st, i) => { if (i > 0 && isObj(st) && !gatedIfAllowed(st.if)) bad('template', `Step ${i + 1} of the job ${show(id)} has an if: that could run it after pipegen's head check failed (always(), failure(), cancelled(), or a top-level ||), so the check would not stop that deploy.`); });
+      steps.shift();
+    }
+  }
+  if (!isDeepStrictEqual(rest, orig.parsed.js)) bad('template', 'The edit changes the user\'s workflow beyond the job, needs and head checks pipegen inserted.');
   // G1 (C5a, C7s): the jobs pipegen inserts follow the same layout rules under the user's triggers (no gate on a push to another branch, no find-run on schedule)
   judgeLayoutJobs(fc, parsed.js.on, triggersOf(parsed.js.on), jobs, mark.jobs);
   judgeJobs(fc, jobs, mark.jobs);
@@ -2345,12 +2448,15 @@ async function judgeFiles(allFiles: CreatedFile[], draft: PipelineDraft, platfor
     const runs = j.judged.some((x) => { const m = /^spec:(\d+)$/.exec(x.match?.source ?? ''); return m !== null && zizmorSpec(Number(m[1])); });
     if (!runs) add(j.file, 'unreviewed', `The job "workflow-lint" runs no ${WORKFLOW_LINT_TOOL} step: workflow lint runs ${WORKFLOW_LINT_TOOL} (poutine only next to it), never another tool in its place.`);
   }
-  // G5-R1 I1: a draft that records a signing plan never publishes an image unsigned: a job that pushes an image (build-push with push) needs a
-  // sign job of the judged files holding the plan's sign (or attest) step; mode none is a draft with no plan
-  if (draft.signing !== undefined && draft.signing !== null) {
+  // G5-R1 I1, carry G5→G7 1: a repository that signs never publishes an image unsigned: a job that pushes an image (build-push with push)
+  // needs a sign job of the judged files holding the plan's sign (or attest) step. The mode is re-derived from the repository and its
+  // capabilities (signingMode), never taken from the draft's recorded plan: a stripped plan is no way around it. Mode none is a repository
+  // that signs nothing (private Free).
+  const signingOwn = signingMode(draft.profile, draft.capabilities);
+  if ((draft.signing !== undefined && draft.signing !== null) || signingOwn !== 'none') {
     const publishes = ex.jobs.some((j) => j.judged.some((x) => x.entryId === BUILD_PUSH_ID && x.step.with?.push !== 'false'));
     const signs = ex.jobs.some((j) => j.id === 'sign' && j.judged.some((x) => x.kind === 'sign' || x.kind === 'attest'));
-    if (publishes && !signs) add('(draft)', 'permissions', `The draft records ${show(String(draft.signing.mode))} signing and a job publishes an image, but the judged files hold no sign job with the plan's sign step: the image would be published unsigned.`);
+    if (publishes && !signs) add('(draft)', 'permissions', `This repository signs in mode ${show(String(draft.signing?.mode ?? signingOwn))} and a job publishes an image, but the judged files hold no sign job with the plan's sign step: the image would be published unsigned.`);
   }
   judgeBaseTwins(ex, add);
   judgeUploadsPerFile(ex, add);
