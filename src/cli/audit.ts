@@ -47,7 +47,7 @@ import {
   getAuth, GitHubAccessError, GITHUB_TIMEOUT_MS, hideToken, makeOctokit, permissionsTable, readAccessSteps, readGitHubContext,
 } from '../github/client.js';
 import { NotGitHubRepoError, readProject } from '../read/project.js';
-import { applyTypeOverrides, type TypeOverride } from '../read/project-type.js';
+import type { TypeOverride } from '../read/project-type.js';
 import type { AiProvider, Auth, Capabilities, RepoProfile, ReviewedTool } from '../types.js';
 import { packageVersion } from '../util/package-data.js';
 import { knownValuesFrom, makeSafeOutput, OUTPUT_CAP, usableKnownValues } from '../util/safe-output.js';

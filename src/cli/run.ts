@@ -38,7 +38,7 @@ import { decideTests } from '../debate/tests.js';
 import type { StarterDeps } from '../create/tests.js';
 import { deliver, deliverCentral, DeliverError, planDelivery, previewText, readCentralFileList, type DeliverResult, type DeliveryInput, type SigningKey, type CentralResult } from '../deliver/deliver.js';
 import { pipegenDocWith } from '../deliver/docs.js';
-import { coFacts, finish, githubFinishProbe, type CoFacts } from '../deliver/finish.js';
+import { coFacts, type CoFacts } from '../deliver/finish.js';
 import { readBlobText, readHead, readRepo, readTree } from '../deliver/git-data.js';
 import type { CreatedInputs } from '../engine/created-files.js';
 import { discover } from '../engine/discover.js';
@@ -50,10 +50,9 @@ import { codeownersProtectedPaths } from '../engine/created-builders.js';
 import { newRateBudget, type RateClock } from '../engine/github-rate.js';
 import { ensureLinters, ensurePinnedBinary, loadPinnedBinaries } from '../engine/linters.js';
 import { floorNeeds, isRunnable, planNeeds, publishedImageServices, type NeedsPlan } from '../engine/needs.js';
-import { needLanguage } from '../engine/discover.js';
 import { platformActions, type PlatformActions } from '../engine/pin.js';
 import type { RefereeReport } from '../engine/referee.js';
-import { assertBootstrapAllowed, bootstrapProofsNote, loadReviewed, reviewedFor } from '../engine/reviewed.js';
+import { assertBootstrapAllowed, bootstrapProofsNote, loadReviewed } from '../engine/reviewed.js';
 import { loadQualityBar } from '../engine/quality-bar.js';
 import { loadBaseImages } from '../engine/base-images.js';
 import { activity30d, estimate, needKeyCount, type Activity, type Estimates } from '../estimate/estimate.js';
@@ -66,7 +65,7 @@ import { AssembleError, assembleJobs } from '../layers/jobs.js';
 import { planLocks, type LockPlan } from '../layers/locks.js';
 import { precommitFiles, type PrecommitResult } from '../layers/precommit.js';
 import { checkProofRepos, type ProofRepos } from '../proof/repos.js';
-import { PROOF_SIGNING_MODE, type ProofAssemble } from '../proof/harness.js';
+import type { ProofAssemble } from '../proof/harness.js';
 import { StateStore, type StateDeps } from '../proof/state.js';
 import { CENTRAL_REPO } from '../proof/target.js';
 import type { Auth, Capabilities, Candidate, CreatedFile, PipelineDraft, RepoProfile, ReviewedTool, SkippablePart } from '../types.js';
@@ -78,9 +77,11 @@ import { withActiveVault } from '../util/known-values.js';
 import { TYPE_CANCELLED } from './audit.js';
 import { askConsent, consentScreen } from './consent.js';
 import { tokenLogin } from './inspect.js';
+import { finishCommand, interactiveRun } from './commands.js';
+export { interactiveRun };
 import type { CliIO } from './io.js';
 import {
-  assembledJobs, consentJobs, docFor, draftFromDebate, isAiNote, parseStrictness, pickOwners, proofAssembleWith, prWaitMinutes, requiredWorkflowApplies,
+  assembledJobs, consentJobs, docFor, draftFromDebate, isAiNote, parseStrictness, pickOwners, proofAssembleWith, prWaitMinutes,
   signingFor, warnFirstFor, type Strictness,
 } from './run-parts.js';
 import { typeStep } from './type-confirm.js';
@@ -230,8 +231,6 @@ const newRunId = (now: number): string => {
   const d = new Date(now).toISOString();
   return `${d.slice(0, 10).replace(/-/g, '')}-${d.slice(11, 19).replace(/:/g, '')}-${Math.floor(Math.random() * 0x1000000).toString(16).padStart(6, '0')}`;
 };
-/** Interactive only when it is real (carry 18): a terminal, not CI. */
-export const interactiveRun = (io: CliIO): boolean => io.interactive === true && (io.env.CI ?? '') === '';
 
 /**
  * `pipegen run` (see the file header). `deps` are the seams; a real run passes only `flags`.
@@ -830,38 +829,3 @@ async function listFiles(dir: string): Promise<string[]> {
   await walk('', 0);
   return out;
 }
-
-// ---------- finish, verify, update (main.ts) ----------
-
-/** What finish/verify/update need of GitHub (tests pass a fake). */
-export interface CommandGitHub { gh: Octokit; login: string | null; local?: LocalRecordDeps; clock?: RateClock }
-
-/** `pipegen finish [--print] [--rotate-key]` (carry 59): prints FinishResult; 0 done, 1 a stop. */
-export async function finishCommand(io: CliIO, app: { owner: string; repo: string }, opts: { print?: boolean; rotateKey?: boolean }, g: CommandGitHub): Promise<number> {
-  const res = await finish(g.gh, app, opts, {
-    out: (l) => { io.out(l); }, probe: githubFinishProbe(g.login), cosignBin: () => ensurePinnedBinary('cosign'),
-    ...(g.clock === undefined ? {} : { clock: g.clock }), local: g.local ?? {}, io: io.prompt, interactive: interactiveRun(io),
-  });
-  if (opts.print === true) for (const c of res.commands ?? []) io.out(c);
-  if (res.recordHash !== undefined) io.out(`install record: sha256 ${res.recordHash}`);
-  if (res.centralPrUrl !== undefined) io.out(`central pull request: ${safeText(res.centralPrUrl, 300)}`);
-  return 0;
-}
-
-export { requiredWorkflowApplies };
-export const PROOF_MODE = PROOF_SIGNING_MODE;
-export type { TypeOverride };
-export const ensureLintersFor = ensureLinters;
-export const runPermissions = (auth: Pick<Auth, 'canCreateRepos'>): ReturnType<typeof permissionsTable> => permissionsTable('write', { appCreatesRepos: auth.canCreateRepos });
-export type { Activity };
-export { listWriters as appWriters };
-export const NO_OP_SLACK: SkippablePart = 'slack';
-export { assembleJobs };
-export const PR_STATE_NOTE = (pr: number): string => `setup pull request #${pr}`;
-export { decideTests };
-export type { Strictness };
-export const DOCKER_SKIP: SkippablePart = 'docker';
-export { isAiNote };
-export const CENTRAL = CENTRAL_REPO;
-export const doc = pipegenDocWith;
-export type { BaseTree };

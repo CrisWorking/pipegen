@@ -22,7 +22,9 @@ import { AiSpendMeter } from '../src/ai/spend-meter.js';
 import type { CodeBundle } from '../src/ai/redact.js';
 import { notProvableNotes, auditCredits, createdInputsFor, dastWayPast, defaultProof, fullRun, judgeBuilt, NEVER_SKIPPED, parseSkip, PROOF_NOT_BUILT, runCreators, SCOPE_LINE, UNPINNED, WINDOWS_REFUSAL, GATE_UNREACHABLE, guardRecord, insertedBlock, type Built, type BuildInput, type GitHubFacts, type RunDeps, type RunStages } from '../src/cli/run.js';
 import { assembledJobs, consentJobs, docFor, draftFromDebate, isAiNote, parseStrictness, pickOwners, prWaitMinutes, proofAssembleWith, proofLayout, warnFirstFor, signingFor } from '../src/cli/run-parts.js';
-import { TYPE_CANCELLED } from '../src/cli/audit.js';
+import { EXIT_UNSAFE_FOLDER, TYPE_CANCELLED } from '../src/cli/audit.js';
+import { run as main, type Commands } from '../src/cli/main.js';
+import { finishCommand, interactiveRun, updateCommand, verifyCommand } from '../src/cli/commands.js';
 import type { CliIO, Prompter } from '../src/cli/io.js';
 import { PromptCancelledError } from '../src/cli/io.js';
 import { SecretVault } from '../src/create/secrets.js';
@@ -800,5 +802,156 @@ describe('G13: two-step delivery and after', () => {
   it('run: the PR wait is the longest needs chain of the merge jobs', () => {
     expect(prWaitMinutes({ a: { 'timeout-minutes': 5 }, b: { 'timeout-minutes': 10, needs: ['a'] }, c: { 'timeout-minutes': 3 } } as never)).toBe(15);
     expect(prWaitMinutes({})).toBe(0);
+  });
+});
+
+// ---------- main.ts: the commands ----------
+
+describe('G13: main dispatch', () => {
+  const repoDir = (files: Record<string, string> = {}): string => {
+    const dir = tmp('pg-main-');
+    mkdirSync(join(dir, '.git'), { recursive: true });
+    writeFileSync(join(dir, '.git', 'config'), '[remote "origin"]\n\turl = https://github.com/o/r.git\n');
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'app', scripts: { test: 'vitest run' } }));
+    for (const [rel, body] of Object.entries(files)) writeFileSync(join(dir, rel), body);
+    return dir;
+  };
+  const fakes = () => {
+    const got: Record<string, unknown[]> = {};
+    const g = { gh: {} as Octokit, login: 'alice' };
+    const cmds: Partial<Commands> = {
+      fullRun: async (...a) => { got.fullRun = a; return 0; },
+      cleanup: async (...a) => { got.cleanup = a; return 0; },
+      connect: async (...a) => { got.connect = a; return { app: { owner: 'o', repo: 'r' }, g, token: TOKEN }; },
+      finish: async (...a) => { got.finish = a; return 0; },
+      verify: async (...a) => { got.verify = a; return 1; },
+      update: async (...a) => { got.update = a; return 0; },
+    };
+    return { got, cmds };
+  };
+  const mio = (cwd: string) => { const i = io({}, { cwd }); return i; };
+
+  it('main: argv → main → cleanupCommand (--dir, --allow-broad-token); help lists run, finish, verify, update, cleanup', async () => {
+    const dir = repoDir();
+    const { got, cmds } = fakes();
+    expect(await main(['cleanup', '--dir', dir, '--allow-broad-token'], mio(tmpdir()), cmds)).toBe(0);
+    expect(got.cleanup?.[0]).toBe(dir);
+    expect(got.cleanup?.[2]).toEqual({ allowBroad: true });
+    const h = mio(tmpdir());
+    expect(await main(['--help'], h)).toBe(0);
+    const help = h.lines.join('\n');
+    for (const c of ['run', 'finish', 'verify', 'update', 'cleanup']) expect(help).toMatch(new RegExp(`pipegen ${c}\\b`));
+    expect(help).toMatch(/npx pipegen\s+Audit this folder/);
+  });
+
+  it('main: no command is still the audit; run, finish, verify, update take only their own flags', async () => {
+    const dir = repoDir();
+    const { got, cmds } = fakes();
+    // the flags each command takes
+    expect(await main(['run', '--dir', dir, '--skip', 'tests', '--strictness', 'strict', '--type', 'app=server'], mio(tmpdir()), cmds)).toBe(0);
+    expect((got.fullRun?.[2] as RunDeps).flags).toEqual({ types: [{ service: 'app', type: 'server' }], allowBroad: false, skip: 'tests', strictness: 'strict' });
+    expect(await main(['finish', '--dir', dir, '--print', '--rotate-key'], mio(tmpdir()), cmds)).toBe(0);
+    expect(got.finish?.[2]).toEqual({ print: true, rotateKey: true });
+    expect((got.connect?.[2] as { mode: string }).mode).toBe('write');
+    // drift: verify's exit code 1 passes through; verify connects read-only
+    expect(await main(['verify', '--dir', dir], mio(tmpdir()), cmds)).toBe(1);
+    expect((got.connect?.[2] as { mode: string }).mode).toBe('read');
+    expect(await main(['update', '--dir', dir], mio(tmpdir()), cmds)).toBe(0);
+    expect(got.update).toBeDefined();
+    // each option with its own command only
+    for (const [argv, msg] of [
+      [['finish', '--skip', 'tests'], '--skip works with pipegen run only.'],
+      [['audit', '--skip', 'tests'], '--skip works with pipegen run only.'],
+      [['verify', '--print'], '--print works with pipegen finish only.'],
+      [['run', '--rotate-key'], '--rotate-key works with pipegen finish only.'],
+      [['update', '--type', 'server'], '--type works with pipegen audit and pipegen run only.'],
+      [['finish', '--strictness', 'strict'], '--strictness works with pipegen run only.'],
+      [['run', '--json'], '--json works with pipegen audit only.'],
+    ] as const) {
+      const i = mio(dir);
+      expect(await main([...argv], i, cmds), argv.join(' ')).toBe(1);
+      expect(i.errs.join('\n')).toContain(msg);
+    }
+    // no command: the audit, never the run
+    const before = Object.keys(got).length;
+    const fetched: string[] = [];
+    const i = io({}, { cwd: tmpdir(), fetch: (async (u: unknown) => { fetched.push(String(u)); return new Response('{}', { status: 404 }); }) as typeof fetch });
+    await main(['--dir', dir, '--json'], i, cmds);
+    expect(fetched.every((u) => u.startsWith('https://api.github.com/'))).toBe(true);
+    expect(Object.keys(got).length).toBe(before);
+    expect(i.lines.join('\n')).toMatch(/"profile"|"checks"|\{/);
+  });
+
+  it('run: unsafe folder stops with exit 4 before the type question, the remote read and any GitHub call', async () => {
+    const dir = repoDir({ '.npmrc': 'registry=https://registry.example.invalid/\n' });
+    for (const command of ['run', 'finish', 'verify', 'update', 'cleanup']) {
+      const { got, cmds } = fakes();
+      const i = io({ types: 'cancel' }, { cwd: dir, interactive: true });
+      expect(await main([command], i, cmds), command).toBe(EXIT_UNSAFE_FOLDER);
+      expect(got, command).toEqual({});
+      expect(i.asked, command).toEqual([]);
+    }
+  });
+
+  it('main: an error is one cleaned line with no token', async () => {
+    const dir = repoDir();
+    const { cmds } = fakes();
+    cmds.finish = async () => { throw new Error(`boom with ${TOKEN}`); };
+    const i = mio(tmpdir());
+    expect(await main(['finish', '--dir', dir], i, cmds)).toBe(1);
+    expect(i.errs.join('\n')).toMatch(/pipegen finish failed: boom/);
+    expect(i.errs.join('\n')).not.toContain(TOKEN);
+  });
+});
+
+// ---------- finish, verify, update: what they print ----------
+
+describe('G13: finish, verify and update print their results', () => {
+  const g = { gh: {} as Octokit, login: 'alice', local: { env: {} } };
+  const app = { owner: 'o', repo: 'r' };
+
+  it('finish --print: the commands, the applied and skipped steps, the record hash; exit 0', async () => {
+    let deps: Record<string, unknown> = {};
+    const i = io({}, { interactive: true, env: {} });
+    const code = await finishCommand(i, app, { print: true }, g, (async (_gh: unknown, _a: unknown, _o: unknown, d: Record<string, unknown>) => {
+      deps = d;
+      return { applied: ['ruleset pipegen'], skipped: [{ what: 'org rule', why: 'not an org' }], notes: ['a note'], commands: ['gh api -X PUT x'], recordHash: 'f'.repeat(64), centralPrUrl: 'https://github.com/o/pipelines/pull/2' };
+    }) as never);
+    expect(code).toBe(0);
+    const out = i.lines.join('\n');
+    for (const s of ['applied: ruleset pipegen', 'skipped: org rule (not an org)', 'a note', 'gh api -X PUT x', `install record: sha256 ${'f'.repeat(64)}`, 'central pull request: https://github.com/o/pipelines/pull/2']) expect(out).toContain(s);
+    expect(deps.interactive).toBe(true);
+    expect(deps.local).toEqual({ env: {} });
+    expect(typeof deps.cosignBin).toBe('function');
+    expect(typeof deps.probe).toBe('function');
+    // CI is never interactive (carry 18)
+    const ci = io({}, { interactive: true, env: { CI: 'true' } });
+    await finishCommand(ci, app, {}, g, (async (_g: unknown, _a: unknown, _o: unknown, d: Record<string, unknown>) => { deps = d; return { applied: [], skipped: [], notes: [] }; }) as never);
+    expect(deps.interactive).toBe(false);
+    expect(interactiveRun({ interactive: false, env: {} })).toBe(false);
+  });
+
+  it('verify: drift as a table → exit 1; none → exit 0', async () => {
+    const i = io();
+    expect(await verifyCommand(i, app, g, (async () => ({ drift: [{ what: 'environment pipegen-signing (default branch only)', expected: 'only main may use it', actual: 'any branch' }], warnings: ['w'], notes: ['n'] })) as never)).toBe(1);
+    expect(i.lines.join('\n')).toContain('environment pipegen-signing (default branch only) | only main may use it | any branch');
+    expect(i.lines.join('\n')).toContain('warning: w');
+    const i2 = io();
+    expect(await verifyCommand(i2, app, g, (async () => ({ drift: [], warnings: [], notes: [] })) as never)).toBe(0);
+    expect(i2.lines.join('\n')).toMatch(/No drift/);
+  });
+
+  it('update: preview, PRs, prompts, ignored, refused and conflicts printed; an owner-edited file is listed, not overwritten', async () => {
+    let deps: Record<string, unknown> = {};
+    const i = io();
+    expect(await updateCommand(i, app, g, (async (_g: unknown, _a: unknown, d: Record<string, unknown>) => {
+      deps = d;
+      return { done: true, preview: 'PREVIEW', prUrl: 'https://github.com/o/r/pull/9', prompts: [{ issue: 1, in: 'app', key: 'k', version: '1.2.3', patches: [] }], ignored: [{ issue: 2, in: 'app', why: 'old' }], refused: [{ issue: 3, in: 'central', why: 'differs', shown: 'both sides' }], conflicts: [{ repo: 'app', path: 'Dockerfile', why: 'you changed it' }], notes: ['n'] };
+    }) as never)).toBe(0);
+    const out = i.lines.join('\n');
+    for (const s of ['PREVIEW', 'pull request: https://github.com/o/r/pull/9', 'issue #1', 'ignored: issue #2', 'refused: issue #3', 'both sides', 'not changed (your edits): Dockerfile: you changed it']) expect(out).toContain(s);
+    expect(Array.isArray(deps.reviewed)).toBe(true);
+    expect(deps.local).toEqual({ env: {} });
+    expect(deps.interactive).toBe(false);
   });
 });
