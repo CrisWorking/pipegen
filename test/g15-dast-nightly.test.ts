@@ -5,8 +5,8 @@
 // each scrubbed result and uploads it to code scanning. Reported, never gated. Its format is the real nuclei 3.11.1 SARIF
 // (test/fixtures/sarif/nuclei.sarif, captured from the pinned binary; gate/src/sarif.ts SARIF_TOOLS.nuclei).
 // ZAP's active scan (an Automation Framework plan) is NOT run: its report can not be taken from the pinned zap-stable image offline (no image,
-// no source here), and the gate's ZAP reader is unverified even for the baseline report (gate/src/zap.ts ZAP_JSON_VERIFIED). It stays refused
-// (fail closed), with a note, until a live capture from the pinned digest exists.
+// no source here then; round 5 verified the reader and wrote the plan, src/engine/zap-active.ts, but not its run job). It stays refused
+// (fail closed), with a note, until its run job, code-scanning form and referee rules exist.
 import { describe, expect, it } from 'vitest';
 import { DAST_HANDOFF_STEP_ID, dastCheckStepId, dastRawArtifact, DAST_UPLOAD_JOB, dastNightlyCategory, NIGHTLY_WORKFLOW } from '../src/engine/job-rules.js';
 import { nightlyDastSpec, NIGHTLY_DAST_TOOL } from '../src/engine/dast-handoff.js';
@@ -95,7 +95,7 @@ describe('G15a round 4 (b3): the nightly DAST scan', () => {
     expect(JSON.stringify(a.merge)).not.toMatch(/code-scanning-dast|pipegen-dast-nightly/);
     expect(a.nightly.gate).toBeUndefined();
     // ZAP's active scan is refused, with a plain note
-    expect(a.notes.join('\n')).toMatch(/ZAP's active scan is not run nightly: .*report.*not verified/);
+    expect(a.notes.join('\n')).toMatch(/ZAP's active scan is not run nightly yet\. Nuclei scans the app nightly instead\./);
     expect(shown(await judge(fs, a.draft))).toBe('');
   });
 

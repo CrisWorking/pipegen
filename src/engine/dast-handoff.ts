@@ -28,10 +28,11 @@ import { renderComposeUp, renderPlatformStep, renderRuntimeEnv, renderScrub, ren
 /**
  * G15a round 4 (b3, P-4): the nightly DAST tool. Nuclei 3.11.1 with its pinned templates: its result is SARIF, and the gate's nuclei reader
  * was checked against a real run of the pinned binary (test/fixtures/sarif/nuclei.sarif). ZAP's active scan (an Automation Framework plan)
- * is not run: its report could not be taken from the pinned zap-stable image (gate/src/zap.ts ZAP_JSON_VERIFIED), so it stays refused.
+ * is not run yet. Round 5: its report is verified on the pinned zap-stable image (gate/src/zap.ts ZAP_JSON_VERIFIED) and its reviewed plan is
+ * written (zap-active.ts), but its run step, its code-scanning form and its referee rules are not built, so it stays refused.
  */
 export const NIGHTLY_DAST_TOOL = 'nuclei';
-export const ZAP_ACTIVE_REFUSED_NOTE = "ZAP's active scan is not run nightly: the report of the pinned ZAP image is not verified yet, so pipegen can not read it. Nuclei scans the app nightly instead.";
+export const ZAP_ACTIVE_REFUSED_NOTE = "ZAP's active scan is not run nightly yet. Nuclei scans the app nightly instead.";
 
 /**
  * The nightly DAST spec of a merge-layer DAST check: the same check and service, run by the reviewed nuclei entry with nothing chosen (no AI
