@@ -794,7 +794,9 @@ export async function deliver(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vaul
     let env: EnvEntry | null = null;
     let key: SigningKey | null = null;
     let replacePair = false;
-    if (d.draft.signing?.mode === 'key-env') {
+    // G13 carry 60: a re-run whose trusted record already names this public key (a `finish --rotate-key` made it) keeps the stored pair
+    const keepPair = d.draft.signing?.mode === 'key-env' && deps.signingKey === undefined && typeof d.draft.signing.cosignPubSha256 === 'string' && prev?.cosignPubSha256 === d.draft.signing.cosignPubSha256;
+    if (d.draft.signing?.mode === 'key-env' && !keepPair) {
       const want = d.draft.signing.cosignPubSha256;
       if (deps.signingKey === undefined || typeof want !== 'string') throw new DeliverError('key-env signing needs the key pair pipegen made before the setup pull request, and its public key hash.');
       key = await deps.signingKey();
