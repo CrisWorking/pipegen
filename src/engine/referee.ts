@@ -105,6 +105,8 @@ export const JOB_PERMISSIONS: Readonly<Record<string, Readonly<Record<string, Le
   'pr-check': { 'pull-requests': 'read' },
   'pipegen-verify': { actions: 'read', packages: 'read', attestations: 'read' },
   'code-scanning': { 'security-events': 'write', actions: 'read' },
+  // G15a round 4 (b1): the full-history scan's own upload job, the code-scanning job's twin
+  'code-scanning-history': { 'security-events': 'write', actions: 'read' },
   gate: { actions: 'read', 'pull-requests': 'read' },
   'base-scan': { actions: 'read' },
   'baseline-check': { actions: 'read' },
@@ -169,6 +171,7 @@ export const JOB_STEP_POLICY: Readonly<Record<string, readonly StepKind[]>> = Ob
   // G7-R1 sec M3: no checkout and no artifact download: the digest comes through the API by the gated run's id, and nothing may overwrite it
   'pipegen-verify': ['harden', 'gate', 'verify'],
   'code-scanning': ['harden', 'download-artifact', 'upload-sarif'],
+  'code-scanning-history': ['harden', 'download-artifact', 'upload-sarif'],
   // no checkout: the gate never reads the workspace (Plan C ruling S21); it reads the event, the job outputs and the API
   // C5b: the gate's own uploads (result, baseline, clean-run marker) after the gate step, and no other upload (checkJobOrder, gateUploadProblems)
   gate: ['harden', 'download-artifact', 'gate', 'upload-artifact'],
@@ -683,6 +686,13 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
     } catch (e) {
       if (!(e instanceof RenderError)) throw e;
       notes.push(`The commit-range secrets scan can not be rendered, so no step may claim to be it: ${safeText(e.message, 200)}`);
+    }
+    // G15a round 4 (b1, P-4): the nightly full-history scan, the same step with no base (reported through code scanning, never gated)
+    try {
+      record('history:secrets', ctxs.map(() => renderRangeScan(rangeTool, 'history').steps), false, false, true, undefined, undefined);
+    } catch (e) {
+      if (!(e instanceof RenderError)) throw e;
+      notes.push(`The full-history secrets scan can not be rendered, so no step may claim to be it: ${safeText(e.message, 200)}`);
     }
   }
   // the project's own scripts its needs call for (ruling S10): the only other run steps pipegen makes
@@ -1884,7 +1894,7 @@ function judgeJobSteps(fc: FileCtx, where: string, steps: unknown[], job: boolea
     const dformat = dspec === undefined || !isObj(dspec) || !isObj(dspec.tool) ? undefined : fc.ex.byId.get(dspec.tool.id)?.step.output.format;
     if (dspec !== undefined && x.step.id !== undefined && x.harmlessId && (dformat === 'sarif' || dformat === 'zap-json')) scans.set(x.step.id, { tool: dspec.tool.id, format: dformat });
     // C9: the commit-range scan, recognised by content as the range source's own step
-    if (x.match?.source === 'range:secrets' && x.match.final && x.kind === 'tool' && x.harmlessId && x.step.id !== undefined) scans.set(x.step.id, { tool: RANGE_TOOL, format: 'sarif' });
+    if ((x.match?.source === 'range:secrets' || x.match?.source === 'history:secrets') && x.match.final && x.kind === 'tool' && x.harmlessId && x.step.id !== undefined) scans.set(x.step.id, { tool: RANGE_TOOL, format: 'sarif' });
   }
   // D4 M1: compose-up reads the password the runtime-env step generated, so each compose-up has exactly one runtime-env step before it in its job (and a job has one)
   const rtAt = judged.flatMap((x, i) => (x.match?.source === RUNTIME_ENV_SOURCE ? [i] : []));

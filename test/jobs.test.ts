@@ -197,7 +197,7 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
   it('assemble: nightly opens warn-ending, finish-missing and update issues (issues: write only there), never pushes files', async () => {
     const x = planned(profileOf(), { over: { warnFirst: { licences: { since: '2026-11-05' } } } });
     const a = assemble(x);
-    expect(Object.keys(a.nightly)).toEqual(['nightly', 'scorecard', 'code-scanning']);   // G15a round 3: weekly Scorecard (its own job and upload)
+    expect(Object.keys(a.nightly)).toEqual(['nightly', 'scorecard', 'code-scanning', 'secrets-history', 'code-scanning-history']);   // G15a round 3: weekly Scorecard (its own job and upload); round 4: the full-history secrets scan and its upload
     const n = a.nightly.nightly as Job;
     // the gate action in nightly mode opens the issues (warn-ending, finish-missing, update, and the warn-first "switch to blocking" one)
     expect(n.steps.slice(1)).toEqual([renderNightlyStep(REVIEWED.find((t) => t.id === 'pipegen-gate') as never, a.draft)]);

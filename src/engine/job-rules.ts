@@ -6,8 +6,8 @@ import { EXPR, own, RenderError, show } from './render-error.js';
 import {
   BUILD_PUSH_STEP_ID, DIGEST_STEP_ENV, DIGEST_STEP_ID, FIND_RUN_STEP_ID, HEAD_CHECK_DIR, HEAD_CHECK_ENV, HEAD_CHECK_STEP_ID, imageDigestArtifact, PUBLISH_DIGEST_ENV, PUBLISH_DIGEST_STEP_ID,
 } from './deploy-steps.js';
-import { GATE_RESULT_ARTIFACT, resultArtifactName, SECRETS_RANGE_ARTIFACT, slug } from './artifact-names.js';
-import { ARGV_POLICIES, ATTEST_DIGEST_STEP_ID_RE, DOCKER_STEP_IMAGES, attestDigestRef, attestDigestStepId, BASE_CHECKOUT_REF, GATE_OPTIONAL_UPLOADS, RANGE_BEFORE_REF, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, isGateUploadName, CHECKER_STEP_ID_RE, GATE_USES_RE, isStagedTool, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, stagePath, stageStepId, STAGE_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
+import { GATE_RESULT_ARTIFACT, resultArtifactName, SECRETS_HISTORY_ARTIFACT, SECRETS_RANGE_ARTIFACT, slug } from './artifact-names.js';
+import { ARGV_POLICIES, ATTEST_DIGEST_STEP_ID_RE, DOCKER_STEP_IMAGES, attestDigestRef, attestDigestStepId, BASE_CHECKOUT_REF, GATE_OPTIONAL_UPLOADS, HISTORY_STEP_ENV, historyScanStepId, RANGE_BEFORE_REF, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, isGateUploadName, CHECKER_STEP_ID_RE, GATE_USES_RE, isStagedTool, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, stagePath, stageStepId, STAGE_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
 
 /** One step of a job, as pipegen renders it. `usesComment` becomes the trailing `# <version>` comment on `uses:`. */
 export interface RenderedStep {
@@ -248,7 +248,8 @@ export function checkJobOrder(steps: readonly RenderedStep[], job: Partial<JobCo
  * run. With `scans`, the step is the range tool's scan. One range scan per job.
  */
 export function rangeChainProblems(steps: readonly RenderedStep[], scans?: ReadonlyMap<string, ScanFact>): string[] {
-  const at = steps.flatMap((s, i) => (s.id === rangeScanStepId && s.run !== undefined ? [i] : []));
+  // G15a round 4 (b1): the full-history scan reads the git history the same way (historyScanStepId), and is held to the same chain
+  const at = steps.flatMap((s, i) => ((s.id === rangeScanStepId || s.id === historyScanStepId) && s.run !== undefined ? [i] : []));
   if (at.length === 0) return [];
   if (at.length > 1) return [`The job holds ${at.length} commit-range scan steps; it has one.`];
   const i = at[0] as number;
@@ -257,7 +258,7 @@ export function rangeChainProblems(steps: readonly RenderedStep[], scans?: Reado
   if (checkouts.length !== 1 || (checkouts[0] as number) > i || steps[checkouts[0] as number]?.with?.['fetch-depth'] !== '0') {
     problems.push(`Step ${i + 1} (${show(steps[i]?.name ?? '')}) scans the pull request's commits, so the job needs exactly one checkout before it, with fetch-depth: '0' (the whole history): a shallow checkout has no base commit to scan from.`);
   }
-  const fact = scans?.get(rangeScanStepId);
+  const fact = scans?.get(steps[i]?.id as string);
   if (scans !== undefined && (fact === undefined || fact.tool !== RANGE_TOOL || fact.format !== 'sarif')) problems.push(`Step ${i + 1} (${show(steps[i]?.name ?? '')}) is the commit-range scan, but its scan fact is not ${RANGE_TOOL} writing SARIF.`);
   return problems;
 }
@@ -291,7 +292,7 @@ export function stageChainProblems(steps: readonly RenderedStep[], scans?: Reado
   });
   if (scans !== undefined) {
     steps.forEach((s, i) => {
-      if (s.id === undefined || s.run === undefined || s.id === rangeScanStepId || !isStagedTool(scans.get(s.id)?.tool)) return;
+      if (s.id === undefined || s.run === undefined || s.id === rangeScanStepId || s.id === historyScanStepId || !isStagedTool(scans.get(s.id)?.tool)) return;
       const stageId = s.id.replace(/^tool-run-/, 'stage-');
       const stageAt = steps.findIndex((x) => isStageStep(x) && x.id === stageId);
       if (stageAt < 0 || stageAt > i) problems.push(`Step ${i + 1} (${show(s.name)}) scans for secrets, but the stage step of its result does not come before it in this job: the scanner reads the stage folder, which only the stage step fills (an empty or old folder would read as clean).`);
@@ -360,7 +361,7 @@ export function scrubChainProblems(steps: readonly RenderedStep[], scans?: Reado
       return;
     }
     const scanTool = scans?.get(steps[scanAt]?.id as string)?.tool ?? (typeof tool === 'string' ? tool : undefined);
-    if (artifact === SECRETS_RANGE_ARTIFACT) {
+    if (artifact === SECRETS_RANGE_ARTIFACT || artifact === SECRETS_HISTORY_ARTIFACT) {
       // C9: the commit-range scan reads the history, never a stage folder; its scrub names none, and it scrubs the range tool's result
       if (w.stage !== undefined) problems.push(`${at} scrubs the commit-range scan, which reads the history and has no stage folder: its scrub names none.`);
       if (typeof tool === 'string' && tool !== RANGE_TOOL) problems.push(`${at} scrubs the commit-range scan as the tool ${show(tool)}, but that scan runs ${RANGE_TOOL}.`);
@@ -478,6 +479,13 @@ export const SCORECARD_CRON = '23 4 * * 1';
 export const SCORECARD_IF = `github.event.schedule == '${SCORECARD_CRON}'`;
 export const SCORECARD_JOB = 'scorecard';
 export const CODE_SCANNING_JOB = 'code-scanning';
+/**
+ * G15a round 4 (b1, P-4): the nightly full-history secrets scan (a full checkout, then render-step.ts renderHistoryBlock) and its own
+ * code-scanning upload job (its own, so a failed or skipped Scorecard run never holds it back, and the reverse), with its category.
+ */
+export const SECRETS_HISTORY_JOB = 'secrets-history';
+export const HISTORY_UPLOAD_JOB = 'code-scanning-history';
+export const SECRETS_HISTORY_CATEGORY = 'pipegen-secrets-history';
 /** G15a round 3 (PF-3): the reviewed tools whose result a scrub reads but that run as a docker step (no argv policy): Scorecard. */
 export const SCRUB_ONLY_TOOLS: ReadonlySet<string> = new Set(['scorecard-action']);
 /** A `docker://<image>@sha256:<64 hex>` uses of an image in DOCKER_STEP_IMAGES (the shape only; the referee checks the reviewed digest). */
@@ -968,6 +976,8 @@ export function checkExpressions(step: RenderedStep): void {
       if (group === 'env') {
         // C9: the commit-range scan step (its id, a run step) carries this event's base and head commits, each exactly its form
         if (step.id === rangeScanStepId && step.run !== undefined && step.uses === undefined && Object.hasOwn(RANGE_STEP_ENV, k) && RANGE_STEP_ENV[k] === v) continue;
+        // G15a round 4 (b1): the full-history scan step carries only the commit the run checked out
+        if (step.id === historyScanStepId && step.run !== undefined && step.uses === undefined && own(HISTORY_STEP_ENV, k) === v) continue;
         // G4 (C9r1): the pre-push head fetch step carries exactly its own forms (the event's earlier head and the job's own token)
         if (step.id === RANGE_FETCH_STEP_ID && step.run !== undefined && step.uses === undefined && own(RANGE_FETCH_STEP_ENV, k) === v) continue;
         // G1 (BP-6): the pr-check lookup step, exactly as renderPrCheckStep writes it (every field that runs), carries the job's own token

@@ -308,7 +308,7 @@ describe('G5: the delivered files and their callers', () => {
     expect(workflows(a).map((f) => f.path).sort()).toEqual([CALLER_WORKFLOW, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PUSH_WORKFLOW].sort());
     // the push and nightly jobs are inline in their own files (a local push or nightly callee would be the file itself)
     for (const path of [PUSH_WORKFLOW, NIGHTLY_WORKFLOW]) for (const [id, j] of Object.entries(jobsOfFile(fileAt(a, 'app', path)))) expect(j.uses, `${path} ${id}`).toBeUndefined();
-    expect(Object.keys(jobsOfFile(fileAt(a, 'app', NIGHTLY_WORKFLOW)))).toEqual(['nightly', 'scorecard', 'code-scanning']);   // G15a round 3: weekly Scorecard
+    expect(Object.keys(jobsOfFile(fileAt(a, 'app', NIGHTLY_WORKFLOW)))).toEqual(['nightly', 'scorecard', 'code-scanning', 'secrets-history', 'code-scanning-history']);   // G15a round 3: weekly Scorecard; round 4: the full-history secrets scan
     // no uses anywhere names the central repo
     expect(a.files.map((f) => f.content).join('\n')).not.toMatch(/\/pipelines\//);
     // a public draft with a central pin is refused (its find-run would look for a central workflow that is not there)

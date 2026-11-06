@@ -66,7 +66,7 @@ import { ARCHIVE_TOOL_IDS, renderImageArchiveScan, renderImageBuild } from '../e
 import { dastStartOf, renderDastRun, renderDastScrub, type DastStart } from '../engine/dast-handoff.js';
 import {
   BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, dastRunJobId, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, IMAGE_BUILD_NEED, imageBuildJobId, isReviewed,
-  isScrubStep, jobOutputsFor, CODE_SCANNING_JOB, NIGHTLY_CONCURRENCY, NO_SCANS, SCORECARD_IF, SCORECARD_JOB, renderRangeFetchStep, type RenderedStep, type ScanFact,
+  isScrubStep, jobOutputsFor, CODE_SCANNING_JOB, HISTORY_UPLOAD_JOB, SECRETS_HISTORY_CATEGORY, SECRETS_HISTORY_JOB, NIGHTLY_CONCURRENCY, NO_SCANS, SCORECARD_IF, SCORECARD_JOB, renderRangeFetchStep, type RenderedStep, type ScanFact,
 } from '../engine/job-rules.js';
 import { NEED_ID_CATEGORY, SCHEDULED_CATEGORIES } from '../engine/need-ids.js';
 import { MINIMUM_CATEGORIES, NO_HOOKS_CI_MANAGERS, NO_IMAGE_CATEGORIES, noImageServices, riskyTriggersOf, WORKFLOW_LINT_EXTRA, WORKFLOW_LINT_TOOL, workflowLintTools } from '../engine/needs.js';
@@ -76,12 +76,13 @@ import { APP_RUNNING_CATEGORIES, renderStarterTestRun } from '../engine/render-c
 import { RenderError } from '../engine/render-error.js';
 import {
   dedupeJobSteps, renderBaselineCheckStep, renderComposeUp, renderFindingsBlock, renderGateStep, renderGateUploads, renderJobPrelude, renderNightlyStep,
-  renderPlatformStep, renderProjectScript, renderRangeBlock, renderRepoTool, renderRuntimeEnv, renderScorecardBlock, renderScrub, renderStep, renderUpload, scanFactOf, scrubbedPath,
+  renderHistoryBlock, renderPlatformStep, renderProjectScript, renderRangeBlock, renderRepoTool, renderRuntimeEnv, renderScorecardBlock, renderScrub, renderStep, renderUpload, scanFactOf, scrubbedPath,
   SCORECARD_ARTIFACT, SCORECARD_CATEGORY, type RenderContext,
 } from '../engine/render-step.js';
 import { projectScriptFor, repoToolFor, repoToolProblem, type RepoToolStep } from '../engine/reviewed.js';
 import { PLATFORM_USES, RANGE_TOOL } from '../engine/tool-flags.js';
 import { signedImageOwner } from '../engine/signing.js';
+import { codeSecurityAvailable } from '../github/availability.js';
 import type { SigningMode } from '../github/signing-mode.js';
 import { signJob, type SignJob } from './central.js';
 import type { Need, NeedCategory, PipelineDraft, ReviewedTool, Service, SkippablePart, StepSpec } from '../types.js';
@@ -663,6 +664,33 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     } catch (e) {
       if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e;
       addNote(notes, `OpenSSF Scorecard is not run: ${safeText(e.message, 200)}`);
+    }
+  }
+
+  // G15a round 4 (b1, P-4): betterleaks over the whole history, nightly, when the merge layer scans the repository for secrets. Reported
+  // through code scanning from its own upload job, never gated; with no code scanning nothing would report it, so it is not written
+  const repoSecrets = draft.needs.some((n) => n.layer === 'merge' && n.id === 'secrets' && n.service === undefined && specsOf(n).some((s) => isFindings(toolOf(c, s.tool.id))));
+  if (repoSecrets && !codeSecurityAvailable(draft.profile, draft.capabilities)) {
+    addNote(notes, 'The nightly scan of the whole history for secrets is not run: it reports through code scanning, which this repository does not have.');
+  } else if (repoSecrets) {
+    try {
+      const tool = toolOf(c, RANGE_TOOL);
+      const b = renderHistoryBlock(tool, deps.platform, gate);
+      const prelude = renderJobPrelude({ fetchDepth: '0' }, deps.platform).steps;
+      nightly[SECRETS_HISTORY_JOB] = job(dedupeJobSteps([egressStepFor(egressSetsForTool(tool), { userSecret: false, dockerNetworks: false, job: SECRETS_HISTORY_JOB }), ...prelude, ...b.steps], { id: SECRETS_HISTORY_JOB, scans: new Map([[b.scan.stepId, b.scan.fact]]) }));
+      const scrubbed = `\${{ runner.temp }}/pipegen-out/${b.artifact}`;
+      const file = (b.result.output as { path: string }).path.split('/').pop() as string;
+      nightly[HISTORY_UPLOAD_JOB] = {
+        'runs-on': JOB_RUNNER, 'timeout-minutes': JOB_MINUTES, needs: [SECRETS_HISTORY_JOB], permissions: { contents: 'read', 'security-events': 'write', actions: 'read' }, 'cache-mode': 'none',
+        steps: [
+          egressStepFor([], { userSecret: false, dockerNetworks: false, job: HISTORY_UPLOAD_JOB }),
+          { ...renderPlatformStep('download-artifact', deps.platform, { name: b.artifact, path: scrubbed }), name: 'Download the scrubbed full-history secrets result' },
+          { ...renderPlatformStep('upload-sarif', deps.platform, { sarif_file: `${scrubbed}/${file}`, category: SECRETS_HISTORY_CATEGORY }), name: 'Upload the full-history secrets result to code scanning' },
+        ],
+      };
+    } catch (e) {
+      if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e;
+      addNote(notes, `The nightly scan of the whole history for secrets is not run: ${safeText(e.message, 200)}`);
     }
   }
 
