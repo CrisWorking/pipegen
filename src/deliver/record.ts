@@ -85,7 +85,9 @@ const OWNER_EDITED = { ownerEdited: z.literal(true).optional() };
 const EDIT_BASE = { path: PATH, originalSha: SHA, writtenShas: SHAS, ...OWNER_EDITED };
 const EDIT = z.discriminatedUnion('kind', [
   z.strictObject({ repo: REPO_KIND, path: PATH, kind: z.enum(['codeowners', 'hooks', 'dependabot']), inserted: z.string().max(256 * 1024), originalSha: SHA.nullable(), writtenShas: SHAS, ...OWNER_EDITED }),
-  z.strictObject({ repo: z.literal('app'), ...EDIT_BASE, kind: z.literal('verify-job'), jobs: z.array(z.string().max(100)).min(1).max(50), needs: z.array(z.strictObject({ job: z.string().max(100), added: z.array(z.string().max(100)).max(50) })).max(200) }),
+  // G13 (G7-R1, G7-R2 carries): headCheck = the user's jobs pipegen started with its head check; a called workflow (jobs empty) holds only those
+  z.strictObject({ repo: z.literal('app'), ...EDIT_BASE, kind: z.literal('verify-job'), jobs: z.array(z.string().max(100)).max(50), needs: z.array(z.strictObject({ job: z.string().max(100), added: z.array(z.string().max(100)).max(50) })).max(200), headCheck: z.array(z.string().max(100)).min(1).max(50).optional() })
+    .refine((e) => e.jobs.length > 0 || (e.headCheck?.length ?? 0) > 0, 'a verify-job edit records a job pipegen inserted or a head check'),
   z.strictObject({ repo: z.literal('app'), ...EDIT_BASE, kind: z.literal('package-json'), add: z.record(z.string().max(214).refine((k) => !PROTO_KEYS.has(k)), z.string().max(100)), setTest: z.boolean(), previousTest: z.string().max(10_000).optional(), lock: PATH.optional() }),
   z.strictObject({ repo: z.literal('app'), ...EDIT_BASE, kind: z.literal('package-lock'), json: PATH }),
 ]);

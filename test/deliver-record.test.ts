@@ -67,7 +67,12 @@ describe('install record schema (S13, Plan V §5)', () => {
     expect(() => parseRecord(JSON.stringify(sampleRecord({ files: many })))).toThrow(RecordError);
     expect(() => parseRecord('{not json')).toThrow(RecordError);
     for (const schema of [1, 3]) expect(InstallRecordSchema.safeParse({ ...sampleRecord(), schema }).success).toBe(false);
-    expect(InstallRecordSchema.safeParse({ ...sampleRecord(), edits: [{ repo: 'app', path: 'x', kind: 'verify-job', inserted: 'x', originalSha: null, writtenShas: [] }] }).success).toBe(false);
+    expect(InstallRecordSchema.safeParse({ ...sampleRecord(), edits: [{ repo: 'app', path: 'x', kind: 'verify-job', inserted: 'x', originalSha: null, writtenShas: [] }] }).success).toBe(false);    // G13 (G7-R1 carry): the jobs an insert started with the head check are recorded; a called workflow holds no job of pipegen's, only head checks
+    const vj = (over: Record<string, unknown>) => ({ ...sampleRecord(), edits: [{ repo: 'app', path: '.github/workflows/x.yml', kind: 'verify-job', jobs: ['pipegen-verify'], needs: [], originalSha: SHA('a'), writtenShas: [SHA('b')], ...over }] });
+    expect(InstallRecordSchema.safeParse(vj({ headCheck: ['deploy'] })).success).toBe(true);
+    expect(InstallRecordSchema.safeParse(vj({ jobs: [], headCheck: ['deploy', 'smoke'] })).success).toBe(true);
+    expect(InstallRecordSchema.safeParse(vj({ jobs: [] })).success).toBe(false);
+    expect(InstallRecordSchema.safeParse(vj({ jobs: [], headCheck: [] })).success).toBe(false);
   });
 
   it('the record path is installs/<centralProjectName>.json', () => {

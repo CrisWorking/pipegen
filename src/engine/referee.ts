@@ -2078,6 +2078,7 @@ function judgeEdited(fc: FileCtx, parsed: Parsed, mark: PipegenInserted): void {
     bad('template', 'The file is marked as an edited user workflow, but it is not one of the repository\'s existing workflows.');
     return;
   }
+  if (mark.calledBy !== undefined) { judgeCalled(fc, parsed, mark); return; }
   if (!Array.isArray(mark.jobs) || mark.jobs.length === 0 || !Array.isArray(mark.needs) || typeof mark.original !== 'string') { bad('template', 'The edit mark is incomplete.'); return; }
   const orig = parseYaml(mark.original, 'user');
   if (!('parsed' in orig)) { bad('template', `The user's original workflow can not be read (${orig.problems.join('; ')}), so pipegen can not show its edit is only the inserted job.`); return; }
@@ -2154,6 +2155,59 @@ function judgeEdited(fc: FileCtx, parsed: Parsed, mark: PipegenInserted): void {
   // G1 (C5a, C7s): the jobs pipegen inserts follow the same layout rules under the user's triggers (no gate on a push to another branch, no find-run on schedule)
   judgeLayoutJobs(fc, parsed.js.on, triggersOf(parsed.js.on), jobs, mark.jobs);
   judgeJobs(fc, jobs, mark.jobs);
+}
+
+/**
+ * G13 (the G7-R2 carry, BINDING): a local workflow that gated deploy jobs call, edited only by pipegen's head check as the first step of EVERY
+ * job (insertHeadChecks). It must be an existing workflow started only by workflow_call; each workflow `calledBy` names is in this batch and
+ * has a job that calls this file and waits for pipegen-verify; pipegen added no job and no needs; every job starts with the exact head check
+ * (no anchor), no later step can run after it failed, and without the head checks the file is the original exactly.
+ */
+function judgeCalled(fc: FileCtx, parsed: Parsed, mark: PipegenInserted): void {
+  const bad = issueFor(fc);
+  const callers: unknown[] = Array.isArray(mark.calledBy) ? mark.calledBy : [null];
+  if (typeof mark.original !== 'string' || !Array.isArray(mark.jobs) || mark.jobs.length > 0 || !Array.isArray(mark.needs) || mark.needs.length > 0 || mark.needsOnly !== undefined || callers.length === 0) {
+    bad('template', 'The edit mark of a called workflow is incomplete, or says pipegen added a job or needs there.');
+    return;
+  }
+  const orig = parseYaml(mark.original, 'user');
+  if (!('parsed' in orig)) { bad('template', `The user's original workflow can not be read (${orig.problems.join('; ')}), so pipegen can not show its edit is only the head checks.`); return; }
+  const jobs = parsed.js.jobs;
+  const origJobs = orig.parsed.js.jobs;
+  if (!isObj(jobs) || !isObj(origJobs)) { bad('template', 'The workflow has no jobs map.'); return; }
+  for (const t of [triggersOf(parsed.js.on), triggersOf(orig.parsed.js.on)]) {
+    if (t === null || t.length !== 1 || t[0] !== 'workflow_call') bad('template', 'A workflow pipegen edits only with its head checks must be started by workflow_call alone (the head check refuses any other run).');
+  }
+  judgeEnv(fc, parsed.js.env, 'the user\'s workflow');
+  const d = parsed.js.defaults;
+  const run = isObj(d) ? d.run : undefined;
+  if (d !== undefined && !(isObj(d) && Object.keys(d).every((k) => k === 'run') && isObj(run) && Object.keys(run).every((k) => k === 'shell') && (run.shell === undefined || run.shell === 'bash' || run.shell === 'sh'))) bad('injection', 'The user\'s called workflow has defaults that would change pipegen\'s head check (only defaults.run.shell bash or sh is accepted).');
+  for (const c of callers) {
+    const caller = typeof c === 'string' ? fc.others.get(`app:${c}`) : undefined;
+    const cj = caller !== undefined && isObj(caller.js.jobs) ? caller.js.jobs : {};
+    const calls = Object.values(cj).some((j) => isObj(j) && j.uses === `./${fc.file.path}` && needsList(j.needs).includes('pipegen-verify'));
+    if (!calls) bad('template', `The workflow ${show(c)} the edit names as its caller is not in this batch, or has no job that calls this file and waits for pipegen-verify.`);
+  }
+  const heads: unknown[] = Array.isArray(mark.headCheck) ? mark.headCheck : [null];
+  const ids = Object.keys(origJobs);
+  if (Object.keys(jobs).length !== ids.length || ids.some((id) => !Object.hasOwn(jobs, id))) bad('template', 'The edit adds or removes a job of the user\'s called workflow.');
+  if (heads.length !== ids.length || ids.some((id) => !heads.includes(id))) bad('template', 'Every job of a called workflow pipegen edits must start with its head check.');
+  let want: unknown = null;
+  try { want = stepsToYaml([renderHeadCheckStep(fc.draft.profile.defaultBranch)]).toJSON()[0]; } catch (e) { if (!(e instanceof RenderError)) throw e; }
+  const rest: Obj = structuredClone(parsed.js);
+  const restJobs = rest.jobs as Obj;
+  for (const id of heads) {
+    const j = typeof id === 'string' && Object.hasOwn(restJobs, id) ? restJobs[id] : undefined;
+    if (typeof id !== 'string' || !isObj(j)) { bad('template', `The head check pipegen added is on ${show(id)}, which is not a job of the workflow.`); continue; }
+    const steps = Array.isArray(j.steps) ? j.steps : [];
+    const p = jobPair(parsed.doc, id);
+    const stepsNode = isMap(p?.value) ? p.value.get('steps', true) : undefined;
+    if (hasAnchorOrAlias(isSeq(stepsNode) ? stepsNode.items[0] : undefined)) bad('injection', `The head check pipegen added to ${show(id)} uses a YAML anchor or alias.`);
+    if (want === null || !isDeepStrictEqual(steps[0], want)) { bad('template', `The job ${show(id)} does not start with pipegen's head check exactly (the step pipegen writes for the default branch, first).`); continue; }
+    steps.forEach((st, i) => { if (i > 0 && isObj(st) && !gatedIfAllowed(st.if)) bad('template', `Step ${i + 1} of the job ${show(id)} has an if: that could run it after pipegen's head check failed (always(), failure(), cancelled(), or a top-level ||), so the check would not stop that deploy.`); });
+    steps.shift();
+  }
+  if (!isDeepStrictEqual(rest, orig.parsed.js)) bad('template', 'The edit changes the user\'s called workflow beyond the head checks pipegen inserted.');
 }
 
 /**

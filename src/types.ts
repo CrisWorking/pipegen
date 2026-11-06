@@ -183,7 +183,13 @@ export interface KnownValueCheck { containsKnownValue(text: string): boolean; /*
  * `needsOnly` (G7-R3): the gated jobs that wait for the check without the head check, each one gated only because it may deploy by its runner
  * or by `vars` (a WEAK reason) and unable to take the step; the referee refuses it on a job with a STRONG reason (src/engine/deploy-gating.ts).
  */
-export interface PipegenInserted { original: string; jobs: string[]; needs: { job: string; added: string[] }[]; headCheck?: string[]; needsOnly?: string[] }
+/**
+ * pipegen's edit of a user workflow (G7): the original text, the jobs it inserted, the needs it added, the jobs it started with its head check
+ * (headCheck) and the jobs that wait with needs only (needsOnly). `calledBy` (G13, the G7-R2 carry): this file is a local workflow that gated
+ * deploy jobs call (`uses: ./.github/workflows/<file>`); pipegen inserted no job and no needs here, only its head check as the first step of
+ * every job (`headCheck`), and `calledBy` names the edited workflows whose gated jobs call it.
+ */
+export interface PipegenInserted { original: string; jobs: string[]; needs: { job: string; added: string[] }[]; headCheck?: string[]; needsOnly?: string[]; calledBy?: string[] }
 export interface NotProven { part: Part; needId?: string; reason: string; missingSecrets: string[] }
 export interface TestDecision { service: string; current?: string; proposed?: string; reasons: string[]; choice: 'keep' | 'switch' | 'none' }
 export interface PipelineDraft {
@@ -283,7 +289,7 @@ export interface EnvSettings {
  */
 export type InstallEdit =
   | { repo: RecordRepo; path: string; kind: 'codeowners' | 'hooks' | 'dependabot'; inserted: string; originalSha: string | null; writtenShas: string[]; ownerEdited?: true }
-  | { repo: 'app'; path: string; kind: 'verify-job'; jobs: string[]; needs: { job: string; added: string[] }[]; originalSha: string; writtenShas: string[]; ownerEdited?: true }
+  | { repo: 'app'; path: string; kind: 'verify-job'; jobs: string[]; needs: { job: string; added: string[] }[]; headCheck?: string[]; originalSha: string; writtenShas: string[]; ownerEdited?: true }
   | { repo: 'app'; path: string; kind: 'package-json'; add: Record<string, string>; setTest: boolean; previousTest?: string; lock?: string; originalSha: string; writtenShas: string[]; ownerEdited?: true }
   | { repo: 'app'; path: string; kind: 'package-lock'; json: string; originalSha: string; writtenShas: string[]; ownerEdited?: true };
 /** A GitHub API call planned now and sent by `finish` (the shape of src/layers/locks.ts ApiRequest). */

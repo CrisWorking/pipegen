@@ -522,7 +522,8 @@ function editOfFile(f: CreatedFile, d: DeliveryPlan, delivered: readonly Created
   if (f.inserted !== undefined) {
     if (f.repo !== 'app') throw new DeliverError(`${show(f.path)}: only an app workflow takes pipegen's inserted jobs.`);
     const originalSha = prev?.kind === 'verify-job' ? prev.originalSha : gitBlobSha(f.inserted.original);
-    return { repo: 'app', path: f.path, kind: 'verify-job', jobs: [...f.inserted.jobs], needs: f.inserted.needs.map((n) => ({ job: n.job, added: [...n.added] })), originalSha, writtenShas: appendSha(prev?.writtenShas ?? [], sha) };
+    const heads = f.inserted.headCheck ?? [];
+    return { repo: 'app', path: f.path, kind: 'verify-job', jobs: [...f.inserted.jobs], needs: f.inserted.needs.map((n) => ({ job: n.job, added: [...n.added] })), ...(heads.length > 0 ? { headCheck: [...heads] } : {}), originalSha, writtenShas: appendSha(prev?.writtenShas ?? [], sha) };
   }
   const original = (f.edited as { original: string }).original;
   const rule = CREATED_RULES.find((r) => r.repo === f.repo && r.mode === 'edit' && r.match(f.path, d.draft));

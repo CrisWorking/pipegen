@@ -13,6 +13,9 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { imageDigestArtifact, renderDigestStep, renderHeadCheckStep, renderPublishDigestStep } from '../src/engine/deploy-steps.js';
 import type { RenderedStep } from '../src/engine/job-rules.js';
 import { SCRIPT_HEAD } from '../src/engine/pipegen-script.js';
+import { insertHeadChecks } from '../src/layers/deploy.js';
+import type { Job } from '../src/layers/jobs.js';
+import { parse } from 'yaml';
 
 const which = (exe: string): string | null => {
   try { return execFileSync('bash', ['-c', `command -v ${exe}`], { encoding: 'utf8' }).trim() || null; } catch { return null; }
@@ -309,5 +312,22 @@ describe('G7-R1 spec I2: the harness itself', () => {
     if (!READY) console.warn(`test/deploy-scripts.test.ts skipped: jq ${JQ ?? 'missing'}, openssl ${OPENSSL ?? 'missing'}`);
     // G7-R2 5: in CI the script tests never skip silently: a runner without jq or openssl fails here
     expect(READY || process.env.CI === undefined || process.env.CI === '', `CI is set but jq (${JQ ?? 'missing'}) or openssl (${OPENSSL ?? 'missing'}) is missing`).toBe(true);
+  });
+});
+
+describe.skipIf(!READY)('G13 (G7-R2 carry): the head check in a called workflow\'s job runs like the verify job\'s', () => {
+  it('head check in a called job: an approval wait in the called job, then a newer head → refused', async () => {
+    const called = 'on:\n  workflow_call:\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    environment: production\n    steps:\n      - run: ./ship.sh\n';
+    const verify = { 'runs-on': 'ubuntu-24.04', steps: [renderHeadCheckStep('main')] } as unknown as Job;
+    const edit = insertHeadChecks(called, ['.github/workflows/deploy.yml'], verify);
+    const step = ((parse(edit.text) as { jobs: { deploy: { steps: RenderedStep[] } } }).jobs.deploy.steps[0]) as RenderedStep;
+    // the approval was given after a newer commit reached main: the called job's own first step refuses the older commit
+    api = fresh({ head: NEWER });
+    const late = await run(step);
+    expect(late.code).not.toBe(0);
+    expect(late.err).toMatch(/default branch has moved on to a newer commit/);
+    // still the head: the deploy goes on
+    api = fresh();
+    expect((await run(step)).code).toBe(0);
   });
 });
