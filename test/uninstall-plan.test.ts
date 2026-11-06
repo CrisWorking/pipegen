@@ -245,7 +245,7 @@ describe('uninstall plan: files (V4)', () => {
   });
 
   it('record: path not claimed by its part\'s created-file rule or a pipegen workflow path → manual review, never removed', async () => {
-    const extra: Record<string, string> = { 'src/index.ts': 'x\n', '.github/workflows/deploy.yml': 'on: push\n', 'sub/Dockerfile': 'FROM a\n', 'CODEOWNERS': '* @o\n', 'docs/guide.md': 'g\n' };
+    const extra: Record<string, string> = { 'test/con.test.ts': 't\n', 'src/index.ts': 'x\n', '.github/workflows/deploy.yml': 'on: push\n', 'sub/Dockerfile': 'FROM a\n', 'CODEOWNERS': '* @o\n', 'docs/guide.md': 'g\n' };
     const w = world({ ...FILES, ...extra });
     const rec = sampleRecord(w);
     rec.files.push(
@@ -254,11 +254,12 @@ describe('uninstall plan: files (V4)', () => {
       { repo: 'app', path: 'sub/Dockerfile', part: 'docker', shas: [blob('FROM a\n')] },         // not at a recorded service root
       { repo: 'app', path: 'CODEOWNERS', part: 'codeowners', shas: [blob('* @o\n')] },          // an edit kind, never a whole file
       { repo: 'app', path: 'docs/guide.md', part: 'docs', shas: [blob('g\n')] },
+      { repo: 'app', path: 'test/con.test.ts', part: 'tests', shas: [blob('t\n')] },             // the path rule refuses it (a Windows device name)
     );
     // a Dockerfile recorded under another part
     (rec.files.find((f) => f.path === 'PIPEGEN.md') as InstallRecord['files'][number]).part = 'tests';
     const u = await plan(w, rec, term({ confirm: () => false }));
-    for (const p of ['src/index.ts', '.github/workflows/deploy.yml', 'sub/Dockerfile', 'CODEOWNERS', 'docs/guide.md', 'PIPEGEN.md']) {
+    for (const p of ['test/con.test.ts', 'src/index.ts', '.github/workflows/deploy.yml', 'sub/Dockerfile', 'CODEOWNERS', 'docs/guide.md', 'PIPEGEN.md']) {
       expect(u.removeFiles.map((f) => f.path), p).not.toContain(p);
       expect(u.keepAsk.map((f) => f.path), p).not.toContain(p);
       expect(u.manual.find((m) => m.what === p)?.why, p).toMatch(/not a file pipegen creates there/);
@@ -519,6 +520,12 @@ describe('uninstall plan: GitHub objects (V4)', () => {
     e.stored.delete('TEAM_TOKEN');
     w.vars.delete('env:pipegen-signing');
     expect((await plan(w, rec, term())).deleteEnvironments.map((x) => x.name)).toEqual(['pipegen-signing']);
+    // a list GitHub gives only in part (more than one page): kept
+    w.g.hooks.unshift((call) => (call.route.endsWith('/environments/{environment_name}/variables') ? { status: 200, data: { total_count: 3, variables: [] } } : undefined));
+    const partial = await plan(w, rec, term());
+    expect(partial.deleteEnvironments).toEqual([]);
+    expect(whats(partial)).toMatch(/couldn't list every variable/);
+    w.g.hooks.shift();
     // a secret recorded but with another created_at is not pipegen's: the environment stays
     e.stored.set('PIPEGEN_COSIGN_KEY', LATER);
     expect((await plan(w, rec, term())).deleteEnvironments).toEqual([]);
@@ -617,8 +624,13 @@ describe('uninstall plan: GitHub objects (V4)', () => {
     const u3 = await plan(w, rec, term({ type: () => 'master' }));
     expect(u3.restoreClassic).toBeUndefined();
     expect(u3.skipped).toContainEqual({ what: 'branch protection of main', why: 'kept: its name was not typed' });
-    // changed since pipegen set it: kept, a manual step, never asked
-    w.protection = { ...w.protection, required_signatures: { enabled: true } };
+    // changed since pipegen set it: kept, a manual step, never asked (a field pipegen sets, then one it never sets)
+    const set = w.protection;
+    w.protection = { ...set, enforce_admins: { enabled: false } };
+    const t5 = term();
+    expect((await plan(w, rec, t5)).restoreClassic).toBeUndefined();
+    expect(t5.typed).toEqual([]);
+    w.protection = { ...set, required_signatures: { enabled: true } };
     const t4 = term();
     const u4 = await plan(w, rec, t4);
     expect(u4.restoreClassic).toBeUndefined();
@@ -666,6 +678,9 @@ describe('uninstall plan: GitHub objects (V4)', () => {
       ],
       environments: [{ name: 'pipegen-signing', created: true, githubCreatedAt: AT, changed: [], branchPolicyIds: [] }],
     });
+    // a fork's pull request on a branch of the same name is never pipegen's
+    w.app.pulls.push({ number: 4, head: 'pipegen/setup', base: 'main', title: 'fork', body: '', state: 'open', html_url: 'f' });
+    w.pullRepoId.set(4, 999_999);
     const u = await plan(w, rec, term(), { setupPr: 3 });
     expect(u.unfinished).toBe(true);
     expect(u.closePrs).toEqual([{ repo: 'app', number: 3, branch: 'pipegen/setup', confirmedByName: false }]);
@@ -815,6 +830,7 @@ describe('uninstall plan: reads, terminal and preview (V4)', () => {
     });
     const u = await plan(w, rec, term());
     expect(u.restoreVariables).toMatchObject([{ name: 'PIPEGEN_BLOCK_FROM', scope: 'repo', previous: 'old-value-before-pipegen', pipegenValue: '2026-11-05T00:00:00Z', confirmedByName: true }]);
+    expect(u.deleteVariables.find((v) => v.name === 'DEPLOY_URL')).toMatchObject({ confirmedByName: true });
     const p = previewUninstall(u);
     for (const name of ['PIPEGEN_FP_KEY', 'STRIPE_KEY', 'PIPEGEN_BLOCK_FROM', 'DEPLOY_URL']) expect(p).toContain(name);
     for (const value of ['old-value-before-pipegen', '2026-11-05T00:00:00Z', 'value-set-by-pipegen', 'BEGIN PUBLIC KEY', 'MFkwEwYHKoZIzj0']) expect(p).not.toContain(value);
@@ -874,6 +890,9 @@ describe('uninstall plan: reads, terminal and preview (V4)', () => {
     const u2 = await plan(w2, rec2, term());
     expect(u2.lastProject).toBe(true);
     expect(u2.centralLocks).toEqual(rec2.central);
+    // another project's central workflow with no record of it (records deleted, files left): still not the last project
+    w2.g.commitOn('o/pipelines', 'main', { '.github/workflows/other--push.yml': 'x\n' });
+    expect((await plan(w2, rec2, term(), { centralHead: w2.g.head('o/pipelines') })).lastProject).toBe(false);
     // a public app (records-only pipelines): only the record
     const u3 = await plan(w2, sampleRecord(w2, { centralSha: null }), term());
     expect(u3.centralFiles).toEqual([recordPath('shop')]);
@@ -889,5 +908,50 @@ describe('uninstall plan: reads, terminal and preview (V4)', () => {
     expect(u.restoreVariables).toEqual([]);
     expect(u.manual.find((m) => m.what === 'variable PIPEGEN_COSIGN_PUB (environment pipegen-signing)')?.step).toMatch(/gh variable set PIPEGEN_COSIGN_PUB --env pipegen-signing/);
     expect(whats(u)).toMatch(/variable MY_VAR: pipegen doesn't know the value it set/);
+    // no earlier value recorded: left as it is, even where pipegen knows its own value
+    setVar(w, 'repo', 'PIPEGEN_BLOCK_FROM', 'b');
+    const u2 = await plan(w, sampleRecord(w, { variables: [{ name: 'PIPEGEN_BLOCK_FROM', scope: 'repo', created: false }], blockFrom: 'b' }), term());
+    expect(u2.restoreVariables).toEqual([]);
+    expect(whats(u2)).toMatch(/variable PIPEGEN_BLOCK_FROM: pipegen didn't create it and has no earlier value of it/);
+  });
+  it('plan: a variable changed since pipegen set it is not put back; central secrets go only with the last project', async () => {
+    const w = world();
+    setVar(w, 'repo', 'PIPEGEN_BLOCK_FROM', 'the owner changed it');
+    const u = await plan(w, sampleRecord(w, { variables: [{ name: 'PIPEGEN_BLOCK_FROM', scope: 'repo', created: false, previous: 'old' }], blockFrom: '2026-11-05T00:00:00Z' }), term());
+    expect(u.restoreVariables).toEqual([]);
+    expect(whats(u)).toMatch(/variable PIPEGEN_BLOCK_FROM: it no longer holds the value pipegen set/);
+    // a central one: kept while another project uses pipelines, deleted (after its identity read) with the last project
+    w.central.stored.set('PIPEGEN_CENTRAL', AT);
+    const centralOnes = [{ name: 'PIPEGEN_CENTRAL', scope: 'central' as const, created: true, githubCreatedAt: AT }];
+    const alone = await plan(w, sampleRecord(w, { [SEC]: centralOnes }), term());
+    expect(alone.lastProject).toBe(true);
+    expect(alone.deleteSecrets.map((x) => x[SK].name)).toEqual(['PIPEGEN_CENTRAL']);
+    w.g.commitOn('o/pipelines', 'main', { [recordPath('other')]: '{}\n' });
+    const shared = await plan(w, sampleRecord(w, { [SEC]: centralOnes }), term(), { centralHead: w.g.head('o/pipelines') });
+    expect(shared.lastProject).toBe(false);
+    expect(shared.deleteSecrets).toEqual([]);
+    expect(whats(shared)).toMatch(/PIPEGEN_CENTRAL \(pipelines\): other projects of pipelines may use it/);
+    // an open central pull request of another project: not the last one either
+    const w2 = world();
+    w2.central.pulls.push({ number: 2, head: 'pipegen/update-other', base: 'main', title: 'x', body: '', state: 'open', html_url: 'x' });
+    expect((await plan(w2, sampleRecord(w2), term())).lastProject).toBe(false);
+  });
+
+  it('plan: org rule deleted only when it targets this repo and pins this project\'s required workflow in the recorded central repo', async () => {
+    const w = world();
+    const liveOrg = (over: Record<string, unknown> = {}) => ({ id: 77, name: 'pipegen-required--shop', source_type: 'Organization', source: 'o', created_at: AT,
+      conditions: { repository_id: { repository_ids: [w.app.id] }, ref_name: { include: ['~DEFAULT_BRANCH'], exclude: [] } },
+      rules: [{ type: 'workflows', parameters: { workflows: [{ path: '.github/workflows/shop--required.yml', sha: SHA('c'), repository_id: w.central.id }] } }], ...over });
+    const org = { org: 'o', id: 77, name: 'pipegen-required--shop', githubCreatedAt: AT, pinnedSha: SHA('c') };
+    const rec = (centralId: number) => sampleRecord(w, { orgRuleset: org, central: { repoId: centralId, createdByPipegen: true } });
+    w.org.set(77, liveOrg());
+    const u = await plan(w, rec(w.central.id), term());
+    expect(u.deleteOrgRuleset).toMatchObject({ org: 'o', id: 77, confirmedByName: false });
+    expect(previewUninstall(u)).toMatch(/org ruleset pipegen-required--shop \(id 77\) of o: deleted/);
+    // the record names another central repo id (pipelines re-created): not pipegen's rule
+    expect((await plan(w, rec(w.central.id + 50), term())).deleteOrgRuleset).toBeUndefined();
+    // pinned at another commit: not pipegen's
+    w.org.set(77, liveOrg({ rules: [{ type: 'workflows', parameters: { workflows: [{ path: '.github/workflows/shop--required.yml', sha: SHA('d'), repository_id: w.central.id }] } }] }));
+    expect((await plan(w, rec(w.central.id), term())).deleteOrgRuleset).toBeUndefined();
   });
 });
