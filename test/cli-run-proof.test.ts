@@ -229,3 +229,148 @@ describe('G14: the brief\'s tests (preflight §7 G14)', () => {
     }
   });
 });
+
+describe('G14: disputes and the carries', () => {
+  /** A dispute on sast--api: the builder's pick against the judge's (the key's other offered tool). */
+  async function disputed() {
+    const w0 = await proofWorld();
+    const debate = w0.input.debate as NonNullable<typeof w0.input.debate>;
+    const p = w0.input.draft.profile;
+    const offers = keyOffers(debate.needs, debate.candidates, p, { reviewed: w0.input.reviewed });
+    const api = debate.choices.find((c) => c.key === 'sast--api') as NonNullable<typeof w0.input.debate>['choices'][number];
+    const other = offers.offers.get('sast--api')?.find((o) => o.entry.id !== api.chosen.tool.id);
+    const ref = offers.refs.find((r) => r.key === 'sast--api');
+    const { specFor } = await import('../src/debate/builder.js');
+    const judgeChoice = { ...api, chosen: specFor(ref as never, other as never, p) };
+    return [{ id: 'd1', key: 'sast--api', needId: 'sast', options: [
+      { label: 'builder', variant: 'dispute-d1-a', choice: api, argument: 'a', objectionIds: [] },
+      { label: 'judge', variant: 'dispute-d1-b', choice: judgeChoice, argument: 'b', objectionIds: ['o1'] },
+    ] }] as never;
+  }
+
+  it('run: disputes after pushProofSetup and before the main merge; a judge win reruns main and planted', async () => {
+    const w = await proofWorld({ disputes: await disputed() });
+    const r = await w.run();
+    expect(r.ok).toBe(true);
+    const iSetup = at(w.tl, 'setup');
+    const iA = at(w.tl, 'pushBranch:dispute-d1-a');
+    const iB = at(w.tl, 'pushBranch:dispute-d1-b');
+    const iMain = at(w.tl, 'pushBranch:main@parent');
+    const iPl = at(w.tl, 'pushBranch:planted@parent');
+    const iMerge = at(w.tl, 'variant:main:merge');
+    expect(iSetup).toBeLessThan(iA);
+    expect(iA).toBeLessThan(iB);
+    expect(Math.max(iB, iMain, iPl)).toBeLessThan(iMerge);
+    expect(iMain).toBeGreaterThan(iB);
+    // keepOpen false: each variant's PR is closed after its runs
+    expect(w.tl.filter((x) => x.startsWith('variant:dispute')).every((x) => !x.endsWith(':open'))).toBe(true);
+    // each variant carries the planted files
+    expect(w.pushed.filter((x) => x.variant.startsWith('dispute')).every((x) => x.files.some((f) => String(f.path).startsWith('pipegen-planted/')))).toBe(true);
+  });
+
+  it('run: a decided dispute\'s winner reaches the draft by key; the scoreboard is written as is', async () => {
+    const ds = await disputed();
+    const judgeTool = (ds as { options: { choice: { chosen: { tool: { id: string } } } }[] }[])[0]?.options[1]?.choice.chosen.tool.id;
+    const w = await proofWorld({ disputes: ds });
+    let winners: Map<string, unknown> | undefined;
+    let board: string[] = [];
+    w.ops.decide = async (d, deps) => { const { decideDisputes } = await import('../src/debate/decide.js'); const x = await decideDisputes(d, deps); winners = x.winners; board = x.scoreboard; return x; };
+    w.input.withWinners = (m) => { expect(m).toBe(winners); return { ...w.input.draft, steps: w.input.draft.steps.map((s) => (s.needId === 'sast' && s.service === 'api' ? (m.get('sast--api') as { chosen: typeof s }).chosen : s)) }; };
+    const r = await w.run();
+    expect(r.draft?.steps.find((s) => s.needId === 'sast' && s.service === 'api')?.tool.id).toBe(judgeTool);
+    expect(r.draft?.scoreboard).toEqual(board);
+    expect(board.length).toBeGreaterThan(0);
+  });
+
+  it('run: a cap stop saves the fixed draft; resume starts from it (G0-R1 I2)', async () => {
+    const w = await proofWorld({ results: [failOn('sast')] });
+    w.meter.restore(5);   // the AI cap reached: the loop's first cap check stops it
+    const r = await w.run();
+    expect(r.ok).toBe(false);
+    expect(w.tl).toContain('cancelActive');
+    expect(w.store.state?.stage).toBe('stopped');
+    expect(w.store.state?.stoppedBy).toBe('ai-cost');
+    expect(w.store.state?.proofOk).toBe(false);
+    expect(w.store.state?.draft).toBeDefined();
+    // the resume half: resume.test below proves the saved draft
+  });
+
+  it('run: interrupting() is checked before real keys are stored and before each push', async () => {
+    const seen: string[] = [];
+    const k = guardedKeys({ real: async () => { seen.push('real'); }, setup: async () => { seen.push('setup'); }, placeholders: async () => { seen.push('ph'); } } as unknown as FixKeys, { recordSecretNames: (n) => { seen.push(`names:${n.join(',')}`); } });
+    stop.on = true;
+    try {
+      await expect(k.real(['API_TOKEN'])).rejects.toThrow(/real test keys are not stored/);
+      await expect(k.setup(['API_TOKEN'])).rejects.toThrow(/stopping/);
+      expect(seen).toEqual([]);
+      // a push: refused before it starts (the run's transport), and the cleanup still runs
+      const w = await proofWorld();
+      const r = await w.run();
+      expect(r.ok).toBe(false);
+      expect(w.tl.some((x) => x.startsWith('push:'))).toBe(false);
+      expect(w.tl.some((x) => x.startsWith('cleanup:'))).toBe(true);
+    } finally {
+      stop.on = false;
+    }
+    await k.real(['API_TOKEN']);
+    expect(seen).toEqual(['names:API_TOKEN', 'real']);
+  });
+
+  it('run: cleanup on an interrupt during the proof; the scratch repo deleted only when the token may', async () => {
+    for (const may of [false, true]) {
+      const w = await proofWorld({ canDelete: may });
+      await w.run();
+      // the armed Ctrl-C hook's cleanup is the same cleanupAfterProof, with the signal
+      const ac = new AbortController();
+      await w.armed[0]?.cleanup({ signal: ac.signal } as never);
+      expect(w.cleanupOpts.map((x) => x.canDeleteRepo)).toEqual([may, may]);
+      expect(w.cleanupOpts[1]?.signal).toBe(ac.signal);
+    }
+  });
+
+  it('run: the meters reach armProofCleanup and cleanupAfterProof; stopAtCap saves through saveStopState', async () => {
+    const w = await proofWorld();
+    await w.run();
+    const m = w.armed[0]?.meters();
+    expect(m?.ai).toBe(w.meter);
+    expect(m?.minutes?.cap).toBe(100);
+    expect(w.cleanupOpts[0]?.meters?.()).toEqual(m);
+    // stopAtCap's saveState is saveStopState: the meters saved, then stopped with the cap (see the cap test above)
+    expect(readFileSync(join(process.cwd(), 'src/cli/run-proof.ts'), 'utf8')).toMatch(/saveState: saveStopState\(store, meters\)/);
+  });
+
+  it('run: a blocking scanner with no planted item stays blocking, never in notProven', async () => {
+    const w = await proofWorld({ draft: (d) => ({ ...d, needs: [...d.needs, { id: 'dast', layer: 'merge', category: 'dast', service: 'web', why: 'w', blocking: true, floor: false }] }) });
+    const r = await w.run();
+    const items = (w.evals[0]?.ctx.plantedItems ?? []).map((x) => x.category);
+    expect(items).not.toContain('dast');
+    expect(r.draft?.needs.find((n) => n.id === 'dast')?.blocking).toBe(true);
+    expect(r.draft?.notProven.some((n) => /dast/.test(JSON.stringify(n)))).toBe(false);
+  });
+
+  it('run: a private app\'s central workflows are pushed once: a change to them stops the proof, cleaned up', async () => {
+    const w = await proofWorld({ private: true, results: [failOn('sast'), PASS] });
+    // the first proof as set up; the next one with a draft whose central workflow differs
+    w.ops.fixLoop = async (d, deps) => {
+      await deps.prove(d, 'full');
+      await deps.prove({ ...d, centralPin: { repo: 'CrisWorking/pipelines', sha: '1'.repeat(40) } } as PipelineDraft, 'full');
+      throw new Error('the second proof should have stopped');
+    };
+    w.input.assembleFor = async (d) => async () => [
+      { repo: 'app', path: '.github/workflows/pipegen.yml', content: 'on: [push]\njobs: {}\n', part: 'pipeline', reason: 'r' },
+      { repo: 'central', path: '.github/workflows/r--merge.yml', content: `on: workflow_call\n# ${d.centralPin?.sha ?? ''}\njobs: {}\n`, part: 'pipeline', reason: 'r' },
+    ];
+    const r = await w.run();
+    expect(r.ok).toBe(false);
+    expect(r.stopped).toContain(CENTRAL_CHANGED.slice(0, 50));
+    expect(w.tl.some((x) => x.startsWith('cleanup:'))).toBe(true);
+  });
+});
+
+describe('G14: the workflows a proof waits for', () => {
+  it('proofWorkflowsOf: push and pull_request from each workflow\'s `on:` (string, list or map); other files ignored', () => {
+    const f = (path: string, on: string) => ({ path, content: `on: ${on}\njobs: {}\n` });
+    expect(proofWorkflowsOf([f('.github/workflows/a.yml', '[push, pull_request]'), f('.github/workflows/b.yml', 'pull_request'), f('.github/workflows/c.yml', '{push: {branches: [main]}}'), f('README.md', 'push')]))
+      .toEqual({ push: ['.github/workflows/a.yml', '.github/workflows/c.yml'], pullRequest: ['.github/workflows/a.yml', '.github/workflows/b.yml'], merge: ['.github/workflows/a.yml', '.github/workflows/c.yml'] });
+  });
+});
