@@ -677,7 +677,7 @@ describe('uninstall plan: GitHub objects (V4)', () => {
     // run 1 asks nothing about settings: it says the next run will
     const t0 = term();
     const a = await plan(w, rec, t0);
-    expect(t0.confirms).toEqual([]);
+    expect(t0.confirms.filter((q) => q.startsWith('Turn off'))).toEqual([]);
     expect(a.settings.every((x) => !x.turnOff)).toBe(true);
     expect(previewUninstall(a)).toMatch(/Next run[^]*asks whether to turn off[^]*secret scanning/);
     const u2 = await planB(w, rec, term({ confirm: (q) => q.startsWith('Turn off secret scanning') }));

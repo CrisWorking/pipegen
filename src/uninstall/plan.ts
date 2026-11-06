@@ -22,12 +22,19 @@
 //   pipegen recorded writing (else manual), the N4 environment and the deliver-time secrets (record entries) as above.
 // - The local leftovers file (V-N5): each entry for this repo is identity-checked and always asked by name; never deleted blind.
 // - Central: the exact list (record `repo: 'central'` ∩ centralFilesOf + the record, V-B4); lastProject from the records AND the files on the
-//   central default branch, and no open central PR of another project.
+//   central default branch, and no open central PR but this project's own (exact branch and GitHub's id of the recorded central repo).
+// - Fix round 1 (V4-R1), two runs: `phase` A (run 1: the uninstall PR, pipegen's open PRs (app and the central update PR), the merge
+//   locks) asks typed names only for its own items; run 2's items (secrets, variables, environments, settings, central) are planned and
+//   previewed with no question and no token (`needsName`). Phase B (run 2, a fresh plan and confirmation) asks those names, asks no file
+//   question, and sees run 1's work as done (`done`: files gone, a file back to its original or without pipegen's part, a ruleset gone,
+//   the protection as before), or as still to do by hand, never as a new action. A leftover secret or environment with no creation date is
+//   never deleted (it may be one pipegen only overwrote). "Unfinished" (no PR to wait for) only when none of pipegen's own workflows is on
+//   the default branch (and, under full trust, the record has no mergedAt).
 import type { Octokit } from '@octokit/rest';
 import { PromptCancelledError, type Prompter } from '../cli/io.js';
 import { readEnv, SETUP_BRANCH } from '../deliver/deliver.js';
 import { DeliverError, ghRead, isoAt, readBlobText, readHead, readTree, statusOf, type RepoRef, type TreeEntry } from '../deliver/git-data.js';
-import { readLocalLeftovers, recordPath, RecordError, type Leftover } from '../deliver/record.js';
+import { centralUpdateBranch, readLocalLeftovers, recordPath, RecordError, type Leftover } from '../deliver/record.js';
 import { classicPutForm } from '../deliver/settings-api.js';
 import { centralFilesOf, UPDATE_BRANCH } from '../deliver/update.js';
 import { HOOK_FILES, HOOKS_MARKER } from '../engine/created-builders.js';
@@ -44,7 +51,7 @@ import { UninstallError } from './errors.js';
 import { askTypedName, type LoadedRecord, type UninstallDeps } from './record.js';
 import { revertEdits, type CurrentFile, type RevertResult } from './revert.js';
 import {
-  droppedLiveField, environmentOwned, exactlyAsSet, isPipegens, UninstallApi, UninstallRefusal,
+  droppedLiveField, environmentOwned, exactlyAsSet, isPipegens, ownedName, uninstallBranch, UninstallApi, UninstallRefusal,
   type Confirmable, type EnvForm, type Owned, type TypedName, type UninstallApp as TargetApp,
 } from './target.js';
 
@@ -56,10 +63,19 @@ type RulesetEntry = InstallRecord['rulesets'][number];
 type OrgEntry = NonNullable<InstallRecord['orgRuleset']>;
 type SettingKey = 'shaPinningRequired' | 'vulnerabilityAlerts' | 'secretScanning' | 'pushProtection';
 
-/** A typed name the user gave for one object (confirmedByName), with the token V3 takes for it when the object has one. */
-interface Named { confirmedByName: boolean; typed?: TypedName }
+/**
+ * A typed name the user gave for one object (confirmedByName), with the token V3 takes for it when the object has one. `needsName`: the
+ * item belongs to the other run, which asks its name (no question here, no token).
+ */
+interface Named { confirmedByName: boolean; typed?: TypedName; needsName?: true }
+/** A: run 1 (the uninstall PR, pipegen's PRs, the merge locks). B: run 2, after the uninstall PR merged (secrets … central). */
+export type UninstallPhase = 'A' | 'B';
 
 export interface UninstallPlan {
+  /** The run this plan is for; only its own items carry typed names and tokens (V4-R1). */
+  phase: UninstallPhase;
+  /** Phase B: run 1's work found done on GitHub (names only). */
+  done: string[];
   /** The app as GitHub reports it now (LoadedRecord.app). */
   app: { owner: string; repo: string; repoId: number; defaultBranch: string };
   /** The write API of this run: V5/V6 send every write through it, so the typed-name tokens below are honoured (they are bound to it). */
@@ -98,12 +114,13 @@ export interface UninstallPlan {
   centralFiles: string[];
   lastProject: boolean;
   centralLocks?: InstallRecord['central'];
-  /** The setup PR was never merged (V-S4): no uninstall PR to wait for. */
+  /** None of pipegen's own workflows is on the default branch (and, full trust, no mergedAt): no uninstall PR to wait for (V-S4). */
   unfinished: boolean;
   skipped: { what: string; why: string }[];
 }
 
-export type PlanDeps = Omit<UninstallDeps, 'io'>;
+/** `phase`: A (run 1, the default) or B (run 2). */
+export type PlanDeps = Omit<UninstallDeps, 'io'> & { phase?: UninstallPhase };
 
 const show = (s: unknown, n = 120): string => safeText(String(s), n);
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -118,6 +135,10 @@ const MAX_BLOB = 8 * 1024 * 1024;
 const MAX_SCANNED = 200;
 const NOT_TYPED = 'kept: its name was not typed';
 const GONE = 'GitHub doesn\'t show it (already gone, or this login can\'t see it): nothing to do';
+const ORG_GONE = 'GitHub answers 404 for it: it is gone, or this login can\'t read the organisation\'s rulesets (pipegen can\'t tell which); check it in the organisation\'s settings';
+const CANT_ASK = 'its name has characters (or a length) the terminal can\'t show exactly, so it can\'t be asked safely; pipegen leaves it';
+/** A name askTypedName can ask for exactly (V1: it refuses any name safeText would change or cut). */
+const askable = (name: unknown): boolean => typeof name === 'string' && name.trim() !== '' && safeText(name, 120) === name;
 
 /** pipegen's own app workflows (assemble.ts): claimed by their exact path, part `pipeline`. */
 const APP_WORKFLOWS: readonly string[] = [CALLER_WORKFLOW, PUSH_WORKFLOW, NIGHTLY_WORKFLOW, LOCAL_MERGE_WORKFLOW];
@@ -146,8 +167,9 @@ const TYPED_MANUAL: readonly { fields: readonly string[]; what: string; step: st
 ];
 
 /**
- * The uninstall plan of `loaded` (V1's trusted record). Asks the keep questions (default keep; none without a terminal) and the typed
- * names (only at the interactive terminal: without one, a needed name stops with UninstallError). Sends no write.
+ * The uninstall plan of `loaded` (V1's trusted record) for one run (`deps.phase`, default A). Asks the keep questions (run 1; default keep;
+ * none without a terminal) and the typed names of this run's items only (at the interactive terminal: without one, a needed name stops with
+ * UninstallError). Sends no write. Run 2 (B) is a fresh plan: it never reuses run 1's answers or tokens.
  */
 export async function planUninstall(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined, deps: PlanDeps = {}): Promise<UninstallPlan> {
   try { return await build(gh, loaded, io, deps); } catch (e) {
@@ -163,6 +185,8 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
   const appRef: RepoRef = { owner: loaded.app.owner, repo: loaded.app.repo };
   const full = `${appRef.owner}/${appRef.repo}`;
   const typedTrust = loaded.trust === 'typed';
+  const phase: UninstallPhase = deps.phase === 'B' ? 'B' : 'A';
+  const inA = phase === 'A';
   const interactive = deps.interactive === true && io !== undefined;
   const askDeps = { ...(io === undefined ? {} : { io }), ...(deps.interactive === undefined ? {} : { interactive: deps.interactive }) };
   // the typed-name question of this run: target.ts builds it; `context` (the diff, the reason) is shown above it once
@@ -178,6 +202,7 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
   const central: RepoRef = { owner: appRef.owner, repo: CENTRAL_REPO };
 
   const u: UninstallPlan = {
+    phase, done: [],
     app: { owner: appRef.owner, repo: appRef.repo, repoId: loaded.app.repoId, defaultBranch: loaded.app.defaultBranch },
     api, trust: loaded.trust, typedNames: loaded.typedNames,
     base: { appHead: '', appTree: '', centralHead: loaded.centralHead, recordBlobSha: loaded.blobSha },
@@ -187,6 +212,8 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
   };
   const skip = (what: string, why: string): void => { u.skipped.push({ what, why }); };
   const manual = (what: string, why: string, step?: string): void => { u.manual.push({ what, why, ...(step === undefined ? {} : { step }) }); };
+  /** Phase B: run 1's work found done on GitHub. */
+  const markDone = (what: string): void => { u.done.push(what); };
 
   /** A yes/no question (the default when there is no terminal, or the question is cancelled). */
   const ask = async (q: string, def: boolean): Promise<boolean> => {
@@ -205,22 +232,23 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
   const typedPlain = (expected: string, question: string): Promise<boolean> => askTypedName(askDeps, expected, question);
 
   /** A GET through the API: the answer, or why it isn't there (404: gone or no access; 403 or another status: a manual step). */
-  const live = async (route: string, params: Record<string, unknown>): Promise<{ data: unknown } | { missing: string; manual: boolean }> => {
+  const live = async (route: string, params: Record<string, unknown>, gone = GONE): Promise<{ data: unknown } | { missing: string; manual: boolean }> => {
     try { return { data: (await api.read(route, params)).data }; } catch (e) {
       if (e instanceof UninstallRefusal) return { missing: `pipegen won't read it (${show(e.message, 200)})`, manual: true };
       const s = statusOf(e);
       if (isRateStop(e) || e instanceof GitHubAccessError || s === undefined || s === 401) throw e;
-      if (s === 404) return { missing: GONE, manual: false };
+      if (s === 404) return { missing: gone, manual: false };
       return { missing: `GitHub refused to show it (HTTP ${s}), so pipegen can't tell whether it is the one it created`, manual: true };
     }
   };
 
   /**
    * One object pipegen may delete: read now, judged by isPipegens, then (when a name is needed) its typed name. null: kept, and listed.
-   * `extra`: a name is needed besides the verdict (not pipegen-shaped, or a leftover); `check`: a reason to keep it found right before asking.
+   * `extra`: a name is needed besides the verdict (not pipegen-shaped, or a leftover); `check`: a reason to keep it found right before asking;
+   * `when`: the run that sends it (V4-R1): another run's name is not asked here (`needsName`, no token); `gone`: the words for a 404.
    */
-  const classify = async (o: Owned, what: string, read: { route: string; params: Record<string, unknown> }, extra: boolean, opts: { why?: string; check?: () => Promise<string | null> } = {}): Promise<Named | null> => {
-    const l = await live(read.route, read.params);
+  const classify = async (o: Owned, what: string, read: { route: string; params: Record<string, unknown> }, extra: boolean, opts: { why?: string; check?: () => Promise<string | null>; when: UninstallPhase; gone?: string }): Promise<Named | null> => {
+    const l = await live(read.route, read.params, opts.gone);
     if ('missing' in l) {
       if (l.manual) manual(what, l.missing, 'Check it on GitHub and remove it by hand if it is pipegen\'s.');
       else skip(what, l.missing);
@@ -232,6 +260,8 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
     if (kept !== null) { skip(what, kept); return null; }
     const need = v.is === 'ask' || loaded.typedNames || extra;
     if (!need) return { confirmedByName: false };
+    if (!askable(ownedName(o))) { manual(what, CANT_ASK, 'Check it on GitHub and remove it by hand if it is pipegen\'s.'); return null; }
+    if (opts.when !== phase) return { confirmedByName: false, needsName: true };
     const reason = [opts.why, v.is === 'ask' ? `${v.why}.` : null, loaded.typedNames ? 'This run asks each name: the install record was trusted by typing, or its marker in the setup pull request differs.' : null].filter((x): x is string => x !== null && x !== undefined).join(' ');
     const t = await confirm(o, reason);
     if (t === null) { skip(what, NOT_TYPED); return null; }
@@ -291,11 +321,21 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
       continue;
     }
     const e = entries.get(f.path);
-    if (e === undefined) { skip(f.path, 'it is no longer on the default branch: nothing to remove'); continue; }
+    if (e === undefined) {
+      if (inA) skip(f.path, 'it is no longer on the default branch: nothing to remove');
+      else markDone(`${show(f.path, 200)}: not on the default branch`);
+      continue;
+    }
     if (!plainFile(e)) { manual(f.path, 'it is not a plain file now (a link or a submodule), so pipegen leaves it'); judged.push({ f, claim, state: 'held', changed: true }); continue; }
     if (f.ownerEdited === true) {
       manual(f.path, '`pipegen update` merged its change into your edits, so the file is yours now; pipegen never removes it', 'Review it and take out pipegen\'s parts by hand if you don\'t want them.');
       judged.push({ f, claim, state: 'held', changed: true });
+      continue;
+    }
+    if (!inA) {
+      // run 2 asks no file question: the file is still there (kept in run 1, or the uninstall PR isn't merged)
+      skip(f.path, 'it is still on the default branch (you kept it in the first run, or the uninstall pull request is not merged yet), so pipegen leaves it');
+      judged.push({ f, claim, state: 'held', changed: false });
       continue;
     }
     const changed = !f.shas.includes(e.sha);
@@ -350,7 +390,8 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
   const keptPkg: InstallEdit[] = testsKept ? appEdits.filter((e) => e.kind === 'package-json' || e.kind === 'package-lock') : [];
   for (const e of keptPkg) skip(e.path, 'kept with the starter tests you keep (they need its change)');
   const toRevert = appEdits.filter((e) => !keptPkg.includes(e));
-  if (toRevert.length > 0) {
+  if (!inA) await doneEdits(toRevert);
+  else if (toRevert.length > 0) {
     const current = new Map<string, CurrentFile | null>();
     for (const e of toRevert) {
       const t = entries.get(e.path);
@@ -397,29 +438,34 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
   u.centralFiles = [...own.filter((p) => claimed.has(p)), rp];
   const otherRecords = [...centralTree.entries.keys()].filter((p) => /^installs\/[^/]+\.json$/.test(p) && p !== rp);
   const otherFiles = [...centralTree.entries.keys()].filter((p) => CENTRAL_LAYER_RE.test(p) && !own.includes(p));
-  const mine = new Set([`pipegen/update-${rec.name}`, `pipegen/uninstall-${rec.name}`]);
+  // a central PR is this project's only on its exact branch, from the recorded central repo itself (never a fork's PR of the same name)
+  const updateBranch = centralUpdateBranch(appRef.repo);
+  const mine = new Set([updateBranch, uninstallBranch(targetApp, 'central')]);
+  const ownHead = (p: Record<string, unknown>, branches: ReadonlySet<string>): boolean => isObj(p.head) && typeof p.head.ref === 'string' && branches.has(p.head.ref) && isObj(p.head.repo) && p.head.repo.id === loaded.centralRepoId;
   const openCentral = await live('GET /repos/{owner}/{repo}/pulls', { ...central, state: 'open', per_page: 100 });
-  const otherPrs = !('data' in openCentral) || !Array.isArray(openCentral.data) ? null : openCentral.data.filter((p) => !(isObj(p) && isObj(p.head) && mine.has(String(p.head.ref))));
+  const centralPrs = !('data' in openCentral) || !Array.isArray(openCentral.data) ? null : openCentral.data;
+  const otherPrs = centralPrs === null ? null : centralPrs.filter((p) => !(isObj(p) && ownHead(p, mine)));
   u.lastProject = otherRecords.length === 0 && otherFiles.length === 0 && otherPrs !== null && otherPrs.length === 0;
   if (u.lastProject && !typedTrust && rec.central !== undefined) u.centralLocks = rec.central;
 
-  // ---------- 4. the merge locks: rulesets, the org rule, classic protection ----------
-  for (const r of rec.rulesets) {
+  // ---------- 4. the merge locks: rulesets, the org rule, classic protection (run 1; run 2 checks them done) ----------
+  if (!inA) await doneLocks();
+  else for (const r of rec.rulesets) {
     const what = `ruleset ${show(r.name, 100)} (id ${r.id})`;
-    const n = await classify({ kind: 'ruleset', entry: r }, what, { route: 'GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', params: { ...appRef, ruleset_id: r.id } }, false);
+    const n = await classify({ kind: 'ruleset', entry: r }, what, { route: 'GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', params: { ...appRef, ruleset_id: r.id } }, false, { when: 'A' });
     if (n !== null) u.deleteRulesets.push({ kind: r.kind, id: r.id, entry: r, ...n });
   }
-  if (!typedTrust && rec.orgRuleset !== undefined) {
+  if (inA && !typedTrust && rec.orgRuleset !== undefined) {
     const e = rec.orgRuleset;
     const what = `org ruleset ${show(e.name, 100)} (id ${e.id})`;
     // the pinned central repo is GitHub's, and only when it is the recorded one (V3 checks it again before the delete)
     const cid = centralRepoId === undefined || centralRepoId === loaded.centralRepoId ? loaded.centralRepoId : undefined;
     const n = lower(e.org) !== lower(appRef.owner)
       ? (skip(what, `it names the organisation ${show(e.org, 40)}, not ${show(appRef.owner, 40)}`), null)
-      : await classify({ kind: 'org-ruleset', entry: e, ...(cid === undefined ? {} : { centralRepoId: cid }) }, what, { route: 'GET /orgs/{org}/rulesets/{ruleset_id}', params: { org: e.org, ruleset_id: e.id } }, false);
+      : await classify({ kind: 'org-ruleset', entry: e, ...(cid === undefined ? {} : { centralRepoId: cid }) }, what, { route: 'GET /orgs/{org}/rulesets/{ruleset_id}', params: { org: e.org, ruleset_id: e.id } }, false, { when: 'A', gone: ORG_GONE });
     if (n !== null) u.deleteOrgRuleset = { org: e.org, id: e.id, entry: e, ...n };
   }
-  if (!typedTrust && rec.classicProtection !== undefined) await planClassic(rec.classicProtection, rec.planned.classic);
+  if (inA && !typedTrust && rec.classicProtection !== undefined) await planClassic(rec.classicProtection, rec.planned.classic);
 
   // ---------- 5. secrets (the record's, then the leftovers'), variables, environments ----------
   const secretWhat = (s: { name: string; scope: string }): string => `secret ${show(s.name, 100)}${s.scope === 'repo' ? '' : s.scope === 'central' ? ` (${CENTRAL_REPO})` : ` (environment ${show(s.scope.slice(4), 100)})`}`;
@@ -433,7 +479,7 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
     if (s.created !== true) { skip(what, 'pipegen didn\'t create it, so it never deletes it'); return; }
     if (s.scope === 'central' && !u.lastProject) { skip(what, `other projects of ${CENTRAL_REPO} may use it; pipegen deletes a central secret only with the last project`); return; }
     const why = leftover ? 'pipegen stored it before a delivery stopped (this machine\'s leftovers file lists it); pipegen can\'t tell whether it created it or only replaced the value of one that was there.' : undefined;
-    const n = await classify({ kind: 'secret', entry: s }, what, secretRead(s), leftover || !s.name.startsWith('PIPEGEN_'), why === undefined ? {} : { why });
+    const n = await classify({ kind: 'secret', entry: s }, what, secretRead(s), leftover || !s.name.startsWith('PIPEGEN_'), { when: 'B', ...(why === undefined ? {} : { why }) });
     if (n !== null) u.deleteSecrets.push({ secret: s, ...(leftover ? { fromLeftovers: true as const } : {}), ...n });
   };
   for (const s of rec.secrets) await planSecret(s, false);
@@ -447,13 +493,17 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
     skip(`${x.kind === 'secret' ? secretWhat({ name: x.name, scope: x.scope ?? 'repo' }) : `${x.kind} ${show(x.name, 100)}`} (leftovers file)`, `it is listed for another repo (${show(x.repo, 140)}), so pipegen leaves it`);
     return false;
   });
-  const asEntry = (x: Leftover): { githubCreatedAt: string } | { unconfirmed: true } => (isoAt(x.githubCreatedAt) ? { githubCreatedAt: x.githubCreatedAt } : { unconfirmed: true });
   const leftSecrets: SecretEntry[] = [];
   for (const x of ours.filter((y) => y.kind === 'secret')) {
     const scope = x.scope ?? 'repo';
     if (rec.secrets.some((s) => s.name === x.name && s.scope === scope)) continue;   // the record's entry decides
     if (scope !== 'repo' && !/^env:.+$/.test(scope)) { skip(`${secretWhat({ name: x.name, scope })} (leftovers file)`, 'its scope is not one pipegen stores secrets in'); continue; }
-    const entry = { name: x.name, scope: scope as SecretEntry['scope'], created: true, ...asEntry(x) } as SecretEntry;
+    if (!isoAt(x.githubCreatedAt)) {
+      // deliver records a secret whose value it replaced with no creation date: it may be the user's own (V4-R1 sec I1)
+      manual(`${secretWhat({ name: x.name, scope })} (leftovers file)`, 'pipegen may only have replaced the value of a secret you already had: the leftovers file holds no creation date to prove pipegen made it, so pipegen never deletes it', 'Check it, and delete it by hand if pipegen created it.');
+      continue;
+    }
+    const entry = { name: x.name, scope: scope as SecretEntry['scope'], created: true, githubCreatedAt: x.githubCreatedAt } as SecretEntry;
     leftSecrets.push(entry);
     await planSecret(entry, true);
   }
@@ -465,7 +515,7 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
       const read = v.scope === 'repo'
         ? { route: 'GET /repos/{owner}/{repo}/actions/variables/{name}', params: { ...appRef, name: v.name } }
         : { route: 'GET /repos/{owner}/{repo}/environments/{environment_name}/variables/{name}', params: { ...appRef, environment_name: v.scope.slice(4), name: v.name } };
-      const n = await classify({ kind: 'variable', entry: v }, what, read, !v.name.startsWith('PIPEGEN_'));
+      const n = await classify({ kind: 'variable', entry: v }, what, read, !v.name.startsWith('PIPEGEN_'), { when: 'B' });
       if (n !== null) u.deleteVariables.push({ name: v.name, scope: v.scope, entry: v, ...n });
       continue;
     }
@@ -479,6 +529,8 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
     const l = await live('GET /repos/{owner}/{repo}/actions/variables/{name}', { ...appRef, name: v.name });
     if ('missing' in l) { if (l.manual) manual(what, l.missing); else skip(what, l.missing); continue; }
     if (!isObj(l.data) || l.data.value !== pipegenValue) { skip(what, 'it no longer holds the value pipegen set (changed since), so pipegen leaves it'); continue; }
+    if (!askable(v.name)) { manual(what, CANT_ASK); continue; }
+    if (inA) { u.restoreVariables.push({ name: v.name, scope: v.scope, previous: v.previous, pipegenValue, entry: v, confirmedByName: false, needsName: true }); continue; }
     const t = await confirm({ kind: 'variable-restore', entry: v }, `pipegen would put the variable ${show(v.name, 100)} back to the value it had before pipegen (the value is not shown).`);
     if (t === null) { skip(what, NOT_TYPED); continue; }
     u.restoreVariables.push({ name: v.name, scope: v.scope, previous: v.previous, pipegenValue, entry: v, confirmedByName: true, typed: t });
@@ -507,7 +559,7 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
     const what = `environment ${show(e.name, 100)}`;
     const held = environmentOwned({ secrets: [...rec.secrets, ...leftSecrets], variables: rec.variables }, e);
     const why = leftover ? 'pipegen made it before a delivery stopped (this machine\'s leftovers file lists it).' : undefined;
-    const n = await classify(held, what, { route: 'GET /repos/{owner}/{repo}/environments/{environment_name}', params: { ...appRef, environment_name: e.name } }, leftover || !e.name.startsWith('pipegen-'), { ...(why === undefined ? {} : { why }), check: () => foreignIn(e.name) });
+    const n = await classify(held, what, { route: 'GET /repos/{owner}/{repo}/environments/{environment_name}', params: { ...appRef, environment_name: e.name } }, leftover || !e.name.startsWith('pipegen-'), { when: 'B', ...(why === undefined ? {} : { why }), check: () => foreignIn(e.name) });
     if (n !== null) u.deleteEnvironments.push({ name: e.name, entry: e, owned: held, ...n });
   };
   for (const e of rec.environments) {
@@ -517,7 +569,14 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
   }
   for (const x of ours.filter((y) => y.kind === 'environment')) {
     if (rec.environments.some((e) => e.name === x.name)) continue;   // the record's entry decides
-    if (x.previous === undefined) { await planEnvDelete({ name: x.name, created: true, changed: [], branchPolicyIds: [], ...asEntry(x) } as EnvEntry, true); continue; }
+    if (x.previous === undefined) {
+      if (!isoAt(x.githubCreatedAt)) {
+        manual(`environment ${show(x.name, 100)} (leftovers file)`, 'the leftovers file holds no creation date for it, so pipegen can\'t prove it made it (it may be one you already had); pipegen never deletes it', 'Check it, and delete it by hand if pipegen created it.');
+        continue;
+      }
+      await planEnvDelete({ name: x.name, created: true, changed: [], branchPolicyIds: [], githubCreatedAt: x.githubCreatedAt }, true);
+      continue;
+    }
     // G10-R3 N3: an existing environment pipegen narrowed; the same data as a record entry, to confirm
     const changed = Array.isArray(x.changed) ? x.changed : [];
     await planEnvRestore({ name: x.name, created: false, previous: x.previous as unknown as EnvSettings, changed: changed as (keyof EnvSettings)[], branchPolicyIds: [], ...(isoAt(x.githubCreatedAt) ? { githubCreatedAt: x.githubCreatedAt } : {}) });
@@ -531,7 +590,11 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
   if (!typedTrust && rec.repoSettings !== undefined) {
     for (const key of SETTING_KEYS) {
       const s = rec.repoSettings[key];
-      if (s === undefined || s.previous !== false) continue;
+      if (s === undefined) continue;
+      if (s.previous === true) { skip(`setting ${SETTING_LABEL[key]}`, 'it was on before pipegen: nothing to turn back'); continue; }
+      if (s.previous !== false) continue;
+      // run 1 asks nothing about settings: the preview says run 2 will
+      if (inA) { u.settings.push({ key, previous: false, turnOff: false, confirmedByName: false }); continue; }
       let turnOff = await ask(`Turn off ${SETTING_LABEL[key]}? (y/N)`, false);
       let named = false;
       if (turnOff && loaded.typedNames) {
@@ -544,12 +607,21 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
 
   // ---------- 7. pipegen's open pull requests, and an unfinished install (V-S4) ----------
   let setupMerged: boolean | null = null;
+  let setupClosed = false;
   if (loaded.setupPr !== null) {
     const l = await live('GET /repos/{owner}/{repo}/pulls/{pull_number}', { ...appRef, pull_number: loaded.setupPr });
-    if ('data' in l && isObj(l.data)) setupMerged = typeof l.data.merged_at === 'string' && l.data.merged_at !== '';
+    if ('data' in l && isObj(l.data)) {
+      setupMerged = typeof l.data.merged_at === 'string' && l.data.merged_at !== '';
+      setupClosed = l.data.state === 'closed';
+    }
   }
-  const pipegenOnDefault = rec.files.some((f) => f.repo === 'app' && entries.has(f.path));
-  u.unfinished = setupMerged === false || (setupMerged === null && (typedTrust || rec.mergedAt === undefined) && !pipegenOnDefault);
+  // V4-R1: unfinished (nothing to wait for) only when none of pipegen's own workflows is on the default branch, and (full trust) the
+  // record has no mergedAt; a setup PR closed unmerged with the workflows live (copied over by hand) still takes two runs
+  const workflowsLive = rec.files.some((f) => f.repo === 'app' && APP_WORKFLOWS.includes(f.path) && f.adopted !== true && plainFile(entries.get(f.path)));
+  u.unfinished = !workflowsLive && (typedTrust || rec.mergedAt === undefined) && setupMerged !== true;
+  if (setupMerged === false && setupClosed && workflowsLive) {
+    u.warnings.push(`The setup pull request #${loaded.setupPr} was closed without merging, but pipegen's workflows are on ${show(loaded.app.defaultBranch, 100)}: pipegen uninstalls them through the uninstall pull request, in two runs.`);
+  }
   for (const branch of [SETUP_BRANCH, UPDATE_BRANCH]) {
     const l = await live('GET /repos/{owner}/{repo}/pulls', { ...appRef, head: `${appRef.owner}:${branch}`, state: 'open', per_page: 100 });
     const prs = 'data' in l && Array.isArray(l.data) ? l.data.filter(isObj) : [];
@@ -557,6 +629,7 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
       const n = p.number;
       if (!(typeof n === 'number' && Number.isSafeInteger(n) && n > 0) || p.state !== 'open' || !isObj(p.head) || p.head.ref !== branch || !isObj(p.head.repo) || p.head.repo.id !== loaded.app.repoId) continue;
       if (u.closePrs.some((x) => x.number === n)) continue;
+      if (!inA) { manual(`pull request #${n} (${branch})`, 'it is still open: the first run didn\'t close it', 'Close it on GitHub if you don\'t need it.'); continue; }
       let named = false;
       if (loaded.typedNames) {
         named = await typedPlain(branch, `pipegen would close its pull request #${n} (branch ${branch}) in ${show(full)}. This run asks each name: the install record was trusted by typing, or its marker in the setup pull request differs.`);
@@ -565,7 +638,20 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
       u.closePrs.push({ repo: 'app', number: n, branch, confirmedByName: named });
     }
   }
-  if (u.unfinished) {
+  // the central update PR of this project (spec I2): exact branch, opened from the recorded central repo itself; the record names no author,
+  // so its number is always typed
+  const recordedCentral = centralRepoId === undefined || centralRepoId === loaded.centralRepoId;
+  for (const p of centralPrs ?? []) {
+    if (!recordedCentral || !isObj(p) || p.state !== 'open' || !ownHead(p, new Set([updateBranch]))) continue;
+    const n = p.number;
+    if (!(typeof n === 'number' && Number.isSafeInteger(n) && n > 0)) continue;
+    const what = `pull request #${n} (${updateBranch}) in ${show(`${central.owner}/${central.repo}`)}`;
+    if (!inA) { manual(what, 'it is still open: the first run didn\'t close it', 'Close it on GitHub if you don\'t need it.'); continue; }
+    const named = await typedPlain(String(n), `pipegen would close its pull request #${n} (branch ${updateBranch}) in ${show(`${central.owner}/${central.repo}`)}. The install record doesn't say who opened it, so pipegen asks for its number.`);
+    if (!named) { skip(what, NOT_TYPED); continue; }
+    u.closePrs.push({ repo: 'central', number: n, branch: updateBranch, confirmedByName: true });
+  }
+  if (inA && u.unfinished) {
     const head = await readHead(gh, appRef, SETUP_BRANCH, clock);
     if (head !== null) {
       const foreign = await foreignOnSetup(head);
@@ -597,10 +683,80 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
     for (const f of files) {
       const p = typeof f.filename === 'string' ? f.filename : '';
       const e = tree.entries.get(p);
-      const shas = [...rec.files.filter((x) => x.repo === 'app' && x.path === p).flatMap((x) => x.shas), ...rec.edits.filter((x) => x.repo === 'app' && x.path === p).flatMap((x) => x.writtenShas)];
+      // only a path pipegen creates (a created-file rule claims it) or edits (full trust) counts as pipegen's (sec M5)
+      const shas = [...rec.files.filter((x) => x.repo === 'app' && x.path === p && claimOf(x) !== null).flatMap((x) => x.shas), ...(typedTrust ? [] : rec.edits.filter((x) => x.repo === 'app' && x.path === p).flatMap((x) => x.writtenShas))];
       if (p === '' || typeof f.previous_filename === 'string' || e === undefined || !shas.includes(e.sha)) out.push(p === '' ? '(a change with no name)' : p);
     }
     return out;
+  }
+
+  /**
+   * Phase B: each edit as run 1 left it. Done: the file is its original version (or gone, when pipegen made it), or pipegen's text is out
+   * of it. Anything else is a manual step (pipegen never reverts in run 2), never a new action.
+   */
+  async function doneEdits(list: InstallEdit[]): Promise<void> {
+    for (const e of list) {
+      const p = show(e.path, 200);
+      const t = entries.get(e.path);
+      if (t === undefined) {
+        if (e.originalSha === null) markDone(`${p}: removed`);
+        else manual(e.path, 'it is gone from the default branch, but it was there before pipegen, so pipegen can\'t put it back', 'Restore it from your history if you need it.');
+        continue;
+      }
+      if (!plainFile(t)) { manual(e.path, 'it is not a plain file now (a link or a submodule), so pipegen leaves it'); continue; }
+      if (t.sha === e.originalSha) { markDone(`${p}: back to its version before pipegen`); continue; }
+      const text = await readBlob(t.sha);
+      let still: boolean | null = null;
+      if (text === null) still = null;
+      else if (e.kind === 'codeowners' || e.kind === 'hooks' || e.kind === 'dependabot') still = e.inserted === '' ? null : text.includes(e.inserted);
+      else if (e.kind === 'verify-job') still = text.includes(VERIFY_JOB_ID) || text.includes(HEAD_CHECK_STEP_ID);
+      if (still === false) { markDone(`${p}: pipegen's part taken out`); continue; }
+      manual(e.path, still === true ? 'pipegen\'s change is still in it (the first run didn\'t take it out, or the uninstall pull request is not merged yet)' : 'pipegen can\'t tell whether its change is still in it', 'Take pipegen\'s change out by hand, or merge the uninstall pull request and run `pipegen uninstall` again.');
+    }
+  }
+
+  /** Phase B: the merge locks as run 1 left them: gone (done), still pipegen's (manual), or changed since (left). */
+  async function doneLocks(): Promise<void> {
+    const step = 'Delete it by hand, or run `pipegen uninstall` again from the first run.';
+    for (const r of rec.rulesets) {
+      const what = `ruleset ${show(r.name, 100)} (id ${r.id})`;
+      const l = await live('GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', { ...appRef, ruleset_id: r.id });
+      if ('missing' in l) { if (l.manual) manual(what, l.missing); else markDone(`${what}: deleted`); continue; }
+      const v = isPipegens({ kind: 'ruleset', entry: r }, l.data, targetApp);
+      if (v.is === 'no') skip(what, v.why);
+      else manual(what, 'it is still there: the first run didn\'t delete it', step);
+    }
+    if (!typedTrust && rec.orgRuleset !== undefined) {
+      const e = rec.orgRuleset;
+      const what = `org ruleset ${show(e.name, 100)} (id ${e.id})`;
+      if (lower(e.org) !== lower(appRef.owner)) skip(what, `it names the organisation ${show(e.org, 40)}, not ${show(appRef.owner, 40)}`);
+      else {
+        const l = await live('GET /orgs/{org}/rulesets/{ruleset_id}', { org: e.org, ruleset_id: e.id }, ORG_GONE);
+        if ('missing' in l) { if (l.manual) manual(what, l.missing); else skip(what, l.missing); }
+        else {
+          const v = isPipegens({ kind: 'org-ruleset', entry: e }, l.data, targetApp);
+          if (v.is === 'no') skip(what, v.why);
+          else manual(what, 'it is still there: the first run didn\'t delete it', step);
+        }
+      }
+    }
+    const cp = typedTrust ? undefined : rec.classicProtection;
+    if (cp === undefined) return;
+    const what = `branch protection of ${show(cp.branch, 100)}`;
+    const back = `Check Settings → Branches of ${show(full)} and put the protection of ${show(cp.branch, 100)} back as you want it (the install record holds what it was before pipegen).`;
+    const l = await live('GET /repos/{owner}/{repo}/branches/{branch}/protection', { ...appRef, branch: cp.branch });
+    if ('missing' in l) {
+      if (l.manual) manual(what, l.missing, back);
+      else if (cp.previous === null) markDone(`${what}: taken off (there was none before pipegen)`);
+      else manual(what, 'GitHub shows no protection on it now, but there was one before pipegen', back);
+      return;
+    }
+    const now = classicPutForm(l.data);
+    const extra = droppedLiveField(l.data);
+    const planned = rec.planned.classic;
+    if (extra === null && cp.previous !== null && exactlyAsSet(cp.previous, now)) { markDone(`${what}: back as it was before pipegen`); return; }
+    if (extra === null && planned !== undefined && isObj(planned.body) && exactlyAsSet(planned.body, now)) { manual(what, 'it is still as pipegen set it: the first run didn\'t put it back', back); return; }
+    skip(what, 'it changed since pipegen set it, so pipegen leaves it as it is');
   }
 
   /** V-B3: classic protection put back from `previous` (null: taken off), only while it is exactly as pipegen set it; the typed branch name. */
@@ -649,7 +805,15 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
     if (e.changed.includes('branch_policies')) manual(what, 'pipegen changed its branch and tag rules; the ones it had before pipegen are in the install record, and uninstall only takes off the rules pipegen added', 'Add the earlier branch and tag rules back in the environment\'s settings (Deployment branches and tags).');
     if (lines.length === 0 && policyIds.length === 0) { skip(what, 'its settings are already as they were before pipegen'); return; }
     const diff = lines.join('\n');
-    const t = await confirm({ kind: 'environment-restore', entry: e }, `pipegen would put back the settings it changed on the environment ${show(e.name, 100)} (only these):\n${diff === '' ? '  (the branch rules pipegen added are taken off)' : diff}`);
+    const current: EnvSettings = { ...cur.settings, branch_policies: cur.policies.map((p) => ({ name: p.name, type: p.type })) };
+    if (!askable(e.name)) { manual(what, CANT_ASK, 'Check the environment\'s settings by hand.'); return; }
+    if (inA) {
+      u.restoreEnvironments.push({ name: e.name, previous, changed: [...e.changed], current, shown: cur.settings, diff, entry: e, deleteBranchPolicies: policyIds.map((id) => ({ id })), confirmedByName: false, needsName: true });
+      return;
+    }
+    // the question names every change it covers, the branch rules too (sec M2)
+    const rules = policyIds.length === 0 ? '' : `${diff === '' ? '' : '\n'}  and takes off the branch rules pipegen added (ids ${policyIds.join(', ')})`;
+    const t = await confirm({ kind: 'environment-restore', entry: e }, `pipegen would put back the settings it changed on the environment ${show(e.name, 100)} (only these):\n${diff}${rules}`);
     if (t === null) { skip(what, NOT_TYPED); return; }
     const deleteBranchPolicies: { id: number; typed?: TypedName }[] = [];
     for (const id of policyIds) {
@@ -658,7 +822,6 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
       if (pt === null) skip(`branch rule ${id} of ${what}`, NOT_TYPED);
       else deleteBranchPolicies.push({ id, typed: pt });
     }
-    const current: EnvSettings = { ...cur.settings, branch_policies: cur.policies.map((p) => ({ name: p.name, type: p.type })) };
     u.restoreEnvironments.push({ name: e.name, previous, changed: [...e.changed], current, shown: cur.settings, diff, entry: e, deleteBranchPolicies, confirmedByName: true, typed: t });
   }
 }
@@ -666,25 +829,35 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
 // ---------- the preview ----------
 
 const TWO_RUNS = 'the uninstall PR removes the gate, so the merge lock is removed now; until you merge it, run `pipegen finish` to lock again';
-const by = (x: { confirmedByName: boolean }): string => (x.confirmedByName ? ' (you typed its name)' : '');
+/** How the name of an item is (or will be) confirmed. */
+const by = (x: { confirmedByName: boolean; needsName?: true }): string => (x.confirmedByName ? ' (you typed its name)' : x.needsName === true ? ' (you type its name then)' : '');
 /** `text` line by line, each line escaped (safeText: no control character reaches the terminal), indented. */
 const block = (text: string, indent: string): string[] => text.replace(/\n$/, '').split('\n').map((l) => `${indent}| ${safeText(l, 200)}`);
 
-/** What uninstall will do, for the one confirmation (V5): names only, never a secret or variable value; every manual step. */
+/**
+ * What this run of uninstall will do, for its one confirmation (V5): names only, never a secret or variable value; every manual step.
+ * Run 1 also lists what the next run will do (named, nothing asked yet); run 2 lists what it found done.
+ */
 export function previewUninstall(u: UninstallPlan): string {
   const repo = show(`${u.app.owner}/${u.app.repo}`);
-  const out: string[] = [`pipegen uninstall: what it will do in ${repo}`];
+  const inA = u.phase === 'A';
+  const out: string[] = [`pipegen uninstall: what it will do in ${repo} (${u.unfinished ? 'part' : 'run'} ${inA ? 1 : 2} of 2)`];
   const list = (title: string, items: string[]): void => { if (items.length > 0) out.push('', title, ...items); };
   if (u.trust === 'typed') out.push('', 'The install record was trusted by typing the repo name: pipegen uses only the names you confirmed, and lists the rest as manual steps.');
   list('Warnings:', u.warnings.map((w) => `  - ${show(w, 400)}`));
   out.push('');
-  if (u.unfinished) {
-    out.push(`The setup pull request was never merged, so pipegen's checks never ran on ${show(u.app.defaultBranch, 100)}: there is no uninstall pull request to wait for, and everything below is done in this run.`);
+  if (!inA) {
+    out.push(u.unfinished
+      ? 'This is the second part: pipegen deletes the secrets, variables and environments below, turns off the settings you choose, and opens the central pull request.'
+      : 'This is the second run, after the uninstall pull request: pipegen deletes the secrets, variables and environments below, turns off the settings you choose, and opens the central pull request.');
+  } else if (u.unfinished) {
+    out.push(`The setup pull request was never merged, so pipegen's workflows are not on ${show(u.app.defaultBranch, 100)}: there is no uninstall pull request to wait for. Right after this part, pipegen goes on to the next part, with its own questions and confirmation.`);
   } else {
-    out.push(`This takes two runs. Now: pipegen opens the uninstall pull request (branch pipegen/uninstall) and takes off the merge locks: ${TWO_RUNS}.`);
-    out.push('Then, after you merge the uninstall pull request, run `pipegen uninstall` again: pipegen deletes the secrets, variables and environments below, turns off the settings you chose, and opens the central pull request.');
+    out.push(`This takes two runs. Now: pipegen opens the uninstall pull request (branch pipegen/uninstall), closes its own open pull requests and takes off the merge locks: ${TWO_RUNS}.`);
+    out.push('Then, after you merge the uninstall pull request, run `pipegen uninstall` again: it asks the names below, deletes the secrets, variables and environments, turns off the settings you choose, and opens the central pull request.');
   }
-  // run 1: the uninstall PR
+  list('Done in the first run:', u.done.map((d) => `  - ${show(d, 300)}`));
+  // run 1: the uninstall PR, pipegen's pull requests, the merge locks
   const pr: string[] = [];
   for (const f of u.removeFiles) pr.push(`  - remove ${show(f.path, 200)}`);
   for (const r of u.reverts) {
@@ -695,7 +868,7 @@ export function previewUninstall(u: UninstallPlan): string {
   }
   list(`Uninstall pull request in ${repo}:`, pr);
   list('Kept (asked; the default keeps):', u.keepAsk.filter((k) => k.keep).map((k) => `  - ${show(k.path, 200)}${k.pair === undefined ? '' : ` (with ${show(k.pair, 200)})`}: ${show(k.why, 200)}`));
-  list('Pull requests closed:', u.closePrs.map((p) => `  - #${p.number} (${show(p.branch, 100)})${by(p)}`));
+  list('Pull requests closed:', u.closePrs.map((p) => `  - #${p.number}${p.repo === 'central' ? ` in ${show(`${u.app.owner}/${CENTRAL_REPO}`)}` : ''} (${show(p.branch, 100)})${by(p)}`));
   list('Branches deleted:', u.deleteBranches.map((b) => `  - ${show(b.branch, 100)}${by(b)}`));
   const locks: string[] = [];
   for (const r of u.deleteRulesets) locks.push(`  - ruleset ${show(r.entry.name, 100)} (id ${r.id}): deleted${by(r)}`);
@@ -707,7 +880,7 @@ export function previewUninstall(u: UninstallPlan): string {
       : `  - branch protection of ${show(c.branch, 100)}: put back as it was before pipegen${by(c)}`, ...c.diff.split('\n').map((l) => `    ${safeText(l, 300)}`));
   }
   list(u.unfinished ? 'Merge locks:' : 'Merge locks taken off now:', locks);
-  // run 2
+  // run 2's items: named in run 1 (nothing asked yet), done in run 2
   const later: string[] = [];
   for (const s of u.deleteSecrets) later.push(`  - delete the secret ${show(s.secret.name, 100)}${s.secret.scope === 'repo' ? '' : ` (${show(s.secret.scope, 120)})`}${s.fromLeftovers === true ? ' (from the leftovers file)' : ''}${by(s)}`);
   for (const v of u.deleteVariables) later.push(`  - delete the variable ${show(v.name, 100)}${v.scope === 'repo' ? '' : ` (${show(v.scope, 120)})`}${by(v)}`);
@@ -717,15 +890,22 @@ export function previewUninstall(u: UninstallPlan): string {
     later.push(`  - put back the settings pipegen changed on the environment ${show(e.name, 100)} (only these)${by(e)}:`, ...(e.diff === '' ? [] : e.diff.split('\n').map((l) => `    ${safeText(l, 300)}`)));
     if (e.deleteBranchPolicies.length > 0) later.push(`    and take off the branch rules pipegen added (ids ${e.deleteBranchPolicies.map((p) => p.id).join(', ')})`);
   }
-  const off = u.settings.filter((s) => s.turnOff);
-  if (off.length > 0) later.push('  - Settings pipegen turns off (you said yes):', ...off.map((s) => `      ${SETTING_LABEL[s.key]}${by(s)}`));
-  const on = u.settings.filter((s) => !s.turnOff);
-  if (on.length > 0) later.push(`  - settings pipegen turned on and leaves on (you can turn them off yourself): ${on.map((s) => SETTING_LABEL[s.key]).join(', ')}`);
+  if (inA) {
+    if (u.settings.length > 0) later.push(`  - asks whether to turn off: ${u.settings.map((s) => SETTING_LABEL[s.key]).join(', ')} (pipegen turned them on; the default keeps them on)`);
+  } else {
+    const off = u.settings.filter((s) => s.turnOff);
+    if (off.length > 0) later.push('  - Settings pipegen turns off (you said yes):', ...off.map((s) => `      ${SETTING_LABEL[s.key]}${by(s)}`));
+    const on = u.settings.filter((s) => !s.turnOff);
+    if (on.length > 0) later.push(`  - settings pipegen turned on and leaves on (you can turn them off yourself): ${on.map((s) => SETTING_LABEL[s.key]).join(', ')}`);
+  }
   later.push(`  - a central pull request in ${show(`${u.app.owner}/${CENTRAL_REPO}`)} removes this project's files: ${u.centralFiles.map((p) => show(p, 200)).join(', ')} (the install record last)`);
-  later.push(u.lastProject
+  // sec M1: the central locks go only when the plan holds them (full trust, last project)
+  later.push(u.centralLocks !== undefined
     ? `  - this is the last project in ${CENTRAL_REPO}: its central ruleset, CODEOWNERS and Actions access go too, as recorded`
-    : `  - other projects use ${CENTRAL_REPO}: its central ruleset, CODEOWNERS and Actions access stay`);
-  list(u.unfinished ? 'Also:' : 'In the second run:', later);
+    : u.lastProject
+      ? `  - this is the last project in ${CENTRAL_REPO}, but the install record doesn't vouch for its central ruleset, CODEOWNERS and Actions access: pipegen doesn't touch them (see the manual steps)`
+      : `  - other projects use ${CENTRAL_REPO}: its central ruleset, CODEOWNERS and Actions access stay`);
+  list(!inA ? 'This run:' : u.unfinished ? 'Next part (right after this one), pipegen will:' : 'Next run (after you merge the uninstall PR), pipegen will:', later);
   list('Not done (kept):', u.skipped.map((s) => `  - ${show(s.what, 200)}: ${show(s.why, 400)}`));
   const man: string[] = [];
   for (const m of u.manual) man.push(`  - ${show(m.what, 200)}: ${show(m.why, 400)}`, ...(m.step === undefined ? [] : [`    ${show(m.step, 400)}`]));
