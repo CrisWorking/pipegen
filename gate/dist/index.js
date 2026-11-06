@@ -2659,6 +2659,17 @@ var RANGE_STEP_ENV = Object.freeze({ PIPEGEN_RANGE_BASE: BASE_CHECKOUT_REF, PIPE
 var rangeScanStepId = `checker-run-${sha16(SECRETS_RANGE_ARTIFACT)}`;
 var HISTORY_STEP_ENV = Object.freeze({ PIPEGEN_HISTORY_HEAD: "${{ github.sha }}" });
 var historyScanStepId = `checker-run-${sha16(SECRETS_HISTORY_ARTIFACT)}`;
+var JOB_TOKEN_REF = "${{ github.token }}";
+var ZIZMOR_ONLINE_HOST = "github.com";
+var ZIZMOR_ONLINE_POLICY = Object.freeze((({ flags: _flags, required: _required, ...rest }) => ({
+  ...rest,
+  flags: { "gh-hostname": { values: [ZIZMOR_ONLINE_HOST] } },
+  required: { "gh-hostname": ZIZMOR_ONLINE_HOST },
+  tokenEnv: "GH_TOKEN"
+}))(ARGV_POLICIES.zizmor));
+var ZIZMOR_ONLINE_STEP_ENV = Object.freeze({ GH_TOKEN: JOB_TOKEN_REF });
+var ZIZMOR_ONLINE_ID = "workflow-lint-online";
+var zizmorOnlineStepId = `tool-run-${sha16(`${RESULT_ARTIFACT_PREFIX}${ZIZMOR_ONLINE_ID}`)}`;
 var RENDERER_INPUTS = Object.freeze({
   // the base commit, for the base-scan job only (the job rule is in job-rules.ts); no other ref is ever set
   "actions/checkout": { ref: { describe: "the event-switched base commit (BASE_CHECKOUT_REF) and nothing else", check: (v) => v === BASE_CHECKOUT_REF } },
