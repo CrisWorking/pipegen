@@ -152,6 +152,7 @@ describe('pipegen inspect', () => {
     writeIn(dir, '.nvmrc', `${hostileNames.screenClear}20${hostileNames.bidiOverride}\n`);
     writeIn(dir, 'Dockerfile', 'FROM node:20\n');
     writeIn(dir, `svc${hostileNames.ansiColour}${hostileNames.bidiIsolates}/Dockerfile`, 'FROM node:20\nEXPOSE 8080\n');
+    writeIn(dir, `svc${hostileNames.ansiColour}${hostileNames.bidiIsolates}/index.js`, '1;\n');   // GJ-R4 (N3): a folder with code of its own stays a service
     writeIn(dir, `.github/workflows/ci${hostileNames.bidiOverride}.yml`, 'on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n');
     const { code, out, all } = await inspect(dir, publicRoutes());
     expect(code).toBe(0);

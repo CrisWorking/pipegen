@@ -105,11 +105,14 @@ export const SERVICE_NAME_RE = /^[A-Za-z0-9._@/-]{1,214}$/;
 const MAX_WORKSPACE_PATTERNS = 100;
 /** Manifests of an app that isn't a Node package: a folder holding one (and a Dockerfile) is a service next to Node workspaces. */
 const OTHER_APP_MANIFESTS = ['pyproject.toml', 'setup.py', 'go.mod'];
-const NOT_SERVICE_DIRS = ['.devcontainer', 'test', 'tests', '__tests__', 'fixtures', 'examples', 'docs'];
-/** GJ-R3 (H1 b): the compose and bake files whose build contexts count as image builds, at most MAX_BUILD_FILES of each (as MAX_WORKFLOWS). */
+// GJ-R4 (N3): and the O3 folder names (NOT_BUILD_DIRS): an example, end-to-end, story, script, demo, sample or benchmark image is no service
+const NOT_SERVICE_DIRS = ['.devcontainer', 'test', 'tests', '__tests__', 'fixtures', 'examples', 'docs', 'example', 'e2e', 'playwright', 'cypress', '.storybook', 'scripts', 'demo', 'samples', 'testdata', 'benchmark'];
+const plainPath = (p: string): string => (PLAIN_PATH_RE.test(p) ? p : 'a folder');
+/** GJ-R3 (H1 b): the compose and bake files whose build contexts count as image builds; GJ-R4 (N5): at most 20 of each, 2 MB of text in all. */
 const COMPOSE_FILE_RE = /^(?:docker-)?compose(?:\.[\w-]+)?\.ya?ml$/i;
 const BAKE_FILE_RE = /^docker-bake(?:\.[\w-]+)?\.hcl$/i;
-const MAX_BUILD_FILES = MAX_WORKFLOWS;
+const MAX_BUILD_FILES = 20;
+const MAX_BUILD_FILE_BYTES = 2_000_000;
 // Root files read by direct path so the file cap can never hide them.
 const ROOT_FILES = ['package.json', 'pnpm-workspace.yaml', 'turbo.json', 'nx.json', '.nvmrc', '.node-version', '.python-version', 'pyproject.toml', 'setup.py', 'Dockerfile', ...NODE_LOCKS.map(([f]) => f), ...PYTHON_LOCKS.map(([f]) => f)];
 
@@ -208,6 +211,8 @@ interface Shared {
   repo: string; serviceDirs: string[]; quality: QualityRun; copies: DockerCopy[];
   /** GJ-R2 (N1, N4): the paths the repo's workflows build from (workflowBuildRefs), and what each container file copies, by file. */
   buildRefs: ReadonlySet<string>; fileCopies: { file: string; source: string }[];
+  /** GJ-R4 (N4): the workflow references alone (they rank first in the Dockerfile choice), and the compose and bake ones. */
+  workflowRefs: ReadonlySet<string>; buildFileRefs: ReadonlySet<string>;
   /** Plan J J2: git's untracked-and-ignored test (J1's rule), loaded once and only when a static generator is found. */
   untrackedIgnored: () => Promise<(rel: string) => boolean>;
   /** Fix round 1 (review J2 I1): the file listing was cut at the read limit or left out paths too long to check. */
@@ -265,7 +270,7 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
       : undefined;
 
   // GJ-R1/R2 (sec I1, N1, N4): the folder's own container file (any container file name; the one a workflow builds first, with a note)
-  const chosen = chooseContainerFile(containerFilesIn(ctx.fileSet, dir), shared.buildRefs);
+  const chosen = chooseContainerFile(containerFilesIn(ctx.fileSet, dir), shared.workflowRefs, shared.buildFileRefs);
   if (chosen?.note != null && !ctx.notes.includes(chosen.note)) ctx.notes.push(chosen.note);
   const dockerfile = chosen?.file;
   // GJ-R2 (N1): no file of its own, but built into an image anyway (deeper file, a workflow, another container file's COPY): never static
@@ -413,10 +418,18 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
     && (OTHER_APP_MANIFESTS.some((m) => ctx.fileSet.has(inDir(d, m))) || requirementDirs.has(d));
   const appManifest = (d: string) => ctx.fileSet.has(inDir(d, 'package.json')) || otherApp(d);
   if (dirs.length === 0) {
-    // GJ-R3 (O1): the root app with no container file of its own, and a container file in a folder with no app manifest (docker/Dockerfile.dev,
-    // deploy/Dockerfile.prod): that file builds the root (its hint names it), so the root stays the service, as otherApp does below
-    if (!dockerDirs.includes('.') && appManifest('.') && dockerDirs.some((d) => !appManifest(d))) dirs = ['.', ...dockerDirs.filter(appManifest)];
-    else dirs = dockerDirs.length > 0 ? dockerDirs : ['.'];
+    // GJ-R3 (O1), GJ-R4 (N3): the root app, and a container file in a folder with no app manifest (docker/Dockerfile.dev,
+    // deploy/Dockerfile.prod): that folder is part of the root app, so the root stays the service (with its own container file, if any), as
+    // otherApp does below; a note names each such folder, whose image pipegen does not build or scan
+    // a folder with code of its own (a worker with index.js and a Dockerfile) is a service, as before; only a folder of container files is the root's
+    const codeDirs = new Set<string>();
+    for (const f of ctx.fileSet) if (CODE_FILE_RE.test(baseOf(f))) for (let d = dirOf(f); d !== '.' && !codeDirs.has(d); d = dirOf(d)) codeDirs.add(d);
+    const ownApp = (d: string) => appManifest(d) || codeDirs.has(d);
+    const subs = dockerDirs.filter((d) => d !== '.');
+    if (appManifest('.') && subs.some((d) => !ownApp(d))) {
+      dirs = ['.', ...subs.filter(ownApp)];
+      for (const d of subs.filter((x) => !ownApp(x))) note(ctx, `The folder ${plainPath(d)} has a container file but no app manifest or code, so pipegen takes it as part of the root app and does not build or scan its image.`);
+    } else dirs = dockerDirs.length > 0 ? dockerDirs : ['.'];
   } else {
     // A Node workspace list names Node packages only (DoD run, fastapi/full-stack-fastapi-template: backend/ was lost). A
     // folder with a Dockerfile and a Python or Go manifest beside it is a service the list can't name; a Dockerfile
@@ -439,7 +452,7 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
   // Plan P Task 1: one run for the quality facts, so each lockfile is read once and the read budgets hold for the repo.
   let untracked: Promise<(rel: string) => boolean> | undefined;
   const shared: Shared = {
-    repo, serviceDirs: dirs, quality: newQualityRun(dir, [...ctx.fileSet], dirs, workspaceMembers), copies: [], buildRefs: new Set<string>(), fileCopies: [],
+    repo, serviceDirs: dirs, quality: newQualityRun(dir, [...ctx.fileSet], dirs, workspaceMembers), copies: [], buildRefs: new Set<string>(), workflowRefs: new Set<string>(), buildFileRefs: new Set<string>(), fileCopies: [],
     untrackedIgnored: () => (untracked ??= untrackedIgnoredOf(dir)),
     listingIncomplete,
   };
@@ -455,11 +468,28 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
   }
   // GJ-R2 (N1, N4): the paths the workflows build from, read as text (never run). GJ-R3 (B1): the first MAX_WORKFLOWS in the workflow
   // reader's order, each parsed as it is read; (H1 b) and the build contexts of the compose and bake files, capped the same way
-  const buildRefs = new Set<string>();
-  for (const f of [...ctx.fileSet].filter((x) => WORKFLOW_FILE.test(x)).sort().slice(0, MAX_WORKFLOWS)) { const t = await readFile(ctx, f); if (t !== null) workflowBuildRefs([t], buildRefs); }
-  for (const f of [...ctx.fileSet].filter((x) => COMPOSE_FILE_RE.test(baseOf(x))).sort().slice(0, MAX_BUILD_FILES)) { const doc = await readYaml(ctx, f); if (doc !== null) composeBuildRefs(f, doc, buildRefs); }
-  for (const f of [...ctx.fileSet].filter((x) => BAKE_FILE_RE.test(baseOf(x))).sort().slice(0, MAX_BUILD_FILES)) { const t = await readFile(ctx, f); if (t !== null) bakeBuildRefs(f, t, buildRefs); }
-  shared.buildRefs = buildRefs;
+  const workflowRefs = new Set<string>();
+  for (const f of [...ctx.fileSet].filter((x) => WORKFLOW_FILE.test(x)).sort().slice(0, MAX_WORKFLOWS)) { const t = await readFile(ctx, f); if (t !== null) workflowBuildRefs([t], workflowRefs); }
+  // GJ-R4 (N5): at most MAX_BUILD_FILES of each kind and MAX_BUILD_FILE_BYTES of text in all, each skip noted
+  const buildFileRefs = new Set<string>();
+  let buildFileBytes = 0;
+  for (const [kind, re, parse] of [
+    ['compose', COMPOSE_FILE_RE, (f: string, t: string) => composeBuildRefs(f, parseYamlLimited(t), buildFileRefs)],
+    ['bake', BAKE_FILE_RE, (f: string, t: string) => bakeBuildRefs(f, t, buildFileRefs)],
+  ] as const) {
+    const all = [...ctx.fileSet].filter((x) => re.test(baseOf(x))).sort();
+    if (all.length > MAX_BUILD_FILES) note(ctx, `Only the first ${MAX_BUILD_FILES} ${kind} files were read for image builds.`);
+    for (const f of all.slice(0, MAX_BUILD_FILES)) {
+      const t = await readFile(ctx, f);
+      if (t === null) continue;
+      buildFileBytes += Buffer.byteLength(t);
+      if (buildFileBytes > MAX_BUILD_FILE_BYTES) { note(ctx, `Skipped ${safeText(f, PATH_SHOWN_MAX)}: the compose and bake files pipegen reads for image builds are over 2 MB together.`); continue; }
+      try { parse(f, t); } catch { note(ctx, `Skipped ${safeText(f, PATH_SHOWN_MAX)}: it could not be parsed.`); }
+    }
+  }
+  shared.workflowRefs = workflowRefs;
+  shared.buildFileRefs = buildFileRefs;
+  shared.buildRefs = new Set([...workflowRefs, ...buildFileRefs]);
   const services: Service[] = [];
   for (const d of dirs) services.push(await readService(ctx, d, shared));
   uniqueServiceNames(ctx, services);

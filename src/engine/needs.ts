@@ -112,7 +112,8 @@ export function isRunnable(s: Service): boolean {
   if (types !== undefined && types.includes('static-site') && !types.includes('container')) return false;
   // fix round 1 (controller ruling, review J2 ⚠️1): the `server` type runs, also an unsure static site with no run script
   // fix round 2 (review J2 r1 N1): never for a folder that isn't standalone (P55), whatever its type says
-  return ((types?.includes('server') ?? false) && s.notStandalone === undefined) || baseRunnable(s);
+  // GJ-R4 (N2): so does the `container` type (a --type SERVICE=container override with no Dockerfile pipegen sees: the escape the skip names)
+  return ((types?.includes('server') === true || types?.includes('container') === true) && s.notStandalone === undefined) || baseRunnable(s);
 }
 export { baseRunnable };
 
@@ -152,7 +153,7 @@ export interface CheckRule {
 
 const NO_SERVICES = 'no services found';
 /** Plan J J2 (ruling S2): why a static site gets no image, DAST or API DAST check. GJ-R3 (H1 c): what pipegen assumed, and how to say otherwise. */
-export const STATIC_SKIP = 'no image build found; if a workflow builds one, use --type SERVICE=container';
+export const STATIC_SKIP = 'no workflow, compose or bake image build found; else use --type SERVICE=container';
 /** Ruling S2: why a service that doesn't run gets no image or DAST check (today's "doesn't run as a server" wording). */
 const NOT_RUNNABLE_SKIP = "this service doesn't run as a server, so there is no image to build or running app to scan";
 /** A static site that isn't also a container (the case isRunnable turns off). */

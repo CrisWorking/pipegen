@@ -7,7 +7,7 @@
 // service's own Dockerfile (the folder's own file), the COPY pass, and the container hint (a file deeper in the folder, a workflow that builds
 // it, a container file elsewhere that copies it): a hint makes a static decision unsure (a server), never the static skip.
 import { posix } from 'node:path';
-import { regexLines, regexSafe } from './limits.js';
+import { READ_LIMITS, regexLines, regexSafe } from './limits.js';
 import { baseOf, dirOf, PLAIN_PATH_RE } from './manifest.js';
 
 /** A path as the hint shows it: a plain repo path, else a fixed word (no repo text reaches the evidence, S14). */
@@ -35,11 +35,16 @@ export function containerFilesIn(files: Iterable<string>, dir: string): string[]
  * The folder's own container file: the one a workflow builds (`built`), else a plain `Dockerfile`, else the first by name. `note` names the
  * chosen file and the others when there is more than one (N4: pipegen builds and scans one image per service, so the user sees which).
  */
-export function chooseContainerFile(candidates: readonly string[], built: ReadonlySet<string>): { file: string; note: string | null } | undefined {
+// GJ-R4 (N4): a workflow's build first, then a plain Dockerfile, then a compose or bake file's build (often a dev image), then by name
+export function chooseContainerFile(candidates: readonly string[], built: ReadonlySet<string>, composed: ReadonlySet<string> = new Set()): { file: string; note: string | null } | undefined {
   if (candidates.length === 0) return undefined;
-  const byWorkflow = candidates.filter((c) => built.has(c));
+  const byWorkflow = candidates.find((c) => built.has(c));
   const plainDf = candidates.find((c) => baseOf(c) === 'Dockerfile');
-  const [file, why] = byWorkflow.length > 0 ? [byWorkflow[0] as string, 'the one a workflow builds'] : plainDf !== undefined ? [plainDf, 'the plain Dockerfile'] : [candidates[0] as string, 'the first by name; no workflow builds one of them'];
+  const byBuildFile = candidates.find((c) => composed.has(c));
+  const [file, why] = byWorkflow !== undefined ? [byWorkflow, 'the one a workflow builds']
+    : plainDf !== undefined ? [plainDf, 'the plain Dockerfile']
+      : byBuildFile !== undefined ? [byBuildFile, 'the one a compose or bake file builds']
+        : [candidates[0] as string, 'the first by name; no workflow, compose or bake file builds one of them'];
   const note = candidates.length > 1 ? `${dirOf(file) === '.' ? 'The repository root' : `The folder ${plain(dirOf(file))}`} has several container files (${candidates.map(plain).join(', ')}); pipegen builds and scans ${plain(file)} (${why}).` : null;
   return { file, note };
 }
@@ -63,9 +68,10 @@ const FLAG_WITH_VALUE = new Set(['-t', '--tag', '--build-arg', '--platform', '--
  */
 export function workflowBuildRefs(texts: readonly string[], out: Set<string> = new Set<string>()): Set<string> {
   const add = (v: string | undefined): void => { if (v !== undefined && regexSafe(v)) out.add(norm(v)); };
-  // GJ-R-sec1: line by line over regexLines (each line bounded, like the other parsers), `[ \t]*` at the anchor
+  // GJ-R-sec1: line by line over regexLines (each line bounded, like the other parsers), `[ \t]*` at the anchor.
+  // GJ-R4 (N1): `\`-continued lines are joined first, within the same per-line budget (a longer one is dropped whole)
   for (const t of texts) {
-    for (const line of regexLines(t)) {
+    for (const line of joinedLines(t)) {
       const ctxKey = /^[ \t]*(?:-[ \t]+)?context:[ \t]*("[^"]+"|'[^']+'|[^\s"'#]+)/.exec(line);
       if (ctxKey !== null) add(ctxKey[1]);
       const fileKey = /^[ \t]*(?:-[ \t]+)?file:[ \t]*("[^"]+"|'[^']+'|[^\s"'#]+)/.exec(line);
@@ -85,6 +91,32 @@ export function workflowBuildRefs(texts: readonly string[], out: Set<string> = n
       }
     }
   }
+  return out;
+}
+
+/** The lines of `t` with shell `\` continuations joined; a joined line over the regex budget is dropped. Linear: no regex on unbounded text. */
+function joinedLines(t: string): string[] {
+  const out: string[] = [];
+  let acc = '';
+  let bytes = 0;
+  let over = false;
+  for (const raw of t.split('\n')) {
+    let end = raw.length;
+    while (end > 0 && (raw.charCodeAt(end - 1) === 32 || raw.charCodeAt(end - 1) === 9 || raw.charCodeAt(end - 1) === 13)) end--;
+    const cont = end > 0 && raw.charCodeAt(end - 1) === 92;
+    const part = cont ? raw.slice(0, end - 1) : raw.slice(0, end);
+    if (!over) {
+      bytes += Buffer.byteLength(part) + 1;
+      if (bytes > READ_LIMITS.maxRegexLineBytes) over = true;
+      else acc += (acc === '' ? '' : ' ') + part;
+    }
+    if (cont) continue;
+    if (!over) out.push(acc);
+    acc = '';
+    bytes = 0;
+    over = false;
+  }
+  if (acc !== '' && !over) out.push(acc);
   return out;
 }
 

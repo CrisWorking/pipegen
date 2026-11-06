@@ -139,7 +139,7 @@ describe('GJ-R1 (review GJ spec I1): no created Dockerfile or .dockerignore for 
   const STATIC = { types: ['static-site' as const], evidence: [], unsure: false };
   it('a static site: the Dockerfile and its .dockerignore are refused with the plan\'s reason', () => {
     const d = mkDraft([svc({ port: 3000, projectType: STATIC })]);
-    expect(problems(df(), d).join('\n')).toMatch(/builds no image for the service "api".*no image build found;/);
+    expect(problems(df(), d).join('\n')).toMatch(/builds no image for the service "api".*no workflow, compose or bake image build found;/);
     expect(problems(di(dockerignoreText(svc(), false)), d).join('\n')).toMatch(/builds no image for the service "api"/);
   });
   it('a service that does not run (no start script, no port, no framework): refused too', () => {

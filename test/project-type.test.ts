@@ -756,7 +756,7 @@ describe('GJ-R2 (review GJ-r1 N1, N2, N4): every container file that builds a fo
     expect(web.projectType?.evidence.join('\n')).toMatch(/apps\/web\/docker\/Dockerfile/);
     // the audit names it as not covered (the file pipegen can't build), never "pipegen would create one"
     const row = wouldCreateOf(p).find((r) => r.what === 'docker' && r.why.startsWith('nothing for web,'));
-    expect(row?.why).toMatch(/built into an image elsewhere \(a container file builds it: apps\/web\/docker\/Dockerfile\): pipegen can't build or scan that image yet, so it is not covered/);
+    expect(row?.why).toMatch(/may be built into an image elsewhere \(a container file builds it: apps\/web\/docker\/Dockerfile\): pipegen can't build or scan that image yet, so it is not covered/);
   });
   it('a workspace static site built by a root Dockerfile.web (COPY of its folder) is unsure, so a server', async () => {
     const p = await read(ws({ 'Dockerfile.web': 'FROM nginx:1.27\nCOPY apps/web/out /usr/share/nginx/html\nEXPOSE 80\n' }));
@@ -905,7 +905,7 @@ describe('GJ-R3 (review GJ-r2 H1, O1, O2, O3, B1, W1): builds the reader could n
   it('H1 (c): the static skip states what pipegen found, and how to say otherwise', () => {
     const s = svc({ name: 'site', scripts: ['dev', 'build'], frameworks: ['next'], projectType: type(['static-site']) });
     const why = skippedChecks(profile([s]), CAPS).find((k) => k.category === 'image-build')?.why ?? '';
-    expect(why).toBe('no image build found; if a workflow builds one, use --type SERVICE=container');
+    expect(why).toBe(STATIC_SKIP);
     expect(why).not.toMatch(/[`<>*_|[\]\\]/);
   });
 
@@ -987,13 +987,13 @@ describe('GJ-R3 (review GJ-r2 H1, O1, O2, O3, B1, W1): builds the reader could n
   it('W1: the hint row reads as an entry of "pipegen would also create:" (it creates nothing for that image)', async () => {
     const p = await readWith(ws({ 'apps/web/docker/Dockerfile': NGINX }));
     const row = wouldCreateOf(p).find((r) => r.what === 'docker' && r.why.includes('web'));
-    expect(row?.why).toBe("nothing for web, which is built into an image elsewhere (a container file builds it: apps/web/docker/Dockerfile): pipegen can't build or scan that image yet, so it is not covered.");
+    expect(row?.why).toMatch(/^nothing for web, which may be built into an image elsewhere/);
   });
 
   it('W1: the hint row is shown for a service that does not run too (its image is still not covered)', () => {
     const lib = svc({ name: 'lib', scripts: ['build'], projectType: type(['library']), containerHint: 'a container file builds it: lib/docker/Dockerfile' });
     expect(isRunnable(lib)).toBe(false);
-    expect(wouldCreateOf(profile([lib])).find((r) => r.what === 'docker')?.why).toMatch(/^nothing for lib, which is built into an image elsewhere/);
+    expect(wouldCreateOf(profile([lib])).find((r) => r.what === 'docker')?.why).toMatch(/^nothing for lib, which may be built into an image elsewhere/);
   });
   it('nit: .j2, .tpl, .in and .dist names are templates, not container files', async () => {
     for (const name of ['Dockerfile.j2', 'Dockerfile.tpl', 'Dockerfile.in', 'Dockerfile.dist']) {
@@ -1001,5 +1001,113 @@ describe('GJ-R3 (review GJ-r2 H1, O1, O2, O3, B1, W1): builds the reader could n
       expect(p.services[0]?.dockerfile, name).toBeUndefined();
       expect(p.services[0]?.projectType?.types, name).toEqual(['static-site']);
     }
+  });
+});
+
+describe('GJ-R4 (review GJ-r3 N1-N5, N7): continued build lines, a container override that runs, the root keeps its own file', () => {
+  const CAPS4: Capabilities = { branchProtection: true, environments: false, envRequiredReviewers: false, deploymentBranchPolicies: false, attestations: false, codeScanning: true, keylessSigningAllowed: true };
+  const NGINX = 'FROM nginx:1.27\nCOPY out /usr/share/nginx/html\nEXPOSE 80\n';
+  const LOCK = '{"lockfileVersion":3,"packages":{}}';
+  const run = (lines: string[]) => `on: { push: { branches: [main] } }\njobs:\n  img:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n${lines.map((l) => `          ${l}`).join('\n')}\n`;
+  const site = (extra: Record<string, string>) => ({ 'package.json': nextPkg({ dev: 'next dev', build: 'next build', test: 'vitest run' }), 'package-lock.json': LOCK, 'next.config.mjs': "export default { output: 'export' };\n", 'app/page.tsx': PAGE, ...extra });
+  const ws = (extra: Record<string, string>) => ({
+    'package.json': JSON.stringify({ name: 'mono', private: true, workspaces: ['apps/*'] }), 'package-lock.json': LOCK,
+    'apps/web/package.json': pkg({ name: 'web', scripts: { dev: 'next dev', build: 'next build' }, dependencies: { next: '15.0.0', react: '19.0.0' } }), 'apps/web/next.config.mjs': "export default { output: 'export' };\n", 'apps/web/app/page.tsx': PAGE,
+    ...extra,
+  });
+  const read = async (files: Record<string, string>, notes: string[] = []): Promise<RepoProfile> => ({ ...(await readProject(repo(files), { notes })), private: false, ownerType: 'User', plan: 'free' } as RepoProfile);
+  const staticSkip = (p: RepoProfile, name: string) => skippedChecks(p, CAPS4).some((k) => k.category === 'image-build' && k.service === name && k.why === STATIC_SKIP);
+  const needsOf = (p: RepoProfile, name: string) => floorNeeds(p, CAPS4).filter((n) => n.service === name).map((n) => n.category);
+  const assembled = async (p: RepoProfile) => { const a = assemble(planned(p, { over: { skipped: [{ part: 'deploy' as const, reason: 't' }] } })); return { a, issues: shown(await judge(files(a), a.draft)) }; };
+
+  it('N1: a multi-line (\\-continued) buildx build counts its -f and its context', async () => {
+    expect([...workflowBuildRefs([['docker buildx build \\', '  -f apps/web/Dockerfile.ci \\', '  -t ghcr.io/o/web \\', '  apps/web'].join('\n')])].sort()).toEqual(['apps/web', 'apps/web/Dockerfile.ci']);
+    const p = await read(ws({ '.github/workflows/img.yml': run(['docker buildx build \\', '  -f apps/web/Dockerfile.ci \\', '  -t ghcr.io/o/web --push \\', '  apps/web']) }));
+    const web = p.services.find((s) => s.name === 'web') as Service;
+    expect(web.containerHint).toContain('apps/web');
+    expect(staticSkip(p, 'web')).toBe(false);
+    // a continued line past the 4 KB budget is dropped whole, never parsed
+    expect(workflowBuildRefs([`docker build \\\n${`  -t x \\\n`.repeat(1000)}  apps/web`]).size).toBe(0);
+  });
+  it('N1: a continued -f Dockerfile.prod wins the Dockerfile choice over the plain Dockerfile', async () => {
+    const p = await read(site({ Dockerfile: 'FROM node:24\nEXPOSE 3000\n', 'Dockerfile.prod': NGINX, '.github/workflows/img.yml': run(['docker build \\', '  -f Dockerfile.prod \\', '  -t ghcr.io/o/site .']) }));
+    expect(p.services[0]?.dockerfile).toBe('Dockerfile.prod');
+  });
+
+  it('N2: --type <svc>=container on a build-only site (no run script, framework or port) brings image build, image scan and DAST back', async () => {
+    const eleventy = { 'package.json': pkg({ name: 'blog', scripts: { build: 'eleventy' }, devDependencies: { '@11ty/eleventy': '3.0.0' } }), 'package-lock.json': LOCK, '.eleventy.js': 'module.exports = {};\n', 'src/index.md': '# hi\n' };
+    const p = await read(eleventy);
+    expect(staticSkip(p, 'blog')).toBe(true);
+    const c = applyTypeOverrides(p, [{ service: 'blog', type: 'container' }]);
+    expect(isRunnable(c.services[0] as Service)).toBe(true);
+    for (const cat of ['image-build', 'image-scan', 'dast']) expect(needsOf(c, 'blog'), cat).toContain(cat);
+    // the skip text names this escape, and it is one the type list has
+    expect(STATIC_SKIP).toMatch(/--type SERVICE=container/);
+  });
+
+  // N3: the root's own container file stays the root's; container folders with no app manifest are part of it (a note names each)
+  const express = (extra: Record<string, string>) => ({ 'package.json': pkg({ name: 'api', scripts: { start: 'node index.js', test: 'vitest run' }, dependencies: { express: '4.0.0' } }), 'package-lock.json': LOCK, 'index.js': "require('express')().listen(3000);\n", 'index.test.js': 'test("x", () => {});\n', Dockerfile: 'FROM node:24\nEXPOSE 3000\nCMD ["node", "index.js"]\n', ...extra });
+  const cases: [string, Record<string, string>, string | null][] = [
+    ['root express + Dockerfile + docker/Dockerfile.dev', express({ 'docker/Dockerfile.dev': 'FROM node:24\n' }), 'docker'],
+    ['root express + Dockerfile + deploy/Dockerfile.prod', express({ 'deploy/Dockerfile.prod': 'FROM node:24\n' }), 'deploy'],
+    ['root express + Dockerfile + e2e/Dockerfile.playwright', express({ 'e2e/Dockerfile.playwright': 'FROM node:24\n' }), null],
+    ['root static + Dockerfile.prod + docker/Dockerfile.dev', site({ 'Dockerfile.prod': NGINX, 'docker/Dockerfile.dev': 'FROM node:24\n' }), 'docker'],
+  ];
+  for (const [label, files, folder] of cases) {
+    it(`N3: ${label} keeps the root as its only service, with image checks, and assembles cleanly`, async () => {
+      const notes: string[] = [];
+      const p = await read(files, notes);
+      expect(p.services.map((s) => [s.path, s.language])).toEqual([['.', 'node']]);
+      expect(needsOf(p, p.services[0]?.name as string)).toContain('image-build');
+      if (folder !== null) expect(notes.join('\n')).toContain(`The folder ${folder} has a container file but no app manifest or code`);
+      else expect(notes.join('\n')).not.toMatch(/has a container file but no app manifest/);
+      const { a, issues } = await assembled(p);
+      expect(issues).toBe('');
+      expect(Object.keys(a.merge).some((k) => /image/.test(k))).toBe(true);
+    });
+  }
+  it('N3: the O3 folder names are never service folders either', async () => {
+    for (const sub of ['example', 'e2e', 'playwright', 'cypress', '.storybook', 'scripts', 'demo', 'samples', 'testdata', 'benchmark']) {
+      const p = await read({ [`${sub}/Dockerfile`]: 'FROM node:24\n', 'svc/Dockerfile': 'FROM node:24\n' });
+      expect(p.services.map((s) => s.path), sub).toEqual(['svc']);
+    }
+  });
+
+  it('N4: a workflow ref wins, then the plain Dockerfile, then a compose or bake ref (its own reason), then the first by name', async () => {
+    const choose = async (extra: Record<string, string>) => { const notes: string[] = []; const p = await read(site(extra), notes); return { file: p.services[0]?.dockerfile, notes: notes.join('\n') }; };
+    const devCompose = { 'compose.yaml': 'services:\n  site:\n    build:\n      context: .\n      dockerfile: Dockerfile.dev\n' };
+    const three = { Dockerfile: 'FROM node:24\nEXPOSE 3000\n', 'Dockerfile.dev': 'FROM node:24\nEXPOSE 3000\n', 'Dockerfile.prod': NGINX };
+    expect((await choose({ ...three, ...devCompose })).file).toBe('Dockerfile');
+    expect((await choose({ ...three, ...devCompose, '.github/workflows/img.yml': run(['docker build -f Dockerfile.prod -t x .']) })).file).toBe('Dockerfile.prod');
+    const composed = await choose({ 'Dockerfile.dev': 'FROM node:24\nEXPOSE 3000\n', 'Dockerfile.prod': NGINX, 'compose.yaml': 'services:\n  site:\n    build:\n      context: .\n      dockerfile: Dockerfile.prod\n' });
+    expect(composed.file).toBe('Dockerfile.prod');
+    expect(composed.notes).toContain('pipegen builds and scans Dockerfile.prod (the one a compose or bake file builds)');
+    const byName = await choose({ 'Dockerfile.dev': 'FROM node:24\nEXPOSE 3000\n', 'Dockerfile.prod': NGINX });
+    expect(byName.notes).toContain('(the first by name; no workflow, compose or bake file builds one of them)');
+  });
+
+  it('N5: compose and bake reads stop at 20 files each and 2 MB in all, with a note', async () => {
+    const many: Record<string, string> = {};
+    for (let i = 0; i < 21; i++) many[`c${String(i).padStart(2, '0')}/compose.yaml`] = 'services:\n  x:\n    image: alpine\n';
+    many['c20/compose.yaml'] = 'services:\n  web:\n    build: ../apps/web\n';
+    const notes: string[] = [];
+    const p = await read(ws(many), notes);
+    expect((p.services.find((s) => s.name === 'web') as Service).containerHint).toBeUndefined();
+    expect(notes.join('\n')).toContain('Only the first 20 compose files were read for image builds.');
+    const big = `# ${'x'.repeat(990_000)}\nservices:\n  x:\n    image: alpine\n`;
+    const heavy: Record<string, string> = { 'a/compose.yaml': big, 'b/compose.yaml': big, 'c/compose.yaml': `# ${'x'.repeat(50_000)}\nservices:\n  web:\n    build: ../apps/web\n` };
+    const notes2: string[] = [];
+    const t0 = performance.now();
+    const q = await read(ws(heavy), notes2);
+    expect(performance.now() - t0).toBeLessThan(15_000);
+    expect(notes2.join('\n')).toMatch(/Skipped c\/compose\.yaml: the compose and bake files pipegen reads for image builds are over 2 MB together\./);
+    expect((q.services.find((s) => s.name === 'web') as Service).containerHint).toBeUndefined();
+  });
+
+  it('N7: the hint row says "may be built" and the skip text names workflow, compose and bake files', async () => {
+    const p = await read(ws({ 'apps/web/docker/Dockerfile': NGINX }));
+    const row = wouldCreateOf(p).find((r) => r.what === 'docker' && r.why.includes('web'));
+    expect(row?.why).toBe("nothing for web, which may be built into an image elsewhere (a container file builds it: apps/web/docker/Dockerfile): pipegen can't build or scan that image yet, so it is not covered.");
+    expect(STATIC_SKIP).toBe('no workflow, compose or bake image build found; else use --type SERVICE=container');
   });
 });
