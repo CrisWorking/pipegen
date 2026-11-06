@@ -2,7 +2,8 @@
 // sign workflow (private repositories only): the digest hand-off of each image (image-publish's artifact), pipegen's digest step (the file
 // read, checked as sha256:<64 hex>, the registry login for the push, the digest as the step's output), and the reviewed actions/attest v4
 // with that output as its subject-digest (never a literal) and push-to-registry true. Nothing else runs in the job.
-import { Document, parse, parseDocument } from 'yaml';
+import { readFileSync } from 'node:fs';
+import { Document, parse, parseDocument, stringify } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { attestDigestStepId, DEPLOY_PUSH_IF } from '../src/engine/job-rules.js';
 import { referee, type Linters } from '../src/engine/referee.js';
@@ -14,6 +15,8 @@ import { sharedWorkflows, signCallerJob, signJob, signPermissions, SIGN_JOB_ID }
 import type { Capabilities, CreatedFile, PipelineDraft, ReviewedTool } from '../src/types.js';
 import { draftOf, imageProf, jobsOf, p, workflow } from './helpers/gate-pipeline.js';
 import { reviewedList } from './helpers/render.js';
+import { makeTempDir, writeIn } from './helpers/make-repo.js';
+import { loadReviewed } from '../src/engine/reviewed.js';
 
 type Obj = Record<string, any>;
 const OIDC = ['id', 'token'].join('-');
@@ -110,6 +113,19 @@ describe('G15a carries 10-12: the attest sign job', () => {
     await refused((j) => { j.steps = [j.steps[0], j.steps[2]]; }, 'missing digest step');
     // another image name than the plan's
     await refused((j) => { j.steps[2].with['subject-name'] = 'ghcr.io/o/r-other'; }, 'other image');
+    // the attestation kept out of the registry, or push-to-registry left to its default
+    await refused((j) => { j.steps[2].with['push-to-registry'] = 'false'; }, 'push-to-registry false');
+    await refused((j) => { delete j.steps[2].with['push-to-registry']; }, 'push-to-registry missing');
+    // and the reviewed entry can not drop it or set it false (the loader's input policy)
+    const file0 = parse(readFileSync('data/reviewed-tools.yml', 'utf8')) as { pinnedOn: string; tools: Obj[] };
+    const entry0 = file0.tools.find((t) => t.id === 'actions-attest') as Obj;
+    for (const v of [undefined, 'false']) {
+      const e = structuredClone(entry0);
+      for (const w of [e.step.action.with, e.fixedInputs.with]) { if (v === undefined) delete w['push-to-registry']; else w['push-to-registry'] = v; }
+      const dir = makeTempDir();
+      writeIn(dir, 'reviewed-tools.yml', stringify({ pinnedOn: file0.pinnedOn, tools: [e] }));
+      expect(() => loadReviewed(`${dir}/reviewed-tools.yml`), String(v)).toThrow(/push-to-registry/);
+    }
   });
 
   it('referee: the attest sign job holds only the attest step and the digest step', async () => {

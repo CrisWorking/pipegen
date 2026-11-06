@@ -87,6 +87,10 @@ describe('G15a G11-2: no licence data counts as Unknown', () => {
     expect(scrub(readFileSync('test/fixtures/sarif/trivy-licence.sarif')).status).toBe('tool-error');
     // a result class the reader does not know (it might hold licences it would skip)
     expect(err({ ...base, Results: [{ Target: 'x', Class: 'config', Misconfigurations: [] }] })).toMatch(/class/);
+    // an empty licence list is no licence data too (trivy omits the key today; an empty list must not read as licensed)
+    const el = structuredClone(base);
+    el.Results[0].Packages[1].Licenses = [];
+    expect(parseTrivyLicenceJson(el, TOOL).findings.map((f) => f.ruleId)).toContain('acme/gpl:no-licence-data');
     // a malformed package or licence
     const lp = structuredClone(base);
     lp.Results[0].Packages[0].Licenses = 'MIT';
