@@ -588,15 +588,18 @@ describe('E7 fix loop', () => {
     const createdInputs = { centralCodeowners: null };
     const files = [file('a', 'b', 'docker')];
     const noGh = Object.fromEntries([['gh' + 'Token', null]]) as Pick<Parameters<typeof makeFixReferee>[0], 'ghToken'>;
-    const fixRef = makeFixReferee({ assemble: async () => files, platform: {} as never, reviewed: [], linters: {} as never, ...noGh, deps: { vault, createdInputs } });
+    // G13 (carry 11, GJ C3): assemble returns AssembledFiles' files and draft; the referee judges the assembled draft, never the input one
+    const assembled = baseDraft();
+    const fixRef = makeFixReferee({ assemble: async () => ({ files, draft: assembled }), platform: {} as never, reviewed: [], linters: {} as never, ...noGh, deps: { vault, createdInputs } });
     const d = baseDraft();
     await fixRef(d);
     const args = vi.mocked(referee).mock.calls.at(-1) ?? [];
     expect(args).toHaveLength(7);
     expect(args[0]).toBe(files);
-    expect(args[1]).toBe(d);
+    expect(args[1]).toBe(assembled);
+    expect(args[1]).not.toBe(d);
     expect(args[6]).toMatchObject({ vault, createdInputs });
-    expect(() => makeFixReferee({ assemble: async () => files, platform: {} as never, reviewed: [], linters: {} as never, ...noGh, deps: {} as never })).toThrow(/vault/);
+    expect(() => makeFixReferee({ assemble: async () => ({ files, draft: d }), platform: {} as never, reviewed: [], linters: {} as never, ...noGh, deps: {} as never })).toThrow(/vault/);
     expect(() => makeFixGuard({ root: '/x', baseTree: { complete: true, entries: new Map() }, installRecord: null, profile: d.profile } as never)).toThrow(/vault/);
     // source scan: every call of the referee in src/ passes 7 arguments; src/proof never names isolatedTestJob
     const calls: { f: string; n: number }[] = [];

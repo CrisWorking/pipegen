@@ -3,10 +3,10 @@
 // the merge locks, the environments, the signing environment's key and PIPEGEN_COSIGN_PUB, PIPEGEN_BLOCK_FROM, sha pinning, then the central
 // ruleset and CODEOWNERS last, and updates the install record; `pipegen verify` reports drift between the repos and the record. Every GitHub
 // call goes to an in-memory GitHub (test/helpers/finish-github.ts); cosign is a fake exec; no network.
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { gitBlobSha } from '../src/create/guard.js';
 import { storeCosignKey, storeEnvSecret } from '../src/create/secrets.js';
@@ -14,10 +14,11 @@ import { centralWorkflowFile } from '../src/engine/central-path.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { pubKeySha256 } from '../src/engine/signing.js';
 import { ensureSigningEnvironment, plannedOfLocks, readEnv, SETUP_BRANCH } from '../src/deliver/deliver.js';
-import { finish, FinishError, FINISH_WRITE_ROUTES, type FinishDeps, type FinishProbe } from '../src/deliver/finish.js';
-import { checkRecord, localFinishPendingPath, readLocalRecord, readRecord, recordHash, recordMarkerOf, writeFinishPending, writeLocalRecord, writeRecord } from '../src/deliver/record.js';
+import { finish, FinishError, FINISH_WRITE_ROUTES, githubFinishProbe, type FinishDeps, type FinishProbe } from '../src/deliver/finish.js';
+import { checkRecord, protectedPathsForRecord, recordFileText, recordPath, localFinishPendingPath, readLocalRecord, readRecord, recordHash, recordMarkerOf, writeFinishPending, writeLocalRecord, writeRecord } from '../src/deliver/record.js';
 import { SettingsApi } from '../src/deliver/settings-api.js';
 import { verify } from '../src/deliver/verify.js';
+import { isMemoryFolder } from '../src/layers/deploy.js';
 import { planLocks, type LockPlan } from '../src/layers/locks.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
 import type { Capabilities, CreatedFile, InstallPlanned, InstallRecord, Plan, RepoProfile } from '../src/types.js';
@@ -56,7 +57,7 @@ interface SeedOpts {
 }
 interface Seed {
   g: FinishGitHub; home: string; record: InstallRecord; pin: string; pr: number; locks: LockPlan; lines: string[]; probes: number[]; resolves: string[]; execs: string[];
-  deps: (over?: Partial<FinishDeps>) => FinishDeps; caps: { value: Capabilities }; plan: { value: Plan };
+  deps: (over?: Partial<FinishDeps>) => FinishDeps; caps: { value: Capabilities }; plan: { value: Plan }; shm: string;
 }
 
 /** A project delivered by pipegen (the setup PR, the record written as deliver writes it) and, unless `merge: false`, merged. */
@@ -132,8 +133,12 @@ async function seed(o: SeedOpts = {}): Promise<Seed> {
     probes.push(g.calls.length);
     return { plan: plan.value, caps: caps.value, centralBranchProtection: caps.value.branchProtection || plan.value === 'unknown', workflowPins: { tagPinned: 0, unchecked: false } };
   };
+  // G13 (carry 28): finish makes the key pair with generateCosignKeys, only in a memory folder; the tests name a folder they treat as one
+  const shm = join(home, 'shm');
+  mkdirSync(shm);
   const deps = (over: Partial<FinishDeps> = {}): FinishDeps => ({
     out: (l) => { lines.push(l); }, probe, clock: clock(), now: () => new Date('2026-11-07T10:00:00Z'), local: { home, env: {} },
+    keyBase: shm, isMemory: (d) => d === shm,
     cosignBin: async () => { n++; resolves.push(`/opt/cosign-${n}`); return `/opt/cosign-${n}`; },
     exec: async (bin, args, opts) => {
       execs.push(bin);
@@ -144,7 +149,7 @@ async function seed(o: SeedOpts = {}): Promise<Seed> {
     },
     ...over,
   });
-  return { g, home, record, pin, pr, locks, lines, probes, resolves, execs, deps, caps, plan };
+  return { g, home, shm, record, pin, pr, locks, lines, probes, resolves, execs, deps, caps, plan };
 }
 
 const recordOn = async (s: Seed, branch?: string) => (await readRecord(s.g.octokit(), { owner: 'o', repo: 'pipelines' }, 'r', branch === undefined ? {} : { branch }))?.record as InstallRecord;
@@ -390,6 +395,8 @@ describe('G11 finish: print, rotate, the signing key', () => {
     expect(s.g.calls.slice(from).some((c) => c.route === 'PATCH /repos/{owner}/{repo}/git/refs/{ref}' && c.params.repo === 'pipelines' && c.params.ref === 'heads/main')).toBe(false);
     expect((await recordOn(s)).cosignPubSha256).toBe(pubKeySha256(PUB));
     expect(s.lines.join('\n')).toMatch(/verify.*fails.*until.*pull request/i);
+    // G13-R2 6: the way to open that pull request is the full run, never the bare audit
+    expect(s.lines.join('\n')).toMatch(/run `npx pipegen run` again to open it/);
     // until it is merged, verify fails closed: the variable doesn't hash to the record on the default branch
     const v = await verify(s.g.octokit(), { owner: 'o', repo: 'r' }, { local: { home: s.home, env: {} } });
     expect(v.drift.map((d) => d.what)).toEqual(expect.arrayContaining(['PIPEGEN_COSIGN_PUB (sha256)', 'install record hash (local record file)']));
@@ -432,6 +439,87 @@ describe('G11 finish: print, rotate, the signing key', () => {
     await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, { rotateKey: true }, deps);
     // one resolve right before each exec, and each exec runs exactly the path just resolved (never one kept from before)
     expect(order).toEqual(['resolve /opt/cosign-1', 'exec /opt/cosign-1', 'resolve /opt/cosign-2', 'exec /opt/cosign-2']);
+  });
+});
+
+describe('G13 finish: the key pair only in memory (carry 28, BINDING)', () => {
+  /** A folder on a disk: the repo's own folder when the OS temp folder is a tmpfs. */
+  const diskFolder = (): string => {
+    for (const base of [tmpdir(), resolve(import.meta.dirname, '..')]) {
+      if (isMemoryFolder(base)) continue;
+      const d = mkdtempSync(join(base, '.pg-disk-'));
+      homes.push(d);
+      return d;
+    }
+    throw new Error('no disk-backed folder to test with');
+  };
+
+  it('finish: the cosign key is made in memory; no key file on a disk-backed folder', async () => {
+    const s = await seed({ keyEnv: true, keysStored: false });
+    const disk = diskFolder();
+    // the real memory check (no isMemory override) on a folder that is on a disk: refused before cosign runs
+    const res = await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, {}, s.deps({ keyBase: disk, isMemory: undefined }));
+    expect(s.execs).toEqual([]);
+    expect(s.resolves).toEqual([]);
+    expect(readdirSync(disk)).toEqual([]);
+    const why = res.skipped.find((x) => /signing key/.test(x.what))?.why ?? '';
+    expect(why).toMatch(/only in memory/);
+    expect(why).toMatch(/keyless signing/);
+    expect(why).not.toMatch(/npx pipegen finish/);
+    expect(s.g.repo('o/r').envs.get('pipegen-signing')?.stored.has('PIPEGEN_COSIGN_KEY') ?? false).toBe(false);
+    expect(envVarOf(s, 'pipegen-signing', 'PIPEGEN_COSIGN_PUB')).toBeUndefined();
+  });
+
+  it('finish: a memory folder gets the key pair, and the pair folder is gone afterwards', async () => {
+    const s = await seed({ keyEnv: true, keysStored: false });
+    const dirs: string[] = [];
+    const d = s.deps();
+    await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, {}, s.deps({
+      exec: async (bin, args, opts) => { dirs.push(opts.cwd); await (d.exec as NonNullable<FinishDeps['exec']>)(bin, args, opts); },
+    }));
+    expect(dirs).toHaveLength(1);
+    expect((dirs[0] as string).startsWith(`${s.shm}/`)).toBe(true);
+    expect(readdirSync(s.shm)).toEqual([]);
+    expect(envVarOf(s, 'pipegen-signing', 'PIPEGEN_COSIGN_PUB')?.value).toBe(cosignPub(41));
+  });
+});
+
+describe('G13 finish: the real re-probe (carry 59)', () => {
+  it('finish: githubFinishProbe re-reads plan, capabilities and workflow pins', async () => {
+    const s = await seed();
+    s.g.commitOn('o/r', 'main', {
+      '.github/workflows/ci.yml': `on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/setup-node@${'a'.repeat(40)}\n`,
+    }, 'ci');
+    const base = s.g.octokit() as unknown as { request: unknown; rest: Record<string, Record<string, unknown>> };
+    const req = (route: string) => async (p: Record<string, unknown> = {}) => s.g.request(route, p);
+    const gh = {
+      ...base,
+      rest: {
+        ...base.rest,
+        users: { getAuthenticated: async () => ({ status: 200, data: { login: 'o', type: 'User', plan: { name: 'pro' } }, headers: {} }) },
+        repos: { ...base.rest.repos, getRepoRulesets: req('GET /repos/{owner}/{repo}/rulesets'), getAllEnvironments: req('GET /repos/{owner}/{repo}/environments') },
+        codeScanning: { listRecentAnalyses: req('GET /repos/{owner}/{repo}/code-scanning/analyses') },
+      },
+    } as unknown as Parameters<typeof finish>[0];
+    const notes: string[] = [];
+    const r = await githubFinishProbe('o')(gh, { owner: 'o', repo: 'r' }, { private: true, ownerType: 'User', defaultBranch: 'main', centralDefaultBranch: 'main' }, notes, clock());
+    expect(r.plan).toBe('pro');
+    expect(r.workflowPins).toEqual({ tagPinned: 1, unchecked: false });
+    expect(Object.keys(r.caps).sort()).toEqual(['attestations', 'branchProtection', 'codeScanning', 'deploymentBranchPolicies', 'envRequiredReviewers', 'environments', 'keylessSigningAllowed']);
+    expect(r.caps.keylessSigningAllowed).toBe(false);   // a private repo
+    // G13-R1: the values, not only the keys (a private User repo on Pro: rulesets read, no environments or code scanning answer)
+    expect(r.caps).toEqual({ branchProtection: true, environments: false, deploymentBranchPolicies: false, envRequiredReviewers: false, attestations: false, codeScanning: false, keylessSigningAllowed: false });
+    expect(r.centralBranchProtection).toBe(true);
+    // it read the app's and the central repo's capabilities, and the app's workflow file on its default branch
+    const read = s.g.calls.map((c) => `${c.route} ${String(c.params.repo)}`);
+    expect(read).toContain('GET /repos/{owner}/{repo}/rulesets r');
+    expect(read).toContain('GET /repos/{owner}/{repo}/rulesets pipelines');
+    expect(read.some((c) => c.startsWith('GET /repos/{owner}/{repo}/git/blobs/{file_sha} r'))).toBe(true);
+    // the central value is the central repo's own ruleset read: GitHub refusing rulesets there (an upgrade message) makes it false, the app's stays true
+    s.g.hooks.push((c) => (c.route === 'GET /repos/{owner}/{repo}/rulesets' && c.params.repo === 'pipelines' ? { status: 403, data: { message: 'Upgrade to GitHub Pro or make this repository public to enable this feature.' } } : undefined));
+    const r2 = await githubFinishProbe('o')(gh, { owner: 'o', repo: 'r' }, { private: true, ownerType: 'User', defaultBranch: 'main', centralDefaultBranch: 'main' }, [], clock());
+    expect(r2.caps.branchProtection).toBe(true);
+    expect(r2.centralBranchProtection).toBe(false);
   });
 });
 
@@ -724,6 +812,33 @@ describe('G11 verify', () => {
     const s = await finished({ keyEnv: true });
     (envVarOf(s, 'pipegen-signing', 'PIPEGEN_COSIGN_PUB') as { value: string }).value = cosignPub(99);
     expect((await v(s)).drift).toEqual([{ what: 'PIPEGEN_COSIGN_PUB (sha256)', expected: pubKeySha256(PUB), actual: pubKeySha256(cosignPub(99)) }]);
+  });
+
+  it('verify: pipegen-signing no longer limited to the default branch → drift', async () => {
+    const what = 'environment pipegen-signing (default branch only)';
+    const env = (s: Seed) => s.g.repo('o/r').envs.get('pipegen-signing') as NonNullable<ReturnType<ReturnType<Seed['g']['repo']>['envs']['get']>>;
+    // missing policy (any branch may deploy)
+    let s = await finished({ keyEnv: true });
+    env(s).deployment_branch_policy = null;
+    expect((await v(s)).drift.filter((d) => d.what === what)).toEqual([{ what, expected: 'only main may use it', actual: 'any branch' }]);
+    // not custom: protected branches instead of the one default-branch rule
+    s = await finished({ keyEnv: true });
+    env(s).deployment_branch_policy = { protected_branches: true, custom_branch_policies: false };
+    expect((await v(s)).drift.filter((d) => d.what === what)).toEqual([{ what, expected: 'only main may use it', actual: 'protected branches' }]);
+    // a second branch rule, and a tag rule
+    s = await finished({ keyEnv: true });
+    env(s).policies.push({ id: 900, name: 'dev', type: 'branch' });
+    expect((await v(s)).drift.filter((d) => d.what === what)).toEqual([{ what, expected: 'only main may use it', actual: 'branch main, branch dev' }]);
+    s = await finished({ keyEnv: true });
+    env(s).policies.splice(0, 1, { id: 901, name: 'main', type: 'tag' });
+    expect((await v(s)).drift.filter((d) => d.what === what)).toEqual([{ what, expected: 'only main may use it', actual: 'tag main' }]);
+    // the environment gone
+    s = await finished({ keyEnv: true });
+    s.g.repo('o/r').envs.delete('pipegen-signing');
+    expect((await v(s)).drift.filter((d) => d.what === what)).toEqual([{ what, expected: 'only main may use it', actual: null }]);
+    // not key-env: no such check
+    s = await finished();
+    expect((await v(s)).drift).toEqual([]);
   });
 
   it('verify: warns on team-only protected paths and says a key rotation resets the baseline', async () => {
@@ -1565,3 +1680,40 @@ async function runPrinted(g: FinishGitHub, cmd: string): Promise<void> {
   if (cmd.startsWith('#') || cmd.startsWith('gh api --method GET')) return;
   throw new Error(`the test can't run: ${cmd.split('\n')[0]}`);
 }
+
+describe('G13-R2b: protected paths in the record (m7, m1)', () => {
+  const v = (s: Seed) => verify(s.g.octokit(), { owner: 'o', repo: 'r' }, { local: { home: s.home, env: {} }, clock: clock() });
+
+  it('finish: a record with protectedPaths [./trivy.yaml, .github/workflows/**] applies with no LockError (m7)', async () => {
+    const s = await seed({ recordOver: (r) => { r.protectedPaths = ['./trivy.yaml', '.github/workflows/**']; } });
+    const res = await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, {}, s.deps());
+    expect(res.applied.length).toBeGreaterThan(0);
+    expect((await recordOn(s)).protectedPaths).toEqual(['./trivy.yaml', '.github/workflows/**']);
+  });
+
+  it('verify: a root trivy.yaml is labelled protected, sub/trivy.yaml is not (m7)', async () => {
+    const s = await seed({ recordOver: (r) => {
+      r.protectedPaths = ['./trivy.yaml', '.github/workflows/**', 'CODEOWNERS'];
+      r.files.push({ repo: 'app', path: 'trivy.yaml', part: 'pipeline', shas: ['a'.repeat(40)] } as never, { repo: 'app', path: 'sub/trivy.yaml', part: 'pipeline', shas: ['b'.repeat(40)] } as never);
+    } });
+    await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, {}, s.deps());
+    const what = (await v(s)).drift.map((d) => d.what);
+    expect(what).toContain('app file trivy.yaml (protected)');
+    expect(what).toContain('app file sub/trivy.yaml');
+  });
+
+  it('record: ./, .//x and ././x are refused by checkRecord; verify reports such a record as drift, never a crash (m1)', async () => {
+    const s = await seed();
+    const r = await recordOn(s);
+    for (const bad of ['./', './/x', '././x', 'a//b', 'a/./b', '.', '']) expect(() => checkRecord({ ...r, protectedPaths: [bad] }), JSON.stringify(bad)).toThrow(/protectedPaths/);
+    for (const ok of ['./trivy.yaml', '.github/workflows/**', 'CODEOWNERS', 'svc/.gitleaks.toml']) expect(checkRecord({ ...r, protectedPaths: [ok] }).protectedPaths).toEqual([ok]);
+    // the conversion refuses what it can't keep exactly
+    for (const bad of ['//x', '/./x', '/a//b', '/']) expect(() => protectedPathsForRecord([bad]), bad).toThrow();
+    expect(protectedPathsForRecord(['/trivy.yaml', 'CODEOWNERS'])).toEqual(['./trivy.yaml', 'CODEOWNERS']);
+    // a record on the central default branch with such a path: verify says so as drift
+    s.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: recordFileText({ ...r, protectedPaths: ['.//x'] }) });
+    const res = await v(s);
+    expect(res.drift.length).toBeGreaterThan(0);
+    expect(res.drift[0]?.what).toBe('install record');
+  });
+});

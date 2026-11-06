@@ -11,8 +11,11 @@ import { packageVersion } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
 import { AI_CHOICES, audit, normalizeAiFlag, unsafeFolderStop, type AiChoice } from './audit.js';
 import { hookSecrets } from './hook.js';
+import { cleanupCommand } from './cleanup.js';
+import { connect, finishCommand, updateCommand, verifyCommand } from './commands.js';
 import { inspect } from './inspect.js';
 import { processIO, type CliIO } from './io.js';
+import { fullRun } from './run.js';
 import { parseTypeFlags } from './type-confirm.js';
 
 /**
@@ -32,6 +35,14 @@ function usage(): string[] {
     '  pipegen audit      Report which checks your CI already runs, what is missing at each layer, and what the full',
     '                     setup would add, cost and need. Read-only: it changes nothing; no AI unless --ai.',
     '  pipegen inspect    Read this repo and its GitHub settings and print a summary. Read-only; no AI.',
+    '  pipegen run        The full setup: reads the repo, asks before anything costs money or reaches an AI, builds the',
+    '                     pipeline and opens one setup pull request you review once it has passed a proof on a private',
+    '                     test copy. This version has no proof step yet, so run stops before it asks to spend anything.',
+    '  pipegen finish     After you merge the setup pull request: applies the settings (branch rules, environments,',
+    '                     variables). --print prints the commands instead; --rotate-key makes a new signing key pair.',
+    '  pipegen verify     Compares the repo with what pipegen recorded and lists any drift (exit code 1 on drift).',
+    '  pipegen update     Opens pull requests that move pipegen\'s files to this version; never overwrites your edits.',
+    '  pipegen cleanup    Removes what an interrupted proof left in GitHub (the scratch repo\'s branches, keys, runs).',
     '  pipegen hook secrets  What pipegen\'s pre-commit hook runs: its pinned gitleaks on the staged changes.',
     '',
     'Safe mode, for a repo you don\'t trust: run pipegen from OUTSIDE it, with an exact version and npm\'s own registry,',
@@ -42,7 +53,7 @@ function usage(): string[] {
     '',
     'Options:',
     '  --dir <folder>        The repo folder (default: the current folder).',
-    '  --type <type>         audit: set the type of the repo\'s only service, or --type <service>=<type> (give it once',
+    '  --type <type>         audit, run: set the type of the repo\'s only service, or --type <service>=<type> (give it once',
     '                        per service): static-site, library, cli, server or container. No question is asked then.',
     '  --verbose             audit: the full report in the terminal.',
     '  --out <file>          audit: also write the report as Markdown. A relative path is read from the current folder,',
@@ -56,6 +67,11 @@ function usage(): string[] {
     '                        send and what it may cost, and asks you (default No). Needs Linux or macOS (WSL works).',
     '  --model <name>        With --ai: the model.',
     '  --effort <level>      With --ai claude: the effort level.',
+    '  --skip <part,...>     run: leave parts out (tests, precommit, docker, compose, deploy, locks, slack,',
+    '                        test-migration). Secrets scanning and the gate can never be skipped.',
+    '  --strictness <level>  run: starter, standard (default) or strict: which checks block a merge from the start.',
+    '  --print               finish: print the commands instead of running them.',
+    '  --rotate-key          finish: make a new signing key pair (key-env signing).',
     '  --allow-broad-token   Accept a classic token (it reaches every repo you have).',
     '  -h, --help            Show this help.',
     '  -v, --version         Show the version.',
@@ -66,18 +82,40 @@ function usage(): string[] {
   ];
 }
 
-/** Options only `pipegen audit` takes. */
-const AUDIT_ONLY = ['out', 'force', 'json', 'ai', 'model', 'effort', 'type', 'verbose'] as const;
+/** G13 (carry 4): the commands each command-specific option works with. --dir and --allow-broad-token work everywhere. */
+const OPTION_COMMANDS: Readonly<Record<string, readonly string[]>> = {
+  out: ['audit'], force: ['audit'], json: ['audit'], ai: ['audit'], model: ['audit'], effort: ['audit'], verbose: ['audit'],
+  type: ['audit', 'run'], skip: ['run'], strictness: ['run'], print: ['finish'], 'rotate-key': ['finish'],
+};
+/** The commands G13 adds (each reads the folder's origin; unsafeFolderStop first, ruling G13-R0 14). */
+const SETUP_COMMANDS: ReadonlySet<string> = new Set(['run', 'finish', 'verify', 'update', 'cleanup']);
+/** The option no command but `cmds` takes, as the one plain line. */
+function optionProblem(values: Record<string, unknown>, command: string): string | null {
+  for (const [o, cmds] of Object.entries(OPTION_COMMANDS)) {
+    if (values[o] === undefined || cmds.includes(command)) continue;
+    return `--${o} works with ${cmds.map((c) => `pipegen ${c}`).join(' and ')} only.`;
+  }
+  return null;
+}
+
+/** The commands main dispatches to (tests replace them; the defaults are the real ones). */
+export interface Commands {
+  fullRun: typeof fullRun; cleanup: typeof cleanupCommand; connect: typeof connect;
+  finish: typeof finishCommand; verify: typeof verifyCommand; update: typeof updateCommand;
+}
+const REAL: Commands = { fullRun, cleanup: cleanupCommand, connect, finish: finishCommand, verify: verifyCommand, update: updateCommand };
 /** Ruling S10: options that may be given more than once (each --type names one service). */
 const REPEATABLE: ReadonlySet<string> = new Set(['type']);
 
 /** Runs one pipegen command. Returns the exit code; output goes through io.out, errors and usage-on-error through io.err. */
-export async function run(argv: string[], io: CliIO): Promise<number> {
+export async function run(argv: string[], io: CliIO, cmds: Partial<Commands> = {}): Promise<number> {
+  const c: Commands = { ...REAL, ...cmds };
   const say = (s: string) => { io.out(s); };
   const fail = (s: string) => { io.err(s); };
   let values: {
     dir?: string; out?: string; force?: boolean; json?: boolean; ai?: string; model?: string; effort?: string;
     type?: string[]; verbose?: boolean; 'allow-broad-token'?: boolean; help?: boolean; version?: boolean;
+    skip?: string; strictness?: string; print?: boolean; 'rotate-key'?: boolean;
   };
   let positionals: string[];
   let tokens: { kind: string; name?: string }[];
@@ -98,6 +136,10 @@ export async function run(argv: string[], io: CliIO): Promise<number> {
         type: { type: 'string', multiple: true },
         verbose: { type: 'boolean' },
         'allow-broad-token': { type: 'boolean' },
+        skip: { type: 'string' },
+        strictness: { type: 'string' },
+        print: { type: 'boolean' },
+        'rotate-key': { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
         version: { type: 'boolean', short: 'v' },
       },
@@ -137,7 +179,7 @@ export async function run(argv: string[], io: CliIO): Promise<number> {
     }
     return hookSecrets(io, resolve(io.cwd ?? process.cwd(), values.dir ?? '.'));
   }
-  if (command !== 'inspect' && command !== 'audit') {
+  if (command !== 'inspect' && command !== 'audit' && !SETUP_COMMANDS.has(command)) {
     fail(`Unknown command "${safeText(command, 60)}".`);
     for (const line of usage()) fail(line);
     return 1;
@@ -149,12 +191,14 @@ export async function run(argv: string[], io: CliIO): Promise<number> {
   const cwd = io.cwd ?? process.cwd();
   const dir = resolve(cwd, values.dir ?? '.');
 
+  const wrong = optionProblem(values as Record<string, unknown>, command);
+  if (wrong !== null) {
+    fail(wrong);
+    return 1;
+  }
+  if (SETUP_COMMANDS.has(command)) return setupCommand(command, dir, values, io, c);
+
   if (command === 'inspect') {
-    const extra = AUDIT_ONLY.find((o) => values[o] !== undefined);
-    if (extra !== undefined) {
-      fail(`--${extra} works with pipegen audit only.`);
-      return 1;
-    }
     const stopped = await stopIfUnsafe(io, dir);
     if (stopped !== null) return stopped;
     try {
@@ -198,6 +242,39 @@ export async function run(argv: string[], io: CliIO): Promise<number> {
     types,
     verbose: values.verbose === true,
   });
+}
+
+/**
+ * run, finish, verify, update and cleanup (G13): unsafeFolderStop first (carry 1), then the command. An unexpected error is one cleaned line
+ * (no token, no stack trace) and exit 1.
+ */
+async function setupCommand(command: string, dir: string, values: { type?: string[]; skip?: string; strictness?: string; print?: boolean; 'rotate-key'?: boolean; 'allow-broad-token'?: boolean }, io: CliIO, c: Commands): Promise<number> {
+  const allowBroad = values['allow-broad-token'] === true;
+  let types: ReturnType<typeof parseTypeFlags> = [];
+  if (command === 'run') {
+    types = parseTypeFlags(values.type ?? []);
+    if (typeof types === 'string') {
+      io.err(types);
+      return 1;
+    }
+  }
+  const stopped = await stopIfUnsafe(io, dir);
+  if (stopped !== null) return stopped;
+  let token: string | null = null;
+  try {
+    if (command === 'run') {
+      return await c.fullRun(dir, io, { flags: { types: types as Exclude<typeof types, string>, allowBroad, ...(values.skip === undefined ? {} : { skip: values.skip }), ...(values.strictness === undefined ? {} : { strictness: values.strictness }) }, local: { env: io.env }, state: { env: io.env } });
+    }
+    if (command === 'cleanup') return await c.cleanup(dir, io, { allowBroad });
+    const { app, g, token: t } = await c.connect(io, dir, { allowBroad, mode: command === 'verify' ? 'read' : 'write' });
+    token = t;
+    if (command === 'finish') return await c.finish(io, app, { print: values.print === true, rotateKey: values['rotate-key'] === true }, g);
+    if (command === 'verify') return await c.verify(io, app, g);
+    return await c.update(io, app, g);
+  } catch (e) {
+    io.err(`pipegen ${command} failed: ${safeText(hideToken(e instanceof Error ? e.message : String(e), token), 1000)}`);
+    return 1;
+  }
 }
 
 /** unsafeFolderStop, with an unexpected error as one cleaned line and exit 1 (never a stack trace). */

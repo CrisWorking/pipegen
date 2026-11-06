@@ -221,9 +221,15 @@ export function fixSchema(o: { needIds: readonly string[]; candidateIds: readonl
 
 // ---------- the closures Plan G gives (S7) ----------
 
+/** What the fix loop's assemble returns: AssembledFiles' files and its draft. */
+export interface FixAssembled { files: CreatedFile[]; draft: PipelineDraft }
+
 export interface FixRefereeOpts {
-  /** Plan G's assemble: the files of the draft as delivered (signing mode none for the proof). */
-  assemble: (d: PipelineDraft) => CreatedFile[] | Promise<CreatedFile[]>;
+  /**
+   * Plan G's assemble: the files of the draft as delivered (signing mode none for the proof) and the draft they were rendered from
+   * (AssembledFiles.draft). G13 (carry 11, GJ C3): the referee judges that draft, never the input one.
+   */
+  assemble: (d: PipelineDraft) => FixAssembled | Promise<FixAssembled>;
   platform: PlatformActions;
   reviewed: ReviewedTool[];
   linters: Linters;
@@ -232,11 +238,14 @@ export interface FixRefereeOpts {
   deps: RefereeDeps & { vault: KnownValueCheck; createdInputs: CreatedInputs };
 }
 
-/** The referee closure of the fix loop: assemble, then the Plan B referee with all 7 arguments (S7). */
+/** The referee closure of the fix loop: assemble, then the Plan B referee with all 7 arguments (S7), on the assembled draft (G13, carry 11). */
 export function makeFixReferee(o: FixRefereeOpts): (d: PipelineDraft) => Promise<RefereeReport> {
   if (o?.deps?.vault === undefined || o.deps.createdInputs === undefined) throw new Error('makeFixReferee needs deps with the vault and createdInputs (the referee\'s 7th argument).');
   const deps: RefereeDeps = { ...o.deps, vault: o.deps.vault, createdInputs: o.deps.createdInputs };
-  return async (d) => referee(await o.assemble(d), d, o.platform, o.reviewed, o.linters, o.ghToken, deps);
+  return async (d) => {
+    const a = await o.assemble(d);
+    return referee(a.files, a.draft, o.platform, o.reviewed, o.linters, o.ghToken, deps);
+  };
 }
 
 /** The guard closure of the fix loop (S7): guardCreatedFiles with the vault, the reviewed closure, the install record and the delivery base tree. */

@@ -104,6 +104,11 @@ export interface RunState {
   /** GitHub's id of the scratch repo, recorded when pipegen created it: a delete needs it (rulings S3, E1-R4). */
   scratchRepoId?: number;
   scratchDeleted?: boolean;
+  /**
+   * G13-R1 (sec M3): the central repo's Actions access level before pipegen first changed it (checkProofRepos), saved the moment it
+   * changes and carried into the next run's state, so a stop before delivery doesn't lose it (uninstall puts it back).
+   */
+  actionsAccessPrevious?: 'none' | 'user' | 'organization' | 'enterprise';
   /** The cleanup of this run finished with nothing left behind (cleanupAfterProof). */
   cleanupDone?: boolean;
   /** What the cleanup couldn't remove (plain text, names only), for `pipegen cleanup`. */
@@ -169,6 +174,7 @@ const stateSchema = z.strictObject({
   aiCap: nonNeg.nullable(),
   scratchRepoId: z.number().int().positive().optional(),
   scratchDeleted: z.boolean().optional(),
+  actionsAccessPrevious: z.enum(['none', 'user', 'organization', 'enterprise']).optional(),
   cleanupDone: z.boolean().optional(),
   leftovers: z.array(text).max(1000),
   notes: z.array(text).max(1000),
@@ -353,6 +359,7 @@ export class StateStore {
       app: { owner: app.owner, repo: app.repo, private: app.private, ownerType: app.ownerType, defaultBranch: app.defaultBranch },
       stage: 'consented', branches: [], prs: [], secretNames: [], minutesUsed: 0, cap: init.cap, aiCostUsd: 0, aiCap: init.aiCap,
       ...(keepId ? { scratchRepoId: old.scratchRepoId } : {}),
+      ...(old !== null && old.actionsAccessPrevious !== undefined && old.app.owner.toLowerCase() === app.owner.toLowerCase() && old.app.repo.toLowerCase() === app.repo.toLowerCase() ? { actionsAccessPrevious: old.actionsAccessPrevious } : {}),
       ...(init.draft === undefined ? {} : { draft: init.draft }),
       leftovers: [], notes: [], updatedAt: '',
     };
@@ -504,6 +511,13 @@ export class StateStore {
     this.requireArmed('create a repo');
     const s = this.#need();
     return issuePermit({ owner: s.app.owner, repo: s.app.repo });
+  }
+
+  /** G13-R1 (sec M3): the central Actions access level before pipegen changed it; the first one saved stays. */
+  recordActionsAccess(previous: string): void {
+    if (previous !== 'none' && previous !== 'user' && previous !== 'organization' && previous !== 'enterprise') throw new StateError('The Actions access level to record is not one GitHub has.');
+    if (this.#need().actionsAccessPrevious !== undefined) return;
+    this.update((s) => { s.actionsAccessPrevious = previous; });
   }
 
   /** The id GitHub gave the scratch repo pipegen just created (checkProofRepos' onCreated). */

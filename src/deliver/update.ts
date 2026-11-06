@@ -830,7 +830,7 @@ export async function update(gh: Octokit, app: RepoRef, deps: UpdateDeps): Promi
   // G12-R2 N4: update never asks the typed trust question (its answer would stand for deliver and uninstall, and update can't use a view)
   const trusted = await trustedPrevious(gh, app, centralRef, centralRepo.defaultBranch, centralUpdateBranch(app.repo), deps.local ?? {}, clock, notes, { io: deps.io, interactive: false });
   if (trusted.record === null && trusted.why === 'no-local') {
-    throw new UpdateError(`This machine has no local record file for ${show(`${app.owner}/${app.repo}`, 140)}, so pipegen can't check its install record. Run \`npx pipegen\` in this repo first (it re-checks the full setup), then run update again.`);
+    throw new UpdateError(`This machine has no local record file for ${show(`${app.owner}/${app.repo}`, 140)}, so pipegen can't check its install record. Run \`npx pipegen run\` in this repo first (it re-checks the full setup), then run update again.`);
   }
   if (trusted.record === null) {
     throw new UpdateError(`pipegen found no install record for ${show(`${app.owner}/${app.repo}`, 140)} that it trusts, so it changes nothing: update touches only the files the record lists.${notes.length > 0 ? ` ${notes.join(' ')}` : ''}`);
@@ -838,7 +838,7 @@ export async function update(gh: Octokit, app: RepoRef, deps: UpdateDeps): Promi
   const record = trusted.record;
   // G12-R1 C1: a record trusted by typing is a view (edits, plans and settings dropped); update never writes it back as the record
   // N5: from what the trust decision returned, never a second read of the file
-  if (trusted.typed === true) throw new UpdateError('pipegen can\'t update from a record you only confirmed by name. Run `npx pipegen` in this repo first (it re-checks the full setup), then run update again.');
+  if (trusted.typed === true) throw new UpdateError('pipegen can\'t update from a record you only confirmed by name. Run `npx pipegen run` in this repo first (it re-checks the full setup), then run update again.');
   const appRepo = await readRepo(gh, app, clock);
   if (appRepo === null || appRepo.id !== record.app.repoId) throw new UpdateError(`The install record is for another repository than ${show(`${app.owner}/${app.repo}`, 140)} (its id differs), so pipegen changes nothing.`);
   const centralSt = await repoState(gh, centralRef, clock);
@@ -871,6 +871,24 @@ export async function update(gh: Octokit, app: RepoRef, deps: UpdateDeps): Promi
     notes.push(appChanges.length > 0 ? `pipegen holds back the app's own pin changes too, so the app is never half-updated. ${wayOn}` : wayOn);
     d.held.push(`${repin.refused} ${wayOn}`);
     appChanges = [];
+  }
+  if (moved !== null && appChanges.length > 0) {
+    // G13 (m7, ruling G13-R0 8): a verify job names the central commit inside a run line too (attest's --signer-digest), which no pin swap
+    // reaches; update has no draft to render the job again (renewVerifyJob), so a verify job that would keep the old commit is not re-pinned,
+    // and, as in N2, nothing of the app moves (never a verify job on one central commit and the calls on another)
+    const stale = appItems.filter((t) => t.entry === 'edit').filter((t) => {
+      const key = keyOf(t.repo, t.path);
+      const text = appChanges.find((c) => keyOf(c.repo, c.path) === key)?.after ?? d.current.get(key)?.text;
+      return text?.includes(moved.from) === true;
+    });
+    if (stale.length > 0) {
+      for (const t of stale) {
+        const why = `${label(t.repo, show(t.path))}: its pipegen-verify job names the central commit in a run line that \`pipegen update\` can't rebuild, so pipegen doesn't re-pin this verify job or the rest of the app (a verify job on an old central commit fails closed). Run \`npx pipegen run\` again to re-pin it.`;
+        notes.push(why);
+        d.held.push(why);
+      }
+      appChanges = [];
+    }
   }
   if (central.length > 0) {
     // the app pins only a commit on the central default branch (S26): its change waits until the central pull request is merged
@@ -917,7 +935,7 @@ export async function update(gh: Octokit, app: RepoRef, deps: UpdateDeps): Promi
       ? `The pull request ${prUrl} is open and the install record is written (central repo and this machine), but the setup pull request's record marker was not updated (${why}); \`pipegen verify\` reports that until pipegen writes the record again.`
       : at?.at === 'central' && at.via === 'direct'
         // G12-R3 M2: the central default branch holds the new record and this machine's file the old hash: they no longer match
-        ? `The pull request ${prUrl} is open and the install record is written on the central default branch, but this machine's local record file was not updated (${why}), so the two no longer match. Remove ${show(file, 300)}, then run \`npx pipegen\` in this repo (it re-checks the setup and writes a record this machine vouches for); then run update again.`
+        ? `The pull request ${prUrl} is open and the install record is written on the central default branch, but this machine's local record file was not updated (${why}), so the two no longer match. Remove ${show(file, 300)}, then run \`npx pipegen run\` in this repo (it re-checks the setup and writes a record this machine vouches for); then run update again.`
         : at?.at === 'central'
           ? `The pull request ${prUrl} is open and the install record went to the central pull request, but this machine's local record file was not updated (${why}). The record this machine trusts is unchanged, so run \`pipegen update\` again: it rebuilds the central pull request.`
           : `The pull request ${prUrl} is open, but the install record was not written (${why}); run \`pipegen update\` again to record it.`;

@@ -434,7 +434,8 @@ describe('G6: carries (G1-R2 m5, m6; secrets hook; Plan J G-J1)', () => {
       ['other manager', hookDraft(null, { profile: { ...prof, precommit: null, otherHookManagers: ['simple-git-hooks'], services: withBiome(BIOME_VERSION) } }), {}, /another hook manager/],
       ['pre-commit config elsewhere', hookDraft('pre-commit'), { '.pre-commit-config.yml': PRE_COMMIT }, /\.pre-commit-config\.yaml/],
       ['lefthook config elsewhere', hookDraft('lefthook'), { '.lefthook.yml': LEFTHOOK }, /lefthook\.yml/],
-      ['re-run', hookDraft('husky'), { [HOOK_FILES.husky]: `${HUSKY}# pipegen:hooks begin: x\n# pipegen:hooks end\n` }, /no second time/],
+      // G13-R2: a marker without pipegen's exact block is not in place (the exact block's re-run is the G13-R2 describe)
+      ['re-run', hookDraft('husky'), { [HOOK_FILES.husky]: `${HUSKY}# pipegen:hooks begin: x\n# pipegen:hooks end\n` }, /is not pipegen's block as pipegen writes it/],
     ];
     for (const [name, draft, files, re] of cases) {
       const r = await precommitFiles(draft, reviewedList(), repo(files));
@@ -448,5 +449,41 @@ describe('G6: carries (G1-R2 m5, m6; secrets hook; Plan J G-J1)', () => {
     const r = await precommitFiles(hookDraft('pre-commit'), reviewedList(), dir);
     expect(r.files).toEqual([]);
     expect(r.notes.join('\n')).toMatch(/symbolic link|could not read/);
+  });
+});
+
+describe('G13-R2: a hook file counts as in place only with pipegen\'s exact block once (ruling G13-R2 2)', () => {
+  it('precommit: the block written before counts; `|| true`, commented out, marker only, twice, or anything else does not (with a note)', async () => {
+    for (const manager of ['pre-commit', 'lefthook', 'husky'] as const) {
+      const original = { 'pre-commit': PRE_COMMIT, lefthook: LEFTHOOK, husky: HUSKY }[manager];
+      const path = HOOK_FILES[manager];
+      const first = await precommitFiles(hookDraft(manager), reviewedList(), repo({ [path]: original }));
+      const written = first.files[0]?.content as string;
+      const inserted = first.edits[0]?.kind === 'hooks' ? first.edits[0].inserted : '';
+      expect(written, manager).toContain('pipegen:hooks');
+      // the exact block, once: in place, with the setup command
+      const again = await precommitFiles(hookDraft(manager), reviewedList(), repo({ [path]: written }));
+      expect(again.inPlace?.map((x) => x.path), manager).toEqual([path]);
+      expect(again.setupCommand, manager).toBe(first.setupCommand);
+      // the trusted record's inserted text for that path counts too (an older block)
+      const old = written.replace(inserted, inserted.replace(/pipegen:hooks/, 'pipegen:hooks (older)'));
+      const recorded = await precommitFiles(hookDraft(manager), reviewedList(), repo({ [path]: old }), [{ path, inserted: inserted.replace(/pipegen:hooks/, 'pipegen:hooks (older)') }]);
+      expect(recorded.inPlace?.map((x) => x.path), manager).toEqual([path]);
+      const run0 = /(npx|pipegen)[^\n"]*/.exec(inserted)?.[0] as string;
+      expect(run0, manager).toBeDefined();
+      const notSet = [
+        written.replace(run0, `${run0} || true`),                                   // a command that can't fail
+        written.replace(inserted, inserted.split('\n').map((l) => (l === '' ? l : `# ${l}`)).join('\n')),   // commented out
+        written.replace(inserted, `# pipegen:hooks\n`),                             // the marker only
+        `${written}${inserted}`,                                                    // the block twice
+      ];
+      for (const [k, text] of notSet.entries()) {
+        const r = await precommitFiles(hookDraft(manager), reviewedList(), repo({ [path]: text }));
+        expect(r.inPlace, `${manager} #${k}`).toBeUndefined();
+        expect(r.files, `${manager} #${k}`).toEqual([]);
+        expect(r.setupCommand, `${manager} #${k}`).toBe('');
+        expect(r.notes.join('\n'), `${manager} #${k}`).toMatch(/is not pipegen's block as pipegen writes it/);
+      }
+    }
   });
 });

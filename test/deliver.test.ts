@@ -325,6 +325,42 @@ describe('G10 delivery: central and the pin (S26)', () => {
     expect((await record(w))?.centralSha).toBe(c.sha);
   });
 
+  it('G13 carry 60: a re-run whose record already names the public key (finish --rotate-key) asks for no key pair and stores none', async () => {
+    const signing = { signing: { mode: 'key-env' as const, images: [], cosignPubSha256: pubKeySha256(SIGNING.pub) } };
+    const w = world();
+    const first = await firstRun(w, {}, { signingKey: async () => SIGNING }, {}, signing);
+    const p = profile();
+    const before = w.g.calls.length;
+    const v2 = new SecretVault();
+    v2.set(KEY, KEY_VALUE);
+    const res2 = await deliver(w.g.octokit(), p, planDelivery(input(p, first.pin, {}, signing.signing === undefined ? {} : signing)), v2, deps(w));
+    expect(res2.prNumber).toBe(first.res.prNumber);
+    expect(w.g.calls.slice(before).some((c) => c.route.startsWith('PUT') && c.route.includes('/secrets/{secret_name}') && String(nameOf(c)).startsWith('PIPEGEN_COSIGN'))).toBe(false);
+    const rec = await record(w, `pipegen/update-${centralProjectName('r')}`) ?? await record(w);
+    expect(rec?.cosignPubSha256).toBe(pubKeySha256(SIGNING.pub));
+    expect(rec?.environments.map((e) => e.name)).toContain('pipegen-signing');
+    // a key the record doesn't name still needs the pair
+    const v3 = new SecretVault();
+    v3.set(KEY, KEY_VALUE);
+    const other = { signing: { ...signing.signing, cosignPubSha256: 'f'.repeat(64) } };
+    await expect(deliver(w.g.octokit(), p, planDelivery(input(p, first.pin, {}, other)), v3, deps(w))).rejects.toThrow(/needs the key pair/);
+  });
+
+  it('G13 carry 24: the central Actions access level the proof changed is recorded once, never replaced by a later run', async () => {
+    const w = world();
+    const p = profile();
+    await firstRun(w, { proofRepos: { central: { repoId: 77, createdByPipegen: true, actionsAccess: { previous: 'none' } }, scratch: { createdByPipegen: true } } });
+    expect((await record(w))?.central?.actionsAccess).toEqual({ previous: 'none' });
+    // a later run sees the level pipegen set ('user') as "before": the first one stays
+    const v2 = new SecretVault();
+    v2.set(KEY, KEY_VALUE);
+    const c2 = await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w));
+    if (c2.kind !== 'pinned') throw new Error('expected a pin');
+    await deliver(w.g.octokit(), p, planDelivery(input(p, c2.sha, { proofRepos: { central: { createdByPipegen: false, actionsAccess: { previous: 'user' } } } })), v2, deps(w));
+    const rec = await record(w, `pipegen/update-${centralProjectName('r')}`) ?? await record(w);
+    expect(rec?.central?.actionsAccess).toEqual({ previous: 'none' });
+  });
+
   it('deliver: second run updates PR and opens central PR', async () => {
     const w = world();
     const first = await firstRun(w);

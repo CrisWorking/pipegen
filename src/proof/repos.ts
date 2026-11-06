@@ -65,6 +65,11 @@ export interface ProofRepoOptions {
    */
   onCreated?: (repo: string, id: number) => void;
   /**
+   * G13-R2 3 (sec m2): called right after the PUT that changed the central repo's Actions access level, with the level before, so the state
+   * file keeps it even when a later step throws (Plan G: store.recordActionsAccess). It must write synchronously.
+   */
+  onAccessChanged?: (previous: string) => void;
+  /**
    * E8 fix rounds 1-2 (review M-3, O-2): gives the create permit right before pipegen creates a helper repo (App mode). Plan G
    * passes `() => store.createPermit()`, which only an armed StateStore gives, so no repo is made before the Ctrl-C cleanup is
    * registered. Without it, pipegen never creates a repo (a stop, before any create call); a throw stops the proof the same way.
@@ -90,6 +95,8 @@ export interface ProofRepos {
   defaultBranchState?: DefaultBranchState;
   /** Organisations only. */
   orgPerm?: OrgPermission;
+  /** G13 carry 24: the central repo's Actions access level before pipegen changed it (absent: unchanged). */
+  actionsAccess?: { previous: string };
   /** When ready: checkScratchAccess's result (E4 passes its `accepted` back when it checks again). */
   access?: ScratchAccess;
 }
@@ -505,9 +512,9 @@ export async function checkActionsAllowed(gh: Octokit, scratch: GuardedRepo, act
  * `pipelines` holds install records only): otherwise nothing is called. Read first; written only when different
  * ('enterprise' already covers an organisation). A refusal is a ProofStopError with the setting to change by hand.
  */
-export async function ensureActionsAccess(gh: Octokit, t: ProofTarget, app: ProofApp, clock: RateClock = clockOf(gh)): Promise<void> {
+export async function ensureActionsAccess(gh: Octokit, t: ProofTarget, app: ProofApp, clock: RateClock = clockOf(gh), onChanged?: (previous: string) => void): Promise<{ previous: string } | undefined> {
   const central = assertCentral(t, app);
-  if (!t.appPrivate) return;
+  if (!t.appPrivate) return undefined;
   const org = t.ownerType === 'Organization';
   const level = org ? 'organization' : 'user';
   let current: unknown;
@@ -516,7 +523,7 @@ export async function ensureActionsAccess(gh: Octokit, t: ProofTarget, app: Proo
   } catch (e) {
     rethrowHard(gh, e);
   }
-  if (current === level || (org && current === 'enterprise')) return;
+  if (current === level || (org && current === 'enterprise')) return undefined;
   try {
     await guardedWrite(gh, central, 'PUT /repos/{owner}/{repo}/actions/permissions/access', { access_level: level }, clock);
   } catch (e) {
@@ -526,6 +533,11 @@ export async function ensureActionsAccess(gh: Octokit, t: ProofTarget, app: Proo
     throw new ProofStopError(`pipegen couldn't let ${t.scratch} use the workflows in ${central.fullName} (${saidOf(e)}). `
       + `Set it by hand: ${central.fullName} → Settings → Actions → General → Access → "${choice}", then run pipegen again.`);
   }
+  // G13 carry 24: the level before, for the install record (Plan V's uninstall puts it back); an unreadable one is 'none'. G13-R2 3: told at
+  // once (outside the refusal handling above: a throw from the callback is not a refused PUT)
+  const previous = typeof current === 'string' && /^(?:none|user|organization|enterprise)$/.test(current) ? current : 'none';
+  onChanged?.(previous);
+  return { previous };
 }
 
 // ---------- default branch (S1) ----------
@@ -716,7 +728,8 @@ export async function checkProofRepos(gh: Octokit, app: ProofApp, opts: ProofRep
 
   // the proof's actions are allowed in the scratch repo (S13); the central workflows are callable (private projects)
   await checkActionsAllowed(gh, scratch, opts.actions, (w) => io.err(w), clock);
-  await ensureActionsAccess(gh, t, app, clock);
+  const changed = await ensureActionsAccess(gh, t, app, clock, opts.onAccessChanged);
+  if (changed !== undefined) result.actionsAccess = changed;
   result.defaultBranchState = await setScratchDefaultBranch(gh, scratch, clock);
   result.scratchDefaultBranch = t.defaultBranch;
   result.ready = true;

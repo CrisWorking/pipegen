@@ -54,10 +54,11 @@ import { emptyRepoFiles } from '../read/quality.js';
 import { MAX_WORKFLOWS, tagPinnedOf, WORKFLOW_FILE } from '../read/workflows.js';
 import { PROTECTED_PATHS_BASE, type Capabilities, type CreatedFile, type EnvSettings, type ExistingWorkflow, type InstallEdit, type InstallPlanned, type InstallRecord, type Plan, type RepoProfile } from '../types.js';
 import { safeText } from '../util/safe-text.js';
-import { makeCosignKeyPair, type CosignExec, type CosignResolver } from './cosign-keys.js';
+import { generateCosignKeys } from '../layers/deploy.js';
+import type { CosignExec, CosignResolver } from './cosign-keys.js';
 import { ensureSigningEnvironment, plannedOfLocks, readEnv, SETUP_BRANCH } from './deliver.js';
 import { DeliverError, isoAt, readBlobText, readHead, readRepo, readTree, statusOf, type RepoRef, type TreeEntry } from './git-data.js';
-import { centralOf, centralUpdateBranch, localFinishPendingPath, readFinishPending, readLocalRecord, RecordError, writeFinishPending, writeRecord, type FinishPending, type LocalRecordDeps } from './record.js';
+import { centralOf, centralUpdateBranch, localFinishPendingPath, protectedPathsOfRecord, readFinishPending, readLocalRecord, RecordError, writeFinishPending, writeRecord, type FinishPending, type LocalRecordDeps } from './record.js';
 import { classicPutForm, holdsWanted, isObj, PLANNED_ROUTES, refusedAsUnavailable, SettingsApi } from './settings-api.js';
 import { trustedPrevious } from './trust.js';
 
@@ -97,8 +98,13 @@ export interface FinishDeps {
   clock?: RateClock; now?: () => Date; local?: LocalRecordDeps;
   /** The trust question (G10-R-sec6): only an interactive run (a terminal, no --yes, not CI) may ask it. */
   io?: Prompter; interactive?: boolean;
-  /** Where the key pair is made (a fresh 0700 folder in it, removed after). Default: the OS temp folder. */
-  tmpDir?: string;
+  /**
+   * G13 (carry 28, BINDING): where the key pair is made, a fresh 0700 folder in it, removed after (generateCosignKeys). It must be a memory
+   * folder (tmpfs or ramfs), so the key never reaches a disk; anything else is refused before cosign runs. Default: /dev/shm.
+   */
+  keyBase?: string;
+  /** Test seam: whether a folder is a memory folder (default: the statfs check, isMemoryFolder). */
+  isMemory?: (dir: string) => boolean;
 }
 export interface FinishResult {
   applied: string[]; skipped: { what: string; why: string }[]; notes: string[];
@@ -110,7 +116,7 @@ export interface FinishResult {
 type EnvEntry = InstallRecord['environments'][number];
 type VarEntry = InstallRecord['variables'][number];
 type SecretEntry = InstallRecord['secrets'][number];
-interface CoFacts { path: string | null; text: string; isSymlink: boolean; block: string | null }
+export interface CoFacts { path: string | null; text: string; isSymlink: boolean; block: string | null }
 interface Ctx {
   gh: Octokit; api: SettingsApi; app: RepoRef; central: RepoRef; clock: RateClock; deps: FinishDeps; print: boolean; rotate: boolean;
   rec: InstallRecord; typed: boolean; planned: InstallPlanned; fresh: LockPlan; profile: RepoProfile; caps: Capabilities; shaRead: ShaPinningRead;
@@ -233,7 +239,7 @@ function ownersOf(block: string | null): string[] {
   for (const line of block.split('\n').slice(1, -1)) for (const t of line.trim().split(/\s+/).slice(1)) if (/^@[A-Za-z0-9-]+$/.test(t) && !out.includes(t)) out.push(t);
   return out;
 }
-async function coFacts(gh: Octokit, r: RepoRef, entries: ReadonlyMap<string, TreeEntry>, clock: RateClock): Promise<CoFacts> {
+export async function coFacts(gh: Octokit, r: RepoRef, entries: ReadonlyMap<string, TreeEntry>, clock: RateClock): Promise<CoFacts> {
   for (const path of CO_PLACES) {
     const e = entries.get(path);
     if (e === undefined) continue;
@@ -653,7 +659,7 @@ async function signing(x: Ctx): Promise<void> {
       x.commands.push(`gh secret set ${COSIGN_KEY_SECRET} --env ${SIGNING_ENVIRONMENT} --repo ${repo} < pipegen-signing.key`);
       x.commands.push(`gh secret set ${PASSWORD_SECRET} --env ${SIGNING_ENVIRONMENT} --repo ${repo} < pipegen-signing.password`);
       x.commands.push(`gh variable set ${COSIGN_PUB_VAR} --env ${SIGNING_ENVIRONMENT} --repo ${repo} < pipegen-signing.pub`);
-      x.commands.push('# Then delete the three files. The verify step checks the new public key\'s sha256 only after a pull request puts it in your workflow (run `npx pipegen` again).');
+      x.commands.push('# Then delete the three files. The verify step checks the new public key\'s sha256 only after a pull request puts it in your workflow (run `npx pipegen run` again).');
     } else if (x.rec.cosignPub !== undefined) await step(x, whatPub, () => setVariable(x, SIGNING_SCOPE, COSIGN_PUB_VAR, x.rec.cosignPub as string, whatPub));
     else x.skipped.push(noPub());
     return;
@@ -677,7 +683,12 @@ async function signing(x: Ctx): Promise<void> {
     let made = false;
     let fresh = '';
     await step(x, whatKey, async () => {
-      const pair = await makeCosignKeyPair(x.deps.cosignBin, x.deps.exec, x.deps.tmpDir);
+      // G13 (carry 28): only in a memory folder (generateCosignKeys refuses any other, before cosign runs)
+      const keys = await generateCosignKeys(x.deps.cosignBin, {
+        ...(x.deps.exec === undefined ? {} : { exec: x.deps.exec }), ...(x.deps.keyBase === undefined ? {} : { base: x.deps.keyBase }),
+        ...(x.deps.isMemory === undefined ? {} : { isMemory: x.deps.isMemory }),
+      });
+      const pair = { key: keys.privateKey, password: keys.password, pub: keys.publicKey };
       const stores: [string, () => Promise<void>][] = [
         [COSIGN_KEY_SECRET, () => storeCosignKey(x.gh, x.app, SIGNING_ENVIRONMENT, pair.key, x.clock)],
         [PASSWORD_SECRET, () => storeEnvSecret(x.gh, x.app, SIGNING_ENVIRONMENT, PASSWORD_SECRET, pair.password, x.clock)],
@@ -706,7 +717,7 @@ async function signing(x: Ctx): Promise<void> {
     pub = fresh;
     x.applied.push(whatKey);
     x.notes.push('The new signing key replaces the old one: images signed with the old key won\'t verify any more. Re-run the pipeline on the commit you deploy to sign it again with the new key.');
-    x.notes.push('The verify step fails closed until a pull request puts the new public key\'s sha256 in your workflow: that literal changes only through a pull request (run `npx pipegen` again to open it).');
+    x.notes.push('The verify step fails closed until a pull request puts the new public key\'s sha256 in your workflow: that literal changes only through a pull request (run `npx pipegen run` again to open it).');
     x.newKey = true;
   } else {
     const p = x.rec.cosignPub;
@@ -915,7 +926,7 @@ export async function finish(gh: Octokit, app: RepoRef, opts: FinishOpts, deps: 
     };
     // the inputs from the record (a typed record carries none: re-derived from the CODEOWNERS block on the default branch)
     const owners = typed ? ownersOf(appCo.block) : rec.planned.owners.app;
-    const protectedPaths = rec.protectedPaths.length > 0 ? rec.protectedPaths : [...PROTECTED_PATHS_BASE];
+    const protectedPaths = rec.protectedPaths.length > 0 ? protectedPathsOfRecord(rec.protectedPaths) : [...PROTECTED_PATHS_BASE];
     const coEdit = rec.edits.find((e) => e.repo === 'app' && e.kind === 'codeowners' && e.path === appCo.path) as { inserted: string } | undefined;
     const inserted = coEdit !== undefined && appCo.text.split(coEdit.inserted).length === 2 ? coEdit.inserted : appCo.block;
     const fresh = planLocks({

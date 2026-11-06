@@ -69,8 +69,25 @@ const API = z.strictObject({
 });
 /** The deepest nesting a record may have (fix round 1, m2): deeper is refused with a plain reason before the schema runs. */
 export const MAX_RECORD_DEPTH = 32;
+/**
+ * G13-R2 1: the protected paths in the record. CODEOWNERS and the gate anchor a name to the root with a leading `/` (`/trivy.yaml`: the root
+ * only; `trivy.yaml`: any depth). The record holds repo-relative paths only (REL), so a root-anchored entry is kept as `./name` (still the root
+ * only, also for the gate's matcher) and read back as `/name`. The one pair of conversions, used by deliver (write) and finish/verify (read).
+ * G13-R2b m1: what can't be kept exactly is refused (more than one leading `/`, an empty or `.` segment), never rewritten.
+ */
+export const protectedPathsForRecord = (paths: readonly string[]): string[] => paths.map((p) => {
+  if (!p.startsWith('/')) return p;
+  const rest = p.slice(1);
+  if (rest.startsWith('/') || !segmentsOk(rest)) throw new RecordError(`The protected path ${JSON.stringify(p.slice(0, 200))} can't be kept in the install record exactly (an empty or "." segment, or more than one leading slash).`);
+  return `./${rest}`;
+});
+export const protectedPathsOfRecord = (paths: readonly string[]): string[] => paths.map((p) => (p.startsWith('./') ? `/${p.replace(/^(?:\.\/)+/, '')}` : p));
+/** At least one segment, none empty, `.` or `..`. */
+const segmentsOk = (p: string): boolean => p !== '' && p.split('/').every((s) => s !== '' && s !== '.' && s !== '..');
 /** A repo-relative path or glob pattern: no absolute path, no backslash, no `..` segment (fix round 1, m3). */
 const REL = z.string().max(400).refine((p) => p !== '' && !p.startsWith('/') && !p.includes('\\') && !p.split('/').includes('..'), 'not a repo-relative path');
+/** G13-R2b m1: a protected path: REL, and after one optional leading `./`, at least one segment and none empty, `.` or `..`. */
+const PROTECTED_REL = REL.refine((p) => segmentsOk(p.startsWith('./') ? p.slice(2) : p), 'not a protected path pipegen writes');
 const ENV_SETTINGS = z.strictObject({
   wait_timer: z.number().int().min(0).max(43_200), prevent_self_review: z.boolean(),
   reviewers: z.array(z.strictObject({ type: z.enum(['User', 'Team']), id: ID })).max(6),
@@ -85,7 +102,9 @@ const OWNER_EDITED = { ownerEdited: z.literal(true).optional() };
 const EDIT_BASE = { path: PATH, originalSha: SHA, writtenShas: SHAS, ...OWNER_EDITED };
 const EDIT = z.discriminatedUnion('kind', [
   z.strictObject({ repo: REPO_KIND, path: PATH, kind: z.enum(['codeowners', 'hooks', 'dependabot']), inserted: z.string().max(256 * 1024), originalSha: SHA.nullable(), writtenShas: SHAS, ...OWNER_EDITED }),
-  z.strictObject({ repo: z.literal('app'), ...EDIT_BASE, kind: z.literal('verify-job'), jobs: z.array(z.string().max(100)).min(1).max(50), needs: z.array(z.strictObject({ job: z.string().max(100), added: z.array(z.string().max(100)).max(50) })).max(200) }),
+  // G13 (G7-R1, G7-R2 carries): headCheck = the user's jobs pipegen started with its head check; a called workflow (jobs empty) holds only those
+  z.strictObject({ repo: z.literal('app'), ...EDIT_BASE, kind: z.literal('verify-job'), jobs: z.array(z.string().max(100)).max(50), needs: z.array(z.strictObject({ job: z.string().max(100), added: z.array(z.string().max(100)).max(50) })).max(200), headCheck: z.array(z.string().max(100)).min(1).max(50).optional() })
+    .refine((e) => e.jobs.length > 0 || (e.headCheck?.length ?? 0) > 0, 'a verify-job edit records a job pipegen inserted or a head check'),
   z.strictObject({ repo: z.literal('app'), ...EDIT_BASE, kind: z.literal('package-json'), add: z.record(z.string().max(214).refine((k) => !PROTO_KEYS.has(k)), z.string().max(100)), setTest: z.boolean(), previousTest: z.string().max(10_000).optional(), lock: PATH.optional() }),
   z.strictObject({ repo: z.literal('app'), ...EDIT_BASE, kind: z.literal('package-lock'), json: PATH }),
 ]);
@@ -125,7 +144,7 @@ export const InstallRecordSchema = z.strictObject({
     owners: z.strictObject({ app: z.array(LOGIN).max(50), central: z.array(LOGIN).max(50) }),
     codeOwners: z.array(LOGIN).max(50),
   }),
-  protectedPaths: z.array(REL).max(2000),
+  protectedPaths: z.array(PROTECTED_REL).max(2000),
   cosignPubSha256: SHA256.optional(), blockFrom: DAY.optional(),
   cosignPub: z.string().max(MAX_COSIGN_PUB_BYTES).refine((v) => cosignPubProblem(v) === null, 'not a cosign public key').optional(),
 }).superRefine((r, ctx) => {
