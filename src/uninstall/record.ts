@@ -1,0 +1,235 @@
+// v0.2 Plan V V1 (rulings V-B1, V-B6, V-S1, V-S2, V-S13, V-N2, V-N4, V-N13, V-N14): the install record uninstall works from, and only that.
+// Uninstall may delete only what the record proves pipegen created, so the record is read through the one trust order every pipegen
+// command uses (trustedPrevious, src/deliver/trust.ts), never through a second parser:
+//   - full trust: this machine's local record file holds the record's hash;
+//   - typed trust: the user typed the app repo's name after seeing the record's names (now, or on an earlier run): only confirmView's view
+//     is granted, and every field it drops (edits, previous settings, classic protection, the org rule, central and scratch facts) becomes
+//     a manual step for the plan (TYPED_DROPPED);
+//   - anything else (no record, a record that doesn't match the local file, an unreadable one, no terminal to ask at): stop.
+// The app's facts (id, visibility, default branch, owner type) are GitHub's, never the record's; a record of another repo id stops. An open
+// central pull request on pipegen/update-<name> can still change the record: stop until it is merged or closed. The setup pull request's
+// record marker is never trust (any app writer can edit it): it is compared for a warning only, and a differing or missing one makes the
+// plan ask for a typed name before every API delete and restore. Typed names come only from the user's terminal (askTypedName).
+import type { Octokit } from '@octokit/rest';
+import { PromptCancelledError, type Prompter } from '../cli/io.js';
+import { isRateStop, type RateClock } from '../engine/github-rate.js';
+import { clockOf, GitHubAccessError } from '../github/client.js';
+import { SETUP_BRANCH } from '../deliver/deliver.js';
+import { DeliverError, ghRead, readHead, readRepo, statusOf, type RepoRef } from '../deliver/git-data.js';
+import {
+  canonicalRecordJson, centralOf, centralUpdateBranch, localRecordPath, readLocalRecord, readRecord, RecordError, recordMarkerOf, recordPath,
+  type LocalRecordDeps, type ReadRecordResult,
+} from '../deliver/record.js';
+import { confirmView, TYPED_VIEW_FIELDS, trustedPrevious } from '../deliver/trust.js';
+import type { InstallRecord } from '../types.js';
+import { safeText } from '../util/safe-text.js';
+import { UninstallError } from './errors.js';
+
+/** The app repo as GitHub reports it now (readRepo), never as the record says. */
+export interface UninstallApp extends RepoRef { repoId: number; private: boolean; defaultBranch: string; ownerType: 'User' | 'Organization' }
+
+export interface LoadedRecord {
+  app: UninstallApp;
+  /** The trusted record (full trust), or confirmView's view of it (typed trust). */
+  record: InstallRecord;
+  /** typed: the fields in `dropped` are absent; the plan lists what they'd have undone as manual steps (V-N4). */
+  trust: 'full' | 'typed';
+  /** The record file's blob sha and the central default head it was read at: V4/V5 re-check both before they act (V-S9). */
+  blobSha: string; centralHead: string;
+  /** The setup pull request body's marker against the record's hash. Never a trust source (V-S2): differs/absent → typed names downstream. */
+  marker: 'match' | 'differs' | 'absent';
+  /** The local record file's setup PR, else the newest pull request on pipegen/setup (V-N14); never a number from the record. */
+  setupPr: number | null;
+  /** typed trust: the record fields (and `<kind>.<field>` entry fields) the view doesn't hold (TYPED_DROPPED); full trust: []. */
+  dropped: readonly string[];
+  /** Plain lines for the preview (names only). */
+  warnings: string[];
+}
+
+export interface UninstallDeps {
+  /** The user's terminal; typed names are asked only through it, and only when `interactive` is true (V-S13). */
+  io?: Prompter; interactive?: boolean;
+  local?: LocalRecordDeps; clock?: RateClock;
+}
+
+/**
+ * What a typed trust never grants (TYPED_VIEW_FIELDS, G10-R5): the record fields it drops or writes fresh, and each entry kind's dropped or
+ * fresh fields as `<kind>.<field>`. Built from the allow-list itself, so a field it classifies later shows up here without an edit.
+ */
+export const TYPED_DROPPED: readonly string[] = Object.freeze((() => {
+  const f = TYPED_VIEW_FIELDS;
+  const out: string[] = [...f.record.drop, ...f.record.fresh];
+  for (const [kind, v] of Object.entries(f)) {
+    if (kind === 'record' || kind === 'orgRuleset') continue;   // orgRuleset is dropped whole (in record.drop)
+    const x = v as { drop?: readonly string[]; fresh?: readonly string[] };
+    for (const k of [...(x.drop ?? []), ...(x.fresh ?? [])]) out.push(`${kind}.${k}`);
+  }
+  return out;
+})());
+
+const show = (s: string, n = 140): string => safeText(s, n);
+const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/** The user's terminal, or a stop: typed names are never taken from a flag, an env variable or a run without a terminal (V-S13). */
+function terminalOf(deps: Pick<UninstallDeps, 'io' | 'interactive'>, what: string): Prompter {
+  if (deps.interactive !== true || deps.io === undefined) {
+    throw new UninstallError(`pipegen needs you to ${what} at a terminal, and this run has none (no terminal, --yes, or CI). Nothing was changed. Run \`npx pipegen uninstall\` at a terminal.`);
+  }
+  return deps.io;
+}
+
+/**
+ * Asks the user to type `expected` (exactly, surrounding spaces ignored) after `question`. True only for that name; a wrong name or a
+ * cancelled question is false. No terminal: UninstallError, nothing asked. `question` must already be safe to print (safeText);
+ * `expected` is shown through safeText.
+ */
+export async function askTypedName(deps: Pick<UninstallDeps, 'io' | 'interactive'>, expected: string, question: string): Promise<boolean> {
+  const io = terminalOf(deps, `type ${show(expected, 120)} to confirm`);
+  let typed: string;
+  try { typed = await io.text(`${question}\nType ${show(expected, 120)} to go on; anything else, and pipegen leaves it.`); } catch (e) {
+    if (e instanceof PromptCancelledError) return false;
+    throw e;
+  }
+  return typeof typed === 'string' && typed.trim() === expected;
+}
+
+/** A pull request of `r` by number, or null (404 after the repo itself was read). */
+async function readPull(gh: Octokit, r: RepoRef, n: number, clock: RateClock): Promise<Record<string, unknown> | null> {
+  try {
+    const d = await ghRead(gh, 'GET /repos/{owner}/{repo}/pulls/{pull_number}', r, { pull_number: n }, clock);
+    return isObj(d) ? d : null;
+  } catch (e) {
+    if (statusOf(e) === 404) return null;
+    throw e;
+  }
+}
+
+/** The pull requests of `r` whose head is `owner:branch`, in `state`, numbers newest first. */
+async function pullsOn(gh: Octokit, r: RepoRef, branch: string, state: 'open' | 'all', clock: RateClock): Promise<number[]> {
+  const d = await ghRead(gh, 'GET /repos/{owner}/{repo}/pulls', r, { head: `${r.owner}:${branch}`, state, per_page: 100 }, clock);
+  const list = Array.isArray(d) ? d.filter(isObj) : [];
+  return list
+    .filter((p) => isObj(p.head) && p.head.ref === branch && Number.isSafeInteger(p.number) && (p.number as number) > 0 && (state === 'all' || p.state === 'open'))
+    .map((p) => p.number as number)
+    .sort((a, b) => b - a);
+}
+
+/** V-N14: the local record file's setup PR when it is one on pipegen/setup, else the newest pull request on pipegen/setup. */
+async function setupPrOf(gh: Octokit, app: RepoRef, localPr: number | undefined, clock: RateClock, warnings: string[]): Promise<{ number: number; body: string } | null> {
+  const asSetup = (d: Record<string, unknown> | null): string | null => (d !== null && isObj(d.head) && d.head.ref === SETUP_BRANCH ? (typeof d.body === 'string' ? d.body : '') : null);
+  if (localPr !== undefined) {
+    const body = asSetup(await readPull(gh, app, localPr, clock));
+    if (body !== null) return { number: localPr, body };
+    warnings.push(`This machine's local record file names pull request #${localPr}, which is not pipegen's setup pull request (branch ${SETUP_BRANCH}); pipegen looked for it by its branch instead.`);
+  }
+  for (const n of await pullsOn(gh, app, SETUP_BRANCH, 'all', clock)) {
+    const body = asSetup(await readPull(gh, app, n, clock));
+    if (body !== null) return { number: n, body };
+  }
+  return null;
+}
+
+/** The record on `branch`, or null (none there, or one that can't be read: it can't be the trusted one then). */
+async function reread(gh: Octokit, central: RepoRef, appRepo: string, branch: string, clock: RateClock): Promise<ReadRecordResult | null> {
+  try { return await readRecord(gh, central, appRepo, { branch, clock }); } catch (e) {
+    if (e instanceof RecordError) return null;
+    throw e;
+  }
+}
+
+/** Whether `found` is the record behind `trusted` (the same record, or, typed, the record whose view it is). */
+function behind(found: ReadRecordResult | null, trusted: InstallRecord, typed: boolean): boolean {
+  if (found === null) return false;
+  if (!typed) return canonicalRecordJson(found.record) === canonicalRecordJson(trusted);
+  const cv = confirmView(found.record);
+  return 'view' in cv && canonicalRecordJson(cv.view) === canonicalRecordJson(trusted);
+}
+
+/**
+ * The install record of `app` that uninstall may act on (see the header). Throws UninstallError, with nothing changed on GitHub, when there
+ * is none, it isn't trusted, it is another repo's, or an open central pull request can still change it. A rate stop or a rejected token
+ * passes through as is.
+ */
+export async function loadUninstallRecord(gh: Octokit, app: RepoRef, deps: UninstallDeps = {}): Promise<LoadedRecord> {
+  try { return await load(gh, app, deps); } catch (e) {
+    if (e instanceof UninstallError || isRateStop(e) || e instanceof GitHubAccessError) throw e;
+    if (e instanceof DeliverError || e instanceof RecordError) throw new UninstallError(`${e.message} Nothing was changed.`, { cause: e });
+    throw e;
+  }
+}
+
+async function load(gh: Octokit, app: RepoRef, deps: UninstallDeps): Promise<LoadedRecord> {
+  const clock = deps.clock ?? clockOf(gh);
+  const name = show(`${app.owner}/${app.repo}`);
+  const none = `No install record for ${name}. pipegen only removes what it recorded installing.`;
+  const warnings: string[] = [];
+
+  // 1. the app, as GitHub reports it
+  const a = await readRepo(gh, app, clock);
+  if (a === null) throw new UninstallError(`pipegen can't see ${name} (it isn't there, or this login has no access to it), so it removes nothing.`);
+  const uapp: UninstallApp = { owner: app.owner, repo: app.repo, repoId: a.id, private: a.private, defaultBranch: a.defaultBranch, ownerType: a.ownerType };
+
+  // the private central repo the record lives in (records-only for a public app, V-N13)
+  const central = centralOf(app);
+  const centralName = show(`${central.owner}/${central.repo}`);
+  const c = await readRepo(gh, central, clock);
+  if (c === null) throw new UninstallError(`${none} (pipegen can't see ${centralName}, where it keeps its install records.)`);
+  if (!c.private) throw new UninstallError(`${centralName} is public; pipegen keeps install records only in a private one, so it won't act on a record there. Nothing was changed.`);
+
+  // 4. an open central pull request on pipegen/update-<name> can still change the record: stop before anything is asked
+  const update = centralUpdateBranch(app.repo);
+  const open = await pullsOn(gh, central, update, 'open', clock);
+  if (open.length > 0) {
+    throw new UninstallError(`pipegen's central pull request #${open[0]} (branch ${show(update, 120)}) in ${centralName} is still open, and it can change the install record. Merge or close it first, then run \`npx pipegen uninstall\` again. Nothing was changed.`);
+  }
+  const updateExists = await readHead(gh, central, update, clock) !== null;
+
+  // 2. the one trust order; a typed confirmation only from the user's terminal (V-S13)
+  const notes: string[] = [];
+  const confirm = deps.io !== undefined && deps.interactive === true ? { io: deps.io, interactive: true } : undefined;
+  const trusted = await trustedPrevious(gh, app, central, c.defaultBranch, updateExists ? update : null, deps.local ?? {}, clock, notes, confirm);
+  if (trusted.record === null) {
+    if (!trusted.exists) throw new UninstallError(none);
+    const file = localRecordPath(app, deps.local ?? {});
+    const wayOn = trusted.why === 'mismatch'
+      ? `This machine's local record file ${show(file, 300)} holds another record's hash. If you set pipegen up from another machine, move that file away and run \`npx pipegen uninstall\` again at a terminal: pipegen then shows what the record claims and asks you to type the repo name.`
+      : confirm === undefined
+        ? 'This machine has no local record file for it. Run `npx pipegen uninstall` at a terminal: pipegen then shows what the record claims and asks you to type the repo name.'
+        : "You didn't confirm it by typing the repo name.";
+    throw new UninstallError(`pipegen found no install record for ${name} that it trusts, so it removes nothing. ${wayOn}${notes.length > 0 ? ` ${notes.join(' ')}` : ''}`);
+  }
+  const typed = trusted.typed === true;
+  const record = trusted.record;
+
+  // the record's file and the central head it was read at, for the re-checks before any change (the trusted one must be the default branch's)
+  const onDefault = await reread(gh, central, app.repo, c.defaultBranch, clock);
+  if (!behind(onDefault, record, typed)) {
+    const onBranch = updateExists ? await reread(gh, central, app.repo, update, clock) : null;
+    throw new UninstallError(behind(onBranch, record, typed)
+      ? `The install record pipegen trusts is on the central branch ${show(update, 120)} and not on the default branch of ${centralName}. Merge that change (or delete the branch), then run \`npx pipegen uninstall\` again. Nothing was changed.`
+      : `The install record in ${centralName} changed while pipegen read it. Run \`npx pipegen uninstall\` again. Nothing was changed.`);
+  }
+  const found = onDefault as ReadRecordResult;
+
+  // 3. the record must be this repository's (a renamed or re-created repo has another id)
+  if (record.app.repoId !== a.id || record.app.owner.toLowerCase() !== app.owner.toLowerCase() || record.app.repo.toLowerCase() !== app.repo.toLowerCase()) {
+    throw new UninstallError(`The install record ${show(recordPath(app.repo), 200)} names another repo id or name: ${name} is not the repository pipegen was installed in (re-created or renamed?), so pipegen removes nothing.`);
+  }
+  if (record.app.private !== a.private) warnings.push(`${name} is ${a.private ? 'private' : 'public'} now; it was ${record.app.private ? 'private' : 'public'} when pipegen set it up.`);
+  if (record.app.defaultBranch !== a.defaultBranch) warnings.push(`The default branch of ${name} is ${show(a.defaultBranch, 100)} now; pipegen set it up on ${show(record.app.defaultBranch, 100)}.`);
+
+  // 5. the setup pull request's marker: a warning, never trust
+  const local = await readLocalRecord(app, deps.local ?? {}).catch((e: unknown) => { if (e instanceof RecordError) return null; throw e; });
+  const pr = await setupPrOf(gh, app, local?.setupPr, clock, warnings);
+  const m = pr === null ? null : recordMarkerOf(pr.body);
+  const marker: LoadedRecord['marker'] = m === null ? 'absent' : m === found.hash ? 'match' : 'differs';
+  const ask = 'pipegen will ask you to type each name before it deletes or restores anything on GitHub.';
+  if (pr === null) warnings.push(`pipegen found no setup pull request (branch ${SETUP_BRANCH}) in ${name} to compare the record's hash with, so ${ask}`);
+  else if (marker === 'absent') warnings.push(`The setup pull request #${pr.number} holds no record marker on its last line, so ${ask}`);
+  else if (marker === 'differs') warnings.push(`The record marker in the setup pull request #${pr.number} doesn't match the install record (someone edited one of them), so ${ask}`);
+
+  // V-N4: what a typed trust doesn't grant
+  if (typed) warnings.push(`The install record was trusted by typing the repo name, so pipegen uses only the names you confirmed. It doesn't undo its edits, restore earlier settings, remove the merge locks or the org rule, or delete repos: those are manual steps it lists.`);
+
+  return { app: uapp, record, trust: typed ? 'typed' : 'full', blobSha: found.blobSha, centralHead: found.commit, marker, setupPr: pr?.number ?? null, dropped: typed ? TYPED_DROPPED : [], warnings };
+}
