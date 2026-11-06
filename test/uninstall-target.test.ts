@@ -757,6 +757,11 @@ describe('V3 fix round 1', () => {
     const gone = api((route) => { if (route === 'GET /repos/{owner}/{repo}') return { id: 101 }; throw httpErr(404); }, { raw: true });
     const g = await gone.api.restoreClassic({ branch: 'main', previous: prev }, planned, await typedOn(gone.api, main));
     expect(g.status).toBe('kept');
+    expect((g as { why: string }).why).toMatch(/is gone/);
+    // pipegen's plan for another branch says nothing about this one
+    const other = api((route) => (route.startsWith('GET ') ? asSet() : {}));
+    expect((await other.api.restoreClassic({ branch: 'main', previous: prev }, { ...planned, params: { ...planned.params, branch: 'release' } }, await typedOn(other.api, main))).status).toBe('kept');
+    expect(other.writes()).toEqual([]);
     expect(gone.writes()).toEqual([]);
   });
 
@@ -774,6 +779,8 @@ describe('V3 fix round 1', () => {
     const r = api((route) => (route.startsWith('GET ') ? liveRuleset({ id: 11, source: 'acme/pipelines' }) : {}));
     const gateTyped = await typedOn(r.api, { kind: 'ruleset', entry: rsEntry() });
     await expect(r.api.deleteIfPipegens({ kind: 'central-ruleset', id: 11 }, { typed: gateTyped })).rejects.toBeInstanceOf(UninstallRefusal);
+    const sameId = await typedOn(r.api, { kind: 'ruleset', entry: rsEntry({ id: 11 }) });   // the kind and repo bind it, not the id alone
+    await expect(r.api.deleteIfPipegens({ kind: 'central-ruleset', id: 11 }, { typed: sameId })).rejects.toBeInstanceOf(UninstallRefusal);
     expect(r.writes()).toEqual([]);
     // a token of another run (another UninstallApi) never counts here
     const o = api((route) => (route.startsWith('GET ') ? { name: 'PIPEGEN_X', created_at: AT } : {}));
@@ -919,6 +926,9 @@ describe('V3 fix round 1', () => {
     await expect(c.write('PUT /repos/{owner}/{repo}/actions/permissions/access', { owner: OWNER, repo: 'pipelines', access_level: 'none' })).rejects.toBeInstanceOf(UninstallRefusal);
     await expect(c.deleteBranch('central', 'pipegen/update-shop')).rejects.toBeInstanceOf(UninstallRefusal);
     expect(f.writes()).toEqual([]);
+    // a 404 is not "gone" when the parent repo GitHub answers for is another one (deleted and made again)
+    const p = new UninstallApi(fakeGh((route) => { if (route === 'GET /repos/{owner}/{repo}') return { id: 999 }; throw httpErr(404); }, { raw: true }).gh, APP, { clock: clock() });
+    await expect(p.deleteIfPipegens({ kind: 'ruleset', entry: rsEntry() })).rejects.toBeInstanceOf(UninstallRefusal);
     // the app's own id passes
     expect(await c.write('DELETE /repos/{owner}/{repo}/vulnerability-alerts', { owner: OWNER, repo: 'shop' })).toEqual({ status: 'done' });
   });
@@ -965,7 +975,7 @@ describe('V3 fix round 1', () => {
   });
 
   it('R1 sec M7: environment, variable and branch-policy restores go through their own checked functions', async () => {
-    const was = { wait_timer: 0, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: null, branch_policies: [] };
+    const was = { wait_timer: 30, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: null, branch_policies: [] };   // wait_timer: not changed by pipegen
     const entry = { name: 'pipegen-signing', created: false, githubCreatedAt: AT, previous: was, changed: ['deployment_branch_policy'], branchPolicyIds: [41] } as InstallRecord['environments'][number];
     const liveEnv = (dbp: unknown, created = AT) => ({ name: 'pipegen-signing', created_at: created, can_admins_bypass: true, protection_rules: [], deployment_branch_policy: dbp });
     const narrowed = { protected_branches: false, custom_branch_policies: true };
@@ -998,6 +1008,9 @@ describe('V3 fix round 1', () => {
     const mine = vr('the user set this');
     expect((await mine.api.restoreVariable(v, 'pipegens')).status).toBe('kept');
     expect((await mine.api.restoreVariable(v, undefined)).status).toBe('kept');
+    const noValue = api((route) => (route.startsWith('GET ') ? { name: 'PIPEGEN_BLOCK_FROM', created_at: AT } : {}));
+    expect((await noValue.api.restoreVariable(v, undefined)).status).toBe('kept');
+    expect(noValue.writes()).toEqual([]);
     expect(mine.writes()).toEqual([]);
     const envVar = vr('pipegens');
     expect((await envVar.api.restoreVariable({ ...v, scope: 'env:prod' }, 'pipegens'))).toMatchObject({ status: 'leftover', manual: expect.stringContaining('gh variable set PIPEGEN_BLOCK_FROM --env prod') });
