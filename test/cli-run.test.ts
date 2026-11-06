@@ -1342,6 +1342,15 @@ describe('G13-R2: a public app\'s central CODEOWNERS', () => {
 });
 
 describe('G13-R2: the state file never holds a known value (ruling G13-R2 4)', () => {
+  it('run: the state store\'s tokens hold the AI key too (G14, controller addendum)', async () => {
+    const w = world();
+    let guard: Parameters<RunStages['state']>[1] | undefined;
+    w.stages.state = async (p, g) => { guard = g; w.calls.push('state'); return StateStore.open(p, { home: w.home, env: {}, ...g }); };
+    const aiKey = ['made', 'up', 'ai', 'key', '0123456789'].join('-');
+    const other = ['other', 'ai', 'key', '0123456789'].join('-');
+    expect(await run(w, io({}, { env: { [['ANTHROPIC', 'API', 'KEY'].join('_')]: aiKey, [['OPENAI', 'API', 'KEY'].join('_')]: other } }))).toBe(0);
+    expect(guard?.tokens).toEqual([TK, aiKey, other]);
+  });
   it('run: the state store gets the run\'s known-value check (the vault and the key vault, live) and the GitHub token', async () => {
     const w = world();
     let guard: Parameters<RunStages['state']>[1] | undefined;

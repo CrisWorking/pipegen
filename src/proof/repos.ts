@@ -512,7 +512,7 @@ export async function checkActionsAllowed(gh: Octokit, scratch: GuardedRepo, act
  * `pipelines` holds install records only): otherwise nothing is called. Read first; written only when different
  * ('enterprise' already covers an organisation). A refusal is a ProofStopError with the setting to change by hand.
  */
-export async function ensureActionsAccess(gh: Octokit, t: ProofTarget, app: ProofApp, clock: RateClock = clockOf(gh), onChanged?: (previous: string) => void): Promise<{ previous: string } | undefined> {
+export async function ensureActionsAccess(gh: Octokit, t: ProofTarget, app: ProofApp, clock: RateClock = clockOf(gh), onChanged?: (previous: string) => void, warn: (s: string) => void = () => {}): Promise<{ previous: string } | undefined> {
   const central = assertCentral(t, app);
   if (!t.appPrivate) return undefined;
   const org = t.ownerType === 'Organization';
@@ -524,19 +524,31 @@ export async function ensureActionsAccess(gh: Octokit, t: ProofTarget, app: Proo
     rethrowHard(gh, e);
   }
   if (current === level || (org && current === 'enterprise')) return undefined;
+  // G13 carry 24: the level before, for the install record (Plan V's uninstall puts it back); an unreadable one is 'none'
+  const previous = typeof current === 'string' && /^(?:none|user|organization|enterprise)$/.test(current) ? current : 'none';
+  // G14 (controller addendum): told through onChanged; a callback that throws leaves the level unrecorded, so it is said here and stops
+  const tell = (): void => {
+    try {
+      onChanged?.(previous);
+    } catch (e) {
+      warn(`Left behind: central Actions access was ${previous} before pipegen changed it on ${central.fullName}; set it back by hand if you uninstall (pipegen couldn't record it).`);
+      throw e;
+    }
+  };
   try {
     await guardedWrite(gh, central, 'PUT /repos/{owner}/{repo}/actions/permissions/access', { access_level: level }, clock);
   } catch (e) {
     if (e instanceof ScratchGuardError) throw e;
     rethrowHard(gh, e);
+    // G14 (controller addendum): a PUT that failed without a 4xx (a 5xx, no answer) may still have changed the level: recorded as changed
+    const status = statusOf(e);
+    if (!(typeof status === 'number' && status >= 400 && status < 500)) tell();
     const choice = org ? `Accessible from repositories in the ${t.owner} organization` : `Accessible from repositories owned by the user ${t.owner}`;
     throw new ProofStopError(`pipegen couldn't let ${t.scratch} use the workflows in ${central.fullName} (${saidOf(e)}). `
       + `Set it by hand: ${central.fullName} → Settings → Actions → General → Access → "${choice}", then run pipegen again.`);
   }
-  // G13 carry 24: the level before, for the install record (Plan V's uninstall puts it back); an unreadable one is 'none'. G13-R2 3: told at
-  // once (outside the refusal handling above: a throw from the callback is not a refused PUT)
-  const previous = typeof current === 'string' && /^(?:none|user|organization|enterprise)$/.test(current) ? current : 'none';
-  onChanged?.(previous);
+  // G13-R2 3: told at once (outside the refusal handling above: a throw from the callback is not a refused PUT)
+  tell();
   return { previous };
 }
 
@@ -728,7 +740,7 @@ export async function checkProofRepos(gh: Octokit, app: ProofApp, opts: ProofRep
 
   // the proof's actions are allowed in the scratch repo (S13); the central workflows are callable (private projects)
   await checkActionsAllowed(gh, scratch, opts.actions, (w) => io.err(w), clock);
-  const changed = await ensureActionsAccess(gh, t, app, clock, opts.onAccessChanged);
+  const changed = await ensureActionsAccess(gh, t, app, clock, opts.onAccessChanged, (w) => io.err(w));
   if (changed !== undefined) result.actionsAccess = changed;
   result.defaultBranchState = await setScratchDefaultBranch(gh, scratch, clock);
   result.scratchDefaultBranch = t.defaultBranch;

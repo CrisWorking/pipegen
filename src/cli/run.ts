@@ -362,7 +362,8 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     // sec m3: the vaults exist from here (empty), so the state store checks every write against what is typed later
     vault = new SecretVault();
     keyVault = new SecretVault();
-    store = await st.state(p, { vault: knownChecks(vault, keyVault), tokens: [auth.token] });
+    // G14 (controller addendum): the AI keys from the environment are tokens the state file must never hold, like the GitHub one
+    store = await st.state(p, { vault: knownChecks(vault, keyVault), tokens: [auth.token, ...aiKeysOf(io.env)] });
     const runId = (deps.runId ?? (() => newRunId(now())))();
     // S20: one pipegen per app repo on this machine
     store.acquireLease(runId);
@@ -601,6 +602,10 @@ export async function scanCounted(dir: string, consent: ConsentToken, knownValue
   if (!counted.covers(bundle)) throw new Error('The scanned files are not the ones you agreed to send; nothing was sent.');
   return bundle;
 }
+
+/** The AI provider keys set in the environment (makeProvider reads these names), for the state store's token check. */
+export const aiKeysOf = (env: NodeJS.ProcessEnv): string[] =>
+  ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY'].map((n) => env[n]).filter((v): v is string => typeof v === 'string' && v !== '');
 
 /** sec I5: only the scratch repo (pipegen-proof-<repo>) is the state's scratch repo; the central repo checkProofRepos also creates is not. */
 export const onCreatedFor = (store: Pick<StateStore, 'scratchCreated'>, repo: string) => (name: string, id: number): void => {
