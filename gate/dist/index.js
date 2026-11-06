@@ -4473,7 +4473,7 @@ function parseSarifText(input, toolId, opts = {}) {
 
 // gate/src/zap.ts
 var ZAP_TOOL = "zap-baseline";
-var ZAP_JSON_VERIFIED = false;
+var ZAP_JSON_VERIFIED = true;
 var UNVERIFIED_NOTE = "zap-json parsing is unverified against a real zap-baseline -J report";
 var MAX_PLUGIN_ID = 256;
 var MAX_URL_PATH = 2048;
@@ -4547,7 +4547,7 @@ function parseZapJson(json, toolId, opts = {}) {
         }
       }
     }
-    notes.push(UNVERIFIED_NOTE);
+    if (!ZAP_JSON_VERIFIED) notes.push(UNVERIFIED_NOTE);
     if (unknownRisk > 0) notes.push(`${unknownRisk} alert(s) had an unknown riskcode and are counted as high`);
     return findings;
   });
