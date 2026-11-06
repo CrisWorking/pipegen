@@ -7,7 +7,8 @@ import { defaultPushTrigger, DEPLOY_PUSH_IF, NO_SCANS } from '../src/engine/job-
 import { describe, expect, it } from 'vitest';
 import { JOB_PERMISSIONS, JOB_STEP_POLICY, pipegenLines, referee, type Linters, type RefereeDeps, type RefereeIssue, type RefereeReport } from '../src/engine/referee.js';
 import { gateJobList, jobIdFor } from '../src/engine/gate-job-list.js';
-import { jobOutputsFor } from '../src/engine/job-rules.js';
+import { attestDigestRef, jobOutputsFor } from '../src/engine/job-rules.js';
+import { renderAttestDigestStep } from '../src/engine/signing.js';
 import { dedupeJobSteps, RenderError, renderFindRunStep, renderGateStep, renderJobPrelude, renderNightlyStep, renderPlatformStep, renderProjectScript, renderScrub, renderStep, renderUpload, scrubbedPath, stepsToYaml, type RenderContext, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
 import { resultArtifactName } from '../src/engine/artifact-names.js';
 import { NEED_ID_CATEGORY, NEED_IDS } from '../src/engine/need-ids.js';
@@ -30,6 +31,11 @@ const sha = (c: string): string => c.repeat(40);
 const ref = (n: string): string => ['${{', `secrets.${n}`, '}}'].join(' ');
 /** The OIDC permission and the login inputs, spelled at run time for the same reason. */
 const OIDC = ['id', 'token'].join('-');
+/** G15a: the attest sign steps of the image ghcr.io/o/app: pipegen's digest step, then actions/attest with that step's output (never a literal). */
+const attestSteps = (pl: ReturnType<typeof platform>, repo = 'ghcr.io/o/app'): RenderedStep[] => [
+  renderAttestDigestStep({ service: 'app', repo }),
+  renderPlatformStep('attest', pl, { 'subject-name': repo, 'subject-digest': attestDigestRef(repo) }),
+];
 const loginInputs = (): Record<string, string> => Object.fromEntries([['username', '${{ github.actor }}'], [['pass', 'word'].join(''), ref('GITHUB_TOKEN')]]);
 /** A spec field or job key named `secrets`, set at run time. */
 const SEC_FIELD = ['sec', 'rets'].join('');
@@ -177,10 +183,10 @@ describe('referee: the renderer and the referee agree', () => {
     const co = checkout as RenderedStep;
     jobs['code-scanning'] = job([download(), renderPlatformStep('upload-sarif', p, { sarif_file: sarif, category: 'pipegen-sast' })], { permissions: { contents: 'read', 'security-events': 'write', actions: 'read' } });
     jobs['baseline-check'] = job([download(), gateAct('baseline-check')], { permissions: { contents: 'read', actions: 'read' } });
+    // (G15a: the attest sign job holds only the digest downloads, pipegen's digest step and actions/attest with that step's output)
     jobs.sign = job([
-      co, download(),
-      renderPlatformStep('docker-login', p, loginInputs(), { registry: 'ghcr.io' }),
-      renderPlatformStep('attest', p, { 'subject-name': 'ghcr.io/o/app', 'subject-digest': `sha256:${'a'.repeat(64)}` }),
+      download(),
+      ...attestSteps(p),
     // (v0.2 Plan G G2-R-sec2: a sign job that writes to the registry is a deploy job of the default-push pipegen.yml)
     ], { permissions: { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' }, environment: 'pipegen-signing', if: DEPLOY_PUSH_IF, needs: ['gate'] });
     // (G7: pipegen-verify's shape is the deploy layer's whole verify job, the find-run step, the head check, the digest and the signature check
@@ -340,10 +346,11 @@ describe('referee: only reviewed tools, and only as their template', () => {
     const login = renderPlatformStep('docker-login', p, loginInputs(), { registry: 'ghcr.io' });
     // (G2-R-sec2: no packages: write here, which would make it a registry write outside a deploy job; the login's whenWith is the subject)
     const perms = { permissions: { contents: 'read' } };
-    // (v0.2 Plan G G2-R1 I3: image-publish writes to the registry only from a deploy job on a default-branch push, so the login is judged in the sign job, the other row that holds it)
-    expect(show(await run([wf({ sign: job([login], perms) })], draftOf([])))).toBe('');
+    // (v0.2 Plan G G2-R1 I3: image-publish writes to the registry only from a deploy job on a default-branch push; with contents: read only it
+    // writes nothing, so the login is judged there. G15a: the sign row no longer holds a login action)
+    expect(show(await run([wf({ 'image-publish': job([login], perms) })], draftOf([])))).toBe('');
     const elsewhere = { ...login, with: { ...login.with, registry: 'evil.example' } };
-    expect(checks(await run([rawWf({ sign: job([elsewhere], perms) })], draftOf([])))).toContain('injection');
+    expect(checks(await run([rawWf({ 'image-publish': job([elsewhere], perms) })], draftOf([])))).toContain('injection');
     const up = renderUpload('pipegen-out-secrets', '${{ runner.temp }}/pipegen-out/pipegen-out-secrets/gitleaks.sarif', p);
     const outside = { ...up, with: { ...up.with, path: '/etc' } };
     expect(has(await run([wf({ a: job([outside]) })], draftOf([])), 'template')).toBe(true);
@@ -466,8 +473,7 @@ describe('referee: permissions by exact job id', () => {
   });
   it('a reusable-workflow caller may have the union of the called file\'s jobs (when that file is in files)', async () => {
     // (G3: the sign job asks for the OIDC token and attestations write only with the step that uses them, here actions/attest)
-    const attest = renderPlatformStep('attest', platform(), { 'subject-name': 'ghcr.io/o/app', 'subject-digest': `sha256:${'a'.repeat(64)}` });
-    const called = wf({ sign: job([attest], { permissions: { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' } }) }, { on: { workflow_call: null } }, '.github/workflows/sign.yml');
+    const called = wf({ sign: job(attestSteps(platform()), { permissions: { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' } }) }, { on: { workflow_call: null } }, '.github/workflows/sign.yml');
     const caller = (perms: unknown): CreatedFile => wf({ release: { uses: './.github/workflows/sign.yml', permissions: perms } });
     const union = { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' };
     const attestDraft = draftOf([g.spec], { profile: { ...draftOf([g.spec]).profile, private: true }, signing: { mode: 'attest', images: [{ service: 'app', repo: 'ghcr.io/o/app' }] } });
@@ -1007,9 +1013,8 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
   it('A22: environment pipegen-signing only on sign and pipegen-verify', async () => {
     expect(has(await run([wf({ t: job(scriptSteps(), { environment: 'pipegen-signing' }) })], dScripts()), 'permissions')).toBe(true);
     // (G3: the OIDC token and attestations write only with actions/attest in the job)
-    const attest = renderPlatformStep('attest', platform(), { 'subject-name': 'ghcr.io/o/app', 'subject-digest': `sha256:${'a'.repeat(64)}` });
     const attestDraft = draftOf([], { profile: { ...draftOf([]).profile, private: true }, signing: { mode: 'attest', images: [{ service: 'app', repo: 'ghcr.io/o/app' }] } });
-    expect(permsBesidesRegistry(await run([wf({ sign: job([attest], { permissions: SIGNP, environment: 'pipegen-signing' }) })], attestDraft))).toBe(false);   // (G2-R-sec2: the registry-write rule aside; G3-R2: attest mode)
+    expect(permsBesidesRegistry(await run([wf({ sign: job(attestSteps(platform()), { permissions: SIGNP, environment: 'pipegen-signing' }) })], attestDraft))).toBe(false);   // (G2-R-sec2: the registry-write rule aside; G3-R2: attest mode)
   });
   it('A8: a secret value hidden by a YAML escape is found in the parsed scalars', async () => {
     const esc = fake.awsKey().replace(/^A/, '\\x41');

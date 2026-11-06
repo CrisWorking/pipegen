@@ -47,7 +47,7 @@ import { createdFileProblems, duplicatePathProblems, type CreatedInputs, type Cr
 import {
   ACTION_PATH_RE, CALLER_WORKFLOW, checkExpressions, createdPathProblem, checkJobOrder, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, gateResultUploadProblems, IF_VALUES,
   CALLER_TRIGGERS, IMAGE_ARCHIVE_STEP_ID, IMAGE_BUILD_NEED, imageBuildJobId, imageBuildSlugOf, imageCheckStepId, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, LOCAL_MERGE_WORKFLOW, narrowingChoiceProblem, NIGHTLY_CONCURRENCY, NIGHTLY_WORKFLOW, PR_CHECK_IF, PR_CHECK_JOB,
-  PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, REQUIRED_JOB, REQUIRED_NAME, requiredWorkflowForm, renderRangeFetchStep, SECRET_REF_RE, SIGN_STEP_ID_RE, BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, DAST_HANDOFF_STEP_ID, dastAppStepId, dastCheckStepId, dastRunJobId, dastRunSlugOf, DAST_CHECK_ID_RE, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, BASELINE_STEP_IFS,
+  PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, REQUIRED_JOB, REQUIRED_NAME, requiredWorkflowForm, renderRangeFetchStep, SECRET_REF_RE, SIGN_STEP_ID_RE, ATTEST_DIGEST_STEP_ID_RE, attestDigestRef, attestDigestStepId, BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, DAST_HANDOFF_STEP_ID, dastAppStepId, dastCheckStepId, dastRunJobId, dastRunSlugOf, DAST_CHECK_ID_RE, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, BASELINE_STEP_IFS,
   STEP_KEYS as STEP_KEY_LIST, WORKFLOW_CONCURRENCY, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact,
 } from './job-rules.js';
 import { signingMode } from '../github/signing-mode.js';
@@ -173,8 +173,9 @@ export const JOB_STEP_POLICY: Readonly<Record<string, readonly StepKind[]>> = Ob
   'baseline-check': ['harden', 'download-artifact', 'gate'],
   // G7 (B3 a): the publish digest step and the upload of the digest folder, after the build (job-rules.ts publishTailAt)
   'image-publish': ['harden', 'checkout', 'setup-buildx', 'docker-login', 'build-push', 'publish-digest', 'upload-artifact'],
-  // G2: the cosign sign steps of the draft's signing plan (B3 b); attest mode signs with the reviewed actions/attest
-  sign: ['harden', 'checkout', 'download-artifact', 'docker-login', 'attest', 'sign'],
+  // G2: the cosign sign steps of the draft's signing plan (B3 b); attest mode signs with the reviewed actions/attest after pipegen's digest
+  // step (a sign-kind step, G15a). G15a (carry C11): no checkout and no login action (cosign and the digest step log in themselves)
+  sign: ['harden', 'download-artifact', 'attest', 'sign'],
   // no checkout: the nightly job holds PIPEGEN_FP_KEY (it verifies the baseline) and reads only the API; the identity comes from GITHUB_REPOSITORY (C7 fix round 1)
   nightly: ['harden', 'download-artifact', 'gate'],
   watch: ['harden', 'checkout', 'watcher'],
@@ -1253,11 +1254,43 @@ function judgeSignPermissions(fc: FileCtx, where: string, j: Obj, judged: readon
  */
 const SIGN_JOB_KINDS: ReadonlySet<StepKind> = new Set(['download-artifact', 'sign']);
 function judgeSignJobSteps(fc: FileCtx, where: string, judged: readonly Judged[]): void {
+  if (judged.some((x) => x.kind === 'attest')) { judgeAttestJobSteps(fc, where, judged); return; }
   if (!judged.some((x) => x.kind === 'sign' && typeof x.step.id === 'string' && SIGN_STEP_ID_RE.test(x.step.id))) return;
   judged.forEach((x, i) => {
     // G4 (carry G3 ruling 5, P-3): the one exception, the reviewed egress step (Bullfrog, its template judged like any action) as the job's first step
     if (x.kind === 'harden' && i === 0) return;
     if (!SIGN_JOB_KINDS.has(x.kind)) fc.add(fc.file.path, 'permissions', `${where}, step ${i + 1} (${show(String(x.step.name ?? x.step.uses ?? x.kind))}): the job holds the signing identity, so it runs only the egress step (first), the digest download, the pinned cosign install and the sign step (which logs in with cosign itself), never another step or action.`);
+  });
+}
+
+/**
+ * G15a (carries C10, C11; G3-R1, G3-R2): the attest sign job holds the OIDC token, so it runs only the digest downloads, pipegen's attest digest
+ * steps (recognised by content, signing.ts renderAttestDigestStep: the hand-off file, DIGEST_RE, the step output) and the reviewed
+ * actions/attest steps: no egress step (T52), no checkout, no login action, no other run step or action. Each attest step names an image
+ * of the draft's plan, and its subject-digest is the output of that image's digest step, earlier in the same job (the input table accepts
+ * only that form; here the step must also be there, and be pipegen's own).
+ */
+// (an egress step only narrows the job's network, so it may stand there too; pipegen writes none: threat model T52)
+const ATTEST_JOB_KINDS: ReadonlySet<StepKind> = new Set(['harden', 'download-artifact', 'sign', 'attest']);
+function judgeAttestJobSteps(fc: FileCtx, where: string, judged: readonly Judged[]): void {
+  const bad = (m: string): void => fc.add(fc.file.path, 'permissions', `${where} ${m}`);
+  const plan = fc.draft.signing;
+  const images = plan === undefined || plan === null || plan.mode !== 'attest' || !Array.isArray(plan.images) ? [] : plan.images;
+  judged.forEach((x, i) => {
+    const what = `step ${i + 1} (${show(String(x.step.name ?? x.step.uses ?? x.kind))})`;
+    if (!ATTEST_JOB_KINDS.has(x.kind)) { bad(`holds the OIDC token, so it runs only an egress step, the digest downloads, pipegen's digest steps and the reviewed actions/attest; ${what} is none of them.`); return; }
+    if (x.kind === 'sign' && !(typeof x.step.id === 'string' && ATTEST_DIGEST_STEP_ID_RE.test(x.step.id))) bad(`runs ${what}, a cosign sign step, next to actions/attest: one job signs in one mode.`);
+    if (x.kind !== 'attest') return;
+    const name = x.step.with?.['subject-name'];
+    const k = images.findIndex((img) => img?.repo === name);
+    if (k < 0) { bad(`attests ${show(String(name))} in ${what}, which is not an image of the draft's signing plan.`); return; }
+    const want = attestDigestRef(String(name));
+    if (x.step.with?.['subject-digest'] !== want) { bad(`gives ${what} a subject-digest that is not the output of the image's digest step (the hand-off image-publish uploaded).`); return; }
+    const d = judged.findIndex((y) => y.step.id === attestDigestStepId(String(name)));
+    const digest = judged[d];
+    if (d < 0 || d > i || digest?.kind !== 'sign' || digest.match?.source !== `${SIGN_SOURCE}:${k}` || digest.match.final !== true) {
+      bad(`attests ${show(String(name))} in ${what} without pipegen's own digest step of that image before it in the job (its digest must be the hand-off file, checked as sha256:<64 hex>).`);
+    }
   });
 }
 
@@ -1335,8 +1368,11 @@ const SHARED_CDN_HOSTS: ReadonlySet<string> = new Set([...SHARED_CDN_SETS].flatM
 function judgeEgress(fc: FileCtx, id: string, where: string, j: Obj, judged: readonly Judged[]): void {
   const bad = issueFor(fc);
   const keylessSign = id === 'sign' && fc.draft.signing?.mode === 'keyless' && judged.some((x) => x.kind === 'sign' && typeof x.step.id === 'string' && SIGN_STEP_ID_RE.test(x.step.id) && ![...x.secrets].some((n) => SIGNING_KEY_SECRETS.has(n)));
+  // G15a: the attest sign job is the same exception (actions/attest needs the per-run OIDC token host too; T52); judgeAttestJobSteps refuses
+  // any egress step in it
+  const attestSign = id === 'sign' && fc.draft.signing?.mode === 'attest' && judged.some((x) => x.kind === 'attest');
   const hardens = judged.filter((x) => x.kind === 'harden');
-  if (!keylessSign && (judged[0]?.kind !== 'harden' || hardens.length !== 1)) bad('permissions', `${where} must start with pipegen's egress step (the reviewed Bullfrog block, once, first): without it the job's network is open.`);
+  if (!keylessSign && !attestSign && (judged[0]?.kind !== 'harden' || hardens.length !== 1)) bad('permissions', `${where} must start with pipegen's egress step (the reviewed Bullfrog block, once, first): without it the job's network is open.`);
   // G15a (carries A2, A3): the Sigstore hosts only in the keyless verify job (mode re-derived from the repository, never the draft's plan)
   const keylessVerify = id === 'pipegen-verify' && signingMode(fc.draft.profile, fc.draft.capabilities) === 'keyless';
   for (const h of hardens) {

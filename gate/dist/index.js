@@ -2096,7 +2096,7 @@ var POLICIES = {
   cosign: { method: GH, needsSlot: "is run by Plan G's sign job, which adds its own reviewed flags", package: "cosign-linux-amd64", exe: "cosign", dialect: "long", sub: ["sign"], flags: { yes: "bool" }, required: { yes: "true" } },
   // G15a (B3 d, P-5): the pinned gh release, run only by the attest verify step (signing.ts renderVerifySteps), which adds its own reviewed
   // flags; never by renderStep. The template is the subcommand alone
-  gh: { method: GH, needsSlot: "is run by the attest verify step of the job pipegen-verify, which adds its own reviewed flags", package: "gh_2.103.3_linux_amd64.tar.gz", exe: "gh", dialect: "long", sub: ["attestation", "verify"], flags: {} },
+  gh: { method: GH, needsSlot: "is run by Plan G's attest verify step (job pipegen-verify), which adds its own reviewed flags", package: "gh_2.103.3_linux_amd64.tar.gz", exe: "gh", dialect: "long", sub: ["attestation", "verify"], flags: {} },
   actionlint: {
     method: GH,
     package: "actionlint_1.7.12_linux_amd64.tar.gz",
@@ -2376,6 +2376,8 @@ var ARGV_POLICIES = Object.freeze(Object.fromEntries(
   Object.entries(POLICIES).map(([id, pol]) => [id, READS_ONLY.includes(id) ? { ...pol, readsOnly: true } : pol])
 ));
 var sha16 = (text) => createHash("sha256").update(text).digest("hex").slice(0, 16);
+var attestDigestStepId = (repo2) => `pipegen-attest-digest-${sha16(`attest-digest:${repo2}`)}`;
+var attestDigestRef = (repo2) => `\${{ steps.${attestDigestStepId(repo2)}.outputs.digest }}`;
 var stagePath = (artifact) => `\${{ runner.temp }}/pipegen-stage/${artifact}`;
 var isStagedTool = (tool2) => tool2 !== void 0 && Object.hasOwn(ARGV_POLICIES, tool2) && ARGV_POLICIES[tool2]?.staged !== void 0;
 var PIPEGEN_GATE_USES = "crisworking/pipegen/gate";
@@ -2436,7 +2438,8 @@ var ACTION_POLICIES = Object.freeze({
     push: { values: ["false", "true"], as: "choice" }
   },
   "github/codeql-action/upload-sarif": {},
-  "actions/attest": {},
+  // G15a (carry C10): the attestation is stored next to the image in the registry (the attest job logs in to ghcr.io in its digest step)
+  "actions/attest": { "push-to-registry": { values: ["true"], as: "fixed", required: true } },
   // pipegen's own gate action: no inputs of its own to fix or choose; every one is the renderer's (RENDERER_INPUTS below)
   [PIPEGEN_GATE_USES]: {},
   "bullfrogsec/bullfrog": {
@@ -2666,9 +2669,14 @@ var RENDERER_INPUTS = Object.freeze({
   },
   "actions/download-artifact": { name: ARTIFACT_NAME, path: OWN_FOLDER_PATH },
   "github/codeql-action/upload-sarif": { sarif_file: RUNNER_TEMP_PATH, category: rx(/^pipegen-[a-z0-9][a-z0-9-]{0,100}$/, "a category starting pipegen-") },
+  // G15a (carry C10): the digest is the run-time output of pipegen's digest step of the same image (the hand-off file image-publish uploaded,
+  // checked as sha256:<64 hex>), never a literal and never another step's output
   "actions/attest": {
     "subject-name": rx(/^(?:ghcr\.io|docker\.io)\/[a-z0-9][a-z0-9._/-]{0,200}$/, "an image name on ghcr.io or docker.io, with no tag"),
-    "subject-digest": rx(/^sha256:[0-9a-f]{64}$/, "a sha256 digest")
+    "subject-digest": rx(/^\$\{\{ steps\.pipegen-attest-digest-[0-9a-f]{16}\.outputs\.digest \}\}$/, "the digest output of pipegen's attest digest step (${{ steps.pipegen-attest-digest-<16 hex>.outputs.digest }}), never a literal", {
+      check: (all) => typeof all["subject-name"] === "string" && all["subject-digest"] === attestDigestRef(all["subject-name"]),
+      describe: "only as the digest step output of the image subject-name names"
+    })
   },
   "docker/build-push-action": {
     file: rx(PLAIN_REL_RE, "a repo-relative file path"),

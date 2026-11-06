@@ -2,7 +2,8 @@
 // reviewed entries. renderStep still refuses cosign (the sign job owns its flags, Plan B carry B6); these steps are rendered here only, and
 // the referee recognises them only as this render of the draft's signing plan (PipelineDraft.signing), each kind in its own job:
 // - sign (job `sign` only): the reviewed cosign release (checked by its sha256), then `cosign sign` of `<image>@<digest>`, the digest read
-//   from pipegen's hand-off file and checked as sha256:<64 hex> before anything signs it.
+//   from pipegen's hand-off file and checked as sha256:<64 hex> before anything signs it. Attest mode (G15a): pipegen's digest step (the same
+//   hand-off and check, the registry login, the digest as its output), then the reviewed actions/attest with that output as its subject.
 //   key-env: the key and its password from the signing environment's secrets, `--tlog-upload=false` (no public log for a private repo)
 //   and `--use-signing-config=false` (cosign 3 needs it for a key without the log). keyless: the job's GitHub OIDC identity, logged publicly.
 // - verify (job `pipegen-verify` only):
@@ -16,7 +17,7 @@ import { createHash } from 'node:crypto';
 import { slug } from './artifact-names.js';
 import { DIGEST_FILE, IMAGE_DIGEST_ID, imageDigestArtifact } from './deploy-steps.js';
 import { centralWorkflowFile } from './central-path.js';
-import { SIGN_STEP_ENV, signStepId, VERIFY_STEP_ENV, verifyStepId, type RenderedStep } from './job-rules.js';
+import { ATTEST_DIGEST_STEP_ENV, attestDigestStepId, SIGN_STEP_ENV, signStepId, VERIFY_STEP_ENV, verifyStepId, type RenderedStep } from './job-rules.js';
 import { isGitHubRepo } from './names.js';
 import { pipegenScriptStep } from './pipegen-script.js';
 import { releaseInstallStep } from './render-cli.js';
@@ -162,6 +163,25 @@ export function renderSignSteps(cosign: ReviewedTool, mode: 'key-env' | 'keyless
 }
 
 /**
+ * G15a (carry C10; G3-R2 carry: the attest digest bound to the hand-off): the attest sign job's digest step of one image (job `sign` only, attest
+ * mode): the digest image-publish uploaded (its hand-off file, checked as sha256:<64 hex>), the registry login actions/attest's
+ * push-to-registry reads (the job's token on stdin only, unset once used; ghcr.io only), and the digest as the step's output `digest`, the
+ * one value the attest step's subject-digest may name (tool-flags.ts RENDERER_INPUTS). The login is the docker CLI's (pipegen's own step,
+ * no login action in a job that holds the OIDC token, G3-R3); it is stored in the runner's docker config, which a hosted runner drops with
+ * the job, and the token is the job's own, which actions/attest already holds.
+ */
+export function renderAttestDigestStep(image: SignedImage): RenderedStep {
+  const { repo, artifact } = imageRepo(image);
+  if (!repo.startsWith(`${SIGN_REGISTRY}/`)) throw new RenderError(`The image ${show(repo)} is not on ${SIGN_REGISTRY}: the attest job logs in with the workflow token, which goes to ${SIGN_REGISTRY} only.`);
+  return runStep(attestDigestStepId(repo), `pipegen: the digest of ${repo} to attest`, [
+    ...refLines(repo, artifact),
+    `printf '%s' "$PIPEGEN_REGISTRY_TOKEN" | /usr/bin/docker login ${SIGN_REGISTRY} -u "$GITHUB_ACTOR" --password-stdin > /dev/null`,
+    'unset PIPEGEN_REGISTRY_TOKEN',
+    'echo "digest=$digest" >> "$GITHUB_OUTPUT"',
+  ], { ...ATTEST_DIGEST_STEP_ENV });
+}
+
+/**
  * The verify steps of one image (job `pipegen-verify` only), in the draft's signing mode: `tool` is the reviewed cosign entry (key-env,
  * keyless) or the reviewed gh entry (attest). Throws a RenderError for anything that can not be verified as recorded (no plan, no hash
  * literal, no central pin for attest, another entry).
@@ -257,10 +277,10 @@ export function expectedSigningSteps(draft: PipelineDraft, reviewed: readonly Re
         return null;
       }
     };
-    if (plan.mode !== 'attest') {
-      const s = attempt('sign', () => { if (cosign === undefined) throw new RenderError('the reviewed list has no cosign entry'); return renderSignSteps(cosign, plan.mode as 'key-env' | 'keyless', image); });
-      if (s !== null) out.sign.push(s);
-    }
+    // G15a: attest mode's own sign-kind step is the digest step (the attest step itself is the reviewed actions/attest, judged as an action)
+    const s = plan.mode === 'attest' ? attempt('sign', () => [renderAttestDigestStep(image)])
+      : attempt('sign', () => { if (cosign === undefined) throw new RenderError('the reviewed list has no cosign entry'); return renderSignSteps(cosign, plan.mode as 'key-env' | 'keyless', image); });
+    if (s !== null) out.sign.push(s);
     const tool = plan.mode === 'attest' ? gh : cosign;
     const v = attempt('verify', () => { if (tool === undefined) throw new RenderError(`the reviewed list has no ${plan.mode === 'attest' ? 'gh (the pinned gh release)' : 'cosign'} entry`); return renderVerifySteps(tool, draft, image); });
     if (v !== null) out.verify.push(v);

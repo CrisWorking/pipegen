@@ -7,7 +7,7 @@ import {
   BUILD_PUSH_STEP_ID, DIGEST_STEP_ENV, DIGEST_STEP_ID, FIND_RUN_STEP_ID, HEAD_CHECK_DIR, HEAD_CHECK_ENV, HEAD_CHECK_STEP_ID, imageDigestArtifact, PUBLISH_DIGEST_ENV, PUBLISH_DIGEST_STEP_ID,
 } from './deploy-steps.js';
 import { GATE_RESULT_ARTIFACT, resultArtifactName, SECRETS_RANGE_ARTIFACT, slug } from './artifact-names.js';
-import { ARGV_POLICIES, BASE_CHECKOUT_REF, GATE_OPTIONAL_UPLOADS, RANGE_BEFORE_REF, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, isGateUploadName, CHECKER_STEP_ID_RE, GATE_USES_RE, isStagedTool, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, stagePath, stageStepId, STAGE_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
+import { ARGV_POLICIES, ATTEST_DIGEST_STEP_ID_RE, attestDigestRef, attestDigestStepId, BASE_CHECKOUT_REF, GATE_OPTIONAL_UPLOADS, RANGE_BEFORE_REF, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, isGateUploadName, CHECKER_STEP_ID_RE, GATE_USES_RE, isStagedTool, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, stagePath, stageStepId, STAGE_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
 
 /** One step of a job, as pipegen renders it. `usesComment` becomes the trailing `# <version>` comment on `uses:`. */
 export interface RenderedStep {
@@ -627,6 +627,9 @@ export function narrowingChoiceProblem(name: string, value: string): string | nu
 
 /** The sign step (job sign only) and the verify steps (job pipegen-verify only): their ids, one per image (sha16 of the image repository). */
 export const SIGN_STEP_ID_RE = /^pipegen-sign-[0-9a-f]{16}$/;
+/** G15a (carry C10): the attest sign job's digest step (one per image; signing.ts renderAttestDigestStep), id and env. */
+export { ATTEST_DIGEST_STEP_ID_RE, attestDigestRef, attestDigestStepId };
+export const ATTEST_DIGEST_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_REGISTRY_TOKEN: '${{ secrets.GITHUB_TOKEN }}' });
 export const VERIFY_STEP_ID_RE = /^pipegen-verify-[0-9a-f]{16}$/;
 export const signStepId = (repo: string): string => `pipegen-sign-${sha16(`sign:${repo}`)}`;
 export const verifyStepId = (repo: string): string => `pipegen-verify-${sha16(`verify:${repo}`)}`;
@@ -958,6 +961,7 @@ export function checkExpressions(step: RenderedStep): void {
         // step by content and holds each kind to its job; here only which expression a step of that id may hold)
         if (step.run !== undefined && step.uses === undefined && step.id !== undefined) {
           if (SIGN_STEP_ID_RE.test(step.id) && own(SIGN_STEP_ENV, k) === v) continue;
+          if (ATTEST_DIGEST_STEP_ID_RE.test(step.id) && own(ATTEST_DIGEST_STEP_ENV, k) === v) continue;
           if (VERIFY_STEP_ID_RE.test(step.id) && own(VERIFY_STEP_ENV, k) === v) continue;
           const ic = IMAGE_CHECK_ID_RE.exec(step.id);
           if (ic !== null && k === IMAGE_SHA_ENV && v === imageShaRef(ic[1] as string)) continue;

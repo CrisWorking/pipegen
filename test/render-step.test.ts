@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { attestDigestRef } from '../src/engine/job-rules.js';
 import { Document, parse } from 'yaml';
 import {
   jobSettings, mapNodeVersion, RenderError, renderJobPrelude, renderPlatformStep, renderStep, renderUpload, stepsToYaml, validateSpec, type RenderedStep,
@@ -208,7 +209,7 @@ describe('renderStep: actions', () => {
       const filled: Record<string, string> = key === 'upload-artifact' ? { name: `${RESULT_ARTIFACT_PREFIX}sast`, path: '${{ runner.temp }}/pipegen-out/pipegen-out-sast' }
         : key === 'download-artifact' ? { name: `${RESULT_ARTIFACT_PREFIX}sast`, path: '${{ runner.temp }}/pipegen-out/pipegen-out-sast' }
           : key === 'upload-sarif' ? { sarif_file: '${{ runner.temp }}/pipegen-out/pipegen-out-sast/x.sarif', category: 'pipegen-sast' }
-            : key === 'attest' ? { 'subject-name': 'ghcr.io/o/r', 'subject-digest': `sha256:${'a'.repeat(64)}` }
+            : key === 'attest' ? { 'subject-name': 'ghcr.io/o/r', 'subject-digest': attestDigestRef('ghcr.io/o/r') }
               : key === 'docker-login' ? loginWith() : {};
       const s = renderPlatformStep(key as keyof ReturnType<typeof platform>, platform(), filled);
       expect(s.uses, key).toMatch(SHA_RE);

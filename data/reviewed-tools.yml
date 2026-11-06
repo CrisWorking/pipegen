@@ -328,6 +328,8 @@ tools:
     proofs: 0
 
   # Records a GitHub build attestation for the image (v4, ruling S24: checked live).
+  # G15a (carry C10): push-to-registry fixed true (the attestation is stored next to the image; the attest job's digest step logs in to
+  #   ghcr.io first). The subject is the renderer's: the image name and the digest step's output (tool-flags.ts RENDERER_INPUTS), never a literal.
   # Source: git ref refs/tags/v4.2.2 of actions/attest (GitHub API), release published_at. Released 2026-08-04T20:36:29Z.
   - id: actions-attest
     categories: ["platform", "attestation"]
@@ -346,13 +348,16 @@ tools:
     step:
       action:
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
-        with: {}
+        with:
+          push-to-registry: "true"
       output: { path: "", format: none }
-    fixedInputs: {}
+    fixedInputs:
+      with:
+        push-to-registry: "true"
     choices: {}
     configFiles: []
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-11-06"
     proofs: 0
 
   # Egress control for proof and CI jobs (spike S8): Bullfrog in block mode, sudo off, so no later step can undo it.

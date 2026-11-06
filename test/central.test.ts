@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Document, parse, parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
-import { DEPLOY_PUSH_IF } from '../src/engine/job-rules.js';
+import { attestDigestRef, DEPLOY_PUSH_IF } from '../src/engine/job-rules.js';
 import { referee, type Linters } from '../src/engine/referee.js';
 import { RenderError } from '../src/engine/render-error.js';
 import { renderPlatformStep } from '../src/engine/render-step.js';
@@ -138,12 +138,16 @@ describe('G3: central shared files (Plan G Task 1)', () => {
     // the reviewed actions/attest is at v4
     expect(p.attest.candidate.repo).toBe('actions/attest');
     expect(p.attest.candidate.version.startsWith(`${ATTEST_MAJOR}.`)).toBe(true);
-    // until the gate re-pin batch adds a run-time digest form, the attest job can not be written: refused with a plain reason (fail closed:
-    // never a sign file that does not sign, never a cosign job in its place)
-    expect(() => signJob(d, 'attest', deps)).toThrow(/Attest signing can not be written yet.*G15/);
-    expect(() => sharedWorkflows(d, 'attest', deps)).toThrow(RenderError);
-    expect(() => signCallerJob(d, 'attest', ['gate'])).toThrow(RenderError);
-    // another attest action, or another major, is refused before that
+    // G15a: the job is written (the run-time digest form is in the input table), its file and its caller too: the digest download, pipegen's
+    // digest step, then actions/attest v4 at its reviewed pin with that step's output (test/g15-attest.test.ts: the referee and the refusals)
+    const j = signJob(d, 'attest', deps);
+    expect(j.permissions).toEqual(signPermissions('attest'));
+    const attest = (j.steps as Obj[])[2] as Obj;
+    expect(attest.uses).toBe(p.attest.step.action?.uses);
+    expect(attest.with).toEqual({ 'push-to-registry': 'true', 'subject-name': IMG.repo, 'subject-digest': attestDigestRef(IMG.repo) });
+    expect(sharedWorkflows(d, 'attest', deps)).toHaveLength(1);
+    expect(signCallerJob(d, 'attest', NEEDS)).not.toBeNull();
+    // another attest action, or another major, is refused
     const old = { ...p, attest: { ...p.attest, candidate: { ...p.attest.candidate, version: 'v3.0.0' } } } as typeof p;
     expect(() => signJob(d, 'attest', { ...deps, platform: old })).toThrow(/written for actions\/attest v4/);
     const other = { ...p, attest: { ...p.attest, candidate: { ...p.attest.candidate, repo: 'evil/attest' } } } as typeof p;
@@ -307,7 +311,8 @@ describe('G3: central shared files (Plan G Task 1)', () => {
 
 describe('G3 fix round 1 (G3-R2)', () => {
   const attestStep = (): Obj => {
-    const { usesComment: _c, ...rest } = renderPlatformStep('attest', p, { 'subject-name': 'ghcr.io/o/r-app', 'subject-digest': `sha256:${'b'.repeat(64)}` }) as Obj;
+    // (G15a: the subject-digest is the output of the image's digest step, never a literal)
+    const { usesComment: _c, ...rest } = renderPlatformStep('attest', p, { 'subject-name': 'ghcr.io/o/r-app', 'subject-digest': attestDigestRef('ghcr.io/o/r-app') }) as Obj;
     return rest;
   };
   const WIDE = { contents: 'read', packages: 'write', [OIDC]: 'write', attestations: 'write' };

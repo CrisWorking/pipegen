@@ -48,8 +48,8 @@
 // - baseline-check (the gate in mode baseline-check, output `found`), gate (renderGateStep over the returned draft, its uploads, `if:
 //   always()`, needs = every job of the gate's list plus base-scan), nightly (renderNightlyStep: the warn-ending, finish-missing, update and
 //   warn-first issues; issues: write here only; no checkout, so it never pushes a file; concurrency pipegen-nightly);
-// - sign: G3's job for the delivered mode (signingMode), none for the proof (PROOF_SIGNING_MODE) or a skipped deploy; attest is "not signed
-//   yet (G15)" with a note, never another mode. GJ (Plan J): a signing or attestation need on a service that builds no image is report-only:
+// - sign: G3's job for the delivered mode (signingMode), none for the proof (PROOF_SIGNING_MODE) or a skipped deploy; an attest job that can
+//   not be written is "not signed" with a note, never another mode. GJ (Plan J): a signing or attestation need on a service that builds no image is report-only:
 //   its image leaves the signing plan, and with no service building an image there is no sign job at all; a note each (PIPEGEN.md, G9).
 import { isDeepStrictEqual } from 'node:util';
 import { keyOffers, specFor, BuilderError, workflowLintAvailable, type Offer } from '../debate/builder.js';
@@ -158,7 +158,7 @@ export interface AssembledJobs {
   merge: Record<string, Job>;
   /** The nightly job (the scheduled checks of v0.2 are limits, see NOT_RENDERED_V02). */
   nightly: Record<string, Job>;
-  /** G3's sign job for the delivered mode; null for none, the proof, a skipped deploy and attest (until G15). */
+  /** G3's sign job for the delivered mode; null for none, the proof, a skipped deploy and an attest job that can not be written. */
   sign: SignJob | null;
   notes: string[];
   /**
@@ -662,7 +662,7 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
   if (deps.mode !== 'none' && !input.skipped.some((p) => p.part === 'deploy') && !imageNone) {
     try { sign = signJob(draft, deps.mode, { reviewed: deps.reviewed, platform: deps.platform }); } catch (e) {
       if (!(e instanceof RenderError) || deps.mode !== 'attest') throw e;
-      addNote(notes, 'The images are not signed yet: attest signing lands in a later pipegen release, and pipegen never falls back to another mode.');
+      addNote(notes, `The images are not signed: the attest signing job could not be written (${safeText(e.message, 200)}), and pipegen never falls back to another mode.`);
     }
   }
   if (deps.mode === 'none' || input.skipped.some((p) => p.part === 'deploy') || imageNone) { const { signing: _s, ...rest } = draft; draft = rest; }
