@@ -695,10 +695,23 @@ async function checkPin(gh: Octokit, d: DeliveryPlan, c: RepoRef, defaultBranch:
 }
 
 /** The setup pull request's body (the record's marker line is added by writeRecord). */
-function prBody(d: DeliveryPlan, commits: readonly { part: Part; files: CreatedFile[] }[], left: number): string {
+export function prBody(d: DeliveryPlan, commits: readonly { part: Part; files: CreatedFile[] }[], left: number, adopted: readonly Pick<CreatedFile, 'repo' | 'path'>[] = [], rewritten: readonly Pick<CreatedFile, 'repo' | 'path'>[] = [], carried: readonly Pick<CreatedFile, 'repo' | 'path'>[] = []): string {
+  // the body is markdown: a path pipegen would not write (anything outside the plain created-path alphabet) is never printed
+  adopted = adopted.filter((f) => createdPathProblem(f.path) === null);
+  rewritten = rewritten.filter((f) => createdPathProblem(f.path) === null);
+  carried = carried.filter((f) => createdPathProblem(f.path) === null);
+  const aiWritten = d.aiWritten.filter((x) => createdPathProblem(x) === null);
   const lines = ['pipegen sets up the security checks of this repository. One commit per part:', ''];
   for (const c of commits) lines.push(`- ${PART_TITLE[c.part]} (${c.part}): ${c.files.length} file${c.files.length === 1 ? '' : 's'}`);
-  if (d.aiWritten.length > 0) lines.push('', `Written by the AI (read them closely): ${d.aiWritten.map((x) => `\`${show(x)}\``).join(', ')}`);
+  // G10-R4 P3 (G9-R0 1): the files that were already there, byte-identical to what pipegen writes, are named; pipegen never rewrites them
+  if (adopted.length > 0) {
+    lines.push('', `Already there and identical to what pipegen writes, so pipegen left ${adopted.length === 1 ? 'it' : 'them'} as ${adopted.length === 1 ? 'it is' : 'they are'} (recorded as adopted: pipegen never rewrites ${adopted.length === 1 ? 'it' : 'them'}, and uninstall asks before it deletes ${adopted.length === 1 ? 'it' : 'them'}): ${adopted.map((f) => `\`${show(f.path)}\`${f.repo === 'central' ? ' (central repo)' : ''}`).join(', ')}`);
+  }
+  // adopted by an earlier run and still there: this run does not write them, so they are not "identical to what pipegen writes" (that is only said of the files above)
+  if (carried.length > 0) lines.push('', `Adopted by an earlier run and still in the repository (pipegen never rewrites ${carried.length === 1 ? 'it' : 'them'}, and uninstall asks before it deletes ${carried.length === 1 ? 'it' : 'them'}): ${carried.map((f) => `\`${show(f.path)}\`${f.repo === 'central' ? ' (central repo)' : ''}`).join(', ')}`);
+  // a file an earlier run adopted that this run rewrites (its text changed): said plainly
+  if (rewritten.length > 0) lines.push('', `This run rewrites ${rewritten.length === 1 ? 'a file' : 'files'} that an earlier run adopted (${rewritten.length === 1 ? 'it was' : 'they were'} in your repository before pipegen): ${rewritten.map((f) => `\`${show(f.path)}\``).join(', ')}`);
+  if (aiWritten.length > 0) lines.push('', `Written by the AI (read them closely): ${aiWritten.map((x) => `\`${show(x)}\``).join(', ')}`);
   if (left > 0) lines.push('', `${left} change${left === 1 ? '' : 's'} that run code (scripts or dependencies) ${left === 1 ? 'was' : 'were'} left out, as you chose.`);
   lines.push('', 'After you merge it, run `npx pipegen finish`: it turns on the merge locks and the settings pipegen planned (none of them comes before the merge, or this pull request could not merge).');
   return lines.join('\n');
@@ -829,7 +842,16 @@ export async function deliver(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vaul
       tree = r.tree;
     }
     if (await setBranch(gh, app, SETUP_BRANCH, parent, true, clock) === 'created') stored.push({ kind: 'branch', name: SETUP_BRANCH, repo: `${p.owner}/${p.repo}` });
-    const pr = await openOrUpdatePr(gh, app, { head: SETUP_BRANCH, base: appRepo.defaultBranch, title: 'pipegen: set up the security pipeline', body: prBody(d, commits, left) }, clock);
+    // N2/G9: the adopted files named in the body; an adopted file of the record that this run rewrites is said so
+    const rewrittenAdopted = commits.flatMap((c) => c.files).filter((f) => prev?.files.find((r) => r.repo === f.repo && r.path === f.path)?.adopted === true);
+    // adopted on an earlier run and still there (a re-run does not add them to `adopted` again: the record already holds their sha), minus the ones this run rewrites
+    const adoptedHere: Pick<CreatedFile, 'repo' | 'path'>[] = [...adopted].map((f) => ({ repo: f.repo, path: f.path }));
+    const carriedHere: Pick<CreatedFile, 'repo' | 'path'>[] = [];
+    for (const r of prev?.files ?? []) {
+      if (r.adopted !== true || adoptedHere.some((a) => a.repo === r.repo && a.path === r.path) || rewrittenAdopted.some((f) => f.repo === r.repo && f.path === r.path)) continue;
+      if ((r.repo === 'app' ? baseTree.entries : centralTree.entries).has(r.path)) carriedHere.push({ repo: r.repo, path: r.path });
+    }
+    const pr = await openOrUpdatePr(gh, app, { head: SETUP_BRANCH, base: appRepo.defaultBranch, title: 'pipegen: set up the security pipeline', body: prBody(d, commits, left, adoptedHere, rewrittenAdopted, carriedHere) }, clock);
     if (pr.opened) stored.push({ kind: 'pull-request', name: `#${pr.number}`, repo: `${p.owner}/${p.repo}` });
     done.push(`${pr.opened ? 'opened' : 'updated'} the setup pull request ${pr.url}`);
 
