@@ -22,7 +22,8 @@ import { isDeepStrictEqual } from 'node:util';
 import type { Octokit } from '@octokit/rest';
 import { makeProvider } from '../ai/provider.js';
 import { bundleCode, chooseSecretScanner, type CodeBundle } from '../ai/redact.js';
-import { ConsentToken, CountingSummary, countingSummary } from '../audit/consent-token.js';
+import { ConsentToken, CountingSummary, countingSummary, isSpent, spend } from '../audit/consent-token.js';
+import { ollamaHostOf } from '../ai/ollama.js';
 import { AiSpendMeter, meteredProvider } from '../ai/spend-meter.js';
 import { mapCoverage } from '../audit/coverage.js';
 import { buildsNoImage } from '../audit/model.js';
@@ -193,7 +194,7 @@ export interface RunStages {
   /** The counting bundle consent shows (no secret scan yet: ruling S21). */
   bundle(dir: string, knownValues: string[]): Promise<CodeBundle>;
   /** G13-R1 (sec I1): after the yes, the pinned scanner the consent named over exactly the counted files; refuses when it can't. */
-  scan(dir: string, consent: ConsentToken, knownValues: string[]): Promise<CodeBundle>;
+  scan(dir: string, consent: ConsentToken, knownValues: string[], agreed: Agreed): Promise<CodeBundle>;
   activity(f: GitHubFacts, p: RepoProfile): Promise<Activity>;
   consent(f: GitHubFacts, p: RepoProfile, ai: ReturnType<typeof makeProvider>, est: Estimates, bundle: CodeBundle, auth: Auth, extra: string[]): Promise<ConsentToken | null>;
   /** G13-R2 4 (sec m3): `guard` is the run's known-value check (the vault and the key vault, read live) and its tokens: never written. */
@@ -354,7 +355,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     const consent = await st.consent(facts, p, provider, est, counted, auth, extra);
     if (consent === null) { err('No consent: nothing was created, nothing was sent to an AI and no secret was asked for. exit code 1.'); return 1; }
     // the secret scan of the counted files only; a finding stops the run before anything is sent to an AI
-    const bundle = await st.scan(dir, consent, knownValues);
+    const bundle = await st.scan(dir, consent, knownValues, { ai: provider, capUsd: est.aiCostCapUsd });
     if (bundle.found.names.length > 0 || bundle.found.values.length > 0) { err(SECRET_FOUND); return 2; }
     // sec m3: the vaults exist from here (empty), so the state store checks every write against what is typed later
     vault = new SecretVault();
@@ -569,11 +570,23 @@ async function pinnedScanner(name: 'gitleaks' | 'betterleaks'): Promise<{ name: 
  * G13-R1 (sec I1), the audit's pattern: after the yes, the scanner the consent screen named (name and version) over exactly the files it
  * counted. A token that is not askConsent's 'full' one, another scanner, or a bundle with a file that was not counted is refused (thrown).
  */
-export async function scanCounted(dir: string, consent: ConsentToken, knownValues: string[], ensure: NonNullable<RunDeps['secretScanner']>): Promise<CodeBundle> {
+/** What the run agreed to at consent: the provider (name, model, Ollama host) and the AI cost cap of the estimate. */
+export interface Agreed { ai: ReturnType<typeof makeProvider>; capUsd: number | null }
+export async function scanCounted(dir: string, consent: ConsentToken, knownValues: string[], ensure: NonNullable<RunDeps['secretScanner']>, agreed: Agreed): Promise<CodeBundle> {
   const c: unknown = consent;
   if (!ConsentToken.isToken(c) || c.terms.mode !== 'full') throw new Error('pipegen run needs the consent askConsent gives for its own screen; nothing was sent.');
-  const counted = c.terms.files;
-  if (!CountingSummary.isSummary(counted)) throw new Error('The consent was not given for counted files; nothing was sent.');
+  // G13-R2 5 (the audit's checkConsent): spent before the first await, so two scans started at once can't both pass; a token refused below is
+  // spent too (the safe side)
+  if (isSpent(c)) throw new Error('This consent was already used; each run needs its own yes. Nothing was sent.');
+  spend(c);
+  const t = c.terms;
+  const host = agreed.ai.name === 'ollama' ? ollamaHostOf(agreed.ai) ?? undefined : undefined;
+  if (t.pricedFor.provider !== agreed.ai.name || t.pricedFor.model !== agreed.ai.model || t.pricedFor.host !== host || t.capUsd !== agreed.capUsd) {
+    throw new Error('The scan was given another AI provider, model or cost cap than the one you agreed to; nothing was sent.');
+  }
+  const counted = t.files;
+  const here = await realpath(dir).catch(() => null);
+  if (!CountingSummary.isSummary(counted) || t.dir === null || counted.dir !== t.dir || here !== t.dir) throw new Error('This consent was given for the files counted in another folder; nothing was sent.');
   const named = c.terms.secretScanner;
   if (named === undefined) throw new Error('The consent named no secret scanner; nothing was sent.');
   const scanner = await ensure(named.name);
@@ -835,7 +848,7 @@ function realStages(io: CliIO, deps: RunDeps): RunStages {
       for (const l of extra) io.err(l);
       return askConsent(io.prompt, screen, (s) => { io.err(s); });
     },
-    scan: (dir, consent, knownValues) => scanCounted(dir, consent, knownValues, deps.secretScanner ?? pinnedScanner),
+    scan: (dir, consent, knownValues, agreed) => scanCounted(dir, consent, knownValues, deps.secretScanner ?? pinnedScanner, agreed),
     state: (p, guard) => StateStore.open(p, { ...deps.state, vault: guard.vault, tokens: guard.tokens }),
     async gateReachable(f, reviewed) {
       // ruling G13-R0 12: the gate action's pinned commit, read through the API; any failure is "unreachable"

@@ -21,7 +21,7 @@ import type { Octokit } from '@octokit/rest';
 import { AiSpendMeter } from '../src/ai/spend-meter.js';
 import type { mapCoverage } from '../src/audit/coverage.js';
 import type { CodeBundle } from '../src/ai/redact.js';
-import { proofReposFor, onCreatedFor, provenDraft, NOT_IN_SCOPE, NO_MEMORY_FOLDER, SECRET_FOUND, notProvableNotes, auditCredits, createdInputsFor, dastWayPast, defaultProof, fullRun, judgeBuilt, NEVER_SKIPPED, parseSkip, PROOF_NOT_BUILT, runCreators, SCOPE_LINE, UNPINNED, WINDOWS_REFUSAL, GATE_UNREACHABLE, guardRecord, insertedBlock, type Built, type BuildInput, type GitHubFacts, type RunDeps, type RunStages } from '../src/cli/run.js';
+import { proofReposFor, onCreatedFor, scanCounted, provenDraft, NOT_IN_SCOPE, NO_MEMORY_FOLDER, SECRET_FOUND, notProvableNotes, auditCredits, createdInputsFor, dastWayPast, defaultProof, fullRun, judgeBuilt, NEVER_SKIPPED, parseSkip, PROOF_NOT_BUILT, runCreators, SCOPE_LINE, UNPINNED, WINDOWS_REFUSAL, GATE_UNREACHABLE, guardRecord, insertedBlock, type Built, type BuildInput, type GitHubFacts, type RunDeps, type RunStages } from '../src/cli/run.js';
 import { assembledJobs, consentJobs, docFor, draftFromDebate, isAiNote, parseStrictness, pickOwners, prWaitMinutes, proofAssembler, proofLayout, warnFirstFor, signingFor } from '../src/cli/run-parts.js';
 import { EXIT_UNSAFE_FOLDER, TYPE_CANCELLED } from '../src/cli/audit.js';
 import { run as main, type Commands } from '../src/cli/main.js';
@@ -142,7 +142,7 @@ function world(o: { local?: RepoProfile; facts?: GitHubFacts; debate?: DebateRes
     readProject: async (a, l) => { rec('readProject', a, l); return o.facts ?? facts(); },
     provider: () => { rec('provider'); return ai.ai; },
     bundle: async (d, k) => { rec('bundle', d, k); return { files: [] } as unknown as CodeBundle; },
-    scan: async (d, c, k) => { rec('scan', d, c, k); return { files: [], found: o.found ?? { names: [], values: [], [TL_KEY]: [] } } as unknown as CodeBundle; },
+    scan: async (d, c, k, agreed) => { rec('scan', d, c, k, agreed); return { files: [], found: o.found ?? { names: [], values: [], [TL_KEY]: [] } } as unknown as CodeBundle; },
     activity: async () => { rec('activity'); return { pushes: 10, prs: 5, capped: false }; },
     consent: async (f, p, prov, est, b, auth, extra) => { rec('consent', f, p, prov, est, b, auth, extra); return o.consent === false ? null : ({} as never); },
     state: async (p) => { rec('state', p); return StateStore.open(p, { home, env: {} }); },
@@ -1113,6 +1113,44 @@ describe('G13-R1: consent, then the secret scan, then the AI', () => {
   });
 });
 
+describe('G13-R2: the scan checks the consent as the audit does (ruling G13-R2 5)', () => {
+  it('scanCounted: the token is spent before the first await; another folder, provider, model or cap is refused', async () => {
+    const dir = tmp('pg-run-tok-');
+    writeFileSync(join(dir, 'index.js'), 'console.log(1);\n');
+    const other = tmp('pg-run-tok2-');
+    writeFileSync(join(other, 'index.js'), 'console.log(2);\n');
+    const stub = makeStub(CLEAN).bin;
+    const ensure = async () => betterleaksAt(stub, loadPinnedBinaries().betterleaks.version) as never;
+    const gh = { request: async () => { throw new Error('no GitHub here'); } } as unknown as Octokit;
+    /** One real run up to the scan: the token askConsent gave, and what the run agreed to (provider, cap). */
+    type Got = { c: Parameters<typeof scanCounted>[1]; agreed: Parameters<typeof scanCounted>[4] };
+    const capture = async (): Promise<Got> => {
+      const w = world();
+      delete w.stages.bundle; delete w.stages.consent;
+      let got: Got | undefined;
+      w.deps.stages = { ...w.stages, readProject: async () => facts({ gh }), scan: async (_d, c, _k, agreed) => { got = { c, agreed }; throw new Error('captured'); } };
+      await fullRun(dir, io(), w.deps);
+      if (got === undefined) throw new Error('no token');
+      return got;
+    };
+    // the right folder, provider and cap: scanned; the same token again: refused (spent), even when both calls start at once
+    const a = await capture();
+    await expect(scanCounted(dir, a.c, [], ensure, a.agreed)).resolves.toBeDefined();
+    await expect(scanCounted(dir, a.c, [], ensure, a.agreed)).rejects.toThrow(/already used/);
+    const b = await capture();
+    const [r1, r2] = await Promise.allSettled([scanCounted(dir, b.c, [], ensure, b.agreed), scanCounted(dir, b.c, [], ensure, b.agreed)]);
+    expect([r1.status, r2.status].sort()).toEqual(['fulfilled', 'rejected']);
+    // another folder
+    const c = await capture();
+    await expect(scanCounted(other, c.c, [], ensure, c.agreed)).rejects.toThrow(/another folder/);
+    // another provider or model, another cap
+    const d = await capture();
+    await expect(scanCounted(dir, d.c, [], ensure, { ...d.agreed, ai: { ...d.agreed.ai, model: 'another-model' } })).rejects.toThrow(/another AI provider, model or cost cap/);
+    const e = await capture();
+    await expect(scanCounted(dir, e.c, [], ensure, { ...e.agreed, capUsd: (e.agreed.capUsd ?? 0) + 5 })).rejects.toThrow(/another AI provider, model or cost cap/);
+  });
+});
+
 describe('G13-R1: before anything costs money', () => {
   it('run: a repository not owned by CrisWorking is refused before any GitHub call (sec M2)', async () => {
     const w = world();
@@ -1299,11 +1337,11 @@ describe('G13-R2: a public app\'s central CODEOWNERS', () => {
 describe('G13-R2: the state file never holds a known value (ruling G13-R2 4)', () => {
   it('run: the state store gets the run\'s known-value check (the vault and the key vault, live) and the GitHub token', async () => {
     const w = world();
-    let guard: { vault: { containsKnownValue(t: string): boolean }; tokens: readonly string[] } | undefined;
+    let guard: Parameters<RunStages['state']>[1] | undefined;
     const seen: boolean[] = [];
     w.stages.state = async (p, g) => { guard = g; w.calls.push('state'); return StateStore.open(p, { home: w.home, env: {}, ...g }); };
-    const secrets = w.stages[SEC_STAGE] as RunStages['secrets'];
-    w.stages[SEC_STAGE] = async (...a) => { seen.push(guard?.vault.containsKnownValue('x typed-value-1234567890 y') ?? false); return secrets(...a); };
+    const asked = w.stages[SEC_STAGE] as RunStages['secrets'];
+    w.stages[SEC_STAGE] = async (...a) => { seen.push(guard?.vault.containsKnownValue('x typed-value-1234567890 y') ?? false); return asked(...a); };
     expect(await run(w)).toBe(0);
     expect(guard?.tokens).toEqual([TK]);
     // the value typed after the store was opened is known to it (a live check, not a copy)
@@ -1311,7 +1349,7 @@ describe('G13-R2: the state file never holds a known value (ruling G13-R2 4)', (
     // and a real store with that guard refuses to write it
     const d = tmp('pg-state-guard-');
     const v = new SecretVault();
-    const store = await StateStore.open({ owner: OWN, repo: 'r' }, { home: d, env: {}, vault: v, tokens: [TK] });
+    const store = await StateStore.open({ owner: OWN, repo: 'r' }, { home: d, env: {}, vault: v, [TL_KEY]: [TK] });
     store.begin('20261106-100000-abc123', { owner: OWN, repo: 'r', private: true, ownerType: 'User', defaultBranch: 'main' }, { cap: 1, aiCap: 1 });
     v.set('API_TK', 'typed-value-1234567890');
     expect(() => store.recordVerdict({ ok: false, stopped: 'typed-value-1234567890' })).toThrow();
