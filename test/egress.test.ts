@@ -16,8 +16,8 @@ const HOST_RE = /^(?!-)[a-z0-9-]+(\.[a-z0-9-]+)+$/;
 describe('egress', () => {
   it('egress: sets github-core, npm, pypi, dockerhub (with production.cloudfront.docker.com and the R2 host), ghcr', () => {
     // the five reviewed choices, plus the E3-R1 exact-host sets (since E9 all eight are the bullfrog choices)
-    // G15a: plus the mode-scoped Sigstore set (test/g15-sigstore.test.ts)
-    expect(Object.keys(EGRESS_DOMAIN_SETS).sort()).toEqual(['dockerhub', 'ghcr', 'github-core', 'github-releases', 'npm', 'osv', 'pypi', 'sigstore', 'trivy-db']);
+    // G15a: plus the mode-scoped Sigstore set (test/g15-sigstore.test.ts) and gh's attestation set (test/g15-attest-verify.test.ts)
+    expect(Object.keys(EGRESS_DOMAIN_SETS).sort()).toEqual(['dockerhub', 'ghcr', 'github-attest', 'github-core', 'github-releases', 'npm', 'osv', 'pypi', 'sigstore', 'trivy-db']);
     expect([...REVIEWED_EGRESS_LABELS, ...E3_EGRESS_SETS, ...G15_EGRESS_SETS].sort()).toEqual([...bullfrog().choices['allowed-domains']!].sort());
     expect([...E3_EGRESS_SETS].sort()).toEqual(['github-releases', 'osv', 'trivy-db']);
     expect([...REVIEWED_EGRESS_LABELS, ...E3_EGRESS_SETS, ...G15_EGRESS_SETS].sort()).toEqual(Object.keys(EGRESS_DOMAIN_SETS).sort());

@@ -9,7 +9,9 @@ export const E3_EGRESS_SETS = Object.freeze(['github-releases', 'trivy-db', 'osv
  * keyless verify job's egress step names it (egress.ts KEYLESS_VERIFY_SETS), and the referee refuses its hosts in any other job.
  */
 export const SIGSTORE_SET = 'sigstore';
-export const G15_EGRESS_SETS = Object.freeze([SIGSTORE_SET] as const);
+/** G15a (ruling G15a-R0b item 2): gh's own hosts for `gh attestation verify` of a private repository's attestation (the attest verify job only). */
+export const GITHUB_ATTEST_SET = 'github-attest';
+export const G15_EGRESS_SETS = Object.freeze([SIGSTORE_SET, GITHUB_ATTEST_SET] as const);
 /** A set name: one of the reviewed labels, an E3-R1 set or the G15 Sigstore set. */
 export type EgressSet = typeof REVIEWED_EGRESS_LABELS[number] | typeof E3_EGRESS_SETS[number] | typeof G15_EGRESS_SETS[number];
 
@@ -60,6 +62,19 @@ export type EgressSet = typeof REVIEWED_EGRESS_LABELS[number] | typeof E3_EGRESS
  *   checklist verifies it (kept per the controller's start list, review-G4.md l. 77).
  *   Left out: fulcio.sigstore.dev (cmd/cosign/cli/options/fulcio.go:35, signcommon/common.go:435: signing only). The keyless sign job keeps
  *   its documented no-block exception (threat model T52): it also needs the per-run OIDC token host, which can not be listed exactly.
+ * - github-attest: `gh attestation verify` of the pinned gh v2.103.3 (data/reviewed-tools.yml, gh), run with --no-public-good in the attest
+ *   verify job only (attest mode is only ever a private repository's, so its attestations are signed by GitHub's own instance). Each host:
+ *   tuf-repo.github.com: GitHub's TUF mirror, the trust root of GitHub-issued attestations: pkg/cmd/attestation/verification/tuf.go:19
+ *   (GitHubTUFMirror), set as the repository URL at tuf.go:48-55 (GitHubTUFOptions), used by newGitHubVerifier at
+ *   pkg/cmd/attestation/verification/sigstore.go:340; the live checklist verifies it under Bullfrog.
+ *   tmaproduction.blob.core.windows.net: where the attestation bundle is downloaded from. The attestations API answers `bundle: null`
+ *   with a `bundle_url` (pkg/cmd/attestation/api/client.go:201-215, fetchBundleFromAttestations; getBundle at client.go:234), and that
+ *   URL's host was exactly this one, observed live 2026-11-06 on the attestations API (GET /repos/cli/cli/attestations/sha256:4c8069…, a
+ *   SAS URL under /attestations/<repo id>/). The exact host only, never *.blob.core.windows.net (any Azure storage account); the live
+ *   checklist verifies it ("confirm bundle_url host"). The API itself (api.github.com, pkg/cmd/attestation/api/client.go) is in github-core.
+ *   Not added: tuf-repo-cdn.sigstore.dev, the public-good TUF: gh fetches it only without --no-public-good
+ *   (pkg/cmd/attestation/verification/sigstore.go:78-79, newPublicGoodVerifier; sigstore-go v1.3.0 pkg/tuf/options.go:32 DefaultMirror).
+ *   Verification itself is offline: the bundle carries its transparency-log and timestamp proofs.
  * Not added: Sigstore hosts for the proof harness (it signs key-based with --tlog-upload=false, so none is needed); actions/attest
  * (its OIDC token URL is a per-run actions.githubusercontent.com host that can't be listed exactly: attestation stays
  * not-proven under Bullfrog); semgrep, nuclei and ZAP need none beyond github-core and their image registry (their rules
@@ -80,5 +95,6 @@ export const EGRESS_DOMAIN_SETS: Readonly<Record<EgressSet, readonly string[]>> 
   'trivy-db': Object.freeze(['mirror.gcr.io']),
   osv: Object.freeze(['api.osv.dev']),
   [SIGSTORE_SET]: Object.freeze(['rekor.sigstore.dev', 'tuf-repo-cdn.sigstore.dev']),
+  [GITHUB_ATTEST_SET]: Object.freeze(['tmaproduction.blob.core.windows.net', 'tuf-repo.github.com']),
 });
 

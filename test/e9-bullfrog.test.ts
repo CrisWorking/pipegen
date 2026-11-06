@@ -13,8 +13,8 @@ import { loadReviewed } from '../src/engine/reviewed.js';
 import { ACTION_POLICIES, allowedDomainsProblem, egressDomains } from '../src/engine/tool-flags.js';
 import { ctxFor, entry, platform, service, specFor } from './helpers/render.js';
 
-// (G15a: the Sigstore set of the keyless verify job is the ninth)
-const LABELS = ['github-core', 'npm', 'pypi', 'dockerhub', 'ghcr', 'github-releases', 'trivy-db', 'osv', 'sigstore'];
+// (G15a: the Sigstore set of the keyless verify job, and gh's attestation set of the attest verify job)
+const LABELS = ['github-core', 'npm', 'pypi', 'dockerhub', 'ghcr', 'github-releases', 'trivy-db', 'osv', 'sigstore', 'github-attest'];
 const union = (...sets: (keyof typeof EGRESS_DOMAIN_SETS)[]): string => [...new Set(sets.flatMap((s) => EGRESS_DOMAIN_SETS[s]))].sort().join('\n');
 
 describe('E9: the bullfrog allowed-domains policy', () => {

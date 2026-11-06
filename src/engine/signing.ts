@@ -194,6 +194,9 @@ export function renderVerifySteps(tool: ReviewedTool, draft: PipelineDraft, imag
   const name = `pipegen: verify ${repo} (${plan.mode})`;
   if (plan.mode === 'attest') {
     reviewedRelease(tool, GH_ID, GH_REPO, 'gh');
+    // G15a-R0b: attest mode is only a private repository's (signingMode), whose attestations GitHub's own instance signs, so gh runs with
+    // --no-public-good and never fetches the public-good TUF (gh v2.103.3 pkg/cmd/attestation/verification/sigstore.go:78-79)
+    if (draft.profile.private !== true) throw new RenderError('Attest mode is for private repositories only; a public repository signs keyless.');
     const central = draft.centralPin?.repo;
     if (central === undefined) throw new RenderError('Attest mode verifies against the central sign workflow, and the draft has no central pin.');
     const signer = attestSignerWorkflow(central, draft.profile.repo);
@@ -214,7 +217,7 @@ export function renderVerifySteps(tool: ReviewedTool, draft: PipelineDraft, imag
       // a fresh config folder: the runner's own gh login or config is never read
       'ghcfg="$(mktemp -d "$RUNNER_TEMP/pipegen-gh.XXXXXX")"',
       COMMIT_LINE,
-      `GH_TOKEN="$PIPEGEN_GH_TOKEN" GH_CONFIG_DIR="$ghcfg" GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 "${install.bin}" attestation verify "oci://$ref" --repo ${q(app)} --source-ref ${q(`refs/heads/${branch}`)} --source-digest "$GITHUB_SHA" --signer-workflow ${q(signer)} --signer-digest ${q(centralSha)} --deny-self-hosted-runners`,
+      `GH_TOKEN="$PIPEGEN_GH_TOKEN" GH_CONFIG_DIR="$ghcfg" GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 "${install.bin}" attestation verify "oci://$ref" --repo ${q(app)} --source-ref ${q(`refs/heads/${branch}`)} --source-digest "$GITHUB_SHA" --signer-workflow ${q(signer)} --signer-digest ${q(centralSha)} --no-public-good --deny-self-hosted-runners`,
     ], { PIPEGEN_GH_TOKEN: VERIFY_STEP_ENV.PIPEGEN_GH_TOKEN as string })];
   }
   reviewedRelease(tool, COSIGN_ID, COSIGN_REPO, 'cosign');

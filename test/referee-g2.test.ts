@@ -5,6 +5,7 @@
 import { createHash } from 'node:crypto';
 import { Document, parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
+import { GITHUB_ATTEST_SET, renderEgressStep } from '../src/engine/egress.js';
 import { aiChoiceNames, CODE_FILLED_CHOICES } from '../src/create/coverage.js';
 import { builderOffers } from '../src/debate/builder.js';
 import { jobIdFor } from '../src/engine/gate-job-list.js';
@@ -195,7 +196,7 @@ describe('G2: signing and verification steps (B3 b, d)', () => {
     // G2-R-sec 2: bound like keyless: the source is the app's default branch, the signer is the central sign workflow AT the central commit
     // pipegen pinned (a reusable workflow called at a commit signs with that commit), on a GitHub-hosted runner
     // G15a: and the deployed commit itself (--source-digest, the push's GITHUB_SHA, checked as 40 hex first)
-    expect(ghRun).toContain(`"$RUNNER_TEMP/pipegen-bin/pipegen-gh-verify/gh" attestation verify "oci://$ref" --repo 'o/r' --source-ref 'refs/heads/main' --source-digest "$GITHUB_SHA" --signer-workflow 'o/pipelines/.github/workflows/r--sign.yml' --signer-digest '${'a'.repeat(40)}' --deny-self-hosted-runners`);
+    expect(ghRun).toContain(`"$RUNNER_TEMP/pipegen-bin/pipegen-gh-verify/gh" attestation verify "oci://$ref" --repo 'o/r' --source-ref 'refs/heads/main' --source-digest "$GITHUB_SHA" --signer-workflow 'o/pipelines/.github/workflows/r--sign.yml' --signer-digest '${'a'.repeat(40)}' --no-public-good --deny-self-hosted-runners`);
     for (const defaultBranch of ['-x', 'a..b', "ma'in", 'ma in', '']) {
       expect(() => renderVerifySteps(gh, { ...at, profile: { ...at.profile, defaultBranch } }, IMG), defaultBranch).toThrow(RenderError);
     }
@@ -237,13 +238,15 @@ describe('G2: signing and verification steps (B3 b, d)', () => {
     const pubOnOther: RenderedStep = { id: 'pipegen-verify-0000000000000000', name: 'x', run: 'echo "$PIPEGEN_COSIGN_PUB"', shell: 'bash', env: { PIPEGEN_COSIGN_PUB: '${{ vars.PIPEGEN_COSIGN_PUB }}' } };
     expect((await runWith([rawFile({ 'pipegen-verify': job([leaked, pubOnOther], { permissions: VERIFY_PERMS, environment: 'pipegen-signing' }) }, { on: { workflow_call: null } }, '.github/workflows/deploy-verify.yml')], keDraft)).ok).toBe(false);
     // attest: with the real gh entry the step is pipegen's own verify step (recognised by content, in pipegen-verify); without the entry
-    // nothing renders it, so it is refused. G15a: the attest verify job is still refused as a whole, for one reason only: gh reads GitHub's
-    // Sigstore trust root from a host no reviewed network set holds (not confirmed offline for the pinned gh; the live checklist), so
-    // behind the network lock it could only fail
-    const atFile = vf({ 'pipegen-verify': verifyJob(ghSteps) });
+    // nothing renders it, so it is refused. G15a-R0b: attest verify is on; its job's egress step reaches gh's attestation hosts (the
+    // referee requires them there, test/g15-attest-verify.test.ts), and with them the job passes
+    const atJob = verifyJob(ghSteps);
+    const atEgress = { ...atJob, steps: [renderEgressStep(['ghcr', 'github-releases', GITHUB_ATTEST_SET], { dockerNetworks: false }), ...(atJob.steps as RenderedStep[]).slice(1)] };
+    const atFile = vf({ 'pipegen-verify': atEgress });
     const withGh = await runWith([atFile], at, reviewedList());
-    expect(withGh.issues.map((i) => i.message).filter((m) => !/trust root/.test(m)), show(withGh)).toEqual([]);
-    expect(has(withGh, 'template', /attest[\s\S]*trust root/), show(withGh)).toBe(true);
+    expect(show(withGh)).toBe('');
+    // without them (the default egress step of these tests) it is refused
+    expect(has(await runWith([vf({ 'pipegen-verify': atJob })], at, reviewedList()), 'template', /attestation hosts/)).toBe(true);
     const noGh = await runWith([atFile], at, reviewedList().filter((t) => t.id !== GH_ID));
     expect(noGh.ok).toBe(false);
     expect(noGh.notes.some((n) => /gh/.test(n)), noGh.notes.join('\n')).toBe(true);

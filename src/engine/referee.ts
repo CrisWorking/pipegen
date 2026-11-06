@@ -65,7 +65,7 @@ import { strongReason } from './deploy-gating.js';
 import { ARCHIVE_TOOL_IDS, imageBuildTag, renderImageArchiveScan, renderImageBuild } from './image-handoff.js';
 import { dastStartOf, renderDastRun, renderDastScrub } from './dast-handoff.js';
 import { ATTEST_VERIFY_REFUSAL, ATTEST_VERIFY_SETS, KEYLESS_VERIFY_SETS, SHARED_CDN_SETS } from './egress.js';
-import { EGRESS_DOMAIN_SETS, SIGSTORE_SET } from './egress-sets.js';
+import { EGRESS_DOMAIN_SETS, GITHUB_ATTEST_SET, SIGSTORE_SET } from './egress-sets.js';
 import { allowedDomainsProblem, ARGV_POLICIES, BULLFROG_USES, CACHE_LOCKS, GATE_OPTIONAL_UPLOADS, PLAIN_REL_RE, PLATFORM_USES, RANGE_TOOL, RENDERER_INPUTS, rendererInputProblems, SCRUB_SECRET, uploadIfNoFiles } from './tool-flags.js';
 
 // ---------- the report ----------
@@ -1170,10 +1170,13 @@ function judgeVerifyJob(fc: FileCtx, where: string, j: Obj, judged: readonly Jud
     if (mode === 'attest' && ATTEST_VERIFY_SETS === null) bad(`checks an attest-mode image, which pipegen does not verify yet: ${ATTEST_VERIFY_REFUSAL}.`);
     // G15a (carry A2): keyless verification reads Sigstore's trusted root and log, so the job's egress step must reach them (else it fails
     // closed at run time and every deploy stops)
-    if (mode === 'keyless') {
+    // G15a-R0b: attest verification reads GitHub's trust root and downloads the attestation bundle, so the same holds for gh's hosts
+    const need = mode === 'keyless' ? { hosts: KEYLESS_VERIFY_HOSTS, what: 'a keyless signature', whose: 'Sigstore\'s hosts' }
+      : mode === 'attest' ? { hosts: ATTEST_VERIFY_HOSTS, what: 'an attestation', whose: 'gh\'s attestation hosts' } : null;
+    if (need !== null) {
       const egress = judged[0]?.kind === 'harden' ? String(judged[0].step.with?.['allowed-domains'] ?? '').split('\n').map((x) => x.trim()) : [];
-      const missing = KEYLESS_VERIFY_HOSTS.filter((h) => !egress.includes(h));
-      if (judged[0]?.kind !== 'harden' || missing.length > 0) bad(`checks a keyless signature, so it starts with its egress step and that step reaches Sigstore's hosts (${KEYLESS_VERIFY_HOSTS.join(', ')}); ${judged[0]?.kind !== 'harden' ? 'it has no egress step first' : `it misses ${missing.join(', ')}`}.`);
+      const missing = need.hosts.filter((h) => !egress.includes(h));
+      if (judged[0]?.kind !== 'harden' || missing.length > 0) bad(`checks ${need.what}, so it starts with its egress step and that step reaches ${need.whose} (${need.hosts.join(', ')}); ${judged[0]?.kind !== 'harden' ? 'it has no egress step first' : `it misses ${missing.join(', ')}`}.`);
     }
   }
   // nothing of the verify job's own may come before the find-run step but its egress block
@@ -1357,6 +1360,9 @@ const safeRunId = (service: string): string => { try { return dastRunJobId(servi
 /** G15a: the hosts of the Sigstore set (the keyless verify job's, KEYLESS_VERIFY_SETS). */
 const SIGSTORE_HOSTS: ReadonlySet<string> = new Set(EGRESS_DOMAIN_SETS[SIGSTORE_SET]);
 const KEYLESS_VERIFY_HOSTS: readonly string[] = KEYLESS_VERIFY_SETS.flatMap((x) => EGRESS_DOMAIN_SETS[x]);
+/** G15a-R0b: the hosts of gh's attestation set (the attest verify job's, ATTEST_VERIFY_SETS). */
+const ATTEST_VERIFY_HOSTS: readonly string[] = (ATTEST_VERIFY_SETS ?? []).flatMap((x) => EGRESS_DOMAIN_SETS[x]);
+const ATTEST_HOSTS: ReadonlySet<string> = new Set(EGRESS_DOMAIN_SETS[GITHUB_ATTEST_SET]);
 /** G4-R1 (E3-R3): the hosts of the shared-CDN egress sets (anyone can serve from them). */
 const SHARED_CDN_HOSTS: ReadonlySet<string> = new Set([...SHARED_CDN_SETS].flatMap((s) => EGRESS_DOMAIN_SETS[s]));
 /**
@@ -1374,10 +1380,14 @@ function judgeEgress(fc: FileCtx, id: string, where: string, j: Obj, judged: rea
   const hardens = judged.filter((x) => x.kind === 'harden');
   if (!keylessSign && !attestSign && (judged[0]?.kind !== 'harden' || hardens.length !== 1)) bad('permissions', `${where} must start with pipegen's egress step (the reviewed Bullfrog block, once, first): without it the job's network is open.`);
   // G15a (carries A2, A3): the Sigstore hosts only in the keyless verify job (mode re-derived from the repository, never the draft's plan)
-  const keylessVerify = id === 'pipegen-verify' && signingMode(fc.draft.profile, fc.draft.capabilities) === 'keyless';
+  const repoMode = signingMode(fc.draft.profile, fc.draft.capabilities);
+  const keylessVerify = id === 'pipegen-verify' && repoMode === 'keyless';
+  const attestVerify = id === 'pipegen-verify' && repoMode === 'attest';
   for (const h of hardens) {
     const hosts = String(h.step.with?.['allowed-domains'] ?? '').split('\n').map((x) => x.trim());
     const sig = hosts.filter((x) => SIGSTORE_HOSTS.has(x));
+    const gha = hosts.filter((x) => ATTEST_HOSTS.has(x));
+    if (gha.length > 0 && !attestVerify) bad('permissions', `${where} opens gh's attestation hosts (${gha.map((x) => show(x)).join(', ')}), which only the attest verify job pipegen-verify reaches.`);
     if (sig.length > 0 && !keylessVerify) bad('permissions', `${where} opens Sigstore's hosts (${sig.map((x) => show(x)).join(', ')}), which only the keyless verify job pipegen-verify reaches: no other job reads Sigstore, and anyone can write to its log.`);
   }
   const userSecret = judged.some((x) => [...x.secrets].some((n) => fc.ex.declared.has(n) && !PIPEGEN_SECRETS.includes(n)));

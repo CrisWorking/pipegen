@@ -308,10 +308,9 @@ describe('G7 verify job: what pipegen-verify proves before a deploy', () => {
     expect(run).toContain("--signer-workflow 'o/pipelines/.github/workflows/r--sign.yml'");
     expect(run).toContain(`--signer-digest '${PIN.sha}'`);
     expect(run).toContain("--repo 'o/r'");
-    // the attest verify job stays refused, with a plain reason: gh reads GitHub's Sigstore trust root from a host no reviewed network set
-    // holds yet (the live checklist confirms it for the pinned gh), so behind the network lock the job could only fail
-    expect(() => verifyTail(draft, REVIEWED)).toThrow(/trust root/);
-    expect(() => verifyTail(draft, REVIEWED)).not.toThrow(/\bG\d+\b/);
+    expect(run).toContain(' --no-public-good');
+    // G15a-R0b: attest verify is on; its job reaches gh's attestation hosts (test/g15-attest-verify.test.ts holds it to the referee)
+    expect(verifyTail(draft, REVIEWED).sets).toContain('github-attest');
     expect(verifyPermissions(draft)).toEqual({ contents: 'read', actions: 'read', packages: 'read', attestations: 'read' });
   });
 

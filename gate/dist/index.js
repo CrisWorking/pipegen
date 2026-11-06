@@ -1950,7 +1950,8 @@ function validDate(text) {
 var REVIEWED_EGRESS_LABELS = Object.freeze(["github-core", "npm", "pypi", "dockerhub", "ghcr"]);
 var E3_EGRESS_SETS = Object.freeze(["github-releases", "trivy-db", "osv"]);
 var SIGSTORE_SET = "sigstore";
-var G15_EGRESS_SETS = Object.freeze([SIGSTORE_SET]);
+var GITHUB_ATTEST_SET = "github-attest";
+var G15_EGRESS_SETS = Object.freeze([SIGSTORE_SET, GITHUB_ATTEST_SET]);
 var EGRESS_DOMAIN_SETS = Object.freeze({
   "github-core": Object.freeze([
     "github.com",
@@ -1971,7 +1972,8 @@ var EGRESS_DOMAIN_SETS = Object.freeze({
   "github-releases": Object.freeze(["release-assets.githubusercontent.com"]),
   "trivy-db": Object.freeze(["mirror.gcr.io"]),
   osv: Object.freeze(["api.osv.dev"]),
-  [SIGSTORE_SET]: Object.freeze(["rekor.sigstore.dev", "tuf-repo-cdn.sigstore.dev"])
+  [SIGSTORE_SET]: Object.freeze(["rekor.sigstore.dev", "tuf-repo-cdn.sigstore.dev"]),
+  [GITHUB_ATTEST_SET]: Object.freeze(["tmaproduction.blob.core.windows.net", "tuf-repo.github.com"])
 });
 
 // src/engine/tool-flags.ts

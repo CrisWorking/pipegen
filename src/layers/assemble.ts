@@ -504,7 +504,7 @@ export function verifyTail(draft: PipelineDraft, reviewed: readonly ReviewedTool
     steps.push(...guard(() => renderVerifySteps(tool as ReviewedTool, draft, image as SignedImage)));
     for (const x of egressSetsForTool(tool as ReviewedTool)) sets.add(x);
     sets.add('ghcr');
-    // G15a (open question 3): gh's own Sigstore hosts are not sourced for the pinned gh yet, so an attest verify job is refused (fail closed)
+    // G15a-R0b: gh's own hosts (the github-attest set, cited in egress-sets.ts); were ATTEST_VERIFY_SETS null, attest verify is refused (fail closed)
     if (plan.mode === 'attest') {
       if (ATTEST_VERIFY_SETS === null) fail(`Attest-mode deploys can not be verified yet: ${ATTEST_VERIFY_REFUSAL}.`);
       for (const x of ATTEST_VERIFY_SETS ?? []) sets.add(x);

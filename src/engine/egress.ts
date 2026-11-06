@@ -19,8 +19,8 @@ import type { RenderedStep } from './job-rules.js';
 import { loadReviewed } from './reviewed.js';
 import { egressDomains } from './tool-flags.js';
 
-export { E3_EGRESS_SETS, EGRESS_DOMAIN_SETS, G15_EGRESS_SETS, REVIEWED_EGRESS_LABELS, SIGSTORE_SET, type EgressSet } from './egress-sets.js';
-import { EGRESS_DOMAIN_SETS, SIGSTORE_SET, type EgressSet } from './egress-sets.js';
+export { E3_EGRESS_SETS, EGRESS_DOMAIN_SETS, G15_EGRESS_SETS, GITHUB_ATTEST_SET, REVIEWED_EGRESS_LABELS, SIGSTORE_SET, type EgressSet } from './egress-sets.js';
+import { EGRESS_DOMAIN_SETS, GITHUB_ATTEST_SET, SIGSTORE_SET, type EgressSet } from './egress-sets.js';
 
 /**
  * Sets a tool needs at run time beyond its install (ruling E3-R1), by reviewed id. Reviewed data: a new entry that talks to
@@ -89,7 +89,7 @@ export function egressSetsForTool(tool: ReviewedTool): EgressSet[] {
  * E3-R3 (E-b5): the egress sets whose hosts serve anyone's content (release assets, the OSV API, the Trivy DB mirror): never in a job with a
  * user secret. G15a: the Sigstore set too (anyone can write an entry to the public transparency log, so it could carry a secret out).
  */
-export const SHARED_CDN_SETS: ReadonlySet<EgressSet> = new Set<EgressSet>(['github-releases', 'osv', 'trivy-db', SIGSTORE_SET]);
+export const SHARED_CDN_SETS: ReadonlySet<EgressSet> = new Set<EgressSet>(['github-releases', 'osv', 'trivy-db', SIGSTORE_SET, GITHUB_ATTEST_SET]);
 
 /**
  * G15a (carries A2, A3; open question 1, mode-scoped): the sets the keyless verify job adds to cosign's own (cosign verify reads Sigstore's
@@ -98,13 +98,12 @@ export const SHARED_CDN_SETS: ReadonlySet<EgressSet> = new Set<EgressSet>(['gith
 export const KEYLESS_VERIFY_SETS: readonly EgressSet[] = Object.freeze([SIGSTORE_SET]);
 
 /**
- * G15a (open question 3): the sets the attest verify job adds for `gh attestation verify`, or null while they are not sourced. gh reads the
- * trusted root of GitHub's own Sigstore instance through TUF from its own host (the installed gh 2.87.3 holds tuf-repo.github.com and
- * tuf-repo-cdn.sigstore.dev), but the pinned gh v2.103.3 could not be read offline, and every host in a set cites the pinned upstream. So
- * the attest verify job is refused (fails closed) until a reviewed set lists them: the live checklist confirms the hosts on v2.103.3.
+ * G15a (ruling G15a-R0b item 2): the sets the attest verify job reaches beyond its install and ghcr: gh's own hosts (the github-attest set,
+ * each host cited in egress-sets.ts from the pinned gh v2.103.3 source and one live reading). gh runs with --no-public-good there, so the
+ * public-good TUF is never fetched. null would refuse attest verify (fail closed) while a host is uncited.
  */
-export const ATTEST_VERIFY_SETS: readonly EgressSet[] | null = null;
-/** Why an attest verify job is refused while ATTEST_VERIFY_SETS is null (plain words, shown by assemble and the referee). */
+export const ATTEST_VERIFY_SETS: readonly EgressSet[] | null = Object.freeze([GITHUB_ATTEST_SET]);
+/** Said only while ATTEST_VERIFY_SETS is null (a reviewed host of gh is missing): attest verify is then refused, never written to fail. */
 export const ATTEST_VERIFY_REFUSAL = 'gh reads the trust root of GitHub\'s own signing service from a host that is in no reviewed network set yet, so behind the network lock the verify job could only fail; pipegen refuses the attest deploy check instead of writing a job that never passes';
 
 /** The Docker network range a job's services and containers use (the reviewed `allowed-ips` choice). */
