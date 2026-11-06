@@ -1111,3 +1111,97 @@ describe('GJ-R4 (review GJ-r3 N1-N5, N7): continued build lines, a container ove
     expect(STATIC_SKIP).toBe('no workflow, compose or bake image build found; else use --type SERVICE=container');
   });
 });
+
+describe('GJ-R5 (review GJ-r4 R1, H1): code next to a suffixed container file is the root app\'s; expressions never cut a build line', () => {
+  const CAPS5: Capabilities = { branchProtection: true, environments: false, envRequiredReviewers: false, deploymentBranchPolicies: false, attestations: false, codeScanning: true, keylessSigningAllowed: true };
+  const NGINX = 'FROM nginx:1.27\nCOPY out /usr/share/nginx/html\nEXPOSE 80\n';
+  const LOCK = '{"lockfileVersion":3,"packages":{}}';
+  const read = async (files: Record<string, string>, notes: string[] = []): Promise<RepoProfile> => ({ ...(await readProject(repo(files), { notes })), private: false, ownerType: 'User', plan: 'free' } as RepoProfile);
+  const assembled = async (p: RepoProfile) => { const a = assemble(planned(p, { over: { skipped: [{ part: 'deploy' as const, reason: 't' }] } })); return { a, issues: shown(await judge(files(a), a.draft)) }; };
+  const express = (extra: Record<string, string>, own = true) => ({ 'package.json': pkg({ name: 'api', scripts: { start: 'node index.js', test: 'vitest run' }, dependencies: { express: '4.0.0' } }), 'package-lock.json': LOCK, 'index.js': "require('express')().listen(3000);\n", 'index.test.js': 'test("x", () => {});\n', ...(own ? { Dockerfile: 'FROM node:24\nEXPOSE 3000\nCMD ["node", "index.js"]\n' } : {}), ...extra });
+  const site = (extra: Record<string, string>) => ({ 'package.json': nextPkg({ dev: 'next dev', build: 'next build', test: 'vitest run' }), 'package-lock.json': LOCK, 'next.config.mjs': "export default { output: 'export' };\n", 'app/page.tsx': PAGE, ...extra });
+
+  const cases: [string, Record<string, string>][] = [
+    ['root express + Dockerfile + docker/Dockerfile.dev + docker/healthcheck.js', express({ 'docker/Dockerfile.dev': 'FROM node:24\n', 'docker/healthcheck.js': '1;\n' })],
+    ['root express + Dockerfile + deploy/Dockerfile.prod + deploy/scripts/smoke.js', express({ 'deploy/Dockerfile.prod': 'FROM node:24\n', 'deploy/scripts/smoke.js': '1;\n' })],
+    ['root express + Dockerfile + .docker/dev.Dockerfile + .docker/seed.ts', express({ '.docker/dev.Dockerfile': 'FROM node:24\n', '.docker/seed.ts': 'export {};\n' })],
+    ['root express + Dockerfile + docker/Dockerfile.test + docker/wait-for.js', express({ 'docker/Dockerfile.test': 'FROM node:24\n', 'docker/wait-for.js': '1;\n' })],
+    ['root express + Dockerfile + infra/Dockerfile.lambda + infra/lambda/handler.py', express({ 'infra/Dockerfile.lambda': 'FROM public.ecr.aws/lambda/python:3.12\n', 'infra/lambda/handler.py': 'def h(e, c): return 1\n' })],
+    ['root express + Dockerfile + .github/actions/n/Dockerfile.action + entrypoint.py', express({ '.github/actions/n/Dockerfile.action': 'FROM python:3.12\n', '.github/actions/n/entrypoint.py': 'print(1)\n', '.github/actions/n/action.yml': 'runs:\n  using: docker\n  image: Dockerfile.action\n' })],
+    ['root static + Dockerfile.prod + docker/Dockerfile.dev + docker/dev-server.mjs', site({ 'Dockerfile.prod': NGINX, 'docker/Dockerfile.dev': 'FROM node:24\n', 'docker/dev-server.mjs': 'export {};\n' })],
+  ];
+  for (const [label, files] of cases) {
+    it(`R1: ${label} keeps the root as its only service and assembles cleanly with image checks`, async () => {
+      const notes: string[] = [];
+      const p = await read(files, notes);
+      expect(p.services.map((s) => [s.path, s.language])).toEqual([['.', 'node']]);
+      expect(notes.join('\n')).toMatch(/has a container file but no app manifest/);
+      const { a, issues } = await assembled(p);
+      expect(issues).toBe('');
+      expect(Object.keys(a.merge).some((k) => /image/.test(k))).toBe(true);
+    });
+  }
+  it('R1: with no container file of its own the root is still kept (its hint names the folder\'s file)', async () => {
+    const p = await read(express({ 'docker/Dockerfile.dev': 'FROM node:24\n', 'docker/healthcheck.js': '1;\n' }, false));
+    expect(p.services.map((s) => [s.path, s.language])).toEqual([['.', 'node']]);
+    expect(p.services[0]?.containerHint).toContain('docker/Dockerfile.dev');
+    const q = await read(site({ 'docker/Dockerfile.dev': 'FROM node:24\n', 'docker/dev-server.mjs': 'export {};\n' }));
+    expect(q.services.map((s) => s.path)).toEqual(['.']);
+    await expect(assembled(q)).rejects.toThrow(/--type site=static-site/);
+    expect((await assembled(applyTypeOverrides(q, [{ service: 'site', type: 'static-site' }]))).issues).toBe('');
+  });
+  it('R1 control: a folder with code and a plain Dockerfile (or Containerfile) stays a service, as at 2450960', async () => {
+    expect((await read(express({ 'worker/Dockerfile': 'FROM node:24\n', 'worker/index.js': '1;\n' }))).services.map((s) => s.path).sort()).toEqual(['.', 'worker']);
+    expect((await read(express({ 'jobs/Containerfile': 'FROM node:24\n', 'jobs/run.py': 'print(1)\n' }))).services.map((s) => s.path).sort()).toEqual(['.', 'jobs']);
+  });
+
+  it('H1: a ${{ … || … }} expression on a build line (one line or continued) never ends it', async () => {
+    const one = 'docker buildx build -t ghcr.io/o/web:${{ github.head_ref || github.ref_name }} -f apps/web/Dockerfile.ci apps/web';
+    expect([...workflowBuildRefs([one])].sort()).toEqual(['apps/web', 'apps/web/Dockerfile.ci']);
+    const multi = ['docker buildx build \\', '  -t ghcr.io/o/web:${{ github.head_ref || github.ref_name }} \\', '  -f apps/web/Dockerfile.ci \\', '  apps/web'].join('\n');
+    expect([...workflowBuildRefs([multi])].sort()).toEqual(['apps/web', 'apps/web/Dockerfile.ci']);
+    expect([...workflowBuildRefs(['docker build -t "x:$(git rev-parse --short HEAD || echo dev)" -f ops/a.Dockerfile svc-a'])].sort()).toEqual(['ops/a.Dockerfile', 'svc-a']);
+    const ws = {
+      'package.json': JSON.stringify({ name: 'mono', private: true, workspaces: ['apps/*'] }), 'package-lock.json': LOCK,
+      'apps/web/package.json': pkg({ name: 'web', scripts: { dev: 'next dev', build: 'next build' }, dependencies: { next: '15.0.0' } }), 'apps/web/next.config.mjs': "export default { output: 'export' };\n", 'apps/web/app/page.tsx': PAGE,
+      '.github/workflows/img.yml': `on: push\njobs:\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ${one} --push\n`,
+    };
+    const p = await read(ws);
+    const web = p.services.find((s) => s.name === 'web') as Service;
+    expect(web.containerHint).toContain('apps/web');
+    expect(skippedChecks(p, CAPS5).some((k) => k.service === 'web' && k.why === STATIC_SKIP)).toBe(false);
+  });
+  it('H1: a value that is an expression is no reference', () => {
+    expect([...workflowBuildRefs(['          context: ${{ matrix.context }}', '          file: ${{ matrix.df }}.Dockerfile'])]).toEqual([]);
+    expect([...workflowBuildRefs(['docker build -f ${{ env.DF }} .'])]).toEqual(['.']);
+  });
+  it('R1 control: a folder with a plain Dockerfile and no code or manifest (an nginx image) is the root app\'s, with a note', async () => {
+    const notes: string[] = [];
+    const p = await read(express({ 'nginx/Dockerfile': 'FROM nginx:1.27\n' }), notes);
+    expect(p.services.map((s) => s.path)).toEqual(['.']);
+    expect(notes.join('\n')).toContain('The folder nginx has a container file but no app manifest');
+  });
+  it('H1: docker build apps/web -t img:${{ github.sha }} keeps its context', () => {
+    expect([...workflowBuildRefs(['docker build apps/web -t img:${{ github.sha }}'])]).toEqual(['apps/web']);
+    expect([...workflowBuildRefs(['docker build $(pwd)/x -t y apps/api'])]).toEqual(['apps/api']);
+  });
+  it('H1: expression blanking is bounded (deep nesting, unclosed spans, long runs finish fast and drop what they cover)', () => {
+    const t0 = performance.now();
+    for (const h of ['$('.repeat(1500), '${{'.repeat(1300), `docker build ${'$('.repeat(100)} apps/x`, `docker build \${{ ${'|'.repeat(4000)}`]) workflowBuildRefs([h]);
+    expect(performance.now() - t0).toBeLessThan(1000);
+    expect([...workflowBuildRefs([`docker build -t x:${'$('.repeat(40)}${')'.repeat(40)} apps/x`])]).toEqual([]);
+  });
+
+  it('compose read order: shallow paths first, so a root docker-compose.yml is never pushed out by the cap', async () => {
+    const files: Record<string, string> = {
+      'package.json': JSON.stringify({ name: 'mono', private: true, workspaces: ['apps/*'] }), 'package-lock.json': LOCK,
+      'apps/web/package.json': pkg({ name: 'web', scripts: { dev: 'next dev', build: 'next build' }, dependencies: { next: '15.0.0' } }), 'apps/web/next.config.mjs': "export default { output: 'export' };\n", 'apps/web/app/page.tsx': PAGE,
+      'docker-compose.yml': 'services:\n  web:\n    build: ./apps/web\n',
+    };
+    for (let i = 0; i < 21; i++) files[`apps/a${String(i).padStart(2, '0')}/docker-compose.yml`] = 'services:\n  x:\n    image: alpine\n';
+    const notes: string[] = [];
+    const p = await read(files, notes);
+    expect(notes.join('\n')).toContain('Only the first 20 compose files were read for image builds.');
+    expect((p.services.find((s) => s.name === 'web') as Service).containerHint).toContain('apps/web');
+  });
+});

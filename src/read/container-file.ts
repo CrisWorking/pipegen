@@ -67,11 +67,11 @@ const FLAG_WITH_VALUE = new Set(['-t', '--tag', '--build-arg', '--platform', '--
  * (a coverage report) is no build.
  */
 export function workflowBuildRefs(texts: readonly string[], out: Set<string> = new Set<string>()): Set<string> {
-  const add = (v: string | undefined): void => { if (v !== undefined && regexSafe(v)) out.add(norm(v)); };
+  const add = (v: string | undefined): void => { if (v !== undefined && !v.includes(EXPR) && regexSafe(v)) out.add(norm(v)); };
   // GJ-R-sec1: line by line over regexLines (each line bounded, like the other parsers), `[ \t]*` at the anchor.
   // GJ-R4 (N1): `\`-continued lines are joined first, within the same per-line budget (a longer one is dropped whole)
   for (const t of texts) {
-    for (const line of joinedLines(t)) {
+    for (const line of joinedLines(t).map(blankExpressions)) {
       const ctxKey = /^[ \t]*(?:-[ \t]+)?context:[ \t]*("[^"]+"|'[^']+'|[^\s"'#]+)/.exec(line);
       if (ctxKey !== null) add(ctxKey[1]);
       const fileKey = /^[ \t]*(?:-[ \t]+)?file:[ \t]*("[^"]+"|'[^']+'|[^\s"'#]+)/.exec(line);
@@ -117,6 +117,44 @@ function joinedLines(t: string): string[] {
     over = false;
   }
   if (acc !== '' && !over) out.push(acc);
+  return out;
+}
+
+/** GJ-R5 (H1): what stands for a `${{ … }}` or `$( … )` span; a value holding it is no reference. */
+const EXPR = '\u0000';
+const MAX_EXPR_DEPTH = 16;
+/**
+ * GJ-R5 (H1): each `${{ … }}` and `$( … )` span of a (bounded) line becomes one EXPR character, so an `||` or a space inside it never ends a
+ * build line or splits a word. A character loop, no regex; an unclosed span, or `$(` nested deeper than MAX_EXPR_DEPTH, blanks the rest of
+ * the line.
+ */
+function blankExpressions(line: string): string {
+  let out = '';
+  let i = 0;
+  while (i < line.length) {
+    if (line.startsWith('${{', i)) {
+      const j = line.indexOf('}}', i + 3);
+      if (j < 0) return out + EXPR;
+      out += EXPR;
+      i = j + 2;
+      continue;
+    }
+    if (line.charCodeAt(i) === 36 && line.charCodeAt(i + 1) === 40) {
+      let depth = 0;
+      let j = i + 1;
+      for (; j < line.length; j++) {
+        const c = line.charCodeAt(j);
+        if (c === 40 && ++depth > MAX_EXPR_DEPTH) return out + EXPR;
+        if (c === 41 && --depth === 0) break;
+      }
+      if (j >= line.length) return out + EXPR;
+      out += EXPR;
+      i = j + 1;
+      continue;
+    }
+    out += line[i];
+    i++;
+  }
   return out;
 }
 

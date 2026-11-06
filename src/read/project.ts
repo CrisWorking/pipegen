@@ -421,10 +421,12 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
     // GJ-R3 (O1), GJ-R4 (N3): the root app, and a container file in a folder with no app manifest (docker/Dockerfile.dev,
     // deploy/Dockerfile.prod): that folder is part of the root app, so the root stays the service (with its own container file, if any), as
     // otherApp does below; a note names each such folder, whose image pipegen does not build or scan
-    // a folder with code of its own (a worker with index.js and a Dockerfile) is a service, as before; only a folder of container files is the root's
+    // GJ-R5 (R1): a folder with code of its own and a plain Dockerfile or Containerfile (a worker) is a service, as at 2450960; one whose
+    // container files all have suffixed names (docker/Dockerfile.dev + healthcheck.js) is the root app's, whatever code it holds
     const codeDirs = new Set<string>();
     for (const f of ctx.fileSet) if (CODE_FILE_RE.test(baseOf(f))) for (let d = dirOf(f); d !== '.' && !codeDirs.has(d); d = dirOf(d)) codeDirs.add(d);
-    const ownApp = (d: string) => appManifest(d) || codeDirs.has(d);
+    const plainContainer = (d: string) => ctx.fileSet.has(inDir(d, 'Dockerfile')) || ctx.fileSet.has(inDir(d, 'Containerfile'));
+    const ownApp = (d: string) => appManifest(d) || (codeDirs.has(d) && plainContainer(d));
     const subs = dockerDirs.filter((d) => d !== '.');
     if (appManifest('.') && subs.some((d) => !ownApp(d))) {
       dirs = ['.', ...subs.filter(ownApp)];
@@ -477,7 +479,9 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
     ['compose', COMPOSE_FILE_RE, (f: string, t: string) => composeBuildRefs(f, parseYamlLimited(t), buildFileRefs)],
     ['bake', BAKE_FILE_RE, (f: string, t: string) => bakeBuildRefs(f, t, buildFileRefs)],
   ] as const) {
-    const all = [...ctx.fileSet].filter((x) => re.test(baseOf(x))).sort();
+    // GJ-R5: shallow paths first (then by name), so the cap never pushes out the root compose file
+    const depth = (x: string) => x.split('/').length;
+    const all = [...ctx.fileSet].filter((x) => re.test(baseOf(x))).sort((a, b) => depth(a) - depth(b) || (a < b ? -1 : a > b ? 1 : 0));
     if (all.length > MAX_BUILD_FILES) note(ctx, `Only the first ${MAX_BUILD_FILES} ${kind} files were read for image builds.`);
     for (const f of all.slice(0, MAX_BUILD_FILES)) {
       const t = await readFile(ctx, f);
