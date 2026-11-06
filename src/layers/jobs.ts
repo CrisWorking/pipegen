@@ -66,7 +66,7 @@ import { ARCHIVE_TOOL_IDS, renderImageArchiveScan, renderImageBuild } from '../e
 import { dastStartOf, renderDastRun, renderDastScrub, type DastStart } from '../engine/dast-handoff.js';
 import {
   BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, dastRunJobId, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, IMAGE_BUILD_NEED, imageBuildJobId, isReviewed,
-  isScrubStep, jobOutputsFor, CODE_SCANNING_JOB, HISTORY_UPLOAD_JOB, SECRETS_HISTORY_CATEGORY, SECRETS_HISTORY_JOB, NIGHTLY_CONCURRENCY, NO_SCANS, SCORECARD_IF, SCORECARD_JOB, renderRangeFetchStep, type RenderedStep, type ScanFact,
+  isScrubStep, jobOutputsFor, CODE_SCANNING_JOB, HISTORY_UPLOAD_JOB, SECRETS_HISTORY_CATEGORY, SECRETS_HISTORY_JOB, NIGHTLY_CONCURRENCY, NO_SCANS, SCORECARD_IF, SCORECARD_JOB, ZIZMOR_ONLINE_JOB, renderRangeFetchStep, type RenderedStep, type ScanFact,
 } from '../engine/job-rules.js';
 import { NEED_ID_CATEGORY, SCHEDULED_CATEGORIES } from '../engine/need-ids.js';
 import { MINIMUM_CATEGORIES, NO_HOOKS_CI_MANAGERS, NO_IMAGE_CATEGORIES, noImageServices, riskyTriggersOf, WORKFLOW_LINT_EXTRA, WORKFLOW_LINT_TOOL, workflowLintTools } from '../engine/needs.js';
@@ -76,7 +76,7 @@ import { APP_RUNNING_CATEGORIES, renderStarterTestRun } from '../engine/render-c
 import { RenderError } from '../engine/render-error.js';
 import {
   dedupeJobSteps, renderBaselineCheckStep, renderComposeUp, renderFindingsBlock, renderGateStep, renderGateUploads, renderJobPrelude, renderNightlyStep,
-  renderHistoryBlock, renderPlatformStep, renderProjectScript, renderRangeBlock, renderRepoTool, renderRuntimeEnv, renderScorecardBlock, renderScrub, renderStep, renderUpload, scanFactOf, scrubbedPath,
+  renderHistoryBlock, renderPlatformStep, renderZizmorOnline, renderProjectScript, renderRangeBlock, renderRepoTool, renderRuntimeEnv, renderScorecardBlock, renderScrub, renderStep, renderUpload, scanFactOf, scrubbedPath,
   SCORECARD_ARTIFACT, SCORECARD_CATEGORY, type RenderContext,
 } from '../engine/render-step.js';
 import { projectScriptFor, repoToolFor, repoToolProblem, type RepoToolStep } from '../engine/reviewed.js';
@@ -691,6 +691,21 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     } catch (e) {
       if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e;
       addNote(notes, `The nightly scan of the whole history for secrets is not run: ${safeText(e.message, 200)}`);
+    }
+  }
+
+  // G15a round 5 (b2, P-4): zizmor online, nightly, when the merge layer lints the workflows with zizmor (offline there). The same reviewed entry
+  // under its online policy (no --offline, the host named) with the job's read token as GH_TOKEN; contents: read; a job-status check, never gated
+  const lintsWithZizmor = draft.needs.some((n) => n.layer === 'merge' && isLint(n) && specsOf(n).some((s) => s.tool.id === WORKFLOW_LINT_TOOL));
+  if (lintsWithZizmor) {
+    try {
+      const tool = toolOf(c, WORKFLOW_LINT_TOOL);
+      const r = renderZizmorOnline(tool, deps.platform, { profile: draft.profile });
+      const prelude = renderJobPrelude({}, deps.platform).steps;
+      nightly[ZIZMOR_ONLINE_JOB] = job(dedupeJobSteps([egressStepFor(egressSetsForTool(tool), { userSecret: false, dockerNetworks: false, job: ZIZMOR_ONLINE_JOB }), ...prelude, ...r.steps], { id: ZIZMOR_ONLINE_JOB, scans: NO_SCANS }));
+    } catch (e) {
+      if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e;
+      addNote(notes, `zizmor's online checks are not run nightly: ${safeText(e.message, 200)}`);
     }
   }
 

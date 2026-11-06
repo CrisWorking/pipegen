@@ -46,12 +46,12 @@ import { docRecomputeProblem } from '../deliver/docs.js';
 import { createdFileProblems, duplicatePathProblems, type CreatedInputs, type CreatedRule } from './created-files.js';
 import {
   ACTION_PATH_RE, CALLER_WORKFLOW, checkExpressions, createdPathProblem, checkJobOrder, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, gateResultUploadProblems, IF_VALUES,
-  CALLER_TRIGGERS, IMAGE_ARCHIVE_STEP_ID, IMAGE_BUILD_NEED, imageBuildJobId, imageBuildSlugOf, imageCheckStepId, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, LOCAL_MERGE_WORKFLOW, narrowingChoiceProblem, NIGHTLY_CONCURRENCY, NIGHTLY_WORKFLOW, SCORECARD_IF, SCORECARD_JOB, PR_CHECK_IF, PR_CHECK_JOB,
+  CALLER_TRIGGERS, IMAGE_ARCHIVE_STEP_ID, IMAGE_BUILD_NEED, imageBuildJobId, imageBuildSlugOf, imageCheckStepId, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, LOCAL_MERGE_WORKFLOW, narrowingChoiceProblem, NIGHTLY_CONCURRENCY, NIGHTLY_WORKFLOW, SCORECARD_IF, SCORECARD_JOB, PR_CHECK_IF, PR_CHECK_JOB, ZIZMOR_ONLINE_JOB,
   PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, REQUIRED_JOB, REQUIRED_NAME, requiredWorkflowForm, renderRangeFetchStep, SECRET_REF_RE, SIGN_STEP_ID_RE, ATTEST_DIGEST_STEP_ID_RE, attestDigestRef, attestDigestStepId, BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, DAST_HANDOFF_STEP_ID, dastAppStepId, dastCheckStepId, dastRunJobId, dastRunSlugOf, DAST_CHECK_ID_RE, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, BASELINE_STEP_IFS,
   STEP_KEYS as STEP_KEY_LIST, WORKFLOW_CONCURRENCY, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact,
 } from './job-rules.js';
 import { signingMode } from '../github/signing-mode.js';
-import { containerRefusal, RenderError, renderComposeUp, renderDockerActionStep, renderScorecardBlock, SCORECARD_MOVE_STEP_ID, renderProjectScript, renderRepoTool, renderRuntimeEnv, renderStep, sameDedupeContent, stepsToYaml, type RenderContext } from './render-step.js';
+import { containerRefusal, RenderError, renderComposeUp, renderDockerActionStep, renderScorecardBlock, SCORECARD_MOVE_STEP_ID, renderProjectScript, renderRepoTool, renderRuntimeEnv, renderStep, renderZizmorOnline, sameDedupeContent, stepsToYaml, type RenderContext } from './render-step.js';
 import { COMPOSE_PATH, planCompose } from '../create/compose.js';
 import { dockerfilesOf } from './created-judges/compose.js';
 import { loadBaseImages } from './base-images.js';
@@ -147,6 +147,8 @@ export type StepKind = 'checkout' | 'setup' | 'harden' | 'upload-artifact' | 'do
   | 'publish-digest'
   /** G15a round 3 (PF-3): a reviewed container action as a docker step at its recorded digest (renderDockerActionStep), job scorecard only */
   | 'docker-step';
+/** G15a round 5 (b2): the source of the expected runs of zizmor online (its install and its run). */
+const ZIZMOR_ONLINE_SOURCE = 'online:zizmor';
 /** pipegen's own actions by reviewed-entry id (Plan C adds the gate entry, Plan H the watcher entry, under these ids). */
 export const PIPEGEN_ACTION_IDS = { gate: 'pipegen-gate', watcher: 'pipegen-watcher' } as const;
 /** The step kind of each reviewed action entry that is not an ordinary tool, by entry id. The gate entry is kind `gate`, except a recognised scrub step of it (isScrubStep: judgeUses). */
@@ -172,6 +174,8 @@ export const JOB_STEP_POLICY: Readonly<Record<string, readonly StepKind[]>> = Ob
   'pipegen-verify': ['harden', 'gate', 'verify'],
   'code-scanning': ['harden', 'download-artifact', 'upload-sarif'],
   'code-scanning-history': ['harden', 'download-artifact', 'upload-sarif'],
+  // G15a round 5 (b2): zizmor online, nightly: egress, the checkout, its install and run (kind tool, the online source only: judgeStepPolicy)
+  [ZIZMOR_ONLINE_JOB]: ['harden', 'checkout', 'tool'],
   // no checkout: the gate never reads the workspace (Plan C ruling S21); it reads the event, the job outputs and the API
   // C5b: the gate's own uploads (result, baseline, clean-run marker) after the gate step, and no other upload (checkJobOrder, gateUploadProblems)
   gate: ['harden', 'download-artifact', 'gate', 'upload-artifact'],
@@ -693,6 +697,17 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
     } catch (e) {
       if (!(e instanceof RenderError)) throw e;
       notes.push(`The full-history secrets scan can not be rendered, so no step may claim to be it: ${safeText(e.message, 200)}`);
+    }
+  }
+  // G15a round 5 (b2, P-4): zizmor online, nightly (the job ZIZMOR_ONLINE_JOB of the nightly file only, judgeStepPolicy), when the draft lints
+  // the workflows with the reviewed zizmor: its install and its run with the job's read token (a job-status check, never gated)
+  const zizmor = byId.get(WORKFLOW_LINT_TOOL);
+  if (draft.steps.some((s) => hasNeed(s) && s.needId === 'workflow-lint' && isObj(s.tool) && s.tool.id === WORKFLOW_LINT_TOOL) && zizmor !== undefined && isReviewed(zizmor.candidate)) {
+    try {
+      record(ZIZMOR_ONLINE_SOURCE, ctxs.map((c) => renderZizmorOnline(zizmor, platform, c).steps), false, false, true, undefined, undefined);
+    } catch (e) {
+      if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e;
+      notes.push(`zizmor's online run can not be rendered, so no step may claim to be it: ${safeText(e.message, 200)}`);
     }
   }
   // the project's own scripts its needs call for (ruling S10): the only other run steps pipegen makes
@@ -1748,6 +1763,15 @@ function judgeStepPolicy(fc: FileCtx, id: string, where: string, j: Obj, judged:
   const row = own(JOB_STEP_POLICY, id);
   const power = privileged(j, secrets, fc.ex);
   if (id === SCORECARD_JOB && !isNightlyFile(fc)) bad('permissions', `${where}: the job ${SCORECARD_JOB} is the weekly Scorecard job of the nightly file only.`);
+  // G15a round 5 (b2): the online zizmor steps (they carry the job's token) run only in the job ZIZMOR_ONLINE_JOB of the nightly file, and that
+  // job runs no other tool step
+  const onlineJob = id === ZIZMOR_ONLINE_JOB && isNightlyFile(fc);
+  if (id === ZIZMOR_ONLINE_JOB && !isNightlyFile(fc)) bad('permissions', `${where}: the job ${ZIZMOR_ONLINE_JOB} is the nightly online zizmor job of the nightly file only.`);
+  judged.forEach((x, i) => {
+    const online = x.match?.source === ZIZMOR_ONLINE_SOURCE;
+    if (online && !onlineJob) bad('permissions', `${where}, step ${i + 1}: zizmor's online run (with the job's token) runs only in the job ${ZIZMOR_ONLINE_JOB} of the nightly file.`);
+    if (onlineJob && x.kind === 'tool' && !online) bad('permissions', `${where}, step ${i + 1}: the job ${ZIZMOR_ONLINE_JOB} runs zizmor online and no other tool.`);
+  });
   if (power && row === undefined) bad('permissions', `${where} holds power (a permission beyond contents: read, an environment or pipegen's own secret) but is not one of pipegen's jobs (${Object.keys(JOB_STEP_POLICY).join(', ')}).`);
   if (row !== undefined) {
     judged.forEach((x, i) => {
