@@ -79,7 +79,7 @@ const rsEntry = (over: Partial<InstallRecord['rulesets'][number]> = {}): Install
 const orgEntry = (over: Partial<NonNullable<InstallRecord['orgRuleset']>> = {}): NonNullable<InstallRecord['orgRuleset']> => ({ org: OWNER, id: 9, name: requiredRulesetName('shop'), githubCreatedAt: AT, pinnedSha: PIN, ...over });
 
 /** GitHub's answers to the settings reads, as pipegen left them (sec N-M5). */
-const pipegenSa = { security_and_analysis: { secret_scanning: { status: 'enabled' }, secret_scanning_push_protection: { status: 'enabled' } } };
+const pipegenSa = { security_and_analysis: { [SS]: { status: 'enabled' }, [SP]: { status: 'enabled' } } };
 const settingsNow = (over: { perms?: unknown; access?: unknown; alerts?: number } = {}): Handler => (route) => {
   if (route === 'GET /repos/{owner}/{repo}/actions/permissions') return over.perms ?? { enabled: true, allowed_actions: 'all', sha_pinning_required: true };
   if (route === 'GET /repos/{owner}/{repo}/actions/permissions/access') return over.access ?? { access_level: 'organization' };
@@ -251,6 +251,8 @@ function importProblems(src: string): string[] {
   }
   return out;
 }
+/** `<x>.<namespace>.<method>(`: an Octokit endpoint method (with or without `.rest`); an array method on a list of that name is not one. */
+const OCTOKIT_ENDPOINT_RE = /\.\s*(?:actions|activity|apps|billing|checks|codeScanning|codesOfConduct|codespaces|copilot|dependabot|dependencyGraph|emojis|gists|git|gitignore|interactions|issues|licenses|markdown|meta|migrations|oidc|orgs|packages|projects|pulls|rateLimit|reactions|repos|search|secretScanning|securityAdvisories|teams|users)\s*\.\s*(?!(?:filter|map|find|findIndex|findLast|findLastIndex|some|every|forEach|reduce|includes|indexOf|slice|concat|flat|flatMap|join|sort|toSorted|at|keys|values|entries)\b)[A-Za-z]+\s*\(/;
 /** What the scan finds wrong in one file of src/uninstall (target.ts is the one that writes). */
 function scanProblems(file: string, src: string): string[] {
   const out: string[] = [];
@@ -272,6 +274,12 @@ function scanProblems(file: string, src: string): string[] {
   no(/\bimport\s*\(/, 'a dynamic import', code);
   no(/\brequire\s*\(/, 'a require', code);
   no(/\.rest\s*\.\s*[a-zA-Z]+/, 'gh.rest', code);
+  // sec N-I2: @octokit/rest also hangs every endpoint method on the client itself (legacyRestEndpointMethods: gh.repos.delete, …), and
+  // paginate / graphql / hook send whatever their route or query says; none of them belongs outside target.ts
+  no(OCTOKIT_ENDPOINT_RE, 'an Octokit endpoint method', code);
+  no(/\bpaginate\b/, 'paginate', code);
+  no(/\bgraphql\b/, 'graphql', code);
+  no(/\.\s*hook\b|\bhook\s*[,}]/, 'an Octokit hook', code);
   no(WRITERS, 'a write function of another module', body);
   no(/\bmethod\s*:\s*['"`](?:POST|PUT|PATCH|DELETE)/, 'a write method');
   out.push(...importProblems(src));
@@ -1117,7 +1125,7 @@ describe('V3 fix round 2', () => {
   const base = { id: CENTRAL_ID, name: 'pipelines', full_name: 'acme/pipelines', owner: { login: OWNER }, description: DESC, default_branch: 'main', forks_count: 0, has_wiki: false, has_discussions: false };
   const ourPr = { number: 4, head: { ref: 'pipegen/update-shop', repo: { id: CENTRAL_ID } } };
   interface W { repo?: Record<string, unknown>; refs?: unknown[]; pulls?: unknown[]; dependabot?: unknown[] | number; codespaces?: unknown[] | number }
-  const secretList = (x: unknown[] | number | undefined) => { if (typeof x === 'number') throw httpErr(x); return { total_count: (x ?? []).length, [LIST]: x ?? [] }; };
+  const listOf = (x: unknown[] | number | undefined) => { if (typeof x === 'number') throw httpErr(x); return { total_count: (x ?? []).length, [LIST]: x ?? [] }; };
   const go = async (w: W) => {
     const state = { deleted: false };
     const f = fakeGh((route, p) => {
@@ -1129,8 +1137,8 @@ describe('V3 fix round 2', () => {
       if (route === 'GET /repos/{owner}/{repo}/git/matching-refs/{ref}') return p.ref === '' ? [{ ref: 'refs/heads/main' }, ...(w.refs ?? [])] : [];
       if (route === 'GET /repos/{owner}/{repo}/issues') return (w.pulls ?? []).map((x) => ({ number: (x as { number: number }).number, pull_request: {} }));
       if (route === 'GET /repos/{owner}/{repo}/pulls') return w.pulls ?? [];
-      if (route === 'GET /repos/{owner}/{repo}/dependabot/secrets') return secretList(w.dependabot);
-      if (route === 'GET /repos/{owner}/{repo}/codespaces/secrets') return secretList(w.codespaces);
+      if (route === 'GET /repos/{owner}/{repo}/dependabot/secrets') return listOf(w.dependabot);
+      if (route === 'GET /repos/{owner}/{repo}/codespaces/secrets') return listOf(w.codespaces);
       if (route.endsWith('/secrets') || route.endsWith('/variables') || route.endsWith('/environments')) return { total_count: 0, [LIST]: [], variables: [], environments: [] };
       if (route === 'GET /repos/{owner}/{repo}/releases') return [];
       if (route === 'DELETE /repos/{owner}/{repo}') { state.deleted = true; return {}; }
@@ -1247,6 +1255,7 @@ describe('V3 fix round 2', () => {
       [[], ['CODEOWNERS'], created], [[], ['docs/CODEOWNERS'], created],
       [[file('docs/CODEOWNERS')], ['.github/CODEOWNERS', 'CODEOWNERS'], created],  // the reviewer's probe P7c
       [[], ['.github/CODEOWNERS'], there],                                        // there before pipegen: never deleted
+      [[], ['.github/CODEOWNERS'], [{ ...edit('.github/CODEOWNERS', null), ownerEdited: true as const }]],   // the owner's lines are in it now
       [[file('.github/CODEOWNERS')], [], undefined],                              // no record edits: no CODEOWNERS change
       [[], ['.github/CODEOWNERS'], undefined],
       [[file('.github/CODEOWNERS')], [], [edit('.github/CODEOWNERS', null), edit('docs/CODEOWNERS', null)]],   // two CODEOWNERS edits: which one?
@@ -1298,10 +1307,10 @@ describe('V3 fix round 2', () => {
     // Dependabot alerts already off → kept, nothing sent; on → DELETE
     await keptNoWrite(api(settingsNow({ alerts: 404 })), 'DELETE /repos/{owner}/{repo}/vulnerability-alerts', app);
     // secret scanning: only the switch still on is turned off; both off already, or unknown → kept
-    const half = api(settingsNow(), { repo: { security_and_analysis: { secret_scanning: { status: 'enabled' }, secret_scanning_push_protection: { status: 'disabled' } } } });
+    const half = api(settingsNow(), { repo: { security_and_analysis: { [SS]: { status: 'enabled' }, [SP]: { status: 'disabled' } } } });
     expect(await half.api.write('PATCH /repos/{owner}/{repo}', { ...app, security_and_analysis: { [SS]: { status: 'disabled' }, [SP]: { status: 'disabled' } } })).toEqual({ status: 'done' });
     expect(half.writes()).toEqual([{ route: 'PATCH /repos/{owner}/{repo}', params: { ...app, security_and_analysis: { [SS]: { status: 'disabled' } } } }]);
-    await keptNoWrite(api(settingsNow(), { repo: { security_and_analysis: { secret_scanning: { status: 'disabled' }, secret_scanning_push_protection: { status: 'disabled' } } } }), 'PATCH /repos/{owner}/{repo}', { ...app, security_and_analysis: { [SS]: { status: 'disabled' }, [SP]: { status: 'disabled' } } });
+    await keptNoWrite(api(settingsNow(), { repo: { security_and_analysis: { [SS]: { status: 'disabled' }, [SP]: { status: 'disabled' } } } }), 'PATCH /repos/{owner}/{repo}', { ...app, security_and_analysis: { [SS]: { status: 'disabled' }, [SP]: { status: 'disabled' } } });
     await keptNoWrite(api(settingsNow()), 'PATCH /repos/{owner}/{repo}', { ...app, security_and_analysis: { [SS]: { status: 'disabled' } } });
     // central Actions access: only while it is the level pipegen set (given by the caller from the record's owner type)
     const access = 'PUT /repos/{owner}/{repo}/actions/permissions/access';
