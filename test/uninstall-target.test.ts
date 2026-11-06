@@ -1124,20 +1124,21 @@ describe('V3 fix round 2', () => {
   });
   const base = { id: CENTRAL_ID, name: 'pipelines', full_name: 'acme/pipelines', owner: { login: OWNER }, description: DESC, default_branch: 'main', forks_count: 0, has_wiki: false, has_discussions: false };
   const ourPr = { number: 4, head: { ref: 'pipegen/update-shop', repo: { id: CENTRAL_ID } } };
-  interface W { repo?: Record<string, unknown>; refs?: unknown[]; pulls?: unknown[]; dependabot?: unknown[] | number; codespaces?: unknown[] | number }
+  interface W { repo?: Record<string, unknown>; refs?: unknown[]; refsAnswer?: unknown; pulls?: unknown[]; dependabot?: unknown[] | number; codespaces?: unknown[] | number; dependabotLater?: number }
   const listOf = (x: unknown[] | number | undefined) => { if (typeof x === 'number') throw httpErr(x); return { total_count: (x ?? []).length, [LIST]: x ?? [] }; };
   const go = async (w: W) => {
     const state = { deleted: false };
+    let dependabotReads = 0;
     const f = fakeGh((route, p) => {
       if (route === 'GET /repos/{owner}/{repo}') { if (state.deleted) throw httpErr(404); return w.repo ?? base; }
       if (route === 'GET /repos/{owner}/{repo}/branches') return [{ name: 'main' }];
       if (route === 'GET /repos/{owner}/{repo}/git/ref/{ref}') return { object: { sha: SHA } };
       if (route === 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}') return { tree: { sha: SHA }, parents: [] };
       if (route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}') return { truncated: false, tree: [{ path: 'README.md', sha: gitBlobSha(readme), mode: '100644', type: 'blob' }] };
-      if (route === 'GET /repos/{owner}/{repo}/git/matching-refs/{ref}') return p.ref === '' ? [{ ref: 'refs/heads/main' }, ...(w.refs ?? [])] : [];
+      if (route === 'GET /repos/{owner}/{repo}/git/matching-refs/{ref}') return p.ref === '' ? ('refsAnswer' in w ? w.refsAnswer : [{ ref: 'refs/heads/main' }, ...(w.refs ?? [])]) : [];
       if (route === 'GET /repos/{owner}/{repo}/issues') return (w.pulls ?? []).map((x) => ({ number: (x as { number: number }).number, pull_request: {} }));
       if (route === 'GET /repos/{owner}/{repo}/pulls') return w.pulls ?? [];
-      if (route === 'GET /repos/{owner}/{repo}/dependabot/secrets') return listOf(w.dependabot);
+      if (route === 'GET /repos/{owner}/{repo}/dependabot/secrets') { if (w.dependabotLater !== undefined && dependabotReads++ > 0) throw httpErr(w.dependabotLater); return listOf(w.dependabot); }
       if (route === 'GET /repos/{owner}/{repo}/codespaces/secrets') return listOf(w.codespaces);
       if (route.endsWith('/secrets') || route.endsWith('/variables') || route.endsWith('/environments')) return { total_count: 0, [LIST]: [], variables: [], environments: [] };
       if (route === 'GET /repos/{owner}/{repo}/releases') return [];
@@ -1172,6 +1173,8 @@ describe('V3 fix round 2', () => {
       [{ pulls: [ourPr], refs: [{ ref: 'refs/pull/5/head' }] }, /refs\/pull\/5\/head/],
       [{ refs: [{ ref: 'refs/heads/wip' }] }, /refs\/heads\/wip/],
       [{ refs: [{ nope: 1 }] }, /ref/],
+      [{ refsAnswer: { ref: 'refs/heads/main' } }, /refs/],
+      [{ dependabotLater: 403 }, /read less/],   // readable when asked, unreadable after the typed name
     ] as const) {
       const r = await go(w as W);
       expect(r.deleted, JSON.stringify(w)).toBe(false);
@@ -1197,7 +1200,7 @@ describe('V3 fix round 2', () => {
       'const g = api.gh; await g.repos.update({ ...p, private: false });', 'await gh.paginate(\'DELETE /repos/{owner}/{repo}\', p);', 'for await (const x of gh.paginate.iterator(\'POST /x\', p)) {}',
       'const o = makeOctokit(t); await o.repos.delete(p);', 'await gh\n  .repos\n  .delete(p);', 'await gh . issues . update(p);', 'gh.hook.before(\'x\', f);', 'const q = gh.graphql;',
       'await gh.graphql(\'mutation { x }\');', 'await o.orgs.deleteWebhook(p);', 'await o.secretScanning.updateAlert(p);', 'await o.codespaces.deleteRepoSecret(p);', 'await o.dependabot.deleteRepoSecret(p);',
-      'const { paginate } = gh;', 'const send = gh.request;',
+      'const { paginate } = gh;', 'const send = gh.request;', 'await run(gh.graphql, q);',
     ]) expect(scanProblems('plan.ts', bad), bad).not.toEqual([]);
     for (const ok of [
       'const open = d.issues.filter((x) => x.state === \'open\');', 'const n = rec.secrets.map((s) => s.name);', 'const ids = data.pulls.map((p) => p.number);',
@@ -1311,7 +1314,8 @@ describe('V3 fix round 2', () => {
     expect(await half.api.write('PATCH /repos/{owner}/{repo}', { ...app, security_and_analysis: { [SS]: { status: 'disabled' }, [SP]: { status: 'disabled' } } })).toEqual({ status: 'done' });
     expect(half.writes()).toEqual([{ route: 'PATCH /repos/{owner}/{repo}', params: { ...app, security_and_analysis: { [SS]: { status: 'disabled' } } } }]);
     await keptNoWrite(api(settingsNow(), { repo: { security_and_analysis: { [SS]: { status: 'disabled' }, [SP]: { status: 'disabled' } } } }), 'PATCH /repos/{owner}/{repo}', { ...app, security_and_analysis: { [SS]: { status: 'disabled' }, [SP]: { status: 'disabled' } } });
-    await keptNoWrite(api(settingsNow()), 'PATCH /repos/{owner}/{repo}', { ...app, security_and_analysis: { [SS]: { status: 'disabled' } } });
+    expect(await keptNoWrite(api(settingsNow()), 'PATCH /repos/{owner}/{repo}', { ...app, security_and_analysis: { [SS]: { status: 'disabled' } } })).toMatchObject({ manual: expect.stringContaining('repos/acme/shop') });
+    expect(await keptNoWrite(api(settingsNow(), { repo: { security_and_analysis: { [SS]: { status: 'disabled' }, [SP]: { status: 'enabled' } } } }), 'PATCH /repos/{owner}/{repo}', { ...app, security_and_analysis: { [SS]: { status: 'enabled' } } })).toMatchObject({ why: expect.stringMatching(/only turns/) });
     // central Actions access: only while it is the level pipegen set (given by the caller from the record's owner type)
     const access = 'PUT /repos/{owner}/{repo}/actions/permissions/access';
     const central = { owner: OWNER, repo: 'pipelines', access_level: 'none' };
@@ -1319,6 +1323,7 @@ describe('V3 fix round 2', () => {
     await keptNoWrite(api(settingsNow({ access: { access_level: 'enterprise' } })), access, central, { pipegenSet: 'organization' });
     await keptNoWrite(api(settingsNow({ access: {} })), access, central, { pipegenSet: 'organization' });
     await keptNoWrite(api(settingsNow()), access, central, { pipegenSet: 'everyone' });
+    await keptNoWrite(api(settingsNow({ access: { access_level: 'enterprise' } })), access, central, { pipegenSet: 'enterprise' });   // finish never sets it
     const ok = api(settingsNow({ access: { access_level: 'user' } }));
     expect(await ok.api.write(access, central, { pipegenSet: 'user' })).toEqual({ status: 'done' });
     expect(ok.writes()).toEqual([{ route: access, params: central }]);
