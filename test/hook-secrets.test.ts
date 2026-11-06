@@ -3,7 +3,7 @@
 // config only (never the repo's .gitleaks.toml or .gitleaksignore), redacted output, inline allow comments ignored. Found → the commit is
 // blocked; a scan that can't run blocks it too. A real git repo in a temp folder; the scanner is a fake that reads what it was given.
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -36,13 +36,15 @@ function io(env: NodeJS.ProcessEnv = ENV): CliIO & { errs: string[] } {
   const errs: string[] = [];
   return { errs, out: () => {}, err: (s) => { errs.push(s); }, env, prompt: { confirm: async () => false, select: async (_m, _o, d) => d, text: async () => '' } };
 }
-interface Seen { file: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv; config: string; files: Record<string, string>; ignoreHasFile: boolean }
+interface Seen { file: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv; config: string; files: Record<string, string>; modes: number[]; ignoreHasFile: boolean }
 /** A fake scanner that records what it was given (the exported files and the config) and exits with `code`. */
 function scanner(code: number, seen: Seen[]): (file: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv }) => Promise<number> {
   return async (file, args, opts) => {
-    const files = Object.fromEntries(readdirSync(opts.cwd, { recursive: true, withFileTypes: true }).filter((e) => e.isFile()).map((e) => [join(e.parentPath, e.name).slice(opts.cwd.length + 1), readFileSync(join(e.parentPath, e.name), 'utf8')]));
+    const entries = readdirSync(opts.cwd, { recursive: true, withFileTypes: true }).filter((e) => e.isFile());
+    const files = Object.fromEntries(entries.map((e) => [join(e.parentPath, e.name).slice(opts.cwd.length + 1), readFileSync(join(e.parentPath, e.name), 'utf8')]));
+    const modes = entries.map((e) => statSync(join(e.parentPath, e.name)).mode & 0o777);
     const ign = args[args.indexOf('--gitleaks-ignore-path') + 1] as string;
-    seen.push({ file, args, cwd: opts.cwd, env: opts.env, config: readFileSync(args[args.indexOf('--config') + 1] as string, 'utf8'), files, ignoreHasFile: existsSync(join(ign, '.gitleaksignore')) });
+    seen.push({ file, args, cwd: opts.cwd, env: opts.env, config: readFileSync(args[args.indexOf('--config') + 1] as string, 'utf8'), files, modes, ignoreHasFile: existsSync(join(ign, '.gitleaksignore')) });
     return code;
   };
 }
@@ -99,6 +101,55 @@ describe('G6: pipegen hook secrets', () => {
     const del = repo({});
     git(del, 'rm', '-q', 'kept.txt');
     expect(await hookSecrets(io(), del, { gitleaks: async () => { throw new Error('not asked'); }, exec: async () => 0 })).toBe(0);
+  });
+
+  it('the secrets hook command: a type change (a link replaced by a file holding a key) is scanned (G6-R-sec1, 1)', async () => {
+    const dir = repo({});
+    symlinkSync('kept.txt', join(dir, 'link'));
+    git(dir, 'add', 'link');
+    git(dir, '-c', 'user.email=a@b', '-c', 'user.name=a', 'commit', '-q', '-m', 'l');
+    rmSync(join(dir, 'link'));
+    writeFileSync(join(dir, 'link'), 'fake key here\n');
+    git(dir, 'add', 'link');
+    expect(git(dir, 'diff', '--cached', '--name-status')).toMatch(/^T\tlink/m);
+    const seen: Seen[] = [];
+    const found = async (file: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv }): Promise<number> => {
+      await scanner(0, seen)(file, args, opts);
+      return [HOOK_SECRETS_EXIT.clean, HOOK_SECRETS_EXIT.found][Number(Object.values((seen.at(-1) as Seen).files).some((t) => t.includes('fake key')))] as number;
+    };
+    expect(await hookSecrets(io(), dir, { gitleaks: async () => '/g', exec: found })).toBe(1);
+    expect((seen[0] as Seen).files).toEqual({ link: 'fake key here\n' });
+  });
+
+  it('the secrets hook command: the raw staged blobs are scanned, never a .gitattributes-filtered copy (G6-R-sec1, 2)', async () => {
+    const seen: Seen[] = [];
+    const found = async (file: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv }): Promise<number> => {
+      await scanner(0, seen)(file, args, opts);
+      return [HOOK_SECRETS_EXIT.clean, HOOK_SECRETS_EXIT.found][Number(Object.values((seen.at(-1) as Seen).files).some((t) => t.includes('fake key')))] as number;
+    };
+    // a smudge filter that would rewrite the text on checkout, and an eol / ident attribute: the scanner sees the blob's bytes
+    const dir = repo({ '.gitattributes': '*.txt filter=hide ident eol=crlf\n*.enc working-tree-encoding=UTF-16LE\n' });
+    git(dir, 'config', 'filter.hide.smudge', 'echo nothing to see');
+    git(dir, 'config', 'filter.hide.clean', 'cat');
+    writeFileSync(join(dir, 'a.txt'), 'fake key in a\n');
+    git(dir, 'add', 'a.txt');
+    expect(await hookSecrets(io(), dir, { gitleaks: async () => '/g', exec: found })).toBe(1);
+    const files = (seen[0] as Seen).files;
+    expect(files['a.txt']).toBe('fake key in a\n');
+    expect(files['.gitattributes']).toContain('filter=hide');
+    // working-tree-encoding: the blob is UTF-8, the checkout would be UTF-16 (the scanner would read no plain text)
+    const enc = repo({ '.gitattributes': '*.enc working-tree-encoding=UTF-16LE\n' });
+    writeFileSync(join(enc, 'b.enc'), Buffer.from('fake key in b\n', 'utf16le'));
+    git(enc, 'add', 'b.enc');
+    const seen2: Seen[] = [];
+    const found2 = async (file: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv }): Promise<number> => {
+      await scanner(0, seen2)(file, args, opts);
+      return [HOOK_SECRETS_EXIT.clean, HOOK_SECRETS_EXIT.found][Number(Object.values((seen2.at(-1) as Seen).files).some((t) => t.includes('fake key')))] as number;
+    };
+    expect(await hookSecrets(io(), enc, { gitleaks: async () => '/g', exec: found2 })).toBe(1);
+    expect((seen2[0] as Seen).files['b.enc']).toBe('fake key in b\n');
+    // the exported files are private (0600) and stay inside the folder
+    expect((seen2[0] as Seen).modes.every((m) => m === 0o600)).toBe(true);
   });
 
   it('the secrets hook command: a scanner error, a pinned binary that does not check out, or no git repo blocks the commit (fail closed)', async () => {

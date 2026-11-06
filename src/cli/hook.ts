@@ -2,8 +2,9 @@
 // (src/engine/created-builders.ts secretsHookRun: `npx --yes --registry=https://registry.npmjs.org pipegen@<exact> hook secrets`).
 //
 // It runs pipegen's PINNED gitleaks (data/pinned-binaries.yml; ensurePinnedBinary downloads it once and re-hashes it before every use) on what
-// is about to be committed: the staged text of every added, copied, modified or renamed regular file, exported from the git index into a
-// private temp folder (`git checkout-index`), scanned with `gitleaks dir`, the mode CI runs. Not `gitleaks git --staged` (nor the old
+// is about to be committed: the raw staged blob of every changed regular file (any change but a deletion, type changes included), read with
+// `git cat-file --batch` and written into a private temp folder (G6-R-sec1: no .gitattributes filter applies), scanned with `gitleaks dir`,
+// the mode CI runs. Not `gitleaks git --staged` (nor the old
 // `protect --staged`): live, gitleaks 8.30.1 misses a secret on the first added line of a staged hunk, so a one-line file passes.
 // The scan uses the reviewed config only (the gitleaks entry's, the one CI uses; never the repository's .gitleaks.toml, nor GITLEAKS_CONFIG),
 // an ignore folder with no .gitleaksignore (a repository's ignore list can't hide a finding), inline allow comments ignored, the secret redacted
@@ -13,7 +14,7 @@
 import { spawn } from 'node:child_process';
 import { lstat, mkdir, mkdtemp, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { ensurePinnedBinary } from '../engine/linters.js';
 import { SECRETS_SCAN_CONFIG } from '../engine/tool-flags.js';
 import { safeText } from '../util/safe-text.js';
@@ -76,20 +77,55 @@ async function neutralize(dir: string): Promise<void> {
   }
 }
 
-/** The staged regular files that change in this commit (added, copied, modified, renamed), as NUL-separated index paths. */
-async function stagedFiles(git: NonNullable<HookSecretsDeps['git']>, cwd: string, env: NodeJS.ProcessEnv): Promise<string[]> {
-  const changed = await git(['diff', '--cached', '--name-only', '-z', '--no-renames', '--diff-filter=ACMR'], { cwd, env });
+/** One staged regular file that changes in this commit: its index path and blob id. */
+interface StagedBlob { path: string; oid: string }
+/**
+ * The staged regular files that change in this commit: every change but a deletion (`--diff-filter=d`: added, copied, modified, renamed and
+ * type changes, so a link replaced by a file holding a key is scanned; G6-R-sec1), kept only when the index holds a regular file (100644, 100755).
+ */
+async function stagedFiles(git: NonNullable<HookSecretsDeps['git']>, cwd: string, env: NodeJS.ProcessEnv): Promise<StagedBlob[]> {
+  const changed = await git(['diff', '--cached', '--name-only', '-z', '--no-renames', '--diff-filter=d'], { cwd, env });
   if (changed.code !== 0) throw new Error('git could not list the staged changes.');
   const wanted = new Set(changed.stdout.toString('utf8').split('\0').filter((p) => p !== ''));
   if (wanted.size === 0) return [];
   const index = await git(['ls-files', '--stage', '-z'], { cwd, env });
   if (index.code !== 0) throw new Error('git could not read the index.');
-  const out: string[] = [];
+  const out: StagedBlob[] = [];
   for (const rec of index.stdout.toString('utf8').split('\0')) {
-    const m = /^(\d{6}) [0-9a-f]{40,64} 0\t(.+)$/s.exec(rec);
-    if (m !== null && (m[1] === '100644' || m[1] === '100755') && wanted.has(m[2] as string)) out.push(m[2] as string);
+    const m = /^(\d{6}) ([0-9a-f]{40}|[0-9a-f]{64}) 0\t(.+)$/s.exec(rec);
+    if (m !== null && (m[1] === '100644' || m[1] === '100755') && wanted.has(m[3] as string)) out.push({ path: m[3] as string, oid: m[2] as string });
   }
   return out;
+}
+
+/** A plain relative index path (no empty, `.` or `..` segment, no backslash or NUL), so the file lands inside the export folder. */
+const safeIndexPath = (p: string): boolean => p.length > 0 && p.length <= 4096 && !p.startsWith('/') && !/[\\\0]/.test(p) && p.split('/').every((s) => s !== '' && s !== '.' && s !== '..');
+
+/**
+ * Writes each blob's RAW bytes (G6-R-sec1: `git cat-file --batch`, never checkout-index, which applies .gitattributes filters, eol, ident and
+ * working-tree-encoding, so the scanner could read other bytes than the commit stores) under `stage`, mode 0600, creating only folders of its
+ * own inside the private folder (nothing there is a link) and never overwriting a file.
+ */
+async function exportBlobs(git: NonNullable<HookSecretsDeps['git']>, cwd: string, env: NodeJS.ProcessEnv, stage: string, blobs: readonly StagedBlob[]): Promise<void> {
+  for (const b of blobs) if (!safeIndexPath(b.path)) throw new Error('a staged path is not a plain relative path.');
+  const r = await git(['cat-file', '--batch'], { cwd, env, input: Buffer.from(blobs.map((b) => `${b.oid}\n`).join(''), 'utf8') });
+  if (r.code !== 0) throw new Error('git could not read the staged files.');
+  const buf = r.stdout;
+  let at = 0;
+  for (const b of blobs) {
+    const nl = buf.indexOf(0x0a, at);
+    if (nl < 0) throw new Error('git gave an unreadable answer for the staged files.');
+    const head = /^([0-9a-f]{40}|[0-9a-f]{64}) blob (\d{1,12})$/.exec(buf.subarray(at, nl).toString('utf8'));
+    if (head === null || head[1] !== b.oid) throw new Error('git gave an unreadable answer for the staged files.');
+    const size = Number(head[2]);
+    const start = nl + 1;
+    if (start + size + 1 > buf.length || buf[start + size] !== 0x0a) throw new Error('git gave an unreadable answer for the staged files.');
+    const target = join(stage, ...b.path.split('/'));
+    await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+    await writeFile(target, buf.subarray(start, start + size), { mode: 0o600, flag: 'wx' });
+    at = start + size + 1;
+  }
+  if (at !== buf.length) throw new Error('git gave an unreadable answer for the staged files.');
 }
 
 /** Runs the staged secret scan in `dir` (the repository root the hook starts in). 0: clean; 1: a secret was found; 2: the scan could not run. */
@@ -107,9 +143,7 @@ export async function hookSecrets(io: CliIO, dir: string, deps: HookSecretsDeps 
     await writeFile(config, SECRETS_SCAN_CONFIG, { mode: 0o600, flag: 'wx' });
     const stage = join(tmp, 'staged');
     await mkdir(stage, { mode: 0o700 });
-    // the index's text of those files, written under the private folder (checkout-index writes no link, it is given regular files only)
-    const out = await git(['checkout-index', '-z', '--stdin', `--prefix=${stage}/`], { cwd: dir, env, input: Buffer.from(`${files.join('\0')}\0`, 'utf8') });
-    if (out.code !== 0) throw new Error('git could not export the staged files.');
+    await exportBlobs(git, dir, env, stage, files);
     await neutralize(stage);
     // the temp folder is the ignore folder: it holds no .gitleaksignore
     const code = await (deps.exec ?? spawnExec)(bin, hookSecretsArgv(config, tmp), { cwd: stage, env });
