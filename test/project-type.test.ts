@@ -673,3 +673,32 @@ describe('project type: the unsure → server rule keeps the older guards (revie
     }
   });
 });
+
+describe('GJ-R1 (review GJ sec I1): any container build file of the folder is container evidence', () => {
+  const CAPS: Capabilities = { branchProtection: true, environments: false, envRequiredReviewers: false, deploymentBranchPolicies: false, attestations: false, codeScanning: true, keylessSigningAllowed: true };
+  const DEPLOY = '.github/workflows/deploy.yml';
+  const deployWf = (file: string) => `on: push\njobs:\n  d:\n    runs-on: ubuntu-latest\n    steps:\n      - run: docker build -f ${file} -t ghcr.io/o/site . && docker push ghcr.io/o/site\n`;
+  for (const file of ['Dockerfile.prod', 'Containerfile', 'web.Dockerfile', 'Containerfile.release']) {
+    it(`next export plus ${file}: a container, so image build, image scan and signing stay (never the static skip)`, async () => {
+      const files = { 'package.json': nextPkg(), 'next.config.mjs': "export default { output: 'export' };\n", 'app/page.tsx': PAGE, [file]: 'FROM nginx\nCOPY out /usr/share/nginx/html\n', [DEPLOY]: deployWf(file) };
+      const p = { ...(await profileOf(files)), private: false, ownerType: 'User', plan: 'free' } as RepoProfile;
+      const s = p.services[0] as Service;
+      expect(s.dockerfile).toBe(file);
+      expect(s.projectType?.types).toContain('container');
+      expect(s.projectType?.evidence.join('\n')).toContain(file);
+      expect(isRunnable(s)).toBe(true);
+      const ids = floorNeeds(p, CAPS).filter((n) => n.service === s.name).map((n) => n.id);
+      expect(ids).toEqual(expect.arrayContaining(['image-build', 'image-scan', 'signing']));
+      expect(skippedChecks(p, CAPS).some((k) => /static site/.test(k.why))).toBe(false);
+      // a --type override keeps the container type too
+      const over = applyTypeOverrides(p, [{ service: s.name, type: 'static-site' }] as never);
+      expect(over.services[0]?.projectType?.types).toEqual(['static-site', 'container']);
+      expect(isRunnable(over.services[0] as Service)).toBe(true);
+    });
+  }
+  it('a Dockerfile.dockerignore or a Dockerfile in a sub-folder is not the folder\'s container file', async () => {
+    const p = await profileOf({ 'package.json': nextPkg(), 'next.config.mjs': "export default { output: 'export' };\n", 'app/page.tsx': PAGE, 'Dockerfile.dockerignore': 'node_modules\n' });
+    expect(p.services[0]?.dockerfile).toBeUndefined();
+    expect(p.services[0]?.projectType?.types).toEqual(['static-site']);
+  });
+});

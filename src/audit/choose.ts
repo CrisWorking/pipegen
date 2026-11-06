@@ -202,7 +202,6 @@ function deadCodeRule(c: Ctx): Choice {
   return generic(c);
 }
 
-
 /** The CI line for each hook manager's own runner. husky runs free shell, so there is no one command to give. */
 function hooksCiRule(c: Ctx): Choice {
   const manager = c.p.precommit;

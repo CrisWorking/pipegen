@@ -20,7 +20,23 @@ import { isGitHubRepo } from './names.js';
 import { pipegenScriptStep } from './pipegen-script.js';
 import { releaseInstallStep } from './render-cli.js';
 import { RenderError, show } from './render-error.js';
-import type { PipelineDraft, RepoProfile, ReviewedTool, SigningPlan } from '../types.js';
+import { noImageServices } from './needs.js';
+import type { Capabilities, PipelineDraft, RepoProfile, ReviewedTool, Service, SigningPlan } from '../types.js';
+
+/**
+ * GJ-R1 (review sec M3): the profile service a signing-plan image belongs to, matched by slug (the identity checkedImages and the digest
+ * artifacts use). `reportOnly` when that service builds no image (noImageServices: its signing is report-only, the image leaves the plan);
+ * not `reportOnly` when no profile service has that slug, or the name has no letters or digits (refused: nothing would build that image).
+ */
+export function signedImageOwner(p: RepoProfile, caps: Capabilities, service: unknown): { ok: true; service: Service } | { ok: false; reportOnly: boolean; why: string } {
+  let k: string;
+  try { k = slug(String(service)); } catch { return { ok: false, reportOnly: false, why: `${show(String(service))}, which is no service of the repository` }; }
+  const owners = p.services.filter((s) => { try { return slug(s.name) === k; } catch { return false; } });
+  if (typeof service !== 'string' || owners.length !== 1) return { ok: false, reportOnly: false, why: `${show(String(service))}, which is no service of the repository` };
+  const svc = owners[0] as Service;
+  const why = noImageServices(p, caps).get(svc.name);
+  return why === undefined ? { ok: true, service: svc } : { ok: false, reportOnly: true, why };
+}
 
 /** The reviewed entries the steps come from. GH_ID is the reviewed pinned gh release entry (it lands in G15's re-pin batch, ruling B3 d). */
 export const COSIGN_ID = 'cosign';

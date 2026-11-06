@@ -46,7 +46,7 @@ describe('dockerfile judge', () => {
     ];
     for (const t of bad) expect(problems(df(t)).length, t).toBeGreaterThan(0);
     // a build step with a single stage
-    expect(problems(df(SINGLE), mkDraft([svc({ scripts: ['build'] })])).join()).toMatch(/multi-stage/);
+    expect(problems(df(SINGLE), mkDraft([svc({ scripts: ['build'], port: 3000 })])).join()).toMatch(/multi-stage/);   // GJ-R1: a port keeps the service runnable (one that runs nothing builds no image, so gets no Dockerfile)
     // the service's own port beats the file's
     expect(problems(df(), mkDraft([svc({ port: 8080 })])).join()).toMatch(/EXPOSE/);
     // not an npm service
@@ -83,7 +83,7 @@ describe('dockerfile judge', () => {
     // the same file passes the leaf only for the scripts the service has
     expect(problems(df(run('lint')), mkDraft([svc({ scripts: ['start'] })])).join()).toMatch(/npm run/);
     expect(problems(df(run('lint')), mkDraft([svc({ scripts: ['start', 'lint'] })]))).toEqual([]);
-    expect(problems(df(run('lint')), mkDraft([svc({ scripts: [] })])).join()).toMatch(/npm run/);
+    expect(problems(df(run('lint')), mkDraft([svc({ scripts: [], port: 3000 })])).join()).toMatch(/npm run/);   // GJ-R1: runnable through its port
     // and CMD
     expect(problems(df(SINGLE.replace('CMD ["npm", "start"]', 'CMD ["npm", "run", "serve"]')), mkDraft([svc({ scripts: ['start'] })])).join()).toMatch(/CMD/);
     expect(problems(df(SINGLE.replace('CMD ["npm", "start"]', 'CMD ["npm", "run", "serve"]')), mkDraft([svc({ scripts: ['start', 'serve'] })]))).toEqual([]);
@@ -111,7 +111,7 @@ describe('dockerignore judge', () => {
       plain.replace(/\n/g, '\r\n'), plain.replace('.venv', '.venv '), plain + '# note\n', plain.replace('**/*.pem', '*.pem'),
     ]) expect(problems(di(t)).length, JSON.stringify(t)).toBeGreaterThan(0);
     // dist belongs to a service that builds inside, and only to it
-    const b = mkDraft([svc({ scripts: ['build'] })]);
+    const b = mkDraft([svc({ scripts: ['build'], port: 3000 })]);   // GJ-R1: runnable through its port, so it builds an image
     expect(problems(di(plain), b).length).toBeGreaterThan(0);
     expect(problems(di(dockerignoreText(svc(), true)), b)).toEqual([]);
     expect(problems(di(dockerignoreText(svc(), true))).length).toBeGreaterThan(0);
@@ -132,5 +132,24 @@ describe('referee', () => {
     const r = await run(tampered);
     expect(r.issues.some((i) => i.file.endsWith('Dockerfile'))).toBe(true);
     expect(r.issues.some((i) => i.file.endsWith('.dockerignore'))).toBe(true);
+  });
+});
+
+describe('GJ-R1 (review GJ spec I1): no created Dockerfile or .dockerignore for a service that builds no image', () => {
+  const STATIC = { types: ['static-site' as const], evidence: [], unsure: false };
+  it('a static site: the Dockerfile and its .dockerignore are refused with the plan\'s reason', () => {
+    const d = mkDraft([svc({ port: 3000, projectType: STATIC })]);
+    expect(problems(df(), d).join('\n')).toMatch(/builds no image for the service "api".*static site/);
+    expect(problems(di(dockerignoreText(svc(), false)), d).join('\n')).toMatch(/builds no image for the service "api"/);
+  });
+  it('a service that does not run (no start script, no port, no framework): refused too', () => {
+    const d = mkDraft([svc({ scripts: ['test'] })]);
+    expect(problems(df(), d).join('\n')).toMatch(/builds no image for the service "api".*doesn't run as a server/);
+    expect(problems(di(dockerignoreText(svc(), false)), d).join('\n')).toMatch(/builds no image/);
+  });
+  it('control: a server (and a static site that is also a container) keeps its created Dockerfile', () => {
+    expect(problems(df(), mkDraft([svc({ port: 3000 })]))).toEqual([]);
+    expect(problems(df(), mkDraft([svc({ port: 3000, projectType: { types: ['server'], evidence: [], unsure: false } })]))).toEqual([]);
+    expect(problems(di(dockerignoreText(svc(), false)), mkDraft([svc()]))).toEqual([]);
   });
 });

@@ -384,7 +384,7 @@ function offersFor(ref: NeedRef, cands: readonly Candidate[], p: RepoProfile, de
     if (ref.blocking && ADVISORY_TOOLS.has(e.id)) continue;   // ruling S9: an advisory tool never covers a blocking need
     // GJ (Plan J fix wave I1, DECISIONS #122): workflow lint is zizmor (plus poutine on a risky trigger), never actionlint; without zizmor
     // on the list nothing is offered (the check is only a suggestion)
-    if (categoryOf(ref.id) === 'workflow-lint' && (!workflowLintTools(p).includes(e.id) || !listed.has(WORKFLOW_LINT_TOOL))) continue;
+    if (categoryOf(ref.id) === 'workflow-lint' && (!workflowLintTools(p).includes(e.id) || !workflowLintAvailable(deps.reviewed))) continue;
     // GJ: a pre-commit or husky repository's hooks are not lefthook's: hooks-ci offers no reviewed tool there (a plain note instead)
     if (categoryOf(ref.id) === 'hooks-ci' && p.precommit !== null && NO_HOOKS_CI_MANAGERS.has(p.precommit)) continue;
     const plan = choicePlan(e, ref, p);
@@ -403,6 +403,12 @@ const where = (ref: NeedRef) => ({ key: ref.key, needId: ref.id, ...(ref.service
 
 /** What deciding the offered tools needs (the judge passes only these, ruling B2). */
 export type OfferDeps = Pick<BuilderDeps, 'reviewed' | 'knownValues'>;
+
+/**
+ * GJ-R1 (review spec M4): whether workflow lint's main tool zizmor is on the reviewed list (a reviewed entry). The one predicate the offers
+ * (keyOffers) and the jobs (assembleJobs) share: without it the check is only a suggestion; with it but not offered, the check is uncovered.
+ */
+export const workflowLintAvailable = (reviewed: readonly ReviewedTool[]): boolean => reviewed.some((t) => t?.id === WORKFLOW_LINT_TOOL && isReviewed(t.candidate));
 
 /** builderOffers without the suggestions: what the builder and the judge (F3) both offer per key. */
 export type KeyOffers = Omit<BuilderOffers, 'suggestions'>;
@@ -431,7 +437,9 @@ export function keyOffers(needs: readonly Need[], candidates: ReadonlyMap<string
       else byCode('no-reviewed-tool');
       continue;
     }
-    const offers = offersFor(ref, candidates.get(ref.key) ?? [], p, deps, kv);
+    let offers = offersFor(ref, candidates.get(ref.key) ?? [], p, deps, kv);
+    // GJ-R1 (review sec M1): workflow lint without its main tool zizmor offered is uncovered (pipegen stops), never poutine in its place
+    if (category === 'workflow-lint' && !offers.some((o) => o.entry.id === WORKFLOW_LINT_TOOL)) offers = [];
     if (offers.length === 0) { result.uncovered.push({ ...where(ref), blocking: ref.blocking, reason: 'none-offered' }); continue; }
     result.offers.set(ref.key, offers);
     (ref.offered ? result.aiKeys : result.codeKeys).push(ref.key);

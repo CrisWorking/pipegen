@@ -508,7 +508,7 @@ export async function projectTypeOf(k: TypeInput): Promise<ProjectType> {
   }
   if (k.hasDockerfile) {
     types.push('container');
-    evidence.push(`has a Dockerfile: ${shown(inDir(k.dir, 'Dockerfile'), 'Dockerfile')}`);
+    evidence.push(`has a Dockerfile: ${shown(k.dockerfile ?? inDir(k.dir, 'Dockerfile'), 'Dockerfile')}`);
   }
   return { types: ordered(types), evidence, unsure };
 }

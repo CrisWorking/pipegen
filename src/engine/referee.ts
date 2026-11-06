@@ -57,8 +57,8 @@ import { loadBaseImages } from './base-images.js';
 import { centralWorkflowFile, centralWorkflowPath } from './central-path.js';
 import { projectScriptFor, repoToolFor } from './reviewed.js';
 import { slotProblem, type SlotKind } from './slots.js';
-import { expectedSigningSteps } from './signing.js';
-import { NO_IMAGE_CATEGORIES, noImageServices } from './needs.js';
+import { expectedSigningSteps, signedImageOwner } from './signing.js';
+import { NO_IMAGE_CATEGORIES, noImageServices, WORKFLOW_LINT_TOOL } from './needs.js';
 import { ARCHIVE_TOOL_IDS, imageBuildTag, renderImageArchiveScan, renderImageBuild } from './image-handoff.js';
 import { dastStartOf, renderDastRun, renderDastScrub } from './dast-handoff.js';
 import { SHARED_CDN_SETS } from './egress.js';
@@ -460,6 +460,8 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
   // a non-blocking copy on another layer must never let a narrowing value through). No such need: blocking (fail closed).
   const blockingOf = (needId: string, service: string | undefined): boolean => {
     const matching = draft.needs.filter((n) => n.id === needId && n.service === service);
+    // (GJ-R1, review spec M3) every caller is behind hasNeed now, so `matching` is never empty there; the clause stays as a defensive
+    // fail-closed default (no such need counts as blocking) for any later caller
     return matching.length === 0 || matching.some((n) => n.blocking !== false);
   };
   const record = (source: string, results: RenderedStep[][], appRunning: boolean, blocking: boolean, readsWorkspace: boolean, need: string | undefined, owner: string | undefined): void => {
@@ -606,8 +608,13 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
     add(`draft.needs[${i}]`, 'unreviewed', `The draft plans the check ${show(n.id)} for ${show(n.service)}, but the plan builds no image for it (${safeText(noImage.get(n.service) as string, 200)}), so there is nothing to build, scan or start; no job may run it.`);
   });
   if (draft.signing !== undefined && draft.signing !== null && Array.isArray(draft.signing.images)) {
+    // GJ-R1 (sec M3): matched by slug (the identity of the digest artifacts); an image of no profile service is refused too
     for (const img of draft.signing.images) {
-      if (isObj(img) && typeof img.service === 'string' && noImage.has(img.service)) add('(draft)', 'permissions', `The draft signs the image of ${show(img.service)}, but the plan builds no image for it (${safeText(noImage.get(img.service) as string, 200)}): its signing is report-only, so no step may sign it.`);
+      const o = signedImageOwner(draft.profile, draft.capabilities, isObj(img) ? img.service : undefined);
+      if (o.ok) continue;
+      add('(draft)', 'permissions', o.reportOnly
+        ? `The draft signs the image of ${show(String((img as { service?: unknown }).service))}, but the plan builds no image for it (${safeText(o.why, 200)}): its signing is report-only, so no step may sign it.`
+        : `The draft signs the image of ${safeText(o.why, 200)}: nothing builds that image, so no step may sign it.`);
     }
   }
   const signing = expectedSigningSteps(draft, reviewed);
@@ -2321,6 +2328,17 @@ async function judgeFiles(allFiles: CreatedFile[], draft: PipelineDraft, platfor
   }
 
   for (const check of ex.deferred) check();
+  // GJ-R1 (review sec M1): workflow lint runs zizmor (DECISIONS #122): a draft whose workflow-lint check has no zizmor step, or a job
+  // workflow-lint that runs none of the draft's zizmor steps, is refused (poutine never stands in for it)
+  const zizmorSpec = (i: number): boolean => { const st = draft.steps[i]; return isObj(st) && st.needId === 'workflow-lint' && isObj(st.tool) && st.tool.id === WORKFLOW_LINT_TOOL; };
+  if (draft.needs.some((n) => isObj(n) && n.id === 'workflow-lint') && !draft.steps.some((_st, i) => zizmorSpec(i))) {
+    add('(draft)', 'unreviewed', `The draft's workflow lint check has no ${WORKFLOW_LINT_TOOL} step: workflow lint runs ${WORKFLOW_LINT_TOOL} (poutine only next to it), never another tool in its place.`);
+  }
+  for (const j of ex.jobs) {
+    if (j.id !== 'workflow-lint') continue;
+    const runs = j.judged.some((x) => { const m = /^spec:(\d+)$/.exec(x.match?.source ?? ''); return m !== null && zizmorSpec(Number(m[1])); });
+    if (!runs) add(j.file, 'unreviewed', `The job "workflow-lint" runs no ${WORKFLOW_LINT_TOOL} step: workflow lint runs ${WORKFLOW_LINT_TOOL} (poutine only next to it), never another tool in its place.`);
+  }
   // G5-R1 I1: a draft that records a signing plan never publishes an image unsigned: a job that pushes an image (build-push with push) needs a
   // sign job of the judged files holding the plan's sign (or attest) step; mode none is a draft with no plan
   if (draft.signing !== undefined && draft.signing !== null) {

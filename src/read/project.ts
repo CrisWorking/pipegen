@@ -110,6 +110,20 @@ const ROOT_FILES = ['package.json', 'pnpm-workspace.yaml', 'turbo.json', 'nx.jso
 
 interface Ctx { root: string; fileSet: Set<string>; notes: string[] }
 
+/**
+ * GJ-R1 (review GJ sec I1): a container build file of the folder itself (never a sub-folder): `Dockerfile` first, else the first, sorted, of
+ * `Dockerfile.<x>`, `<x>.Dockerfile`, `Containerfile` and `Containerfile.<x>` (a `.dockerignore` excepted). Each is container evidence: a
+ * folder that builds an image keeps its image checks, so a static site with `Dockerfile.prod` is never given the static skip.
+ */
+const CONTAINER_FILE_RE = /^(?:Dockerfile\.[^/]+|[^/]+\.Dockerfile|Containerfile(?:\.[^/]+)?)$/;
+function containerFileOf(files: ReadonlySet<string>, dir: string): string | undefined {
+  if (files.has(inDir(dir, 'Dockerfile'))) return inDir(dir, 'Dockerfile');
+  const prefix = dir === '.' || dir === '' ? '' : `${dir}/`;
+  const names = [...files].filter((f) => f.startsWith(prefix) && !f.slice(prefix.length).includes('/')).map((f) => f.slice(prefix.length))
+    .filter((n) => CONTAINER_FILE_RE.test(n) && !/\.dockerignore$/i.test(n)).sort();
+  return names[0] === undefined ? undefined : inDir(dir, names[0]);
+}
+
 const isUnder = (file: string, dir: string) => dir === '.' || file.startsWith(`${dir}/`);
 
 function note(ctx: Ctx, line: string): void {
@@ -256,7 +270,7 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
       ? (await firstLine(scope.map((d) => inDir(d, '.python-version')))) ?? py.requires
       : undefined;
 
-  const dockerfile = ctx.fileSet.has(inDir(dir, 'Dockerfile')) ? inDir(dir, 'Dockerfile') : undefined;
+  const dockerfile = containerFileOf(ctx.fileSet, dir);
   const deps = asObj(pkg?.dependencies);
   const devDeps = asObj(pkg?.devDependencies);
   const pkgScripts = asObj(pkg?.scripts);
@@ -293,7 +307,7 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
   // P55 (batch B): a folder that runs only by its start script, but is a one-shot script, is built into another image, or is an email-template package
   const kind = {
     dir, read: (rel: string) => readFile(ctx, rel), fileSet: ctx.fileSet, copies: shared.copies, scripts: pkgScripts, deps, devDeps, frameworks,
-    hasDockerfile: dockerfile !== undefined, port, language, serviceDirs: shared.serviceDirs,
+    hasDockerfile: dockerfile !== undefined, ...(dockerfile === undefined ? {} : { dockerfile }), port, language, serviceDirs: shared.serviceDirs,
   };
   const notStandalone = await notStandaloneOf(kind);
   // Plan J J2 (ruling B2): the type from the service's own files; finishProjectTypes completes it after the workflow pass

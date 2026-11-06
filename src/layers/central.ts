@@ -35,9 +35,8 @@ import type { PlatformActions } from '../engine/pin.js';
 import { SIGNING_ENVIRONMENT } from '../engine/referee.js';
 import { RenderError, show } from '../engine/render-error.js';
 import { renderPlatformStep, stepsToYaml } from '../engine/render-step.js';
-import { COSIGN_ID, imageDigestArtifact, renderSignSteps, SIGN_REGISTRY, type SignedImage } from '../engine/signing.js';
+import { COSIGN_ID, imageDigestArtifact, renderSignSteps, SIGN_REGISTRY, signedImageOwner, type SignedImage } from '../engine/signing.js';
 import { egressSetsForTool, renderEgressStep } from '../engine/egress.js';
-import { noImageServices } from '../engine/needs.js';
 import { signingMode, type SigningMode } from '../github/signing-mode.js';
 import type { Capabilities, CreatedFile, PipelineDraft, RepoProfile, ReviewedTool, SigningPlan } from '../types.js';
 
@@ -138,9 +137,13 @@ function planFor(draft: PipelineDraft, mode: SigningMode): (SigningPlan & { mode
   if (plan.mode !== m) throw new RenderError(`The draft's signing plan is ${show(String(plan.mode))}, but the signing mode is ${m}.`);
   checkedImages(plan.images);
   // GJ (Plan J): the image of a service the plan builds no image for (noImageServices: skippedChecks) is report-only, so it leaves the plan;
-  // a plan left with no image signs nothing (no sign job, no sign workflow, no caller)
-  const noImage = noImageServices(draft.profile, draft.capabilities);
-  const images = plan.images.filter((i) => !noImage.has(i.service));
+  // a plan left with no image signs nothing (no sign job, no sign workflow, no caller). GJ-R1 (sec M3): matched by slug; an image of no
+  // profile service is refused
+  const images = plan.images.filter((i) => {
+    const o = signedImageOwner(draft.profile, draft.capabilities, i.service);
+    if (!o.ok && !o.reportOnly) throw new RenderError(`The signing plan signs the image of ${o.why}, so nothing builds it.`);
+    return o.ok;
+  });
   if (images.length === 0) return null;
   return { ...plan, images, mode: m };
 }

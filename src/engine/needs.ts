@@ -368,6 +368,18 @@ export const workflowLintTools = (p: RepoProfile): string[] => [WORKFLOW_LINT_TO
  */
 export const NO_HOOKS_CI_MANAGERS: ReadonlySet<string> = new Set(['pre-commit', 'husky']);
 
+/**
+ * GJ-R1 (review spec M5): the needs the estimate counts jobs for (jobCategories(estimateNeeds(...))): every need but those Plan G writes
+ * no job for, a signing or attestation need on a service that builds no image (report-only) and hooks-ci of a pre-commit or husky repository
+ * (a note). Never used to decide a check: the plan keeps those needs.
+ */
+export function estimateNeeds(p: RepoProfile, caps: Capabilities, needs: readonly Need[]): Need[] {
+  const noImage = noImageServices(p, caps);
+  const hooksNote = p.precommit !== null && NO_HOOKS_CI_MANAGERS.has(p.precommit);
+  return needs.filter((n) => !((n.category === 'signing' || n.category === 'attestation') && n.layer === 'deploy' && n.service !== undefined && noImage.has(n.service))
+    && !(hooksNote && n.category === 'hooks-ci'));
+}
+
 /** iac (an older check) now also applies to Kubernetes manifests. */
 const iacSkip = (p: RepoProfile): string | null => (p.terraformDirs.length > 0 || p.repoFiles.kubernetes ? null : 'no Terraform or Kubernetes files found');
 

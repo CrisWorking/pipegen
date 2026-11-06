@@ -5,20 +5,25 @@
 //    What the creator writes passes; one changed byte or rule gives an issue.
 //  - `<service>/.dockerignore` must EQUAL dockerignoreText(service, buildsInside): a fixed text, so no `!` line and no comment can slip in.
 // A missing input never reads as "nothing wrong": no service for the folder, two services in it, or an unreadable list all refuse.
+// GJ-R1 (Plan J): both are refused for a service the plan builds no image for (noImageServices: a static site, or one that doesn't run).
 import { buildsInsideOf, dockerfileProblems, dockerignoreText } from '../../create/dockerfile-rules.js';
 import type { CreatedFile, PipelineDraft, Service } from '../../types.js';
 import { loadBaseImages } from '../base-images.js';
+import { noImageServices } from '../needs.js';
 import type { CreatedCtx } from '../created-files.js';
 
 const dirOf = (path: string): string => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
 const rootPrefix = (svcPath: string): string => svcPath.replace(/^(?:\.\/)+/, '').replace(/\/+$/, '').replace(/^\.$/, '');
 
-/** The one service whose folder holds the file, or why there is not exactly one. */
+/** The one service whose folder holds the file, or why there is not exactly one, or why it gets no image (GJ-R1). */
 function serviceOf(file: CreatedFile, draft: PipelineDraft): Service | string {
   const owners = draft.profile.services.filter((s) => rootPrefix(s.path) === dirOf(file.path));
   if (owners.length === 0) return 'no service of the repository has this folder';
   if (owners.length > 1) return 'more than one service has this folder, so pipegen can not tell which one the file is for';
-  return owners[0] as Service;
+  const svc = owners[0] as Service;
+  const why = noImageServices(draft.profile, draft.capabilities).get(svc.name);
+  if (why !== undefined) return `pipegen builds no image for the service ${JSON.stringify(svc.name.slice(0, 60))} (${why}), so it creates no Dockerfile or .dockerignore for it`;
+  return svc;
 }
 
 const validPort = (n: unknown): n is number => typeof n === 'number' && Number.isInteger(n) && n >= 1 && n <= 65535;

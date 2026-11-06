@@ -38,7 +38,7 @@ import { needLanguage, suggestTools } from '../engine/discover.js';
 import { isRateStop, rateStopOf, resetText, type RateBudget } from '../engine/github-rate.js';
 import { ensurePinnedBinary, loadPinnedBinaries, PinnedBinaryError } from '../engine/linters.js';
 import type { MemoryStore } from '../engine/memory.js';
-import { CHECK_LABELS, floorNeeds, isRunnable, jobCategories, needKey, needsPromptBytes, planNeeds, type NeedsPlan } from '../engine/needs.js';
+import { CHECK_LABELS, estimateNeeds, floorNeeds, isRunnable, jobCategories, needKey, needsPromptBytes, planNeeds, type NeedsPlan } from '../engine/needs.js';
 import type { QualityBar } from '../engine/quality-bar.js';
 import { projectScriptFor, type WouldAddTool } from '../engine/reviewed.js';
 import {
@@ -472,7 +472,7 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
   const wouldAdd = wouldAddRows(profile, coverage, deps, caps);
 
   const activity = await activityOf(deps, profile);
-  const estimates = estimate(profile, jobCategories(needs), 2, activity ?? { pushes: 0, prs: 0, capped: false }, { name: 'claude', model: DEFAULT_MODEL });
+  const estimates = estimate(profile, jobCategories(estimateNeeds(profile, caps, needs)), 2, activity ?? { pushes: 0, prs: 0, capped: false }, { name: 'claude', model: DEFAULT_MODEL });
   if (activity === null) {
     const line = "Activity: pipegen couldn't read this repo's pushes and pull requests for the last 30 days, so monthly minutes assume 0 of each (the real number is likely higher).";
     const at = estimates.basis.findIndex((b) => b.startsWith('Activity:'));

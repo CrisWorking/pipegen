@@ -4,14 +4,15 @@
 // workflow is a deploy target; the referee refuses a job, a check or a signature without its need.
 import { describe, expect, it } from 'vitest';
 import { keyOffers } from '../src/debate/builder.js';
-import { floorNeeds, noImageServices, skippedChecks, WORKFLOW_LINT_EXTRA, WORKFLOW_LINT_TOOL } from '../src/engine/needs.js';
+import { estimateNeeds, jobCategories, floorNeeds, noImageServices, skippedChecks, WORKFLOW_LINT_EXTRA, WORKFLOW_LINT_TOOL } from '../src/engine/needs.js';
 import { sharedWorkflows, signCallerJob, signJob } from '../src/layers/central.js';
 import { assemble as assembleFiles, judgeAssembled, type AssembledFiles } from '../src/layers/assemble.js';
 import { AssembleError, assembleJobs, HOOKS_CI_NOTES, type Job } from '../src/layers/jobs.js';
 import { RenderError } from '../src/engine/render-error.js';
 import type { Capabilities, ExistingWorkflow, Need, PipelineDraft, ProjectType, ReviewedTool, Service, ServiceType } from '../src/types.js';
 import { REVIEWED } from './helpers/debate-fixtures.js';
-import { CAPS, LINTERS, assemble, files, judge, node, p, planned, profileOf, shown } from './helpers/assemble.js';
+import { CAPS, LINTERS, assemble, editJob, files, judge, node, p, planned, profileOf, shown } from './helpers/assemble.js';
+import { POUTINE_NOT_RUN } from '../src/layers/jobs.js';
 
 /** ExistingWorkflow's used-names field, spelled at run time (test/no-secret-literals.test.ts). */
 const USED = ['sec', 'retsUsed'].join('');
@@ -48,6 +49,10 @@ const FIXTURES: readonly [string, Service][] = [
   ['CLI', node({ projectType: type('cli') })],
   ['server', node({ dockerfile: 'Dockerfile', port: 3000, projectType: type('server') })],
   ['container', node({ dockerfile: 'Dockerfile', port: 3000, projectType: type('container') })],
+  // controls (review GJ spec M1): library and CLI change no check in v0.2 (types.ts, F10): only the static-site type is read by isRunnable,
+  // so a CLI that builds an image keeps its image jobs, and a static site that is also a container is one
+  ['CLI with an image', node({ dockerfile: 'Dockerfile', port: 3000, projectType: type('cli') })],
+  ['static site + container', node({ dockerfile: 'Dockerfile', port: 3000, projectType: type('static-site', 'container') })],
 ];
 
 describe('GJ: G2/G3, G4 and G5 follow Plan J (a project type per service, fewer and right checks)', () => {
@@ -57,7 +62,7 @@ describe('GJ: G2/G3, G4 and G5 follow Plan J (a project type per service, fewer 
       const a = assemble(x);
       // the image jobs are exactly those the needs call for (no more, no fewer)
       expect(imageJobs(a.merge), name).toEqual(imageJobsOfNeeds(x.draft.needs));
-      const runs = name === 'server' || name === 'container' || name === 'unsure static site';
+      const runs = ['server', 'container', 'unsure static site', 'CLI with an image', 'static site + container'].includes(name);
       expect(imageJobs(a.merge).length > 0, name).toBe(runs);
       // every merge-layer check keeps its job (the minimum among them): secrets, SAST, deps, workflow lint, the pin check and the gate
       for (const id of ['secrets', `sast--${svc.name}`, `deps--${svc.name}`, 'workflow-lint', 'workflow-pin-check', 'gate']) expect(a.merge[id], `${name} ${id}`).toBeDefined();
@@ -228,7 +233,6 @@ describe('GJ: G2/G3, G4 and G5 follow Plan J (a project type per service, fewer 
     expect(steps).toHaveLength(2);
     expect(steps[1]?.with?.mode).toBe('find-run');
     expect(JSON.stringify(steps)).not.toMatch(/digest|cosign/);
-    expect(imageJobs(Object.fromEntries(a.files.flatMap((f) => Object.entries((f as unknown as { jobs?: Record<string, Job> }).jobs ?? {}))))).toEqual([]);
     expect(a.files.map((f) => f.content).join('\n')).not.toMatch(/image-build--|image-scan--|dast--/);
     expect(shown(await judgeAssembled(a, JD))).toBe('');
   });
@@ -268,5 +272,105 @@ describe('GJ: the referee refuses a job, a check or a signature without its need
     // the same for a check job's step (sast): a planted step with no need is never accepted
     const r2 = await judge(files(a), { ...a.draft, needs: a.draft.needs.filter((n) => n.id !== 'sast') });
     expect(r2.issues.some((i) => /The step for "sast" for "app" .*has no need of its own in the draft/.test(i.message)), shown(r2)).toBe(true);
+  });
+});
+
+describe('GJ-R1: fix round 1 (reviews GJ security and spec)', () => {
+  const wfOn = (...triggers: string[]): ExistingWorkflow => ({ path: '.github/workflows/t.yml', triggers, deploys: false, [USED]: [], jobs: ['t'] } as unknown as ExistingWorkflow);
+  const risky = (): ReturnType<typeof profileOf> => profileOf([node()], { existingWorkflows: [wfOn('pull_request_target')] });
+
+  it('GJ-R1 (spec I2, sec M2): a risky trigger with poutine not offered → zizmor runs and a note says poutine is not run and why', () => {
+    const without = REVIEWED.filter((t) => t.id !== WORKFLOW_LINT_EXTRA);
+    const prof = risky();
+    const x = planned(prof);
+    const o = keyOffers(x.plan.needs, x.plan.candidates, prof, { reviewed: without });
+    expect(o.offers.get('workflow-lint')?.map((of) => of.entry.id)).toEqual([WORKFLOW_LINT_TOOL]);
+    const a = assembleJobs(x.draft, { ...x.plan, uncovered: o.uncovered }, { reviewed: without, platform: p, mode: 'none' });
+    expect(a.notes).toContain(POUTINE_NOT_RUN);
+    expect(POUTINE_NOT_RUN).toMatch(/pull_request_target or issue_comment.*poutine is not run/);
+    // no risky trigger, or poutine offered: no such note
+    expect(assemble(planned(profileOf())).notes).not.toContain(POUTINE_NOT_RUN);
+    expect(assemble(planned(prof)).notes).not.toContain(POUTINE_NOT_RUN);
+  });
+
+  it('GJ-R1 (sec M1): workflow-lint offers without zizmor are uncovered, so pipegen stops; poutine never stands in', () => {
+    const prof = risky();
+    const x = planned(prof);
+    const cands = new Map([...x.plan.candidates].map(([k, v]) => [k, k === 'workflow-lint' ? v.filter((c) => c.id !== WORKFLOW_LINT_TOOL) : v]));
+    const o = keyOffers(x.plan.needs, cands, prof, { reviewed: REVIEWED });
+    expect(o.offers.has('workflow-lint')).toBe(false);
+    expect(o.uncovered.some((u) => u.key === 'workflow-lint' && u.blocking)).toBe(true);
+    expect(() => assembleJobs(x.draft, { ...x.plan, candidates: cands, uncovered: o.uncovered }, { reviewed: REVIEWED, platform: p, mode: 'none' })).toThrow(/no tool it can run \("workflow-lint"/);
+  });
+
+  it('GJ-R1 (sec M1) referee: a workflow-lint job, or a draft, with no zizmor step is refused', async () => {
+    const x = planned(risky());
+    const a = assemble(x);
+    expect(shown(await judge(files(a), a.draft))).toBe('');
+    // the draft keeps only poutine for workflow lint
+    const poutineOnly = { ...a.draft, steps: a.draft.steps.filter((st) => !(st.needId === 'workflow-lint' && st.tool.id === WORKFLOW_LINT_TOOL)) };
+    const r = await judge(files(a), poutineOnly);
+    expect(r.issues.some((i) => /workflow lint runs zizmor/.test(i.message)), shown(r)).toBe(true);
+    // the job loses its zizmor steps (the draft still holds the spec)
+    const f = files(a)[0] as NonNullable<ReturnType<typeof files>[number]>;
+    const cut = editJob(f, 'workflow-lint', (j) => { j.steps = j.steps.filter((st: { name?: string }) => !/zizmor/.test(String(st.name))); });
+    const r2 = await judge([cut, ...files(a).slice(1)], a.draft);
+    expect(r2.issues.some((i) => /The job "workflow-lint" runs no zizmor step/.test(i.message)), shown(r2)).toBe(true);
+  });
+
+  it('GJ-R1 (sec M3): signing images are matched by slug; an image of no profile service, or of a no-image service in another spelling, is refused', async () => {
+    const site = node({ name: 'site', path: 'site', projectType: type('static-site') });
+    const api = node({ name: 'api', path: '.', dockerfile: 'Dockerfile', port: 3000, projectType: type('server') });
+    const prof = profileOf([api, site], { existingWorkflows: [DEPLOY_WF] });
+    const needs = floorNeeds(prof, CAPS).filter((n) => n.id !== 'dast');
+    const API = { service: 'api', repo: 'ghcr.io/o/r-api' };
+    for (const [label, img] of [['another spelling of the static site', { service: 'Site', repo: 'ghcr.io/o/r-site' }], ['no such service', { service: 'ghost', repo: 'ghcr.io/o/r-ghost' }]] as const) {
+      const x = planned(prof, { needs, over: { signing: { mode: 'keyless', images: [API, img] } } });
+      // the jobs: the other spelling of the static site is report-only; a service the profile does not have is refused
+      if (img.service === 'ghost') expect(() => assemble(x, 'keyless'), label).toThrow(/signs the image of "ghost", which is no service of the repository/);
+      else {
+        const a = assemble(x, 'keyless');
+        expect(a.draft.signing?.images, label).toEqual([API]);
+        expect(a.notes.join('\n'), label).toMatch(/"Site" builds no image, so its signing is report-only/);
+      }
+      // G3's functions: the same
+      if (img.service === 'ghost') expect(() => signJob(x.draft, 'keyless', { reviewed: REVIEWED, platform: p }), label).toThrow(/no service of the repository/);
+      else expect(JSON.stringify(signJob(x.draft, 'keyless', { reviewed: REVIEWED, platform: p }).steps), label).not.toContain('r-site');
+      // the referee: refused either way
+      const ok = assemble(planned(prof, { needs, over: SKIP_DEPLOY }));
+      const r = await judge(files(ok), { ...ok.draft, signing: { mode: 'keyless', images: [API, img] } });
+      expect(r.issues.some((i) => i.check === 'permissions' && new RegExp(`signs the image of "${img.service}"`).test(i.message)), `${label}: ${shown(r)}`).toBe(true);
+    }
+  });
+
+  it('GJ-R1 (sec M4, spec M4): assembleJobs returns the uncovered minimum, routes zizmor into the suggestions, and writes every other minimum check', () => {
+    const plain = assemble(planned(profileOf()));
+    expect(plain.uncoveredMinimum).toEqual([]);
+    const without = REVIEWED.filter((t) => t.id !== WORKFLOW_LINT_TOOL);
+    const prof = profileOf();
+    const x = planned(prof);
+    const o = keyOffers(x.plan.needs, x.plan.candidates, prof, { reviewed: without });
+    const draft = { ...x.draft, steps: x.draft.steps.filter((st) => st.needId !== 'workflow-lint') };
+    const a = assembleJobs(draft, { ...x.plan, uncovered: o.uncovered }, { reviewed: without, platform: p, mode: 'none' });
+    expect(a.uncoveredMinimum).toEqual([{ category: 'workflow-lint', why: expect.stringMatching(/zizmor is not on pipegen's reviewed list/) }]);
+    expect(a.draft.suggestions.some((sg) => sg.name === WORKFLOW_LINT_TOOL && sg.repo === 'zizmorcore/zizmor')).toBe(true);
+  });
+
+  it('GJ-R1 (spec M5): the estimate counts no sign job for a service that builds no image, and no hooks-ci job for a pre-commit or husky repository', () => {
+    const site = node({ projectType: type('static-site') });
+    const prof = profileOf([site], { existingWorkflows: [DEPLOY_WF] });
+    const needs = floorNeeds(prof, CAPS);
+    expect(jobCategories(needs).deploy).toContain('signing');
+    expect(jobCategories(estimateNeeds(prof, CAPS, needs)).deploy).not.toContain('signing');
+    // a server keeps its sign job in the estimate
+    const api = profileOf([node({ dockerfile: 'Dockerfile', port: 3000 })], { existingWorkflows: [DEPLOY_WF] });
+    expect(jobCategories(estimateNeeds(api, CAPS, floorNeeds(api, CAPS))).deploy).toContain('signing');
+    for (const manager of ['pre-commit', 'husky'] as const) {
+      const pc = profileOf([node()], { precommit: manager });
+      const est = jobCategories(estimateNeeds(pc, CAPS, floorNeeds(pc, CAPS)));
+      expect([...est.push, ...est.merge], manager).not.toContain('hooks-ci');
+    }
+    const lh = profileOf([node()], { precommit: 'lefthook' });
+    expect(jobCategories(estimateNeeds(lh, CAPS, floorNeeds(lh, CAPS))).merge).toContain('hooks-ci');
   });
 });

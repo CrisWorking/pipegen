@@ -52,7 +52,7 @@
 //   yet (G15)" with a note, never another mode. GJ (Plan J): a signing or attestation need on a service that builds no image is report-only:
 //   its image leaves the signing plan, and with no service building an image there is no sign job at all; a note each (PIPEGEN.md, G9).
 import { isDeepStrictEqual } from 'node:util';
-import { keyOffers, specFor, BuilderError, type Offer } from '../debate/builder.js';
+import { keyOffers, specFor, BuilderError, workflowLintAvailable, type Offer } from '../debate/builder.js';
 import type { DebateResult } from '../debate/debate.js';
 import { needKeyOf, NeedKeyError, type NeedRef } from '../debate/need-ref.js';
 import { COMPOSE_PATH, planCompose } from '../create/compose.js';
@@ -69,7 +69,7 @@ import {
   isScrubStep, jobOutputsFor, NIGHTLY_CONCURRENCY, NO_SCANS, renderRangeFetchStep, type RenderedStep, type ScanFact,
 } from '../engine/job-rules.js';
 import { NEED_ID_CATEGORY, SCHEDULED_CATEGORIES } from '../engine/need-ids.js';
-import { NO_HOOKS_CI_MANAGERS, NO_IMAGE_CATEGORIES, noImageServices, WORKFLOW_LINT_TOOL, workflowLintTools } from '../engine/needs.js';
+import { MINIMUM_CATEGORIES, NO_HOOKS_CI_MANAGERS, NO_IMAGE_CATEGORIES, noImageServices, riskyTriggersOf, WORKFLOW_LINT_EXTRA, WORKFLOW_LINT_TOOL, workflowLintTools } from '../engine/needs.js';
 import { parseImageRef } from '../engine/names.js';
 import { PLATFORM_ACTION_IDS, type PlatformActions } from '../engine/pin.js';
 import { APP_RUNNING_CATEGORIES, renderStarterTestRun } from '../engine/render-cli.js';
@@ -80,6 +80,7 @@ import {
 } from '../engine/render-step.js';
 import { projectScriptFor, repoToolFor, repoToolProblem, type RepoToolStep } from '../engine/reviewed.js';
 import { PLATFORM_USES, RANGE_TOOL } from '../engine/tool-flags.js';
+import { signedImageOwner } from '../engine/signing.js';
 import type { SigningMode } from '../github/signing-mode.js';
 import { signJob, type SignJob } from './central.js';
 import type { Need, NeedCategory, PipelineDraft, ReviewedTool, Service, SkippablePart, StepSpec } from '../types.js';
@@ -119,6 +120,8 @@ export const HOOKS_CI_NOTES: Readonly<Record<string, string>> = Object.freeze({
   'pre-commit': "This repository's hooks are pre-commit's, and pipegen has no reviewed pre-commit runner yet, so CI does not run them: add `pre-commit run --all-files` to your own CI.",
   husky: "husky's hooks are shell scripts, so there is no one command pipegen can run in CI: call the same script from a workflow step yourself.",
 });
+/** GJ-R1 (reviews spec I2, sec M2): the note when a workflow runs on a risky trigger but poutine is not offered (not on the reviewed list). */
+export const POUTINE_NOT_RUN = `A workflow runs on pull_request_target or issue_comment, which takes untrusted input, but ${WORKFLOW_LINT_EXTRA} is not on pipegen's reviewed list for this run, so ${WORKFLOW_LINT_EXTRA} is not run; ${WORKFLOW_LINT_TOOL} still lints the workflows.`;
 /** GJ (DECISIONS #122): the note when zizmor, workflow lint's one tool, is not on the reviewed list. */
 export const WORKFLOW_LINT_SUGGESTION = `Workflow lint runs ${WORKFLOW_LINT_TOOL} only, and ${WORKFLOW_LINT_TOOL} is not on pipegen's reviewed list in this version, so it is only a suggestion: add ${WORKFLOW_LINT_TOOL} to your own CI to lint the workflows.`;
 export const PYPI_PUBLISH_NOTE = 'Publishing to PyPI is not rendered yet: the publish action builds or pulls a container at run time, and pipegen runs only images pinned by digest (S31).';
@@ -158,6 +161,12 @@ export interface AssembledJobs {
   /** G3's sign job for the delivered mode; null for none, the proof, a skipped deploy and attest (until G15). */
   sign: SignJob | null;
   notes: string[];
+  /**
+   * GJ-R1 (reviews sec M4, spec M4): the minimum checks (MINIMUM_CATEGORIES) the jobs leave without a job, each with its plain reason: workflow
+   * lint when zizmor is not on the reviewed list (also in draft.suggestions), a deps check whose only scanner has no lockfile to read. Every
+   * other minimum check is a written job (assembleJobs asserts it). The preview and PIPEGEN.md (G9) show these as not covered.
+   */
+  uncoveredMinimum: { category: string; why: string }[];
 }
 
 export class AssembleError extends Error {}
@@ -451,7 +460,8 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     fail(`The draft plans the check ${where(n)}, but pipegen builds no image for that service (${noImage.get(n.service) as string}), so it has nothing to build, scan or start; pipegen never writes that job.`);
   }
   // GJ (DECISIONS #122): workflow lint is zizmor alone; without it on the reviewed list the check is a suggestion only
-  const lintSuggestion = !deps.reviewed.some((t) => t.id === WORKFLOW_LINT_TOOL && isReviewed(t.candidate));
+  const lintSuggestion = !workflowLintAvailable(deps.reviewed);   // the predicate keyOffers uses too (review spec M4)
+  const uncoveredMinimum = new Map<string, string>();
   const isLint = (n: Pick<Need, 'id' | 'category'>): boolean => (categoryOf(n.id) ?? n.category) === 'workflow-lint';
   // GJ (DECISIONS #122): a pre-commit or husky repository's hooks-ci is a note only (no reviewed runner for those hooks)
   const hooksNote = input.profile.precommit !== null && NO_HOOKS_CI_MANAGERS.has(input.profile.precommit) ? HOOKS_CI_NOTES[input.profile.precommit] : undefined;
@@ -478,6 +488,8 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
   if (stop.length > 0) fail(`pipegen stopped before writing the pipeline: these blocking checks have no tool it can run (${stop.join('; ')}). It never guesses a tool.`);
   input = withLintSteps(input, plan, deps.reviewed);
   checkSteps(input, plan, deps.reviewed);
+  // GJ-R1 (reviews spec I2, sec M2): a risky trigger with poutine not offered: zizmor runs alone, and the note says poutine is not run
+  if (riskyTriggersOf(input.profile).length > 0 && input.needs.some(isLint) && !lintSuggestion && !input.steps.some((st) => isLint({ id: st.needId, category: categoryOf(st.needId) ?? st.needId }) && st.tool.id === WORKFLOW_LINT_EXTRA)) addNote(notes, POUTINE_NOT_RUN);
 
   // 2. the draft as assembled: no skipped part, no v0.2 limit
   const dropped = new Set<Need>();
@@ -486,7 +498,7 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     if (part !== undefined) { dropped.add(n); continue; }
     const limit = limitOf(n);
     if (limit !== undefined && n.layer !== 'pre-commit') { dropped.add(n); addNote(notes, limit); }
-    if (lintSuggestion && isLint(n)) { dropped.add(n); addNote(notes, WORKFLOW_LINT_SUGGESTION); }
+    if (lintSuggestion && isLint(n)) { dropped.add(n); addNote(notes, WORKFLOW_LINT_SUGGESTION); uncoveredMinimum.set('workflow-lint', WORKFLOW_LINT_SUGGESTION); }
     if (hooksNote !== undefined && isHooksCi(n)) { dropped.add(n); addNote(notes, hooksNote); }
   }
   for (const p of input.skipped) addNote(notes, `The part ${show(p.part)} is skipped (--skip), so it has no job.`);
@@ -523,7 +535,11 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
   for (const n of draft.needs) {
     const had = draft.steps.some((s) => s.needId === n.id && s.service === n.service);
     const has = keep.some((s) => s.needId === n.id && s.service === n.service);
-    if (had && !has) gone.add(n);
+    if (had && !has) {
+      gone.add(n);
+      const cat = categoryOf(n.id) ?? n.category;
+      if ((MINIMUM_CATEGORIES as readonly string[]).includes(cat) && n.layer === 'merge') uncoveredMinimum.set(cat, `the ${cat} check ${where(n)} has no step pipegen can run (see the notes), so it has no job`);
+    }
   }
   draft = narrowed({ ...draft, steps: keep }, gone);
   c.draft = draft;
@@ -612,8 +628,13 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     if (n.layer === 'deploy' && (cat === 'signing' || cat === 'attestation') && n.service !== undefined && noImage.has(n.service)) addNote(notes, reportOnlyNote(n.service));
   }
   if (draft.signing !== undefined && draft.signing !== null && Array.isArray(draft.signing.images)) {
-    const images = draft.signing.images.filter((i) => !noImage.has(i?.service));
-    for (const i of draft.signing.images) if (noImage.has(i?.service)) addNote(notes, reportOnlyNote(i.service));
+    // GJ-R1 (sec M3): by slug; an image of no profile service is refused, one of a no-image service is report-only
+    const images = draft.signing.images.filter((i) => {
+      const o = signedImageOwner(draft.profile, draft.capabilities, i?.service);
+      if (!o.ok && !o.reportOnly) fail(`The signing plan signs the image of ${o.why}, so nothing builds it; pipegen never signs it.`);
+      if (!o.ok) addNote(notes, reportOnlyNote(String(i.service)));
+      return o.ok;
+    });
     if (images.length !== draft.signing.images.length) {
       const { signing: _s, ...rest } = draft;
       draft = images.length > 0 ? { ...rest, signing: { ...draft.signing, images } } : rest;
@@ -628,7 +649,16 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     }
   }
   if (deps.mode === 'none' || input.skipped.some((p) => p.part === 'deploy') || imageNone) { const { signing: _s, ...rest } = draft; draft = rest; }
-  return { draft, push, merge, nightly, sign, notes };
+  // GJ-R1 (reviews sec M4, spec M4): every minimum check of the plan is a written job or listed as uncovered, never dropped silently
+  for (const cat of MINIMUM_CATEGORIES) {
+    if (!input.needs.some((n) => n.layer === 'merge' && (categoryOf(n.id) ?? n.category) === cat)) continue;
+    const written = cat === 'gate' ? Object.hasOwn(merge, 'gate') : draft.needs.some((n) => n.layer === 'merge' && (categoryOf(n.id) ?? n.category) === cat && Object.hasOwn(merge, jobIdFor(n.id, n.service)));
+    if (!written && !uncoveredMinimum.has(cat)) fail(`The minimum check ${show(cat)} has no job and no reason pipegen can show; it never drops silently.`);
+  }
+  if (uncoveredMinimum.has('workflow-lint') && !draft.suggestions.some((sg) => sg.name === WORKFLOW_LINT_TOOL)) {
+    draft = { ...draft, suggestions: [...draft.suggestions, { name: WORKFLOW_LINT_TOOL, repo: 'zizmorcore/zizmor', why: WORKFLOW_LINT_SUGGESTION }] };
+  }
+  return { draft, push, merge, nightly, sign, notes, uncoveredMinimum: [...uncoveredMinimum].map(([category, why]) => ({ category, why })) };
 }
 
 function addNote(notes: string[], line: string): void { if (!notes.includes(line)) notes.push(line); }

@@ -154,6 +154,8 @@ async function isOneShot(entry: string, read: Reader, fileSet: ReadonlySet<strin
 export interface KindInput {
   dir: string; read: Reader; fileSet: ReadonlySet<string>; copies: readonly DockerCopy[];
   scripts: Obj; deps: Obj; devDeps: Obj; frameworks: readonly string[]; hasDockerfile: boolean; port: number | undefined; language: string;
+  /** GJ-R1: the folder's container build file when hasDockerfile (Dockerfile, Dockerfile.<x>, <x>.Dockerfile, Containerfile), for the evidence line. */
+  dockerfile?: string;
   /** P57 (I1): every service folder of the repo, so only a service's own Dockerfile can build a folder into its image. */
   serviceDirs: readonly string[];
 }
