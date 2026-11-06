@@ -55,7 +55,7 @@ import { newRateBudget, type RateClock } from '../engine/github-rate.js';
 import { ensureLinters, ensurePinnedBinary, loadPinnedBinaries } from '../engine/linters.js';
 import { floorNeeds, isRunnable, planNeeds, publishedImageServices, type NeedsPlan } from '../engine/needs.js';
 import { platformActions, type PlatformActions } from '../engine/pin.js';
-import type { RefereeReport } from '../engine/referee.js';
+import type { RefereeReport, RunLinters } from '../engine/referee.js';
 import { assertBootstrapAllowed, bootstrapProofsNote, loadReviewed } from '../engine/reviewed.js';
 import { loadQualityBar } from '../engine/quality-bar.js';
 import { loadBaseImages } from '../engine/base-images.js';
@@ -1099,7 +1099,7 @@ export async function judgeBuilt(i: BuildInput, files: Pick<Built, 'assembled' |
  * makeFixReferee (seven arguments, judging AssembledFiles.draft), and the guard on the same batch (a Dockerfile with its .dockerignore);
  * either one refusing is an issue. Never isolatedTestJob.
  */
-export function proofBuildFor(i: BuildInput, facts: BuildFacts, envPlan: EnvPlanFn = NO_ENV_PLAN, deps: { linters?: () => ReturnType<typeof ensureLinters>; guard?: typeof guardCreatedFiles } = {}): ProofBuild {
+export function proofBuildFor(i: BuildInput, facts: BuildFacts, envPlan: EnvPlanFn = NO_ENV_PLAN, deps: { linters?: () => ReturnType<typeof ensureLinters>; guard?: typeof guardCreatedFiles; runLinters?: RunLinters } = {}): ProofBuild {
   const cache = new WeakMap<PipelineDraft, ReturnType<typeof buildFiles>>();
   const rebuild = (d: PipelineDraft): ReturnType<typeof buildFiles> => {
     let b = cache.get(d);
@@ -1109,7 +1109,7 @@ export function proofBuildFor(i: BuildInput, facts: BuildFacts, envPlan: EnvPlan
   const referee = makeFixReferee({
     assemble: async (d) => { const b = await rebuild(d); return { files: b.files, draft: b.assembled.draft }; },
     platform: i.platform, reviewed: i.reviewed, linters: (deps.linters ?? ensureLinters)(), ghToken: i.auth.token ?? null,
-    deps: { vault: i.vault, createdInputs: createdInputsFor(i, facts) },
+    deps: { vault: i.vault, createdInputs: createdInputsFor(i, facts), ...(deps.runLinters === undefined ? {} : { runLinters: deps.runLinters }) },
   });
   const ctx = { root: i.dir, baseTree: facts.baseTree, installRecord: guardRecord(i.prev), repo: 'app' as const, closure: loadReviewedClosure(i.reviewed), vault: i.vault };
   const guard = deps.guard ?? guardCreatedFiles;
