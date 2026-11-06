@@ -152,6 +152,21 @@ describe('G6: pipegen hook secrets', () => {
     expect((seen2[0] as Seen).modes.every((m) => m === 0o600)).toBe(true);
   });
 
+  it('the secrets hook command: an index path that would leave the private folder fails closed (G6-R-sec1)', async () => {
+    const oid = 'a'.repeat(40);
+    for (const path of ['../escape.txt', '/abs.txt', 'a//b', 'a/./b', 'a\\b']) {
+      let wrote = false;
+      const fake = async (args: string[]): Promise<{ code: number; stdout: Buffer }> => {
+        if (args[0] === 'diff') return { code: 0, stdout: Buffer.from(`${path}\0`) };
+        if (args[0] === 'ls-files') return { code: 0, stdout: Buffer.from(`100644 ${oid} 0\t${path}\0`) };
+        wrote = true;
+        return { code: 0, stdout: Buffer.from(`${oid} blob 1\nx\n`) };
+      };
+      expect(await hookSecrets(io(), '/repo', { git: fake, gitleaks: async () => '/g', exec: async () => 0 }), path).toBe(2);
+      expect(wrote, path).toBe(false);
+    }
+  });
+
   it('the secrets hook command: a scanner error, a pinned binary that does not check out, or no git repo blocks the commit (fail closed)', async () => {
     const dir = repo({ 'a.txt': 'a\n' });
     for (const code of [1, 2, 126, -1]) {
