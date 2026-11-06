@@ -959,10 +959,10 @@ describe('G7-R1 spec: the byte-level edit, the key, the network note, the enviro
     await expect(generateCosignKeys(async () => '/opt/cosign', { base: '/', isMemory: () => false })).rejects.not.toThrow(/pipegen finish/);
   });
 
-  it('G7-R1 spec I4: a keyless verify job whose Sigstore hosts are not a reviewed network set gets a release-blocker note', () => {
+  it('G7-R1 spec I4 (G15a: the release blocker is fixed): a keyless verify job reaches the reviewed Sigstore set, so no release-blocker note', () => {
     const kl = world('keyless');
-    expect(kl.a.notes.join('\n')).toMatch(/Your deploys stop for now: pipegen checks a keyless signature with Sigstore[\s\S]*before release/);
-    expect(world('key-env').a.notes.join('\n')).not.toMatch(/Your deploys stop for now/);
+    expect(kl.a.notes.join('\n')).not.toMatch(/Your deploys stop/);
+    expect(world('key-env').a.notes.join('\n')).not.toMatch(/Your deploys stop/);
   });
 
   it('G7-R1 minor: environments of workflows pipegen does not protect keep their branch rules, with a note', async () => {
@@ -1099,10 +1099,13 @@ describe('G7-R2 3-6: what the notes and messages say', () => {
     expect(String(renderHeadCheckStep('main').run)).toContain('if that commit starts a deploy; otherwise push again or re-run all jobs on the newest commit');
   });
   it('G7-R2 6: the Sigstore note names no internal task and is keyed on the hosts the verify job may reach', () => {
-    const note = world('keyless').a.notes.find((n) => /Sigstore/.test(n) && /deploys stop/.test(n)) as string;
-    expect(note).toMatch(/before release/);
-    expect(note).not.toMatch(/\bG\d+\b/);
-    expect(readFileSync('src/layers/assemble.ts', 'utf8')).not.toMatch(/SIGSTORE_SET = 'sigstore'/);
+    // G15a: the note is keyed on the verify job's own egress step, never on a set's name, and says nothing about a later release
+    const src = readFileSync('src/layers/assemble.ts', 'utf8');
+    expect(src).not.toMatch(/SIGSTORE_SET = 'sigstore'/);
+    expect(src).toMatch(/SIGSTORE_HOSTS\.some\(\(h\) => !egressHostsOf\(verify as Job\)\.has\(h\)\)/);
+    const note = /addNote\(notes, '(Your deploys stop[^']*)'\)/.exec(src)?.[1] as string;
+    expect(note).toBeDefined();
+    expect(note).not.toMatch(/\bG\d+\b|before release|adds them/);
   });
 });
 

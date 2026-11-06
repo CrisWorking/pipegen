@@ -64,8 +64,8 @@ import { FIND_RUN_STEP_ID, renderDigestStep, renderHeadCheckStep, renderPublishD
 import { strongReason } from './deploy-gating.js';
 import { ARCHIVE_TOOL_IDS, imageBuildTag, renderImageArchiveScan, renderImageBuild } from './image-handoff.js';
 import { dastStartOf, renderDastRun, renderDastScrub } from './dast-handoff.js';
-import { SHARED_CDN_SETS } from './egress.js';
-import { EGRESS_DOMAIN_SETS } from './egress-sets.js';
+import { KEYLESS_VERIFY_SETS, SHARED_CDN_SETS } from './egress.js';
+import { EGRESS_DOMAIN_SETS, SIGSTORE_SET } from './egress-sets.js';
 import { allowedDomainsProblem, ARGV_POLICIES, BULLFROG_USES, CACHE_LOCKS, GATE_OPTIONAL_UPLOADS, PLAIN_REL_RE, PLATFORM_USES, RANGE_TOOL, RENDERER_INPUTS, rendererInputProblems, SCRUB_SECRET, uploadIfNoFiles } from './tool-flags.js';
 
 // ---------- the report ----------
@@ -1164,6 +1164,13 @@ function judgeVerifyJob(fc: FileCtx, where: string, j: Obj, judged: readonly Jud
     const k = plan === undefined || plan === null || !Array.isArray(plan.images) ? -1 : plan.images.findIndex((i) => { try { return slug(String(i?.service)) === s; } catch { return false; } });
     const verify = k < 0 ? -1 : at(`${VERIFY_SOURCE}:${k}`);
     if (verify < 0 || verify < digest) bad(`must check the signature of the image of ${show(service)} after its digest step: this repository signs in mode ${mode}, so a deploy of an image pipegen did not sign (or one verified in mode none) is never let through.`);
+    // G15a (carry A2): keyless verification reads Sigstore's trusted root and log, so the job's egress step must reach them (else it fails
+    // closed at run time and every deploy stops)
+    if (mode === 'keyless') {
+      const egress = judged[0]?.kind === 'harden' ? String(judged[0].step.with?.['allowed-domains'] ?? '').split('\n').map((x) => x.trim()) : [];
+      const missing = KEYLESS_VERIFY_HOSTS.filter((h) => !egress.includes(h));
+      if (judged[0]?.kind !== 'harden' || missing.length > 0) bad(`checks a keyless signature, so it starts with its egress step and that step reaches Sigstore's hosts (${KEYLESS_VERIFY_HOSTS.join(', ')}); ${judged[0]?.kind !== 'harden' ? 'it has no egress step first' : `it misses ${missing.join(', ')}`}.`);
+    }
   }
   // nothing of the verify job's own may come before the find-run step but its egress block
   judged.slice(0, find).forEach((x, i) => { if (x.kind !== 'harden') bad(`step ${i + 1} comes before its find-run step; only the egress block may.`); });
@@ -1311,18 +1318,29 @@ function judgeDastJobs(fc: FileCtx, id: string, where: string, j: Obj, judged: r
 }
 const safeRunId = (service: string): string => { try { return dastRunJobId(service); } catch (e) { if (e instanceof ArtifactNameError) return '?'; throw e; } };
 
+/** G15a: the hosts of the Sigstore set (the keyless verify job's, KEYLESS_VERIFY_SETS). */
+const SIGSTORE_HOSTS: ReadonlySet<string> = new Set(EGRESS_DOMAIN_SETS[SIGSTORE_SET]);
+const KEYLESS_VERIFY_HOSTS: readonly string[] = KEYLESS_VERIFY_SETS.flatMap((x) => EGRESS_DOMAIN_SETS[x]);
 /** G4-R1 (E3-R3): the hosts of the shared-CDN egress sets (anyone can serve from them). */
 const SHARED_CDN_HOSTS: ReadonlySet<string> = new Set([...SHARED_CDN_SETS].flatMap((s) => EGRESS_DOMAIN_SETS[s]));
 /**
  * G4-R1 (E0d, P-3 as a referee backstop): every job pipegen writes with steps starts with exactly one reviewed egress step (Bullfrog, its
- * template judged like any action), except the keyless sign job (its Sigstore and OIDC hosts are in no reviewed set; documented in
- * central.ts). E3-R3: a job whose steps name a user secret (a declared app secret, not pipegen's own) has no shared-CDN set in its egress list.
+ * template judged like any action), except the keyless sign job (its per-run OIDC token host can not be listed exactly; threat model T52,
+ * documented in central.ts). E3-R3: a job whose steps name a user secret (a declared app secret, not pipegen's own) has no shared-CDN set in
+ * its egress list. G15a: Sigstore's hosts only in the keyless verify job (judgeVerifyJob requires them there).
  */
 function judgeEgress(fc: FileCtx, id: string, where: string, j: Obj, judged: readonly Judged[]): void {
   const bad = issueFor(fc);
   const keylessSign = id === 'sign' && fc.draft.signing?.mode === 'keyless' && judged.some((x) => x.kind === 'sign' && typeof x.step.id === 'string' && SIGN_STEP_ID_RE.test(x.step.id) && ![...x.secrets].some((n) => SIGNING_KEY_SECRETS.has(n)));
   const hardens = judged.filter((x) => x.kind === 'harden');
   if (!keylessSign && (judged[0]?.kind !== 'harden' || hardens.length !== 1)) bad('permissions', `${where} must start with pipegen's egress step (the reviewed Bullfrog block, once, first): without it the job's network is open.`);
+  // G15a (carries A2, A3): the Sigstore hosts only in the keyless verify job (mode re-derived from the repository, never the draft's plan)
+  const keylessVerify = id === 'pipegen-verify' && signingMode(fc.draft.profile, fc.draft.capabilities) === 'keyless';
+  for (const h of hardens) {
+    const hosts = String(h.step.with?.['allowed-domains'] ?? '').split('\n').map((x) => x.trim());
+    const sig = hosts.filter((x) => SIGSTORE_HOSTS.has(x));
+    if (sig.length > 0 && !keylessVerify) bad('permissions', `${where} opens Sigstore's hosts (${sig.map((x) => show(x)).join(', ')}), which only the keyless verify job pipegen-verify reaches: no other job reads Sigstore, and anyone can write to its log.`);
+  }
   const userSecret = judged.some((x) => [...x.secrets].some((n) => fc.ex.declared.has(n) && !PIPEGEN_SECRETS.includes(n)));
   if (!userSecret) return;
   for (const h of hardens) {

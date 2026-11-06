@@ -682,7 +682,7 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
   if (suggestions.length !== draft.suggestions.length) draft = { ...draft, suggestions };
   // G7 (carry G4→G7, ruling S31's pattern): the deploy layer's sbom and egress needs have no job of pipegen's in v0.2. pipegen never changes
   // the user's own deploy jobs, so their network is not locked (pipegen's image-publish and verify jobs start with the egress block; the
-  // keyless sign job has none until Sigstore's hosts are a reviewed set, G15), and no reviewed job makes the published image's SBOM yet.
+  // keyless and attest sign jobs have none, threat model T52: the per-run OIDC token host), and no reviewed job makes the published image's SBOM yet.
   // Neither is counted as covered: each leaves the draft with a plain note.
   const release = new Set(draft.needs.filter((n) => n.layer === 'deploy' && RELEASE_ONLY_NOTES.has(categoryOf(n.id) ?? n.category)));
   for (const n of release) addNote(notes, RELEASE_ONLY_NOTES.get(categoryOf(n.id) ?? n.category) as string);
@@ -710,7 +710,7 @@ function withLintSteps(draft: PipelineDraft, plan: JobsPlan, reviewed: readonly 
 /** G7: the deploy-layer needs pipegen writes no job for in v0.2, each with its note (and PIPEGEN.md line, G9): never counted as covered. */
 export const RELEASE_ONLY_NOTES: ReadonlyMap<string, string> = new Map([
   ['sbom', 'The SBOM of the published image is not made yet: no reviewed job of pipegen\'s builds it after the image is published (v0.2). The image checks of pull requests still run.'],
-  ['egress', 'Your own deploy jobs keep their open network: pipegen never changes them (it only adds the pipegen-verify job they wait for). pipegen\'s own image publish and verify jobs run behind the network lock; a keyless signing job does not (Sigstore\'s hosts are not in a reviewed network set yet).'],
+  ['egress', 'Your own deploy jobs keep their open network: pipegen never changes them (it only adds the pipegen-verify job they wait for). pipegen\'s own image publish and verify jobs run behind the network lock; a keyless or attest signing job does not, because it needs a per-run token host that can not be listed exactly (only pipegen\'s own steps run there).'],
 ]);
 
 /** GJ: the note (and the PIPEGEN.md line, G9) of a signing or attestation need on a service that builds no image. */

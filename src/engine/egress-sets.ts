@@ -4,8 +4,14 @@
 export const REVIEWED_EGRESS_LABELS = Object.freeze(['github-core', 'npm', 'pypi', 'dockerhub', 'ghcr'] as const);
 /** The exact-host sets added by ruling E3-R1 (labels of the reviewed bullfrog choices since E9). */
 export const E3_EGRESS_SETS = Object.freeze(['github-releases', 'trivy-db', 'osv'] as const);
-/** A set name: one of the reviewed labels or an E3-R1 set. */
-export type EgressSet = typeof REVIEWED_EGRESS_LABELS[number] | typeof E3_EGRESS_SETS[number];
+/**
+ * G15a (carries A1-A3, the release blocker): the mode-scoped Sigstore set. It is in no tool's sets (egress.ts egressSetsForTool): only the
+ * keyless verify job's egress step names it (egress.ts KEYLESS_VERIFY_SETS), and the referee refuses its hosts in any other job.
+ */
+export const SIGSTORE_SET = 'sigstore';
+export const G15_EGRESS_SETS = Object.freeze([SIGSTORE_SET] as const);
+/** A set name: one of the reviewed labels, an E3-R1 set or the G15 Sigstore set. */
+export type EgressSet = typeof REVIEWED_EGRESS_LABELS[number] | typeof E3_EGRESS_SETS[number] | typeof G15_EGRESS_SETS[number];
 
 /**
  * Reviewed by Claude (delegated by Cristiano, DECISIONS #105). Every host is an exact lowercase hostname: no wildcard, scheme,
@@ -40,7 +46,21 @@ export type EgressSet = typeof REVIEWED_EGRESS_LABELS[number] | typeof E3_EGRESS
  *   not known without a live run: if it differs, the GHCR fallback (the ghcr set) carries the download.
  * - osv: api.osv.dev: osv-scanner sends package names and versions there (tool catalogue l. 176, 272;
  *   raw/code-security.md l. 74).
- * Not added: Sigstore hosts (the harness signs key-based with --tlog-upload=false, so none is needed); actions/attest
+ * G15a (carries A1-A3), sourced offline from the pinned cosign itself: the reviewed binary cosign v3.1.3 (cosign-linux-amd64, sha256
+ * 4629c757..., the entry's pin), whose Go build info names its modules (sigstore-go v1.2.2, sigstore v1.10.8), disassembled with
+ * `go tool objdump`; each host below is the string a call site loads, with that call site's upstream file and line. Mode-scoped: only the
+ * keyless verify job gets it (egress.ts KEYLESS_VERIFY_SETS); it is in SHARED_CDN_SETS (anyone can write to the log), never in a tool's sets.
+ * - sigstore:
+ *   tuf-repo-cdn.sigstore.dev: Sigstore's TUF repository, where `cosign verify` reads its trusted root: cosign v3.1.3
+ *   cmd/cosign/cli/verify/common.go:191 (SetTrustedMaterial calls cosign.TrustedRoot), pkg/cosign/tuf.go:84 (setTUFOpts, the default
+ *   mirror), sigstore-go v1.2.2 pkg/tuf/options.go:142 (DefaultOptions, DefaultMirror); the live checklist verifies it under Bullfrog.
+ *   rekor.sigstore.dev: the public transparency log: cosign v3.1.3 cmd/cosign/cli/verify/common.go:134 (SetLegacyClientsAndKeys, called
+ *   by VerifyCommand.Exec, makes the Rekor client), the URL's default in cmd/cosign/cli/options/rekor.go:32-35 (RekorOptions.AddFlags).
+ *   A signature that carries its log entry verifies offline, so whether verify really calls it is not known without a run: the live
+ *   checklist verifies it (kept per the controller's start list, review-G4.md l. 77).
+ *   Left out: fulcio.sigstore.dev (cmd/cosign/cli/options/fulcio.go:35, signcommon/common.go:435: signing only). The keyless sign job keeps
+ *   its documented no-block exception (threat model T52): it also needs the per-run OIDC token host, which can not be listed exactly.
+ * Not added: Sigstore hosts for the proof harness (it signs key-based with --tlog-upload=false, so none is needed); actions/attest
  * (its OIDC token URL is a per-run actions.githubusercontent.com host that can't be listed exactly: attestation stays
  * not-proven under Bullfrog); semgrep, nuclei and ZAP need none beyond github-core and their image registry (their rules
  * come from github.com archives; -duc/-ni/-silent/--metrics=off turn the other calls off).
@@ -59,5 +79,6 @@ export const EGRESS_DOMAIN_SETS: Readonly<Record<EgressSet, readonly string[]>> 
   'github-releases': Object.freeze(['release-assets.githubusercontent.com']),
   'trivy-db': Object.freeze(['mirror.gcr.io']),
   osv: Object.freeze(['api.osv.dev']),
+  [SIGSTORE_SET]: Object.freeze(['rekor.sigstore.dev', 'tuf-repo-cdn.sigstore.dev']),
 });
 

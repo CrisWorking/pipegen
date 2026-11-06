@@ -541,7 +541,7 @@ describe('doc: carries (lines present when they apply, absent when they do not)'
     expect(a).toMatch(/`concurrency` group, so runs never overlap/);
     expect(a).toMatch(/closed \(even a stale bot running as the github-actions bot\) is reopened by design|any bot closed \(even a stale bot running as the github-actions bot\) is reopened by design/);
     // key-env: the signing lines (the keyless line is absent)
-    expect(a).not.toMatch(/Keyless signing runs without a network block/);
+    expect(a).not.toMatch(/keyless signing job runs without a network block/);
     // Dependabot central (33)
     expect(a).toMatch(/Dependabot does not bump the central commit/);
     expect(a).toMatch(/uses Renovate keeps it and gets no Dependabot file/);
@@ -558,7 +558,7 @@ describe('doc: carries (lines present when they apply, absent when they do not)'
     expect(b).toMatch(/It does not cancel the pull request's own run/);
     expect(a).not.toMatch(/anyone can submit a review/);
     // keyless signing without a network block (21)
-    expect(docOf(shapeB({ signing: { mode: 'keyless', images: [] } }))).toMatch(/Keyless signing runs without a network block for now/);
+    expect(docOf(shapeB({ signing: { mode: 'keyless', images: [] } }))).toMatch(/The keyless signing job runs without a network block: it needs a per-run token host/);
     // S28 (42)
     for (const t of [a, b]) expect(t).toMatch(/pipegen v0\.2 is for repositories owned by CrisWorking\. A public repository uses the gate in the normal way/);
     expect(a).toMatch(/This repository is private, so its checks run from central workflows/);

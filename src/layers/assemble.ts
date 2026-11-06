@@ -51,8 +51,8 @@ import { RenderError } from '../engine/render-error.js';
 import { renderFindRunStep, stepsToYaml } from '../engine/render-step.js';
 import { FIND_RUN_STEP_ID, renderDigestStep, renderHeadCheckStep } from '../engine/deploy-steps.js';
 import { slug } from '../engine/artifact-names.js';
-import { egressSetsForTool } from '../engine/egress.js';
-import { EGRESS_DOMAIN_SETS, type EgressSet } from '../engine/egress-sets.js';
+import { egressSetsForTool, KEYLESS_VERIFY_SETS } from '../engine/egress.js';
+import type { EgressSet } from '../engine/egress-sets.js';
 import { publishedImageServices } from '../engine/needs.js';
 import { COSIGN_ID, GH_ID, renderVerifySteps, type SignedImage } from '../engine/signing.js';
 import type { BaseImage } from '../engine/base-images.js';
@@ -112,10 +112,15 @@ export function verifyPermissions(draft: PipelineDraft): Record<string, 'read'> 
   return out;
 }
 /**
- * G7-R1 spec I4, G7-R2 6: the hosts keyless verification reaches (Sigstore's TUF root and its transparency log). The note below is keyed on
- * whether the verify job's egress sets (the cosign entry's, plus github-core and ghcr) reach them, not on a set's name (G15 adds the set).
+ * G7-R1 spec I4, G7-R2 6, G15a: the hosts keyless verification reaches (Sigstore's TUF root and its transparency log). The note below is keyed
+ * on whether the verify job's own egress step reaches them, not on a set's name.
  */
 const SIGSTORE_HOSTS: readonly string[] = ['tuf-repo-cdn.sigstore.dev', 'rekor.sigstore.dev'];
+/** The hosts a job's egress step (the reviewed Bullfrog block) lets through: its allowed-domains, one per line; none without the step. */
+function egressHostsOf(j: Job): Set<string> {
+  const h = j.steps.find((x) => typeof x.uses === 'string' && x.with?.['allowed-domains'] !== undefined && /^bullfrogsec\/bullfrog@/i.test(x.uses));
+  return new Set(String(h?.with?.['allowed-domains'] ?? '').split('\n').filter((x) => x !== ''));
+}
 /** The job ids pipegen.yml reserves for its own jobs (a deploy job may not take one). */
 const RESERVED_IDS: ReadonlySet<string> = new Set([MERGE_CALLER_JOB, SIGN_JOB_ID, VERIFY_JOB_ID, PUSH_CALLER_JOB, NIGHTLY_CALLER_JOB, PR_CHECK_JOB, 'gate']);
 
@@ -413,13 +418,11 @@ export function assemble(input: PipelineDraft, opts: AssembleOpts): AssembledFil
     const waitMinutes = runMinutes + VERIFY_GRACE_MINUTES;
     if (waitMinutes + VERIFY_MARGIN_MINUTES > MAX_JOB_MINUTES) fail(`The gated run can take ${runMinutes} minutes, longer than the verify job can wait (a job runs at most ${MAX_JOB_MINUTES} minutes).`);
     verify = verifyJob(draft, { gate: opts.gate, reviewed: opts.reviewed, platform: opts.platform, waitMinutes });
-    // G7-R1 spec I4 (a release blocker until G15): keyless verification reads Sigstore's hosts, which no reviewed network set holds yet, so
-    // under the network lock the verify job fails closed and every deploy of the image stops
+    // G7-R1 spec I4, re-keyed in G15a (carry A2): keyless verification reads Sigstore's hosts. The note is keyed on the hosts the verify job
+    // really gets (its egress step's allowed-domains), so it fires only if a later change leaves them out of the job's reach
     const keyless = draft.signing?.mode === 'keyless' && publishedImageServices(draft.profile, draft.capabilities).length > 0;
-    const cosign = opts.reviewed.find((t) => t.id === COSIGN_ID);
-    const reach = new Set<string>(cosign === undefined ? [] : ['github-core', 'ghcr', ...egressSetsForTool(cosign)].flatMap((x) => EGRESS_DOMAIN_SETS[x as EgressSet] ?? []));
-    if (keyless && SIGSTORE_HOSTS.some((h) => !reach.has(h))) {
-      addNote(notes, 'Your deploys stop for now: pipegen checks a keyless signature with Sigstore, whose hosts are not in a reviewed network set yet, so the verify job can not reach them behind the network lock and fails. pipegen adds them before release; until then a deploy of this image does not pass pipegen-verify.');
+    if (keyless && SIGSTORE_HOSTS.some((h) => !egressHostsOf(verify as Job).has(h))) {
+      addNote(notes, 'Your deploys stop: pipegen checks a keyless signature with Sigstore, whose hosts the verify job can not reach behind the network lock, so the verify job fails and a deploy of this image does not pass pipegen-verify.');
     }
   }
 
@@ -500,6 +503,8 @@ export function verifyTail(draft: PipelineDraft, reviewed: readonly ReviewedTool
     steps.push(...guard(() => renderVerifySteps(tool as ReviewedTool, draft, image as SignedImage)));
     for (const x of egressSetsForTool(tool as ReviewedTool)) sets.add(x);
     sets.add('ghcr');
+    // G15a (carries A2, A3): keyless verification reads Sigstore's trusted root and log; only this job gets that set (mode-scoped)
+    if (plan.mode === 'keyless') for (const x of KEYLESS_VERIFY_SETS) sets.add(x);
   }
   return { steps, sets: [...sets].sort() };
 }

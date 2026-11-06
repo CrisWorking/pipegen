@@ -385,14 +385,14 @@ tools:
         egress-policy: "block"
         dns-policy: "allowed-domains-only"
         enable-sudo: "false"
-    # allowed-domains: the labels of the reviewed host sets (src/engine/egress-sets.ts; E3-R1 added github-releases, trivy-db, osv). The
+    # allowed-domains: the labels of the reviewed host sets (src/engine/egress-sets.ts; E3-R1 added github-releases, trivy-db, osv; G15a sigstore). The
     # value a step carries is the sorted union of the chosen sets' hosts with github-core, one per line (tool-flags.ts allowedDomainsProblem, E9).
     choices:
-      allowed-domains: ["github-core", "npm", "pypi", "dockerhub", "ghcr", "github-releases", "trivy-db", "osv"]
+      allowed-domains: ["github-core", "npm", "pypi", "dockerhub", "ghcr", "github-releases", "trivy-db", "osv", "sigstore"]
       allowed-ips: ["172.16.0.0/12"]
     configFiles: []
     reviewedBy: Claude delegated DECISIONS 105
-    reviewedAt: "2026-11-04"
+    reviewedAt: "2026-11-06"
     proofs: 0
 
   # The registry:2 image, a local registry service for image builds in proof jobs (no scan output).
