@@ -102,6 +102,13 @@ describe('V2: the revert engine', () => {
     // an anchor in a touched job: manual, never cut
     const anchored = changed.replace('    needs: [lint, pipegen-verify]', '    needs: &n [lint, pipegen-verify]');
     expect(kind(revertEdit(edit, cur(anchored), blob, CTX))).toBe('manual');
+    // a comment the owner put on pipegen's needs line, or spacing changed inside pipegen's flow entry: the owner's bytes, manual
+    expect(kind(revertEdit(edit, cur(changed.replace('      - pipegen-verify\n', '      - pipegen-verify   # keep\n')), blob, CTX))).toBe('manual');
+    expect(kind(revertEdit(edit, cur(changed.replace('[lint, build, pipegen-verify]', '[lint, build,  pipegen-verify]')), blob, CTX))).toBe('manual');
+    // the owner cut lint down to its needs line alone: taking that line out would leave the job empty, which is not the owner's file minus pipegen's part
+    const bare = changed.replace('  lint:\n    needs: [pipegen-verify]\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm run lint\n', '  lint:\n    needs: [pipegen-verify]\n');
+    expect(bare).not.toBe(changed);
+    expect(kind(revertEdit(edit, cur(bare), blob, CTX))).toBe('manual');
     // a comment the owner put inside pipegen's job is the owner's text: manual
     const commented = changed.replace('runs-on: ubuntu-24.04', 'runs-on: ubuntu-24.04  # mine');
     expect(kind(revertEdit(edit, cur(commented), blob, CTX))).toBe('manual');
@@ -169,6 +176,8 @@ describe('V2: the revert engine', () => {
       expect(r.kind).toBe('manual');
       expect(r).not.toHaveProperty('remove');
     }
+    const rules = textEdit('codeowners', 'CODEOWNERS', original, `${original}a @x\nb @y\nc @z\n`);
+    expect(kind(revertEdit(rules, cur(`q @q\n${original}a @x\nb @y\nc @z\n`), blob))).toBe('manual');
     // codeowners at a path no rule claims
     const block = codeownersBlock(['a.yml'], ['@o']);
     expect(kind(revertEdit(textEdit('codeowners', 'src/CODEOWNERS', original, codeownersFile(original, block)), cur(codeownersFile(original, block)), blob))).toBe('manual');
@@ -201,6 +210,9 @@ describe('V2: the revert engine', () => {
     // the original blob can't be read, or is not the blob of that sha: no restore (the strip still takes pipegen's text out exactly)
     const lying = (s: string): string | null => (s === e.originalSha ? 'something else\n' : blob(s));
     expect(revertEdit(e, cur(codeownersFile(original, block)), lying)).toEqual({ kind: 'strip', text: original });
+    // a record whose originalSha names another blob restores nothing of it: the current text is not that blob plus pipegen's part
+    const other: TextEdit = { ...e, originalSha: put('* @mallory\n') };
+    expect(revertEdit(other, cur(codeownersFile(original, block)), blob)).toEqual({ kind: 'strip', text: original });
     // the current text is not the blob of the sha the caller gave: manual
     expect(kind(revertEdit(e, { text: codeownersFile(original, block), sha: gitBlobSha('x') }, blob))).toBe('manual');
     // the current sha is not the last one pipegen wrote: never a restore
@@ -209,6 +221,8 @@ describe('V2: the revert engine', () => {
     // verify-job: the owner's original workflow back, byte for byte
     const { edit, written } = verifyEdit(USER_WF, ['build', 'deploy'], ['build']);
     expect(revertEdit(edit, cur(written), blob, CTX)).toEqual({ kind: 'restore', text: USER_WF });
+    const otherWf: VerifyEdit = { ...edit, originalSha: put(USER_WF.replace('./deploy.sh', './steal.sh')) };
+    expect(kind(revertEdit(otherWf, cur(written), blob, CTX))).toBe('strip');
     expect(kind(revertEdit(edit, cur(written), (s) => (s === edit.originalSha ? null : blob(s)), CTX))).toBe('strip');
   });
 
@@ -234,6 +248,8 @@ describe('V2: the revert engine', () => {
     bothManual(revertPair({ edit: json, current: cur(pjNew) }, { edit: { ...lk, json: 'web/package.json' }, current: cur(lockNew) }, blob));
     // the package.json edit doesn't read as the recorded one: manual
     bothManual(revertPair({ edit: { ...json, add: { other: '1.0.0' } }, current: cur(pjNew) }, { edit: lk, current: cur(lockNew) }, blob));
+    // a blob reader that hands back another text for a sha: never restored
+    bothManual(revertPair({ edit: json, current: cur(pjNew) }, { edit: lk, current: cur(lockNew) }, (s) => (s === lk.originalSha ? '{}\n' : blob(s))));
     // the lock's original can't be read: manual (never the package.json alone)
     bothManual(revertPair({ edit: json, current: cur(pjNew) }, { edit: lk, current: cur(lockNew) }, (s) => (s === lk.originalSha ? null : blob(s))));
     // a recorded lock that isn't given: manual
@@ -319,6 +335,9 @@ describe('V2: the revert engine', () => {
     expect(revertEdit(textEdit('hooks', '.pre-commit-config.yaml', null, `repos:\n${pre}`), cur(`repos:\n${pre}`), blob)).toEqual({ kind: 'delete' });
     const dep = `version: 2\nupdates:\n${dependabotEntryText({ profile: { private: false } } as unknown as PipelineDraft)}`;
     expect(revertEdit(textEdit('dependabot', '.github/dependabot.yaml', null, dep), cur(dep), blob)).toEqual({ kind: 'delete' });
+    // the last version pipegen wrote is not the recorded text alone (a record that doesn't match the file): manual, never deleted
+    const grown = `${block}x @y\n`;
+    expect(kind(revertEdit({ ...e, writtenShas: [put(grown)] }, cur(grown), blob))).toBe('manual');
     // the current sha is an older one pipegen wrote: changed, manual
     expect(kind(revertEdit({ ...e, writtenShas: [gitBlobSha(block), gitBlobSha('x')] }, cur(block), blob))).toBe('manual');
   });
