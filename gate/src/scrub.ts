@@ -31,7 +31,7 @@ import { CONTENT_FORMS, fingerprintAll, isQuotingFinding, keyId, keyProblem, mas
 import { fail, getOwn, isObj, MAX_RAW_BYTES, ReadError, readJson, type ParsedFinding, type ParseResult } from './parse-common.js';
 import { MAX_ADVISORY_IDS, SARIF_TOOLS, parseSarifText } from './sarif.js';
 import { applyStage, readStage, StageError, STAGED_NAME_RE, type Stage, type StagedFindings } from './stage.js';
-import { applyRange, isRangeSkipped, RANGE_FACTS_FILE, SKIP_NOTES, SKIP_REASONS, RangeFactsError, readRangeFacts, SECRETS_RANGE_ARTIFACT, SECRETS_RANGE_TOOL, type RangeRun } from './range.js';
+import { applyRange, isRangeSkipped, RANGE_FACTS_FILE, SKIP_NOTES, SKIP_REASONS, RangeFactsError, readRangeFacts, SECRETS_HISTORY_ARTIFACT, SECRETS_RANGE_ARTIFACT, SECRETS_RANGE_TOOL, type RangeRun } from './range.js';
 import { ZAP_TOOL, parseZapJsonText } from './zap.js';
 import { parseTrivyLicenceJsonText, TRIVY_LICENCE_TOOL } from './trivy-licence.js';
 
@@ -60,7 +60,8 @@ export interface ScrubOptions {
    * C9: the facts of a commit-range scan (gate/src/range.ts), for the result of SECRETS_RANGE_ARTIFACT only: the SARIF of betterleaks in `git`
    * mode, every finding with its commit; the two canary commits are required and taken out. No stage folder, and no region of the checkout is
    * read (a secret of the range is in a commit, not in HEAD's files): its secrets take the line form. Facts that say the event had no range
-   * (fix round 1) give a result with no finding, marked `pipegenRangeSkipped`, and the raw file is not read.
+   * (fix round 1) give a result with no finding, marked `pipegenRangeSkipped`, and the raw file is not read. G15a round 4 (b1): the result of
+   * SECRETS_HISTORY_ARTIFACT (the nightly full-history scan) reads the history form only, the same way.
    */
   range?: RangeRun;
 }
@@ -530,10 +531,11 @@ export function scrubFile(opts: ScrubFileOptions): ScrubFileResult {
   // C9: the commit-range scan reads the history, not a stage folder: its coverage is proven by its count (the scan step) and its canary commits,
   // from the facts the step wrote beside its raw result
   let range: RangeRun | undefined;
-  if (opts.artifact === SECRETS_RANGE_ARTIFACT) {
+  // G15a round 4 (b1): the nightly full-history scan is the same step with no base; its artifact reads only the history form of the facts
+  if (opts.artifact === SECRETS_RANGE_ARTIFACT || opts.artifact === SECRETS_HISTORY_ARTIFACT) {
     if (opts.stage !== undefined) return fail1('the commit-range scan has no stage folder');
     try {
-      range = readRangeFacts(join(dirname(opts.raw), RANGE_FACTS_FILE));
+      range = readRangeFacts(join(dirname(opts.raw), RANGE_FACTS_FILE), opts.artifact === SECRETS_HISTORY_ARTIFACT ? 'history' : 'range');
     } catch (e) {
       return fail1(e instanceof RangeFactsError ? e.message : 'the commit-range facts could not be read');
     }
