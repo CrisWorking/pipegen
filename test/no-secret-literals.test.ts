@@ -39,9 +39,15 @@ describe('fixtures', () => {
       // Real scanner output (test/fixtures/sarif, C1a) holds two benign strings that look like secrets to redact(): osv-scanner's
       // empty `redactionTokens` array and trivy's already-masked match line. Nothing else is excused.
       const text = buf.toString('utf8').replaceAll('"redactionTokens": [],', '').replaceAll('GITHUB_TOKEN=****************************************', 'masked match');
-      const scanned = f.startsWith('test/fixtures/scorecard/') ? SCORECARD_PROSE.reduce((t, x) => t.replaceAll(x, 'scorecard prose'), text.replaceAll('\\n', '\n')) : text;
+      // G15a round 5: the real ZAP reports (test/fixtures/zap) carry ZAP's own HTML help text (an alert's `solution`) as one JSON string
+      // over 4 KB; split it at its paragraph ends so every piece is still scanned (each under 4 KB). Nothing is excused.
+      const scanned = f.startsWith('test/fixtures/scorecard/') ? SCORECARD_PROSE.reduce((t, x) => t.replaceAll(x, 'scorecard prose'), text.replaceAll('\\n', '\n'))
+        : f.startsWith('test/fixtures/zap/') ? text.replaceAll('</p>', '</p>\n') : text;
       if (scanned !== text) expect(Math.max(...scanned.split('\n').map((l) => l.length)), f).toBeLessThan(4096);
-      expect(redact(scanned) === scanned, `a redact pattern matches ${f}`).toBe(true);
+      // ZAP's reports put `"@name": "http://<host>:<port>",` right before `"@host": …` on the next line, and redact() reads a URL's
+      // authority across a line break up to that '@' (over-redaction, the safe side); so the ZAP reports are scanned line by line
+      const pieces = f.startsWith('test/fixtures/zap/') ? scanned.split('\n') : [scanned];
+      for (const piece of pieces) expect(redact(piece) === piece, `a redact pattern matches ${f}`).toBe(true);
     }
   });
 
