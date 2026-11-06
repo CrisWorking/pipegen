@@ -16,7 +16,7 @@ import { PromptCancelledError, type Prompter } from '../src/cli/io.js';
 import { deliver, deliverCentral, PART_ORDER, planDelivery, previewText, SETUP_BRANCH, type DeliveryInput, type DeliverDeps, type SigningKey } from '../src/deliver/deliver.js';
 import { DeliverError, ghRead, ghWrite } from '../src/deliver/git-data.js';
 import { confirmView, TYPED_VIEW_FIELDS } from '../src/deliver/trust.js';
-import { InstallRecordSchema, readRecord, recordHash, recordMarker, recordPath, writeRecord } from '../src/deliver/record.js';
+import { InstallRecordSchema, readRecord, recordFileText, recordHash, recordMarker, recordPath, writeLocalRecord, writeRecord } from '../src/deliver/record.js';
 import { COMPAT_PREFIX, HARNESS_PATH } from '../src/proof/harness.js';
 import type { LockPlan } from '../src/layers/locks.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
@@ -334,6 +334,24 @@ describe('G10 delivery: central and the pin (S26)', () => {
     expect(w.g.repo('o/pipelines').pulls.filter((x) => x.state === 'open').length).toBe(1);   // the same central PR, updated, never a second one
     const branchFiles = w.g.filesAt('o/pipelines', w.g.head('o/pipelines', `pipegen/update-${centralProjectName('r')}`));
     expect(branchFiles.get('.github/workflows/r--merge.yml')).toContain('# v2');
+  });
+
+  it('G12-R1 m1: a re-run keeps the ownerEdited marker on files and edits (sticky, like adopted)', async () => {
+    const w = world();
+    const first = await firstRun(w);
+    const r = await record(w) as NonNullable<Awaited<ReturnType<typeof record>>>;
+    // pipegen update merged into the owner's PIPEGEN.md and deploy.yml earlier (as recorded)
+    const marked = { ...r, files: r.files.map((f) => (f.path === 'PIPEGEN.md' ? { ...f, ownerEdited: true as const } : f)), edits: r.edits.map((e) => (e.path === '.github/workflows/deploy.yml' ? { ...e, ownerEdited: true as const } : e)) };
+    w.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: recordFileText(marked) }, 'record');
+    await writeLocalRecord({ owner: 'o', repo: 'r' }, { recordHash: recordHash(marked), setupPr: first.res.prNumber, updatedAt: '2026-11-05T12:00:00Z' }, { home: w.home, env: {} });
+    const v2 = new SecretVault();
+    v2.set(KEY, KEY_VALUE);
+    const p = profile();
+    await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w));
+    await deliver(w.g.octokit(), p, planDelivery(input(p, first.pin)), v2, deps(w));
+    const r2 = await record(w, `pipegen/update-${centralProjectName('r')}`) ?? await record(w);
+    expect(r2?.files.find((f) => f.path === 'PIPEGEN.md')?.ownerEdited).toBe(true);
+    expect(r2?.edits.find((e) => e.path === '.github/workflows/deploy.yml')?.ownerEdited).toBe(true);
   });
 
   it('deliver: the required workflow and the central CODEOWNERS go with the record commit, never into the pinned commit', async () => {

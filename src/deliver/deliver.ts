@@ -570,6 +570,8 @@ function buildRecord(x: RecordCtx): InstallRecord {
     if (f.edited !== undefined || f.inserted !== undefined) {
       const at = edits.findIndex((e) => e.repo === f.repo && e.path === f.path);
       const e = editOfFile(f, d, x.delivered, at < 0 ? undefined : edits[at]);
+      // G12-R1 m1: an edit `pipegen update` merged into the owner's text stays the owner's (sticky, like adopted)
+      if (at >= 0 && edits[at]?.ownerEdited === true) e.ownerEdited = true;
       if (at < 0) edits.push(e); else edits[at] = e;
       continue;
     }
@@ -577,7 +579,8 @@ function buildRecord(x: RecordCtx): InstallRecord {
     const sha = gitBlobSha(f.content);
     const aiEdited = f.aiEdited === true || (at >= 0 && files[at]?.aiEdited === true);
     const adopted = at >= 0 ? files[at]?.adopted === true : x.adopted.has(f);   // N2: sticky; a file pipegen recorded as created stays created
-    const entry = { repo: f.repo, path: f.path, part: f.part, shas: appendSha(at < 0 ? [] : files[at]?.shas ?? [], sha), ...(aiEdited ? { aiEdited: true as const } : {}), ...(adopted ? { adopted: true as const } : {}) };
+    const ownerEdited = at >= 0 && files[at]?.ownerEdited === true;   // G12-R1 m1: sticky, like adopted
+    const entry = { repo: f.repo, path: f.path, part: f.part, shas: appendSha(at < 0 ? [] : files[at]?.shas ?? [], sha), ...(aiEdited ? { aiEdited: true as const } : {}), ...(adopted ? { adopted: true as const } : {}), ...(ownerEdited ? { ownerEdited: true as const } : {}) };
     if (at < 0) files.push(entry); else files[at] = entry;
   }
   const secrets = (prev?.secrets ?? []).filter((s) => !x.secrets.some((n) => n.name === s.name && n.scope === s.scope)).concat(x.secrets);
