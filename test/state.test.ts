@@ -438,3 +438,22 @@ describe('E8 readByWorkflows (carry E4-R4 R7)', () => {
     expect(workflowSecretNames([])).toBeNull();   // Plan G G0 (E-F2 m2): an empty list is unknown, never "reads no secret"
   });
 });
+
+describe('G13-R1 (sec M3): the central Actions access level before pipegen changed it', () => {
+  it('state: the earlier level is saved the moment it changes, kept on a later change, and carried into the next run', async () => {
+    const h = home();
+    const s = await open(h);
+    s.begin(RUN, app(), { cap: 10, aiCap: 1 });
+    s.recordActionsAccess('none');
+    expect(s.load()?.actionsAccessPrevious).toBe('none');
+    // a later change sees pipegen's own level as "before": the first one stays
+    s.recordActionsAccess('user');
+    expect(s.load()?.actionsAccessPrevious).toBe('none');
+    expect(() => s.recordActionsAccess('anything')).toThrow();
+    // the next run's state keeps it (a stopped run never delivered the record that would carry it)
+    s.setStage('planned');
+    const s2 = await open(h);
+    s2.begin('20261104-100000-abc124', app(), { cap: 10, aiCap: 1 });
+    expect(s2.load()?.actionsAccessPrevious).toBe('none');
+  });
+});

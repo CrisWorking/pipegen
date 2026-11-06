@@ -22,7 +22,7 @@
 // Two facts are tied to their real sources by construction (final review batch 2, I1): the file facts are a
 // BundleSummary, which only bundleSummary() of a secret-scanned bundle makes, and the estimate must say it was
 // priced for the provider and model shown (Estimates.pricedFor), or the screen is refused.
-// 'audit-ai' alone may take a CountingSummary instead (Plan U T4b, ruling S21: the scanner download happens only after
+// Either mode may take a CountingSummary instead ('audit-ai': Plan U T4b; 'full': G13-R1 sec I1; ruling S21: the scanner download happens only after
 // consent, so the screen counts the bundle before the secret scan, says so, and calls the counts "at most"; the AI
 // step reads only the counted files, bundleCode `onlyPaths`, with CountingSummary.covers() as the backstop).
 // "No AI call without consent" is a type rule backed by runtime checks (Plan U T4b, review M1/M2): consentScreen() makes
@@ -218,29 +218,28 @@ export class ConsentScreen {
 
 /**
  * The consent text. `est`: estimate() for 'full', estimateAuditAi() for 'audit-ai', both given `provider` itself, so
- * `est.pricedFor` matches it. `bundle`: bundleSummary() of the secret-scanned bundle that will be sent, or, for
- * 'audit-ai' only, countingSummary() of the counted bundle (consent before the scanner download, ruling S21).
+ * `est.pricedFor` matches it. `bundle`: bundleSummary() of the secret-scanned bundle that will be sent, or
+ * countingSummary() of the counted bundle (consent before the scanner download, ruling S21; 'full' too since G13-R1).
  * `perms`: permissionsTable('write', { appCreatesRepos }) for 'full', permissionsTable('read') for 'audit-ai'.
  * `repos`: `pipelines` and `pipegen-proof-<repo>` with whether each exists ('full' only; 'audit-ai' shows none).
- * Refused (programming errors): a bundle summary bundleSummary()/countingSummary() didn't make (or a counted one for
- * 'full'); an estimate priced for another provider, model or Ollama host (or for none); a write permission in
+ * Refused (programming errors): a bundle summary bundleSummary()/countingSummary() didn't make; an estimate priced for another provider, model or Ollama host (or for none); a write permission in
  * 'audit-ai'; in token mode, a permission saying pipegen creates or deletes a repo (a table built for the App).
  */
-export function consentText(p: RepoProfile, provider: AiProvider, est: Estimates, bundle: BundleSummary, perms: PermissionRows, repos: HelperRepo[], mode: 'full', facts: FullConsentFacts): string;
+export function consentText(p: RepoProfile, provider: AiProvider, est: Estimates, bundle: BundleSummary | CountingSummary, perms: PermissionRows, repos: HelperRepo[], mode: 'full', facts: FullConsentFacts): string;
 export function consentText(p: RepoProfile, provider: AiProvider, est: AuditAiEstimate, bundle: BundleSummary | CountingSummary, perms: PermissionRows, repos: HelperRepo[], mode: 'audit-ai', facts: AuditConsentFacts): string;
 export function consentText(p: RepoProfile, provider: AiProvider, est: Estimates | AuditAiEstimate, bundle: BundleSummary | CountingSummary, perms: PermissionRows, repos: HelperRepo[], mode: ConsentMode, facts: AuditConsentFacts | FullConsentFacts): string {
   return screenFor(p, provider, est, bundle, perms, repos, mode, facts).text;
 }
 
 /** consentText's screen with the terms a yes agrees to, for askConsent (same arguments, same refusals). */
-export function consentScreen(p: RepoProfile, provider: AiProvider, est: Estimates, bundle: BundleSummary, perms: PermissionRows, repos: HelperRepo[], mode: 'full', facts: FullConsentFacts): ConsentScreen;
+export function consentScreen(p: RepoProfile, provider: AiProvider, est: Estimates, bundle: BundleSummary | CountingSummary, perms: PermissionRows, repos: HelperRepo[], mode: 'full', facts: FullConsentFacts): ConsentScreen;
 export function consentScreen(p: RepoProfile, provider: AiProvider, est: AuditAiEstimate, bundle: BundleSummary | CountingSummary, perms: PermissionRows, repos: HelperRepo[], mode: 'audit-ai', facts: AuditConsentFacts): ConsentScreen;
 export function consentScreen(p: RepoProfile, provider: AiProvider, est: Estimates | AuditAiEstimate, bundle: BundleSummary | CountingSummary, perms: PermissionRows, repos: HelperRepo[], mode: ConsentMode, facts: AuditConsentFacts | FullConsentFacts): ConsentScreen {
   return screenFor(p, provider, est, bundle, perms, repos, mode, facts);
 }
 
 function screenFor(p: RepoProfile, provider: AiProvider, est: Estimates | AuditAiEstimate, bundle: BundleSummary | CountingSummary, perms: PermissionRows, repos: HelperRepo[], mode: ConsentMode, facts: AuditConsentFacts | FullConsentFacts): ConsentScreen {
-  const counted = mode === 'audit-ai' && CountingSummary.isSummary(bundle);
+  const counted = CountingSummary.isSummary(bundle);
   if (!counted && !BundleSummary.isSummary(bundle)) {
     throw new Error('The consent screen needs the file facts from bundleSummary() of the secret-scanned code bundle.');
   }

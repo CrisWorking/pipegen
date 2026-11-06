@@ -514,7 +514,7 @@ describe('counting summary (audit --ai: consent comes before the gitleaks downlo
     expect(c.covers(only)).toBe(true);
   });
 
-  it('consent (audit-ai): a counting summary says "at most" and that gitleaks runs after the yes; the full screen refuses it', async () => {
+  it('consent (audit-ai, full): a counting summary says "at most" and that gitleaks runs after the yes (full: G13-R1)', async () => {
     const dir = makeTempDir();
     for (const f of FILES) writeIn(dir, f, `// ${f.length}\n`);
     const c = countingSummary(await bundleCode(dir));
@@ -526,9 +526,16 @@ describe('counting summary (audit --ai: consent comes before the gitleaks downlo
     expect(text).toContain('These counts were made before the gitleaks check');
     expect(text).toContain('gitleaks 8.30.1, which pipegen downloads (checksum-verified) into its cache');
     expect(text).not.toMatch(/secret scan was not run|counting only/);
+    // G13-R1 (sec I1): the full run asks the same way: counted before the scan, "at most", the scanner runs after the yes; the terms
+    // carry the counted folder, so the run's scan reads only the counted files
     const f = full();
-    // @ts-expect-error the full run's screen takes only the checked bundle's summary
-    expect(() => consentText(f.p, claude, f.est, c, permissionsTable('write', { appCreatesRepos: false }), repos(f.p, [true, true]), 'full', { appCreatesRepos: false, ...gitleaksFacts() })).toThrow(/bundleSummary/);
+    const fullText = consentText(f.p, claude, f.est, c, permissionsTable('write', { appCreatesRepos: false }), repos(f.p, [true, true]), 'full', { appCreatesRepos: false, ...gitleaksFacts() });
+    expect(fullText).toContain('pipegen sends at most 7 files');
+    expect(fullText).toContain('These counts were made before the gitleaks check');
+    const screen = consentScreen(f.p, claude, f.est, c, permissionsTable('write', { appCreatesRepos: false }), repos(f.p, [true, true]), 'full', { appCreatesRepos: false, ...gitleaksFacts() });
+    expect(screen.terms.files).toBe(c);
+    // a raw bundle is still refused
+    expect(() => consentText(f.p, claude, f.est, { files: 7, bytes: 1, topFolders: [] } as never, permissionsTable('write', { appCreatesRepos: false }), repos(f.p, [true, true]), 'full', { appCreatesRepos: false, ...gitleaksFacts() })).toThrow(/bundleSummary/);
   });
 });
 
