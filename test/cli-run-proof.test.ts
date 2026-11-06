@@ -9,6 +9,9 @@ vi.mock('../src/util/exit-hooks.js', async (orig) => {
   const real = await orig<typeof import('../src/util/exit-hooks.js')>();
   return { ...real, interrupting: () => stop.on };
 });
+// the real optionRunOf, watched: a dispute option is scored on the same workflow set as the main proof (sec M3)
+vi.mock(import('../src/debate/decide.js'), async (orig) => { const m = await orig(); return { ...m, optionRunOf: vi.fn(m.optionRunOf) }; });
+import { optionRunOf as watchedOptionRunOf } from '../src/debate/decide.js';
 
 import { DECLINED_REASON, dropDeclined, guardedKeys, midRunConfirm, nextCandidateFrom, proofWorkflowsOf, REPOS_NOT_READY, CENTRAL_CHANGED, PRIVATE_REASON } from '../src/cli/run-proof.js';
 import { proofAssembler } from '../src/cli/run-parts.js';
@@ -334,6 +337,13 @@ describe('G14: disputes and the carries', () => {
     expect(JSON.stringify(w.pushed[winMain]?.files)).toContain(`sast:${judgeId}`);
     // keepOpen false: each variant's PR is closed after its runs
     expect(w.tl.filter((x) => x.startsWith('variant:dispute')).every((x) => !x.endsWith(':open'))).toBe(true);
+    // sec M3: each option is scored on the main proof's workflow set: no proof harness, no compat copy
+    const scored = vi.mocked(watchedOptionRunOf).mock.calls.slice(-2).map((c) => c[1].pipegenWorkflows);
+    expect(scored.length).toBe(2);
+    for (const wfs of scored) {
+      expect(wfs).toContain('.github/workflows/pipegen.yml');
+      expect(wfs).not.toContain(HARNESS_PATH);
+    }
     // each variant carries the planted files
     expect(w.pushed.filter((x) => x.variant.startsWith('dispute')).every((x) => x.files.some((f) => String(f.path).startsWith('pipegen-planted/')))).toBe(true);
   });
