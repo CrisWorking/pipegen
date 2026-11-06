@@ -437,10 +437,10 @@ describe('uri: normalisation (S10, uri part)', () => {
 });
 
 describe('sarif: the tool table', () => {
-  it('sarif: every reviewed entry that writes SARIF is in the table, except scorecard-action (reported only, never gated); every table entry is a reviewed entry', () => {
-    const sarifIds = loadReviewed().filter((t) => t.step.output.format === 'sarif').map((t) => t.id).filter((id) => id !== 'scorecard-action').sort();
+  it('sarif: every reviewed entry that writes SARIF is in the table (scorecard-action for its scrub only: reported, never gated); every table entry is a reviewed entry', () => {
+    const sarifIds = loadReviewed().filter((t) => t.step.output.format === 'sarif').map((t) => t.id).sort();
     expect(Object.keys(SARIF_TOOLS).sort()).toEqual(sarifIds);
-    expect(sarifIds).toEqual(['bandit', 'betterleaks', 'gitleaks', 'gosec', 'hadolint', 'kube-linter', 'nuclei', 'osv-scanner', 'ruff', 'semgrep', 'trivy-config', 'trivy-image', 'trivy-licence']);
+    expect(sarifIds).toEqual(['bandit', 'betterleaks', 'gitleaks', 'gosec', 'hadolint', 'kube-linter', 'nuclei', 'osv-scanner', 'ruff', 'scorecard-action', 'semgrep', 'trivy-config', 'trivy-image', 'trivy-licence']);
   });
 
   it('sarif: the table is plain data with a driver name for each tool and a null prototype (no inherited ids)', () => {

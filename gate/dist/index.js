@@ -4099,7 +4099,9 @@ var SARIF_TOOLS = Object.freeze(Object.assign(/* @__PURE__ */ Object.create(null
   nuclei: tool("Nuclei", "security-severity", { fileMode: "none", executionSuccessfulFalse: "ignored" }),
   ruff: tool("ruff", "level", { errorRules: ["invalid-syntax", "E999", "E902", "panic"] }),
   gosec: tool("gosec", "tag-word"),
-  bandit: tool("Bandit", "issue-severity")
+  bandit: tool("Bandit", "issue-severity"),
+  // G15a round 3 (PF-3): reported weekly, never gated (a scheduled category: never on the gate's job list); read only to scrub it
+  "scorecard-action": tool("Scorecard", "security-severity", { noFileUri: "no file associated with this alert" })
 }));
 var TRIVY_VULN_MESSAGE = /^Package: [^\n]*\nInstalled Version: [^\n]*\nVulnerability [^\n]*\nSeverity: [^\n]*\nFixed Version: ([^\n]*)(?:\n|$)/;
 function trivyFixable(message) {
@@ -4335,7 +4337,14 @@ function readRun(run, index, toolId, info, opts, limits, notes) {
     }
     let file;
     let uriUnmapped = false;
-    if (uri !== void 0) {
+    const noFile = uri !== void 0 && info.noFileUri !== void 0 && uri === info.noFileUri && (baseId === void 0 || baseId === "%SRCROOT%");
+    if (noFile) {
+      line = void 0;
+      startColumn = void 0;
+      endLine = void 0;
+      endColumn = void 0;
+    }
+    if (uri !== void 0 && !noFile) {
       if (info.fileMode === "none") {
         uriUnmapped = true;
       } else {

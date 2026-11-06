@@ -67,6 +67,12 @@ export interface SarifToolInfo {
   readonly errorRules: readonly string[];
   /** trivy writes security-severity 0.0 for a severity it does not know (UNKNOWN): no value, so high. Not for licences (S9: info, a human decides). */
   readonly zeroScoreIsUnknown: boolean;
+  /**
+   * G15a round 3 (PF-3): the exact uri the tool writes for a finding about no file (Scorecard v5.6.0 writes `no file associated with this
+   * alert` under %SRCROOT% at line 1; measured in the real fixtures test/fixtures/sarif/scorecard-*.sarif). Such a result has no file and no
+   * line, and it is not an unmapped uri. Only this exact string, under %SRCROOT% or no base: any other uri maps as usual.
+   */
+  readonly noFileUri?: string;
   /** A note put on every result of this tool (what its SARIF cannot prove). */
   readonly note?: string;
   /**
@@ -89,8 +95,8 @@ const tool = (driver: string, severity: SeveritySource, over: Partial<SarifToolI
 
 /**
  * The reviewed tools that write SARIF and that the gate reads, by reviewed-list id. A null-prototype table: an id from
- * a file or an argument can never find an inherited property. scorecard-action also writes SARIF but is reported only,
- * never gated, so it is not here (test: every other `format: sarif` reviewed entry is).
+ * a file or an argument can never find an inherited property. scorecard-action is here for its scrub only: it is reported
+ * weekly and never gated (a scheduled category, never on the gate's job list).
  */
 export const SARIF_TOOLS: Readonly<Record<string, SarifToolInfo>> = Object.freeze(Object.assign(Object.create(null) as Record<string, SarifToolInfo>, {
   betterleaks: tool('betterleaks', 'secret', { secrets: true, uriEncoding: 'raw' }),
@@ -106,6 +112,8 @@ export const SARIF_TOOLS: Readonly<Record<string, SarifToolInfo>> = Object.freez
   ruff: tool('ruff', 'level', { errorRules: ['invalid-syntax', 'E999', 'E902', 'panic'] }),
   gosec: tool('gosec', 'tag-word'),
   bandit: tool('Bandit', 'issue-severity'),
+  // G15a round 3 (PF-3): reported weekly, never gated (a scheduled category: never on the gate's job list); read only to scrub it
+  'scorecard-action': tool('Scorecard', 'security-severity', { noFileUri: 'no file associated with this alert' }),
 }));
 
 // ---------- E9 (carry E5-R3): fix information of an image finding ----------
@@ -401,7 +409,9 @@ function readRun(run: unknown, index: number, toolId: string, info: SarifToolInf
     }
     let file: string | undefined;
     let uriUnmapped = false;
-    if (uri !== undefined) {
+    const noFile = uri !== undefined && info.noFileUri !== undefined && uri === info.noFileUri && (baseId === undefined || baseId === '%SRCROOT%');
+    if (noFile) { line = undefined; startColumn = undefined; endLine = undefined; endColumn = undefined; }
+    if (uri !== undefined && !noFile) {
       if (info.fileMode === 'none') {
         uriUnmapped = true;
       } else {
