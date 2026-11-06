@@ -315,6 +315,8 @@ function userTopProblem(js: Obj): string | null {
 
 /** Whether a job is a call of another workflow (job-level `uses`): it has no steps of its own to start with the head check. */
 const callsWorkflow = (job: unknown): boolean => isObj(job) && job.uses !== undefined;
+/** The jobs an insert started with the head check. */
+const headCheckJobs = (mark: PipegenInserted): string[] => mark.headCheck ?? [];
 /** A job's permissions: its own, else the workflow's (undefined: the repository's default, which may be write). */
 const permissionsOf = (job: unknown, top: unknown): unknown => (isObj(job) && job.permissions !== undefined ? job.permissions : top);
 /** Whether the job's token can read the branch (the head check's API call): no permissions set, read-all or write-all, or contents read or write. */
@@ -323,6 +325,10 @@ function readsContents(job: unknown, top: unknown): boolean {
   if (p === undefined || p === 'read-all' || p === 'write-all') return true;
   return isObj(p) && (p.contents === 'read' || p.contents === 'write');
 }
+/** A GitHub-hosted runner label, written plainly (no expression, list or map): ubuntu-*, windows-* or macos-*. */
+const githubHosted = (runsOn: unknown): boolean => typeof runsOn === 'string' && /^(?:ubuntu|windows|macos)-[a-z0-9.-]{1,40}$/.test(runsOn);
+/** G7-R2 1c: a runner pipegen's head check is written for (a GitHub-hosted ubuntu label, no job container): bash, curl and jq on the fixed PATH. */
+const plainUbuntu = (job: unknown): boolean => isObj(job) && job.container === undefined && typeof job['runs-on'] === 'string' && /^ubuntu-[a-z0-9.-]{1,40}$/.test(job['runs-on']);
 /** G7-R-sec1: every step's if: of a job runs only when the steps before it passed (the job-level rule, gatedIfAllowed, per step). */
 const stepsGated = (job: unknown): boolean => isObj(job) && (!Array.isArray(job.steps) || job.steps.every((st) => !isObj(st) || gatedIfAllowed(st.if)));
 /**
@@ -334,6 +340,10 @@ function mayDeploy(job: unknown, top: unknown): string | null {
   if (!isObj(job)) return 'it can not be read';
   if (callsWorkflow(job)) return 'it calls another workflow';
   if (job.environment !== undefined && job.environment !== null) return 'it has an environment';
+  // G7-R2 2 (sec M2): a runner of the user's own (self-hosted, a group or label map, an expression) may hold credentials of its own, and a
+  // configuration variable may hold a deploy hook: either may deploy without a secret
+  if (!githubHosted(job['runs-on'])) return 'it runs on a runner of its own, which may hold credentials';
+  if (/\bvars\s*\./.test(JSON.stringify(job))) return 'it reads a configuration variable (vars), which may be a deploy hook';
   const text = JSON.stringify(job).replace(/\bsecrets\s*\.\s*GITHUB_TOKEN\b/gi, '');
   if (/\bsecrets\b/i.test(text)) return 'it uses a secret';
   const p = permissionsOf(job, top);
@@ -400,7 +410,21 @@ export function planVerifyInserts(draft: PipelineDraft, texts: ReadonlyMap<strin
       out.notes.push(line);
     }
     for (const id of deployJobs.filter((x) => callsWorkflow(jobs[x]))) {
-      out.notes.push(`${wf.path}: the job ${show(id)} calls another workflow, so pipegen can not start it with its head check: only ${VERIFY_JOB} checks that the commit is still the head of the default branch, before the job starts. After a newer commit, re-run all jobs (not this job alone), or move the deploy into a job with steps.`);
+      // G7-R2 3 (sec M1): what is not checked for such a job; the BINDING carry to G13 puts the head check into a local called workflow's jobs
+      out.notes.push(`${wf.path}: the job ${show(id)} calls another workflow, so pipegen can not start it with its head check: only ${VERIFY_JOB} checks that the commit is still the head of the default branch, before the job starts. So an older commit can still deploy when the called workflow waits for an approval and a newer commit ships first, or when someone re-runs this job (or "re-run failed jobs") on an older run. Approve deploys in order, re-run all jobs (never this job alone) after a newer commit, or move the deploy into a job with steps.`);
+    }
+    // G7-R2 1c: the head check runs on the job's own runner or container: anything but GitHub's ubuntu runner may lack bash, curl or jq (it
+    // fails closed and says which tool; the job stays gated)
+    for (const id of headCheckJobs(edit.inserted).filter((x) => !plainUbuntu(jobs[x]))) {
+      const line = `${wf.path}: ${show(id)} runs pipegen's head check on its own runner or container: the check needs bash, curl and jq on this runner (on its PATH under /usr/local/bin, /usr/bin or /bin), or every deploy of that job stops with a message naming the missing tool.`;
+      out.preview.push(line);
+      out.notes.push(line);
+    }
+    // G7-R2 4 (sec M3): a push filtered by paths: a newer commit may start no deploy, and the older one's head check then refuses it
+    const push = isObj(js.on) && isObj(js.on.push) ? js.on.push : {};
+    if (push.paths !== undefined || push['paths-ignore'] !== undefined) {
+      out.preview.push(`${wf.path}: its push only for some paths starts a deploy, so a newer commit that changes none of them deploys nothing while it stops an older one.`);
+      out.notes.push(`${wf.path}: its push starts a deploy only for some paths. pipegen's head check refuses an older commit once a newer commit is on the default branch, and a newer commit that starts no deploy (it changes none of those paths) ships nothing. When that happens, push again or re-run all jobs on the newest commit.`);
     }
     out.notProven.push({ part: 'deploy-verify', reason: `pipegen's edit of ${wf.path} (the ${VERIFY_JOB} job, its needs and the head checks) is not proven: the proof never runs a user's workflow beside real keys, so only the referee checked it.`, missingSecrets: [] });
   }

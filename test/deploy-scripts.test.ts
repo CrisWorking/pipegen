@@ -57,7 +57,7 @@ function zipOf(entries: [string, string][]): Buffer {
   return Buffer.concat([...locals, cd, end]);
 }
 
-interface Api { head: string; artifacts: unknown; zip: Buffer; redirectTo?: string; seen: { url: string; who: string | undefined }[] }
+interface Api { head: string; type?: string; refStatus?: number; listStatus?: number; artifacts: unknown; zip: Buffer; redirectTo?: string; seen: { url: string; who: string | undefined }[] }
 let api: Api;
 let server: Server;
 let base = '';
@@ -78,8 +78,14 @@ beforeAll(async () => {
     const url = req.url ?? '';
     api.seen.push({ url, who: req.headers[['author', 'ization'].join('')] as string | undefined });
     const json = (v: unknown): void => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(v)); };
-    if (url === '/repos/o/r/git/ref/heads/main') return json({ ref: 'refs/heads/main', object: { type: 'commit', sha: api.head } });
-    if (url === `/repos/o/r/actions/runs/${RUN}/artifacts?name=${ARTIFACT}&per_page=2`) return json(api.artifacts);
+    if (url === '/repos/o/r/git/ref/heads/main') {
+      if (api.refStatus !== undefined) { res.writeHead(api.refStatus); res.end('{}'); return undefined; }
+      return json({ ref: 'refs/heads/main', object: { type: api.type ?? 'commit', sha: api.head } });
+    }
+    if (url === `/repos/o/r/actions/runs/${RUN}/artifacts?name=${ARTIFACT}&per_page=2`) {
+      if (api.listStatus !== undefined) { res.writeHead(api.listStatus); res.end('{}'); return undefined; }
+      return json(api.artifacts);
+    }
     if (url === `/repos/o/r/actions/artifacts/${ART}/zip`) {
       if (api.redirectTo !== undefined) { res.writeHead(302, { location: api.redirectTo }); res.end(); return undefined; }
       res.writeHead(200, { 'content-type': 'application/zip', 'content-length': String(api.zip.length) }); res.end(api.zip); return undefined;
@@ -105,11 +111,11 @@ const fresh = (over: Partial<Api> = {}): Api => ({ head: SHA, artifacts: goodArt
 
 interface Ran { code: number; err: string; out: string; tmp: string }
 /** Runs a rendered step as the runner would (bash, its env, the job's GITHUB_* variables), with jq from the harness folder. */
-async function run(step: RenderedStep, env: Record<string, string> = {}): Promise<Ran> {
+async function run(step: RenderedStep, env: Record<string, string> = {}, pathDir?: string): Promise<Ran> {
   const fixed = SCRIPT_HEAD[2] as string;
   const script = String(step.run);
   expect(script.split('\n').filter((l) => l === fixed)).toHaveLength(1);
-  const body = script.replace(fixed, fixed.replace('PATH=', `PATH=${bin}:`));
+  const body = script.replace(fixed, pathDir === undefined ? fixed.replace('PATH=', `PATH=${bin}:`) : `PATH=${pathDir}`);
   const tmp = mkdtempSync(join(dir, 'run-'));
   const out = join(tmp, 'output');
   writeFileSync(out, '');
@@ -169,6 +175,34 @@ describe.skipIf(!READY)('G7-R1 spec I2: the head check runs (real bash, curl, jq
     api.head = '';
     const r = await run(head);
     expect(r.code).not.toBe(0);
+    // a tag object whose sha matches the commit: still not a branch head (G7-R2 8)
+    api = fresh({ type: 'tag' });
+    const t = await run(head);
+    expect(t.code).not.toBe(0);
+  });
+  it('head check: the ref answers 404 or 5xx → refused (G7-R2 8)', async () => {
+    for (const status of [404, 500, 503]) {
+      api = fresh({ refStatus: status });
+      const r = await run(head);
+      expect(r.code, String(status)).not.toBe(0);
+    }
+  });
+  it('head check: a runner without jq (or curl) fails with a plain message naming the tool (G7-R2 1b)', async () => {
+    api = fresh();
+    const only = mkdtempSync(join(dir, 'path-'));
+    symlinkSync(which('curl') as string, join(only, 'curl'));
+    const r = await run(head, {}, only);
+    expect(r.code).not.toBe(0);
+    expect(r.err).toMatch(/has no jq, which pipegen's head check needs; install jq there/);
+    expect(api.seen).toEqual([]);
+    const none = mkdtempSync(join(dir, 'path-'));
+    const c = await run(head, {}, none);
+    expect(c.err).toMatch(/has no curl/);
+  });
+  it('head check: the refusal says what to do when the newer commit starts no deploy (G7-R2 4)', async () => {
+    api = fresh({ head: NEWER });
+    const r = await run(head);
+    expect(r.err).toMatch(/if that commit starts a deploy; otherwise push again or re-run all jobs on the newest commit/);
   });
 });
 
@@ -186,6 +220,20 @@ describe.skipIf(!READY)('G7-R1 spec I2: the digest step runs', () => {
   });
   it('digest: the artifact of another run (wrong workflow_run.id) → refused', async () => {
     api = fresh({ artifacts: goodArtifacts({ workflow_run: { id: 1 } }) });
+    const r = await run(step);
+    expect(r.code).not.toBe(0);
+    expect(r.out).toBe('');
+  });
+  it('digest: the artifact list answers 404 or 5xx → refused (G7-R2 8)', async () => {
+    for (const status of [404, 500, 502]) {
+      api = fresh({ listStatus: status });
+      const r = await run(step);
+      expect(r.code, String(status)).not.toBe(0);
+      expect(r.out).toBe('');
+    }
+  });
+  it('digest: an artifact of the gated run under another name → refused (G7-R2 8)', async () => {
+    api = fresh({ artifacts: goodArtifacts({ name: imageDigestArtifact('other') }) });
     const r = await run(step);
     expect(r.code).not.toBe(0);
     expect(r.out).toBe('');
@@ -257,8 +305,9 @@ describe.skipIf(!READY)('G7-R1 spec I2: the publish digest step runs', () => {
 });
 
 describe('G7-R1 spec I2: the harness itself', () => {
-  it('says why it is skipped when jq or openssl is missing (set PIPEGEN_TEST_JQ to a jq binary)', () => {
+  it('says why it is skipped when jq or openssl is missing (set PIPEGEN_TEST_JQ to a jq binary); in CI it fails instead', () => {
     if (!READY) console.warn(`test/deploy-scripts.test.ts skipped: jq ${JQ ?? 'missing'}, openssl ${OPENSSL ?? 'missing'}`);
-    expect(typeof READY).toBe('boolean');
+    // G7-R2 5: in CI the script tests never skip silently: a runner without jq or openssl fails here
+    expect(READY || process.env.CI === undefined || process.env.CI === '', `CI is set but jq (${JQ ?? 'missing'}) or openssl (${OPENSSL ?? 'missing'}) is missing`).toBe(true);
   });
 });

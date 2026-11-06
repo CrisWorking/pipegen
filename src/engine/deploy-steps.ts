@@ -43,6 +43,8 @@ export function publishedImageRepo(owner: string, repo: string, service: string)
 }
 
 /** The one expression each step's env holds, exactly (job-rules.ts checkExpressions accepts these and nothing else for these ids). */
+/** The head check's working-directory (G7-R2 1a): the one expression checkExpressions accepts in that field, on that step only. */
+export const HEAD_CHECK_DIR = '${{ runner.temp }}';
 export const HEAD_CHECK_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_HEAD_TOKEN: '${{ github.token }}' });
 export const DIGEST_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({
   PIPEGEN_RUN_ID: `\${{ steps.${FIND_RUN_STEP_ID}.outputs.run-id }}`, PIPEGEN_DIGEST_TOKEN: '${{ github.token }}',
@@ -79,7 +81,10 @@ const CURL = "printf 'Authorization: Bearer %s\\n' \"$TOKEN\" | curl -fsS --prot
  */
 export function renderHeadCheckStep(defaultBranch: string): RenderedStep {
   const branch = branchOf(defaultBranch);
-  return pipegenScriptStep(HEAD_CHECK_STEP_ID, 'pipegen: the deployed commit is the head of the default branch', [
+  const step = pipegenScriptStep(HEAD_CHECK_STEP_ID, 'pipegen: the deployed commit is the head of the default branch', [
+    // G7-R2 1b: the check runs on the user's own runner or container too (the first step of each gated deploy job), so it says plainly which
+    // tool is missing rather than failing with "command not found"
+    'for t in curl jq; do command -v "$t" > /dev/null || pg_fail "this job\'s runner or container has no $t, which pipegen\'s head check needs; install $t there, or run this deploy job on ubuntu-latest"; done',
     `want=${q(branch)}`,
     // G7-R1 sec M2: a push only. For workflow_run, issue_comment or pull_request_target GITHUB_REF is the default branch and GITHUB_SHA its
     // head, while the job may deploy another commit (the other run's, a pull request's)
@@ -89,8 +94,11 @@ export function renderHeadCheckStep(defaultBranch: string): RenderedStep {
     'TOKEN="$PIPEGEN_HEAD_TOKEN"',
     'unset PIPEGEN_HEAD_TOKEN',
     `head="$(${CURL} "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/ref/heads/$want" | jq -er 'if .object.type == "commit" and (.object.sha | type) == "string" then .object.sha else error("not a branch head") end')"`,
-    'if [ "$head" != "$GITHUB_SHA" ]; then pg_fail "the default branch has moved on to a newer commit, so this older commit is not deployed (the newer commit\'s own run deploys it)"; fi',
+    'if [ "$head" != "$GITHUB_SHA" ]; then pg_fail "the default branch has moved on to a newer commit, so this older commit is not deployed (the newer commit\'s own run deploys it if that commit starts a deploy; otherwise push again or re-run all jobs on the newest commit)"; fi',
   ], { ...HEAD_CHECK_ENV });
+  // G7-R2 1a: its own working folder, the runner's temp folder (it exists before any checkout, on every runner and in every container), so a
+  // job's `defaults.run.working-directory` (often a folder the checkout makes) does not apply to it
+  return { ...step, 'working-directory': HEAD_CHECK_DIR };
 }
 
 /**

@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { isMap, parse, parseDocument, type YAMLMap, type YAMLSeq } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { DIGEST_STEP_ID, FIND_RUN_STEP_ID, HEAD_CHECK_STEP_ID, imageDigestArtifact, PUBLISH_DIGEST_STEP_ID, renderDigestStep, renderHeadCheckStep } from '../src/engine/deploy-steps.js';
-import { isFindRunStep, isKnownHarmless } from '../src/engine/job-rules.js';
+import { checkExpressions, isFindRunStep, isKnownHarmless } from '../src/engine/job-rules.js';
 import { deployGateOf } from '../src/audit/coverage/deploy-gate.js';
 import { floorNeeds } from '../src/engine/needs.js';
 import { RenderError } from '../src/engine/render-error.js';
@@ -864,7 +864,7 @@ describe('G7-R1 sec M1-M7: the signature binds the commit; the verify job is exa
   it('G7-R1 sec M2: the head check refuses any event but push', () => {
     const run = String(renderHeadCheckStep('main').run);
     expect(run.indexOf('"$GITHUB_EVENT_NAME" != "push"')).toBeGreaterThan(-1);
-    expect(run.indexOf('"$GITHUB_EVENT_NAME" != "push"')).toBeLessThan(run.indexOf('curl'));
+    expect(run.indexOf('"$GITHUB_EVENT_NAME" != "push"')).toBeLessThan(run.indexOf('| curl -fsS'));
   });
 
   it('G7-R1 sec M3: the verify job holds no checkout and no artifact download (the digest comes from the API only)', async () => {
@@ -960,7 +960,7 @@ describe('G7-R1 spec: the byte-level edit, the key, the network note, the enviro
 
   it('G7-R1 spec I4: a keyless verify job whose Sigstore hosts are not a reviewed network set gets a release-blocker note', () => {
     const kl = world('keyless');
-    expect(kl.a.notes.join('\n')).toMatch(/Your deploys stop for now: pipegen checks a keyless signature with Sigstore[\s\S]*G15/);
+    expect(kl.a.notes.join('\n')).toMatch(/Your deploys stop for now: pipegen checks a keyless signature with Sigstore[\s\S]*before release/);
     expect(world('key-env').a.notes.join('\n')).not.toMatch(/Your deploys stop for now/);
   });
 
@@ -1006,5 +1006,101 @@ describe('G7-R-sec1: a step-level if: can not run a deploy step after the head c
       expect(w.v.inserts, cond).toHaveLength(1);
       expect(shown(await judge(w)), cond).toBe('');
     }
+  });
+});
+
+// ---------- G7-R2 fix round 2 (ruling G7-R2, re-reviews G7 security r1 and spec r1) ----------
+
+describe('G7-R2: the head check in the user\'s own job (its working folder, its tools, its runner)', () => {
+  const MONO = DEPLOY_A.replace('    environment: production\n', '    environment: production\n    defaults:\n      run:\n        working-directory: web\n');
+  it('G7-R2 1a: the head check runs in the runner\'s temp folder, so a job default working-directory (a folder made by checkout) does not break it', async () => {
+    const head = renderHeadCheckStep('main');
+    expect(head['working-directory']).toBe('${{ runner.temp }}');
+    // that one expression, on that step only
+    expect(() => checkExpressions(head)).not.toThrow();
+    expect(() => checkExpressions({ ...head, 'working-directory': '${{ github.workspace }}' })).toThrow(RenderError);
+    expect(() => checkExpressions({ ...head, id: 'other', 'working-directory': '${{ runner.temp }}' })).toThrow(RenderError);
+    const w = world('keyless', [[A, MONO]]);
+    expect(w.v.gaps).toEqual([]);
+    const steps = (jobsIn(w.v.inserts[0]?.text as string).deploy as Obj).steps as Obj[];
+    expect(steps[0]).toEqual({ ...head });
+    expect(steps[0]?.['working-directory']).toBe('${{ runner.temp }}');
+    expect(shown(await judge(w))).toBe('');
+    // the referee's exact compare follows the renderer: the step without its working-directory is not pipegen's
+    const f = w.v.inserts[0]?.file as CreatedFile;
+    const d = parseDocument(f.content);
+    ((d.getIn(['jobs', 'deploy', 'steps']) as YAMLSeq).items[0] as YAMLMap).delete('working-directory');
+    expect((await judge(w, [{ ...f, content: d.toString({ lineWidth: 0 }) }])).ok).toBe(false);
+  });
+
+  it('G7-R2 1b: the head check\'s own first line checks for curl and jq, with a plain message', () => {
+    const run = String(renderHeadCheckStep('main').run);
+    const own = run.split('\n').slice(4);
+    expect(own[0]).toBe('for t in curl jq; do command -v "$t" > /dev/null || pg_fail "this job\'s runner or container has no $t, which pipegen\'s head check needs; install $t there, or run this deploy job on ubuntu-latest"; done');
+  });
+
+  it('G7-R2 1c: a gated job in a container, on macOS or Windows, or self-hosted keeps its head check and gets a preview line and a note', async () => {
+    const shapes: [string, string][] = [
+      ['container', DEPLOY_A.replace('    environment: production\n', '    environment: production\n    container: node:22-alpine\n')],
+      ['macos', DEPLOY_A.replace('    environment: production\n    env: *common', '    environment: production\n    env: *common').replace(/(  deploy:[\s\S]*?)runs-on: ubuntu-latest/, '$1runs-on: macos-14')],
+      ['windows', DEPLOY_A.replace(/(  deploy:[\s\S]*?)runs-on: ubuntu-latest/, '$1runs-on: windows-latest')],
+      ['self-hosted', DEPLOY_A.replace(/(  deploy:[\s\S]*?)runs-on: ubuntu-latest/, '$1runs-on: [self-hosted, linux]')],
+    ];
+    for (const [what, text] of shapes) {
+      expect(text, what).not.toBe(DEPLOY_A);
+      const w = world('keyless', [[A, text]]);
+      expect(w.v.gaps, what).toEqual([]);
+      const ins = w.v.inserts[0] as VerifyPlan['inserts'][number];
+      expect(ins.inserted.headCheck, what).toEqual(['deploy']);
+      expect(w.v.preview.join('\n'), what).toMatch(/"deploy" runs pipegen's head check on its own runner or container: the check needs bash, curl and jq on this runner/);
+      expect(w.v.notes.join('\n'), what).toMatch(/"deploy"[\s\S]*the check needs bash, curl and jq on this runner/);
+      expect(shown(await judge(w)), what).toBe('');
+    }
+    // a plain GitHub-hosted ubuntu runner gets no such line
+    expect(world('keyless').v.notes.join('\n')).not.toMatch(/needs bash, curl and jq on this runner/);
+  });
+});
+
+describe('G7-R2 2: a job on its own runner, or one that reads vars, may deploy', () => {
+  it('G7-R2 2: a read-only, secret-free job on a self-hosted runner (or a runner group, or an expression) waits for the check', () => {
+    const w = world('keyless', [[A, INFRA]]);
+    for (const runsOn of ['[self-hosted, prod-vpc]', '{ group: deployers }', '${{ matrix.os }}']) {
+      const text = INFRA.replace('  lint:\n    runs-on: ubuntu-latest\n', `  lint:\n    runs-on: ${runsOn}\n`);
+      expect(text, runsOn).not.toBe(INFRA);
+      expect(planVerifyInserts(w.a.draft, new Map([[A, text]]), w.a.verify).inserts[0]?.inserted.needs.map((n) => n.job), runsOn).toContain('lint');
+    }
+  });
+  it('G7-R2 2: a job that reads a configuration variable (a deploy hook URL in vars) waits for the check', () => {
+    const w = world('keyless', [[A, INFRA]]);
+    const text = INFRA.replace('      - run: npm run lint\n', `      - run: curl -X POST "\${{ vars.HOOK_URL }}"\n`);
+    expect(text).not.toBe(INFRA);
+    expect(planVerifyInserts(w.a.draft, new Map([[A, text]]), w.a.verify).inserts[0]?.inserted.needs.map((n) => n.job)).toContain('lint');
+  });
+});
+
+describe('G7-R2 3-6: what the notes and messages say', () => {
+  it('G7-R2 3: the note of a job that calls another workflow covers an approval wait and a deliberate re-run', () => {
+    const w = world('keyless', [[A, INFRA]]);
+    const note = w.v.notes.find((n) => n.includes('"release" calls another workflow')) as string;
+    expect(note).toMatch(/approval/);
+    expect(note).toMatch(/re-run/i);
+    expect(note).toMatch(/an older commit can still deploy/);
+  });
+  it('G7-R2 4: a push filtered by paths gets a preview line and a note; the head check says what to do when the newer commit deploys nothing', () => {
+    for (const filter of ['paths', 'paths-ignore']) {
+      const text = DEPLOY_A.replace('    branches: [main]   # main only\n', `    branches: [main]   # main only\n    ${filter}: ['src/**']\n`);
+      const w = world('keyless', [[A, text]]);
+      expect(w.v.gaps, filter).toEqual([]);
+      expect(w.v.preview.join('\n'), filter).toMatch(/push only for some paths/);
+      expect(w.v.notes.join('\n'), filter).toMatch(/a newer commit that starts no deploy[\s\S]*push again or re-run all jobs on the newest commit/);
+    }
+    expect(world('keyless').v.preview.join('\n')).not.toMatch(/push only for some paths/);
+    expect(String(renderHeadCheckStep('main').run)).toContain('if that commit starts a deploy; otherwise push again or re-run all jobs on the newest commit');
+  });
+  it('G7-R2 6: the Sigstore note names no internal task and is keyed on the hosts the verify job may reach', () => {
+    const note = world('keyless').a.notes.find((n) => /Sigstore/.test(n) && /deploys stop/.test(n)) as string;
+    expect(note).toMatch(/before release/);
+    expect(note).not.toMatch(/\bG\d+\b/);
+    expect(readFileSync('src/layers/assemble.ts', 'utf8')).not.toMatch(/SIGSTORE_SET = 'sigstore'/);
   });
 });

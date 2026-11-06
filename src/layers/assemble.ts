@@ -52,7 +52,7 @@ import { renderFindRunStep, stepsToYaml } from '../engine/render-step.js';
 import { FIND_RUN_STEP_ID, renderDigestStep, renderHeadCheckStep } from '../engine/deploy-steps.js';
 import { slug } from '../engine/artifact-names.js';
 import { egressSetsForTool } from '../engine/egress.js';
-import { E3_EGRESS_SETS, REVIEWED_EGRESS_LABELS, type EgressSet } from '../engine/egress-sets.js';
+import { EGRESS_DOMAIN_SETS, type EgressSet } from '../engine/egress-sets.js';
 import { publishedImageServices } from '../engine/needs.js';
 import { COSIGN_ID, GH_ID, renderVerifySteps, type SignedImage } from '../engine/signing.js';
 import type { BaseImage } from '../engine/base-images.js';
@@ -111,8 +111,11 @@ export function verifyPermissions(draft: PipelineDraft): Record<string, 'read'> 
   if (plan.mode === 'attest') out.attestations = 'read';
   return out;
 }
-/** G7-R1 spec I4: the network set keyless verification needs (Sigstore's TUF root, Fulcio and Rekor); not a reviewed set until G15. */
-const SIGSTORE_SET = 'sigstore';
+/**
+ * G7-R1 spec I4, G7-R2 6: the hosts keyless verification reaches (Sigstore's TUF root and its transparency log). The note below is keyed on
+ * whether the verify job's egress sets (the cosign entry's, plus github-core and ghcr) reach them, not on a set's name (G15 adds the set).
+ */
+const SIGSTORE_HOSTS: readonly string[] = ['tuf-repo-cdn.sigstore.dev', 'rekor.sigstore.dev'];
 /** The job ids pipegen.yml reserves for its own jobs (a deploy job may not take one). */
 const RESERVED_IDS: ReadonlySet<string> = new Set([MERGE_CALLER_JOB, SIGN_JOB_ID, VERIFY_JOB_ID, PUSH_CALLER_JOB, NIGHTLY_CALLER_JOB, PR_CHECK_JOB, 'gate']);
 
@@ -413,8 +416,10 @@ export function assemble(input: PipelineDraft, opts: AssembleOpts): AssembledFil
     // G7-R1 spec I4 (a release blocker until G15): keyless verification reads Sigstore's hosts, which no reviewed network set holds yet, so
     // under the network lock the verify job fails closed and every deploy of the image stops
     const keyless = draft.signing?.mode === 'keyless' && publishedImageServices(draft.profile, draft.capabilities).length > 0;
-    if (keyless && !(REVIEWED_EGRESS_LABELS as readonly string[]).includes(SIGSTORE_SET) && !(E3_EGRESS_SETS as readonly string[]).includes(SIGSTORE_SET)) {
-      addNote(notes, 'Your deploys stop for now: pipegen checks a keyless signature with Sigstore, whose hosts are not in a reviewed network set yet, so the verify job can not reach them behind the network lock and fails. This is fixed before release (G15); until then a deploy of this image does not pass pipegen-verify.');
+    const cosign = opts.reviewed.find((t) => t.id === COSIGN_ID);
+    const reach = new Set<string>(cosign === undefined ? [] : ['github-core', 'ghcr', ...egressSetsForTool(cosign)].flatMap((x) => EGRESS_DOMAIN_SETS[x as EgressSet] ?? []));
+    if (keyless && SIGSTORE_HOSTS.some((h) => !reach.has(h))) {
+      addNote(notes, 'Your deploys stop for now: pipegen checks a keyless signature with Sigstore, whose hosts are not in a reviewed network set yet, so the verify job can not reach them behind the network lock and fails. pipegen adds them before release; until then a deploy of this image does not pass pipegen-verify.');
     }
   }
 

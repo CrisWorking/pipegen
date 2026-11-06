@@ -4,7 +4,7 @@
 // tool-flags.ts and types.ts (test/final-fix-b.test.ts and test/module-graph.test.ts check this).
 import { EXPR, own, RenderError, show } from './render-error.js';
 import {
-  BUILD_PUSH_STEP_ID, DIGEST_STEP_ENV, DIGEST_STEP_ID, FIND_RUN_STEP_ID, HEAD_CHECK_ENV, HEAD_CHECK_STEP_ID, imageDigestArtifact, PUBLISH_DIGEST_ENV, PUBLISH_DIGEST_STEP_ID,
+  BUILD_PUSH_STEP_ID, DIGEST_STEP_ENV, DIGEST_STEP_ID, FIND_RUN_STEP_ID, HEAD_CHECK_DIR, HEAD_CHECK_ENV, HEAD_CHECK_STEP_ID, imageDigestArtifact, PUBLISH_DIGEST_ENV, PUBLISH_DIGEST_STEP_ID,
 } from './deploy-steps.js';
 import { GATE_RESULT_ARTIFACT, resultArtifactName, SECRETS_RANGE_ARTIFACT, slug } from './artifact-names.js';
 import { ARGV_POLICIES, BASE_CHECKOUT_REF, GATE_OPTIONAL_UPLOADS, RANGE_BEFORE_REF, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, isGateUploadName, CHECKER_STEP_ID_RE, GATE_USES_RE, isStagedTool, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, stagePath, stageStepId, STAGE_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
@@ -925,6 +925,8 @@ export function checkExpressions(step: RenderedStep): void {
   const odd = (what: string): never => { throw new RenderError(`A step's ${what} is not in a form pipegen writes (${show(step.name)}).`); };
   for (const key of STEP_KEYS) {
     const v: unknown = step[key];
+    // G7-R2 1a: the head check (a pipegen run step) runs in the runner's temp folder, the one expression its working-directory may hold
+    if (key === 'working-directory' && v === HEAD_CHECK_DIR && step.id === HEAD_CHECK_STEP_ID && step.run !== undefined && step.uses === undefined) continue;
     if (typeof v === 'string' && v.includes(EXPR)) bad(key);
   }
   if (typeof step.usesComment === 'string' && step.usesComment.includes(EXPR)) bad('usesComment');
