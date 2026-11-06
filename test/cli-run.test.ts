@@ -34,6 +34,7 @@ import { CALLER_WORKFLOW, NIGHTLY_WORKFLOW } from '../src/engine/job-rules.js';
 import { floorNeeds, jobCategories, MINIMUM_CATEGORIES } from '../src/engine/needs.js';
 import { estimate, needKeyCount } from '../src/estimate/estimate.js';
 import { AssembleError } from '../src/layers/jobs.js';
+import { DeliverError } from '../src/deliver/git-data.js';
 import { pubKeySha256 } from '../src/engine/signing.js';
 import { StateStore } from '../src/proof/state.js';
 import type { CreatedFile, InstallRecord, Need, PipelineDraft, RepoProfile } from '../src/types.js';
@@ -510,8 +511,10 @@ describe('G13: stages 8-15', () => {
     const dir = tmp('pg-creators-');
     const hinted = svc({ name: 'built-elsewhere', path: 'a', scripts: ['start'], containerHint: '.github/workflows/build.yml builds an image from a' });
     const plain = svc({ name: 'plain', path: 'b', scripts: ['start'] });
+    // set to container by the user, with no Dockerfile: "pipegen would create one" is not acted on (the C2 extension)
+    const told = svc({ name: 'told-container', path: 'c', scripts: ['start'], projectType: { types: ['container'], evidence: ['set to container by you'], unsure: false, overridden: true } as never });
     const asked: string[] = [];
-    const draft = { profile: LOCAL({ services: [hinted, plain] }), skipped: [] } as unknown as PipelineDraft;
+    const draft = { profile: LOCAL({ services: [hinted, plain, told] }), skipped: [] } as unknown as PipelineDraft;
     const vault = new SecretVault();
     const r = await runCreators(draft, { files: [] } as unknown as CodeBundle, scripted().ai, dir, vault, REVIEWED, {
       dockerfile: async (s) => { asked.push(s.name); return { files: [], notes: [] } as never; },
@@ -731,6 +734,20 @@ describe('G13: two-step delivery and after', () => {
     expect(w.vaults).toHaveLength(1);
     expect(w.vaults[0]?.names()).toEqual([]);
     expect(i.errs.join('\n')).toMatch(/Nothing was delivered/);
+  });
+
+  it('run: what delivery says is shown: its notes, and on a DeliverError what it had stored (carry 19)', async () => {
+    const w = world();
+    w.stages.deliver = async () => { throw new DeliverError('the base moved', { leftovers: ['PIPEGEN_COSIGN_KEY in pipegen-signing'] }); };
+    const i = io();
+    expect(await run(w, i)).toBe(1);
+    expect(i.errs.join('\n')).toContain('pipegen stopped: the base moved');
+    expect(i.errs.join('\n')).toContain('left: PIPEGEN_COSIGN_KEY in pipegen-signing');
+    const ok = world();
+    const i2 = io();
+    await run(ok, i2);
+    expect(i2.lines.join('\n')).toContain('delivery note');
+    expect(i2.lines.join('\n')).toContain('done: central files');
   });
 
   it('run: the vault is wiped on every exit (an error after the secrets too)', async () => {

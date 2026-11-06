@@ -801,7 +801,9 @@ export async function runCreators(draft: PipelineDraft, bundle: CodeBundle, ai: 
   return withActiveVault(vault, async () => {
     if (!skip('docker')) {
       for (const s of p.services) {
-        if (s.dockerfile !== undefined || s.containerHint !== undefined || !isRunnable(s)) continue;
+        // the C2 extension: a service set to `container` with --type (or the question) but no Dockerfile is not given a created one
+        const overriddenContainer = s.projectType?.overridden === true && s.projectType.types.includes('container');
+        if (s.dockerfile !== undefined || s.containerHint !== undefined || overriddenContainer || !isRunnable(s)) continue;
         const r = await (c.dockerfile ?? createDockerfile)(s, p, bundle, ai, { repoPaths });
         files.push(...r.files);
         testNotes.push(...r.notes);
