@@ -479,6 +479,15 @@ export async function centralPrBase(gh: Octokit, central: RepoRef, appRepo: stri
  * branch refuses goes through the pull request instead), the setup PR body's marker line, and the local record file. The record is checked
  * against the schema before anything is sent.
  */
+/**
+ * How far a writeRecord that threw got (G12-R2 N3): `central` = the record is in the central repo (direct commit or central PR) but the local
+ * record file and the setup PR marker are not updated; `local` = central and the local file are, the setup PR marker is not; undefined = the
+ * central record was not written. The error itself is passed through unchanged (a rate stop stays a rate stop).
+ */
+export const recordWriteReached = (e: unknown): 'central' | 'local' | undefined => (typeof e === 'object' && e !== null ? REACHED.get(e) : undefined);
+const REACHED = new WeakMap<object, 'central' | 'local'>();
+const reached = (e: unknown, at: 'central' | 'local'): unknown => { if (typeof e === 'object' && e !== null) REACHED.set(e, at); return e; };
+
 export async function writeRecord(gh: Octokit, args: WriteRecordArgs): Promise<WriteRecordResult> {
   const clock = args.clock ?? clockOf(gh);
   const record = checkRecord(JSON.parse(canonicalRecordJson(args.record)));
@@ -525,12 +534,16 @@ export async function writeRecord(gh: Octokit, args: WriteRecordArgs): Promise<W
     centralPr = { number: pr.number, url: pr.url };
   }
 
-  // the setup pull request's body: every earlier marker removed, the new one on the last line
-  const pr = await ghRead(gh, 'GET /repos/{owner}/{repo}/pulls/{pull_number}', app, { pull_number: args.setupPr }, clock) as { body?: unknown } | null;
-  const body = typeof pr?.body === 'string' ? pr.body : '';
-  await ghWrite(gh, 'PATCH /repos/{owner}/{repo}/pulls/{pull_number}', app, { pull_number: args.setupPr, body: withRecordMarker(body, hash) }, clock);
-
-  await writeLocalRecord(app, { recordHash: hash, setupPr: args.setupPr, updatedAt: (args.now?.() ?? new Date()).toISOString() }, args.local ?? {});
+  // G12-R2 N3: the local record file right after the central write (it vouches for the record pipegen just wrote, so a later run can trust
+  // it even when the marker below fails), then the setup pull request's body: every earlier marker removed, the new one on the last line
+  try {
+    await writeLocalRecord(app, { recordHash: hash, setupPr: args.setupPr, updatedAt: (args.now?.() ?? new Date()).toISOString() }, args.local ?? {});
+  } catch (e) { throw reached(e, 'central'); }
+  try {
+    const pr = await ghRead(gh, 'GET /repos/{owner}/{repo}/pulls/{pull_number}', app, { pull_number: args.setupPr }, clock) as { body?: unknown } | null;
+    const body = typeof pr?.body === 'string' ? pr.body : '';
+    await ghWrite(gh, 'PATCH /repos/{owner}/{repo}/pulls/{pull_number}', app, { pull_number: args.setupPr, body: withRecordMarker(body, hash) }, clock);
+  } catch (e) { throw reached(e, 'local'); }
   return { recordHash: hash, commit, via, ...(centralPr === undefined ? {} : { centralPr }), notes };
 }
 

@@ -11,10 +11,10 @@ import { updatePatch } from '../gate/src/pin-patch.js';
 import type { Prompter } from '../src/cli/io.js';
 import { gitBlobSha } from '../src/create/guard.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
-import { centralUpdateBranch, guardRecordOf, ownWholeFile, readLocalRecord, readRecord, recordFileText, recordHash, recordMarkerOf, recordPath, writeLocalRecord } from '../src/deliver/record.js';
+import { centralUpdateBranch, guardRecordOf, localRecordPath, ownWholeFile, readLocalRecord, readRecord, recordFileText, recordHash, recordMarkerOf, recordPath, writeLocalRecord } from '../src/deliver/record.js';
 import { TYPED_VIEW_FIELDS } from '../src/deliver/trust.js';
 import {
-  applyUnifiedDiff, changeProblem, deriveNotProven, gateSwaps, merge3, notProvenProblem, promptOf, swapPins, update, UPDATE_BRANCH, UpdateError, type UpdateDeps,
+  applyUnifiedDiff, centralSwaps, changeProblem, deriveNotProven, gateSwaps, merge3, notProvenProblem, promptOf, swapPins, update, UPDATE_BRANCH, UpdateError, type UpdateDeps,
 } from '../src/deliver/update.js';
 import type { InstallRecord, ReviewedTool } from '../src/types.js';
 import { FakeGitHub } from './helpers/deliver-github.js';
@@ -495,15 +495,30 @@ describe('G12 fix round 1 (G12-R1)', () => {
 
   it('C1: a record trusted by typing → update stops before any write; the central record stays byte-identical', async () => {
     const w = await publicWorld();
-    rmSync(join(w.home, '.config'), { recursive: true, force: true });   // a new machine: no local record file
+    // the local file says the hash was vouched by typing (an earlier interactive pipegen run): trustedPrevious gives the view, update stops
+    await writeLocalRecord(app, { recordHash: recordHash(w.record), typed: true, updatedAt: '2026-11-01T00:00:00Z' }, { home: w.home, env: {} });
     const before = centralFile(w, recordPath('r'));
-    const typedIo: Prompter = { confirm: async () => true, select: async () => { throw new Error('no select'); }, text: async () => 'o/r' };
-    await expect(update(w.g.octokit(), app, deps(w, { io: typedIo, interactive: true }))).rejects.toThrow(/only confirmed by name.*npx pipegen/);
+    await expect(update(w.g.octokit(), app, deps(w))).rejects.toThrow(/only confirmed by name.*npx pipegen/);
     expect(writes(w)).toEqual([]);
     expect(centralFile(w, recordPath('r'))).toBe(before);
-    // and again from the local file that now says typed: still a stop
-    await expect(update(w.g.octokit(), app, deps(w))).rejects.toThrow(/only confirmed by name/);
+  });
+
+  it('a local record file that matches no record → update stops, nothing written', async () => {
+    const w = await publicWorld();
+    await writeLocalRecord(app, { recordHash: 'f'.repeat(64), setupPr: 1, updatedAt: '2026-11-01T00:00:00Z' }, { home: w.home, env: {} });
+    await expect(update(w.g.octokit(), app, deps(w))).rejects.toThrow(/no install record .* that it trusts/);
     expect(writes(w)).toEqual([]);
+  });
+
+  it('N4: with no local record file update never asks the typed question; it stops with "run npx pipegen first"', async () => {
+    const w = await publicWorld();
+    rmSync(join(w.home, '.config'), { recursive: true, force: true });
+    const typedAsks: string[] = [];
+    const typedIo: Prompter = { confirm: async () => true, select: async () => { throw new Error('no select'); }, text: async (m) => { typedAsks.push(m); return 'o/r'; } };
+    await expect(update(w.g.octokit(), app, deps(w, { io: typedIo, interactive: true }))).rejects.toThrow(/no local record file.*npx pipegen/);
+    expect(typedAsks).toEqual([]);
+    expect(writes(w)).toEqual([]);
+    expect(await readLocalRecord(app, { home: w.home, env: {} })).toBeNull();   // no trust decision kept
   });
 
   it('I1: the re-pin is proven from content: an unrecorded evil sign file or a planted sha never moves the app', async () => {
@@ -644,5 +659,89 @@ describe('G12 fix round 1 (G12-R1)', () => {
     expect(res.done).toBe(true);
     expect(res.conflicts.map((c) => c.path)).toEqual([PIPEGEN_YML]);
     expect(prsOf(w, 'o/r')[0]?.body).not.toContain(`Closes #${noPatch.number as number}`);
+  });
+});
+
+describe('G12 fix round 2 (G12-R2)', () => {
+  it('N1: a spoofed `# gate-v99` on a line pipegen didn\'t write is a conflict, never "a newer pipegen wrote this"', async () => {
+    const written = gateFile(OLD, OLD_V);
+    for (const sha of [OLD, OTHER]) {
+      const spoof = written.replace(`        uses: crisworking/pipegen/gate@${OLD} # gate-v${OLD_V}`, `        uses: crisworking/pipegen/gate@${sha} # gate-v99.0.0`);
+      const w = await publicWorld({ written, current: spoof });
+      const res = await update(w.g.octokit(), app, deps(w));
+      expect(res.conflicts.map((c) => c.path), sha).toEqual([PIPEGEN_YML]);
+      expect(res.notes.join(' '), sha).not.toMatch(/newer pipegen/);
+      expect(writes(w)).toEqual([]);
+    }
+  });
+
+  it('N2: a refused re-pin holds back the whole app (no half update), and a held file means no Closes #N', async () => {
+    // private: the owner's central merge file at the head is not pipegen's swap of the file the app calls → re-pin refused
+    const merge = gateFile(OLD, OLD_V);
+    const w = shell({}, true, { [C_MERGE]: merge });
+    const c0 = w.g.head('o/pipelines');
+    const deploy = `name: deploy\non: { push: { branches: [main] } }\npermissions: {}\njobs:\n  pipegen-verify:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: crisworking/pipegen/gate@${OLD} # gate-v${OLD_V}\n        with:\n          mode: find-run\n          central-sha: ${c0}\n`;
+    w.g.commitOn('o/r', 'main', { [PIPEGEN_YML]: privateCaller(c0), '.github/workflows/deploy.yml': deploy }, 'setup');
+    const ownerMerged = gateFile(NEW, NEW_V, '  owner:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: echo mine');
+    w.g.commitOn('o/pipelines', 'main', { [C_MERGE]: ownerMerged }, 'owner + update merged');
+    await vouch(w, {
+      ...baseRecord(w.g, true, c0, [
+        { repo: 'app', path: PIPEGEN_YML, part: 'pipeline', shas: [gitBlobSha(privateCaller(c0))] },
+        { repo: 'central', path: C_MERGE, part: 'pipeline', shas: [gitBlobSha(merge), gitBlobSha(ownerMerged)], ownerEdited: true },
+      ]),
+      edits: [{ repo: 'app', path: '.github/workflows/deploy.yml', kind: 'verify-job', jobs: ['pipegen-verify'], needs: [], originalSha: gitBlobSha('x'), writtenShas: [gitBlobSha(deploy)] }],
+    });
+    w.issues.app = [issue(updateBody(NEW_V))];
+    const res = await update(w.g.octokit(), app, deps(w));
+    expect(res.done).toBe(false);
+    expect(prsOf(w, 'o/r')).toEqual([]);   // deploy.yml's gate swap held back too
+    expect(res.notes.join(' ')).toMatch(/doesn't re-pin.*npx pipegen/s);
+    // public: one file skipped on purpose (m3), another changed: the PR states the skip and closes nothing
+    const written = gateFile(NEW, NEW_V);
+    const w2 = shell({ [PIPEGEN_YML]: written, [PUSH_YML]: gateFile(OLD, OLD_V) }, false);
+    w2.g.commitOn('o/r', 'main', { [PIPEGEN_YML]: written.replace(`gate@${NEW} # gate-v${NEW_V}`, `gate@${OTHER} # gate-v${NEW_V}`) }, 'owner');
+    await vouch(w2, baseRecord(w2.g, false, null, [
+      { repo: 'app', path: PIPEGEN_YML, part: 'pipeline', shas: [gitBlobSha(written)] },
+      { repo: 'app', path: PUSH_YML, part: 'pipeline', shas: [gitBlobSha(gateFile(OLD, OLD_V))] },
+    ]));
+    const prompt = issue(updateBody(NEW_V));
+    w2.issues.app = [prompt];
+    const r2 = await update(w2.g.octokit(), app, deps(w2));
+    expect(r2.done).toBe(true);
+    const body = prsOf(w2, 'o/r')[0]?.body ?? '';
+    expect(body).toMatch(/Left on its old pin on purpose.*npx pipegen/s);
+    expect(body).not.toContain(`Closes #${prompt.number as number}`);
+  });
+
+  it('N3: a 502 on the setup PR marker → the note says the record and local file are written; the next update trusts it', async () => {
+    const w = await publicWorld();
+    w.g.hooks.unshift((call) => (call.route === 'PATCH /repos/{owner}/{repo}/pulls/{pull_number}' && call.params.pull_number === 1 ? { status: 502 } : undefined));
+    const res = await update(w.g.octokit(), app, deps(w));
+    expect(res.done).toBe(true);
+    expect(res.notes.join(' ')).toMatch(/install record is written.*marker was not updated/);
+    const rec = (await readRecord(w.g.octokit(), { owner: 'o', repo: 'pipelines' }, 'r'))?.record as InstallRecord;
+    expect((await readLocalRecord(app, { home: w.home, env: {} }))?.recordHash).toBe(recordHash(rec));
+    w.g.hooks.shift();
+    await expect(update(w.g.octokit(), app, deps(w))).resolves.toMatchObject({ done: true });
+    // a failure right after the central write (the local file can't be saved): the note says the central record is written, run npx pipegen
+    const w2 = await publicWorld();
+    const { mkdirSync, writeFileSync } = await import('node:fs');
+    const file = localRecordPath(app, { home: w2.home, env: {} });
+    // when the central record ref moves, the local record file's place becomes a folder: saving the file then fails
+    w2.g.hooks.unshift((call) => { if (call.route === 'PATCH /repos/{owner}/{repo}/git/refs/{ref}' && call.params.repo === 'pipelines') { rmSync(file, { force: true }); mkdirSync(file); writeFileSync(join(file, 'x'), 'x'); } return undefined; });
+    const r2 = await update(w2.g.octokit(), app, deps(w2));
+    expect(r2.notes.join(' ')).toMatch(/written in the central repo, but this machine's local record file was not updated.*npx pipegen/);
+  });
+
+  it('N6/N7: central calls match the owner in any case but the path exactly; the m3 note says what differs, also for a quoted gate', async () => {
+    const [uses] = centralSwaps('o', 'r', 'a'.repeat(40), 'b'.repeat(40));
+    expect(uses?.test(`O/pipelines/.github/workflows/r--merge.yml@${'a'.repeat(40)}`)).toBe(true);
+    expect(uses?.test(`o/pipelines/.github/workflows/R--merge.yml@${'a'.repeat(40)}`)).toBe(false);
+    const written = gateFile(NEW, NEW_V);
+    const w = await publicWorld({ written, current: written.replace(`uses: crisworking/pipegen/gate@${NEW} # gate-v${NEW_V}`, `uses: "crisworking/pipegen/gate@${OTHER}" # gate-v${NEW_V}`) });
+    const res = await update(w.g.octokit(), app, deps(w));
+    expect(res.notes.join(' ')).toMatch(/pins a value pipegen can't update .*plain form/);
+    const w2 = await publicWorld({ written, current: written.replace(`gate@${NEW} # gate-v${NEW_V}`, `gate@${OTHER} # gate-v${NEW_V}`) });
+    expect((await update(w2.g.octokit(), app, deps(w2))).notes.join(' ')).toMatch(/pins pipegen's gate at a commit other than the reviewed one/);
   });
 });

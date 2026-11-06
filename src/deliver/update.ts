@@ -37,7 +37,7 @@ import { CENTRAL_REPO } from '../proof/target.js';
 import { FLOOR_NEEDS, type InstallRecord, type RecordRepo, type ReviewedTool } from '../types.js';
 import { safeMarkdown, safeText } from '../util/safe-text.js';
 import { commitFiles, DeliverError, ghRead, statusOf, openOrUpdatePr, readBlobText, readHead, readRepo, readTree, setBranch, type RepoRef, type TreeEntry } from './git-data.js';
-import { centralOf, centralUpdateBranch, readLocalRecord, RecordError, writeRecord, type LocalRecordDeps } from './record.js';
+import { centralOf, centralUpdateBranch, readLocalRecord, RecordError, recordWriteReached, writeRecord, type LocalRecordDeps } from './record.js';
 import { trustedPrevious } from './trust.js';
 
 // ---------- constants ----------
@@ -375,7 +375,9 @@ const CENTRAL_LAYERS: readonly CentralLayer[] = ['merge', 'push', 'nightly', 'si
 /** This project's central workflow files, exactly (G12-R1 m5: never a prefix match, which another project's name could share). */
 export const centralFilesOf = (appRepo: string): string[] => CENTRAL_LAYERS.map((l) => centralWorkflowFile(appRepo, l));
 /** `<owner>/pipelines/<one of this project's central files>@<sha>`: group 1 the file, group 2 the sha. */
-const centralCallRe = (owner: string, appRepo: string): RegExp => new RegExp(`^${esc(owner)}/${esc(CENTRAL_REPO)}/(${centralFilesOf(appRepo).map(esc).join('|')})@([0-9a-f]{40})$`, 'i');
+/** The owner matched in any letter case (GitHub names are case-insensitive); the path matched exactly (git paths are not; G12-R2 N6). */
+const anyCase = (s: string): string => [...s].map((c) => (/[A-Za-z]/.test(c) ? `[${c.toLowerCase()}${c.toUpperCase()}]` : esc(c))).join('');
+const centralCallRe = (owner: string, appRepo: string): RegExp => new RegExp(`^${anyCase(owner)}/${esc(CENTRAL_REPO)}/(${centralFilesOf(appRepo).map(esc).join('|')})@([0-9a-f]{40})$`);
 /** The app's calls of this project's central workflows at commit `from` → `to` (the `uses:` and the find-run step's `central-sha`). */
 export function centralSwaps(owner: string, appRepo: string, from: string, to: string): Swap[] {
   const call = centralCallRe(owner, appRepo);
@@ -553,7 +555,8 @@ async function repoState(gh: Octokit, ref: RepoRef, clock: RateClock): Promise<R
   return { ref, defaultBranch: repo.defaultBranch, head, tree: t.tree, entries: t.entries };
 }
 
-interface Derived { changes: FileChange[]; conflicts: Conflict[]; notes: string[]; current: Map<string, { sha: string; text: string }> }
+/** held (G12-R2 N2): why a file was left on an old pin on purpose; the run then answers no issue whole (no `Closes #N`) and says so. */
+interface Derived { changes: FileChange[]; conflicts: Conflict[]; notes: string[]; held: string[]; current: Map<string, { sha: string; text: string }> }
 const keyOf = (repo: RecordRepo, path: string): string => `${repo}:${path}`;
 
 /** A blob GitHub doesn't give (gone, too large, an answer pipegen can't read): never a rate stop or a rejected token. */
@@ -569,10 +572,14 @@ async function derive(gh: Octokit, st: RepoState, items: readonly Touchable[], s
     // m2: a file that isn't UTF-8 would be decoded lossily and written back changed outside its pin lines
     if (gitBlobSha(current) !== e.sha) { out.conflicts.push({ repo: t.repo, path: t.path, why: 'it is not UTF-8 text, so pipegen can\'t change it byte-exactly' }); continue; }
     out.current.set(keyOf(t.repo, t.path), { sha: e.sha, text: current });
-    // I2: a file a newer pipegen pinned is left alone (never moved back to an older gate)
-    const probe = swapPins(current, swaps);
-    if ('newer' in probe && probe.newer !== undefined) { out.notes.push(`${label(t.repo, show(t.path))}: a newer pipegen wrote this (gate v${probe.newer}); pipegen leaves it as it is. Run \`npx pipegen@latest update\`.`); continue; }
     const ownerEdited = !t.shas.includes(e.sha);
+    // I2: a file a newer pipegen pinned is left alone (never moved back to an older gate). G12-R2 N1: only a file pipegen wrote (its blob is a
+    // recorded sha) is believed; anyone's `# gate-v99` on an unvouched file goes through the merge, where it is a conflict
+    const probe = swapPins(current, swaps);
+    if (!ownerEdited && 'newer' in probe && probe.newer !== undefined) {
+      const why = `${label(t.repo, show(t.path))}: a newer pipegen wrote this (gate v${probe.newer}); pipegen leaves it as it is. Run \`npx pipegen@latest update\`.`;
+      out.notes.push(why); out.held.push(why); continue;
+    }
     let base = current;
     if (ownerEdited) {
       const last = t.shas.at(-1);
@@ -586,8 +593,15 @@ async function derive(gh: Octokit, st: RepoState, items: readonly Touchable[], s
     const theirs = swapPins(base, swaps);
     if ('refused' in theirs) { out.conflicts.push({ repo: t.repo, path: t.path, why: `pipegen can't change it: ${theirs.refused}` }); continue; }
     if (theirs.text === base) {
-      // m3: pipegen's own last text is current, but the owner's file pins the gate elsewhere: say so (never a silent "nothing to change")
-      if ('text' in probe && probe.text !== current) out.notes.push(`${label(t.repo, show(t.path))} pins pipegen's gate at a commit other than the reviewed one (an edit of yours); pipegen didn't change it.`);
+      // m3 (N7): pipegen's own last text is current, but the owner's file pins something else: say what (never a silent "nothing to change")
+      let why: string | null = null;
+      if ('refused' in probe) why = `${label(t.repo, show(t.path))}: your edit pins a value pipegen can't update (${probe.refused}); pipegen didn't change it.`;
+      else if (probe.text !== current) {
+        const gateOnly = swapPins(current, swaps.filter((x) => x.comment !== undefined));
+        const what = 'text' in gateOnly && gateOnly.text !== current ? 'pipegen\'s gate at a commit other than the reviewed one' : 'a central workflow at another central commit';
+        why = `${label(t.repo, show(t.path))} pins ${what} (an edit of yours); pipegen didn't change it.`;
+      }
+      if (why !== null) { out.notes.push(why); out.held.push(why); }
       continue;
     }
     let after = theirs.text;
@@ -615,7 +629,7 @@ function centralCallsIn(texts: readonly string[], owner: string, appRepo: string
         if (!isScalar(pair.key) || pair.key.value !== 'uses' || !isScalar(pair.value) || typeof pair.value.value !== 'string') return;
         const m = re.exec(pair.value.value);
         if (m === null) return;
-        const file = centralFilesOf(appRepo).find((f) => f.toLowerCase() === (m[1] as string).toLowerCase()) as string;
+        const file = m[1] as string;
         calls.set(file, (calls.get(file) ?? new Set()).add(m[2] as string));
       },
     });
@@ -629,14 +643,14 @@ function centralCallsIn(texts: readonly string[], owner: string, appRepo: string
  * (swapPins(blob at from, gate swaps)), and at least one of them must change. Anything that can't be checked, or differs, is no re-pin and a
  * plain note. null: no re-pin.
  */
-async function repinTarget(gh: Octokit, app: RepoRef, appTexts: readonly string[], central: RepoState, gate: readonly Swap[], clock: RateClock, notes: string[]): Promise<{ from: string; to: string } | null> {
+async function repinTarget(gh: Octokit, app: RepoRef, appTexts: readonly string[], central: RepoState, gate: readonly Swap[], clock: RateClock, notes: string[]): Promise<{ from: string; to: string } | { refused: string } | null> {
   const calls = centralCallsIn(appTexts, app.owner, app.repo);
   if (calls.size === 0) return null;
   const shas = new Set([...calls.values()].flatMap((x) => [...x]));
-  if (shas.size !== 1) { notes.push('The app calls its central workflows at more than one central commit, so pipegen doesn\'t re-pin it.'); return null; }
+  if (shas.size !== 1) { const why = 'The app calls its central workflows at more than one central commit, so pipegen doesn\'t re-pin it.'; notes.push(why); return { refused: why }; }
   const from = [...shas][0] as string;
   if (from === central.head) return null;
-  const refuse = (why: string): null => { notes.push(`pipegen doesn't re-pin the app to the central default branch: ${why}.`); return null; };
+  const refuse = (why: string): { refused: string } => { const text = `pipegen doesn't re-pin the app to the central default branch: ${why}.`; notes.push(text); return { refused: text }; };
   let at;
   try { at = await readTree(gh, central.ref, from, clock); } catch (e) { if (!unreadable(e)) throw e; return refuse('it can\'t read the central commit the app calls'); }
   let needed = false;
@@ -703,7 +717,7 @@ function shownLines(diff: string): string[] {
 
 // ---------- the preview ----------
 
-interface Plan { appRepo: string; gate: GatePin; app: FileChange[]; central: FileChange[]; conflicts: Conflict[]; acted: UpdatePrompt[]; ignored: IgnoredIssue[]; refused: RefusedIssue[]; notes: string[]; repin: string | null; name: string }
+interface Plan { held: string[]; appRepo: string; gate: GatePin; app: FileChange[]; central: FileChange[]; conflicts: Conflict[]; acted: UpdatePrompt[]; ignored: IgnoredIssue[]; refused: RefusedIssue[]; notes: string[]; repin: string | null; name: string }
 
 function previewOf(p: Plan): string {
   const out = [`pipegen update: the gate pin of this pipegen's reviewed list is v${p.gate.version} (${p.gate.sha}). Issues are only prompts: pipegen derived every change below itself.`];
@@ -734,6 +748,7 @@ function appPrBody(p: Plan): string {
   if (p.repin !== null) lines.push('', `The calls of the central workflows now pin \`${p.repin}\`, the central commit that holds the updated files.`);
   const conflicts = p.conflicts.filter((c) => c.repo === 'app');
   if (conflicts.length > 0) lines.push('', 'Not changed (merge by hand; pipegen never overwrites your edits):', ...conflicts.map((c) => `- \`${safeMarkdown(c.path, 200)}\`: ${safeMarkdown(c.why, 300)}`));
+  if (p.held.length > 0) lines.push('', 'Left on its old pin on purpose (this pull request doesn\'t finish the update; run `npx pipegen` in this repo to re-check the setup and re-pin):', ...p.held.map((h) => `- ${safeMarkdown(h, 400)}`));
   const closes = p.acted.filter((x) => x.in === 'app' && answers(x, p));
   if (closes.length > 0) lines.push('', ...closes.map((x) => `Closes #${x.issue}`));
   return lines.join('\n');
@@ -743,6 +758,7 @@ function appPrBody(p: Plan): string {
  * issue that names no file (a private repo's) is closed only when no file is left in the conflict list.
  */
 function answers(x: UpdatePrompt, p: Plan): boolean {
+  if (p.held.length > 0) return false;   // G12-R2 N2: a file left on an old pin on purpose: the update is not done
   const changed = new Set([...p.app, ...p.central].map((c) => keyOf(c.repo, c.path)));
   return x.patches.length > 0 ? x.patches.every((y) => changed.has(keyOf(y.repo, y.path))) : p.conflicts.length === 0;
 }
@@ -751,6 +767,7 @@ function centralPrBody(p: Plan): string {
     `pipegen moves the gate pin of the central workflows of ${safeMarkdown(p.name, 100)} to v${safeMarkdown(p.gate.version, 20)} (\`${p.gate.sha}\`), the pin of its reviewed list, and records what it wrote in the install record. After this pull request is merged, run \`pipegen update\` again: it then pins the app to the merged commit.`,
     '', 'Files:', ...p.central.map((c) => `- \`${safeMarkdown(c.path, 200)}\`${c.ownerEdited ? ' (merged with your edits)' : ''}`),
   ];
+  if (p.held.length > 0) lines.push('', 'Left on its old pin on purpose (run `npx pipegen` in the app repo to re-check the setup):', ...p.held.map((h) => `- ${safeMarkdown(h, 400)}`));
   const conflicts = p.conflicts.filter((c) => c.repo === 'central');
   if (conflicts.length > 0) lines.push('', 'Not changed (merge by hand):', ...conflicts.map((c) => `- \`${safeMarkdown(c.path, 200)}\`: ${safeMarkdown(c.why, 300)}`));
   const closes = p.acted.filter((x) => x.in === 'central' && answers(x, p));
@@ -803,14 +820,18 @@ export async function update(gh: Octokit, app: RepoRef, deps: UpdateDeps): Promi
   const centralRepo = await readRepo(gh, centralRef, clock);
   if (centralRepo === null) throw new UpdateError(`pipegen can't see ${show(`${centralRef.owner}/${centralRef.repo}`, 120)}, where its install record is, so it changes nothing.`);
   const notes: string[] = [];
-  const trusted = await trustedPrevious(gh, app, centralRef, centralRepo.defaultBranch, centralUpdateBranch(app.repo), deps.local ?? {}, clock, notes, { io: deps.io, interactive: deps.interactive === true });
+  // G12-R2 N4: update never asks the typed trust question (its answer would stand for deliver and uninstall, and update can't use a view)
+  const trusted = await trustedPrevious(gh, app, centralRef, centralRepo.defaultBranch, centralUpdateBranch(app.repo), deps.local ?? {}, clock, notes, { io: deps.io, interactive: false });
+  if (trusted.record === null && trusted.why === 'no-local') {
+    throw new UpdateError(`This machine has no local record file for ${show(`${app.owner}/${app.repo}`, 140)}, so pipegen can't check its install record. Run \`npx pipegen\` in this repo first (it re-checks the full setup), then run update again.`);
+  }
   if (trusted.record === null) {
     throw new UpdateError(`pipegen found no install record for ${show(`${app.owner}/${app.repo}`, 140)} that it trusts, so it changes nothing: update touches only the files the record lists.${notes.length > 0 ? ` ${notes.join(' ')}` : ''}`);
   }
   const record = trusted.record;
   // G12-R1 C1: a record trusted by typing is a view (edits, plans and settings dropped); update never writes it back as the record
-  const local = await readLocalRecord(app, deps.local ?? {}).catch((e: unknown) => { if (e instanceof RecordError) return null; throw e; });
-  if (local?.typed === true) throw new UpdateError('pipegen can\'t update from a record you only confirmed by name. Run `npx pipegen` in this repo first (it re-checks the full setup), then run update again.');
+  // N5: from what the trust decision returned, never a second read of the file
+  if (trusted.typed === true) throw new UpdateError('pipegen can\'t update from a record you only confirmed by name. Run `npx pipegen` in this repo first (it re-checks the full setup), then run update again.');
   const appRepo = await readRepo(gh, app, clock);
   if (appRepo === null || appRepo.id !== record.app.repoId) throw new UpdateError(`The install record is for another repository than ${show(`${app.owner}/${app.repo}`, 140)} (its id differs), so pipegen changes nothing.`);
   const centralSt = await repoState(gh, centralRef, clock);
@@ -818,12 +839,12 @@ export async function update(gh: Octokit, app: RepoRef, deps: UpdateDeps): Promi
   const { prompts, ignored } = await findUpdates(gh, app, clock);
   const items = touchable(record);
   const gateSw = gateSwaps(gate);
-  const d: Derived = { changes: [], conflicts: [], notes, current: new Map() };
+  const d: Derived = { changes: [], conflicts: [], notes, held: [], current: new Map() };
   const centralItems = items.filter((t) => t.repo === 'central');
   await derive(gh, centralSt, centralItems, gateSw, clock, d);
   const central = d.changes.filter((c) => c.repo === 'central');
   const appItems = items.filter((t) => t.repo === 'app');
-  let repin: { from: string; to: string } | null = null;
+  let repin: { from: string; to: string } | { refused: string } | null = null;
   if (central.length === 0 && record.centralSha !== null) {
     const texts: string[] = [];
     for (const t of appItems) {
@@ -832,20 +853,28 @@ export async function update(gh: Octokit, app: RepoRef, deps: UpdateDeps): Promi
     }
     repin = await repinTarget(gh, app, texts, centralSt, gateSw, clock, notes);
   }
-  const appSwaps = repin === null ? gateSw : [...gateSw, ...centralSwaps(app.owner, app.repo, repin.from, repin.to)];
+  const moved = repin !== null && 'from' in repin ? repin : null;
+  const appSwaps = moved === null ? gateSw : [...gateSw, ...centralSwaps(app.owner, app.repo, moved.from, moved.to)];
   await derive(gh, appSt, appItems, appSwaps, clock, d);
   let appChanges = d.changes.filter((c) => c.repo === 'app');
+  if (repin !== null && 'refused' in repin) {
+    // G12-R2 N2: the app is never half-updated (its verify job on the new gate, its calls on the old central commit): nothing of the app goes out
+    if (appChanges.length > 0) notes.push('pipegen holds back the app\'s own pin changes too, so the app is never half-updated. Run `npx pipegen` in this repo to re-check the setup and re-pin the app.');
+    d.held.push(repin.refused);
+    appChanges = [];
+  }
   if (central.length > 0) {
     // the app pins only a commit on the central default branch (S26): its change waits until the central pull request is merged
     notes.push('Merge the central pull request first, then run `pipegen update` again: it then updates the app and pins it to the merged central commit.');
     appChanges = [];
   }
   const { acted, refused } = checkPrompts(prompts, gate, record, d);
-  const plan: Plan = { gate, app: appChanges, central, conflicts: d.conflicts, acted, ignored, refused, notes, repin: appChanges.length > 0 ? repin?.to ?? null : null, name: record.name, appRepo: record.app.repo };
+  const plan: Plan = { gate, app: appChanges, central, conflicts: d.conflicts, acted, ignored, refused, notes, repin: appChanges.length > 0 ? moved?.to ?? null : null, name: record.name, appRepo: record.app.repo, held: d.held };
   const preview = previewOf(plan);
   const base = { preview, prompts: acted, ignored, refused, conflicts: d.conflicts, notes };
   if (appChanges.length === 0 && central.length === 0) return { done: false, ...base };
 
+  const local = await readLocalRecord(app, deps.local ?? {}).catch((e: unknown) => { if (e instanceof RecordError) return null; throw e; });
   const setupPr = await setupPrNumber(gh, app, local?.setupPr, clock);
   let yes = false;
   try { yes = await deps.io.confirm(`${preview}\n\nOpen the pull request${appChanges.length > 0 && central.length > 0 ? 's' : ''} with these changes?`, false); } catch (e) { if (!(e instanceof PromptCancelledError)) throw e; }
@@ -871,8 +900,15 @@ export async function update(gh: Octokit, app: RepoRef, deps: UpdateDeps): Promi
   } catch (e) {
     // Spec M3: the app pull request is open; say so, and that the record was not written (its sha is missing: the safe side for uninstall)
     if (prUrl === undefined) throw e;
-    const why = e instanceof DeliverError || e instanceof RecordError || e instanceof UpdateError ? e.message : 'GitHub refused or did not answer';
-    return { done: true, ...base, notes: [...notes, `The pull request ${prUrl} is open, but the install record was not written (${show(why, 300)}); run \`pipegen update\` again to record it.`], prUrl };
+    const why = show(e instanceof DeliverError || e instanceof RecordError || e instanceof UpdateError ? e.message : 'GitHub refused or did not answer', 300);
+    // G12-R2 N3: the note says exactly how far the record got
+    const at = recordWriteReached(e);
+    const note = at === 'local'
+      ? `The pull request ${prUrl} is open and the install record is written (central repo and this machine), but the setup pull request's record marker was not updated (${why}); \`pipegen verify\` reports that until pipegen writes the record again.`
+      : at === 'central'
+        ? `The pull request ${prUrl} is open and the install record is written in the central repo, but this machine's local record file was not updated (${why}), so pipegen can't trust that record from here. Run \`npx pipegen\` in this repo to re-check the setup and vouch for it again.`
+        : `The pull request ${prUrl} is open, but the install record was not written (${why}); run \`pipegen update\` again to record it.`;
+    return { done: true, ...base, notes: [...notes, note], prUrl };
   }
   return { done: true, ...base, notes: [...notes, ...written.notes], ...(prUrl === undefined ? {} : { prUrl }), ...(written.centralPr === undefined ? {} : { centralPrUrl: written.centralPr.url }), recordHash: written.recordHash };
 }
