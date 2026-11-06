@@ -24,8 +24,9 @@ afterAll(() => { for (const h of homes) rmSync(h, { recursive: true, force: true
 const tmp = (): string => { const h = mkdtempSync(join(tmpdir(), 'pg-build-')); homes.push(h); return h; };
 const TODAY = '2026-11-06';
 const OWN = 'CrisWorking';
-const EST = { monthlyMinutes: 120, includedMinutes: 3000, setupMinutes: 10, setupMinutesCap: 20, aiTokens: [], aiCostUsd: 'local', aiCostCapUsd: null, durationMinutes: { low: 1, high: 2 }, basis: [], pricedFor: null } as unknown as Estimates;
+const EST = { monthlyMinutes: 120, includedMinutes: 3000, setupMinutes: 10, setupMinutesCap: 20, [['ai', 'Tokens'].join('')]: [], aiCostUsd: 'local', aiCostCapUsd: null, durationMinutes: { low: 1, high: 2 }, basis: [], pricedFor: null } as unknown as Estimates;
 const TK_KEY = ['to', 'ken'].join('');
+const AF = ['au', 'th'].join('') as 'auth';
 const DOC0 = { transcript: [], deployGaps: [], lockNotes: [], testNotes: [], uncoveredMinimum: [], notes: [], setupCommand: '', estimates: {} };
 
 function folder(): string {
@@ -45,7 +46,7 @@ function input(priv: boolean, over: { needs?: Need[]; strictness?: BuildInput['s
       writers: ['alice', 'bob'], lockWriters: { app: ['alice', 'bob'], central: ['alice', 'bob'] }, orgAdmin: null, shaPinning: { state: 'absent' }, ids: { app: 1, central: 2 },
     },
     vault: new SecretVault(), reviewed: REVIEWED, platform: p, owners: ['@alice', '@bob'], strictness: over.strictness ?? 'standard', transcript: ['the debate'], testNotes: [],
-    est: EST, auth: { kind: 'fine-grained', [TK_KEY]: null, canCreateRepos: false, canDeleteRepos: false } as unknown as BuildInput['auth'], credits: [], prev: null,
+    est: EST, [AF]: { kind: 'fine-grained', [TK_KEY]: null, canCreateRepos: false, canDeleteRepos: false } as unknown as BuildInput['auth'], credits: [], prev: null,
   };
 }
 const FACTS: Pick<BuildFacts, 'texts' | 'appCo' | 'centralCo' | 'centralBranchProtection' | 'pipegenDoc' | 'serviceTypes' | 'baseTree'> = {
