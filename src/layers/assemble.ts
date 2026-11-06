@@ -51,7 +51,7 @@ import { RenderError } from '../engine/render-error.js';
 import { renderFindRunStep, stepsToYaml } from '../engine/render-step.js';
 import type { BaseImage } from '../engine/base-images.js';
 import { IMAGE_PUBLISH_JOB, sharedWorkflows, signCallerJob, signPermissions, SIGN_JOB_ID } from './central.js';
-import { AssembleError, assembleJobs, egressStepFor, JOB_RUNNER, type Job, type JobsPlan } from './jobs.js';
+import { AssembleError, assembleJobs, egressStepFor, JOB_RUNNER, type Job, type JobsPlan, type UncoveredMinimum } from './jobs.js';
 import type { CreatedFile, PipelineDraft, ReviewedTool } from '../types.js';
 import { safeText } from '../util/safe-text.js';
 
@@ -122,6 +122,8 @@ export interface AssembledFiles {
   /** The pipegen-verify job for the deploy workflows (G7 places it); null when the deploy part is skipped. */
   verify: Job | null;
   notes: string[];
+  /** GJ-R2 (review GJ-r1 N3): AssembledJobs.uncoveredMinimum, per need (also in draft.suggestions): the preview and PIPEGEN.md (G9) show them. */
+  uncoveredMinimum: UncoveredMinimum[];
 }
 
 const fail = (m: string): never => { throw new AssembleError(m); };
@@ -407,7 +409,7 @@ export function assemble(input: PipelineDraft, opts: AssembleOpts): AssembledFil
   }
 
   checkLayout(files, draft, layout);
-  return { draft, files, verify, notes };
+  return { draft, files, verify, notes, uncoveredMinimum: a.uncoveredMinimum };
 }
 
 function orderedAll(jobs: Readonly<Record<string, Job>>): Record<string, Job> {

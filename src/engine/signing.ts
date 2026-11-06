@@ -32,7 +32,9 @@ export function signedImageOwner(p: RepoProfile, caps: Capabilities, service: un
   let k: string;
   try { k = slug(String(service)); } catch { return { ok: false, reportOnly: false, why: `${show(String(service))}, which is no service of the repository` }; }
   const owners = p.services.filter((s) => { try { return slug(s.name) === k; } catch { return false; } });
-  if (typeof service !== 'string' || owners.length !== 1) return { ok: false, reportOnly: false, why: `${show(String(service))}, which is no service of the repository` };
+  if (typeof service !== 'string' || owners.length === 0) return { ok: false, reportOnly: false, why: `${show(String(service))}, which is no service of the repository` };
+  // (GJ-R2, review GJ-r1 N6) unreachable today (needRefs refuses two services with one slug first), refused if it ever is
+  if (owners.length > 1) return { ok: false, reportOnly: false, why: `${show(service)}, whose name matches more than one service of the repository` };
   const svc = owners[0] as Service;
   const why = noImageServices(p, caps).get(svc.name);
   return why === undefined ? { ok: true, service: svc } : { ok: false, reportOnly: true, why };

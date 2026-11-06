@@ -68,6 +68,7 @@ export interface Service {
   notStandalone?: NotStandalone;   // P55 (batch B): why this folder isn't a service of its own although it has a start or dev script (src/read/service-kind.ts). isRunnable is then false. Set only when true
   publishedPackage?: boolean;   // Plan U Task 5: the repo's only service, and a workflow publishes it to its registry (npm for node, PyPI for python). Set only when true. isRunnable then ignores a port found in its code (a library's default port isn't a server)
   quality: ServiceQuality;      // Plan P Task 1 (src/read/quality.ts): the facts the quality and supply-chain checks read. Always set; emptyServiceQuality() when nothing is known
+  containerHint?: string;   // GJ-R2 (N1): why the folder is built into an image although it has no container file of its own (a deeper container file, a workflow building from it, another container file's COPY); plain repo paths. Set only then. Its static decision is unsure (a server), and the audit names it as not covered
   projectType?: ProjectType;    // Plan J J2 (DECISIONS #121, ruling S4): set by readProject for every service (projectTypeOf, then finishProjectTypes after the workflow pass). Absent = today's rules (a hand-built profile)
 }
 // Plan P Task 1. Ruling PS5 left out what no task reads: QualityPackage 'jscpd', QualityConfig 'jscpd'/'hadolint', RepoFiles.rego.

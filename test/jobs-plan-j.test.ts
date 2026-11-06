@@ -352,7 +352,7 @@ describe('GJ-R1: fix round 1 (reviews GJ security and spec)', () => {
     const o = keyOffers(x.plan.needs, x.plan.candidates, prof, { reviewed: without });
     const draft = { ...x.draft, steps: x.draft.steps.filter((st) => st.needId !== 'workflow-lint') };
     const a = assembleJobs(draft, { ...x.plan, uncovered: o.uncovered }, { reviewed: without, platform: p, mode: 'none' });
-    expect(a.uncoveredMinimum).toEqual([{ category: 'workflow-lint', why: expect.stringMatching(/zizmor is not on pipegen's reviewed list/) }]);
+    expect(a.uncoveredMinimum).toEqual([{ category: 'workflow-lint', needId: 'workflow-lint', why: expect.stringMatching(/zizmor is not on pipegen's reviewed list/), tool: { name: 'zizmor', repo: 'zizmorcore/zizmor' } }]);
     expect(a.draft.suggestions.some((sg) => sg.name === WORKFLOW_LINT_TOOL && sg.repo === 'zizmorcore/zizmor')).toBe(true);
   });
 
@@ -372,5 +372,24 @@ describe('GJ-R1: fix round 1 (reviews GJ security and spec)', () => {
     }
     const lh = profileOf([node()], { precommit: 'lefthook' });
     expect(jobCategories(estimateNeeds(lh, CAPS, floorNeeds(lh, CAPS))).merge).toContain('hooks-ci');
+  });
+
+  it('GJ-R2 (N3): the uncovered minimum is per need, reaches AssembledFiles and the suggestions (two services with no lockfile: both named)', () => {
+    const svc = (name: string) => node({ name, path: name, packageManager: undefined, npmLockfileVersion: undefined });
+    const prof = profileOf([svc('a'), svc('b')]);
+    const x = planned(prof, { over: SKIP_DEPLOY });
+    const jobs = assemble(x);
+    const deps = jobs.uncoveredMinimum.filter((u) => u.category === 'deps');
+    expect(deps.map((u) => u.service).sort()).toEqual(['a', 'b']);
+    for (const u of deps) expect(u.why).toMatch(new RegExp(`"deps" for "${u.service}".*no lockfile`));
+    for (const u of deps) expect(jobs.draft.suggestions.some((sg) => sg.why === u.why && sg.name === 'osv-scanner')).toBe(true);
+    const files = lay(x, 'none');
+    expect(files.uncoveredMinimum.filter((u) => u.category === 'deps').map((u) => u.service).sort()).toEqual(['a', 'b']);
+    expect(files.draft.suggestions.filter((sg) => sg.name === 'osv-scanner')).toHaveLength(2);
+    // one service with a lockfile keeps its job: only the other is listed (per need, not per category)
+    const mixed = planned(profileOf([node({ name: 'a', path: 'a' }), svc('b')]), { over: SKIP_DEPLOY });
+    const m = assemble(mixed);
+    expect(m.merge['deps--a']).toBeDefined();
+    expect(m.uncoveredMinimum.filter((u) => u.category === 'deps').map((u) => u.service)).toEqual(['b']);
   });
 });

@@ -471,6 +471,8 @@ async function staticDecision(k: TypeInput): Promise<StaticResult> {
   if (g === undefined) return notStatic();
   const signal = await generatorSignal(k, g);
   if (!signal.isStatic) return signal;
+  // GJ-R2 (N1): built into an image without a container file of its own: unsure (a server), never the static skip
+  if (k.containerHint !== undefined) return { isStatic: false, unsure: true, evidence: [...signal.evidence, `${k.containerHint}, ${UNSURE_TAIL}`] };
   const signs = await serverSigns(k, g);
   if (signs.length === 0) return signal;
   return { isStatic: false, unsure: true, evidence: [...signal.evidence, ...signs, `looks like a static site, but it has the server signs above, ${UNSURE_TAIL}`] };

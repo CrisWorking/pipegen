@@ -7,6 +7,7 @@ import { PATH_SHOWN_MAX, safeText } from '../util/safe-text.js';
 import { CODE_FILE_RE, PLAIN_PATH_RE, PORT_RULES, REQUIREMENTS_FILE_RE, asObj, asString, asStrings, baseOf, dirOf, inDir, isTestFile, pythonNames, readPyproject, requirementLines, type Obj } from './manifest.js';
 import { readEnv } from './env.js';
 import { copySources, dockerfilesOf, notStandaloneOf, type DockerCopy } from './service-kind.js';
+import { chooseContainerFile, containerFilesIn, containerHintOf, isContainerFileName, workflowBuildRefs } from './container-file.js';
 import { finishProjectTypes, projectTypeOf, untrackedIgnoredOf } from './project-type.js';
 import { newQualityRun, npmLockfileVersion as npmLockfileVersionOf, readRepoFiles, readServiceQuality, type QualityRun } from './quality.js';
 import { readPrecommit, readWorkflows } from './workflows.js';
@@ -110,19 +111,6 @@ const ROOT_FILES = ['package.json', 'pnpm-workspace.yaml', 'turbo.json', 'nx.jso
 
 interface Ctx { root: string; fileSet: Set<string>; notes: string[] }
 
-/**
- * GJ-R1 (review GJ sec I1): a container build file of the folder itself (never a sub-folder): `Dockerfile` first, else the first, sorted, of
- * `Dockerfile.<x>`, `<x>.Dockerfile`, `Containerfile` and `Containerfile.<x>` (a `.dockerignore` excepted). Each is container evidence: a
- * folder that builds an image keeps its image checks, so a static site with `Dockerfile.prod` is never given the static skip.
- */
-const CONTAINER_FILE_RE = /^(?:Dockerfile\.[^/]+|[^/]+\.Dockerfile|Containerfile(?:\.[^/]+)?)$/;
-function containerFileOf(files: ReadonlySet<string>, dir: string): string | undefined {
-  if (files.has(inDir(dir, 'Dockerfile'))) return inDir(dir, 'Dockerfile');
-  const prefix = dir === '.' || dir === '' ? '' : `${dir}/`;
-  const names = [...files].filter((f) => f.startsWith(prefix) && !f.slice(prefix.length).includes('/')).map((f) => f.slice(prefix.length))
-    .filter((n) => CONTAINER_FILE_RE.test(n) && !/\.dockerignore$/i.test(n)).sort();
-  return names[0] === undefined ? undefined : inDir(dir, names[0]);
-}
 
 const isUnder = (file: string, dir: string) => dir === '.' || file.startsWith(`${dir}/`);
 
@@ -214,6 +202,8 @@ export async function readOrigin(root: string): Promise<{ owner: string; repo: s
 
 interface Shared {
   repo: string; serviceDirs: string[]; quality: QualityRun; copies: DockerCopy[];
+  /** GJ-R2 (N1, N4): the paths the repo's workflows build from (workflowBuildRefs), and what each container file copies, by file. */
+  buildRefs: ReadonlySet<string>; fileCopies: { file: string; source: string }[];
   /** Plan J J2: git's untracked-and-ignored test (J1's rule), loaded once and only when a static generator is found. */
   untrackedIgnored: () => Promise<(rel: string) => boolean>;
   /** Fix round 1 (review J2 I1): the file listing was cut at the read limit or left out paths too long to check. */
@@ -270,7 +260,12 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
       ? (await firstLine(scope.map((d) => inDir(d, '.python-version')))) ?? py.requires
       : undefined;
 
-  const dockerfile = containerFileOf(ctx.fileSet, dir);
+  // GJ-R1/R2 (sec I1, N1, N4): the folder's own container file (any container file name; the one a workflow builds first, with a note)
+  const chosen = chooseContainerFile(containerFilesIn(ctx.fileSet, dir), shared.buildRefs);
+  if (chosen?.note != null && !ctx.notes.includes(chosen.note)) ctx.notes.push(chosen.note);
+  const dockerfile = chosen?.file;
+  // GJ-R2 (N1): no file of its own, but built into an image anyway (deeper file, a workflow, another container file's COPY): never static
+  const containerHint = dockerfile !== undefined ? undefined : containerHintOf(dir, ctx.fileSet, shared.serviceDirs, shared.buildRefs, shared.fileCopies);
   const deps = asObj(pkg?.dependencies);
   const devDeps = asObj(pkg?.devDependencies);
   const pkgScripts = asObj(pkg?.scripts);
@@ -307,7 +302,7 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
   // P55 (batch B): a folder that runs only by its start script, but is a one-shot script, is built into another image, or is an email-template package
   const kind = {
     dir, read: (rel: string) => readFile(ctx, rel), fileSet: ctx.fileSet, copies: shared.copies, scripts: pkgScripts, deps, devDeps, frameworks,
-    hasDockerfile: dockerfile !== undefined, ...(dockerfile === undefined ? {} : { dockerfile }), port, language, serviceDirs: shared.serviceDirs,
+    hasDockerfile: dockerfile !== undefined, ...(dockerfile === undefined ? {} : { dockerfile }), ...(containerHint === undefined ? {} : { containerHint }), port, language, serviceDirs: shared.serviceDirs,
   };
   const notStandalone = await notStandaloneOf(kind);
   // Plan J J2 (ruling B2): the type from the service's own files; finishProjectTypes completes it after the workflow pass
@@ -315,7 +310,7 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
   return {
     name, path: dir, language, ...(alsoLanguages.length === 0 ? {} : { alsoLanguages }), ...(alsoPackageManagers.length === 0 ? {} : { alsoPackageManagers }), packageManager,
     ...(npmLockfileVersion === undefined ? {} : { npmLockfileVersion }), runtimeVersion, dockerfile, port, hasTests, testFramework, ...env, scripts, frameworks, quality,
-    ...(notStandalone === undefined ? {} : { notStandalone }), projectType,
+    ...(notStandalone === undefined ? {} : { notStandalone }), ...(containerHint === undefined ? {} : { containerHint }), projectType,
   };
 }
 
@@ -399,10 +394,10 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
   let dirs: string[] = [];
   for (const pkgDir of patterns.length > 0 ? workspaceDirs(ctx, patterns) : []) {
     const scripts = asObj((await readJson(ctx, inDir(pkgDir, 'package.json')))?.scripts);
-    if ('start' in scripts || 'dev' in scripts || ctx.fileSet.has(inDir(pkgDir, 'Dockerfile'))) dirs.push(pkgDir);
+    if ('start' in scripts || 'dev' in scripts || containerFilesIn(ctx.fileSet, pkgDir).length > 0) dirs.push(pkgDir);   // GJ-R2 (N2): any container file
   }
   const workspaceMembers = [...dirs];
-  const isAppDockerfile = (f: string) => baseOf(f) === 'Dockerfile' && !dirOf(f).split('/').some((s) => NOT_SERVICE_DIRS.includes(s));
+  const isAppDockerfile = (f: string) => isContainerFileName(baseOf(f)) && !dirOf(f).split('/').some((s) => NOT_SERVICE_DIRS.includes(s));   // GJ-R2 (N2)
   const dockerDirs = [...new Set([...ctx.fileSet].filter(isAppDockerfile).map(dirOf))].sort();
   if (dirs.length === 0) dirs = dockerDirs.length > 0 ? dockerDirs : ['.'];
   else {
@@ -433,7 +428,7 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
   // Plan P Task 1: one run for the quality facts, so each lockfile is read once and the read budgets hold for the repo.
   let untracked: Promise<(rel: string) => boolean> | undefined;
   const shared: Shared = {
-    repo, serviceDirs: dirs, quality: newQualityRun(dir, [...ctx.fileSet], dirs, workspaceMembers), copies: [],
+    repo, serviceDirs: dirs, quality: newQualityRun(dir, [...ctx.fileSet], dirs, workspaceMembers), copies: [], buildRefs: new Set<string>(), fileCopies: [],
     untrackedIgnored: () => (untracked ??= untrackedIgnoredOf(dir)),
     listingIncomplete,
   };
@@ -442,8 +437,15 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
   for (const f of ctx.fileSet) for (let d = dirOf(f); d !== '.' && !known.has(d); d = dirOf(d)) known.add(d);
   for (const f of dockerfilesOf(ctx.fileSet)) {
     const text = await readFile(ctx, f);
-    if (text !== null) shared.copies.push(...copySources(dirOf(f), text, (p) => known.has(p)).map((source) => ({ dockerDir: dirOf(f), source })));
+    if (text === null) continue;
+    const sources = copySources(dirOf(f), text, (p) => known.has(p));
+    shared.copies.push(...sources.map((source) => ({ dockerDir: dirOf(f), source })));
+    shared.fileCopies.push(...sources.map((source) => ({ file: f, source })));
   }
+  // GJ-R2 (N1, N4): the paths the workflows build from, read as text (never run)
+  const wfTexts: string[] = [];
+  for (const f of [...ctx.fileSet].filter((x) => /^\.github\/workflows\/[^/]+\.ya?ml$/.test(x)).sort()) { const t = await readFile(ctx, f); if (t !== null) wfTexts.push(t); }
+  shared.buildRefs = workflowBuildRefs(wfTexts);
   const services: Service[] = [];
   for (const d of dirs) services.push(await readService(ctx, d, shared));
   uniqueServiceNames(ctx, services);

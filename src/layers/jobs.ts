@@ -121,7 +121,7 @@ export const HOOKS_CI_NOTES: Readonly<Record<string, string>> = Object.freeze({
   husky: "husky's hooks are shell scripts, so there is no one command pipegen can run in CI: call the same script from a workflow step yourself.",
 });
 /** GJ-R1 (reviews spec I2, sec M2): the note when a workflow runs on a risky trigger but poutine is not offered (not on the reviewed list). */
-export const POUTINE_NOT_RUN = `A workflow runs on pull_request_target or issue_comment, which takes untrusted input, but ${WORKFLOW_LINT_EXTRA} is not on pipegen's reviewed list for this run, so ${WORKFLOW_LINT_EXTRA} is not run; ${WORKFLOW_LINT_TOOL} still lints the workflows.`;
+export const POUTINE_NOT_RUN = `A workflow runs on pull_request_target or issue_comment, which takes untrusted input, but pipegen can't offer ${WORKFLOW_LINT_EXTRA} for this run (it is not on the reviewed list, or not yet proven for a full run), so ${WORKFLOW_LINT_EXTRA} is not run; ${WORKFLOW_LINT_TOOL} still lints the workflows.`;
 /** GJ (DECISIONS #122): the note when zizmor, workflow lint's one tool, is not on the reviewed list. */
 export const WORKFLOW_LINT_SUGGESTION = `Workflow lint runs ${WORKFLOW_LINT_TOOL} only, and ${WORKFLOW_LINT_TOOL} is not on pipegen's reviewed list in this version, so it is only a suggestion: add ${WORKFLOW_LINT_TOOL} to your own CI to lint the workflows.`;
 export const PYPI_PUBLISH_NOTE = 'Publishing to PyPI is not rendered yet: the publish action builds or pulls a container at run time, and pipegen runs only images pinned by digest (S31).';
@@ -166,8 +166,14 @@ export interface AssembledJobs {
    * lint when zizmor is not on the reviewed list (also in draft.suggestions), a deps check whose only scanner has no lockfile to read. Every
    * other minimum check is a written job (assembleJobs asserts it). The preview and PIPEGEN.md (G9) show these as not covered.
    */
-  uncoveredMinimum: { category: string; why: string }[];
+  uncoveredMinimum: UncoveredMinimum[];
 }
+
+/**
+ * GJ-R2 (review GJ-r1 N3): one minimum check of the plan left without a job, per need (its id and service), with its plain reason and the tool
+ * that would run it (routed into draft.suggestions, so the preview and PIPEGEN.md show it; a floor check is never not-proven).
+ */
+export interface UncoveredMinimum { category: string; needId: string; service?: string; why: string; tool?: { name: string; repo: string } }
 
 export class AssembleError extends Error {}
 
@@ -461,7 +467,13 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
   }
   // GJ (DECISIONS #122): workflow lint is zizmor alone; without it on the reviewed list the check is a suggestion only
   const lintSuggestion = !workflowLintAvailable(deps.reviewed);   // the predicate keyOffers uses too (review spec M4)
-  const uncoveredMinimum = new Map<string, string>();
+  const uncoveredMinimum = new Map<string, UncoveredMinimum>();
+  const minKey = (n: { id: string; service?: string }): string => `${n.id}\u0000${n.service ?? ''}`;
+  const isMinimum = (n: Pick<Need, 'id' | 'category' | 'layer'>): boolean => n.layer === 'merge' && (MINIMUM_CATEGORIES as readonly string[]).includes(categoryOf(n.id) ?? n.category);
+  const markUncovered = (n: Need, why: string, tool?: { name: string; repo: string }): void => {
+    if (!isMinimum(n) || uncoveredMinimum.has(minKey(n))) return;
+    uncoveredMinimum.set(minKey(n), { category: categoryOf(n.id) ?? n.category, needId: n.id, ...(n.service === undefined ? {} : { service: n.service }), why, ...(tool === undefined ? {} : { tool }) });
+  };
   const isLint = (n: Pick<Need, 'id' | 'category'>): boolean => (categoryOf(n.id) ?? n.category) === 'workflow-lint';
   // GJ (DECISIONS #122): a pre-commit or husky repository's hooks-ci is a note only (no reviewed runner for those hooks)
   const hooksNote = input.profile.precommit !== null && NO_HOOKS_CI_MANAGERS.has(input.profile.precommit) ? HOOKS_CI_NOTES[input.profile.precommit] : undefined;
@@ -498,7 +510,7 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     if (part !== undefined) { dropped.add(n); continue; }
     const limit = limitOf(n);
     if (limit !== undefined && n.layer !== 'pre-commit') { dropped.add(n); addNote(notes, limit); }
-    if (lintSuggestion && isLint(n)) { dropped.add(n); addNote(notes, WORKFLOW_LINT_SUGGESTION); uncoveredMinimum.set('workflow-lint', WORKFLOW_LINT_SUGGESTION); }
+    if (lintSuggestion && isLint(n)) { dropped.add(n); addNote(notes, WORKFLOW_LINT_SUGGESTION); markUncovered(n, WORKFLOW_LINT_SUGGESTION, { name: WORKFLOW_LINT_TOOL, repo: 'zizmorcore/zizmor' }); }
     if (hooksNote !== undefined && isHooksCi(n)) { dropped.add(n); addNote(notes, hooksNote); }
   }
   for (const p of input.skipped) addNote(notes, `The part ${show(p.part)} is skipped (--skip), so it has no job.`);
@@ -537,8 +549,10 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     const has = keep.some((s) => s.needId === n.id && s.service === n.service);
     if (had && !has) {
       gone.add(n);
-      const cat = categoryOf(n.id) ?? n.category;
-      if ((MINIMUM_CATEGORIES as readonly string[]).includes(cat) && n.layer === 'merge') uncoveredMinimum.set(cat, `the ${cat} check ${where(n)} has no step pipegen can run (see the notes), so it has no job`);
+      const left = draft.steps.find((s) => s.needId === n.id && s.service === n.service && leaveOut.has(s));
+      const tool = left === undefined ? undefined : { name: left.tool.id, repo: left.tool.repo };
+      const lock = left?.tool.id === 'osv-scanner' && !hasLockfile(draft, n.service) ? ' (no lockfile to read: commit one to turn the check on)' : '';
+      markUncovered(n, `The check ${where(n)} has no job: its tool ${show(left?.tool.id ?? 'none')} can not run here${lock}, so it is not covered.`, tool);
     }
   }
   draft = narrowed({ ...draft, steps: keep }, gone);
@@ -649,16 +663,21 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     }
   }
   if (deps.mode === 'none' || input.skipped.some((p) => p.part === 'deploy') || imageNone) { const { signing: _s, ...rest } = draft; draft = rest; }
-  // GJ-R1 (reviews sec M4, spec M4): every minimum check of the plan is a written job or listed as uncovered, never dropped silently
-  for (const cat of MINIMUM_CATEGORIES) {
-    if (!input.needs.some((n) => n.layer === 'merge' && (categoryOf(n.id) ?? n.category) === cat)) continue;
-    const written = cat === 'gate' ? Object.hasOwn(merge, 'gate') : draft.needs.some((n) => n.layer === 'merge' && (categoryOf(n.id) ?? n.category) === cat && Object.hasOwn(merge, jobIdFor(n.id, n.service)));
-    if (!written && !uncoveredMinimum.has(cat)) fail(`The minimum check ${show(cat)} has no job and no reason pipegen can show; it never drops silently.`);
+  // GJ-R1/R2 (reviews sec M4, spec M4, GJ-r1 N3): every minimum need of the plan (per need: id and service) is a written job or listed as
+  // uncovered, never dropped silently; each uncovered one goes into the suggestions with its reason
+  const kept = new Set(draft.needs.map(minKey));
+  for (const n of input.needs) {
+    if (!isMinimum(n)) continue;
+    const written = (categoryOf(n.id) ?? n.category) === 'gate' ? Object.hasOwn(merge, 'gate') : kept.has(minKey(n)) && Object.hasOwn(merge, jobIdFor(n.id, n.service));
+    if (!written && !uncoveredMinimum.has(minKey(n))) fail(`The minimum check ${where(n)} has no job and no reason pipegen can show; it never drops silently.`);
   }
-  if (uncoveredMinimum.has('workflow-lint') && !draft.suggestions.some((sg) => sg.name === WORKFLOW_LINT_TOOL)) {
-    draft = { ...draft, suggestions: [...draft.suggestions, { name: WORKFLOW_LINT_TOOL, repo: 'zizmorcore/zizmor', why: WORKFLOW_LINT_SUGGESTION }] };
+  const suggestions = [...draft.suggestions];
+  for (const u of uncoveredMinimum.values()) {
+    if (u.tool === undefined || suggestions.some((sg) => sg.name === u.tool?.name && sg.why === u.why)) continue;
+    suggestions.push({ name: u.tool.name, repo: u.tool.repo, why: u.why });
   }
-  return { draft, push, merge, nightly, sign, notes, uncoveredMinimum: [...uncoveredMinimum].map(([category, why]) => ({ category, why })) };
+  if (suggestions.length !== draft.suggestions.length) draft = { ...draft, suggestions };
+  return { draft, push, merge, nightly, sign, notes, uncoveredMinimum: [...uncoveredMinimum.values()] };
 }
 
 function addNote(notes: string[], line: string): void { if (!notes.includes(line)) notes.push(line); }

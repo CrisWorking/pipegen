@@ -17,6 +17,7 @@
 import { builtinModules } from 'node:module';
 import { posix } from 'node:path';
 import { asString, baseOf, dirOf, inDir } from './manifest.js';
+import { isContainerFileName } from './container-file.js';
 import { regexLines, regexSafe } from './limits.js';
 import type { Obj } from './manifest.js';
 import type { NotStandalone, Service } from '../types.js';
@@ -156,6 +157,8 @@ export interface KindInput {
   scripts: Obj; deps: Obj; devDeps: Obj; frameworks: readonly string[]; hasDockerfile: boolean; port: number | undefined; language: string;
   /** GJ-R1: the folder's container build file when hasDockerfile (Dockerfile, Dockerfile.<x>, <x>.Dockerfile, Containerfile), for the evidence line. */
   dockerfile?: string;
+  /** GJ-R2 (N1): why the folder is built into an image without a container file of its own (containerHintOf); makes a static decision unsure. */
+  containerHint?: string;
   /** P57 (I1): every service folder of the repo, so only a service's own Dockerfile can build a folder into its image. */
   serviceDirs: readonly string[];
 }
@@ -179,7 +182,7 @@ export async function notStandaloneOf(k: KindInput): Promise<NotStandalone | und
 
 /** The Dockerfiles of the repo (Dockerfile, Dockerfile.x, x.Dockerfile), at most MAX_DOCKERFILES, sorted. */
 export function dockerfilesOf(fileSet: ReadonlySet<string>): string[] {
-  return [...fileSet].filter((f) => /^(?:Dockerfile(?:\.[A-Za-z0-9_.-]+)?|[A-Za-z0-9_.-]+\.Dockerfile)$/.test(baseOf(f))).sort().slice(0, MAX_DOCKERFILES);
+  return [...fileSet].filter((f) => isContainerFileName(baseOf(f))).sort().slice(0, MAX_DOCKERFILES);   // GJ-R2: the one container-file rule
 }
 
 /**
