@@ -17,7 +17,8 @@
 import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { gitBlobSha } from '../create/guard.js';
-import { existingSecretsHook, HOOK_FILES, hookCommands, hookFile, SECRETS_HOOK_ID, type HookManager } from '../engine/created-builders.js';
+import { existingSecretsHook } from '../audit/hook-credit.js';
+import { HOOK_FILES, hookCommands, hookFile, SECRETS_HOOK_ID, type HookManager } from '../engine/created-builders.js';
 import { readTextLimitedWithReason } from '../read/limits.js';
 import type { CreatedFile, InstallEdit, PipelineDraft, ReviewedTool } from '../types.js';
 
@@ -94,19 +95,26 @@ export async function precommitFiles(draft: PipelineDraft, reviewed: readonly Re
     if (p.precommit !== null || others.length > 0) return none(`pipegen appends its hooks only to ${path}, and this repository keeps its ${manager} config under another name, so pipegen adds no hook; add pipegen's hooks to your config by hand.`);
   }
 
-  // what the builder will leave out, said plainly
+  // what the builder will leave out, said plainly (G6-R2 spec I3: one true reason each)
   let wanted: string[] = [];
   try { wanted = hookCommands(draft, reviewed).map((c) => c.id); } catch { /* hookFile gives the note */ }
-  if (wanted.includes(SECRETS_HOOK_ID) && existingSecretsHook(original)) notes.push(`Your ${path} already scans for secrets, so pipegen adds no secrets hook of its own there.`);
+  const credited = wanted.includes(SECRETS_HOOK_ID) && existingSecretsHook(manager, original);
+  if (credited) notes.push(`Your ${path} already scans for secrets at commit, so pipegen adds no secrets hook of its own there.`);
+  const asksSecrets = draft.needs.some((n) => n.layer === 'pre-commit' && n.id === 'secrets');
+  if (asksSecrets && !reviewed.some((t) => t.id === 'gitleaks' && t.categories.includes('secrets'))) notes.push("pipegen's reviewed list has no gitleaks entry here, so it adds no local secrets hook; the CI secret scan still runs on every push.");
   const biome = reviewed.find((t) => t.id === 'biome')?.step.cli?.install;
   const asksFormat = draft.needs.some((n) => n.layer === 'pre-commit' && n.id === 'format-lint') && draft.steps.some((s) => s?.needId === 'format-lint' && s.tool?.id === 'biome');
   if (asksFormat && !wanted.includes('pipegen-biome') && biome !== undefined) {
     notes.push(`The format and lint hook runs the repository's own Biome, so pipegen adds it only when the lockfile holds ${biome.package}@${biome.version}; add that exact devDependency and run pipegen again to get it.`);
   }
-  if (manager === 'husky') notes.push('husky hooks are shell scripts, so CI does not re-run them (no hooks-ci command); the CI secret scan still runs on every push.');
 
   const built = hookFile(manager, original, draft, reviewed);
-  if ('note' in built) return none(built.note);
+  if ('note' in built) {
+    // nothing left to add only because the repo already scans: that is the reason, not "no reviewed hook command"
+    const onlyCredited = credited && wanted.every((id) => id === SECRETS_HOOK_ID);
+    return onlyCredited ? none() : none(built.note);
+  }
+  if (manager === 'husky') notes.push('husky hooks are shell scripts, so CI does not re-run them (no hooks-ci command); the CI secret scan still runs on every push.');
   const file: CreatedFile = { path, content: built.content, part: 'precommit', reason: REASON, repo: 'app', edited: { original } };
   const edit: InstallEdit = { repo: 'app', path, kind: 'hooks', inserted: built.inserted, originalSha: original === '' ? null : gitBlobSha(original), writtenShas: [gitBlobSha(built.content)] };
   return { files: [file], edits: [edit], setupCommand: SETUP_COMMANDS[manager], notes };

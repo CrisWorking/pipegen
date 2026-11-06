@@ -4,6 +4,7 @@
 import { LOGIN_RE, MAX_LINE, PIPEGEN_BLOCK_BEGIN, PIPEGEN_BLOCK_END } from '../../gate/src/integrity.js';
 import type { PipelineDraft, ReviewedTool } from '../types.js';
 import { packageVersion } from '../util/package-data.js';
+import { existingSecretsHook } from '../audit/hook-credit.js';
 import { effectiveProtectedPaths } from './protected-paths.js';
 import { isObj, parseYaml } from './yaml-parse.js';
 
@@ -210,7 +211,8 @@ export const NPM_REGISTRY = 'https://registry.npmjs.org';
  */
 export function secretsHookRun(version: string | null): string {
   if (typeof version !== 'string' || !NPM_EXACT_VERSION_RE.test(version)) throw new Error('pipegen can not tell its own exact version, so it can not write the secrets hook (it runs pipegen at that exact version)');
-  return `npx --yes --registry=${NPM_REGISTRY} pipegen@${version} hook secrets`;
+  // --prefix=/ (G6-R2 I3): npx then reads no package of the repository (node_modules/.bin/pipegen) and no project .npmrc (node-options)
+  return `npx --yes --prefix=/ --registry=${NPM_REGISTRY} pipegen@${version} hook secrets`;
 }
 /**
  * The git mode a NEW hook file gets (G6, carry m5): `.husky/pre-commit` is a script git hooks run directly (husky v4 to v8 need the
@@ -221,16 +223,6 @@ export function hookFileMode(path: string): '100755' | null {
 }
 /** The shebang of a new husky script (G6, carry m5). */
 const HUSKY_SHEBANG = '#!/usr/bin/env sh\n';
-/** Secret scanners a hook may already run (G6, Plan J G-J1: a check the repo already has is not added again). */
-const SECRET_SCANNERS_RE = /(?:^|[^A-Za-z0-9_-])(?:gitleaks|betterleaks|trufflehog|detect-secrets|ggshield|git-secrets|talisman|secretlint|pipegen hook secrets)(?![A-Za-z0-9_])/m;
-/**
- * Whether the user's hook file already runs a secret scanner (G6): a known scanner's name outside a comment line. Then pipegen adds no
- * secrets hook of its own (the CI secrets scan and the gate still run). Read from the file text, the same in the builder and the judge.
- */
-export function existingSecretsHook(original: string): boolean {
-  if (typeof original !== 'string') return false;
-  return SECRET_SCANNERS_RE.test(original.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n'));
-}
 /** One hook pipegen appends: its id (`pipegen-<tool>`) and its command line. */
 export interface HookCommand { id: string; run: string }
 const HOOK_RUN_RE = /^[A-Za-z0-9 ._@=:/-]{1,300}$/;
@@ -287,7 +279,8 @@ const installedAt = (svc: PipelineDraft['profile']['services'][number], pkg: str
 /** pipegen's block for one manager: pre-commit a `repo: local` item at `indent` (no rev: it fetches nothing), husky plain lines, lefthook a `pre-commit` key. */
 export function hookBlock(manager: HookManager, commands: readonly HookCommand[], indent = ''): string {
   const q = JSON.stringify;
-  if (manager === 'husky') return [`# ${HOOKS_MARKER} begin: ${HOOKS_NOTE}`, ...commands.map((c) => c.run), `# ${HOOKS_MARKER} end`, ''].join('\n');
+  // G6-R2 I1: each line stops the script when its hook fails (a script's status is its last line's, and husky v4-v8 run it without -e)
+  if (manager === 'husky') return [`# ${HOOKS_MARKER} begin: ${HOOKS_NOTE}`, ...commands.map((c) => `${c.run} || exit 1`), `# ${HOOKS_MARKER} end`, ''].join('\n');
   if (manager === 'lefthook') return [`# ${HOOKS_MARKER}: ${HOOKS_NOTE}`, 'pre-commit:', '  commands:', ...commands.flatMap((c) => [`    ${c.id}:`, `      run: ${q(c.run)}`]), ''].join('\n');
   const i = indent;
   return [`${i}# ${HOOKS_MARKER}: ${HOOKS_NOTE}`, `${i}- repo: local`, `${i}  hooks:`,
@@ -307,7 +300,7 @@ export function hookFile(manager: HookManager, original: string, draft: Pipeline
   let commands: HookCommand[];
   try { commands = hookCommands(draft, reviewed); } catch (e) { return { note: e instanceof Error ? e.message : 'the hook commands can not be built' }; }
   // G6 (Plan J G-J1): a hook file that already runs a secret scanner gets no second one
-  if (existingSecretsHook(original)) commands = commands.filter((c) => c.id !== SECRETS_HOOK_ID);
+  if (existingSecretsHook(manager, original)) commands = commands.filter((c) => c.id !== SECRETS_HOOK_ID);
   if (commands.length === 0) return { note: 'pipegen has no reviewed hook command for this repository (a format and lint check of the root npm service with a tool whose hook form is reviewed), so it adds no hook' };
   if (original.includes(HOOKS_MARKER)) return { note: `the ${HOOK_FILES[manager]} file already holds pipegen's hooks, so pipegen adds them no second time` };
   const by = (why: string): { note: string } => ({ note: `pipegen can not add its hooks to ${HOOK_FILES[manager]} safely (${why}); add them by hand:\n${hookBlock(manager, commands)}` });
@@ -340,6 +333,9 @@ export function hookFile(manager: HookManager, original: string, draft: Pipeline
   const r = parseYaml(original, 'strict');
   if ('problems' in r) return by(`it does not parse strictly: ${r.problems.join('; ')}`);
   const keys = Object.keys(r.parsed.js);
+  // G6-R2 M3: pre-commit runs a hook without `stages` at the default stages: they must include the commit stage
+  const ds = r.parsed.js.default_stages;
+  if (ds !== undefined && !(Array.isArray(ds) && ds.some((x) => x === 'pre-commit' || x === 'commit'))) return by('its `default_stages` leave out the commit stage, so pipegen\'s hooks would not run at commit');
   if (keys[keys.length - 1] !== 'repos' || !Array.isArray(r.parsed.js.repos) || r.parsed.js.repos.length === 0) return by('`repos` is not the last top-level key with a list of repos');
   const lines = original.split('\n');
   const at = lines.map((l, i) => (/^repos:[ ]*(?:#.*)?$/.test(l) ? i : -1)).filter((i) => i >= 0);
@@ -383,22 +379,33 @@ const sortKeys = (v: unknown): unknown => (Array.isArray(v) ? v.map(sortKeys) : 
  */
 export function huskyAppendProblem(original: string): string | null {
   // the code outside comments and quoted strings (quoted text kept as an empty pair, so a word inside a string is not a keyword)
+  // and (G6-R2 M1) `plain`: the code with the quote characters and backslashes taken out but what they hold kept, so `"exit"`, `e"x"it`,
+  // `ex\it` and `"."` read as the words the shell runs
   let code = '';
+  let plain = '';
   let quote: '"' | "'" | null = null;
   for (let i = 0; i < original.length; i++) {
     const c = original[i] as string;
-    if (quote === "'") { if (c === "'") { quote = null; code += "'"; } continue; }
-    if (quote === '"') { if (c === '\\') { i++; continue; } if (c === '"') { quote = null; code += '"'; } continue; }
-    if (c === '\\') { code += c + (original[i + 1] ?? ''); i++; continue; }
+    if (quote === "'") { if (c === "'") { quote = null; code += "'"; } else plain += c; continue; }
+    if (quote === '"') { if (c === '\\') { plain += original[i + 1] ?? ''; i++; continue; } if (c === '"') { quote = null; code += '"'; } else plain += c; continue; }
+    if (c === '\\') { code += c + (original[i + 1] ?? ''); plain += original[i + 1] ?? ''; i++; continue; }
     if (c === "'" || c === '"') { quote = c; code += c; continue; }
-    if (c === '#' && (i === 0 || /\s/.test(original[i - 1] as string))) { while (i < original.length && original[i] !== '\n') i++; code += '\n'; continue; }
+    if (c === '#' && (i === 0 || /\s/.test(original[i - 1] as string))) { while (i < original.length && original[i] !== '\n') i++; code += '\n'; plain += '\n'; continue; }
     code += c;
+    plain += c;
   }
   if (quote !== null) return 'it leaves a quote open at its end';
-  if (/\b(?:exit|exec)\b/.test(code)) return 'it has an exit or exec, after which appended lines would not run';
+  if (/\b(?:exit|exec)\b/.test(plain)) return 'it has an exit or exec, after which appended lines would not run';
   // G6 (G1 r1 minor): eval can run an exit, return ends a sourced script, and a sourced file (`.` or `source`) can do either
-  if (/\b(?:eval|return|source)\b/.test(code)) return 'it has an eval, a return or a source, after which appended lines might not run';
-  if (/(?:^|[;&|(){}!]|\b(?:then|do|else|elif)\b)[ \t]*\.(?=[ \t]|$)/m.test(code)) return 'it sources another file with `.`, after which appended lines might not run';
+  if (/\b(?:eval|return|source)\b/.test(plain)) return 'it has an eval, a return or a source, after which appended lines might not run';
+  const at = '(?:^|[;&|(){}!]|\\b(?:then|do|else|elif|command|builtin)\\b)[ \\t]*';
+  if (new RegExp(`${at}\\.(?=[ \\t]|$)`, 'm').test(plain)) return 'it sources another file with `.`, after which appended lines might not run';
+  // G6-R2 I1: a trap or a turned-off errexit can make the script end well after a failed hook line
+  if (/\btrap\b/.test(plain)) return 'it sets a trap, which can change how the script ends';
+  if (/\bset\b[^\n;&|]*(?:\+[A-Za-z]*e|\+o\s+errexit)/.test(plain)) return 'it turns off errexit (set +e), so a failed hook might not stop the commit';
+  // G6-R2 M1: a command word built at run time, and an npx of the script's own (a function or an alias would run instead of pipegen's lines)
+  if (new RegExp(`${at}\\$`, 'm').test(plain)) return 'it runs a command whose name is a variable, so pipegen can not tell what it runs';
+  if (/\bnpx\s*\(\s*\)|\bfunction\s+npx\b|\balias\b[^\n;]*\bnpx=/.test(plain)) return 'it defines its own npx (a function or an alias), which would run instead of pipegen\'s hooks';
   if (code.includes('<<')) return 'it has a here-document or here-string';
   const n = (re: RegExp): number => (code.match(re) ?? []).length;
   const word = (w: string): RegExp => new RegExp(`(?:^|[\\s;&|(){}])${w}(?=$|[\\s;&|(){}])`, 'g');

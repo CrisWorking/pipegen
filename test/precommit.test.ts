@@ -2,7 +2,8 @@
 // the pre-commit layer. pipegen appends its reviewed local hooks to the repository's own hook manager (pre-commit, husky, lefthook; lefthook
 // set up new when there is none), byte for byte after the user's text, and records the exact inserted text. A hook runs only a reviewed,
 // pinned command: the secrets hook is pipegen itself at its exact version, which runs its pinned gitleaks on the staged changes.
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -46,7 +47,7 @@ function hookDraft(precommit: PipelineDraft['profile']['precommit'], over: Parti
   });
 }
 const judge = (f: CreatedFile, draft: PipelineDraft, reviewed: readonly ReviewedTool[] = reviewedList()): string[] => createdFileProblems(f, draft, CREATED_RULES, { reviewed, inputs: {} }).problems;
-const SCAN_HOOK_RUN = `npx --yes --registry=https://registry.npmjs.org pipegen@${VERSION} hook secrets`;
+const SCAN_HOOK_RUN = `npx --yes --prefix=/ --registry=https://registry.npmjs.org pipegen@${VERSION} hook secrets`;
 const BIOME_RUN = `npx --no --package=@biomejs/biome@${BIOME_VERSION} -- biome check --staged --no-errors-on-unmatched --vcs-enabled=true --vcs-client-kind=git`;
 
 const PRE_COMMIT = 'repos:\n  - repo: https://github.com/pre-commit/pre-commit-hooks\n    rev: 2c9f875913ee60ca25ce70243dc24d5b6415598c   # v6.0.0\n    hooks:\n      - id: trailing-whitespace\n';
@@ -88,7 +89,7 @@ describe('G6: the pre-commit layer (plan Task 3, B4)', () => {
     const f = r.files[0] as CreatedFile;
     const added = f.content.slice(HUSKY.length).split('\n').filter((l) => l !== '');
     // plain shell lines: pipegen's marker comments and the reviewed commands, nothing else
-    expect(added).toEqual(['# pipegen:hooks begin: pipegen\'s reviewed hooks; the install record holds this text', SCAN_HOOK_RUN, BIOME_RUN, '# pipegen:hooks end']);
+    expect(added).toEqual(['# pipegen:hooks begin: pipegen\'s reviewed hooks; the install record holds this text', `${SCAN_HOOK_RUN} || exit 1`, `${BIOME_RUN} || exit 1`, '# pipegen:hooks end']);
     expect(f.content.slice(0, HUSKY.length)).toBe(HUSKY);
     // a husky project without a pre-commit hook yet: a new script with a shebang (m5), written executable
     const fresh = await precommitFiles(hookDraft('husky'), reviewedList(), repo({ '.husky/commit-msg': 'npx commitlint --edit "$1"\n' }));
@@ -99,7 +100,10 @@ describe('G6: the pre-commit layer (plan Task 3, B4)', () => {
     expect(hookFileMode(HOOK_FILES.husky)).toBe('100755');
     for (const p of [HOOK_FILES['pre-commit'], HOOK_FILES.lefthook, '.husky/pre-push', 'x/.husky/pre-commit']) expect(hookFileMode(p), p).toBeNull();
     // a husky original that sources, evals or returns gets no append, only a note (G1 r1 minor), like exit and exec
-    for (const original of ['. "$(dirname -- "$0")/_/husky.sh"\nnpm test\n', 'source ./env.sh\nnpm test\n', 'eval "exit 0"\n', 'npm test\nreturn 0\n', 'npm test && . ./x.sh\n', 'if true; then . ./x.sh; fi\n', '{ . ./x.sh; }\n']) {
+    for (const original of ['. "$(dirname -- "$0")/_/husky.sh"\nnpm test\n', 'source ./env.sh\nnpm test\n', 'eval "exit 0"\n', 'npm test\nreturn 0\n', 'npm test && . ./x.sh\n', 'if true; then . ./x.sh; fi\n', '{ . ./x.sh; }\n',
+      // G6-R2 I1: a trap or errexit turned off; M1: quoted and escaped forms, command/builtin, a command word from a variable, an npx of its own
+      "trap 'exit 0' EXIT\nnpm test\n", 'set +e\nnpm test\n', 'set -u +e\n', 'set +o errexit\n', '"exit" 0\n', "'exit' 0\n", 'e"x"it 0\n', 'ex\\it 0\n', '"." ./x\n', '\\. ./x\n',
+      'command . ./x\n', 'builtin source ./x\n', '${x}it 0\n', '$CMD\n', 'npx() { :; }\n', 'function npx { :; }\n', "alias npx='true'\n", 'echo "source of truth"\n', "echo 'eval me'\n"]) {
       expect(huskyAppendProblem(original), JSON.stringify(original)).not.toBeNull();
       const res = await precommitFiles(hookDraft('husky'), reviewedList(), repo({ [HOOK_FILES.husky]: original }));
       expect(res.files, JSON.stringify(original)).toEqual([]);
@@ -107,7 +111,7 @@ describe('G6: the pre-commit layer (plan Task 3, B4)', () => {
       expect(res.notes.join('\n'), JSON.stringify(original)).toMatch(/can not add its hooks to \.husky\/pre-commit safely/);
     }
     // a dot or the word inside a string, a comment, or as an argument is no command
-    for (const original of ['npx biome check .\n', 'echo "source of truth"\n', '# . ./x.sh\nnpm test\n', 'ls ./src\n', "echo 'eval me'\n"]) {
+    for (const original of ['npx biome check .\n', '# . ./x.sh\nnpm test\n', 'ls ./src\n', 'x=$(date)\nnpm test "$x"\n', 'set -e\nnpm test\n']) {
       expect(huskyAppendProblem(original), JSON.stringify(original)).toBeNull();
     }
   });
@@ -231,10 +235,10 @@ describe('G6: carries (G1-R2 m5, m6; secrets hook; Plan J G-J1)', () => {
   });
 
   it('precommit: an existing secrets hook gets no second one, with a note', async () => {
+    // credited: a scanner that runs at the commit stage and can fail (Plan J's hook reading and tool signatures)
     const withGitleaks = `${PRE_COMMIT}  - repo: https://github.com/gitleaks/gitleaks\n    rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e\n    hooks:\n      - id: gitleaks\n`;
-    const huskyScan = 'npx --no -- secretlint "**/*"\n';
-    const lefthookScan = 'pre-push:\n  commands:\n    scan:\n      run: trufflehog git file://. --since-commit HEAD --fail\n';
-    for (const [manager, original] of [['pre-commit', withGitleaks], ['husky', huskyScan], ['lefthook', lefthookScan]] as const) {
+    const huskyScan = 'gitleaks git --pre-commit --redact --staged\n';
+    for (const [manager, original] of [['pre-commit', withGitleaks], ['husky', huskyScan]] as const) {
       const draft = hookDraft(manager);
       const r = await precommitFiles(draft, reviewedList(), repo({ [HOOK_FILES[manager]]: original }));
       const f = r.files[0] as CreatedFile;
@@ -243,16 +247,86 @@ describe('G6: carries (G1-R2 m5, m6; secrets hook; Plan J G-J1)', () => {
       expect(r.notes.join('\n'), manager).toMatch(/already scans for secrets/);
       expect(judge(f, draft), manager).toEqual([]);
     }
-    // a scanner named only in a comment is no hook
-    const commented = await precommitFiles(hookDraft('husky'), reviewedList(), repo({ [HOOK_FILES.husky]: '# TODO: gitleaks\nnpm test\n' }));
-    expect((commented.files[0] as CreatedFile).content).toContain(SCAN_HOOK_RUN);
-    // only a secrets hook to add and the repo has one: no file at all, the note says why
+    // not credited (G6-R2 spec I2 / sec M2): another stage, a scanner that can't fail, a soft run, a file filter, a mention in a comment or an echo
+    const notCredited: [PipelineDraft['profile']['precommit'], string][] = [
+      ['lefthook', 'pre-push:\n  commands:\n    scan:\n      run: trufflehog git file://. --since-commit HEAD --fail\n'],
+      ['pre-commit', withGitleaks.replace('      - id: gitleaks\n', '      - id: gitleaks\n        stages: [manual]\n')],
+      ['pre-commit', `default_stages: [pre-push]\n${withGitleaks}`.replace('default_stages: [pre-push]', 'default_stages: [pre-commit, pre-push]').replace('      - id: gitleaks\n', '      - id: gitleaks\n        stages: [pre-push]\n')],
+      ['pre-commit', withGitleaks.replace('      - id: gitleaks\n', '      - id: gitleaks\n        exclude: ^docs/\n')],
+      ['pre-commit', `exclude: ^\\.gitleaks\\.toml$\n${PRE_COMMIT}`],
+      ['husky', 'gitleaks version\nnpm test\n'], ['husky', 'detect-secrets scan > .secrets.baseline\n'], ['husky', 'gitleaks git --staged || true\n'],
+      ['husky', 'npm test # gitleaks runs in CI\n'], ['husky', 'echo "TODO: add gitleaks"\n'], ['husky', '# TODO: gitleaks\nnpm test\n'],
+    ];
+    for (const [manager, original] of notCredited) {
+      const r = await precommitFiles(hookDraft(manager), reviewedList(), repo({ [HOOK_FILES[manager ?? 'lefthook']]: original }));
+      const text = r.files.map((f) => f.content).join('') + r.notes.join('\n');
+      expect(text, original).toContain(SCAN_HOOK_RUN);
+      expect(r.notes.join('\n'), original).not.toMatch(/already scans/);
+    }
+    // only a secrets hook to add and the repo has one: no file at all, and the one true reason (spec I3)
     const d = hookDraft('husky');
     const onlyScanHook = { ...d, needs: d.needs.filter((n) => n.id !== 'format-lint') };
     const r = await precommitFiles(onlyScanHook, reviewedList(), repo({ [HOOK_FILES.husky]: huskyScan }));
     expect(r.files).toEqual([]);
-    expect(r.notes.join('\n')).toMatch(/already scans for secrets/);
+    expect(r.notes).toEqual(['Your .husky/pre-commit already scans for secrets at commit, so pipegen adds no secrets hook of its own there.']);
+    // no gitleaks entry in the reviewed list: a note says the local secrets hook is not added
+    const noGitleaks = await precommitFiles(hookDraft('husky'), reviewedList().filter((t) => t.id !== 'gitleaks'), repo({ [HOOK_FILES.husky]: HUSKY }));
+    expect(noGitleaks.notes.join('\n')).toMatch(/no gitleaks entry/);
   });
+
+  it('precommit: a pre-commit config whose default_stages leave out commit gets no append, a note (M3)', async () => {
+    for (const ds of ['[pre-push]', '[manual]', '[]', 'pre-commit']) {
+      const r = await precommitFiles(hookDraft('pre-commit'), reviewedList(), repo({ [HOOK_FILES['pre-commit']]: `default_stages: ${ds}\n${PRE_COMMIT}` }));
+      expect(r.files, ds).toEqual([]);
+      expect(r.notes.join('\n'), ds).toMatch(/default_stages/);
+    }
+    for (const ds of ['[pre-commit]', '[commit, pre-push]']) {
+      const r = await precommitFiles(hookDraft('pre-commit'), reviewedList(), repo({ [HOOK_FILES['pre-commit']]: `default_stages: ${ds}\n${PRE_COMMIT}` }));
+      expect(r.files.length, ds).toBe(1);
+    }
+  });
+
+  it('precommit: the husky block stops at a failed hook under plain sh, with or without -e (I1)', async () => {
+    const bin = mkdtempSync(join(tmpdir(), 'pipegen-fake-npx-'));
+    made.push(bin);
+    const log = join(bin, 'log');
+    // a fake npx: the secrets hook fails, biome passes, each call logged
+    writeFileSync(join(bin, 'npx'), `#!/bin/sh\necho "$*" >> "${log}"\ncase "$*" in *"hook secrets"*) exit 1 ;; esac\nexit 0\n`, { mode: 0o755 });
+    for (const original of [null, HUSKY]) {
+      const dir = repo(original === null ? { '.husky/commit-msg': 'x\n' } : { [HOOK_FILES.husky]: original });
+      const r = await precommitFiles(hookDraft('husky'), reviewedList(), dir);
+      const script = join(dir, 'built-pre-commit');
+      writeFileSync(script, (r.files[0] as CreatedFile).content.replace('npm test', 'true'), { mode: 0o755 });
+      for (const sh of [['sh', script], ['sh', '-e', script]]) {
+        rmSync(log, { force: true });
+        const res = spawnSync(sh[0] as string, sh.slice(1), { env: { PATH: `${bin}:/usr/bin:/bin` }, encoding: 'utf8' });
+        expect(res.status, `${sh.join(' ')} ${String(original)}`).not.toBe(0);
+        // the commands after the failed one never ran
+        expect(readFileSync(log, 'utf8').trim().split('\n')).toEqual([expect.stringContaining('hook secrets')]);
+      }
+    }
+  });
+
+  it('precommit: the secrets hook reads no repository package and no project .npmrc (I3, --prefix=/)', async () => {
+    const dir = repo({
+      'package.json': '{"name":"app","version":"1.0.0"}\n',
+      'node_modules/pipegen/package.json': `{"name":"pipegen","version":"${VERSION}","bin":{"pipegen":"cli.js"}}\n`,
+      'node_modules/pipegen/cli.js': `#!/usr/bin/env node\nrequire('fs').writeFileSync(${JSON.stringify('LOCAL_MARK')}, 'local');\n`,
+      '.npmrc': `node-options=--require=${'./evil.cjs'}\n`,
+      'evil.cjs': "require('fs').writeFileSync('NPMRC_MARK', 'npmrc');\n",
+    });
+    mkdirSync(join(dir, 'node_modules', '.bin'), { recursive: true });
+    symlinkSync('../pipegen/cli.js', join(dir, 'node_modules', '.bin', 'pipegen'));
+    chmodSync(join(dir, 'node_modules', 'pipegen', 'cli.js'), 0o755);
+    const words = secretsHookRun(VERSION).split(' ');
+    // offline (no network in tests): npx can only fail; it must not run the local package or load the .npmrc's node-options on the way
+    const cache = mkdtempSync(join(tmpdir(), 'pipegen-npm-cache-'));
+    made.push(cache);
+    const res = spawnSync(words[0] as string, words.slice(1), { cwd: dir, env: { PATH: process.env.PATH, HOME: process.env.HOME, npm_config_offline: 'true', npm_config_cache: cache }, encoding: 'utf8', timeout: 120_000 });
+    expect(res.status).not.toBe(0);
+    expect(existsSync(join(dir, 'LOCAL_MARK'))).toBe(false);
+    expect(existsSync(join(dir, 'NPMRC_MARK'))).toBe(false);
+  }, 150_000);
 
   it('precommit: the hooks sit where hooks-ci runs them (pre-commit run --all-files, lefthook run pre-commit --all-files)', async () => {
     const pc = await precommitFiles(hookDraft('pre-commit'), reviewedList(), repo({ [HOOK_FILES['pre-commit']]: PRE_COMMIT }));
