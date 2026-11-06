@@ -111,7 +111,9 @@ describe('G6: the pre-commit layer (plan Task 3, B4)', () => {
       'npm test ||\n', 'npm test || # later\n', 'npm test ||   \n', 'npm test ||\t# x\n',
       'hash -p /bin/true npx\n', 'hash -p /bin/true $H\n', 'hash -rp /x npx\n', 'set -e -n -- x\n', 'set -o noexec -- x\n',
       // G6-R-sec4: fail closed: a set or hash whose arguments are not all literal words
-      'set $F\n', 'set -$(printf n)\n', 'set -e <x -n\n', 'set -e `printf -- -n`\n', 'set -e >x -n\n', 'hash -p /bin/true $H\n', 'hash $H\n', 'hash npx >x\n', 'npm test && set -e ${N}\n']) {
+      'set $F\n', 'set -$(printf n)\n', 'set -e <x -n\n', 'set -e `printf -- -n`\n', 'set -e >x -n\n', 'hash -p /bin/true $H\n', 'hash $H\n', 'hash npx >x\n', 'npm test && set -e ${N}\n',
+      // G6-R-sec5: a redirect on a set line could hide an option word; on hash only as trailing words
+      'set -e 2>/dev/null -n\n', 'set -e 2>&1 -n\n', 'set -e >/dev/null -o noexec\n', 'set -eu 2>/dev/null\n', 'hash 2>/dev/null -p /bin/true npx\n', 'hash 2>/dev/null npx\n']) {
       expect(huskyAppendProblem(original), JSON.stringify(original)).not.toBeNull();
       const res = await precommitFiles(hookDraft('husky'), reviewedList(), repo({ [HOOK_FILES.husky]: original }));
       expect(res.files, JSON.stringify(original)).toEqual([]);
@@ -121,7 +123,7 @@ describe('G6: the pre-commit layer (plan Task 3, B4)', () => {
     // a dot or the word inside a string, a comment, or as an argument is no command
     for (const original of ['npx biome check .\n', '# . ./x.sh\nnpm test\n', 'ls ./src\n', 'x=$(date)\nnpm test "$x"\n', 'set -e\nnpm test\n', 'set -eu\nnpm test\n', 'npm test || npm run fix\n', 'echo set -n\n', '# set -n\nnpm test\n', 'hash -r\nnpm test\n', 'npm run lint -- --no-cache\n',
       // G6-R4 minor 3: after `--` (or the first plain word) set takes arguments, not options; hash counts only with -p
-      'set -- --no-stash -n\n', 'set -e -- -n\n', 'set -e foo -n\n', 'set -e bar -n\n', 'hash npx 2>/dev/null && npx lint-staged\n', 'hash npx\n', 'hash -r npx\n', 'hash npx 2>&1 >/dev/null\n', 'set -eu -o pipefail\n', 'set +x\n']) {
+      'set -- --no-stash -n\n', 'set -e -- -n\n', 'set -e foo -n\n', 'set -e bar -n\n', 'hash npx 2>/dev/null && npx lint-staged\n', 'hash npx\n', 'hash -r npx\n', 'hash npx 2>&1 >/dev/null\n', 'hash npx > /dev/null 2>&1\n', 'set -eu -o pipefail\n', 'set +x\n']) {
       expect(huskyAppendProblem(original), JSON.stringify(original)).toBeNull();
     }
   });

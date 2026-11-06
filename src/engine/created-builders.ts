@@ -375,15 +375,20 @@ const sortKeys = (v: unknown): unknown => (Array.isArray(v) ? v.map(sortKeys) : 
  * whole, so this refuses what makes it unclear: `exit` or `exec` anywhere outside a comment, any here-document or here-string (`<<`), a quote
  * left open, and an `if`/`case`/loop or a brace or parenthesis left open at the end. A refused script gets no append and a note.
  */
-/** A redirection that only discards or joins output (`2>/dev/null`, `>>/dev/null`, `2>&1`), the one kind kept in a literal argument list. */
-const QUIET_REDIRECT = /(?:^|[ \t])\d?(?:>>?[ \t]*\/dev\/null|>&\d)(?=[ \t]|$)/g;
+/**
+ * Quiet redirections (`2>/dev/null`, `> /dev/null`, `2>&1`) as the trailing words of a `hash` line, the one place they are kept
+ * (G6-R-sec5: on a `set` line, or between arguments, a redirection could hide an option word, so it is refused).
+ */
+const TRAILING_QUIET_REDIRECTS = /(?:[ \t]+\d?(?:>>?[ \t]*\/dev\/null|>&\d))+[ \t]*$/;
 /**
  * G6-R-sec4 (fail closed): whether a `set` or `hash` at a command position has an argument that is not a literal word (letters, digits
- * and `-_./=+`): a `$`, a backquote, `$(`, a `<` or `>` (other than QUIET_REDIRECT) or any other character the shell may expand.
+ * and `-_./=+`): a `$`, a backquote, `$(`, any `<` or `>` (on hash, other than TRAILING_QUIET_REDIRECTS) or any other character the
+ * shell may expand.
  */
-function nonLiteralArgs(plain: string, at: string, cmd: string): boolean {
+function nonLiteralArgs(plain: string, at: string, cmd: 'set' | 'hash'): boolean {
   for (const m of plain.matchAll(new RegExp(`${at}${cmd}(?![A-Za-z0-9_.-])((?:\\d?>&\\d|[^\\n;&|])*)`, 'gm'))) {
-    if (!/^[A-Za-z0-9_\-./=+ \t]*$/.test((m[1] ?? '').replace(QUIET_REDIRECT, ' '))) return true;
+    const args = m[1] ?? '';
+    if (!/^[A-Za-z0-9_\-./=+ \t]*$/.test(cmd === 'hash' ? args.replace(TRAILING_QUIET_REDIRECTS, '') : args)) return true;
   }
   return false;
 }
@@ -439,7 +444,7 @@ export function huskyAppendProblem(original: string): string | null {
   if (/\bnpx\s*\(\s*\)|\bfunction\s+npx\b|\balias\b[^\n;]*\bnpx=/.test(plain)) return 'it defines its own npx (a function or an alias), which would run instead of pipegen\'s hooks';
   // G6-R3 N3: no-exec mode reads the rest without running it; a hashed npx can point at another program; a dangling `||` at the end
   // joins pipegen's first line to the original's last command, so the scan would run only when that command fails
-  if (['set', 'hash'].some((c) => nonLiteralArgs(plain, at, c))) return 'it runs set or hash with arguments built at run time or redirected, so pipegen can not tell what they do';
+  if ((['set', 'hash'] as const).some((c) => nonLiteralArgs(plain, at, c))) return 'it runs set or hash with arguments built at run time or redirected, so pipegen can not tell what they do';
   if (setsNoexec(plain, at)) return 'it turns on no-exec mode (set -n), so appended lines would not run';
   // G6-R4 minor 3: only `hash -p` gives a command a path of the script's own; a plain `hash npx` just looks it up
   if (new RegExp(`${at}hash\\b[^\\n;&|]*?[ \\t]-[A-Za-z]*p`, 'm').test(plain)) return 'it gives a command a path of its own with hash -p, which could run instead of pipegen\'s hooks';
