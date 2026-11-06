@@ -1187,7 +1187,7 @@ describe('V3 fix round 2', () => {
   });
   const base = { id: CENTRAL_ID, name: 'pipelines', full_name: 'acme/pipelines', owner: { login: OWNER }, description: DESC, default_branch: 'main', forks_count: 0, has_wiki: false, has_discussions: false };
   const ourPr = { number: 4, head: { ref: 'pipegen/update-shop', repo: { id: CENTRAL_ID } } };
-  interface W { repo?: Record<string, unknown>; refs?: unknown[]; refsAnswer?: unknown; pulls?: unknown[]; dependabot?: unknown[] | number; codespaces?: unknown[] | number; dependabotLater?: number; comments?: unknown[] | number }
+  interface W { repo?: Record<string, unknown>; refs?: unknown[]; refsAnswer?: unknown; pulls?: unknown[]; dependabot?: unknown[] | number; codespaces?: unknown[] | number; dependabotLater?: number; comments?: unknown[] | number; empty?: boolean }
   const listOf = (x: unknown[] | number | undefined) => { if (typeof x === 'number') throw httpErr(x); return { total_count: (x ?? []).length, [LIST]: x ?? [] }; };
   const go = async (w: W) => {
     const state = { deleted: false };
@@ -1195,7 +1195,7 @@ describe('V3 fix round 2', () => {
     const f = fakeGh((route, p) => {
       if (route === 'GET /repos/{owner}/{repo}') { if (state.deleted) throw httpErr(404); return w.repo ?? base; }
       if (route === 'GET /repos/{owner}/{repo}/branches') return [{ name: 'main' }];
-      if (route === 'GET /repos/{owner}/{repo}/git/ref/{ref}') return { object: { sha: SHA } };
+      if (route === 'GET /repos/{owner}/{repo}/git/ref/{ref}') { if (w.empty === true) throw httpErr(409); return { object: { sha: SHA } }; }
       if (route === 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}') return { tree: { sha: SHA }, parents: [] };
       if (route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}') return { truncated: false, tree: [{ path: 'README.md', sha: gitBlobSha(readme), mode: '100644', type: 'blob' }] };
       if (route === 'GET /repos/{owner}/{repo}/git/matching-refs/{ref}') return p.ref === '' ? ('refsAnswer' in w ? w.refsAnswer : [{ ref: 'refs/heads/main' }, ...(w.refs ?? [])]) : [];
@@ -1459,6 +1459,8 @@ describe('V3 fix round 2', () => {
       const r = await go({ refsAnswer: [] });
       expect(r.deleted).toBe(false);
       expect(r.out.why).toMatch(/refs\/heads\/main/);
+      // a repo with no commit yet has no branch ref: an empty list is whole then
+      expect((await go({ empty: true, refsAnswer: [] })).out).toEqual({ deleted: true });
     });
 
     it('R2b sec M-r2-8: a commit comment (or an unreadable list of them) keeps the central repo', async () => {
@@ -1511,11 +1513,11 @@ describe('V3 fix round 2', () => {
         // ?. anywhere in the chain
         'await gh?.repos.delete(p);', 'await gh.repos?.delete(p);', 'await gh?.repos?.delete(p);', 'await gh.repos.delete?.(p);', 'await gh.rest?.repos.delete(p);',
         // a bracket after (or around) a namespace
-        'await gh.repos[\'delete\'](p);', 'await gh.repos[m](p);', 'await gh.repos?.[m](p);', 'await gh[\'repos\'].delete(p);', 'await gh.rest[\'git\'].deleteRef(p);',
+        'await gh.repos[\'delete\'](p);', 'await gh.repos[m](p);', 'await gh.repos?.[m](p);', 'await gh[\'repos\'].delete(p);', 'await client[\'repos\'].delete(p);', 'await gh.rest[\'git\'].deleteRef(p);',
         // .call / .apply / .bind on an endpoint method
         'await gh.repos.delete.call(gh, p);', 'await gh.pulls.update.apply(gh, [p]);', 'const f = gh.git.deleteRef.bind(gh);',
         // code inside a template literal's ${…}
-        'const s = `${await gh.repos.delete(p)}`;', 'const s = `a ${`b ${gh.git.deleteRef(p)}`} c`;', 'const s = `${{ x: 1 }.x} ${gh.request(r)}`;',
+        'const s = `${await gh.repos.delete(p)}`;', 'const s = `a ${`b ${gh.git.deleteRef(p)}`} c`;', 'const s = `${{ x: 1 }.x} ${gh.request(r)}`;', 'const s = `${ { a: 1 }.a + gh.repos.delete(p) }`;',
         // the namespaces the hand-written list missed
         'await o.codeSecurity.deleteConfiguration(p);', 'await o.privateRegistries.deleteOrgPrivateRegistry(p);', 'await o.hostedCompute.deleteNetworkConfigurationFromOrg(p);',
         'await o.campaigns.deleteCampaign(p);', 'await o.credentials.revoke(p);', 'await o.enterpriseTeams.delete(p);', 'await o.enterpriseTeamMemberships.remove(p);', 'await o.enterpriseTeamOrganizations.delete(p);',
