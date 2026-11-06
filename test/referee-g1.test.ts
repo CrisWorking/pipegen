@@ -14,6 +14,7 @@ import { GATE_CHECK_NAME, type CreatedFile, type ExistingWorkflow, type Need, ty
 import { draftOf, GATE, job, jobsOf, p, prof, run, show, workflow as stepsWorkflow, type Job } from './helpers/gate-pipeline.js';
 import { entry, reviewedList, specFor } from './helpers/render.js';
 import { withEgress } from './helpers/egress-step.js';
+import { noImages, verifyTail, VERIFY_LIMIT } from './helpers/verify-tail.js';
 
 const d = draftOf();
 /** The helper's workflow, also with reusable-workflow caller jobs (a job with `uses` and no steps). */
@@ -37,13 +38,13 @@ function pushFile(scannerOver: Job = {}, top: Record<string, unknown> = {}, extr
   return at(workflow({ 'pr-check': prCheckJob(), 'sast--app': scanner, ...extraJobs }, { on: { push: featurePushTrigger('main') }, ...top }), PUSH_WORKFLOW);
 }
 /** A user's deploy workflow with pipegen's inserted job (the Plan B marker), under the user's own triggers. */
-function editedUser(on: string, insertedId: string, steps: RenderedStep[], perms: Record<string, string>): { f: CreatedFile; draft: PipelineDraft } {
+function editedUser(on: string, insertedId: string, steps: RenderedStep[], perms: Record<string, string>, extra: Record<string, unknown> = {}): { f: CreatedFile; draft: PipelineDraft } {
   const original = `on:\n${on}jobs:\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ./deploy.sh\n`;
   const doc = new Document();
   doc.contents = doc.createNode({ on: null, jobs: {} });
   const text0 = original.replace('  deploy:\n    runs-on', `  deploy:\n    needs: [${insertedId}]\n    runs-on`);
   const ins = new Document();
-  ins.contents = ins.createNode({ [insertedId]: { 'runs-on': 'ubuntu-latest', permissions: perms, 'cache-mode': 'none' } });
+  ins.contents = ins.createNode({ [insertedId]: { 'runs-on': 'ubuntu-latest', ...extra, permissions: perms, 'cache-mode': 'none' } });
   ins.setIn([insertedId, 'steps'], stepsToYaml(withEgress(steps)));
   const text = `${text0}${ins.toString({ lineWidth: 0 }).split('\n').map((l) => (l === '' ? l : `  ${l}`)).join('\n')}`;
   const f: CreatedFile = { path: '.github/workflows/deploy.yml', content: text, part: 'deploy-verify', reason: 't', repo: 'app', inserted: { original, jobs: [insertedId], needs: [{ job: 'deploy', added: [insertedId] }] } };
@@ -165,7 +166,10 @@ describe('G1: the triggers of Plan G\'s layout (B1, B2, C3)', () => {
     const sch = editedUser("  schedule:\n    - cron: '0 3 * * *'\n", 'pipegen-verify', [renderFindRunStep(GATE, {})], VERIFY_PERMS);
     const rs = await run([sch.f], sch.draft);
     expect(has(rs, 'template', /runs on schedule/), show(rs)).toBe(true);
-    const psh = editedUser('  push:\n    branches: [main]\n', 'pipegen-verify', [renderFindRunStep(GATE, {})], VERIFY_PERMS);
+    // (G7: the verify job as the referee holds it, find-run under its id then the head check, longer than the wait, for a profile that
+    // publishes no image: no digest step or signature check)
+    const psh = editedUser('  push:\n    branches: [main]\n', 'pipegen-verify', verifyTail(renderFindRunStep(GATE, {})), VERIFY_PERMS, { 'timeout-minutes': VERIFY_LIMIT });
+    psh.draft = { ...psh.draft, profile: noImages(psh.draft.profile) };
     const rp = await run([psh.f], psh.draft);
     expect(has(rp, 'template', /runs on schedule/), show(rp)).toBe(false);
     expect(rp.issues.filter((i) => i.file === psh.f.path), show(rp)).toEqual([]);

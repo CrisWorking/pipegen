@@ -17,6 +17,7 @@ import {
 } from '../src/engine/job-rules.js';
 import { protectedMatcher } from '../src/engine/protected-match.js';
 import { referee, type RefereeReport } from '../src/engine/referee.js';
+import { DIGEST_STEP_ID, FIND_RUN_STEP_ID, renderHeadCheckStep } from '../src/engine/deploy-steps.js';
 import { renderFindRunStep, renderJobPrelude, renderPlatformStep, stepsToYaml } from '../src/engine/render-step.js';
 import {
   assemble, callerPermissions, callerSecrets, judgeAssembled, MERGE_CALLER_JOB, NIGHTLY_CRON, NOT_PROVEN_MARK, verifyJob, VERIFY_GRACE_MINUTES, VERIFY_MARGIN_MINUTES,
@@ -342,17 +343,21 @@ describe('G5: the delivered files and their callers', () => {
     // it waits for the whole gated run of pipegen.yml (G5-R1 m1): the merge chain (baseline-check → base-scan → gate, 3 × 30), then
     // image-publish (30) and sign (15), plus the grace; and the job outlives the wait
     const wait = 90 + 30 + 15 + VERIFY_GRACE_MINUTES;
-    expect(find).toEqual(renderFindRunStep(GATE, { central: { repo: PIN.repo, sha: PIN.sha, project: 'r' }, sha: 'github.sha', timeoutMinutes: wait }));
+    expect(find).toEqual({ id: FIND_RUN_STEP_ID, ...renderFindRunStep(GATE, { central: { repo: PIN.repo, sha: PIN.sha, project: 'r' }, sha: 'github.sha', timeoutMinutes: wait }) });
     expect(find.with['central-workflow']).toBe(centralWorkflowPath(PIN.repo, 'r'));
     expect(v['timeout-minutes']).toBe(wait + VERIFY_MARGIN_MINUTES);
     expect(VERIFY_MARGIN_MINUTES).toBeGreaterThan(0);
-    // nothing else yet: the digest hand-off and the signature checks come after the find-run step with the deploy layer (G7)
-    expect(v.steps).toHaveLength(2);
+    // G7: after find-run, the head check, then per published image the digest of the gated run and the signature check
+    expect(v.steps[2]).toEqual(renderHeadCheckStep('main'));
+    expect(v.steps[3]?.id).toBe(DIGEST_STEP_ID);
+    expect(v.steps).toHaveLength(6);
+    expect(v.steps[5]?.run).toContain(' verify --key ');
     // public: inline find-run; no environments: no environment (the plan says so in PIPEGEN.md)
     const pv = lay(pub()).verify as Job;
-    expect(pv.steps[1]).toEqual(renderFindRunStep(GATE, { sha: 'github.sha', timeoutMinutes: 90 + VERIFY_GRACE_MINUTES }));
+    expect(pv.steps[1]).toEqual({ id: FIND_RUN_STEP_ID, ...renderFindRunStep(GATE, { sha: 'github.sha', timeoutMinutes: 90 + VERIFY_GRACE_MINUTES }) });
     expect(pv.environment).toBeUndefined();
-    expect(pv.steps).toHaveLength(2);
+    expect(pv.steps[2]).toEqual(renderHeadCheckStep('main'));
+    expect(pv.steps).toHaveLength(3);
     // the referee accepts the job inserted into a user's deploy workflow (G7 places it), judged with the assembled files in one call
     const deployWf = { path: '.github/workflows/deploy.yml', triggers: ['push'], deploys: true, [['secrets', 'Used'].join('')]: [], jobs: ['deploy'] } as unknown as PipelineDraft['profile']['existingWorkflows'][number];
     const withDeploy = planned(profileOf([node()], { private: true, existingWorkflows: [deployWf] }), { needs: floorNeeds(profileOf([node()], { private: true }), CAPS), over: { centralPin: PIN } });

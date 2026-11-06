@@ -3,6 +3,9 @@
 // the referee and the linters import them from here, so no second copy can drift. It imports only the leaves render-error.ts,
 // tool-flags.ts and types.ts (test/final-fix-b.test.ts and test/module-graph.test.ts check this).
 import { EXPR, own, RenderError, show } from './render-error.js';
+import {
+  BUILD_PUSH_STEP_ID, DIGEST_STEP_ENV, DIGEST_STEP_ID, FIND_RUN_STEP_ID, HEAD_CHECK_ENV, HEAD_CHECK_STEP_ID, imageDigestArtifact, PUBLISH_DIGEST_ENV, PUBLISH_DIGEST_STEP_ID,
+} from './deploy-steps.js';
 import { GATE_RESULT_ARTIFACT, resultArtifactName, SECRETS_RANGE_ARTIFACT, slug } from './artifact-names.js';
 import { ARGV_POLICIES, BASE_CHECKOUT_REF, GATE_OPTIONAL_UPLOADS, RANGE_BEFORE_REF, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, isGateUploadName, CHECKER_STEP_ID_RE, GATE_USES_RE, isStagedTool, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, stagePath, stageStepId, STAGE_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
 
@@ -134,6 +137,16 @@ export function isGateDecideStep(s: RenderedStep): boolean {
 }
 
 /**
+ * G7 (carry G5→G7 3): whether a step is the verify job's find-run step: the gate action pinned by a commit, in `mode: find-run`, with no id
+ * or the id FIND_RUN_STEP_ID (its run-id output feeds the digest step), no `run`. It runs pipegen's own code on the API only (it reads no
+ * workspace and writes nothing a later step runs), so the digest step, the head check and the signature checks may follow it. The shape
+ * only; the referee holds the pin, the inputs and the job (find-run runs only in pipegen-verify's row).
+ */
+export function isFindRunStep(s: RenderedStep): boolean {
+  return (s.id === undefined || s.id === FIND_RUN_STEP_ID) && s.run === undefined && s.uses !== undefined && GATE_USES_RE.test(s.uses) && s.with?.mode === 'find-run';
+}
+
+/**
  * Whether a step is KNOWN not to run the repo's code. Everything else is repo code (fail closed): a step with no id, an
  * unknown or renamed id, `pipegen-npm-ci-…` (the repo's own `npm ci` reads its `.npmrc`), the repo-code run steps, and any
  * action that is not a pinned checkout, setup or upload action. An id counts only on the right kind of step: a script
@@ -143,7 +156,10 @@ export function isGateDecideStep(s: RenderedStep): boolean {
 export function isKnownHarmless(s: RenderedStep): boolean {
   if (isPrCheckStep(s)) return true;   // G1 (BP-6): the exact pr-check lookup reads the API with the job's token, never the workspace
   const pinnedAction = s.uses !== undefined && s.run === undefined && TRUSTED_ACTION_RE.test(s.uses);
+  if (isFindRunStep(s)) return true;
   if (s.id === undefined) return pinnedAction || isGateDecideStep(s);
+  // G7: the head check, the verify job's digest step and image-publish's digest step, pipegen's own scripts (the API and their own files only)
+  if (s.id === HEAD_CHECK_STEP_ID || s.id === DIGEST_STEP_ID || s.id === PUBLISH_DIGEST_STEP_ID) return s.run !== undefined && s.uses === undefined;
   if (SETUP_STEP_ID_RE.test(s.id)) {
     const path = SETUP_ID_ACTION.find(([re]) => re.test(s.id as string))?.[1];
     return pinnedAction && path !== undefined && (s.uses as string).startsWith(`${path}@`);
@@ -199,7 +215,7 @@ export function checkJobOrder(steps: readonly RenderedStep[], job: Partial<JobCo
   const scrubbed = new Set<string>();   // the artifacts a scrub step earlier in this job rebuilt
   // G2 (B6): the exact tail of an image-build job (archive step, then the archive's upload, right after the build) is the one exception
   // G4-R1: and the exact tail of a dast-run job (the app in containers, the DAST step, the raw hand-off), after harmless steps only
-  const tail = imageBuildTailAt(steps, job.id) ?? dastRunTailAt(steps, job.id);
+  const tail = imageBuildTailAt(steps, job.id) ?? dastRunTailAt(steps, job.id) ?? publishTailAt(steps, job.id);
   steps.forEach((s, i) => {
     if (tail !== null && i >= tail) return;
     if (isKnownHarmless(s)) {
@@ -519,11 +535,10 @@ export const BASELINE_CHECK_STEP_ID = 'pipegen-baseline-check';
 export const isBaselineCheckStep = (s: RenderedStep): boolean =>
   s.id === BASELINE_CHECK_STEP_ID && s.run === undefined && s.uses !== undefined && GATE_USES_RE.test(s.uses) && s.with?.mode === 'baseline-check';
 /**
- * The verify job's digest step id (G22, B3 a): the run step that reads the trusted run's digest artifact and checks it. Its renderer and its
- * step kind come with the deploy layer (G7); here only its shape: a run step with this id (until G7 the referee does not recognise its content, so
- * the pipegen-verify row refuses it).
+ * The verify job's digest step id (G22, B3 a): the run step that reads the trusted run's digest artifact and checks it. Its renderer is G7's
+ * (deploy-steps.ts renderDigestStep, which the referee recognises by content); here only its shape: a run step with this id.
  */
-export const DIGEST_STEP_ID = 'pipegen-digest';
+export { DIGEST_STEP_ID };
 const isDigestStep = (s: RenderedStep): boolean => s.id === DIGEST_STEP_ID && typeof s.run === 'string' && s.uses === undefined;
 
 /** The one form of a job output taken from a step's output. */
@@ -622,9 +637,10 @@ export const verifyStepId = (repo: string): string => `pipegen-verify-${sha16(`v
 export const SIGN_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_COSIGN_KEY: '${{ secrets.PIPEGEN_COSIGN_KEY }}', PIPEGEN_COSIGN_PASSWORD: '${{ secrets.PIPEGEN_COSIGN_PASSWORD }}', PIPEGEN_REGISTRY_TOKEN: '${{ secrets.GITHUB_TOKEN }}' });
 /**
  * The verify steps' env: the key-env public key, the variable of the signing environment (a writer can change it, so the step checks its
- * sha256 against the literal pipegen recorded before cosign reads it, DECISIONS #76), and the attest-mode token of gh (the job's own token).
+ * sha256 against the literal pipegen recorded before cosign reads it, DECISIONS #76), the attest-mode token of gh and (G7) the token of cosign's
+ * registry login (both the job's own token: packages and attestations read).
  */
-export const VERIFY_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_COSIGN_PUB: '${{ vars.PIPEGEN_COSIGN_PUB }}', PIPEGEN_GH_TOKEN: '${{ github.token }}' });
+export const VERIFY_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_COSIGN_PUB: '${{ vars.PIPEGEN_COSIGN_PUB }}', PIPEGEN_GH_TOKEN: '${{ github.token }}', PIPEGEN_REGISTRY_TOKEN: '${{ github.token }}' });
 
 /** The PR's own image (ruling B6): `image-build--<svc>` builds it without pushing and hands it to the scanners as an archive bound by its sha256. */
 export const IMAGE_BUILD_NEED = 'image-build';
@@ -746,6 +762,31 @@ function imageBuildTailAt(steps: readonly RenderedStep[], jobId: string | undefi
   const before = steps.slice(0, n - 3).every(isKnownHarmless);
   return before && isBuildPushStep(b) && isImageArchiveStep(a) && upload ? n - 2 : null;
 }
+/** The reviewed docker login (ghcr.io with the job's token), pinned by a commit: the one step besides harmless ones before image-publish's build. */
+const DOCKER_LOGIN_USES_RE = new RegExp(`^${PLATFORM_USES['docker-login'].replace(/[/.]/g, '\\$&')}@[0-9a-f]{40}$`);
+const isDockerLoginStep = (s: RenderedStep): boolean => s.run === undefined && s.uses !== undefined && DOCKER_LOGIN_USES_RE.test(s.uses);
+/**
+ * G7 (carry G2→G7, B3 a): in the job `image-publish`, every step before the build known harmless or the reviewed docker login, the reviewed
+ * build-push step (`id: pipegen-build-push`, push true) builds and pushes the root service's Dockerfile inside BuildKit's own containers
+ * (nothing it runs reaches the runner), and right after it, as the job's last two steps, come exactly the publish digest step of one
+ * service and the upload of that service's digest folder (no scrub: a digest, not a result; it is checked as sha256:<64 hex> wherever it is
+ * read, and the signature binds it). The index where that tail starts, or null when the job is not image-publish or its tail is not this.
+ */
+function publishTailAt(steps: readonly RenderedStep[], jobId: string | undefined): number | null {
+  const n = steps.length;
+  if (jobId !== 'image-publish' || n < 3) return null;
+  const [b, d, u] = [steps[n - 3], steps[n - 2], steps[n - 1]] as [RenderedStep, RenderedStep, RenderedStep];
+  const before = steps.slice(0, n - 3).every((s) => isKnownHarmless(s) || isDockerLoginStep(s));
+  const m = d.id === PUBLISH_DIGEST_STEP_ID && d.run !== undefined && d.uses === undefined ? /^dir="\$RUNNER_TEMP\/pipegen-out\/(pipegen-out-image-digest--[a-z0-9-]{1,120})"$/m.exec(d.run) : null;
+  const artifact = m?.[1];
+  const folder = artifact === undefined ? '' : `\${{ runner.temp }}/pipegen-out/${artifact}`;
+  const upload = artifact !== undefined && uploadFolder(u) === artifact && u.with?.name === artifact && u.with?.path === folder && u.if === undefined && u['continue-on-error'] === undefined;
+  const build = isBuildPushStep(b) && b.id === BUILD_PUSH_STEP_ID && b.with?.push === 'true';
+  let named = false;
+  try { named = artifact !== undefined && artifact === imageDigestArtifact(artifact.slice('pipegen-out-image-digest--'.length)); } catch { named = false; }
+  return before && build && upload && named ? n - 2 : null;
+}
+
 /** Plan G's job outputs (G22, three of four; the nested not-proven output is Plan H's): each on its own job only, from its own step only. */
 const G_OUTPUTS: Readonly<Record<string, { job: string; step: string; is: (s: RenderedStep) => boolean }>> = Object.freeze({
   found: { job: 'baseline-check', step: BASELINE_CHECK_STEP_ID, is: isBaselineCheckStep },
@@ -908,6 +949,9 @@ export function checkExpressions(step: RenderedStep): void {
         if (step.id === RANGE_FETCH_STEP_ID && step.run !== undefined && step.uses === undefined && own(RANGE_FETCH_STEP_ENV, k) === v) continue;
         // G1 (BP-6): the pr-check lookup step, exactly as renderPrCheckStep writes it (every field that runs), carries the job's own token
         if (Object.hasOwn(PR_CHECK_STEP_ENV, k) && PR_CHECK_STEP_ENV[k] === v && isPrCheckStep(step)) continue;
+        // G7: the head check, the verify job's digest step and image-publish's digest step (their ids, run steps) carry exactly their own forms
+        if (step.run !== undefined && step.uses === undefined && ((step.id === HEAD_CHECK_STEP_ID && own(HEAD_CHECK_ENV, k) === v)
+          || (step.id === DIGEST_STEP_ID && own(DIGEST_STEP_ENV, k) === v) || (step.id === PUBLISH_DIGEST_STEP_ID && own(PUBLISH_DIGEST_ENV, k) === v))) continue;
         // G2 (B3 b, B6): a run step with the sign, verify or image-check id carries exactly its own forms (the referee recognises the whole
         // step by content and holds each kind to its job; here only which expression a step of that id may hold)
         if (step.run !== undefined && step.uses === undefined && step.id !== undefined) {

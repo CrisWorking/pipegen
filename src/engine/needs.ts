@@ -347,6 +347,19 @@ export function noImageServices(p: RepoProfile, caps: Capabilities): Map<string,
 }
 
 /**
+ * G7 (B3 a, B6): the services whose image pipegen publishes (image-publish), signs and verifies before a deploy: deploy targets of the plan
+ * that build an image (not in noImageServices), with a Dockerfile, at the repository root (the reviewed build-push template's context is the
+ * root, ruling S8). Sorted by name. Empty when the plan has no deploy layer.
+ */
+export function publishedImageServices(p: RepoProfile, caps: Capabilities): string[] {
+  const targets = mainDeployTargets(p);
+  if (targets === null) return [];
+  const noImage = noImageServices(p, caps);
+  const root = (path: string): boolean => path === '.' || path === '' || path === './';
+  return p.services.filter((s) => targets.includes(s.name) && !noImage.has(s.name) && typeof s.dockerfile === 'string' && s.dockerfile !== '' && root(s.path)).map((s) => s.name).sort();
+}
+
+/**
  * Plan J fix wave I1 (owner choice 3, DECISIONS #122): the main tool of the workflow lint check, zizmor. actionlint is never picked; when
  * zizmor isn't on the reviewed list, the check is only a suggestion and gets no job.
  */

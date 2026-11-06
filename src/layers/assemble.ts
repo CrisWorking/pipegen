@@ -49,6 +49,11 @@ import { signingMode, type SigningMode } from '../github/signing-mode.js';
 import { JOB_PERMISSIONS, referee, SIGNING_ENVIRONMENT, type Linters, type RefereeDeps, type RefereeReport } from '../engine/referee.js';
 import { RenderError } from '../engine/render-error.js';
 import { renderFindRunStep, stepsToYaml } from '../engine/render-step.js';
+import { FIND_RUN_STEP_ID, renderDigestStep, renderHeadCheckStep } from '../engine/deploy-steps.js';
+import { egressSetsForTool } from '../engine/egress.js';
+import type { EgressSet } from '../engine/egress-sets.js';
+import { publishedImageServices } from '../engine/needs.js';
+import { COSIGN_ID, GH_ID, renderVerifySteps, type SignedImage } from '../engine/signing.js';
 import type { BaseImage } from '../engine/base-images.js';
 import { IMAGE_PUBLISH_JOB, sharedWorkflows, signCallerJob, signPermissions, SIGN_JOB_ID } from './central.js';
 import { AssembleError, assembleJobs, egressStepFor, JOB_RUNNER, type Job, type JobsPlan, type UncoveredMinimum } from './jobs.js';
@@ -426,17 +431,51 @@ function addNote(notes: string[], line: string): void { if (!notes.includes(line
  * digest download by the found run's id, the digest check and the signature check of each image (B3 a, c, d): the referee's order rule reads
  * the gate action as a step that could change what runs after it, so those steps need G7's order exception, and none is written here.
  */
-export function verifyJob(draft: PipelineDraft, deps: { gate: ReviewedTool; reviewed: readonly ReviewedTool[]; platform: PlatformActions; waitMinutes: number; sha?: 'github.sha' | 'workflow_run' }): Job {
+export function verifyJob(draft: PipelineDraft, deps: { gate: ReviewedTool; reviewed: readonly ReviewedTool[]; platform: PlatformActions; waitMinutes: number }): Job {
   const wait = deps.waitMinutes;
   if (!Number.isInteger(wait) || wait < 1 || wait + VERIFY_MARGIN_MINUTES > MAX_JOB_MINUTES) fail(`The verify job's wait ${show(wait)} is not 1 to ${MAX_JOB_MINUTES - VERIFY_MARGIN_MINUTES} whole minutes.`);
   const central = draft.centralPin === undefined ? undefined : { ...centralPinOf(draft), project: draft.profile.repo };
   if (central !== undefined && draft.profile.private !== true) fail('A public repository\'s verify job looks for its gate inline, so its draft carries no central pin.');
-  const find = guard(() => renderFindRunStep(deps.gate, { ...(central === undefined ? {} : { central }), sha: deps.sha ?? 'github.sha', timeoutMinutes: wait }));
-  const steps = [egressStepFor([], { userSecret: false, dockerNetworks: false, job: VERIFY_JOB_ID }), find];
+  // B3 e: only a push deploy gets the job (a workflow_run deploy is a DeployGap), so the deployed commit is github.sha
+  const find: RenderedStep = { id: FIND_RUN_STEP_ID, ...guard(() => renderFindRunStep(deps.gate, { ...(central === undefined ? {} : { central }), sha: 'github.sha', timeoutMinutes: wait })) };
+  // G7: the head check (carry G1→G7), then per published image the digest of the gated run (B3 a) and its signature check in the draft's mode
+  const tail = verifyTail(draft, deps.reviewed);
+  const steps = [egressStepFor(tail.sets, { userSecret: false, dockerNetworks: false, job: VERIFY_JOB_ID }), find, ...tail.steps];
+  // the verified digest (G22): the job output of the digest step, when there is an image (a static deploy has none)
+  const outputs = jobOutputsFor(steps);
   return {
     'runs-on': JOB_RUNNER, 'timeout-minutes': wait + VERIFY_MARGIN_MINUTES, permissions: { ...VERIFY_PERMISSIONS },
-    ...(draft.capabilities.environments === true ? { environment: SIGNING_ENVIRONMENT } : {}), 'cache-mode': 'none', steps,
+    ...(draft.capabilities.environments === true ? { environment: SIGNING_ENVIRONMENT } : {}), 'cache-mode': 'none',
+    ...(Object.keys(outputs).length > 0 ? { outputs } : {}), steps,
   };
+}
+
+/**
+ * The verify job's steps after find-run (G7), and the egress sets they need besides github-core: the head check; for the published image
+ * (publishedImageServices: one per repository in v0.2) the digest step; and when the draft records a signing plan, that image's signature
+ * check (signing.ts, from the reviewed cosign entry, or gh for attest). A published image the plan does not sign, a signing plan without
+ * the image, a signing step that can not be rendered (attest until G15) and more than one published image are refused (fail closed).
+ */
+export function verifyTail(draft: PipelineDraft, reviewed: readonly ReviewedTool[]): { steps: RenderedStep[]; sets: EgressSet[] } {
+  const steps: RenderedStep[] = [guard(() => renderHeadCheckStep(draft.profile.defaultBranch))];
+  const images = publishedImageServices(draft.profile, draft.capabilities);
+  if (images.length > 1) fail(`pipegen publishes and verifies one image per repository in v0.2, and this one would publish ${images.length} (${images.map(show).join(', ')}).`);
+  const plan = draft.signing;
+  const planned = plan === undefined || plan === null || !Array.isArray(plan.images) ? [] : plan.images;
+  for (const i of planned) if (!images.includes(i?.service)) fail(`The signing plan signs the image of ${show(i?.service)}, which pipegen does not publish here.`);
+  const sets = new Set<EgressSet>();
+  for (const service of images) {
+    steps.push(guard(() => renderDigestStep(service)));
+    if (plan === undefined || plan === null) continue;
+    const image = planned.find((i) => i.service === service);
+    if (image === undefined) fail(`The image of ${show(service)} is published, but the signing plan does not sign it, so a deploy of it could not be verified.`);
+    const tool = reviewed.find((t) => t.id === (plan.mode === 'attest' ? GH_ID : COSIGN_ID));
+    if (tool === undefined) fail(plan.mode === 'attest' ? 'Attest-mode deploys are verified with the reviewed pinned gh release, which is not on the reviewed list yet (it lands with the re-pin batch, G15), so this deploy can not be verified.' : 'The reviewed list has no cosign entry, so no deploy can be verified.');
+    steps.push(...guard(() => renderVerifySteps(tool as ReviewedTool, draft, image as SignedImage)));
+    for (const x of egressSetsForTool(tool as ReviewedTool)) sets.add(x);
+    sets.add('ghcr');
+  }
+  return { steps, sets: [...sets].sort() };
 }
 
 // ---------- the layout checks ----------
