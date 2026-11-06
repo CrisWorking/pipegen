@@ -90,6 +90,8 @@ export interface ProofRepos {
   defaultBranchState?: DefaultBranchState;
   /** Organisations only. */
   orgPerm?: OrgPermission;
+  /** G13 carry 24: the central repo's Actions access level before pipegen changed it (absent: unchanged). */
+  actionsAccess?: { previous: string };
   /** When ready: checkScratchAccess's result (E4 passes its `accepted` back when it checks again). */
   access?: ScratchAccess;
 }
@@ -505,9 +507,9 @@ export async function checkActionsAllowed(gh: Octokit, scratch: GuardedRepo, act
  * `pipelines` holds install records only): otherwise nothing is called. Read first; written only when different
  * ('enterprise' already covers an organisation). A refusal is a ProofStopError with the setting to change by hand.
  */
-export async function ensureActionsAccess(gh: Octokit, t: ProofTarget, app: ProofApp, clock: RateClock = clockOf(gh)): Promise<void> {
+export async function ensureActionsAccess(gh: Octokit, t: ProofTarget, app: ProofApp, clock: RateClock = clockOf(gh)): Promise<{ previous: string } | undefined> {
   const central = assertCentral(t, app);
-  if (!t.appPrivate) return;
+  if (!t.appPrivate) return undefined;
   const org = t.ownerType === 'Organization';
   const level = org ? 'organization' : 'user';
   let current: unknown;
@@ -516,9 +518,11 @@ export async function ensureActionsAccess(gh: Octokit, t: ProofTarget, app: Proo
   } catch (e) {
     rethrowHard(gh, e);
   }
-  if (current === level || (org && current === 'enterprise')) return;
+  if (current === level || (org && current === 'enterprise')) return undefined;
   try {
     await guardedWrite(gh, central, 'PUT /repos/{owner}/{repo}/actions/permissions/access', { access_level: level }, clock);
+    // G13 carry 24: the level before, for the install record (Plan V's uninstall puts it back); an unreadable one is 'none'
+    return { previous: typeof current === 'string' && /^(?:none|user|organization|enterprise)$/.test(current) ? current : 'none' };
   } catch (e) {
     if (e instanceof ScratchGuardError) throw e;
     rethrowHard(gh, e);
@@ -716,7 +720,8 @@ export async function checkProofRepos(gh: Octokit, app: ProofApp, opts: ProofRep
 
   // the proof's actions are allowed in the scratch repo (S13); the central workflows are callable (private projects)
   await checkActionsAllowed(gh, scratch, opts.actions, (w) => io.err(w), clock);
-  await ensureActionsAccess(gh, t, app, clock);
+  const changed = await ensureActionsAccess(gh, t, app, clock);
+  if (changed !== undefined) result.actionsAccess = changed;
   result.defaultBranchState = await setScratchDefaultBranch(gh, scratch, clock);
   result.scratchDefaultBranch = t.defaultBranch;
   result.ready = true;

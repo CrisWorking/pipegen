@@ -85,7 +85,7 @@ export interface DeliveryInput {
   /** The environments `finish` applies (with reviewers or not). */
   environments?: readonly { name: string; reviewers: boolean }[];
   /** ProofRepos.createdIds / RunState.scratchRepoId, as the run recorded them (Plan V §5 item 5). */
-  proofRepos?: { central?: { repoId?: number; createdByPipegen: boolean }; scratch?: { repoId?: number; createdByPipegen: boolean } };
+  proofRepos?: { central?: { repoId?: number; createdByPipegen: boolean; actionsAccess?: { previous: string } }; scratch?: { repoId?: number; createdByPipegen: boolean } };
   /**
    * The central repo's file list the central CODEOWNERS judge got (`createdInputs.centralFiles`, G8 "added after"; readCentralFileList).
    * Required, and not empty, for a private app and whenever a central file is delivered; deliver refuses a list that differs from the
@@ -592,6 +592,8 @@ function buildRecord(x: RecordCtx): InstallRecord {
     ...(prev?.central ?? {}),
     createdByPipegen: prev?.central?.createdByPipegen === true || pc?.createdByPipegen === true,
     ...(pc?.repoId !== undefined ? { repoId: pc.repoId } : prev?.central?.repoId !== undefined ? { repoId: prev.central.repoId } : {}),
+    // G13 carry 24: the level before pipegen's first change; a later run's "before" is pipegen's own level, so the first one stays
+    ...(prev?.central?.actionsAccess !== undefined ? { actionsAccess: prev.central.actionsAccess } : pc?.actionsAccess !== undefined ? { actionsAccess: { previous: pc.actionsAccess.previous } } : {}),
   };
   const scratch = d.proofRepos?.scratch ?? prev?.scratch;
   const cosign = d.draft.signing?.cosignPubSha256 ?? prev?.cosignPubSha256;

@@ -20,7 +20,7 @@ vi.mock('../src/engine/reviewed.js', async (orig) => {
 import type { Octokit } from '@octokit/rest';
 import { AiSpendMeter } from '../src/ai/spend-meter.js';
 import type { CodeBundle } from '../src/ai/redact.js';
-import { notProvableNotes, auditCredits, createdInputsFor, dastWayPast, defaultProof, fullRun, judgeBuilt, NEVER_SKIPPED, parseSkip, PROOF_NOT_BUILT, runCreators, SCOPE_LINE, UNPINNED, WINDOWS_REFUSAL, GATE_UNREACHABLE, guardRecord, insertedBlock, type Built, type BuildInput, type GitHubFacts, type RunDeps, type RunStages } from '../src/cli/run.js';
+import { proofReposFor, notProvableNotes, auditCredits, createdInputsFor, dastWayPast, defaultProof, fullRun, judgeBuilt, NEVER_SKIPPED, parseSkip, PROOF_NOT_BUILT, runCreators, SCOPE_LINE, UNPINNED, WINDOWS_REFUSAL, GATE_UNREACHABLE, guardRecord, insertedBlock, type Built, type BuildInput, type GitHubFacts, type RunDeps, type RunStages } from '../src/cli/run.js';
 import { assembledJobs, consentJobs, docFor, draftFromDebate, isAiNote, parseStrictness, pickOwners, prWaitMinutes, proofAssembleWith, proofLayout, warnFirstFor, signingFor } from '../src/cli/run-parts.js';
 import { EXIT_UNSAFE_FOLDER, TYPE_CANCELLED } from '../src/cli/audit.js';
 import { run as main, type Commands } from '../src/cli/main.js';
@@ -695,6 +695,17 @@ describe('G13: two-step delivery and after', () => {
     expect((w.got.deliver?.[0] as { centralFileList: string[] }).centralFileList).toBe(w.builds[1]?.centralFiles);
     // only the project's own central workflows go to deliverCentral
     expect((w.got.deliverCentral?.[0] as CreatedFile[]).map((f) => f.path)).toEqual(['.github/workflows/r--merge.yml']);
+  });
+
+  it('run: deliver gets the helper repos pipegen created and the central Actions access level the proof changed (carries 16, 24)', async () => {
+    expect(proofReposFor({ created: ['pipelines'], createdIds: { pipelines: 77 }, actionsAccess: { previous: 'none' } }, { scratchRepoId: 88 })).toEqual({
+      central: { repoId: 77, createdByPipegen: true, actionsAccess: { previous: 'none' } }, scratch: { repoId: 88, createdByPipegen: true },
+    });
+    expect(proofReposFor({ created: [] }, {})).toEqual({ central: { createdByPipegen: false }, scratch: { createdByPipegen: false } });
+    const w = world();
+    w.stages.proofRepos = async () => ({ ready: true, target: {} as never, repos: [], created: [], actionsAccess: { previous: 'none' } });
+    await run(w);
+    expect((w.got.deliver?.[0] as { proofRepos: unknown }).proofRepos).toEqual({ central: { createdByPipegen: false, actionsAccess: { previous: 'none' } }, scratch: { createdByPipegen: false } });
   });
 
   it('run: a central pull request stops the run with exit 2 and its message', async () => {

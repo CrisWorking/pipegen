@@ -346,6 +346,21 @@ describe('G10 delivery: central and the pin (S26)', () => {
     await expect(deliver(w.g.octokit(), p, planDelivery(input(p, first.pin, {}, other)), v3, deps(w))).rejects.toThrow(/needs the key pair/);
   });
 
+  it('G13 carry 24: the central Actions access level the proof changed is recorded once, never replaced by a later run', async () => {
+    const w = world();
+    const p = profile();
+    await firstRun(w, { proofRepos: { central: { repoId: 77, createdByPipegen: true, actionsAccess: { previous: 'none' } }, scratch: { createdByPipegen: true } } });
+    expect((await record(w))?.central?.actionsAccess).toEqual({ previous: 'none' });
+    // a later run sees the level pipegen set ('user') as "before": the first one stays
+    const v2 = new SecretVault();
+    v2.set(KEY, KEY_VALUE);
+    const c2 = await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w));
+    if (c2.kind !== 'pinned') throw new Error('expected a pin');
+    await deliver(w.g.octokit(), p, planDelivery(input(p, c2.sha, { proofRepos: { central: { createdByPipegen: false, actionsAccess: { previous: 'user' } } } })), v2, deps(w));
+    const rec = await record(w, `pipegen/update-${centralProjectName('r')}`) ?? await record(w);
+    expect(rec?.central?.actionsAccess).toEqual({ previous: 'none' });
+  });
+
   it('deliver: second run updates PR and opens central PR', async () => {
     const w = world();
     const first = await firstRun(w);

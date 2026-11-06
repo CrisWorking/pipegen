@@ -227,10 +227,15 @@ describe('E1 repos (plan Task 1, preflight S1/S13/S19)', () => {
     expect(uput.map((c) => c.url.pathname)).toEqual([`/repos/${OWNER}/pipelines/actions/permissions/access`]);
     expect(JSON.parse(uput[0]?.body ?? '{}')).toEqual({ access_level: 'user' });
 
+    // G13 carry 24: the level before the change is kept for the install record (uninstall puts it back)
+    expect((await user.result).actionsAccess).toEqual({ previous: 'none' });
+    expect((await org.result).actionsAccess).toEqual({ previous: 'none' });
+
     // already set: read, not written again
     const set = run({ repos: both, access: 'user' });
     await set.result;
     expect(accessCalls(set.g).map((c) => c.method)).toEqual(['GET']);
+    expect((await set.result).actionsAccess).toBeUndefined();
 
     const pub = run({ repos: both }, app({ private: false }));
     await pub.result;

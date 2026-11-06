@@ -428,7 +428,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     const input: DeliveryInput = {
       draft: built.assembled.draft, files: built.files, locks: built.locks, secretNames: sec.names,
       protectedPaths: codeownersProtectedPaths(built.assembled.draft, reviewed), environments: built.environments,
-      proofRepos: { ...(repos.createdIds?.[CENTRAL_REPO] === undefined ? { central: { createdByPipegen: repos.created.includes(CENTRAL_REPO) } } : { central: { repoId: repos.createdIds[CENTRAL_REPO], createdByPipegen: true } }), scratch: { ...(saved.scratchRepoId === undefined ? {} : { repoId: saved.scratchRepoId }), createdByPipegen: saved.scratchRepoId !== undefined } },
+      proofRepos: proofReposFor(repos, saved),
       ...(centralFileList === undefined ? {} : { centralFileList }),
     };
     if (built.assembled.draft.centralPin?.sha === UNPINNED) throw new Error('pipegen would deliver a draft with no central commit pinned; nothing was delivered.');
@@ -470,6 +470,21 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     for (const g of b.guardProblems.slice(0, 40)) err(`  ${safeText(g, 400)}`);
     return false;
   }
+}
+
+/**
+ * Carries 16 and 24: what deliver records of the helper repos: the central repo pipegen created (with GitHub's id) and the Actions access
+ * level it changed there (checkProofRepos), the scratch repo pipegen created (the state file's id).
+ */
+export function proofReposFor(repos: Pick<ProofRepos, 'created' | 'createdIds' | 'actionsAccess'>, saved: { scratchRepoId?: number }): NonNullable<DeliveryInput['proofRepos']> {
+  const id = repos.createdIds?.[CENTRAL_REPO];
+  return {
+    central: {
+      ...(id === undefined ? { createdByPipegen: repos.created.includes(CENTRAL_REPO) } : { repoId: id, createdByPipegen: true }),
+      ...(repos.actionsAccess === undefined ? {} : { actionsAccess: { previous: repos.actionsAccess.previous } }),
+    },
+    scratch: { ...(saved.scratchRepoId === undefined ? {} : { repoId: saved.scratchRepoId }), createdByPipegen: saved.scratchRepoId !== undefined },
+  };
 }
 
 /**
