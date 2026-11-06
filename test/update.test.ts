@@ -402,6 +402,24 @@ describe('G12 update: central files, owner edits, the record', () => {
     expect(after.edits[0]?.writtenShas).toEqual([gitBlobSha(deploy), gitBlobSha(out)]);
   });
 
+  it('update: a verify job update can\'t rebuild on a re-pin (the attest signer digest) is held, never half re-pinned (m7, G13-R0 8)', async () => {
+    const w = await privateWorld();
+    const run = `gh attestation verify "oci://$IMAGE" --repo o/r --signer-workflow o/pipelines/.github/workflows/r--sign.yml --signer-digest ${w.c0}`;
+    const deploy = `name: deploy\non: { push: { branches: [main] } }\npermissions: {}\njobs:\n  pipegen-verify:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: crisworking/pipegen/gate@${OLD} # gate-v${OLD_V}\n        with:\n          mode: find-run\n          central-sha: ${w.c0}\n      - run: ${run}\n  deploy:\n    needs: [pipegen-verify]\n    runs-on: ubuntu-24.04\n    steps:\n      - run: ./deploy.sh\n`;
+    w.g.commitOn('o/r', 'main', { '.github/workflows/deploy.yml': deploy }, 'deploy');
+    await vouch(w, { ...w.record, edits: [{ repo: 'app', path: '.github/workflows/deploy.yml', kind: 'verify-job', jobs: ['pipegen-verify'], needs: [{ job: 'deploy', added: ['pipegen-verify'] }], originalSha: gitBlobSha('x'), writtenShas: [gitBlobSha(deploy)] }] });
+    await update(w.g.octokit(), app, deps(w));
+    const branch = centralUpdateBranch('r');
+    w.g.commitOn('o/pipelines', 'main', { [C_MERGE]: centralFile(w, C_MERGE, branch) as string, [recordPath('r')]: centralFile(w, recordPath('r'), branch) as string }, 'merge');
+    const res = await update(w.g.octokit(), app, deps(w));
+    // the app is never half re-pinned: neither the verify job (its run line still names the old commit) nor pipegen.yml moves
+    expect(res.done).toBe(false);
+    expect(prsOf(w, 'o/r')).toEqual([]);
+    const said = res.notes.join(' ');
+    expect(said).toMatch(/deploy\.yml.*can't rebuild.*verify job/);
+    expect(said).toMatch(/Run `npx pipegen` again to re-pin it/);
+  });
+
   it('update: preview declined → no PR', async () => {
     const w = await publicWorld();
     w.issues.app = [genuine(w)];

@@ -872,6 +872,24 @@ export async function update(gh: Octokit, app: RepoRef, deps: UpdateDeps): Promi
     d.held.push(`${repin.refused} ${wayOn}`);
     appChanges = [];
   }
+  if (moved !== null && appChanges.length > 0) {
+    // G13 (m7, ruling G13-R0 8): a verify job names the central commit inside a run line too (attest's --signer-digest), which no pin swap
+    // reaches; update has no draft to render the job again (renewVerifyJob), so a verify job that would keep the old commit is not re-pinned,
+    // and, as in N2, nothing of the app moves (never a verify job on one central commit and the calls on another)
+    const stale = appItems.filter((t) => t.entry === 'edit').filter((t) => {
+      const key = keyOf(t.repo, t.path);
+      const text = appChanges.find((c) => keyOf(c.repo, c.path) === key)?.after ?? d.current.get(key)?.text;
+      return text?.includes(moved.from) === true;
+    });
+    if (stale.length > 0) {
+      for (const t of stale) {
+        const why = `${label(t.repo, show(t.path))}: its pipegen-verify job names the central commit in a run line that \`pipegen update\` can't rebuild, so pipegen doesn't re-pin this verify job or the rest of the app (a verify job on an old central commit fails closed). Run \`npx pipegen\` again to re-pin it.`;
+        notes.push(why);
+        d.held.push(why);
+      }
+      appChanges = [];
+    }
+  }
   if (central.length > 0) {
     // the app pins only a commit on the central default branch (S26): its change waits until the central pull request is merged
     notes.push('Merge the central pull request first, then run `pipegen update` again: it then updates the app and pins it to the merged central commit.');
