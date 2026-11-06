@@ -49,7 +49,7 @@ import { safeText } from '../util/safe-text.js';
 import {
   commitFiles, compareStatus, DeliverError, ghRead, ghWrite, isoAt, openOrUpdatePr, readHead, readRepo, readTree, refusedMove, setBranch, statusOf, type RepoRef, type TreeEntry,
 } from './git-data.js';
-import { addLocalLeftovers, centralPrBase, centralUpdateBranch, localRecordPath, RecordError, writeRecord, type Leftover, type LocalRecordDeps } from './record.js';
+import { addLocalLeftovers, centralPrBase, centralUpdateBranch, localRecordPath, ownWholeFile, RecordError, writeRecord, type Leftover, type LocalRecordDeps } from './record.js';
 import { trustedPrevious } from './trust.js';
 
 export { DeliverError };
@@ -328,7 +328,7 @@ export async function deliverCentral(gh: Octokit, p: RepoProfile, files: readonl
   for (const f of files) {
     const e = entries.get(f.path);
     if (e === undefined) continue;
-    const mine = prev.record?.files.find((r) => r.repo === 'central' && r.path === f.path)?.shas.includes(e.sha) === true;
+    const mine = ownWholeFile(prev.record?.files.find((r) => r.repo === 'central' && r.path === f.path), e.sha);
     // N2: a file already byte-identical to what pipegen writes is neither replaced nor a stop (deliver records it, adopted unless proven)
     if (mine || e.sha === gitBlobSha(f.content)) continue;
     const wayOn = prev.why === 'mismatch'
@@ -640,10 +640,10 @@ async function checkPinnedOwn(gh: Octokit, c: RepoRef, pin: string, pinned: read
   const at = await readTree(gh, c, pin, clock);
   const parent = at.parents[0] === undefined ? null : await readTree(gh, c, at.parents[0], clock);
   for (const f of pinned) {
-    const shas = prev?.files.find((r) => r.repo === 'central' && r.path === f.path)?.shas ?? [];
+    const entry = prev?.files.find((r) => r.repo === 'central' && r.path === f.path);
     const here = at.entries.get(f.path)?.sha;
     const before = parent?.entries.get(f.path)?.sha;
-    const mine = (here !== undefined && shas.includes(here)) || (parent !== null && (before === undefined || shas.includes(before)));
+    const mine = ownWholeFile(entry, here) || (parent !== null && (before === undefined || ownWholeFile(entry, before)));
     // N2: not proven pipegen's, but byte-identical to pipegen's text (holds() checked the pin): recorded as adopted, never as created
     if (!mine) adopted.add(f);
   }
@@ -663,7 +663,7 @@ function checkBase(files: readonly CreatedFile[], entries: ReadonlyMap<string, T
     if (original !== undefined) {
       if (original === '' ? e !== undefined : e?.sha !== gitBlobSha(original)) throw new DeliverError(`${show(f.path)} changed since pipegen read it (it is not the file pipegen's edit was made from); run pipegen again.`);
     } else if (e !== undefined) {
-      const mine = prev?.files.find((r) => r.repo === repo && r.path === f.path)?.shas.includes(e.sha) === true;
+      const mine = ownWholeFile(prev?.files.find((r) => r.repo === repo && r.path === f.path), e.sha);
       // N2: byte-identical to pipegen's text: not rewritten, recorded adopted (pipegen didn't prove it created it)
       if (!mine && e.sha === gitBlobSha(f.content)) adopted.add(f);
       else if (!mine) throw new DeliverError(`${show(f.path)} already exists in ${repo === 'app' ? 'your repository' : 'the central repo'} and pipegen didn't write it; pipegen never overwrites your files.`);

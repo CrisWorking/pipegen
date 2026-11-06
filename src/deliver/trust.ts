@@ -64,7 +64,8 @@ export const TYPED_VIEW_FIELDS = {
     fresh: ['edits', 'planned', 'serviceRoots', 'protectedPaths'],
     drop: ['mergedAt', 'blockFrom', 'cosignPubSha256', 'cosignPub', 'central', 'scratch', 'orgRuleset', 'classicProtection', 'repoSettings'],
   },
-  files: { keep: ['repo', 'path', 'part', 'shas', 'aiEdited', 'adopted'] },
+  // ownerEdited (G12) is kept: it only makes a file the owner's (dropping it would make a merged file look like pipegen's own)
+  files: { keep: ['repo', 'path', 'part', 'shas', 'aiEdited', 'adopted', 'ownerEdited'] },
   secrets: { keep: ['name', 'scope', 'created', 'overwritten', 'githubCreatedAt', 'unconfirmed'] },
   variables: { keep: ['name', 'scope', 'created', 'githubCreatedAt', 'unconfirmed'], drop: ['previous'] },
   environments: { keep: ['name', 'created', 'githubCreatedAt', 'unconfirmed'], fresh: ['changed', 'branchPolicyIds'], drop: ['previous'] },

@@ -239,12 +239,14 @@ export interface EnvSettings {
  * One edit to a file pipegen didn't write whole, in the one form of its kind. `originalSha`: the blob sha of the file before pipegen's first edit
  * (null: the file was new); `writtenShas`: every blob sha pipegen wrote there, newest last. `inserted` is the exact bytes pipegen added, its
  * separator included (the `anchor` of schema 1 is gone). package-json `lock` and package-lock `json` name the pair's other path.
+ * `ownerEdited` (G12): `pipegen update` merged a change into a version the owner had edited, so the newest written sha is not pipegen's text
+ * alone: uninstall treats the file as changed (never reverts it blind).
  */
 export type InstallEdit =
-  | { repo: RecordRepo; path: string; kind: 'codeowners' | 'hooks' | 'dependabot'; inserted: string; originalSha: string | null; writtenShas: string[] }
-  | { repo: 'app'; path: string; kind: 'verify-job'; jobs: string[]; needs: { job: string; added: string[] }[]; originalSha: string; writtenShas: string[] }
-  | { repo: 'app'; path: string; kind: 'package-json'; add: Record<string, string>; setTest: boolean; previousTest?: string; lock?: string; originalSha: string; writtenShas: string[] }
-  | { repo: 'app'; path: string; kind: 'package-lock'; json: string; originalSha: string; writtenShas: string[] };
+  | { repo: RecordRepo; path: string; kind: 'codeowners' | 'hooks' | 'dependabot'; inserted: string; originalSha: string | null; writtenShas: string[]; ownerEdited?: true }
+  | { repo: 'app'; path: string; kind: 'verify-job'; jobs: string[]; needs: { job: string; added: string[] }[]; originalSha: string; writtenShas: string[]; ownerEdited?: true }
+  | { repo: 'app'; path: string; kind: 'package-json'; add: Record<string, string>; setTest: boolean; previousTest?: string; lock?: string; originalSha: string; writtenShas: string[]; ownerEdited?: true }
+  | { repo: 'app'; path: string; kind: 'package-lock'; json: string; originalSha: string; writtenShas: string[]; ownerEdited?: true };
 /** A GitHub API call planned now and sent by `finish` (the shape of src/layers/locks.ts ApiRequest). */
 export interface RecordApiRequest { method: 'POST' | 'PUT'; route: string; params: Record<string, string>; body: Record<string, unknown> }
 /** What `finish` applies after the merge, persisted so it can run later in a new process (S13). */
@@ -267,7 +269,7 @@ export interface InstallRecord {
   app: { owner: string; repo: string; repoId: number; defaultBranch: string; private: boolean; ownerType: 'User' | 'Organization' };
   name: string;                                                        // centralProjectName(app.repo); the record is installs/<name>.json
   serviceRoots: string[];                                              // to re-check CREATED_RULES path claims
-  files: { repo: RecordRepo; path: string; part: Part; shas: string[]; aiEdited?: true; adopted?: true }[];   // written whole; every blob sha pipegen wrote, newest last. adopted (G10-R3 N2): the file was already there, byte-identical to pipegen's; pipegen didn't prove it created it, so uninstall asks before deleting it
+  files: { repo: RecordRepo; path: string; part: Part; shas: string[]; aiEdited?: true; adopted?: true; ownerEdited?: true }[];   // written whole; every blob sha pipegen wrote, newest last. adopted (G10-R3 N2): the file was already there, byte-identical to pipegen's; pipegen didn't prove it created it, so uninstall asks before deleting it. ownerEdited (G12, E2-R7, Plan V §5): `pipegen update` merged its change into the owner's edits (3-way), so the newest sha holds the owner's text: the file is the owner's from then on (never pipegen's own for a replace, the guard or uninstall)
   edits: InstallEdit[];
   secrets: { name: string; scope: 'repo' | 'central' | `env:${string}`; created: boolean; overwritten?: true; githubCreatedAt?: string; unconfirmed?: true }[];
   variables: { name: string; scope: 'repo' | `env:${string}`; created: boolean; previous?: string; githubCreatedAt?: string; unconfirmed?: true }[];
