@@ -11,7 +11,7 @@ import { CAPS, LINTERS, p as P, planned, profileOf, shown } from './helpers/asse
 import { REVIEWED } from './helpers/debate-fixtures.js';
 import { checkExpressions, NIGHTLY_WORKFLOW, ZIZMOR_ONLINE_JOB, type RenderedStep } from '../src/engine/job-rules.js';
 import { ARGV_POLICIES, ZIZMOR_ONLINE_POLICY, ZIZMOR_ONLINE_STEP_ENV, zizmorOnlineStepId } from '../src/engine/tool-flags.js';
-import { renderStep, renderZizmorOnline } from '../src/engine/render-step.js';
+import { renderStep, renderStepWith, renderZizmorOnline } from '../src/engine/render-step.js';
 import { argvPolicyProblems, type ReviewedEntry } from '../src/engine/reviewed.js';
 import { RenderError } from '../src/engine/render-error.js';
 
@@ -107,6 +107,19 @@ describe('G15a round 5 (b2): zizmor online, nightly', () => {
     expect(() => renderZizmorOnline(withCommand(ZIZMOR, ['zizmor', '.github/workflows'], []), P, CTX)).toThrow(/offline form/);
     expect(() => renderZizmorOnline(withCommand(ZIZMOR, ['zizmor', '--offline', '.']), P, CTX)).toThrow(/offline form/);
     expect(() => renderZizmorOnline(withCommand(ZIZMOR, ['zizmor', '--offline', '.github/workflows'], []), P, CTX)).toThrow(/offline form/);
+  });
+
+  it('render: only the online zizmor policy may take the job token, the online form must pass that policy, and only the zizmor id runs online (mutants Z8, Z10, Z18)', () => {
+    // Z8: a token on any other policy is refused by the renderer, even for a release binary
+    const lint = REVIEWED.find((t) => t.id === 'actionlint') as ReviewedTool;
+    const lintSpec = { needId: 'workflow-lint', tool: lint.candidate, choices: {}, output: lint.step.output } as unknown as StepSpec;
+    const withToken = { ...ARGV_POLICIES, actionlint: { ...ARGV_POLICIES.actionlint, tokenEnv: GHT } } as typeof ARGV_POLICIES;
+    expect(() => renderStepWith(lintSpec, lint, P, CTX, { policies: withToken })).toThrow(/may not take the job's token/);
+    // Z10: another entry is refused for its id, before anything else is looked at
+    expect(() => renderZizmorOnline(lint, P, CTX)).toThrow(/runs the reviewed zizmor entry only/);
+    // Z18: the offline form with another install is refused by the online policy check (not later by the renderer)
+    const moved = { ...ZIZMOR, step: { ...ZIZMOR.step, cli: { ...ZIZMOR.step.cli!, install: { ...ZIZMOR.step.cli!.install, package: 'other.tar.gz' } } } } as ReviewedTool;
+    expect(() => renderZizmorOnline(moved, P, CTX)).toThrow(/does not pass its argv policy/);
   });
 
   it('job rules: the token form is accepted only on the online zizmor run step, exactly', () => {
