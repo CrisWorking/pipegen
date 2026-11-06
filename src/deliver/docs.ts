@@ -13,7 +13,7 @@
 //   - the user's typed values (the vault): every variable string is scrubbed with the ACTIVE vault before any cut (F4-R14), and the judge checks the
 //     whole text on its cleaned forms. Run the builder inside withActiveVault (pipegenDocWith does; the referee already does).
 // No need keys, item ids, objection ids or dispute keys are ever printed, and neither is the creator's own AI note ("The AI explained ...").
-import { NEED_ID_CATEGORY, SCHEDULED_CATEGORIES } from '../engine/need-ids.js';
+import { NEED_ID_CATEGORY } from '../engine/need-ids.js';
 import { FINDINGS_CATEGORIES, gateJobList, jobIdFor, PIPEGEN_JOB_CATEGORIES, readableFormat, type JobListEntry } from '../engine/gate-job-list.js';
 import { hookCommands, SECRETS_HOOK_ID, type HookCommand } from '../engine/created-builders.js';
 import { PUSH_CREDIT_WARNING } from '../audit/coverage/equivalents.js';
