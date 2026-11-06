@@ -10,7 +10,7 @@ vi.mock('../src/util/exit-hooks.js', async (orig) => {
   return { ...real, interrupting: () => stop.on };
 });
 
-import { guardedKeys, midRunConfirm, nextCandidateFrom, proofWorkflowsOf, REPOS_NOT_READY, CENTRAL_CHANGED, PRIVATE_REASON } from '../src/cli/run-proof.js';
+import { DECLINED_REASON, dropDeclined, guardedKeys, midRunConfirm, nextCandidateFrom, proofWorkflowsOf, REPOS_NOT_READY, CENTRAL_CHANGED, PRIVATE_REASON } from '../src/cli/run-proof.js';
 import { proofAssembler } from '../src/cli/run-parts.js';
 import { assemble } from '../src/layers/assemble.js';
 import { node, p as PLAT, planned, profileOf } from './helpers/assemble.js';
@@ -408,6 +408,62 @@ describe('G14: disputes and the carries', () => {
     // the resume half: resume.test below proves the saved draft
   });
 
+  it('run: a cap stop AFTER an AI fix saves the fixed draft and the meters; the production resume proves from it (G0-R1 I2, spec I2, spec M3)', async () => {
+    const w = await proofWorld({ results: [failOn('sast'), PASS] });
+    const fixedFile: CreatedFile = { repo: 'app', path: 'api/test_fix.py', content: 'def test_f():\n    assert 1\n', part: 'tests', reason: 'r', aiEdited: true };
+    let fixed: PipelineDraft | undefined;
+    // the loop: a proof, an AI change proven, then the AI cap at the next stage boundary (onCap), and its stop with the final draft
+    w.ops.fixLoop = async (d, deps) => {
+      await deps.prove(d, 'pr');
+      fixed = { ...d, created: [...d.created, fixedFile] };
+      const run = await deps.prove(fixed, 'pr');
+      w.meter.restore(5);
+      await deps.onCap?.({ kind: 'ai-cost', limitUsd: 5 });
+      return { result: run.result, draft: fixed, stopped: 'the AI cost cap was reached', cap: { kind: 'ai-cost', limitUsd: 5 } } as never;
+    };
+    const r = await w.run();
+    expect(r.ok).toBe(false);
+    expect(w.store.state).toMatchObject({ stage: 'stopped', stoppedBy: 'ai-cost', proofOk: false });
+    // the saved draft is the loop's final (fixed) one, not the one the proof started from
+    expect(w.store.state?.draft).toEqual(fixed);
+    expect(w.store.state?.draft?.created.some((f) => f.path === 'api/test_fix.py')).toBe(true);
+    // spec M3: the meters saved at the stop (saveStopState with the meters): the AI spend and the proof's start
+    expect(w.store.state?.aiCostUsd).toBeCloseTo(5, 6);
+    expect(w.store.state?.proofStart?.at).toBe(1_000);
+    // the resume: the same store, the production makeRunProof, the saved draft (as run.ts passes it)
+    w.store.setStage('proving');
+    const again = await proofWorld({ input: { store: w.store, draft: w.store.state?.draft as PipelineDraft, resume: true } });
+    let first: PipelineDraft | undefined;
+    again.ops.fixLoop = async (d, deps) => { first = d; return { result: (await deps.prove(d, 'full')).result, draft: d } as never; };
+    const r2 = await again.run();
+    expect(first).toEqual(fixed);
+    expect(r2.ok).toBe(true);
+    expect(again.tl).toContain('minutesForResume:store');
+  });
+
+  it('run: a stop mid-proof (ProofStopError) saves a not-proven verdict with the latest proven draft (spec M2)', async () => {
+    const w = await proofWorld({ private: true, results: [failOn('sast'), PASS] });
+    const fixedFile: CreatedFile = { repo: 'app', path: 'api/test_fix.py', content: 'x\n', part: 'tests', reason: 'r', aiEdited: true };
+    let fixed: PipelineDraft | undefined;
+    w.ops.fixLoop = async (d, deps) => {
+      await deps.prove(d, 'pr');
+      fixed = { ...d, created: [...d.created, fixedFile] };
+      await deps.prove(fixed, 'pr');
+      // then a draft whose central workflow can't be pushed again: the proof stops
+      await deps.prove({ ...fixed, centralPin: { repo: 'CrisWorking/pipelines', sha: '1'.repeat(40) } } as PipelineDraft, 'full');
+      throw new Error('should have stopped');
+    };
+    w.input.assembleFor = async (d) => async () => [
+      { repo: 'app', path: '.github/workflows/pipegen.yml', content: 'on: [push]\njobs: {}\n', part: 'pipeline', reason: 'r' },
+      { repo: 'central', path: '.github/workflows/r--merge.yml', content: `on: workflow_call\n# ${d.centralPin?.sha ?? ''}\njobs: {}\n`, part: 'pipeline', reason: 'r' },
+    ];
+    const r = await w.run();
+    expect(r.ok).toBe(false);
+    expect(r.stopped).toContain(CENTRAL_CHANGED.slice(0, 50));
+    expect(w.store.state).toMatchObject({ stage: 'stopped', stoppedBy: 'proof-failed', proofOk: false });
+    expect(w.store.state?.draft).toEqual(fixed);
+  });
+
   it('run: interrupting() is checked before real keys are stored and before each push', async () => {
     const seen: string[] = [];
     const k = guardedKeys({ real: async () => { seen.push('real'); }, setup: async () => { seen.push('setup'); }, placeholders: async () => { seen.push('ph'); } } as unknown as FixKeys, { [RN_FIELD]: (n: readonly string[]) => { seen.push(`names:${n.join(',')}`); } } as never);
@@ -452,7 +508,9 @@ describe('G14: disputes and the carries', () => {
     expect(readFileSync(join(process.cwd(), 'src/cli/run-proof.ts'), 'utf8')).toMatch(/saveState: saveStopState\(store, meters\)/);
   });
 
-  it('run: a blocking scanner with no planted item stays blocking, never in notProven', async () => {
+  // carry 24's behaviour (a blocking scanner with no planted item stays blocking, never in notProven) is evaluateProof's: G0's
+  // plan-g0.test.ts 'evaluate: blocking scanner with no planted item stays blocking…' and 'I1: … ZAP …'. G14 only hands evaluate F's items.
+  it('run: the proof hands evaluate F\'s planted items as they are: no item invented for a blocking scanner without one (carry 24 wiring)', async () => {
     const w = await proofWorld({ draft: (d) => ({ ...d, needs: [...d.needs, { id: 'dast', layer: 'merge', category: 'dast', service: 'web', why: 'w', blocking: true, floor: false }] }) });
     const r = await w.run();
     const items = (w.evals[0]?.ctx.plantedItems ?? []).map((x) => x.category);
@@ -518,14 +576,14 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import type { Octokit } from '@octokit/rest';
 import { fullRun, PROOF_FILE_IN_DELIVERY, PUBLIC_FILES_CHANGED, type Built, type BuildInput, type RunDeps, type RunStages } from '../src/cli/run.js';
-import { makeRunProof } from '../src/cli/run-proof.js';
+import { makeCleanupOnly, makeRunProof } from '../src/cli/run-proof.js';
 import { StateStore, type AgreedTerms } from '../src/proof/state.js';
 import { DEFAULT_MODEL } from '../src/types.js';
 import { armProofCleanup } from '../src/proof/cleanup.js';
 import { HARNESS_PATH } from '../src/proof/harness.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { CAPS, candidatesFor, choicesFor, profile, scripted, svc } from './helpers/debate-fixtures.js';
-import { CALLER, MADE_UP, NEEDS2, OWN, TK_FIELD } from './helpers/proof-world.js';
+import { A_FIELD, CALLER, MADE_UP, NEEDS2, OWN, TK_FIELD } from './helpers/proof-world.js';
 
 interface RunWorld { tl: string[]; calls: string[]; deps: RunDeps; stages: Partial<RunStages>; home: string; errs: string[]; lines: string[]; got: Record<string, unknown[]>; io: CliIO }
 async function runWorld(o: { private?: boolean; results?: import('../src/types.js').ProofResult[]; canDelete?: boolean; built?: (i: BuildInput, n: number) => Partial<Built>; missing?: string[]; canCreate?: boolean; preview?: boolean } = {}): Promise<RunWorld> {
@@ -747,6 +805,79 @@ describe('G14: pipegen resume (S20, contracts §6 step 2)', () => {
   });
 });
 
+describe('G14-R1: a resume goes on with the terms agreed at consent (sec I2, sec M6)', () => {
+  it('run: begin saves the agreed AI, strictness, scanner and minutes (names only, never a key)', async () => {
+    const w = await runWorld();
+    expect(await fullRun('/repo', w.io, { ...w.deps, flags: { strictness: 'strict' } })).toBe(0);
+    const s = await StateStore.open({ owner: OWN, repo: 'r' }, { home: w.home, env: {} });
+    const agreed = s.load()?.agreed;
+    expect(agreed).toMatchObject({ provider: 'claude', model: DEFAULT_MODEL, strictness: 'strict', scanner: 'betterleaks' });
+    expect(typeof agreed?.monthlyMinutes).toBe('number');
+    expect(JSON.stringify(agreed)).not.toContain(MADE_UP);
+  });
+
+  it('resume: another AI provider, model or host than agreed → exit 2, nothing sent, no proof; a state with no terms → exit 2', async () => {
+    const others: AgreedTerms[] = [
+      { provider: 'openai', model: DEFAULT_MODEL }, { provider: 'claude', model: 'claude-other-model' }, { provider: 'claude', model: DEFAULT_MODEL, host: 'example.test:11434' },
+    ];
+    for (const agreed of others) {
+      const w = await runWorld();
+      await savedRun(w.home, { then: 'interrupted', agreed });
+      let proved = false;
+      w.deps.proof = async () => { proved = true; return { ok: false }; };
+      expect(await fullRun('/repo', w.io, { ...w.deps, resume: true })).toBe(2);
+      expect(proved).toBe(false);
+      expect(w.errs.join('\n')).toMatch(/you agreed to .*but this shell sets up claude/);
+      expect(w.calls).not.toContain('build');
+    }
+    const none = await runWorld();
+    await savedRun(none.home, { then: 'interrupted', agreed: null });
+    expect(await fullRun('/repo', none.io, { ...none.deps, resume: true })).toBe(2);
+    expect(none.errs.join('\n')).toContain('does not say which AI you agreed to');
+  });
+
+  it('resume: the saved strictness and secret scanner are used, not the defaults or the environment', async () => {
+    const w = await runWorld();
+    await savedRun(w.home, { then: 'interrupted', agreed: { provider: 'claude', model: DEFAULT_MODEL, strictness: 'starter', scanner: 'gitleaks', monthlyMinutes: 50 } });
+    let level: string | undefined;
+    const build = w.stages.build as RunStages['build'];
+    w.stages.build = async (i) => { level ??= i.strictness; return build(i); };
+    let scanner: string | undefined;
+    w.deps.proof = async (x) => { scanner = (await x.scanner()).name; return { ok: false }; };
+    w.deps[SC_FIELD] = async (n: 'gitleaks' | 'betterleaks') => ({ name: n, path: '/bin/x', version: '1' });
+    await fullRun('/repo', w.io, { ...w.deps, resume: true });
+    expect(level).toBe('starter');
+    expect(scanner).toBe('gitleaks');
+  });
+
+  it('resume: the minutes are asked again against the AGREED estimate', async () => {
+    for (const [agreedMinutes, asked] of [[0, true], [1_000_000, false]] as const) {
+      // the pipeline as built: one push job (some minutes a month)
+      const w = await runWorld({ built: () => ({ minutes: { jobs: { 'pre-commit': [], push: ['sast'], merge: [], deploy: [], nightly: [] } as never, prWait: 5 } }) });
+      await savedRun(w.home, { ok: true, then: 'cleaned', agreed: { provider: 'claude', model: DEFAULT_MODEL, monthlyMinutes: agreedMinutes } });
+      await fullRun('/repo', w.io, { ...w.deps, resume: true });
+      expect(w.tl.some((x) => x.startsWith('ask:The pipeline as built needs'))).toBe(asked);
+    }
+  });
+
+  it('resume: a Ctrl-C at the preview after a passed, cleaned proof delivers on resume (interrupted at cleaned with proofOk; sec M4)', async () => {
+    const w = await runWorld();
+    const { fixed } = await savedRun(w.home, { ok: true, then: 'cleaned' });
+    const s0 = await StateStore.open({ owner: OWN, repo: 'r' }, { home: w.home, env: {} });
+    s0.load();
+    s0.setStage('interrupted');
+    expect(s0.state).toMatchObject({ stage: 'interrupted', interruptedAt: 'cleaned', proofOk: true });
+    let proved = false;
+    w.deps.proof = async () => { proved = true; return { ok: false }; };
+    expect(await fullRun('/repo', w.io, { ...w.deps, resume: true })).toBe(0);
+    expect(proved).toBe(false);
+    expect(w.calls).toContain('deliver');
+    const s = await StateStore.open({ owner: OWN, repo: 'r' }, { home: w.home, env: {} });
+    expect(s.load()?.draft).toEqual(fixed);
+    expect(s.load()?.stage).toBe('delivered');
+  });
+});
+
 describe('G14: the production proof on a resume', () => {
   it('resume: the minutes come from minutesForResume with the store; no dispute runs; the run (not the proof) set proving', async () => {
     const w = await proofWorld({ disputes: [{ id: 'd1', key: 'sast--api', needId: 'sast', options: [] }] as never, input: { resume: true } });
@@ -759,6 +890,64 @@ describe('G14: the production proof on a resume', () => {
   });
 });
 
+
+describe('G14-R1: a declined AI file and the parts that read it (spec M6, sec M1)', () => {
+  const outcome = async (file: CreatedFile, opts: { floorSast?: boolean } = {}) => {
+    const w = await proofWorld();
+    const d0 = w.input.draft;
+    const needs = d0.needs.map((n) => (n.id === 'sast' ? { ...n, floor: opts.floorSast ?? n.floor } : n));
+    const draft = { ...d0, needs, created: [...d0.created, file] } as PipelineDraft;
+    const parts: import('../src/types.js').PartResult[] = [
+      { part: 'pipeline', status: 'proven', detail: 'ok' }, { part: 'pipeline', needId: 'secrets', status: 'proven', detail: 'ok' },
+      { part: 'pipeline', needId: 'sast', status: 'proven', detail: 'ok' }, { part: file.part, status: 'proven', detail: 'ok' },
+    ];
+    return { draft, result: { ok: true, parts, findings: [], minutesUsed: 1, runUrls: [] } } as unknown as import('../src/proof/fix.js').FixOutcome;
+  };
+  for (const [part, path, extra] of [['docker', 'api/Dockerfile', {}], ['test-migration', 'api/tests/test_moved.py', {}], ['pipeline', 'api/package.json', { needsConfirm: true }]] as const) {
+    it(`dropDeclined: a declined ${part} file${'needsConfirm' in extra ? ' (needsConfirm)' : ''} is dropped, its part and the jobs of its service are not proven`, async () => {
+      const file = { repo: 'app', path, content: 'x\n', part, reason: 'r', aiEdited: true, ...extra } as CreatedFile;
+      // sast of the file's service is not a floor need here: the drop is not a stop unless the part itself is the pipeline
+      const out = dropDeclined(await outcome(file, { floorSast: false }), new Set([path]));
+      expect(out.draft.created.some((f) => f.path === path)).toBe(false);
+      expect(out.draft.notProven).toEqual(expect.arrayContaining([expect.objectContaining({ part, reason: DECLINED_REASON })]));
+      // sec M1: the api service's sast job read the dropped path: not proven; the repo-wide secrets scan keeps its result
+      expect(out.draft.notProven.some((n) => n.needId === 'sast')).toBe(true);
+      expect(out.result.parts.find((x) => x.needId === 'sast')?.status).toBe('not-proven');
+      expect(out.result.parts.find((x) => x.needId === 'secrets')?.status).toBe('proven');
+      expect(out.result.ok).toBe(part !== 'pipeline');
+    });
+  }
+  it('dropDeclined: a floor need whose job read the dropped file → no pass (the floor must be proven)', async () => {
+    const file = { repo: 'app', path: 'api/Dockerfile', content: 'x\n', part: 'docker', reason: 'r', aiEdited: true } as CreatedFile;
+    const out = dropDeclined(await outcome(file, { floorSast: true }), new Set(['api/Dockerfile']));
+    expect(out.result.ok).toBe(false);
+    expect(out.stopped).toContain(DECLINED_REASON);
+    // a file of no service's folder (the web service's sast never read it): nothing else changes
+    const other = { repo: 'app', path: 'docs/x.md', content: 'x\n', part: 'docs', reason: 'r', aiEdited: true } as CreatedFile;
+    const o2 = dropDeclined(await outcome(other, { floorSast: true }), new Set(['docs/x.md']));
+    expect(o2.result.ok).toBe(true);
+    expect(o2.result.parts.find((x) => x.needId === 'sast')?.status).toBe('proven');
+  });
+});
+
+describe('G14-R1: the real cleanup-only of a resume (spec I4)', () => {
+  it('resume: makeCleanupOnly deletes the scratch secrets, deletes the repo only when the token may, passes the meters, ends cleaned', async () => {
+    for (const [canDelete, interrupted] of [[false, false], [true, true]] as const) {
+      const w = await proofWorld({ canDelete });
+      w.store.setStage('proving');
+      w.store.recordVerdict({ ok: true, draft: w.input.draft });
+      w.store.setStage('proven');
+      if (interrupted) w.store.setStage('interrupted');
+      const r = await makeCleanupOnly(w.ops)({ store: w.store, gh: w.input.gh, vault: w.vault, io: w.input.io, [A_FIELD]: w.input[A_FIELD], ai: { meter: w.meter } });
+      expect(w.tl.indexOf('keys.deleteAll')).toBeGreaterThan(-1);
+      expect(w.tl.indexOf('keys.deleteAll')).toBeLessThan(w.tl.indexOf(`cleanup:canDeleteRepo=${String(canDelete)}`));
+      expect(r.repoDeleted).toBe(canDelete);
+      expect(w.cleanupOpts[0]?.meters?.()?.ai).toBe(w.meter);
+      expect(w.store.state?.stage).toBe('cleaned');
+      expect(w.store.state?.proofOk).toBe(true);
+    }
+  });
+});
 
 describe('G14: the production arm', () => {
   it('run: defaultArm passes the meters to armProofCleanup (an interrupt saves them)', async () => {

@@ -696,6 +696,16 @@ describe('G13: the proof seam', () => {
     expect(src.match(/\(deps\.proof \?\? defaultProof\)\(/g)?.length).toBe(1);
     expect(src).not.toMatch(/PROOF_NOT_BUILT|deps\.proof === undefined/);
     expect(typeof defaultProof).toBe('function');
+    // spec M5: the refusal above is the production proof's own (run-proof.ts makeRunProof), not a run.ts shortcut: the proof was entered
+    const proofSrc = readFileSync(join(process.cwd(), 'src/cli/run-proof.ts'), 'utf8');
+    expect(proofSrc).toContain('pipegen has no referee for the proof');
+    expect(src).not.toContain('no referee for the proof');
+    // with a fix-loop build it goes further: the production proof assembles its files (its own assembler refuses this fake draft's tool)
+    const w2 = world({ deps: { proof: undefined }, built: (x) => ({ ...builtOf(x), proof: { rebuild: async (d) => ({ files: [], assembled: d }), referee: async () => ({ ok: true, issues: [], demoted: [], notes: [] }), guard: async (f) => ({ ok: f, refused: [], notes: [] }) } }) });
+    const i2 = io();
+    expect(await run(w2, i2)).not.toBe(0);
+    expect(i2.errs.join('\n')).toMatch(/not a reviewed tool pipegen offered/);
+    for (const s of ['deliverCentral', 'deliver', 'preview', 'finish']) expect(w2.calls).not.toContain(s);
   });
 
   it('run: no delivery without the stage cleaned and a passed verdict', async () => {
@@ -1282,6 +1292,9 @@ describe('G13-R1: the meter, the state, the helper repos', () => {
     expect(ids).toEqual([]);
     // G14-R1 (spec M1): the central repo pipegen made is remembered for a resume's record (never as the scratch id)
     expect(st.centralCreated).toBe(true);
+    // and a resume's delivery record says so, though the repo exists by now (this run's check created nothing)
+    expect(proofReposFor({ created: [] }, { centralCreated: true }).central?.createdByPipegen).toBe(true);
+    expect(proofReposFor({ created: [] }, {}).central?.createdByPipegen).toBe(false);
     cb('pipegen-proof-r', 77);
     expect(ids).toEqual([77]);
   });

@@ -24,6 +24,9 @@ export interface FakeRepo {
   description?: string;
   /** allow_forking (default false). */
   allowForking?: boolean;
+  /** has_wiki / has_projects (G14-R1 sec M5; absent: GitHub doesn't say). */
+  hasWiki?: boolean;
+  hasProjects?: boolean;
   /** An org policy keeps forking on: a PATCH allow_forking:false changes nothing. */
   forkingForced?: boolean;
   /** Who can push, the teams and the deploy keys of this repo (fix round 1, I2). null: 403. Default: collaborators = [me, admin]; teams, keys = []. */
@@ -115,6 +118,7 @@ export function world(opts: WorldOptions = {}): World {
     owner: { login: owner, type: ownerType },
     description: r.description ?? helperDescription(name.startsWith('pipegen-proof-') ? 'scratch' : 'central'),
     allow_forking: r.allowForking ?? false,
+    ...(r.hasWiki === undefined ? {} : { has_wiki: r.hasWiki }), ...(r.hasProjects === undefined ? {} : { has_projects: r.hasProjects }),
   });
   const forbidden = () => json(403, { message: 'Resource not accessible by personal access token' });
   /** One page of a list, with GitHub's Link header when more follow. */

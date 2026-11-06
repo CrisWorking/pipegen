@@ -686,6 +686,19 @@ describe('G14 (controller addendum): the access level on a PUT that failed witho
     expect(seen4).toEqual([]);
   });
 
+  it('repos: an existing helper repo with its wiki or projects on is named with the command to turn them off; none of it is changed (sec M5)', async () => {
+    const { g, i, result } = run({ repos: { pipelines: { private: true, hasWiki: true }, [SCRATCH]: { private: true, hasWiki: false, hasProjects: true } } });
+    await result;
+    expect(i.all()).toContain(`${OWNER}/pipelines has its wiki turned on`);
+    expect(i.all()).toContain(`${OWNER}/${SCRATCH} has its projects turned on`);
+    expect(i.all()).toContain(`gh repo edit ${OWNER}/${SCRATCH} --enable-wiki=false --enable-projects=false`);
+    expect(writePaths(g).filter((x) => x.startsWith('PATCH'))).toEqual([]);
+    // both off (or not said): nothing is named
+    const quiet = run({ repos: { pipelines: { private: true, hasWiki: false, hasProjects: false }, [SCRATCH]: { private: true } } });
+    await quiet.result;
+    expect(quiet.i.all()).not.toContain('turned on');
+  });
+
   it('access: a callback that throws prints "Left behind: central Actions access was <previous>" and stops', async () => {
     const g = world({ repos: both });
     const i = io(true);

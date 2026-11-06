@@ -201,7 +201,7 @@ export async function proofWorld(o: WorldOpts = {}): Promise<World> {
     debate: { choices, needs: [...NEEDS2], candidates: candidatesFor(NEEDS2, p), disputes: o.disputes ?? [], suggestions: [], transcript: [], requireDeployApproval: false, byCode: [], uncovered: [] } as unknown as DebateResult,
     reviewed: (await import('./debate-fixtures.js')).REVIEWED, platform: {} as never, dir: '/repo',
     scanner: async () => ({ name: 'betterleaks', path: '/bin/betterleaks', version: '1.0.0' }),
-    arm: (c, m) => { tl.push('arm'); armed.push({ cleanup: c, meters: m }); disarm = armProofCleanup(store, c, { meters: m }); },
+    arm: (c, m) => { tl.push('arm'); armed.push({ cleanup: c, meters: m }); disarm = armProofCleanup(input.store, c, { meters: m }); },
     variantMinutes: 5,
     checkRepos: async () => { tl.push('checkRepos'); checkOpts.push(store.armed); return { ready: true, target: t, repos: [], created: [], defaultBranchState: 'pending' }; },
     ...o.input,

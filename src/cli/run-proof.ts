@@ -395,10 +395,10 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
       let calls = 0;
       let last: { d: PipelineDraft; files: DraftFiles; runs: VariantRuns[]; placements: readonly PlantedPlacement[] } | null = null;
       const proveDraft = async (d: PipelineDraft, scope: 'pr' | 'full'): Promise<ProofRun> => {
-        latest = d;
         // C1: the draft's own files, every call; a central change after the setup can't be pushed again (one central draft per session)
         const f = await filesAt(d, centralSha);
         if (fileKey(f.central) !== centralKey) throw new ProofStopError(CENTRAL_CHANGED);
+        latest = d;
         let { main, planted: pl, placements } = cur;
         if (calls > 0 || fileKey(f.app) !== fileKey(cur.files.app)) {
           const r = await freshRound(d, f);
@@ -458,16 +458,10 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
 
     let res: { outcome: FixOutcome; cleanup: CleanupResult };
     try {
-      res = await proveThenClean(store, prove, () => cleanup());
+      res = await proveThenClean(store, prove, () => cleanup(), undefined, { stopDraft: () => latest });
     } catch (e) {
       if (e instanceof ProofStopError) {
-        // spec M2: a stop mid-proof keeps the fix loop's draft for a resume (not proven), like a cap stop (G0-R1 I2)
-        if (store.state?.stage === 'proving') {
-          try {
-            store.recordVerdict({ ok: false, draft: latest, stopped: e.message });
-            store.setStage('stopped', { stoppedBy: 'proof-failed' });
-          } catch { /* the stop below is what matters; a resume proves the saved draft again */ }
-        }
+        // spec M2: proveThenClean saved the latest draft the proof ran with a failed verdict (stopDraft)
         return { ok: false, stopped: stopLine(e.message), ...(repos === undefined ? {} : { repos }), notes };
       }
       throw e;
