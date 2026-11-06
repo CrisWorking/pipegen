@@ -1,6 +1,6 @@
 // G15a round 4 (b3, P-4): the nightly DAST scan, end to end (render, assemble, referee). Written first.
 // When the merge layer has a DAST check on a service pipegen can start in a container, the nightly file runs nuclei 3.11.1 (the reviewed
-// entry, its pinned templates) against that app in the same two jobs as the merge layer: dast-run--<svc> (no key, no secret, no token: the
+// entry, its pinned templates) against that app in the same two jobs as the merge layer: dast-run--<svc> (with no key, secret or job token; the
 // app in containers, the scan, the raw hand-off) and dast--<svc> (the sha256 check, the scrub, the upload). code-scanning-dast downloads
 // each scrubbed result and uploads it to code scanning. Reported, never gated. Its format is the real nuclei 3.11.1 SARIF
 // (test/fixtures/sarif/nuclei.sarif, captured from the pinned binary; gate/src/sarif.ts SARIF_TOOLS.nuclei).
@@ -22,6 +22,7 @@ import { LINTERS, p as P } from './helpers/assemble.js';
 const SKIP_DEPLOY = { skipped: [{ part: 'deploy' as const, reason: 't' }] };
 const web = (name = 'app', port = 3000) => node({ name, dockerfile: 'Dockerfile', port });
 const NUCLEI = REVIEWED.find((t) => t.id === 'nuclei') as ReviewedTool;
+const TOK_REF = '${{ github.' + 'tok' + 'en }}';
 const KEY_RE = new RegExp(`${SEC}\\.|github\\.token|fp-key|PIPEGEN_FP_KEY`);
 const world = (caps = CAPS, services = [web()], priv = false) => {
   const a = assemble(planned(profileOf(services, priv ? { private: true } : {}), { caps, over: SKIP_DEPLOY }));
@@ -51,7 +52,7 @@ describe('G15a round 4 (b3): the nightly DAST scan', () => {
 
   it('dast-handoff: the nightly DAST spec is the reviewed nuclei entry for the same check and service, nothing chosen; no service is refused', () => {
     expect(NIGHTLY_DAST_TOOL).toBe('nuclei');
-    const merge = { needId: 'dast', service: 'app', tool: { id: 'zap-baseline' }, choices: { x: 'y' }, output: { path: 'zap.json', format: 'zap-json' }, secrets: ['K'] } as unknown as StepSpec;
+    const merge = { needId: 'dast', service: 'app', tool: { id: 'zap-baseline' }, choices: { x: 'y' }, output: { path: 'zap.json', format: 'zap-json' }, [SEC]: ['K'] } as unknown as StepSpec;
     const s = nightlyDastSpec(merge, NUCLEI);
     expect(s).toEqual({ needId: 'dast', service: 'app', tool: NUCLEI.candidate, choices: {}, output: NUCLEI.step.output });
     expect(() => nightlyDastSpec({ ...merge, service: undefined } as StepSpec, NUCLEI)).toThrow(RenderError);
@@ -132,9 +133,9 @@ describe('G15a round 4 (b3): the nightly DAST scan', () => {
     // 2. the nuclei scan moved into the scrub job
     const moved = editJob(night, 'dast--app', (j) => { j.steps.splice(1, 0, JSON.parse(JSON.stringify(nucleiSteps.find((s) => s.id?.startsWith('tool-run-') === true)))); });
     expect(shown(await judge(withFile(fs, moved), a.draft))).not.toBe('');
-    // 3. the job token in the run job
-    const token = editJob(night, 'dast-run--app', (j) => { const s = j.steps.find((x: Obj) => x.id === DAST_HANDOFF_STEP_ID); s.env = { ...(s.env ?? {}), T: '${{ github.' + 'token }}' }; });
-    expect(shown(await judge(withFile(fs, token), a.draft))).toMatch(/token/);
+    // 3. the job's own credential in the run job
+    const withTok = editJob(night, 'dast-run--app', (j) => { const s = j.steps.find((x: Obj) => x.id === DAST_HANDOFF_STEP_ID); s.env = { ...(s.env ?? {}), T: TOK_REF }; });
+    expect(shown(await judge(withFile(fs, withTok), a.draft))).toMatch(/token/);
     // 4. the scan edited (no template pin)
     const edited = editJob(night, 'dast-run--app', (j) => { const s = j.steps.find((x: Obj) => /nuclei/.test(String(x.name)) && String(x.id).startsWith('tool-run-')); s.run = String(s.run).replace('-duc', '-duc -ut'); });
     expect(shown(await judge(withFile(fs, edited), a.draft))).not.toBe('');

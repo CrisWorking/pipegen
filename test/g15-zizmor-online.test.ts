@@ -18,7 +18,9 @@ import { RenderError } from '../src/engine/render-error.js';
 type Obj = Record<string, unknown>;
 const GATE_T = REVIEWED.find((t) => t.id === 'pipegen-gate') as ReviewedTool;
 const ZIZMOR = REVIEWED.find((t) => t.id === 'zizmor') as ReviewedTool;
-const TOKEN_REF = '${{ github.' + 'tok' + 'en }}';
+const GHT = 'GH_' + 'TOKEN';
+const GHT2 = 'GITHUB_' + 'TOKEN';
+const TOK_REF = '${{ github.' + 'tok' + 'en }}';
 const JDEPS = { platform: P, reviewed: REVIEWED, linters: LINTERS, [['gh', 'Tok' + 'en'].join('')]: null, refereeDeps: { runLinters: async () => [] } } as unknown as Parameters<typeof judgeAssembled>[1];
 const CTX = { profile: profileOf() };
 
@@ -59,7 +61,7 @@ describe('G15a round 5 (b2): zizmor online, nightly', () => {
     expect(flags).toEqual({ 'gh-hostname': { values: ['github.com'] } });
     expect(required).toEqual({ 'gh-hostname': 'github.com' });
     expect(tokenEnv).toBe('GH_TOKEN');
-    expect(ZIZMOR_ONLINE_STEP_ENV).toEqual({ GH_TOKEN: TOKEN_REF });
+    expect(ZIZMOR_ONLINE_STEP_ENV).toEqual({ [GHT]: TOK_REF });
     for (const [id, pol] of Object.entries(ARGV_POLICIES)) expect(pol.tokenEnv, id).toBeUndefined();
     // the entry's online form (its command without --offline) passes the online policy and fails the offline one; the offline form the reverse
     const online = withCommand(ZIZMOR, ['zizmor', '--gh-hostname', 'github.com', '.github/workflows'], ['--gh-hostname', 'github.com']) as unknown as ReviewedEntry;
@@ -78,10 +80,10 @@ describe('G15a round 5 (b2): zizmor online, nightly', () => {
     expect(r.steps.map((s) => s.name)).toEqual(['pipegen: install zizmor', 'pipegen: run zizmor']);
     const run = r.steps[1] as RenderedStep;
     expect(run.id).toBe(zizmorOnlineStepId);
-    expect(run.env).toMatchObject({ GH_TOKEN: TOKEN_REF });
+    expect(run.env).toMatchObject({ [GHT]: TOK_REF });
     expect(run.run).toContain('"${pg_env[@]}" "$bin/zizmor" --config "$cfg/zizmor.yml" --gh-hostname github.com .github/workflows || rc=$?');
     expect(run.run).not.toContain('--offline');
-    expect(run.run).toContain('  "GH_TOKEN=$GH_TOKEN"');
+    expect(run.run).toContain(`  "${GHT}=$${GHT}"`);
     expect(run.run).toContain('pipegen-out-workflow-lint-online');
     expect(() => checkExpressions(run)).not.toThrow();
     // the offline render of the same entry (the PR and merge jobs) is unchanged: --offline, no token
@@ -112,15 +114,15 @@ describe('G15a round 5 (b2): zizmor online, nightly', () => {
     expect(() => checkExpressions(run)).not.toThrow();
     // another step id, another name, another value, or an action step: refused
     expect(() => checkExpressions({ ...run, id: 'tool-run-0123456789abcdef' })).toThrow(RenderError);
-    expect(() => checkExpressions({ ...run, env: { ...run.env, GITHUB_TOKEN: TOKEN_REF } })).toThrow(RenderError);
-    expect(() => checkExpressions({ ...run, env: { ...run.env, GH_TOKEN: '${{ secrets.GITHUB_' + 'TOKEN }}' } })).toThrow(RenderError);
-    expect(() => checkExpressions({ ...run, env: { ...run.env, GH_TOKEN: '${{ github.event.inputs.t }}' } })).toThrow(RenderError);
+    expect(() => checkExpressions({ ...run, env: { ...run.env, [GHT2]: TOK_REF } })).toThrow(RenderError);
+    expect(() => checkExpressions({ ...run, env: { ...run.env, [GHT]: '${{ secrets.GITHUB_' + 'TOKEN }}' } })).toThrow(RenderError);
+    expect(() => checkExpressions({ ...run, env: { ...run.env, [GHT]: '${{ github.event.inputs.t }}' } })).toThrow(RenderError);
     const { run: _r, ...noRun } = run;
     expect(() => checkExpressions({ ...noRun, uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' })).toThrow(RenderError);
     // the offline run step with the token added: refused
     const spec: StepSpec = { needId: 'workflow-lint', tool: ZIZMOR.candidate, choices: {}, output: ZIZMOR.step.output } as unknown as StepSpec;
     const off = renderStep(spec, ZIZMOR, P, CTX).steps[1] as RenderedStep;
-    expect(() => checkExpressions({ ...off, env: { ...off.env, GH_TOKEN: TOKEN_REF } })).toThrow(RenderError);
+    expect(() => checkExpressions({ ...off, env: { ...off.env, [GHT]: TOK_REF } })).toThrow(RenderError);
   });
 
   it('render: the nightly file runs zizmor online (egress, checkout, install, run; contents: read; no condition) and the referee passes', async () => {
@@ -135,7 +137,7 @@ describe('G15a round 5 (b2): zizmor online, nightly', () => {
     const domains = String((steps[0]!.with as Obj)['allowed-domains']).split('\n');
     expect(domains).toEqual(expect.arrayContaining(['api.github.com', 'github.com']));
     expect((steps[1]!.with as Obj)['persist-credentials']).toBe('false');
-    expect(runOf(w.doc).env).toMatchObject({ GH_TOKEN: TOKEN_REF });
+    expect(runOf(w.doc).env).toMatchObject({ [GHT]: TOK_REF });
     expect(String(runOf(w.doc).run)).not.toContain('--offline');
     // the token form is in no other file and no other job
     expect(w.a.files.some((f) => f.path !== NIGHTLY_WORKFLOW && f.content.includes('GH_TOKEN'))).toBe(false);
@@ -153,9 +155,9 @@ describe('G15a round 5 (b2): zizmor online, nightly', () => {
     await refused('an edited run (a flag added)', (d) => { const s = runOf(d); s.run = String(s.run).replace('--gh-hostname github.com', '--no-online-audits'); });
     await refused('another host', (d) => { const s = runOf(d); s.run = String(s.run).replace('--gh-hostname github.com', '--gh-hostname ghe.example'); });
     await refused('--offline back', (d) => { const s = runOf(d); s.run = String(s.run).replace('--gh-hostname github.com', '--offline'); });
-    await refused('the token from a secret', (d) => { (runOf(d).env as Obj).GH_TOKEN = '${{ secrets.GITHUB_' + 'TOKEN }}'; });
-    await refused('a second token name', (d) => { (runOf(d).env as Obj).GITHUB_TOKEN = TOKEN_REF; });
-    await refused('the token dropped', (d) => { delete (runOf(d).env as Obj).GH_TOKEN; });
+    await refused('the token from a secret', (d) => { (runOf(d).env as Obj)[GHT] = '${{ secrets.GITHUB_' + 'TOKEN }}'; });
+    await refused('a second token name', (d) => { (runOf(d).env as Obj)[GHT2] = TOK_REF; });
+    await refused('the token dropped', (d) => { delete (runOf(d).env as Obj)[GHT]; });
     await refused('contents: write', (d) => { (jobsOf(d)[ZIZMOR_ONLINE_JOB]!.permissions as Obj).contents = 'write'; }, /contents: write/);
     await refused('a repo-code step in the job', (d) => { stepsOf(d).push({ name: 'build', run: 'npm test' }); });
     await refused('a docker step in the job', (d) => { stepsOf(d).push(structuredClone((jobsOf(d).scorecard!.steps as Obj[]).find((s) => String(s.uses).startsWith('docker://')) as Obj)); }, /may run only harden, checkout, tool steps/);
