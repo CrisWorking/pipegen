@@ -15,7 +15,7 @@ import { attestSignerWorkflow, COSIGN_ID, GH_ID, imageDigestArtifact, keylessIde
 import { renderFindingsBlock, renderJobPrelude, renderPlatformStep, renderScrub, renderStep, renderUpload, scrubbedPath, type RenderContext } from '../src/engine/render-step.js';
 import { RenderError } from '../src/engine/render-error.js';
 import type { Candidate, CreatedFile, KnownValueCheck, Need, PipelineDraft, ReviewedTool, Service, SigningPlan, StepSpec } from '../src/types.js';
-import { draftOf, GATE, job, jobsOf, p, prof, show, workflow, type Job } from './helpers/gate-pipeline.js';
+import { draftOf, GATE, imageProf, job, jobsOf, p, prof, show, workflow, type Job } from './helpers/gate-pipeline.js';
 import { entry, profile, reviewedList, service, specFor } from './helpers/render.js';
 
 /** Names spelled at run time (test/no-secret-literals.test.ts): the OIDC permission, the password and token env names. */
@@ -56,10 +56,11 @@ const ghEntry = (over: Partial<Candidate> = {}): ReviewedTool => {
 /** A draft of only these steps (its other checks are not the point here). */
 const bare = (over: Partial<PipelineDraft> = {}): PipelineDraft => draftOf({ needs: [], steps: [], ...over });
 /** (G3-R2 M1: the referee holds the plan to signingMode(profile, caps), so each mode gets the repository and capabilities that choose it) */
+// GJ (Plan J): the signed services build an image (imageProf: a Dockerfile each); on a service that runs nothing, signing is report-only
 const MODE_SETUP: Record<SigningPlan['mode'], Partial<PipelineDraft>> = {
-  'key-env': { profile: { ...draftOf().profile, private: true }, capabilities: { ...draftOf().capabilities, environments: true, deploymentBranchPolicies: true, attestations: false } },
-  keyless: { capabilities: { ...draftOf().capabilities, environments: true } },
-  attest: { profile: { ...draftOf().profile, private: true }, capabilities: { ...draftOf().capabilities, environments: true, attestations: true } },
+  'key-env': { profile: { ...imageProf, private: true }, capabilities: { ...draftOf().capabilities, environments: true, deploymentBranchPolicies: true, attestations: false } },
+  keyless: { profile: imageProf, capabilities: { ...draftOf().capabilities, environments: true } },
+  attest: { profile: { ...imageProf, private: true }, capabilities: { ...draftOf().capabilities, environments: true, attestations: true } },
 };
 const signingDraft = (signing: SigningPlan, over: Partial<PipelineDraft> = {}): PipelineDraft =>
   bare({ signing, ...MODE_SETUP[signing.mode], centralPin: { repo: 'o/pipelines', sha: 'a'.repeat(40) }, ...over });
@@ -615,9 +616,11 @@ describe('G2 fix round 1 (ruling G2-R1)', () => {
     const pushBuild: Need = { id: 'image-build', layer: 'push', category: 'image-build', service: 'app', why: 't', blocking: false, floor: false };
     const r7 = await runWith([], draftOf({ profile: imgProf, needs: [pushBuild, needOf('image-build', 'app')], steps: [buildSpec('app', { push: 'true' })] }));
     expect(has(r7, 'unreviewed', /narrow/), show(r7)).toBe(true);
-    // a spec with no need at all counts as blocking (fail closed)
+    // a spec with no need at all is refused (fail closed). GJ: it is now refused before it is rendered (a step without its need is no step of
+    // pipegen's), so the narrowing note no longer appears; the outcome is the same refusal, stricter
     const orphan = await runWith([workflow({ iac: job([...renderJobPrelude({}, p).steps, ...narrowSteps]) })], draftOf({ profile: imgProf, needs: [], steps: [spec] }));
-    expect(orphan.notes.some((n) => /narrow a blocking check/.test(n)), orphan.notes.join('\n')).toBe(true);
+    expect(orphan.ok).toBe(false);
+    expect(has(orphan, 'unreviewed', /The step for "iac" .*has no need of its own in the draft/), show(orphan)).toBe(true);
     // control: every copy non-blocking, the value may stand
     const r8 = await runWith([], draftOf({ profile: imgProf, needs: [pushBuild, needOf('image-build', 'app', false)], steps: [buildSpec('app', { push: 'true' })] }));
     expect(r8.issues.some((i) => /narrow/.test(i.message)), show(r8)).toBe(false);

@@ -58,6 +58,7 @@ import { centralWorkflowFile, centralWorkflowPath } from './central-path.js';
 import { projectScriptFor, repoToolFor } from './reviewed.js';
 import { slotProblem, type SlotKind } from './slots.js';
 import { expectedSigningSteps } from './signing.js';
+import { NO_IMAGE_CATEGORIES, noImageServices } from './needs.js';
 import { ARCHIVE_TOOL_IDS, imageBuildTag, renderImageArchiveScan, renderImageBuild } from './image-handoff.js';
 import { dastStartOf, renderDastRun, renderDastScrub } from './dast-handoff.js';
 import { SHARED_CDN_SETS } from './egress.js';
@@ -445,10 +446,13 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
     declared: new Set(), allowed: new Set(PIPEGEN_SECRETS), rendered: new Set(), matched: new Set(), npmPins: new Map(), byId, deferred: [], jobs: [], twinInputs: [],
   };
   const ctxs: RenderContext[] = SENTINELS.map((t) => ({ profile: draft.profile, targets: { ...t } }));
+  /** GJ: whether the draft plans the need a step is for (its id and service); a step without one is no step of pipegen's */
+  const hasNeed = (spec: unknown): boolean => isObj(spec) && draft.needs.some((n) => n.id === spec.needId && n.service === spec.service);
   /** G2 (B6): the services whose image build the draft holds and pipegen can render (their archive is what the image scanners read) */
   const imageBuilds = new Set<string>();
   for (const spec of draft.steps) {
     const t = isObj(spec) && isObj(spec.tool) && typeof spec.tool.id === 'string' ? byId.get(spec.tool.id) : undefined;
+    if (!hasNeed(spec)) continue;
     if (t?.id !== BUILD_PUSH_ID || !isReviewed(spec.tool) || !sameCandidate(spec.tool, t.candidate) || spec.needId !== IMAGE_BUILD_NEED || typeof spec.service !== 'string') continue;
     try { renderImageBuild(spec, t, platform, { profile: draft.profile }); imageBuilds.add(spec.service); } catch (e) { if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e; }
   }
@@ -480,6 +484,11 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
 
   draft.steps.forEach((spec: StepSpec, i) => {
     const t = isObj(spec) && isObj(spec.tool) && typeof spec.tool.id === 'string' ? byId.get(spec.tool.id) : undefined;
+    // GJ: a step is recognised only for a need the draft plans (its id and service): a job without its need is never let through
+    if (!hasNeed(spec)) {
+      add(`draft.steps[${i}]`, 'unreviewed', `The step for ${show(spec?.needId)}${typeof spec?.service === 'string' ? ` for ${show(spec.service)}` : ''} (${show(spec?.tool?.id)}) has no need of its own in the draft, so it is no step of pipegen's and no job may run it.`);
+      return;
+    }
     if (t === undefined || !isReviewed(spec.tool) || !isReviewed(t.candidate) || !sameCandidate(spec.tool, t.candidate)) {
       add(`draft.steps[${i}]`, 'unreviewed', `The step for ${show(spec?.needId)} runs ${show(spec?.tool?.id)}, which is not an entry of the reviewed list at its reviewed pin; pipegen never runs it, not even as a non-blocking job (it belongs in the suggestions).`);
       return;
@@ -564,7 +573,7 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
   // service's archive; only for a service whose image build is in the draft
   draft.steps.forEach((spec: StepSpec, i) => {
     const t = isObj(spec) && isObj(spec.tool) && typeof spec.tool.id === 'string' ? byId.get(spec.tool.id) : undefined;
-    if (t === undefined || !ARCHIVE_TOOLS.has(t.id) || !isReviewed(spec.tool) || !sameCandidate(spec.tool, t.candidate) || typeof spec.service !== 'string' || !imageBuilds.has(spec.service)) return;
+    if (t === undefined || !hasNeed(spec) || !ARCHIVE_TOOLS.has(t.id) || !isReviewed(spec.tool) || !sameCandidate(spec.tool, t.candidate) || typeof spec.service !== 'string' || !imageBuilds.has(spec.service)) return;
     try {
       const blocking = blockingOf(spec.needId, spec.service);
       const r = renderImageArchiveScan(spec, t, platform, { profile: draft.profile, blocking });
@@ -587,6 +596,19 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
   if (draft.signing !== undefined && draft.signing !== null) {
     const chosen = signingMode(draft.profile, draft.capabilities);
     if (draft.signing.mode !== chosen) add('(draft)', 'permissions', `The draft's signing mode ${show(String(draft.signing.mode))} is not the mode pipegen chooses for this repository and its capabilities (${show(chosen)}).`);
+  }
+  // GJ (Plan J): a service the plan builds no image for (skippedChecks: a static site, or one that doesn't run) has no image check, DAST or
+  // API DAST planned, and its signing is report-only: a plan that signs its image would sign something no job builds
+  const noImage = noImageServices(draft.profile, draft.capabilities);
+  draft.needs.forEach((n, i) => {
+    const category = isObj(n) && typeof n.id === 'string' ? (own(NEED_ID_CATEGORY as Readonly<Record<string, string>>, n.id) ?? n.category) : undefined;
+    if (!isObj(n) || typeof n.service !== 'string' || !NO_IMAGE_CATEGORIES.has(String(category)) || !noImage.has(n.service)) return;
+    add(`draft.needs[${i}]`, 'unreviewed', `The draft plans the check ${show(n.id)} for ${show(n.service)}, but the plan builds no image for it (${safeText(noImage.get(n.service) as string, 200)}), so there is nothing to build, scan or start; no job may run it.`);
+  });
+  if (draft.signing !== undefined && draft.signing !== null && Array.isArray(draft.signing.images)) {
+    for (const img of draft.signing.images) {
+      if (isObj(img) && typeof img.service === 'string' && noImage.has(img.service)) add('(draft)', 'permissions', `The draft signs the image of ${show(img.service)}, but the plan builds no image for it (${safeText(noImage.get(img.service) as string, 200)}): its signing is report-only, so no step may sign it.`);
+    }
   }
   const signing = expectedSigningSteps(draft, reviewed);
   notes.push(...signing.notes.map((n) => safeText(n, 400)));

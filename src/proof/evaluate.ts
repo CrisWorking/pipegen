@@ -25,6 +25,7 @@
 // be reached) never applies to a part that covers a floor need (spec §19): that is failed. One exception is a ruling, not a log
 // reading, withdrawn in E9: a scanner job that failed because Bullfrog refused its bind mount (E3-R7) was not-proven pending
 // gate-v0.2.2 (E5-R1, E5-R2). gate-v0.2.2's scanner steps mount nothing, so that signature now FAILS the pipeline (BULLFROG_MOUNT_FAIL).
+import { NO_HOOKS_CI_MANAGERS } from '../engine/needs.js';
 import type { Octokit } from '@octokit/rest';
 import { coverageNotes, measuredLines, type CoverageDecision } from '../create/coverage.js';
 import { sameResults, type TestCaseResult } from '../create/junit.js';
@@ -501,6 +502,11 @@ async function evaluateInner(draft: PipelineDraft, runs: readonly VariantRuns[],
   const hooks = draft.needs.filter((n) => ['hooks', 'hooks-ci'].includes(categoryOf(n.id, n.category)));
   if (skipped.has('precommit')) sheet.notProven('precommit', `skipped by you (--skip): ${st(skipped.get('precommit'), 200)}`, { caps: true });
   else if (hooks.length > 0 && main === undefined) sheet.notProven('precommit', 'the main variant was not proven, so the hooks are not proven', { caps: true });
+  // GJ (Plan J, DECISIONS #122): a pre-commit or husky repository's hooks have no reviewed CI runner (hooks-ci is a note there, NO_HOOKS_CI_MANAGERS),
+  // so they are not proven through hooks-ci: not proven with that reason, never failed for a job pipegen does not write, never proven
+  else if (hooks.length > 0 && draft.profile.precommit !== null && NO_HOOKS_CI_MANAGERS.has(draft.profile.precommit)) {
+    sheet.notProven('precommit', `the repository's own ${draft.profile.precommit} hooks have no CI runner pipegen can use, so they are not proven through hooks-ci`, { caps: true });
+  }
   else for (const n of hooks) {
     const id = inFolderNeed(n);
     const { state: s, hits } = ownedState(mainLayers, pipegenPr, id);

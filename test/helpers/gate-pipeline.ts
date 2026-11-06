@@ -20,6 +20,11 @@ export const GATE = entry('pipegen-gate');
 const app = service({ name: 'app', path: '.', scripts: ['test'] });
 const web = service({ name: 'web', path: 'apps/web', scripts: ['test'] });
 export const prof = { ...profile([app, web]), repoFiles: emptyRepoFiles() };
+/**
+ * GJ (Plan J): the same two services with a Dockerfile each, so the plan builds their images (skippedChecks lists no image build for them).
+ * A signing plan signs only such a service's image; on prof (where nothing runs) its signing is report-only and the referee refuses the plan.
+ */
+export const imageProf = { ...prof, services: prof.services.map((s) => ({ ...s, dockerfile: s.path === '.' ? 'Dockerfile' : `${s.path}/Dockerfile` })) };
 const caps: Capabilities = { branchProtection: true, environments: false, envRequiredReviewers: false, deploymentBranchPolicies: false, attestations: true, codeScanning: true, keylessSigningAllowed: true };
 export const needOf = (id: string, svc?: string): Need => ({ id, layer: 'merge', category: (NEED_ID_CATEGORY as Record<string, string>)[id] ?? id, ...(svc === undefined ? {} : { service: svc }), why: 't', blocking: true, floor: true });
 export const specs = (): StepSpec[] => [specFor(entry('betterleaks'), { needId: 'secrets' }), specFor(entry('semgrep'), { needId: 'sast', service: 'app' }), specFor(entry('osv-scanner'), { needId: 'deps', service: 'app' })];

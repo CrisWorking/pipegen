@@ -834,6 +834,27 @@ describe('carried notes and parts', () => {
     expect(part(await evaluate(none, both(none), ctxOf()), 'precommit')).toBeUndefined();
   });
 
+  it('GJ precommit: a pre-commit or husky repository\'s hooks are not proven through hooks-ci (no CI runner): not proven, never failed, never proven', async () => {
+    for (const manager of ['pre-commit', 'husky'] as const) {
+      const d0 = D();
+      const d = { ...d0, profile: { ...d0.profile, precommit: manager } };
+      // no hooks job runs (pipegen writes none there): not proven with the reason, not failed
+      const m = greenMain(d);
+      prRun(m).jobs = prRun(m).jobs.filter((j) => j.name !== 'hooks');
+      const r = part(await evaluate(d, both(d, m), ctxOf()), 'precommit');
+      expect(r?.status, manager).toBe('not-proven');
+      expect(JSON.stringify(r), manager).toMatch(new RegExp(`own ${manager} hooks have no CI runner`));
+      // a green job of that name proves nothing either
+      expect(part(await evaluate(d, both(d, greenMain(d)), ctxOf()), 'precommit')?.status, manager).toBe('not-proven');
+    }
+    // a lefthook repository is still held to its hooks job
+    const d0 = D();
+    const lh = { ...d0, profile: { ...d0.profile, precommit: 'lefthook' as const } };
+    const m = greenMain(lh);
+    prRun(m).jobs = prRun(m).jobs.filter((j) => j.name !== 'hooks');
+    expect(part(await evaluate(lh, both(lh, m), ctxOf()), 'precommit')?.status).toBe('failed');
+  });
+
   it('deploy-verify: sign-roundtrip is required when the harness rendered it', async () => {
     const d = D();
     const m = greenMain(d);

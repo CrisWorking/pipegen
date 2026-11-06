@@ -37,6 +37,7 @@ import { RenderError, show } from '../engine/render-error.js';
 import { renderPlatformStep, stepsToYaml } from '../engine/render-step.js';
 import { COSIGN_ID, imageDigestArtifact, renderSignSteps, SIGN_REGISTRY, type SignedImage } from '../engine/signing.js';
 import { egressSetsForTool, renderEgressStep } from '../engine/egress.js';
+import { noImageServices } from '../engine/needs.js';
 import { signingMode, type SigningMode } from '../github/signing-mode.js';
 import type { Capabilities, CreatedFile, PipelineDraft, RepoProfile, ReviewedTool, SigningPlan } from '../types.js';
 
@@ -136,7 +137,12 @@ function planFor(draft: PipelineDraft, mode: SigningMode): (SigningPlan & { mode
   if (plan === undefined || plan === null || typeof plan !== 'object') throw new RenderError(`The signing mode is ${m}, but the draft records no signing plan, so there is nothing to sign.`);
   if (plan.mode !== m) throw new RenderError(`The draft's signing plan is ${show(String(plan.mode))}, but the signing mode is ${m}.`);
   checkedImages(plan.images);
-  return { ...plan, mode: m };
+  // GJ (Plan J): the image of a service the plan builds no image for (noImageServices: skippedChecks) is report-only, so it leaves the plan;
+  // a plan left with no image signs nothing (no sign job, no sign workflow, no caller)
+  const noImage = noImageServices(draft.profile, draft.capabilities);
+  const images = plan.images.filter((i) => !noImage.has(i.service));
+  if (images.length === 0) return null;
+  return { ...plan, images, mode: m };
 }
 
 /** The reviewed actions/attest entry of the platform actions, at the major the attest mode is written for. */
@@ -156,7 +162,7 @@ function attestAction(platform: PlatformActions): ReviewedTool {
  */
 export function signJob(draft: PipelineDraft, mode: SigningMode, deps: { reviewed: readonly ReviewedTool[]; platform: PlatformActions }): SignJob {
   const plan = planFor(draft, mode);
-  if (plan === null) throw new RenderError('The signing mode is none, so there is no sign job.');
+  if (plan === null) throw new RenderError('Nothing is signed here (the signing mode is none, or no service of the plan builds an image), so there is no sign job.');
   if (plan.mode === 'attest') {
     attestAction(deps.platform);
     throw new RenderError('Attest signing can not be written yet: actions/attest takes the image digest as a literal input only (the reviewed input table lives in the gate bundle), and the digest is known only when the deploy runs. It lands with the gate re-pin batch (G15); until then this repository is not signed.');
@@ -197,7 +203,7 @@ const recordsOnly = (draft: PipelineDraft): boolean => draft.profile.private !==
 
 /**
  * The central files of the project that are not per layer: its sign workflow, `.github/workflows/<project>--sign.yml` (workflow_call only,
- * no input, the one job `sign`), or nothing for mode none, the proof, and a records-only `pipelines`. Throws as signJob does.
+ * no input, the one job `sign`), or nothing for mode none, the proof, a records-only `pipelines`, and a plan whose services build no image (GJ). Throws as signJob does.
  */
 export function sharedWorkflows(draft: PipelineDraft, mode: SigningMode, deps: { reviewed: readonly ReviewedTool[]; platform: PlatformActions }): CreatedFile[] {
   if (recordsOnly(draft)) return [];
@@ -215,7 +221,7 @@ export function sharedWorkflows(draft: PipelineDraft, mode: SigningMode, deps: {
 /**
  * The app's caller job of the central sign workflow (for pipegen.yml, G5): a deploy job on a push to the default branch, needing the job
  * that holds the gate (and image-publish, whose digest it signs), pinned to the recorded central commit, granted exactly the sign job's
- * permissions, no input and no secret. Null when there is no central sign workflow (mode none, the proof, a records-only repo).
+ * permissions, no input and no secret. Null when there is no central sign workflow (mode none, the proof, a records-only repo, no service building an image).
  */
 export function signCallerJob(draft: PipelineDraft, mode: SigningMode, needs: readonly string[]): Record<string, unknown> | null {
   if (recordsOnly(draft)) return null;

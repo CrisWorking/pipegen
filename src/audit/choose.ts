@@ -15,7 +15,7 @@
 // settings `finish` would turn on).
 import { codeSecurityAvailable } from '../github/availability.js';
 import { needLanguage } from '../engine/discover.js';
-import { skippedChecks, type SkippedCheck } from '../engine/needs.js';
+import { riskyTriggersOf, skippedChecks, type SkippedCheck } from '../engine/needs.js';
 import { neverImage, neverListed, nodeTypeChecker, repoToolStep, reviewedFor, type RepoToolStep, type WouldAddTool } from '../engine/reviewed.js';
 import { emptyServiceQuality } from '../read/quality.js';
 import type { Capabilities, Need, NeedCategory, RepoProfile, ReviewedTool, Service } from '../types.js';
@@ -202,11 +202,6 @@ function deadCodeRule(c: Ctx): Choice {
   return generic(c);
 }
 
-/**
- * Triggers that run a workflow on input an outsider controls (a fork's pull request code, a comment): the property
- * poutine checks for. `workflow_run` is not one of them by itself: zizmor already reports the risky uses of it.
- */
-const RISKY_TRIGGERS: readonly string[] = ['pull_request_target', 'issue_comment'];
 
 /** The CI line for each hook manager's own runner. husky runs free shell, so there is no one command to give. */
 function hooksCiRule(c: Ctx): Choice {
@@ -259,7 +254,7 @@ const RULES: Readonly<Record<string, Rule>> = {
   duplication: (c) => reviewed(c, T.jscpd, 'jscpd: finds copy-pasted code', [], '; warning only; new copy-paste in the pull request only'),
   'dockerfile-lint': (c) => reviewed(c, T.hadolint, 'Hadolint: lints the Dockerfile', [], "; Trivy config's Dockerfile checks stay on"),
   'workflow-lint': (c) => {
-    const riskyOn = RISKY_TRIGGERS.filter((t) => c.p.existingWorkflows.some((w) => w.triggers.includes(t)));
+    const riskyOn = riskyTriggersOf(c.p);
     const risky = riskyOn.length > 0;
     // owner choice 3 / #122: zizmor alone; poutine only for triggers that take untrusted input; actionlint is not picked
     return reviewed(

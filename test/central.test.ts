@@ -18,7 +18,7 @@ import { signingMode, type SigningMode } from '../src/github/signing-mode.js';
 import { ATTEST_MAJOR, sharedWorkflows, signCallerJob, signingPlan, signJob, signPermissions, SIGN_JOB_ID } from '../src/layers/central.js';
 import { PROOF_SIGNING_MODE } from '../src/proof/harness.js';
 import type { Capabilities, CreatedFile, PipelineDraft, ReviewedTool, SigningPlan } from '../src/types.js';
-import { draftOf, jobsOf, p, prof, workflow } from './helpers/gate-pipeline.js';
+import { draftOf, imageProf, jobsOf, p, workflow } from './helpers/gate-pipeline.js';
 import { entry, reviewedList } from './helpers/render.js';
 
 /** Names spelled at run time (test/no-secret-literals.test.ts): the OIDC permission, the key secret and the password. */
@@ -45,7 +45,8 @@ const NEEDS = ['gate', 'image-publish'];
 const CAPS_BASE: Capabilities = { branchProtection: true, environments: false, envRequiredReviewers: false, deploymentBranchPolicies: false, attestations: false, codeScanning: true, keylessSigningAllowed: false };
 const KE_CAPS: Capabilities = { ...CAPS_BASE, environments: true, deploymentBranchPolicies: true };
 const ATTEST_CAPS: Capabilities = { ...CAPS_BASE, attestations: true, environments: true };
-const privProf = { ...prof, private: true };
+// GJ: the signed services build an image (Dockerfile), else Plan J makes their signing report-only and nothing would be signed
+const privProf = { ...imageProf, private: true };
 /** A private key-env draft with the honest pipeline (so the app caller file of jobsOf passes too). */
 function draft(signing: SigningPlan | undefined, over: Partial<PipelineDraft> = {}): PipelineDraft {
   return draftOf({ profile: privProf, capabilities: KE_CAPS, centralPin: { repo: 'o/pipelines', sha: SHA }, ...(signing === undefined ? {} : { signing }), ...over });
@@ -151,7 +152,7 @@ describe('G3: central shared files (Plan G Task 1)', () => {
 
   it('central: keyless only requests id-token write', async () => {
     // keyless is a public repository's mode: its sign job is a deploy job of the app's own pipegen.yml (the identity keylessIdentity names)
-    const pub = draftOf({ capabilities: { ...CAPS_BASE, keylessSigningAllowed: true }, signing: { mode: 'keyless', images: [IMG] } });
+    const pub = draftOf({ profile: imageProf, capabilities: { ...CAPS_BASE, keylessSigningAllowed: true }, signing: { mode: 'keyless', images: [IMG] } });
     expect(signingMode(pub.profile, pub.capabilities)).toBe('keyless');
     const j = signJob(pub, 'keyless', deps);
     // the OIDC token is its only privileged ask beside the registry write that stores the signature: no attestations, no environment, no key
@@ -200,7 +201,7 @@ describe('G3: central shared files (Plan G Task 1)', () => {
   it('central: sign job has cache-mode none', async () => {
     const j = signJobOf(fileOf(sharedWorkflows(keDraft(), 'key-env', deps)));
     expect(j['cache-mode']).toBe('none');
-    const pub = draftOf({ capabilities: { ...CAPS_BASE, keylessSigningAllowed: true }, signing: { mode: 'keyless', images: [IMG] } });
+    const pub = draftOf({ profile: imageProf, capabilities: { ...CAPS_BASE, keylessSigningAllowed: true }, signing: { mode: 'keyless', images: [IMG] } });
     expect(signJob(pub, 'keyless', deps)['cache-mode']).toBe('none');
     // no cache step of any kind
     expect(JSON.stringify(j.steps)).not.toMatch(/actions\/cache/);
@@ -273,7 +274,7 @@ describe('G3: central shared files (Plan G Task 1)', () => {
     expect(() => signingPlan(privProf, ATTEST_CAPS, 'key-env', [IMG], PUB_SHA)).toThrow(RenderError);
     expect(signingPlan(privProf, ATTEST_CAPS, 'attest', [IMG])).toEqual({ mode: 'attest', images: [IMG] });
     expect(() => signingPlan(privProf, ATTEST_CAPS, 'attest', [IMG], PUB_SHA)).toThrow(RenderError);
-    expect(signingPlan(prof, CAPS_BASE, 'keyless', [IMG])).toEqual({ mode: 'keyless', images: [IMG] });
+    expect(signingPlan(imageProf, CAPS_BASE, 'keyless', [IMG])).toEqual({ mode: 'keyless', images: [IMG] });
     expect(() => signingPlan(privProf, KE_CAPS, 'key-env', [], PUB_SHA)).toThrow(RenderError);
     expect(() => signingPlan(privProf, KE_CAPS, 'key-env', [IMG, { ...IMG }], PUB_SHA)).toThrow(/twice/);
     // the referee: a sign file that declares a workflow_call input (a mode, say) is refused, whatever its steps read
@@ -293,7 +294,7 @@ describe('G3: central shared files (Plan G Task 1)', () => {
 
   it('central: records-only pipelines gets no shared workflow', () => {
     // a public app: its workflows are its own (keyless in its pipegen.yml); its pipelines repo holds only the install record
-    const pub = draftOf({ capabilities: { ...CAPS_BASE, keylessSigningAllowed: true }, signing: { mode: 'keyless', images: [IMG] }, centralPin: { repo: 'o/pipelines', sha: SHA } });
+    const pub = draftOf({ profile: imageProf, capabilities: { ...CAPS_BASE, keylessSigningAllowed: true }, signing: { mode: 'keyless', images: [IMG] }, centralPin: { repo: 'o/pipelines', sha: SHA } });
     expect(pub.profile.private).toBe(false);
     for (const mode of ['keyless', 'none'] as const) {
       expect(sharedWorkflows(pub, mode, deps), mode).toEqual([]);
@@ -330,7 +331,7 @@ describe('G3 fix round 1 (G3-R2)', () => {
     const ra3 = await judge([pa3, withCaller(d, {})], d);
     expect(ra3.issues.some((i) => /attest mode/.test(i.message)), show(ra3)).toBe(true);
     // keyless (public): the OIDC token yes, attestations write no, an attest step no
-    const pub = draftOf({ capabilities: { ...CAPS_BASE, keylessSigningAllowed: true }, signing: { mode: 'keyless', images: [IMG] } });
+    const pub = draftOf({ profile: imageProf, capabilities: { ...CAPS_BASE, keylessSigningAllowed: true }, signing: { mode: 'keyless', images: [IMG] } });
     const j = signJob(pub, 'keyless', deps);
     const inline = (over: Obj, steps: Obj[] = j.steps as Obj[]) => workflow({ ...jobsOf(pub), [SIGN_JOB_ID]: { ...j, steps, if: DEPLOY_PUSH_IF, needs: ['gate'], ...over } }, { on: DEPLOY_ON });
     expect(show(await judge([inline({})], pub))).toBe('');
@@ -459,7 +460,7 @@ describe('G3 fix round 2 (G3-R3)', () => {
       expect(step?.env?.[TOK_NAME], mode).toBe(`\${{ ${SEC_FIELD}.GITHUB_TOKEN }}`);
       expect(run, mode).not.toMatch(/--password(?!-stdin)|-p /);
       // the rendered job: only the digest download, the pinned install and the sign step
-      const d = mode === 'key-env' ? keDraft() : draftOf({ capabilities: { ...CAPS_BASE, keylessSigningAllowed: true }, signing: { mode: 'keyless', images: [IMG] } });
+      const d = mode === 'key-env' ? keDraft() : draftOf({ profile: imageProf, capabilities: { ...CAPS_BASE, keylessSigningAllowed: true }, signing: { mode: 'keyless', images: [IMG] } });
       const j = signJob(d, mode, deps);
       // G4: key-env starts with the egress step (the one exception); keyless has none (its Sigstore and OIDC hosts are in no reviewed set)
       expect(j.steps.map((s) => (s.uses?.split('@')[0] ?? (s.id === step?.id ? 'sign' : s.name))), mode).toEqual([...(mode === 'key-env' ? ['bullfrogsec/bullfrog'] : []), 'actions/download-artifact', 'pipegen: install cosign', 'sign']);
@@ -492,7 +493,7 @@ describe('G3 fix round 2 (G3-R3)', () => {
       expect(only(await judge([twice, caller], d)), 'egress twice').toBe(true);
     }
     // keyless (its job holds an OIDC token): the same allowlist
-    const pub = draftOf({ capabilities: { ...CAPS_BASE, keylessSigningAllowed: true }, signing: { mode: 'keyless', images: [IMG] } });
+    const pub = draftOf({ profile: imageProf, capabilities: { ...CAPS_BASE, keylessSigningAllowed: true }, signing: { mode: 'keyless', images: [IMG] } });
     const j = signJob(pub, 'keyless', deps);
     const inline = (steps: Obj[]) => workflow({ ...jobsOf(pub), [SIGN_JOB_ID]: { ...j, steps, if: DEPLOY_PUSH_IF, needs: ['gate'] } }, { on: DEPLOY_ON });
     expect(only(await judge([inline(j.steps as Obj[])], pub))).toBe(false);

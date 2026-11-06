@@ -328,6 +328,46 @@ export function skippedChecks(p: RepoProfile, caps: Capabilities): SkippedCheck[
   return out;
 }
 
+/**
+ * GJ (Plan J carry, DECISIONS #121): the checks that need an image or a running app. The plan never holds one for a service it builds no
+ * image for (noImageServices); Plan G writes no job for one, and the referee refuses a draft that holds one.
+ */
+export const NO_IMAGE_CATEGORIES: ReadonlySet<string> = new Set(['image-build', 'image-scan', 'dast', 'api-dast']);
+
+/**
+ * GJ: the services the plan builds no image for, each with the plan's own reason: those skippedChecks lists the image build for (a static
+ * site, or a service that doesn't run). Read from the plan's skip list, never from the project type again. Their signing and attestation
+ * needs are report-only (no sign job, no sign caller, a PIPEGEN.md line), and no check of NO_IMAGE_CATEGORIES is planned for them.
+ */
+export function noImageServices(p: RepoProfile, caps: Capabilities): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const k of skippedChecks(p, caps)) if (k.category === 'image-build' && k.service !== undefined && !out.has(k.service)) out.set(k.service, k.why);
+  return out;
+}
+
+/**
+ * Plan J fix wave I1 (owner choice 3, DECISIONS #122): the main tool of the workflow lint check, zizmor. actionlint is never picked; when
+ * zizmor isn't on the reviewed list, the check is only a suggestion and gets no job.
+ */
+export const WORKFLOW_LINT_TOOL = 'zizmor';
+/** The one tool workflow lint adds next to zizmor, only when a workflow runs on a trigger that takes untrusted input (RISKY_TRIGGERS). */
+export const WORKFLOW_LINT_EXTRA = 'poutine';
+/**
+ * Triggers that run a workflow on input an outsider controls (a fork's pull request code, a comment): the property poutine checks for.
+ * `workflow_run` is not one of them by itself: zizmor already reports the risky uses of it.
+ */
+export const RISKY_TRIGGERS: readonly string[] = Object.freeze(['pull_request_target', 'issue_comment']);
+/** The triggers of RISKY_TRIGGERS some existing workflow runs on, in that order. */
+export const riskyTriggersOf = (p: RepoProfile): string[] => RISKY_TRIGGERS.filter((t) => p.existingWorkflows.some((w) => w.triggers.includes(t)));
+/** GJ: the tools workflow lint runs, all of them (the audit's chooser and Plan G agree): zizmor, plus poutine on a risky trigger. */
+export const workflowLintTools = (p: RepoProfile): string[] => [WORKFLOW_LINT_TOOL, ...(riskyTriggersOf(p).length > 0 ? [WORKFLOW_LINT_EXTRA] : [])];
+
+/**
+ * GJ (Plan J, DECISIONS #122): the hook managers whose hooks pipegen has no reviewed CI runner for: pre-commit (its own
+ * `pre-commit run --all-files` is not a reviewed tool) and husky (shell scripts, no one command). Their hooks-ci check is only a note.
+ */
+export const NO_HOOKS_CI_MANAGERS: ReadonlySet<string> = new Set(['pre-commit', 'husky']);
+
 /** iac (an older check) now also applies to Kubernetes manifests. */
 const iacSkip = (p: RepoProfile): string | null => (p.terraformDirs.length > 0 || p.repoFiles.kubernetes ? null : 'no Terraform or Kubernetes files found');
 

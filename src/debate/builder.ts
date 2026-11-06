@@ -32,7 +32,7 @@ import { needLanguage, toSuggestions } from '../engine/discover.js';
 import { PIPEGEN_JOB_CATEGORIES } from '../engine/gate-job-list.js';
 import { isReviewed, NARROWING_CHOICES } from '../engine/job-rules.js';
 import { NEED_ID_CATEGORY, toolCoversNeed } from '../engine/need-ids.js';
-import { needWhy, promptProfile, promptText } from '../engine/needs.js';
+import { needWhy, NO_HOOKS_CI_MANAGERS, promptProfile, promptText, WORKFLOW_LINT_TOOL, workflowLintTools } from '../engine/needs.js';
 import type { QualityBar } from '../engine/quality-bar.js';
 import { validateSpec } from '../engine/render-step.js';
 import { projectScriptFor, repoToolFor, repoToolProblem, reviewedFor } from '../engine/reviewed.js';
@@ -382,6 +382,11 @@ function offersFor(ref: NeedRef, cands: readonly Candidate[], p: RepoProfile, de
     const e = listed.get(c.id);
     if (e === undefined || !isReviewed(e.candidate) || e.candidate.id !== e.id || !toolCoversNeed(e.categories, ref.id)) continue;
     if (ref.blocking && ADVISORY_TOOLS.has(e.id)) continue;   // ruling S9: an advisory tool never covers a blocking need
+    // GJ (Plan J fix wave I1, DECISIONS #122): workflow lint is zizmor (plus poutine on a risky trigger), never actionlint; without zizmor
+    // on the list nothing is offered (the check is only a suggestion)
+    if (categoryOf(ref.id) === 'workflow-lint' && (!workflowLintTools(p).includes(e.id) || !listed.has(WORKFLOW_LINT_TOOL))) continue;
+    // GJ: a pre-commit or husky repository's hooks are not lefthook's: hooks-ci offers no reviewed tool there (a plain note instead)
+    if (categoryOf(ref.id) === 'hooks-ci' && p.precommit !== null && NO_HOOKS_CI_MANAGERS.has(p.precommit)) continue;
     const plan = choicePlan(e, ref, p);
     if (plan === null) continue;
     seen.add(c.id);

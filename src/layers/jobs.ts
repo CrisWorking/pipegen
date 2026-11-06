@@ -12,13 +12,21 @@
 // - a draft whose needs are not the debate's (one source);
 // - a blocking check pipegen can not render (a pnpm service, a Python project script, ...): never dropped silently;
 // - starter tests in the draft while the isolated starter-test job is switched off (ISOLATED_TEST_JOB, ruling D7-R7, S19);
-// - a job that holds a user secret and would need a shared-CDN egress set (E3-R3, E-b5).
+// - a job that holds a user secret and would need a shared-CDN egress set (E3-R3, E-b5);
+// - GJ (Plan J): an image build, image scan, DAST or API DAST need for a service the plan builds no image for (noImageServices, read from
+//   skippedChecks: a static site, or a service that doesn't run). The jobs follow the needs list only; the type is never read again here.
 //
 // What it leaves out, each with a note (the returned draft no longer holds them, so the gate's job list, the referee and PIPEGEN.md agree):
 // - the parts skipped with --skip (tests, precommit, deploy; the others make no job); the secrets scan and the gate are never skippable;
 // - v0.2 limits: api-dast and PyPI publishing (S31); Scorecard (PF-3: the action runs a tag-pinned image); fuzzing (v0.3); an image build
 //   that can not be rendered (a sub-folder service, ruling S8) and the scans of that image; an osv-scanner run for a service with no lockfile
-//   (G12: it exits 128); a non-blocking DAST check whose app pipegen can not start in a container. A blocking one stops (G4-R1, G0-R1).
+//   (G12: it exits 128); a non-blocking DAST check whose app pipegen can not start in a container. A blocking one stops (G4-R1, G0-R1);
+// - GJ (Plan J fix wave I1, DECISIONS #122): workflow lint runs zizmor, plus poutine when a workflow runs on pull_request_target or
+//   issue_comment, never actionlint. Its steps are code-chosen (withLintSteps: every offered tool, each once), so the debate can not pick one
+//   in place of the other; a draft step running another tool is refused. When zizmor isn't on the reviewed list the check is only a
+//   suggestion: no job, its needs leave the draft, a note says so;
+// - GJ (DECISIONS #122): hooks-ci of a pre-commit or husky repository (no reviewed runner for its hooks: NO_HOOKS_CI_MANAGERS) is a plain
+//   note, never lefthook in their place; its needs leave the draft (the proof reports those hooks as not proven).
 //
 // The jobs (one per need key: the gate's job list is keyed by jobIdFor, so the estimate's JOB_GROUP grouping is not applied, see the G4 report):
 // - every job starts with the reviewed egress step (Bullfrog block, E0d per job: github-core plus the sets its tools need; P-3), then its checkout;
@@ -41,7 +49,8 @@
 //   always()`, needs = every job of the gate's list plus base-scan), nightly (renderNightlyStep: the warn-ending, finish-missing, update and
 //   warn-first issues; issues: write here only; no checkout, so it never pushes a file; concurrency pipegen-nightly);
 // - sign: G3's job for the delivered mode (signingMode), none for the proof (PROOF_SIGNING_MODE) or a skipped deploy; attest is "not signed
-//   yet (G15)" with a note, never another mode.
+//   yet (G15)" with a note, never another mode. GJ (Plan J): a signing or attestation need on a service that builds no image is report-only:
+//   its image leaves the signing plan, and with no service building an image there is no sign job at all; a note each (PIPEGEN.md, G9).
 import { isDeepStrictEqual } from 'node:util';
 import { keyOffers, specFor, BuilderError, type Offer } from '../debate/builder.js';
 import type { DebateResult } from '../debate/debate.js';
@@ -60,6 +69,7 @@ import {
   isScrubStep, jobOutputsFor, NIGHTLY_CONCURRENCY, NO_SCANS, renderRangeFetchStep, type RenderedStep, type ScanFact,
 } from '../engine/job-rules.js';
 import { NEED_ID_CATEGORY, SCHEDULED_CATEGORIES } from '../engine/need-ids.js';
+import { NO_HOOKS_CI_MANAGERS, NO_IMAGE_CATEGORIES, noImageServices, WORKFLOW_LINT_TOOL, workflowLintTools } from '../engine/needs.js';
 import { parseImageRef } from '../engine/names.js';
 import { PLATFORM_ACTION_IDS, type PlatformActions } from '../engine/pin.js';
 import { APP_RUNNING_CATEGORIES, renderStarterTestRun } from '../engine/render-cli.js';
@@ -104,6 +114,13 @@ export const NOT_RENDERED_V02: Readonly<Partial<Record<NeedCategory, string>>> =
 });
 /** The PyPI publish action (S31): it builds or pulls a container at run time, so it is not rendered in v0.2. */
 const PYPI_PUBLISH_ID = 'pypi-publish';
+/** GJ (DECISIONS #122): the note of hooks-ci for a hook manager pipegen has no reviewed CI runner for. */
+export const HOOKS_CI_NOTES: Readonly<Record<string, string>> = Object.freeze({
+  'pre-commit': "This repository's hooks are pre-commit's, and pipegen has no reviewed pre-commit runner yet, so CI does not run them: add `pre-commit run --all-files` to your own CI.",
+  husky: "husky's hooks are shell scripts, so there is no one command pipegen can run in CI: call the same script from a workflow step yourself.",
+});
+/** GJ (DECISIONS #122): the note when zizmor, workflow lint's one tool, is not on the reviewed list. */
+export const WORKFLOW_LINT_SUGGESTION = `Workflow lint runs ${WORKFLOW_LINT_TOOL} only, and ${WORKFLOW_LINT_TOOL} is not on pipegen's reviewed list in this version, so it is only a suggestion: add ${WORKFLOW_LINT_TOOL} to your own CI to lint the workflows.`;
 export const PYPI_PUBLISH_NOTE = 'Publishing to PyPI is not rendered yet: the publish action builds or pulls a container at run time, and pipegen runs only images pinned by digest (S31).';
 
 /**
@@ -427,6 +444,18 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
   if (floor.length > 0) fail(`The draft marks the floor check ${floor.map(show).join(', ')} as not proven, but a floor check is always required; pipegen does not assemble it.`);
   if (!isDeepStrictEqual(input.needs, plan.needs)) fail('The draft\'s needs are not the debate\'s needs, so its steps can not be checked against what was offered.');
   if (input.created.some((f) => f.part === 'tests') && !ISOLATED_TEST_JOB) fail('The draft holds starter tests, but the isolated starter-test job is switched off until its live acceptance (ruling D7-R7), so no starter test runs.');
+  // GJ: the plan builds no image for these services (skippedChecks), so no image, DAST or API DAST check may be planned for them
+  const noImage = noImageServices(input.profile, input.capabilities);
+  for (const n of input.needs) {
+    if (n.service === undefined || !NO_IMAGE_CATEGORIES.has(categoryOf(n.id) ?? n.category) || !noImage.has(n.service)) continue;
+    fail(`The draft plans the check ${where(n)}, but pipegen builds no image for that service (${noImage.get(n.service) as string}), so it has nothing to build, scan or start; pipegen never writes that job.`);
+  }
+  // GJ (DECISIONS #122): workflow lint is zizmor alone; without it on the reviewed list the check is a suggestion only
+  const lintSuggestion = !deps.reviewed.some((t) => t.id === WORKFLOW_LINT_TOOL && isReviewed(t.candidate));
+  const isLint = (n: Pick<Need, 'id' | 'category'>): boolean => (categoryOf(n.id) ?? n.category) === 'workflow-lint';
+  // GJ (DECISIONS #122): a pre-commit or husky repository's hooks-ci is a note only (no reviewed runner for those hooks)
+  const hooksNote = input.profile.precommit !== null && NO_HOOKS_CI_MANAGERS.has(input.profile.precommit) ? HOOKS_CI_NOTES[input.profile.precommit] : undefined;
+  const isHooksCi = (n: Pick<Need, 'id' | 'category'>): boolean => (categoryOf(n.id) ?? n.category) === 'hooks-ci';
   const skipped = (n: Need): SkippablePart | undefined => input.skipped.map((s) => s.part).find((part) => skippedByPart(part, n));
   const limitOf = (n: Pick<Need, 'id' | 'category'>): string | undefined => {
     const cat = (categoryOf(n.id) ?? n.category) as NeedCategory;
@@ -437,6 +466,8 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     if (!u.blocking) continue;
     const n = input.needs.filter((x) => keyOf(x) === u.key);
     if (n.length > 0 && n.every((x) => skipped(x) !== undefined)) continue;
+    if (lintSuggestion && isLint({ id: u.needId, category: categoryOf(u.needId) ?? u.needId })) { addNote(notes, WORKFLOW_LINT_SUGGESTION); continue; }
+    if (hooksNote !== undefined && isHooksCi({ id: u.needId, category: categoryOf(u.needId) ?? u.needId })) { addNote(notes, hooksNote); continue; }
     const limit = limitOf({ id: u.needId, category: categoryOf(u.needId) ?? u.needId });
     if (limit !== undefined) { addNote(notes, limit); continue; }
     // G4b: a repo built-in that can not run says why in its own plain words (fixed text, repoToolProblem)
@@ -445,6 +476,7 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     stop.push(`${where(u)}: ${why ?? UNCOVERED_REASON[u.reason] ?? 'no reviewed tool covers it'}`);
   }
   if (stop.length > 0) fail(`pipegen stopped before writing the pipeline: these blocking checks have no tool it can run (${stop.join('; ')}). It never guesses a tool.`);
+  input = withLintSteps(input, plan, deps.reviewed);
   checkSteps(input, plan, deps.reviewed);
 
   // 2. the draft as assembled: no skipped part, no v0.2 limit
@@ -454,6 +486,8 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     if (part !== undefined) { dropped.add(n); continue; }
     const limit = limitOf(n);
     if (limit !== undefined && n.layer !== 'pre-commit') { dropped.add(n); addNote(notes, limit); }
+    if (lintSuggestion && isLint(n)) { dropped.add(n); addNote(notes, WORKFLOW_LINT_SUGGESTION); }
+    if (hooksNote !== undefined && isHooksCi(n)) { dropped.add(n); addNote(notes, hooksNote); }
   }
   for (const p of input.skipped) addNote(notes, `The part ${show(p.part)} is skipped (--skip), so it has no job.`);
   let draft = narrowed(input, dropped);
@@ -571,19 +605,51 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     },
   };
 
-  // 4. signing: G3's job for the delivered mode, none for the proof or a skipped deploy
+  // 4. signing: G3's job for the delivered mode, none for the proof or a skipped deploy. GJ: a signing or attestation need on a service that
+  // builds no image is report-only (its image leaves the plan; with no service building an image there is nothing to sign at all)
+  for (const n of draft.needs) {
+    const cat = categoryOf(n.id) ?? n.category;
+    if (n.layer === 'deploy' && (cat === 'signing' || cat === 'attestation') && n.service !== undefined && noImage.has(n.service)) addNote(notes, reportOnlyNote(n.service));
+  }
+  if (draft.signing !== undefined && draft.signing !== null && Array.isArray(draft.signing.images)) {
+    const images = draft.signing.images.filter((i) => !noImage.has(i?.service));
+    for (const i of draft.signing.images) if (noImage.has(i?.service)) addNote(notes, reportOnlyNote(i.service));
+    if (images.length !== draft.signing.images.length) {
+      const { signing: _s, ...rest } = draft;
+      draft = images.length > 0 ? { ...rest, signing: { ...draft.signing, images } } : rest;
+    }
+  }
+  const imageNone = draft.profile.services.every((s) => noImage.has(s.name));
   let sign: SignJob | null = null;
-  if (deps.mode !== 'none' && !input.skipped.some((p) => p.part === 'deploy')) {
+  if (deps.mode !== 'none' && !input.skipped.some((p) => p.part === 'deploy') && !imageNone) {
     try { sign = signJob(draft, deps.mode, { reviewed: deps.reviewed, platform: deps.platform }); } catch (e) {
       if (!(e instanceof RenderError) || deps.mode !== 'attest') throw e;
       addNote(notes, 'The images are not signed yet: attest signing lands with the gate re-pin batch (G15), and pipegen never falls back to another mode.');
     }
   }
-  if (deps.mode === 'none' || input.skipped.some((p) => p.part === 'deploy')) { const { signing: _s, ...rest } = draft; draft = rest; }
+  if (deps.mode === 'none' || input.skipped.some((p) => p.part === 'deploy') || imageNone) { const { signing: _s, ...rest } = draft; draft = rest; }
   return { draft, push, merge, nightly, sign, notes };
 }
 
 function addNote(notes: string[], line: string): void { if (!notes.includes(line)) notes.push(line); }
+
+/**
+ * GJ (DECISIONS #122): workflow lint's steps are code-chosen: for each workflow-lint need key, specFor of every tool keyOffers offers for it
+ * (zizmor, plus poutine on a risky trigger: workflowLintTools), in place of the debate's pick, so neither runs without the other. A draft
+ * whose workflow-lint step runs another tool is returned as it is (checkSteps refuses it with its own reason).
+ */
+function withLintSteps(draft: PipelineDraft, plan: JobsPlan, reviewed: readonly ReviewedTool[]): PipelineDraft {
+  const isLintStep = (s: StepSpec): boolean => categoryOf(s?.needId) === 'workflow-lint';
+  const tools = workflowLintTools(draft.profile);
+  if (draft.steps.some((s) => isLintStep(s) && !tools.includes(s?.tool?.id))) return draft;
+  let offers: ReturnType<typeof keyOffers>;
+  try { offers = keyOffers(plan.needs, plan.candidates, draft.profile, { reviewed }); } catch (e) { if (e instanceof NeedKeyError) return draft; throw e; }
+  const code = offers.refs.filter((r) => categoryOf(r.id) === 'workflow-lint').flatMap((r) => (offers.offers.get(r.key) ?? []).map((o) => specFor(r, o, draft.profile)));
+  return { ...draft, steps: [...draft.steps.filter((s) => !isLintStep(s)), ...code] };
+}
+
+/** GJ: the note (and the PIPEGEN.md line, G9) of a signing or attestation need on a service that builds no image. */
+const reportOnlyNote = (service: string): string => `The service ${show(service)} builds no image, so its signing is report-only: pipegen signs nothing for it (sign its deployed files with cosign sign-blob yourself if you need it).`;
 
 /** The draft without these needs, and without the steps no remaining need runs (a step is per need key, every layer). */
 function narrowed(draft: PipelineDraft, drop: ReadonlySet<Need>): PipelineDraft {
