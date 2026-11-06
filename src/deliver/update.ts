@@ -830,7 +830,7 @@ export async function update(gh: Octokit, app: RepoRef, deps: UpdateDeps): Promi
   // G12-R2 N4: update never asks the typed trust question (its answer would stand for deliver and uninstall, and update can't use a view)
   const trusted = await trustedPrevious(gh, app, centralRef, centralRepo.defaultBranch, centralUpdateBranch(app.repo), deps.local ?? {}, clock, notes, { io: deps.io, interactive: false });
   if (trusted.record === null && trusted.why === 'no-local') {
-    throw new UpdateError(`This machine has no local record file for ${show(`${app.owner}/${app.repo}`, 140)}, so pipegen can't check its install record. Run \`npx pipegen\` in this repo first (it re-checks the full setup), then run update again.`);
+    throw new UpdateError(`This machine has no local record file for ${show(`${app.owner}/${app.repo}`, 140)}, so pipegen can't check its install record. Run \`npx pipegen run\` in this repo first (it re-checks the full setup), then run update again.`);
   }
   if (trusted.record === null) {
     throw new UpdateError(`pipegen found no install record for ${show(`${app.owner}/${app.repo}`, 140)} that it trusts, so it changes nothing: update touches only the files the record lists.${notes.length > 0 ? ` ${notes.join(' ')}` : ''}`);
@@ -935,7 +935,7 @@ export async function update(gh: Octokit, app: RepoRef, deps: UpdateDeps): Promi
       ? `The pull request ${prUrl} is open and the install record is written (central repo and this machine), but the setup pull request's record marker was not updated (${why}); \`pipegen verify\` reports that until pipegen writes the record again.`
       : at?.at === 'central' && at.via === 'direct'
         // G12-R3 M2: the central default branch holds the new record and this machine's file the old hash: they no longer match
-        ? `The pull request ${prUrl} is open and the install record is written on the central default branch, but this machine's local record file was not updated (${why}), so the two no longer match. Remove ${show(file, 300)}, then run \`npx pipegen\` in this repo (it re-checks the setup and writes a record this machine vouches for); then run update again.`
+        ? `The pull request ${prUrl} is open and the install record is written on the central default branch, but this machine's local record file was not updated (${why}), so the two no longer match. Remove ${show(file, 300)}, then run \`npx pipegen run\` in this repo (it re-checks the setup and writes a record this machine vouches for); then run update again.`
         : at?.at === 'central'
           ? `The pull request ${prUrl} is open and the install record went to the central pull request, but this machine's local record file was not updated (${why}). The record this machine trusts is unchanged, so run \`pipegen update\` again: it rebuilds the central pull request.`
           : `The pull request ${prUrl} is open, but the install record was not written (${why}); run \`pipegen update\` again to record it.`;

@@ -659,7 +659,7 @@ async function signing(x: Ctx): Promise<void> {
       x.commands.push(`gh secret set ${COSIGN_KEY_SECRET} --env ${SIGNING_ENVIRONMENT} --repo ${repo} < pipegen-signing.key`);
       x.commands.push(`gh secret set ${PASSWORD_SECRET} --env ${SIGNING_ENVIRONMENT} --repo ${repo} < pipegen-signing.password`);
       x.commands.push(`gh variable set ${COSIGN_PUB_VAR} --env ${SIGNING_ENVIRONMENT} --repo ${repo} < pipegen-signing.pub`);
-      x.commands.push('# Then delete the three files. The verify step checks the new public key\'s sha256 only after a pull request puts it in your workflow (run `npx pipegen` again).');
+      x.commands.push('# Then delete the three files. The verify step checks the new public key\'s sha256 only after a pull request puts it in your workflow (run `npx pipegen run` again).');
     } else if (x.rec.cosignPub !== undefined) await step(x, whatPub, () => setVariable(x, SIGNING_SCOPE, COSIGN_PUB_VAR, x.rec.cosignPub as string, whatPub));
     else x.skipped.push(noPub());
     return;
@@ -717,7 +717,7 @@ async function signing(x: Ctx): Promise<void> {
     pub = fresh;
     x.applied.push(whatKey);
     x.notes.push('The new signing key replaces the old one: images signed with the old key won\'t verify any more. Re-run the pipeline on the commit you deploy to sign it again with the new key.');
-    x.notes.push('The verify step fails closed until a pull request puts the new public key\'s sha256 in your workflow: that literal changes only through a pull request (run `npx pipegen` again to open it).');
+    x.notes.push('The verify step fails closed until a pull request puts the new public key\'s sha256 in your workflow: that literal changes only through a pull request (run `npx pipegen run` again to open it).');
     x.newKey = true;
   } else {
     const p = x.rec.cosignPub;

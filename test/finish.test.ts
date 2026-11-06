@@ -395,6 +395,8 @@ describe('G11 finish: print, rotate, the signing key', () => {
     expect(s.g.calls.slice(from).some((c) => c.route === 'PATCH /repos/{owner}/{repo}/git/refs/{ref}' && c.params.repo === 'pipelines' && c.params.ref === 'heads/main')).toBe(false);
     expect((await recordOn(s)).cosignPubSha256).toBe(pubKeySha256(PUB));
     expect(s.lines.join('\n')).toMatch(/verify.*fails.*until.*pull request/i);
+    // G13-R2 6: the way to open that pull request is the full run, never the bare audit
+    expect(s.lines.join('\n')).toMatch(/run `npx pipegen run` again to open it/);
     // until it is merged, verify fails closed: the variable doesn't hash to the record on the default branch
     const v = await verify(s.g.octokit(), { owner: 'o', repo: 'r' }, { local: { home: s.home, env: {} } });
     expect(v.drift.map((d) => d.what)).toEqual(expect.arrayContaining(['PIPEGEN_COSIGN_PUB (sha256)', 'install record hash (local record file)']));

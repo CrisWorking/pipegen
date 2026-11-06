@@ -533,7 +533,7 @@ describe('G12 fix round 1 (G12-R1)', () => {
     rmSync(join(w.home, '.config'), { recursive: true, force: true });
     const typedAsks: string[] = [];
     const typedIo: Prompter = { confirm: async () => true, select: async () => { throw new Error('no select'); }, text: async (m) => { typedAsks.push(m); return 'o/r'; } };
-    await expect(update(w.g.octokit(), app, deps(w, { io: typedIo, interactive: true }))).rejects.toThrow(/no local record file.*npx pipegen/);
+    await expect(update(w.g.octokit(), app, deps(w, { io: typedIo, interactive: true }))).rejects.toThrow(/no local record file.*Run `npx pipegen run` in this repo first/);
     expect(typedAsks).toEqual([]);
     expect(writes(w)).toEqual([]);
     expect(await readLocalRecord(app, { home: w.home, env: {} })).toBeNull();   // no trust decision kept
@@ -749,7 +749,7 @@ describe('G12 fix round 2 (G12-R2)', () => {
     // when the central record ref moves, the local record file's place becomes a folder: saving the file then fails
     w2.g.hooks.unshift((call) => { if (call.route === 'PATCH /repos/{owner}/{repo}/git/refs/{ref}' && call.params.repo === 'pipelines') { rmSync(file, { force: true }); mkdirSync(file); writeFileSync(join(file, 'x'), 'x'); } return undefined; });
     const r2 = await update(w2.g.octokit(), app, deps(w2));
-    expect(r2.notes.join(' ')).toMatch(/written on the central default branch, but this machine's local record file was not updated.*Remove .*npx pipegen/);
+    expect(r2.notes.join(' ')).toMatch(/written on the central default branch, but this machine's local record file was not updated.*Remove .*`npx pipegen run`/);
     // the central PR path (the default branch refuses a direct commit): the trusted record is unchanged, so update again works
     const w3 = await publicWorld();
     const file3 = localRecordPath(app, { home: w3.home, env: {} });

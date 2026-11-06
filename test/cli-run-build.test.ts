@@ -15,6 +15,7 @@ import { deliver, planDelivery, type DeliveryInput } from '../src/deliver/delive
 import { InstallRecordSchema, protectedPathsOfRecord, readRecord, recordHash } from '../src/deliver/record.js';
 import { codeownersProtectedPaths } from '../src/engine/created-builders.js';
 import { FakeGitHub } from './helpers/deliver-github.js';
+import { repoFiles, root } from './helpers/repo-files.js';
 import { SecretVault } from '../src/create/secrets.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { floorNeeds, MINIMUM_CATEGORIES } from '../src/engine/needs.js';
@@ -276,5 +277,21 @@ describe('G13-R2: the real build delivers a valid install record (ruling G13-R2 
     // the delivered CODEOWNERS keeps the anchored lines
     const co = built.files.find((f) => /CODEOWNERS$/.test(f.path));
     expect(co?.content).toMatch(/^\/\S+ @alice @bob$/m);
+  });
+});
+
+describe('G13-R2: no user text tells the user to re-run with bare `npx pipegen` (ruling G13-R2 6)', () => {
+  it('source: outside comments, `npx pipegen` (the read-only audit) never appears as a re-run or re-pin instruction; `npx pipegen run` does', () => {
+    const files = repoFiles('src').filter((f) => f.endsWith('.ts'));
+    const bad: string[] = [];
+    for (const f of files) {
+      readFileSync(join(root, f), 'utf8').split('\n').forEach((line, n) => {
+        const t = line.trim();
+        if (t.startsWith('//') || t.startsWith('*') || t.startsWith('/*')) return;
+        // backticked bare `npx pipegen` (escaped in a template literal or not)
+        if (/npx pipegen\\?`/.test(line)) bad.push(`${f}:${n + 1}`);
+      });
+    }
+    expect(bad).toEqual([]);
   });
 });
