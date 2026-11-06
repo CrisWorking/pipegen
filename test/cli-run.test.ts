@@ -251,6 +251,8 @@ describe('G13: before any GitHub call', () => {
     const i = io();
     expect(await run(bad, i)).toBe(1);
     expect(bad.calls).toEqual(['readOrigin', 'localProject']);
+    expect(i.errs.join('\n')).toMatch(/No service is named nope/);
+    expect(i.errs.join('\n')).not.toMatch(/pipegen run failed/);
     // a good one is applied to the profile everything after it sees
     const good = world({ deps: { flags: { types: [{ service: 'app', type: 'static-site' }] } } });
     expect(await run(good)).toBe(0);
@@ -406,7 +408,8 @@ describe('G13: stages 8-15', () => {
 
   it('run: strictness level chosen (default Standard) fills draft.warnFirst; never a floor need', async () => {
     const extra = need('coverage', 'merge', 'web', true);
-    const floorish = { ...need('sast', 'merge', 'web'), floor: true };
+    // a floor need outside the minimum (a type check the floor holds): never warn-first, at any level
+    const floorish = { ...need('unit-tests', 'merge', 'web'), floor: true };
     const typeNeed = need('dast', 'merge', 'web');
     const needs: Need[] = [extra, floorish, typeNeed, need('secrets', 'push', undefined)];
     const types = new Set([typeNeed.id]);
@@ -716,6 +719,15 @@ describe('G13: two-step delivery and after', () => {
     w.stages.proofRepos = async () => ({ ready: true, target: {} as never, repos: [], created: [], actionsAccess: { previous: 'none' } });
     await run(w);
     expect((w.got.deliver?.[0] as { proofRepos: unknown }).proofRepos).toEqual({ central: { createdByPipegen: false, actionsAccess: { previous: 'none' } }, scratch: { createdByPipegen: false } });
+  });
+
+  it('run: a draft still at the stand-in central commit is never delivered (a second net under the re-pin)', async () => {
+    const w = world({ built: (i) => builtOf({ ...i, draft: { ...i.draft, centralPin: { repo: 'o/pipelines', sha: UNPINNED } } }) });
+    const i = io();
+    expect(await run(w, i)).toBe(1);
+    expect(w.calls).not.toContain('deliver');
+    expect(w.calls).not.toContain('preview');
+    expect(i.errs.join('\n')).toMatch(/no central commit pinned/);
   });
 
   it('run: a central pull request stops the run with exit 2 and its message', async () => {
