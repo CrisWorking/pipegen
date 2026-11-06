@@ -763,25 +763,25 @@ describe('V3 fix round 1', () => {
   it('R1 sec I3: a typed name is bound to the object (kind, scope, id), asked by target.ts, and consumed on any use', async () => {
     // (a) a token passed with a `yes` verdict is used up
     const f = api((route) => (route.startsWith('GET ') ? { name: 'PIPEGEN_X', created_at: AT } : {}));
-    const repoSecret: Owned = { kind: 'secret', entry: { name: 'PIPEGEN_X', scope: 'repo', created: true, githubCreatedAt: AT } };
-    const envSecret: Owned = { kind: 'secret', entry: { name: 'PIPEGEN_X', scope: 'env:prod', created: true, unconfirmed: true } };
-    const t = await typedOn(f.api, repoSecret);
-    expect((await f.api.deleteIfPipegens(repoSecret, { typed: t })).status).toBe('deleted');
-    await expect(f.api.deleteIfPipegens(repoSecret, { typed: t })).rejects.toBeInstanceOf(UninstallRefusal);
+    const repoOne: Owned = { kind: 'secret', entry: { name: 'PIPEGEN_X', scope: 'repo', created: true, githubCreatedAt: AT } };
+    const envOne: Owned = { kind: 'secret', entry: { name: 'PIPEGEN_X', scope: 'env:prod', created: true, unconfirmed: true } };
+    const t = await typedOn(f.api, repoOne);
+    expect((await f.api.deleteIfPipegens(repoOne, { typed: t })).status).toBe('deleted');
+    await expect(f.api.deleteIfPipegens(repoOne, { typed: t })).rejects.toBeInstanceOf(UninstallRefusal);
     // (b) the same name in another scope, or the central ruleset under the gate ruleset's name: another object
-    const t2 = await typedOn(f.api, repoSecret);
-    await expect(f.api.deleteIfPipegens(envSecret, { typed: t2 })).rejects.toBeInstanceOf(UninstallRefusal);
+    const t2 = await typedOn(f.api, repoOne);
+    await expect(f.api.deleteIfPipegens(envOne, { typed: t2 })).rejects.toBeInstanceOf(UninstallRefusal);
     const r = api((route) => (route.startsWith('GET ') ? liveRuleset({ id: 11, source: 'acme/pipelines' }) : {}));
-    const gateToken = await typedOn(r.api, { kind: 'ruleset', entry: rsEntry() });
-    await expect(r.api.deleteIfPipegens({ kind: 'central-ruleset', id: 11 }, { typed: gateToken })).rejects.toBeInstanceOf(UninstallRefusal);
+    const gateTyped = await typedOn(r.api, { kind: 'ruleset', entry: rsEntry() });
+    await expect(r.api.deleteIfPipegens({ kind: 'central-ruleset', id: 11 }, { typed: gateTyped })).rejects.toBeInstanceOf(UninstallRefusal);
     expect(r.writes()).toEqual([]);
     // a token of another run (another UninstallApi) never counts here
     const o = api((route) => (route.startsWith('GET ') ? { name: 'PIPEGEN_X', created_at: AT } : {}));
-    await expect(o.api.deleteIfPipegens(envSecret, { typed: await typedOn(f.api, envSecret) })).rejects.toBeInstanceOf(UninstallRefusal);
+    await expect(o.api.deleteIfPipegens(envOne, { typed: await typedOn(f.api, envOne) })).rejects.toBeInstanceOf(UninstallRefusal);
     // (c) the question is target.ts's, naming the object as GitHub knows it
     const ask = asker(true);
     const q = api(undefined, { askName: ask });
-    await q.api.confirm(envSecret);
+    await q.api.confirm(envOne);
     await q.api.confirm({ kind: 'central-ruleset', id: 11 });
     expect(ask.asked[0]).toMatchObject({ expected: 'PIPEGEN_X' });
     expect(ask.asked[0]?.question).toMatch(/environment prod/);
@@ -823,7 +823,7 @@ describe('V3 fix round 1', () => {
       return { out, deleted: f.calls.some((c) => c.route === 'DELETE /repos/{owner}/{repo}') };
     };
     // pipegen's own PRs and its own secret (created_at equal) are fine
-    const ok = await go({ issues: [{ number: 4, pull_request: {} }], pulls: [ourPr], secrets: [{ name: 'PIPEGEN_CENTRAL', created_at: AT }] });
+    const ok = await go({ issues: [{ number: 4, pull_request: {} }], pulls: [ourPr], [LIST]: [{ name: 'PIPEGEN_CENTRAL', created_at: AT }] });
     expect(ok.out).toEqual({ deleted: true });
     for (const [w, why] of [
       [{ tags: [{ ref: 'refs/tags/v1' }] }, /tag/],
@@ -836,8 +836,8 @@ describe('V3 fix round 1', () => {
       [{ repo: { ...base, has_wiki: undefined } }, /wiki/],
       [{ repo: { ...base, forks_count: 3 } }, /fork/],
       [{ repo: { ...base, forks_count: undefined } }, /fork/],
-      [{ secrets: [{ name: 'MY_TOKEN', created_at: AT }] }, /secret/],
-      [{ secrets: [{ name: 'PIPEGEN_CENTRAL', created_at: '2026-11-03T00:00:00Z' }] }, /secret/],
+      [{ [LIST]: [{ name: 'MY_TOKEN', created_at: AT }] }, /secret/],
+      [{ [LIST]: [{ name: 'PIPEGEN_CENTRAL', created_at: '2026-11-03T00:00:00Z' }] }, /secret/],
       [{ variables: [{ name: 'MINE', created_at: AT }] }, /variable/],
       [{ environments: [{ name: 'prod' }] }, /environment/],
       [{ issues: Array.from({ length: 100 }, (_x, i) => ({ number: i + 1, pull_request: {} })), pulls: [ourPr] }, /issue|pull request/],
@@ -853,9 +853,9 @@ describe('V3 fix round 1', () => {
     const envEntry = { name: 'pipegen-signing', created: true, changed: [], branchPolicyIds: [], githubCreatedAt: AT };
     const rec = { [LIST]: [{ name: 'PIPEGEN_COSIGN_KEY', scope: 'env:pipegen-signing', created: true, githubCreatedAt: AT }, { name: 'PIPEGEN_OTHER', scope: 'env:pipegen-signing', created: true, unconfirmed: true }], variables: [{ name: 'PIPEGEN_COSIGN_PUB', scope: 'env:pipegen-signing', created: true, githubCreatedAt: AT }] } as unknown as InstallRecord;
     const o = environmentOwned(rec, envEntry as InstallRecord['environments'][number]);
-    const go = async (secrets: unknown[], variables: unknown[], total?: number) => {
+    const go = async (held: unknown[], variables: unknown[], total?: number) => {
       const f = api((route) => {
-        if (route.endsWith('/secrets')) return { total_count: total ?? secrets.length, [LIST]: secrets };
+        if (route.endsWith('/secrets')) return { total_count: total ?? held.length, [LIST]: held };
         if (route.endsWith('/variables')) return { total_count: variables.length, variables };
         if (route.startsWith('GET ')) return { name: 'pipegen-signing', created_at: AT };
         return {};
@@ -871,7 +871,7 @@ describe('V3 fix round 1', () => {
       [[{ name: 'PIPEGEN_OTHER', created_at: AT }], [], undefined],                            // unconfirmed: can't prove it
       [[], [], 3],                                                                               // more than GitHub listed
     ] as const) {
-      const r = await go(s as unknown[], v as unknown[], total);
+      const r = await go([...s] as unknown[], [...v] as unknown[], total);
       expect(r.out.status, JSON.stringify([s, v, total])).toBe('kept');
       expect(r.writes).toEqual([]);
     }
@@ -912,7 +912,7 @@ describe('V3 fix round 1', () => {
   });
 
   it('R1 sec M3: a write is refused when GitHub\'s id of the app (or of central) is not the recorded one', async () => {
-    const other = new UninstallApi(fakeGh((route) => (route === 'GET /repos/{owner}/{repo}' ? { id: 999 } : liveRuleset()), { raw: true }).gh, APP, { clock: clock(), askName: asker() });
+    const other = new UninstallApi(fakeGh((route) => (route === 'GET /repos/{owner}/{repo}' ? { id: 999 } : { name: 'PIPEGEN_X', created_at: AT }), { raw: true }).gh, APP, { clock: clock(), askName: asker() });
     await expect(other.deleteIfPipegens({ kind: 'secret', entry: { name: 'PIPEGEN_X', scope: 'repo', created: true, unconfirmed: true } }, { typed: await typedOn(other, { kind: 'secret', entry: { name: 'PIPEGEN_X', scope: 'repo', created: true, unconfirmed: true } }) })).rejects.toBeInstanceOf(UninstallRefusal);
     const f = fakeGh((route, p) => (route === 'GET /repos/{owner}/{repo}' ? { id: p.repo === 'pipelines' ? 777 : 101 } : {}), { raw: true });
     const c = new UninstallApi(f.gh, APP, { clock: clock(), centralRepoId: CENTRAL_ID });
