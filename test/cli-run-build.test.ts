@@ -227,6 +227,15 @@ describe('G13-R1: draft.doc.hooksInPlace is read fail-closed (spec I5)', () => {
     const doc = d.doc as NonNullable<PipelineDraft['doc']>;
     // a path pipegen never writes to: no hook file, so the setup command no longer fits and the builder refuses
     expect(() => pipegenDoc({ ...d, doc: { ...doc, hooksInPlace: [{ path: 'evil.yml', runs: doc.hooksInPlace?.[0]?.runs ?? [] }] } }, REVIEWED)).toThrow(/setup command/);
+    // a path pipegen never writes to, with no setup command: no hook counted (the hooks are not set up)
+    const forged = pipegenDoc({ ...d, doc: { ...doc, setupCommand: '', hooksInPlace: [{ path: 'evil.yml', runs: doc.hooksInPlace?.[0]?.runs ?? [] }] } }, REVIEWED).content;
+    expect(forged).toMatch(/Not set up: pipegen wrote no hook file/);
+    expect(forged).not.toMatch(/Blocks the commit/);
+    // a command that only contains pipegen's (a longer line) is not pipegen's command
+    const runs = doc.hooksInPlace?.[0]?.runs ?? [];
+    expect(runs.length).toBeGreaterThan(0);
+    const longer = pipegenDoc({ ...d, doc: { ...doc, hooksInPlace: [{ path: hook.path, runs: runs.map((r) => `${r} || true`) }] } }, REVIEWED).content;
+    expect(longer).toMatch(/Not set up: the hook file does not hold the secrets hook/);
     // the right file but not pipegen's commands: not set up
     expect(pipegenDoc({ ...d, doc: { ...doc, hooksInPlace: [{ path: hook.path, runs: ['echo hi'] }] } }, REVIEWED).content).toMatch(/Not set up: the hook file does not hold the secrets hook/);
   });
