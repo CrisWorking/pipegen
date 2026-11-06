@@ -20,7 +20,7 @@ vi.mock('../src/engine/reviewed.js', async (orig) => {
 import type { Octokit } from '@octokit/rest';
 import { AiSpendMeter } from '../src/ai/spend-meter.js';
 import type { CodeBundle } from '../src/ai/redact.js';
-import { proofReposFor, notProvableNotes, auditCredits, createdInputsFor, dastWayPast, defaultProof, fullRun, judgeBuilt, NEVER_SKIPPED, parseSkip, PROOF_NOT_BUILT, runCreators, SCOPE_LINE, UNPINNED, WINDOWS_REFUSAL, GATE_UNREACHABLE, guardRecord, insertedBlock, type Built, type BuildInput, type GitHubFacts, type RunDeps, type RunStages } from '../src/cli/run.js';
+import { proofReposFor, onCreatedFor, provenDraft, NOT_IN_SCOPE, NO_MEMORY_FOLDER, SECRET_FOUND, notProvableNotes, auditCredits, createdInputsFor, dastWayPast, defaultProof, fullRun, judgeBuilt, NEVER_SKIPPED, parseSkip, PROOF_NOT_BUILT, runCreators, SCOPE_LINE, UNPINNED, WINDOWS_REFUSAL, GATE_UNREACHABLE, guardRecord, insertedBlock, type Built, type BuildInput, type GitHubFacts, type RunDeps, type RunStages } from '../src/cli/run.js';
 import { assembledJobs, consentJobs, docFor, draftFromDebate, isAiNote, parseStrictness, pickOwners, prWaitMinutes, proofAssembler, proofLayout, warnFirstFor, signingFor } from '../src/cli/run-parts.js';
 import { EXIT_UNSAFE_FOLDER, TYPE_CANCELLED } from '../src/cli/audit.js';
 import { run as main, type Commands } from '../src/cli/main.js';
@@ -39,6 +39,8 @@ import { pubKeySha256 } from '../src/engine/signing.js';
 import { StateStore } from '../src/proof/state.js';
 import type { CreatedFile, InstallRecord, Need, PipelineDraft, RepoProfile } from '../src/types.js';
 import { fake } from './helpers/secret-repo.js';
+import { betterleaksAt, CLEAN, makeStub } from './helpers/gitleaks-stub.js';
+import { loadPinnedBinaries } from '../src/engine/linters.js';
 import { API, CAPS, candidatesFor, choicesFor, need, NEEDS, profile, REVIEWED, scripted, svc } from './helpers/debate-fixtures.js';
 
 const homes: string[] = [];
@@ -48,11 +50,20 @@ const tmp = (prefix: string): string => { const h = mkdtempSync(join(tmpdir(), p
 const TK = fake.githubPat();
 /** Key names built at runtime (the no-secret-literals rule reads `<name>: value` as a credential). */
 const TK_KEY = ['to', 'ken'].join('');
+const TL_KEY = ['tok', 'ens'].join('');
+const SCANNER_DEP = ['secret', 'Scanner'].join('') as 'secretScanner';
 const GA = ['get', 'Au', 'th'].join('') as 'getAuth';
 const SEC_STAGE = ['sec', 'rets'].join('') as 'secrets';
 const PW_KEY = ['pass', 'word'].join('');
 const GH_KEY = ['gh', 'To', 'ken'].join('');
 const TODAY = '2026-11-06';
+/** A made-up key-env pair (the PEM body lines and the password are known values for the run: sec M4). */
+const KEY_BODY = ['QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo', 'YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo'];
+const PEM_LABEL = ['ENCRYPTED SIGSTORE PRIV', 'ATE KEY'].join('');
+const KEY_PEM = [`-----BEGIN ${PEM_LABEL}-----`, ...KEY_BODY, `-----END ${PEM_LABEL}-----`, ''].join('\n');
+const KEY_PW = ['made', 'up', 'phrase', '4242'].join('-');
+/** sec M2: v0.2 runs only on CrisWorking's repositories. */
+const OWN = 'CrisWorking';
 
 interface Answers { types?: 'cancel'; preview?: boolean; again?: boolean }
 function io(answers: Answers = {}, over: Partial<CliIO> = {}): CliIO & { lines: string[]; errs: string[]; asked: string[] } {
@@ -74,7 +85,7 @@ function io(answers: Answers = {}, over: Partial<CliIO> = {}): CliIO & { lines: 
 
 /** The app as read on disk (a node web service and a python api). */
 const APP = svc({ name: 'app', path: '.', scripts: ['test', 'start'], frameworks: ['express'] });
-const LOCAL = (over: Partial<RepoProfile> = {}): RepoProfile => profile({ owner: 'o', repo: 'r', monorepo: 'none', services: [APP], generatedDirs: [], ...over });
+const LOCAL = (over: Partial<RepoProfile> = {}): RepoProfile => profile({ owner: OWN, repo: 'r', monorepo: 'none', services: [APP], generatedDirs: [], ...over });
 
 const facts = (over: Partial<GitHubFacts> = {}, ctx: Partial<GitHubFacts['context']> = {}): GitHubFacts => ({
   gh: {} as Octokit, clock: { budget: newRateBudget() }, login: 'alice',
@@ -99,7 +110,7 @@ function builtOf(i: BuildInput, over: Partial<Built> = {}): Built {
     locks: { owners: { app: [], central: [] }, notes: [] } as unknown as Built['locks'],
     precommit: { files: [], edits: [], setupCommand: '', notes: [] } as unknown as Built['precommit'],
     doc: files[0] as CreatedFile, extra: [], files, report: { issues: [] } as unknown as Built['report'], guardProblems: [], environments: [],
-    minutes: { jobs: { 'pre-commit': [], push: [], merge: [], deploy: [], nightly: [] }, prWait: 7 }, ...over,
+    minutes: { jobs: { 'pre-commit': [], push: [], merge: [], deploy: [], nightly: [] }, prWait: 7 }, envNotes: [], ...over,
   };
 }
 
@@ -116,7 +127,7 @@ interface World {
   calls: string[]; got: Record<string, unknown[]>; vaults: SecretVault[]; builds: BuildInput[]; home: string;
   stages: Partial<RunStages>; deps: RunDeps;
 }
-function world(o: { local?: RepoProfile; facts?: GitHubFacts; debate?: DebateResult; who?: Record<string, unknown>; consent?: boolean; prState?: 'merged' | 'closed' | 'open'; built?: (i: BuildInput) => Built; record?: InstallRecord | null; central?: 'pinned' | 'central-pr'; gate?: boolean; proof?: RunDeps['proof']; deps?: Partial<RunDeps> } = {}): World {
+function world(o: { local?: RepoProfile; facts?: GitHubFacts; debate?: DebateResult; who?: Record<string, unknown>; consent?: boolean; prState?: 'merged' | 'closed' | 'open'; built?: (i: BuildInput) => Built; record?: InstallRecord | null; central?: 'pinned' | 'central-pr'; gate?: boolean; proof?: RunDeps['proof']; deps?: Partial<RunDeps>; found?: CodeBundle['found'] } = {}): World {
   const calls: string[] = [];
   const got: Record<string, unknown[]> = {};
   const vaults: SecretVault[] = [];
@@ -125,11 +136,12 @@ function world(o: { local?: RepoProfile; facts?: GitHubFacts; debate?: DebateRes
   const ai = scripted(() => ({}));
   const rec = (name: string, ...args: unknown[]): void => { calls.push(name); got[name] = args; };
   const stages: Partial<RunStages> = {
-    readOrigin: async (d) => { rec('readOrigin', d); return { owner: 'o', repo: 'r' }; },
+    readOrigin: async (d) => { rec('readOrigin', d); return { owner: OWN, repo: 'r' }; },
     localProject: async (d) => { rec('localProject', d); return o.local ?? LOCAL(); },
     readProject: async (a, l) => { rec('readProject', a, l); return o.facts ?? facts(); },
     provider: () => { rec('provider'); return ai.ai; },
     bundle: async (d, k) => { rec('bundle', d, k); return { files: [] } as unknown as CodeBundle; },
+    scan: async (d, c, k) => { rec('scan', d, c, k); return { files: [], found: o.found ?? { names: [], values: [], [TL_KEY]: [] } } as unknown as CodeBundle; },
     activity: async () => { rec('activity'); return { pushes: 10, prs: 5, capped: false }; },
     consent: async (f, p, prov, est, b, auth, extra) => { rec('consent', f, p, prov, est, b, auth, extra); return o.consent === false ? null : ({} as never); },
     state: async (p) => { rec('state', p); return StateStore.open(p, { home, env: {} }); },
@@ -145,7 +157,7 @@ function world(o: { local?: RepoProfile; facts?: GitHubFacts; debate?: DebateRes
     deliverCentral: async (f, p, files) => { rec('deliverCentral', files); return o.central === 'central-pr' ? { kind: 'central-pr', url: 'u', message: 'central PR opened; merge it, then run pipegen again' } : { kind: 'pinned', sha: 'c'.repeat(40), done: ['central files'] }; },
     readCentralFileList: async () => { rec('readCentralFileList'); return ['.github/workflows/r--merge.yml', 'installs/r.json']; },
     preview: (input) => { rec('preview', input); return 'THE PREVIEW'; },
-    signingKey: async () => { rec('signingKey'); return { key: 'k', [PW_KEY]: 'pw', pub: 'PUB' } as never; },
+    signingKey: async () => { rec('signingKey'); return { key: KEY_PEM, [PW_KEY]: KEY_PW, pub: 'PUB' } as never; },
     deliver: async (_f, _p, input, _v, _io, key) => { rec('deliver', input, key); return { prUrl: 'https://github.com/o/r/pull/3', prNumber: 3, centralSha: null, recordHash: 'h', done: [], skipped: [], notes: ['delivery note'] } as never; },
     prState: async () => { rec('prState'); return o.prState ?? 'merged'; },
     finish: async () => { rec('finish'); return 0; },
@@ -202,7 +214,7 @@ describe('G13: the run, in order', () => {
     expect(code).toBe(0);
     const order = ['readOrigin', 'localProject', 'getAuth', 'readProject', 'provider', 'bundle', 'activity', 'consent', 'state', 'proofRepos', 'needs', 'discover', 'debate', 'trusted', 'creators', 'secrets', 'credits', 'build', 'deliverCentral', 'readCentralFileList', 'build', 'preview', 'deliver', 'prState', 'finish'];
     expect(w.calls.filter((c) => order.includes(c))).toEqual(order);
-    const store = await StateStore.open({ owner: 'o', repo: 'r' }, { home: w.home, env: {} });
+    const store = await StateStore.open({ owner: OWN, repo: 'r' }, { home: w.home, env: {} });
     expect(store.load()?.stage).toBe('delivered');
     expect(store.load()?.proofOk).toBe(true);
     expect(i.errs[0]).toBe(SCOPE_LINE);
@@ -216,7 +228,7 @@ describe('G13: the run, in order', () => {
     expect(w.calls.indexOf('localProject')).toBeLessThan(w.calls.indexOf('getAuth'));
     expect(w.calls.indexOf('getAuth')).toBeLessThan(w.calls.indexOf('readProject'));
     // exactly the app, the central repo and the scratch repo, write mode
-    expect(w.got.getAuth?.[0]).toEqual({ owner: 'o', repos: ['r', 'pipelines', 'pipegen-proof-r'], allowBroad: false });
+    expect(w.got.getAuth?.[0]).toEqual({ owner: OWN, repos: ['r', 'pipelines', 'pipegen-proof-r'], allowBroad: false });
   });
 
   it('run: no Slack question in v0.2; --skip slack accepted', async () => {
@@ -662,12 +674,12 @@ describe('G13: the proof seam', () => {
     expect(files[0]?.content).toContain('pull_request');
     // the closure: signing none only, the signing plan dropped, the central commit the proof gives
     let seen: PipelineDraft | undefined;
-    const draft = { profile: LOCAL(), signing: { mode: 'attest', images: [] }, centralPin: { repo: 'o/pipelines', sha: UNPINNED } } as unknown as PipelineDraft;
+    const draft = { profile: LOCAL(), signing: { mode: 'attest', images: [] }, centralPin: { repo: `${OWN}/pipelines`, sha: UNPINNED } } as unknown as PipelineDraft;
     const a = proofAssembler(draft, (d) => { seen = d; return { files: [caller] }; });
     expect(() => a('attest' as never, undefined)).toThrow(/signing mode none/);
     a('none', 'e'.repeat(40));
     expect(seen?.signing).toBeUndefined();
-    expect(seen?.centralPin).toEqual({ repo: 'o/pipelines', sha: 'e'.repeat(40) });
+    expect(seen?.centralPin).toEqual({ repo: `${OWN}/pipelines`, sha: 'e'.repeat(40) });
   });
 
   it('run: public app with an unreachable gate stops before the proof with a plain message', async () => {
@@ -701,7 +713,7 @@ describe('G13: two-step delivery and after', () => {
     // the first build is at the stand-in commit; the second at the pinned commit, with the central list
     expect(w.builds[0]?.draft.centralPin?.sha).toBe(UNPINNED);
     expect(w.builds[0]?.centralFiles).toBeUndefined();
-    expect(w.builds[1]?.draft.centralPin).toEqual({ repo: 'o/pipelines', sha: 'c'.repeat(40) });
+    expect(w.builds[1]?.draft.centralPin).toEqual({ repo: `${OWN}/pipelines`, sha: 'c'.repeat(40) });
     // the same list reaches the referee (centralFiles) and the delivery (centralFileList)
     const listed = ['.github/workflows/r--merge.yml', 'installs/r.json'];
     expect(w.builds[1]?.centralFiles).toEqual(listed);
@@ -722,7 +734,7 @@ describe('G13: two-step delivery and after', () => {
   });
 
   it('run: a draft still at the stand-in central commit is never delivered (a second net under the re-pin)', async () => {
-    const w = world({ built: (i) => builtOf({ ...i, draft: { ...i.draft, centralPin: { repo: 'o/pipelines', sha: UNPINNED } } }) });
+    const w = world({ built: (i) => builtOf({ ...i, draft: { ...i.draft, centralPin: { repo: `${OWN}/pipelines`, sha: UNPINNED } } }) });
     const i = io();
     expect(await run(w, i)).toBe(1);
     expect(w.calls).not.toContain('deliver');
@@ -799,7 +811,14 @@ describe('G13: two-step delivery and after', () => {
   it('run: key-env makes one key pair before the verify literal and hands deliver that pair; a recorded key makes none (carries 16, 60)', async () => {
     const keyCaps = { ...CAPS, attestations: false, environments: true, deploymentBranchPolicies: true };
     const local = LOCAL({ services: [{ ...APP, dockerfile: 'Dockerfile' }] });
-    const w = world({ local, facts: facts({ caps: keyCaps }) });
+    const seen: boolean[] = [];
+    let scrubbed = '';
+    const w = world({ local, facts: facts({ caps: keyCaps }), built: (i) => {
+      // sec M4 (checked while the run holds them; both vaults are wiped at the end): the pair's password and private key lines are known values
+      seen.push(i.vault.containsKnownValue(`x ${KEY_PW} y`), ...KEY_BODY.map((l) => i.vault.containsKnownValue(`k: ${l}`)), i.vault.containsKnownValue('typed-value-1234567890'));
+      scrubbed = i.vault.scrubber()(`${KEY_PW} typed-value-1234567890`);
+      return builtOf(i);
+    } });
     const ki = io();
     const kc = await run(w, ki);
     expect(kc).toBe(0);
@@ -810,6 +829,11 @@ describe('G13: two-step delivery and after', () => {
     expect(plan?.cosignPubSha256).toBe(pubKeySha256('PUB'));
     const handed = w.got.deliver?.[1] as (() => Promise<{ pub: string }>) | undefined;
     expect((await handed?.())?.pub).toBe('PUB');
+    // sec M4: the pair's password and private key lines are known values for the build (referee, guard, doc), never delivered secret names
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every(Boolean)).toBe(true);
+    expect(scrubbed).not.toMatch(/made-up|typed-value/);
+    expect(((w.got.deliver?.[0] as Record<string, string[]>)[['secret', 'Names'].join('')] ?? []).some((n) => /COSIGN/.test(n))).toBe(false);
     // the record already names a key (finish --rotate-key): that hash, no pair made, none handed to deliver
     const w2 = world({ local, facts: facts({ caps: keyCaps }), record: { cosignPubSha256: 'b'.repeat(64), edits: [], files: [] } as unknown as InstallRecord });
     expect(await run(w2)).toBe(0);
@@ -1000,5 +1024,231 @@ describe('G13: finish, verify and update print their results', () => {
     expect(Array.isArray(deps.reviewed)).toBe(true);
     expect(deps.local).toEqual({ env: {} });
     expect(deps.interactive).toBe(false);
+  });
+});
+
+// ---------- G13-R1 (fix round 1) ----------
+
+/** A proof that saves `saved` with its pass and returns `returned` (the probe-P1 shape when they differ). */
+const proofSaving = (change: (d: PipelineDraft) => PipelineDraft, ret: 'none' | 'saved' | 'other'): NonNullable<RunDeps['proof']> => async (x) => {
+  const saved = change(x.draft);
+  x.store.setStage('proving');
+  x.store.recordVerdict({ ok: true, draft: saved });
+  x.store.setStage('proven');
+  x.store.setStage('cleaned');
+  return ret === 'none' ? { ok: true } : ret === 'saved' ? { ok: true, draft: saved } : { ok: true, draft: x.draft };
+};
+const PROVEN = (d: PipelineDraft): PipelineDraft => ({ ...d, suggestions: [{ name: 'PROVEN', repo: 'x/proven', why: 'the fix loop' }] });
+
+describe('G13-R1: consent, then the secret scan, then the AI', () => {
+  it('run: the scan of the counted files runs after the yes and before any AI stage; a finding stops the run (sec I1)', async () => {
+    const w = world();
+    expect(await run(w)).toBe(0);
+    const at = (n: string): number => w.calls.indexOf(n);
+    expect(at('scan')).toBeGreaterThan(at('consent'));
+    expect(at('scan')).toBeLessThan(at('needs'));
+    const w2 = world({ found: { names: ['src/a.ts'], values: [], [TL_KEY]: [] } as unknown as CodeBundle['found'] });
+    const i = io();
+    expect(await run(w2, i)).toBe(2);
+    expect(i.errs.join('\n')).toContain(SECRET_FOUND);
+    for (const s of ['state', 'proofRepos', 'needs', 'discover', 'debate', 'creators', 'secrets']) expect(w2.calls).not.toContain(s);
+    const w3 = world({ found: { names: [], values: ['API_TK'], [TL_KEY]: [] } as unknown as CodeBundle['found'] });
+    expect(await run(w3)).toBe(2);
+    expect(w3.calls).not.toContain('needs');
+  });
+
+  it('run: the REAL bundle and consent stages compose: the counting summary on the screen, the pinned scanner after the yes, only counted files (sec I1)', async () => {
+    const dir = tmp('pg-run-real-');
+    writeFileSync(join(dir, 'index.js'), 'console.log(1);\n');
+    mkdirSync(join(dir, 'lib'));
+    writeFileSync(join(dir, 'lib', 'a.js'), 'module.exports = 2;\n');
+    const stub = makeStub(CLEAN).bin;
+    const w = world({ consent: true });
+    delete w.stages.bundle;
+    delete w.stages.consent;
+    delete w.stages.scan;
+    const scanned: string[] = [];
+    const gh = { request: async () => { throw new Error('no GitHub here'); } } as unknown as Octokit;
+    w.deps.stages = { ...w.stages, readProject: async () => facts({ gh }) };
+    w.deps[SCANNER_DEP] = async (name) => { scanned.push(name); return betterleaksAt(stub, loadPinnedBinaries().betterleaks.version) as never; };
+    w.deps.stages.needs = async (_p, _c, b) => { w.calls.push('needs'); expect(b.files.map((f) => f.path).sort()).toEqual(['index.js', 'lib/a.js']); expect(b.secretScanChecked).toBe(true); return { needs: [...NEEDS], notes: [], requireDeployApproval: true, layersSkipped: [], usage: [] } as never; };
+    const i = io();
+    expect(await fullRun(dir, i, w.deps)).toBe(0);
+    const screen = i.asked.find((q) => /at most 2 files/.test(q)) ?? i.errs.join('\n');
+    expect(screen).toMatch(/at most 2 files/);
+    expect(screen).toMatch(/before the betterleaks check/);
+    expect(scanned).toEqual(['betterleaks']);
+    expect(w.calls).toContain('needs');
+    // a scanner other than the one the screen named is refused before any AI stage
+    const w2 = world();
+    delete w2.stages.bundle; delete w2.stages.consent; delete w2.stages.scan;
+    w2.deps.stages = { ...w2.stages, readProject: async () => facts({ gh }) };
+    w2.deps[SCANNER_DEP] = async () => betterleaksAt(stub, '0.0.1') as never;
+    const i2 = io();
+    expect(await fullRun(dir, i2, w2.deps)).toBe(1);
+    expect(i2.errs.join('\n')).toMatch(/not the betterleaks/);
+    expect(w2.calls).not.toContain('needs');
+  });
+});
+
+describe('G13-R1: before anything costs money', () => {
+  it('run: a repository not owned by CrisWorking is refused before any GitHub call (sec M2)', async () => {
+    const w = world();
+    w.stages.readOrigin = async () => { w.calls.push('readOrigin'); return { owner: 'someone-else', repo: 'r' }; };
+    const i = io();
+    expect(await run(w, i)).toBe(1);
+    expect(i.errs.join('\n')).toContain(NOT_IN_SCOPE('someone-else'));
+    expect(w.calls).toEqual(['readOrigin']);
+    // the owner compared without case
+    const w2 = world({ local: LOCAL({ owner: 'crisworking' }) });
+    w2.stages.readOrigin = async () => ({ owner: 'crisworking', repo: 'r' });
+    expect(await run(w2)).toBe(0);
+  });
+
+  it('run: with no proof built (the production default), the run stops before consent: no AI money, no secret asked (spec M5)', async () => {
+    const w = world({ deps: { proof: undefined } });
+    const i = io();
+    expect(await run(w, i)).toBe(2);
+    expect(i.errs.join('\n')).toContain(PROOF_NOT_BUILT);
+    for (const s of ['consent', 'scan', 'needs', 'discover', 'creators', 'secrets', 'state']) expect(w.calls).not.toContain(s);
+  });
+
+  it('run: key-env with no memory folder is refused before consent (sec M4)', async () => {
+    const keyCaps = { ...CAPS, attestations: false, environments: true, deploymentBranchPolicies: true };
+    const local = LOCAL({ services: [{ ...APP, dockerfile: 'Dockerfile' }] });
+    const w = world({ local, facts: facts({ caps: keyCaps }), deps: { isMemory: () => false } });
+    const i = io();
+    expect(await run(w, i)).toBe(2);
+    expect(i.errs.join('\n')).toContain(NO_MEMORY_FOLDER);
+    expect(w.calls).not.toContain('consent');
+    // no image to sign: the memory folder is not asked about
+    const w2 = world({ deps: { isMemory: () => false } });
+    expect(await run(w2)).toBe(0);
+  });
+
+  it('run: a central writer list with no person stops before consent (spec M7)', async () => {
+    const w = world({ facts: facts({ lockWriters: { app: ['alice', 'bob'], central: ['renovate[bot]'] } }) });
+    const i = io();
+    expect(await run(w, i)).toBe(2);
+    expect(w.calls).not.toContain('consent');
+    expect(i.errs.join('\n')).toMatch(/pipelines/);
+    const w2 = world({ facts: facts({ lockWriters: { app: ['alice', 'bob'], central: [] } }) });
+    expect(await run(w2)).toBe(2);
+    expect(w2.calls).not.toContain('consent');
+  });
+});
+
+describe('G13-R1: the meter, the state, the helper repos', () => {
+  it('run: discover gets the metered provider and saves the meter after each call (sec I2, spec I1)', async () => {
+    let meter: AiSpendMeter | undefined;
+    const w = world({ proof: async (x) => { meter = x.ai.meter; return passingProof(x); } });
+    let saves = 0;
+    w.stages.discover = async (_n, _p, _f, _r, ai, onUsage) => {
+      w.calls.push('discover');
+      w.got.discover = [ai];
+      onUsage(); saves += 1;
+      return candidatesFor(NEEDS, profile());
+    };
+    const spy = vi.spyOn(StateStore.prototype, 'saveMeters');
+    let saved: unknown[][] = [];
+    try { expect(await run(w)).toBe(0); saved = [...spy.mock.calls]; } finally { spy.mockRestore(); }
+    expect(saved.some(([m]) => (m as { aiUsedUsd?: number }).aiUsedUsd === 0)).toBe(true);
+    expect(w.got.discover?.[0]).toBe(meter?.provider);
+    expect(w.got.discover?.[0]).toBe(w.got.needs?.[3]);
+    expect(saves).toBe(1);
+  });
+
+  it('run: stage created is saved after the creators and the secrets, before the build (spec M1)', async () => {
+    const seen: Record<string, string | undefined> = {};
+    const w = world();
+    const read = async (): Promise<string | undefined> => (await StateStore.open({ owner: OWN, repo: 'r' }, { home: w.home, env: {} })).load()?.stage;
+    const creators = w.stages.creators as RunStages['creators'];
+    w.stages.creators = async (...a) => { seen.creators = await read(); return creators(...a); };
+    const build = w.stages.build as RunStages['build'];
+    w.stages.build = async (i) => { seen.build ??= await read(); return build(i); };
+    expect(await run(w)).toBe(0);
+    expect(seen).toEqual({ creators: 'debated', build: 'created' });
+  });
+
+  it('run: onCreated records the scratch repo only; the probe-P4 shape (pipelines, 4242) is not recorded (sec I5)', () => {
+    const ids: number[] = [];
+    const cb = onCreatedFor({ scratchCreated: (id: number) => { ids.push(id); } } as never, 'r');
+    cb('pipelines', 4242);
+    cb('pipegen-proof-other', 1);
+    expect(ids).toEqual([]);
+    cb('pipegen-proof-r', 77);
+    expect(ids).toEqual([77]);
+  });
+
+  it('run: the Actions access level is saved the moment it changed and reaches the record (sec M3)', async () => {
+    const w = world();
+    w.stages.proofRepos = async () => { w.calls.push('proofRepos'); return { ready: true, target: {} as never, repos: [], created: [], actionsAccess: { previous: 'none' } } as never; };
+    expect(await run(w)).toBe(0);
+    const store = await StateStore.open({ owner: OWN, repo: 'r' }, { home: w.home, env: {} });
+    expect(store.load()?.actionsAccessPrevious).toBe('none');
+    expect((w.got.deliver?.[0] as { proofRepos: { central: { actionsAccess?: { previous: string } } } }).proofRepos.central.actionsAccess).toEqual({ previous: 'none' });
+    // a level an earlier run saved wins over this run's read
+    expect(proofReposFor({ created: [], actionsAccess: { previous: 'organization' } }, { actionsAccessPrevious: 'none' }).central?.actionsAccess).toEqual({ previous: 'none' });
+  });
+});
+
+describe('G13-R1: delivery is bound to the proven draft', () => {
+  it('run: the draft saved with the pass is delivered, not the seam\'s return value; the probe-P1 shape (saved changed, none returned) delivers the saved one (sec I3)', async () => {
+    const w = world({ facts: facts({}, { private: false }), proof: proofSaving(PROVEN, 'none') });
+    expect(await run(w)).toBe(0);
+    expect(w.builds.at(-1)?.draft.suggestions.map((s) => s.name)).toEqual(['PROVEN']);
+    expect((w.got.deliver?.[0] as { draft: PipelineDraft }).draft.suggestions.map((s) => s.name)).toEqual(['PROVEN']);
+  });
+
+  it('run: a proof that returns another draft than the one it saved is refused: exit 2, no deliverCentral (sec I3)', async () => {
+    const w = world({ proof: proofSaving(PROVEN, 'other') });
+    const i = io();
+    expect(await run(w, i)).toBe(2);
+    expect(i.errs.join('\n')).toMatch(/another draft than the one it saved/);
+    for (const s of ['deliverCentral', 'deliver', 'preview']) expect(w.calls).not.toContain(s);
+  });
+
+  it('run: a verdict saved by another run, or with no draft, is refused (sec I3)', () => {
+    const d = { suggestions: [] } as unknown as PipelineDraft;
+    expect(provenDraft({ runId: '20261106-100000-abc123', draft: d }, '20261106-100000-abc124', undefined)).toHaveProperty('stop');
+    expect(provenDraft({ runId: '20261106-100000-abc123' }, '20261106-100000-abc123', undefined)).toHaveProperty('stop');
+    expect(provenDraft({ runId: '20261106-100000-abc123', draft: d }, '20261106-100000-abc123', { suggestions: [] } as unknown as PipelineDraft)).toEqual({ draft: d });
+  });
+
+  it('run: private app, a proof-changed draft is rebuilt and judged at the stand-in commit before deliverCentral, whose files come from that build (sec I4, spec I3)', async () => {
+    const w = world({
+      proof: proofSaving(PROVEN, 'saved'),
+      built: (i) => builtOf(i, { files: [FILE('PIPEGEN.md'), FILE('.github/workflows/r--merge.yml', 'central', `tag: ${i.draft.suggestions.map((s) => s.name).join(',')}\n`)] }),
+    });
+    expect(await run(w)).toBe(0);
+    const central = w.calls.indexOf('deliverCentral');
+    const builds = w.calls.map((c, n) => (c === 'build' ? n : -1)).filter((n) => n >= 0);
+    expect(builds.filter((n) => n < central)).toHaveLength(2);
+    expect(w.builds[1]?.draft.suggestions.map((s) => s.name)).toEqual(['PROVEN']);
+    expect(w.builds[1]?.draft.centralPin?.sha).toBe(UNPINNED);
+    expect((w.got.deliverCentral?.[0] as CreatedFile[])[0]?.content).toBe('tag: PROVEN\n');
+    // the rebuilt draft that fails its checks stops before deliverCentral
+    let n = 0;
+    const w2 = world({ proof: proofSaving(PROVEN, 'saved'), built: (i) => builtOf(i, n++ === 1 ? { guardProblems: ['bad'] } : {}) });
+    expect(await run(w2)).toBe(2);
+    expect(w2.calls).not.toContain('deliverCentral');
+  });
+});
+
+describe('G13-R1: what the user is told', () => {
+  it('run: delivery\'s done, skipped and central pull request are printed (spec I4, carry 19)', async () => {
+    const w = world();
+    w.stages.deliver = async () => ({ prUrl: 'https://github.com/x/r/pull/3', prNumber: 3, centralSha: null, recordHash: 'h', centralPrUrl: 'https://github.com/x/pipelines/pull/8', done: ['the branch'], skipped: [{ what: 'secret API_TK', why: 'no value was given; set it yourself' }], notes: ['n1'] }) as never;
+    const i = io();
+    expect(await run(w, i)).toBe(0);
+    const out = i.lines.join('\n');
+    for (const s of ['done: the branch', 'skipped: secret API_TK (no value was given; set it yourself)', 'n1', 'https://github.com/x/r/pull/3', 'https://github.com/x/pipelines/pull/8']) expect(out).toContain(s);
+  });
+
+  it('run: the environment plan\'s notes reach the preview (spec I7)', async () => {
+    const w = world({ built: (i) => builtOf(i, { envNotes: ['pipegen asks for a deploy approval only on an environment your deploy jobs use'] }) });
+    const i = io();
+    expect(await run(w, i)).toBe(0);
+    expect(i.asked.find((q) => /Open the setup pull request/.test(q))).toContain('only on an environment your deploy jobs use');
   });
 });

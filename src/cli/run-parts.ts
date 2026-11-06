@@ -16,7 +16,8 @@ import type { AssembledJobs, Job, JobsPlan } from '../layers/jobs.js';
 import type { LockPlan } from '../layers/locks.js';
 import type { PrecommitResult } from '../layers/precommit.js';
 import { PROOF_SIGNING_MODE } from '../proof/harness.js';
-import type { Capabilities, CreatedFile, Need, PipelineDoc, PipelineDraft, RepoProfile } from '../types.js';
+import { ADVISORY_TOOLS } from '../debate/builder.js';
+import type { Capabilities, CreatedFile, Need, PipelineDoc, PipelineDraft, RepoProfile, StepSpec } from '../types.js';
 
 // ---------- strictness (DECISIONS #96, ruling G13-R0 5) ----------
 
@@ -35,24 +36,38 @@ export function parseStrictness(value: string | undefined): Strictness {
 }
 
 /**
- * The one frozen table of the levels (ruling G13-R0 5), mapped onto `draft.warnFirst` only (no gate code changes, no need's `blocking`
- * changes): which blocking checks start in warn mode (from `today`, for 14 days until the nightly asks to switch them to blocking).
- * - Starter: only the fixed minimum blocks (MINIMUM_CATEGORIES); every other blocking check starts in warn mode.
- * - Standard (default): the minimum and the type checks (floorNeeds: the checks the service types call for) block; the other blocking
- *   checks (the ones the AI added) start in warn mode.
- * - Strict: every check blocks, with no warn period.
- * A floor need is NEVER in warnFirst (gateJobList refuses it, POLICY_FLOOR), and neither is a minimum check, whatever the level.
+ * The one frozen table of the levels (ruling G13-R0 5; G13-R1 spec M2 and I2), mapped onto the merge checks' `draft.warnFirst` and, for
+ * Strict only, their `blocking` (strictNeeds): which merge (gate) checks start in warn mode (from `today`, for 14 days until the nightly
+ * asks to switch them to blocking). Only `layer === 'merge'` needs are gate checks; a pre-commit, push, deploy or nightly need is never in
+ * warnFirst (warn mode means nothing for a commit hook).
+ * - Starter: the fixed minimum (MINIMUM_CATEGORIES) and the floor checks (`floor: true`, which the gate never lets warn: POLICY_FLOOR)
+ *   block; every other blocking merge check starts in warn mode.
+ * - Standard (default): the minimum, the floor and the type checks (floorNeeds: the checks the service types call for) block; the other
+ *   blocking merge checks (the ones the AI added) start in warn mode.
+ * - Strict: every merge check blocks, with no warn period; strictNeeds also makes the non-blocking merge checks blocking.
  */
 export function warnFirstFor(needs: readonly Need[], level: Strictness, typeNeedIds: ReadonlySet<string>, today: string): Record<string, { since: string }> {
   const out: Record<string, { since: string }> = {};
   if (level === 'strict') return out;
   const minimum: ReadonlySet<string> = new Set(MINIMUM_CATEGORIES);
   for (const n of needs) {
-    if (!n.blocking || n.floor || minimum.has(n.category)) continue;
+    if (n.layer !== 'merge' || !n.blocking || n.floor || minimum.has(n.category)) continue;
     if (level === 'standard' && typeNeedIds.has(n.id)) continue;
     out[n.id] = { since: today };
   }
   return out;
+}
+
+/**
+ * Strict (spec M2): every merge check pipegen adds blocks, `blocking: false` ones too, when the debate gave it a tool it can run (a step for
+ * its need and service, and not in the plan's uncovered list) that may block: an advisory tool (ADVISORY_TOOLS, ruling S9: jscpd,
+ * nuclei, scorecard-action) only ever warns, so its check stays non-blocking. A blocking check with no such tool would stop assemble ("It
+ * never guesses a tool"), so Strict never turns a check it can't run into a stop. The other levels and layers are unchanged. Pure.
+ */
+export function strictNeeds(needs: readonly Need[], level: Strictness, covered: { steps: readonly Pick<StepSpec, 'needId' | 'service' | 'tool'>[]; uncovered: readonly { needId: string; service?: string }[] }): Need[] {
+  if (level !== 'strict') return [...needs];
+  const runs = (n: Need): boolean => covered.steps.some((s) => s.needId === n.id && s.service === n.service && !ADVISORY_TOOLS.has(s.tool.id)) && !covered.uncovered.some((u) => u.needId === n.id && u.service === n.service);
+  return needs.map((n) => (n.layer === 'merge' && !n.blocking && runs(n) ? { ...n, blocking: true } : n));
 }
 
 // ---------- the draft from the debate (F-6) ----------
@@ -101,12 +116,15 @@ const BOT_RE = /\[bot\]$|^dependabot$|^github-actions$/i;
 /**
  * The code owners: users who can write to the app AND the central repo, bots left out. The default is the token's login (when it qualifies)
  * plus the other qualifying writers, so with two or more writers there are at least two owners. Fewer than two qualify: no code-owner rule
- * (owners empty) and a note (DECISIONS #75 gap), never a bypass. No human writer at all: stop with a plain reason.
+ * (owners empty) and a note (DECISIONS #75 gap), never a bypass. No human writer of the app, or of the central repo (spec M7): stop with a
+ * plain reason.
  */
 export function pickOwners(writers: { app: readonly string[]; central: readonly string[] }, login: string | null): OwnersPick {
   const central = new Set(writers.central.map((w) => w.toLowerCase()));
   const humans = writers.app.filter((w) => !BOT_RE.test(w));
   if (humans.length === 0) return { stop: 'pipegen found no person with write access to this repository (only bots, or nobody), so it can\'t pick code owners or lock merging safely. Give at least one person write access, then run pipegen again.' };
+  // spec M7 (G8-R2 I1): the central list too, before anything costs money (planLocks would refuse it only at stage 15)
+  if (!writers.central.some((w) => !BOT_RE.test(w))) return { stop: 'pipegen found no person with write access to the central repository (pipelines): only bots, or nobody, so it can\'t pick code owners or lock merging safely. Give at least one person write access to pipelines, then run pipegen again.' };
   const both = [...new Set(humans.filter((w) => central.has(w.toLowerCase())))];
   if (both.length < 2) return { owners: [], writers: humans.length, note: 'Fewer than two people can write to both this repository and the central repository, so pipegen sets no code-owner rule and writes no CODEOWNERS block: a single writer can approve their own changes to the pipeline files.' };
   const first = login !== null ? both.find((w) => w.toLowerCase() === login.toLowerCase()) : undefined;

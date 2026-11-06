@@ -18,12 +18,13 @@
 // 4 the unsafe folder (main.ts). The vault is wiped on every exit.
 import { lstat, readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import type { Octokit } from '@octokit/rest';
 import { makeProvider } from '../ai/provider.js';
-import { bundleCode, bundleSummary, chooseSecretScanner, type CodeBundle } from '../ai/redact.js';
+import { bundleCode, chooseSecretScanner, type CodeBundle } from '../ai/redact.js';
+import { ConsentToken, CountingSummary, countingSummary } from '../audit/consent-token.js';
 import { AiSpendMeter, meteredProvider } from '../ai/spend-meter.js';
 import { mapCoverage } from '../audit/coverage.js';
-import type { ConsentToken } from '../audit/consent-token.js';
 import { readOrigin, readProject } from '../read/project.js';
 import { applyTypeOverrides, type TypeOverride } from '../read/project-type.js';
 import { supportLevel } from '../read/support.js';
@@ -60,15 +61,15 @@ import { probeCapabilities } from '../github/capabilities.js';
 import { getAuth, GITHUB_TIMEOUT_MS, hideToken, listWriters, makeOctokit, permissionsTable, readGitHubContext } from '../github/client.js';
 import { readOrgAdmin, readRepoId, readShaPinning, readWriters, type ShaPinningRead } from '../github/lock-probes.js';
 import { assemble, judgeAssembled, type AssembledFiles } from '../layers/assemble.js';
-import { environmentPlan, generateCosignKeys, planVerifyInserts, releaseJobs, type VerifyPlan } from '../layers/deploy.js';
+import { environmentPlan, generateCosignKeys, isMemoryFolder, MEMORY_DIR, planVerifyInserts, releaseJobs, type EnvironmentPlan, type VerifyPlan } from '../layers/deploy.js';
 import { AssembleError, assembleJobs } from '../layers/jobs.js';
 import { planLocks, type LockPlan } from '../layers/locks.js';
 import { precommitFiles, type PrecommitResult } from '../layers/precommit.js';
 import { checkProofRepos, type ProofRepos } from '../proof/repos.js';
 import type { ProofAssemble } from '../proof/harness.js';
-import { StateStore, type StateDeps } from '../proof/state.js';
+import { StateStore, type RunState, type StateDeps } from '../proof/state.js';
 import { CENTRAL_REPO } from '../proof/target.js';
-import type { Auth, Capabilities, Candidate, CreatedFile, PipelineDraft, RepoProfile, ReviewedTool, SkippablePart } from '../types.js';
+import type { Auth, Capabilities, Candidate, CreatedFile, KnownValueCheck, PipelineDraft, RepoProfile, ReviewedTool, SkippablePart } from '../types.js';
 import { signingMode, type SigningMode } from '../github/signing-mode.js';
 import { safeText } from '../util/safe-text.js';
 import { pubKeySha256 } from '../engine/signing.js';
@@ -82,7 +83,7 @@ export { interactiveRun };
 import type { CliIO } from './io.js';
 import {
   assembledJobs, consentJobs, docFor, draftFromDebate, isAiNote, parseStrictness, pickOwners, proofAssembler, prWaitMinutes,
-  signingFor, warnFirstFor, type Strictness,
+  signingFor, strictNeeds, warnFirstFor, type Strictness,
 } from './run-parts.js';
 import { typeStep } from './type-confirm.js';
 
@@ -118,6 +119,13 @@ export const PROOF_NOT_BUILT = 'pipegen stopped before delivery: the proof step 
 export const GATE_UNREACHABLE = 'pipegen stopped before the proof: this repository is public, and the pipegen gate its pull requests would load can\'t be read at its pinned commit, so every pull request would be blocked. Nothing was changed. exit code 2.';
 /** The stand-in central commit of a private draft before deliverCentral (never delivered: the run re-pins before it judges for delivery). */
 export const UNPINNED = '0'.repeat(40);
+/** G13-R1 (sec M2): the one owner v0.2 sets up (SCOPE_LINE), compared without case. */
+export const V02_OWNER = 'CrisWorking';
+export const NOT_IN_SCOPE = (owner: string): string => `pipegen v0.2 sets up repositories owned by ${V02_OWNER} only, and this folder's origin is owned by ${safeText(owner, 100)}; nothing was read from GitHub or changed. exit code 1.`;
+/** G13-R1 (sec I1): the pinned scanner found a secret in the files consent counted. */
+export const SECRET_FOUND = 'pipegen stopped: the secret scan found what looks like a secret in the files it would send to the AI, so nothing was sent and nothing was created. Remove it (or add the file to .gitignore), then run pipegen again. exit code 2.';
+/** G13-R1 (sec M4): key-env makes its key pair only in a memory folder. */
+export const NO_MEMORY_FOLDER = `pipegen stopped before anything was spent: this repository's images are signed with a key pair, which pipegen makes only in memory (${MEMORY_DIR}), and this machine has no such folder. Run pipegen on Linux (WSL or a Linux container works too). exit code 2.`;
 /** Plan l. 507-508 (stage 20). */
 export const MERGE_POLL_MS = 30_000;
 export const MERGE_WAIT_MS = 30 * 60_000;
@@ -151,13 +159,16 @@ export interface Built {
   files: CreatedFile[];
   report: RefereeReport; guardProblems: string[];
   environments: { name: string; reviewers: boolean }[];
+  /** spec I7: what environmentPlan could not do (also in doc.notes); shown at the preview. */
+  envNotes: string[];
   /** The files judged besides AssembledFiles (PIPEGEN.md, the inserted verify jobs, CODEOWNERS, the org required workflow): judgeAssembled's `extra`. */
   extra: CreatedFile[];
   /** The jobs as assembled, for the preview estimate (carry 43) and the PR wait. */
   minutes: { jobs: ReturnType<typeof assembledJobs>; prWait: number };
 }
 export interface BuildInput {
-  dir: string; draft: PipelineDraft; plan: DebateDraftPlan; facts: GitHubFacts; vault: SecretVault; reviewed: ReviewedTool[]; platform: PlatformActions;
+  /** The known-value check: the user's vault and (key-env) the in-memory key pair (sec M4). */
+  dir: string; draft: PipelineDraft; plan: DebateDraftPlan; facts: GitHubFacts; vault: KnownValueCheck; reviewed: ReviewedTool[]; platform: PlatformActions;
   owners: string[]; strictness: Strictness; transcript: string[]; testNotes: string[]; est: Estimates; auth: Auth;
   /** readCentralFileList, after deliverCentral (carry 15); absent before it. */
   centralFiles?: readonly string[];
@@ -177,7 +188,10 @@ export interface RunStages {
   /** Stage 3: readProject's GitHub half. */
   readProject(auth: Auth, local: Omit<RepoProfile, 'private' | 'ownerType' | 'plan'>): Promise<GitHubFacts>;
   provider(): ReturnType<typeof makeProvider>;
+  /** The counting bundle consent shows (no secret scan yet: ruling S21). */
   bundle(dir: string, knownValues: string[]): Promise<CodeBundle>;
+  /** G13-R1 (sec I1): after the yes, the pinned scanner the consent named over exactly the counted files; refuses when it can't. */
+  scan(dir: string, consent: ConsentToken, knownValues: string[]): Promise<CodeBundle>;
   activity(f: GitHubFacts, p: RepoProfile): Promise<Activity>;
   consent(f: GitHubFacts, p: RepoProfile, ai: ReturnType<typeof makeProvider>, est: Estimates, bundle: CodeBundle, auth: Auth, extra: string[]): Promise<ConsentToken | null>;
   state(p: RepoProfile): Promise<StateStore>;
@@ -185,7 +199,8 @@ export interface RunStages {
   gateReachable(f: GitHubFacts, reviewed: readonly ReviewedTool[]): Promise<boolean>;
   proofRepos(f: GitHubFacts, p: RepoProfile, auth: Auth, store: StateStore, runId: string, actions: readonly string[]): Promise<ProofRepos>;
   needs(p: RepoProfile, caps: Capabilities, bundle: CodeBundle, ai: ReturnType<typeof makeProvider>, writers: number, knownValues: string[]): Promise<NeedsPlan>;
-  discover(needs: NeedsPlan['needs'], p: RepoProfile, f: GitHubFacts, reviewed: ReviewedTool[]): Promise<Map<string, readonly Candidate[]>>;
+  /** `ai` is the run's metered provider (sec I2); `onUsage` saves the meter after each call. */
+  discover(needs: NeedsPlan['needs'], p: RepoProfile, f: GitHubFacts, reviewed: ReviewedTool[], ai: ReturnType<typeof makeProvider>, onUsage: () => void): Promise<Map<string, readonly Candidate[]>>;
   debate(needs: NeedsPlan['needs'], candidates: ReadonlyMap<string, readonly Candidate[]>, p: RepoProfile, caps: Capabilities, bundle: CodeBundle, ai: ReturnType<typeof makeProvider>, rule: { requireDeployApproval: boolean }, reviewed: ReviewedTool[]): Promise<DebateResult>;
   creators(draft: PipelineDraft, bundle: CodeBundle, ai: ReturnType<typeof makeProvider>, dir: string, vault: SecretVault, reviewed: ReviewedTool[]): Promise<Creators>;
   secrets(p: RepoProfile, created: readonly CreatedFile[], vault: SecretVault, io: CliIO): Promise<{ names: string[]; missing: string[]; notes: string[] }>;
@@ -224,6 +239,10 @@ export interface RunDeps {
   runId?: () => string;
   /** G14: armProofCleanup(store, cleanupAfterProof); returns the disarm. Absent (G13): the store stays unarmed, so no helper repo is created. */
   arm?: (store: StateStore) => () => void;
+  /** sec M4: whether the memory folder is one (default isMemoryFolder). */
+  isMemory?: (dir: string) => boolean;
+  /** sec I1: the pinned secret scanner (default ensurePinnedBinary with the pins). */
+  secretScanner?: (name: 'gitleaks' | 'betterleaks') => Promise<{ name: 'gitleaks' | 'betterleaks'; path: string; version: string }>;
 }
 
 const isoDay = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
@@ -242,6 +261,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
   const out = (s: string): void => { io.out(hideToken(s, token)); };
   const err = (s: string): void => { io.err(hideToken(s, token)); };
   let vault: SecretVault | null = null;
+  let keyVault: SecretVault | null = null;
   let store: StateStore | null = null;
   let disarm: (() => void) | null = null;
   /** The services a workflow, compose or bake file builds an image from (containerHint): carry 13's way past. */
@@ -259,6 +279,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     return 1;
   } finally {
     (vault as SecretVault | null)?.wipe();
+    (keyVault as SecretVault | null)?.wipe();
     try { (disarm as (() => void) | null)?.(); } catch { /* the state file keeps what was done */ }
     try { (store as StateStore | null)?.releaseLease(); } catch { /* released at exit anyway */ }
   }
@@ -282,6 +303,8 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
 
     // 1. the origin, the services on disk and the types: no GitHub call yet (carry 2)
     const origin = await st.readOrigin(dir);
+    // G13-R1 (sec M2): what SCOPE_LINE says, enforced from the folder's own origin, before any GitHub call
+    if (origin.owner.toLowerCase() !== V02_OWNER.toLowerCase()) { err(NOT_IN_SCOPE(origin.owner)); return 1; }
     const read = await st.localProject(dir);
     if (read.owner.toLowerCase() !== origin.owner.toLowerCase() || read.repo.toLowerCase() !== origin.repo.toLowerCase()) throw new Error('The folder\'s origin remote changed while pipegen read it.');
     // the audit's own type step (carry 2): --type checked and applied, else the question at a terminal; a cancel reads nothing from GitHub
@@ -304,24 +327,32 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
       err(`pipegen v0.2 can't set this repository up: ${support.reasons.map((r) => safeText(r, 300)).join(' ')} Run \`pipegen audit\` for the report. exit code 2.`);
       return 2;
     }
-    // carry 39 (G8-R2 I1): the code owners, before anything costs money
+    // carry 39 (G8-R2 I1, spec M7): the code owners from both writer lists, before anything costs money
     const pick = pickOwners(facts.lockWriters, facts.login);
     if ('stop' in pick) { err(pick.stop); return 2; }
     if (pick.note !== undefined) err(pick.note);
     const reviewed = (deps.reviewed ?? (() => loadReviewed()))();
-    // 5-6
+    // 5-6: the counting bundle (no secret scan yet: the scanner runs only after the yes, ruling S21, G13-R1 sec I1)
     const provider = st.provider();
     const knownValues = [auth.token];
-    const bundle = await st.bundle(dir, knownValues);
+    const counted = await st.bundle(dir, knownValues);
 
     // 7. consent: the bootstrap switch first (carry 46), then the services the proof can't prove, the estimate, the screen
     assertBootstrapAllowed(io.env);
+    // G13-R1 (sec M4): key-env makes its key pair only in memory; a host without a memory folder is refused before anything costs money
+    const keyEnvApplies = signingMode(p, facts.caps) === 'key-env' && publishedImageServices(p, facts.caps).length > 0;
+    if (keyEnvApplies && !(deps.isMemory ?? isMemoryFolder)(MEMORY_DIR)) { err(NO_MEMORY_FOLDER); return 2; }
+    // G13-R1 (spec M5): until G14 builds the proof, the run stops here: no AI money spent, no secret asked for
+    if (deps.proof === undefined) { err(PROOF_NOT_BUILT); return 2; }
     const extra = notProvableNotes(p);
     const floor = floorNeeds(p, facts.caps);
     const activity = await st.activity(facts, p);
     const est = estimate(p, consentJobs(p, facts.caps), 2, activity, provider, { needKeys: needKeyCount(floor) });
-    const consent = await st.consent(facts, p, provider, est, bundle, auth, extra);
+    const consent = await st.consent(facts, p, provider, est, counted, auth, extra);
     if (consent === null) { err('No consent: nothing was created, nothing was sent to an AI and no secret was asked for. exit code 1.'); return 1; }
+    // the secret scan of the counted files only; a finding stops the run before anything is sent to an AI
+    const bundle = await st.scan(dir, consent, knownValues);
+    if (bundle.found.names.length > 0 || bundle.found.values.length > 0) { err(SECRET_FOUND); return 2; }
     store = await st.state(p);
     const runId = (deps.runId ?? (() => newRunId(now())))();
     // S20: one pipegen per app repo on this machine
@@ -330,6 +361,8 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     // carry 47: one meter per consent token; every AI closure goes through it
     const meter = new AiSpendMeter(provider, est.aiCostCapUsd);
     const ai = meteredProvider(provider, meter);
+    const runStore = store;
+    const onUsage = (): void => { runStore.saveMeters({ aiUsedUsd: meter.usedUsd }); };
 
     // G14 registers the Ctrl-C cleanup here (armProofCleanup): without it the store gives no create permit, so no helper repo is made
     if (deps.arm !== undefined) disarm = deps.arm(store);
@@ -337,11 +370,13 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     if (!p.private && !(await st.gateReachable(facts, reviewed))) { err(GATE_UNREACHABLE); return 2; }
     // 8. the helper repos
     const repos = await st.proofRepos(facts, p, auth, store, runId, proofActions(reviewed));
+    // sec M3: the central Actions access level before the change, saved at once
+    if (repos.actionsAccess !== undefined) store.recordActionsAccess(repos.actionsAccess.previous);
     if (!repos.ready) { err('pipegen stopped: the helper repositories above must exist first (see the commands). exit code 2.'); return 2; }
 
     // 9-10
     const needsPlan = await st.needs(p, facts.caps, bundle, ai, facts.writers.length, knownValues);
-    const candidates = await st.discover(needsPlan.needs, p, facts, reviewed);
+    const candidates = await st.discover(needsPlan.needs, p, facts, reviewed, ai, onUsage);
     store.setStage('planned');
     // 11
     const debated = await st.debate(needsPlan.needs, candidates, p, facts.caps, bundle, ai, { requireDeployApproval: needsPlan.requireDeployApproval }, reviewed);
@@ -359,28 +394,39 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
       ...(trusted.record?.blockFrom === undefined ? {} : { gateSettings: { blockFromRecorded: trusted.record.blockFrom } }),
     };
     const dd = draftFromDebate(base, debated);
-    let draft: PipelineDraft = { ...dd.draft, warnFirst: warnFirstFor(dd.draft.needs, level, typeNeedIds, today) };
+    const levelNeeds = strictNeeds(dd.draft.needs, level, { steps: dd.draft.steps, uncovered: dd.plan.uncovered });
+    let draft: PipelineDraft = { ...dd.draft, needs: levelNeeds, warnFirst: warnFirstFor(levelNeeds, level, typeNeedIds, today) };
+    const plan = { ...dd.plan, needs: levelNeeds };
     // a private app is assembled at a stand-in central commit until deliverCentral gives the real one (carry 14); the proof pins its own
     if (p.private) draft.centralPin = { repo: `${p.owner}/${CENTRAL_REPO}`, sha: UNPINNED };
     // carry 10: the signing plan from the probed mode, only for services that build an image. key-env (carries 16, 28, 60): a record that
     // already names a public key (a finish --rotate-key) keeps it and makes no pair; otherwise one pair, in memory, before the verify literal
+    vault = new SecretVault();
+    keyVault = new SecretVault();
     let pair: SigningKey | undefined;
     let pubSha: string | undefined;
-    if (signingMode(p, facts.caps) === 'key-env' && publishedImageServices(p, facts.caps).length > 0) {
+    if (keyEnvApplies) {
       pubSha = trusted.record?.cosignPubSha256;
-      if (pubSha === undefined) { pair = await st.signingKey(); pubSha = pubKeySha256(pair.pub); }
+      if (pubSha === undefined) {
+        pair = await st.signingKey();
+        pubSha = pubKeySha256(pair.pub);
+        // sec M4: the pair is a known value for the run's lifetime (the referee, the guard, the state file and the doc refuse or scrub it)
+        rememberKey(keyVault, pair);
+      }
     }
     const signing = signingFor(p, facts.caps, pubSha);
     if (signing !== undefined) draft.signing = signing;
+    const known = knownChecks(vault, keyVault);
 
     // 12. the creators
-    vault = new SecretVault();
     const made = await st.creators(draft, bundle, ai, dir, vault, reviewed);
     draft = { ...draft, created: [...draft.created, ...made.files], notProven: [...draft.notProven, ...made.notProven], testDecisions: made.testDecisions };
     // 13. the secrets, then the fingerprint key (made only through generateFpKey, carry 23)
     const sec = await st.secrets(p, draft.created, vault, io);
     for (const n of sec.notes) err(n);
     generateFpKey(vault);
+    // S3: stages 12-13 are `created`
+    store.setStage('created');
     // 14. Slack: nothing in v0.2
 
     // 15. assemble, judge, guard
@@ -388,26 +434,30 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     const testNotes = made.testNotes.filter((n) => !isAiNote(n));
     const credits = await st.credits(p, draft, dir) ?? [];
     const inputs = (d: PipelineDraft, centralFiles?: readonly string[]): BuildInput => ({
-      dir, draft: d, plan: dd.plan, facts, vault: vault as SecretVault, reviewed, platform: plat, owners: pick.owners, strictness: level, transcript: debated.transcript, testNotes, est, auth,
+      dir, draft: d, plan: { ...plan, needs: d.needs }, facts, vault: known, reviewed, platform: plat, owners: pick.owners, strictness: level, transcript: debated.transcript, testNotes, est, auth,
       credits, prev: trusted.record, ...(centralFiles === undefined ? {} : { centralFiles }),
     });
     let built = await st.build(inputs(draft));
     if (!judgedClean(built)) return 2;
-    store.setStage('created');
 
     // 16-17. the proof (G14) through the seam; delivery only from `cleaned` with a passed proof (Plan E carry (a)1)
-    const proofAssemble = proofAssembler(built.assembled.draft, (d, mode) => assemble(d, { gate: gateOf(reviewed), reviewed, platform: plat, mode, layout: d.profile.private ? 'central' : 'local', plan: dd.plan }));
+    const proofAssemble = proofAssembler(built.assembled.draft, (d, mode) => assemble(d, { gate: gateOf(reviewed), reviewed, platform: plat, mode, layout: d.profile.private ? 'central' : 'local', plan: { ...plan, needs: d.needs } }));
     const proof = await (deps.proof ?? defaultProof)({ draft, assembled: built.assembled.draft, files: built.files, assemble: proofAssemble, store, auth, gh: facts.gh, repos, vault, ai: { meter }, io });
     if (!proof.ok) { err(safeText(proof.stopped ?? 'pipegen stopped: the proof did not pass, so nothing was delivered. exit code 2.', 1200)); return 2; }
     const saved = store.load();
     if (saved === null || saved.stage !== 'cleaned' || saved.proofOk !== true) { err('pipegen stopped: the proof did not end cleaned up with a passed verdict, so nothing was delivered. exit code 2.'); return 2; }
-    // a draft the proof changed (its fix loop) is built and judged again before anything is delivered
-    if (proof.draft !== undefined && proof.draft !== draft) {
-      draft = proof.draft;
-      if (!p.private) { built = await st.build(inputs(draft)); if (!judgedClean(built)) return 2; }
+    // G13-R1 (sec I3): deliver only the draft saved with the passing verdict of THIS run
+    const proven = provenDraft(saved, runId, proof.draft);
+    if ('stop' in proven) { err(proven.stop); return 2; }
+    // sec I4 / spec I3: a draft the proof changed is built and judged again (a private app at the stand-in commit) before anything leaves
+    if (!sameDraft(proven.draft, draft)) {
+      draft = { ...proven.draft, ...(p.private ? { centralPin: { repo: `${p.owner}/${CENTRAL_REPO}`, sha: UNPINNED } } : {}) };
+      built = await st.build(inputs(draft));
+      if (!judgedClean(built)) return 2;
     }
 
-    // 18. two-step delivery (carries 14, 15): deliverCentral, the re-pin, the central file list once, assemble and judge again
+    // 18. two-step delivery (carries 14, 15): deliverCentral (the central files of the last judged build), the re-pin, the central file list
+    // once, assemble and judge again
     let centralFileList: string[] | undefined;
     if (p.private) {
       const centralFiles = built.files.filter((f) => f.repo === 'central' && !f.path.endsWith('--required.yml') && /^\.github\/workflows\/[^/]+--[^/]+\.ya?ml$/.test(f.path));
@@ -433,15 +483,24 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     };
     if (built.assembled.draft.centralPin?.sha === UNPINNED) throw new Error('pipegen would deliver a draft with no central commit pinned; nothing was delivered.');
     const note = bootstrapProofsNote(io.env);
-    const preview = [st.preview(input), ...(note === null ? [] : ['', note]), '', `A pull request waits about ${built.minutes.prWait} minutes at most for the checks; about ${est2.monthlyMinutes} Actions minutes a month.`].join('\n');
+    const preview = [
+      st.preview(input), ...(note === null ? [] : ['', note]),
+      // spec I7: what the environment plan couldn't do (an approval with no environment to put it on), said before the yes
+      ...(built.envNotes.length === 0 ? [] : ['', ...built.envNotes.map((n) => safeText(n, 600))]),
+      '', `A pull request waits about ${built.minutes.prWait} minutes at most for the checks; about ${est2.monthlyMinutes} Actions minutes a month.`,
+    ].join('\n');
     if (!(await ask(`${preview}\n\nOpen the setup pull request with these changes?`))) { err('Nothing was delivered: you said no. The secrets you typed were wiped. exit code 1.'); return 1; }
     // 19. deliver (key-env: the key pair made in memory, carry 16 and 28)
     const keyEnv = built.assembled.draft.signing?.mode === 'key-env';
     const key = pair;
     const res = await st.deliver(facts, p, input, vault, io, keyEnv && key !== undefined ? async () => key : undefined);
     store.setStage('delivered');
+    // carry 19 (spec I4): everything delivery says
+    for (const d of res.done) out(`done: ${safeText(d, 300)}`);
+    for (const s of res.skipped) out(`skipped: ${safeText(s.what, 200)} (${safeText(s.why, 600)})`);
     for (const n of res.notes) out(safeText(n, 600));
     out(`The setup pull request: ${safeText(res.prUrl, 300)}`);
+    if (res.centralPrUrl !== undefined) out(`The central pull request (merge it too): ${safeText(res.centralPrUrl, 300)}`);
 
     // 20. wait for the merge, then finish in this process
     const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => { setTimeout(r, ms); }));
@@ -476,15 +535,83 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
  * Carries 16 and 24: what deliver records of the helper repos: the central repo pipegen created (with GitHub's id) and the Actions access
  * level it changed there (checkProofRepos), the scratch repo pipegen created (the state file's id).
  */
-export function proofReposFor(repos: Pick<ProofRepos, 'created' | 'createdIds' | 'actionsAccess'>, saved: { scratchRepoId?: number }): NonNullable<DeliveryInput['proofRepos']> {
+export function proofReposFor(repos: Pick<ProofRepos, 'created' | 'createdIds' | 'actionsAccess'>, saved: { scratchRepoId?: number; actionsAccessPrevious?: string }): NonNullable<DeliveryInput['proofRepos']> {
   const id = repos.createdIds?.[CENTRAL_REPO];
+  // sec M3: the level saved the moment it changed (an earlier, interrupted run's included) wins over this run's read
+  const previous = saved.actionsAccessPrevious ?? repos.actionsAccess?.previous;
   return {
     central: {
       ...(id === undefined ? { createdByPipegen: repos.created.includes(CENTRAL_REPO) } : { repoId: id, createdByPipegen: true }),
-      ...(repos.actionsAccess === undefined ? {} : { actionsAccess: { previous: repos.actionsAccess.previous } }),
+      ...(previous === undefined ? {} : { actionsAccess: { previous } }),
     },
     scratch: { ...(saved.scratchRepoId === undefined ? {} : { repoId: saved.scratchRepoId }), createdByPipegen: saved.scratchRepoId !== undefined },
   };
+}
+
+/** The pinned scanner, downloaded and checked against its pin; the version from the same pins table (the audit's defaultSecretScanner). */
+async function pinnedScanner(name: 'gitleaks' | 'betterleaks'): Promise<{ name: 'gitleaks' | 'betterleaks'; path: string; version: string }> {
+  const pins = loadPinnedBinaries();
+  const path = await ensurePinnedBinary(name, undefined, { pins });
+  return { name, path, version: pins[name].version };
+}
+
+/**
+ * G13-R1 (sec I1), the audit's pattern: after the yes, the scanner the consent screen named (name and version) over exactly the files it
+ * counted. A token that is not askConsent's 'full' one, another scanner, or a bundle with a file that was not counted is refused (thrown).
+ */
+export async function scanCounted(dir: string, consent: ConsentToken, knownValues: string[], ensure: NonNullable<RunDeps['secretScanner']>): Promise<CodeBundle> {
+  const c: unknown = consent;
+  if (!ConsentToken.isToken(c) || c.terms.mode !== 'full') throw new Error('pipegen run needs the consent askConsent gives for its own screen; nothing was sent.');
+  const counted = c.terms.files;
+  if (!CountingSummary.isSummary(counted)) throw new Error('The consent was not given for counted files; nothing was sent.');
+  const named = c.terms.secretScanner;
+  if (named === undefined) throw new Error('The consent named no secret scanner; nothing was sent.');
+  const scanner = await ensure(named.name);
+  if (scanner.name !== named.name || scanner.version !== named.version) {
+    throw new Error(`pipegen was given ${safeText(scanner.name, 20)} ${safeText(scanner.version, 20)}, not the ${named.name} ${named.version} the consent screen named, and ran neither.`);
+  }
+  const bundle = await bundleCode(dir, { secretScanner: scanner, knownValues, onlyPaths: counted.paths() });
+  if (!counted.covers(bundle)) throw new Error('The scanned files are not the ones you agreed to send; nothing was sent.');
+  return bundle;
+}
+
+/** sec I5: only the scratch repo (pipegen-proof-<repo>) is the state's scratch repo; the central repo checkProofRepos also creates is not. */
+export const onCreatedFor = (store: Pick<StateStore, 'scratchCreated'>, repo: string) => (name: string, id: number): void => {
+  if (name === `pipegen-proof-${repo}`) store.scratchCreated(id);
+};
+
+/** sec M4: the key-env pair's secret parts (the password and each line of the private key's body) as known values. */
+export function rememberKey(keyVault: SecretVault, pair: SigningKey): void {
+  keyVault.set('COSIGN_PASSWORD', pair.password);
+  let n = 0;
+  for (const line of pair.key.split(/\r?\n/)) {
+    const t = line.trim();
+    if (t.length < 8 || /^-----(BEGIN|END) /.test(t)) continue;
+    keyVault.set(`COSIGN_KEY_${n++}`, t);
+  }
+}
+
+/** The run's one known-value check: the user's vault and the key vault (the key vault never reaches deliver's secret names). */
+export function knownChecks(...vaults: KnownValueCheck[]): KnownValueCheck {
+  return {
+    containsKnownValue: (t) => vaults.some((v) => v.containsKnownValue(t)),
+    scrubber: () => { const fns = vaults.map((v) => v.scrubber()); return (t) => fns.reduce((acc, fn) => fn(acc), t); },
+  };
+}
+
+const jsonCopy = (x: unknown): unknown => JSON.parse(JSON.stringify(x)) as unknown;
+/** Two drafts are the same after a JSON round trip (the state file's form). */
+export const sameDraft = (a: PipelineDraft, b: PipelineDraft): boolean => isDeepStrictEqual(jsonCopy(a), jsonCopy(b));
+
+/**
+ * sec I3: the draft delivery builds from is the one the state saved with the passing verdict, of this run only; a proof that hands back
+ * another draft than the one it saved is refused.
+ */
+export function provenDraft(saved: Pick<RunState, 'runId' | 'draft'>, runId: string, returned: PipelineDraft | undefined): { draft: PipelineDraft } | { stop: string } {
+  if (saved.runId !== runId) return { stop: 'pipegen stopped: the saved proof verdict belongs to another run, so nothing was delivered. exit code 2.' };
+  if (saved.draft === undefined) return { stop: 'pipegen stopped: the proof saved no draft with its verdict, so nothing was delivered. exit code 2.' };
+  if (returned !== undefined && !sameDraft(returned, saved.draft)) return { stop: 'pipegen stopped: the proof returned another draft than the one it saved with its verdict, so nothing was delivered. exit code 2.' };
+  return { draft: saved.draft };
 }
 
 /**
@@ -553,7 +680,9 @@ export function insertedBlock(prev: InstallRecord | null, repo: 'app' | 'central
 }
 
 /** The pure part of stage 15 (no GitHub read): pre-commit files, assemble (twice: the verify plan's not-proven entries are rendered), locks, PIPEGEN.md. */
-export async function buildFiles(i: BuildInput, f: Pick<BuildFacts, 'texts' | 'appCo' | 'centralCo' | 'centralBranchProtection'>): Promise<Omit<Built, 'report' | 'guardProblems' | 'environments'>> {
+export type EnvPlanFn = (requireApproval: boolean, inserted: readonly string[]) => Promise<{ envs: readonly EnvironmentPlan[]; notes: string[] }>;
+const NO_ENV_PLAN: EnvPlanFn = async () => ({ envs: [], notes: [] });
+export async function buildFiles(i: BuildInput, f: Pick<BuildFacts, 'texts' | 'appCo' | 'centralCo' | 'centralBranchProtection'>, envPlan: EnvPlanFn = NO_ENV_PLAN): Promise<Omit<Built, 'report' | 'guardProblems'>> {
   const { draft: d0, reviewed, platform } = i;
   const p = d0.profile;
   const skip = (part: SkippablePart): boolean => d0.skipped.some((s) => s.part === part);
@@ -582,10 +711,13 @@ export async function buildFiles(i: BuildInput, f: Pick<BuildFacts, 'texts' | 'a
       files: a0.files,
     });
   const prWait = prWaitMinutes(jobs.merge);
+  // spec I7: what the environment plan can't do lands in doc.notes (and the preview) before the judge
+  const env = await envPlan(a0.draft.requireDeployApproval, verify.inserts.map((x) => x.path));
+  const envNotes = [...new Set(env.notes)];
   // carries 31-34: the doc is filled before the judge
   const doc = docFor({
     transcript: i.transcript, verify, locks: { notes: locks.notes, gateRequired: locks.rulesets !== undefined || locks.classic !== undefined }, precommit,
-    jobs: { notes: jobs.notes, uncoveredMinimum: jobs.uncoveredMinimum }, assembledNotes: a0.notes, testNotes: i.testNotes, credits: i.credits ?? [],
+    jobs: { notes: jobs.notes, uncoveredMinimum: jobs.uncoveredMinimum }, assembledNotes: [...a0.notes, ...envNotes], testNotes: i.testNotes, credits: i.credits ?? [],
     estimates: i.est, prWaitMinutes: prWait, strictness: i.strictness,
   });
   const finalDraft: PipelineDraft = { ...a0.draft, doc };
@@ -596,6 +728,7 @@ export async function buildFiles(i: BuildInput, f: Pick<BuildFacts, 'texts' | 'a
   const extra = [pipegenMd, ...inserted, ...(locks.codeowners === undefined ? [] : [locks.codeowners.file]), ...(locks.centralCodeowners === undefined ? [] : [locks.centralCodeowners.file]), ...(locks.orgRequiredWorkflow === undefined ? [] : [locks.orgRequiredWorkflow.file])];
   return {
     assembled, verify, locks, precommit, doc: pipegenMd, extra, files: [...finalDraft.created, ...a0.files, ...extra],
+    environments: env.envs.map((e) => ({ name: e.name, reviewers: e.reviewers })), envNotes,
     minutes: { jobs: assembledJobs(jobs, a0.draft.needs, p), prWait },
   };
 }
@@ -685,10 +818,12 @@ function realStages(io: CliIO, deps: RunDeps): RunStages {
       const scanner = chooseSecretScanner(io.env);
       const repos = [];
       for (const name of [CENTRAL_REPO, `pipegen-proof-${p.repo}`]) repos.push({ name, exists: (await readRepo(f.gh, { owner: p.owner, repo: name }, f.clock).catch(() => null)) !== null });
-      const screen = consentScreen(p, ai, est, bundleSummary(bundle), permissionsTable('write', { appCreatesRepos: auth.canCreateRepos }), repos, 'full', { appCreatesRepos: auth.canCreateRepos, secretScanner: { name: scanner, version: loadPinnedBinaries()[scanner].version } });
+      // sec I1: the counting summary (an upper bound); the pinned scanner runs only after the yes (the scan stage)
+      const screen = consentScreen(p, ai, est, countingSummary(bundle), permissionsTable('write', { appCreatesRepos: auth.canCreateRepos }), repos, 'full', { appCreatesRepos: auth.canCreateRepos, secretScanner: { name: scanner, version: loadPinnedBinaries()[scanner].version } });
       for (const l of extra) io.err(l);
       return askConsent(io.prompt, screen, (s) => { io.err(s); });
     },
+    scan: (dir, consent, knownValues) => scanCounted(dir, consent, knownValues, deps.secretScanner ?? pinnedScanner),
     state: (p) => StateStore.open(p, deps.state ?? {}),
     async gateReachable(f, reviewed) {
       // ruling G13-R0 12: the gate action's pinned commit, read through the API; any failure is "unreachable"
@@ -698,9 +833,9 @@ function realStages(io: CliIO, deps: RunDeps): RunStages {
       if (sha === undefined) return false;
       try { await f.gh.request('GET /repos/{owner}/{repo}/commits/{ref}', { owner, repo, ref: sha }); return true; } catch { return false; }
     },
-    proofRepos: (f, p, auth, store, runId, actions) => checkProofRepos(f.gh, p, { auth, actions, runId, clock: f.clock, onCreated: (_r, id) => { store.scratchCreated(id); }, createPermit: () => store.createPermit() }, io),
+    proofRepos: (f, p, auth, store, runId, actions) => checkProofRepos(f.gh, p, { auth, actions, runId, clock: f.clock, onCreated: onCreatedFor(store, p.repo), createPermit: () => store.createPermit() }, io),
     needs: (p, caps, bundle, ai, writers, knownValues) => planNeeds(p, caps, bundle, ai, writers, { knownValues }),
-    async discover(needs, p, f, reviewed) {
+    async discover(needs, p, f, reviewed, ai, onUsage) {
       // stage 10 (carry 48): discover per need; an unreviewed action candidate is pinned with its image read, or dropped
       const notes: string[] = [];
       const memory = await openMemory();
@@ -709,7 +844,9 @@ function realStages(io: CliIO, deps: RunDeps): RunStages {
       for (const n of needs) {
         const key = needKeyOf(n);
         if (m.has(key)) continue;
-        const found = await discover(n, p, { ai: makeProvider({ env: io.env, fetch: io.fetch }), gh: f.gh, memory, fetch: fetchFn, reviewed, mode: 'full', notes, ...f.clock });
+        // sec I2: the run's metered provider (the consent's cap holds here too), the meter saved after each need
+        const found = await discover(n, p, { ai, gh: f.gh, memory, fetch: fetchFn, reviewed, mode: 'full', notes, ...f.clock });
+        onUsage();
         const kept: Candidate[] = [];
         for (const c of found) {
           if (c.reviewed || c.kind !== 'action') { kept.push(c); continue; }
@@ -730,9 +867,13 @@ function realStages(io: CliIO, deps: RunDeps): RunStages {
     credits: (p, draft, dir) => auditCredits(p, draft, dir),
     async build(i) {
       const facts = await readBuildFacts(i);
-      const files = await buildFiles(i, facts);
-      const envs = await environmentPlan(i.facts.gh, i.draft.profile, i.facts.caps, files.assembled.draft.requireDeployApproval, { texts: facts.texts, inserted: files.verify.inserts.map((x) => x.path), clock: i.facts.clock });
-      return { ...files, ...(await judgeBuilt(i, files, facts)), environments: envs.map((e) => ({ name: e.name, reviewers: e.reviewers })) };
+      // spec I7: the environment plan runs inside buildFiles, before the doc, so its notes reach doc.notes and the preview
+      const files = await buildFiles(i, facts, async (requireApproval, inserted) => {
+        const notes: string[] = [];
+        const envs = await environmentPlan(i.facts.gh, i.draft.profile, i.facts.caps, requireApproval, { texts: facts.texts, inserted, clock: i.facts.clock, notes });
+        return { envs, notes };
+      });
+      return { ...files, ...(await judgeBuilt(i, files, facts)) };
     },
     async trusted(f, p, io2) {
       const notes: string[] = [];
