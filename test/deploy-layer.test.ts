@@ -11,6 +11,7 @@ import { isMap, parse, parseDocument, type YAMLMap, type YAMLSeq } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { DIGEST_STEP_ID, FIND_RUN_STEP_ID, HEAD_CHECK_STEP_ID, imageDigestArtifact, PUBLISH_DIGEST_STEP_ID, renderDigestStep, renderHeadCheckStep } from '../src/engine/deploy-steps.js';
 import { checkExpressions, isFindRunStep, isKnownHarmless } from '../src/engine/job-rules.js';
+import { githubHosted } from '../src/engine/deploy-gating.js';
 import { deployGateOf } from '../src/audit/coverage/deploy-gate.js';
 import { floorNeeds } from '../src/engine/needs.js';
 import { RenderError } from '../src/engine/render-error.js';
@@ -213,7 +214,7 @@ describe('G7 verify-insert: the user\'s deploy workflow gets only the verify job
     // the detector tells the deploy jobs apart (an environment, a deploy command): only they wait; the test job does not
     const w = world('key-env', [[B, DEPLOY_B]]);
     expect(w.v.inserts[0]?.inserted.needs.map((n) => n.job)).toEqual(['web', 'api']);
-    expect(w.v.preview).toEqual([`${B}: pipegen adds the job pipegen-verify, and "web", "api" wait for it.`, `${B}: "test" does not wait for pipegen-verify: it shows no deploy, uses no secret but the workflow token, has only read permissions, no environment, and calls no other workflow.`]);
+    expect(w.v.preview).toEqual([`${B}: pipegen adds the job pipegen-verify, and "web", "api" wait for it.`, `${B}: "web" counts as a deploy job: it deploys.`, `${B}: "api" counts as a deploy job: it has an environment.`, `${B}: "test" does not wait for pipegen-verify: it shows no deploy, uses no secret but the workflow token, has only read permissions, no environment, calls no other workflow, runs on a GitHub-hosted runner, and reads no configuration variable.`]);
     // ambiguous: a workflow that deploys by its name only (no job the detector can name) has every job wait, and the preview says so
     const plain = ['name: release the site', 'on:', '  push:', '    branches: [main]', 'jobs:', '  one:', '    runs-on: ubuntu-latest', '    steps:', '      - run: make', '  two:', '    needs: [one]', '    runs-on: ubuntu-latest', '    steps:', '      - run: make upload', ''].join('\n');
     const u = world('key-env', [[B, plain]]);
@@ -798,7 +799,7 @@ describe('G7-R1 sec I1: the head check runs inside every gated deploy job (after
     const noContents = DEPLOY_A.replace('    environment: production\n', '    environment: production\n    permissions:\n      deployments: write\n');
     const w = world('keyless', [[A, noContents]]);
     expect(w.v.inserts).toEqual([]);
-    expect(w.v.gaps[0]?.why).toMatch(/its job "deploy" sets permissions without contents: read[\s\S]*add contents: read to that job's permissions/);
+    expect(w.v.gaps[0]?.why).toMatch(/its job "deploy" \(it has an environment\) sets permissions without contents: read[\s\S]*add contents: read to that job's permissions/);
     // with contents: read it is inserted
     const ok = planVerifyInserts(w.a.draft, new Map([[A, noContents.replace('      deployments: write\n', '      deployments: write\n      contents: read\n')]]), w.a.verify);
     expect(ok.gaps).toEqual([]);
@@ -829,7 +830,7 @@ describe('G7-R1 sec I2: a job is left ungated only when it plainly can not deplo
     const ins = w.v.inserts[0] as VerifyPlan['inserts'][number];
     expect(ins.inserted.needs.map((n) => n.job)).toEqual(['infra', 'release', 'site']);
     const listed = [...w.v.preview, ...w.v.notes].join('\n');
-    expect(listed).toMatch(/"lint" does not wait for pipegen-verify: it shows no deploy, uses no secret but the workflow token, has only read permissions, no environment, and calls no other workflow/);
+    expect(listed).toMatch(/"lint" does not wait for pipegen-verify: it shows no deploy, uses no secret but the workflow token, has only read permissions, no environment, calls no other workflow, runs on a GitHub-hosted runner, and reads no configuration variable/);
     expect(shown(await judge(w))).toBe('');
     // a job with no permissions of its own may get a write token (the repository's default): it waits too
     const noPerms = INFRA.replace('  lint:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n', '  lint:\n    runs-on: ubuntu-latest\n');
@@ -990,7 +991,7 @@ describe('G7-R-sec1: a step-level if: can not run a deploy step after the head c
     for (const cond of ['always()', '${{ failure() }}', 'cancelled()', "success() || github.ref == 'refs/heads/main'", '${{ !cancelled() }}']) {
       const w = world('keyless', [[A, withStepIf(cond)]]);
       expect(w.v.inserts, cond).toEqual([]);
-      expect(w.v.gaps, cond).toEqual([{ path: A, triggers: ['push'], why: expect.stringMatching(/a step of its job "deploy" has an if: that could run it after pipegen's head check failed/) }]);
+      expect(w.v.gaps, cond).toEqual([{ path: A, triggers: ['push'], why: expect.stringMatching(/a step of its job "deploy" \(it has an environment\) has an if: that could run it after pipegen's head check failed/) }]);
     }
     // the referee refuses the same file edited by hand (the insert forced)
     const w = world('keyless', [[A, withStepIf('always()')]]);
@@ -1102,5 +1103,108 @@ describe('G7-R2 3-6: what the notes and messages say', () => {
     expect(note).toMatch(/before release/);
     expect(note).not.toMatch(/\bG\d+\b/);
     expect(readFileSync('src/layers/assemble.ts', 'utf8')).not.toMatch(/SIGSTORE_SET = 'sigstore'/);
+  });
+});
+
+// ---------- G7-R3 (exception round, DECISIONS #108; re-reviews G7 security r2 and spec r2) ----------
+
+describe('G7-R3: STRONG and WEAK reasons; a job gated only by its runner or vars never makes the workflow a gap', () => {
+  const deployJob = ['  deploy:', '    needs: test', '    runs-on: ubuntu-latest', '    environment: production', '    permissions: { contents: read }', '    steps:', '      - run: ./ship.sh', ''];
+  const wf = (test: string[]): string => ['on: { push: { branches: [main] } }', 'jobs:', '  test:', ...test, ...deployJob].join('\n');
+  const Q: [string, string][] = [
+    ['self-hosted test job with an always() upload', wf(['    runs-on: [self-hosted, linux]', '    permissions: { contents: read }', '    steps:', '      - run: make test', '      - uses: actions/upload-artifact@v4', '        if: always()', '        with: { name: logs, path: logs/ }'])],
+    ['vars in a with, plus always()', wf(['    runs-on: ubuntu-latest', '    permissions: { contents: read }', '    steps:', '      - uses: actions/setup-node@v4', '        with: { node-version: "${{ vars.NODE_VERSION }}" }', '      - run: npm test', '      - run: echo done', '        if: always()'])],
+    ['self-hosted, permissions: {}', wf(['    runs-on: [self-hosted, linux]', '    permissions: {}', '    steps:', '      - run: make test'])],
+    ['matrix.os test job with always()', wf(['    strategy: { matrix: { os: [ubuntu-latest, windows-latest] } }', '    runs-on: ${{ matrix.os }}', '    permissions: { contents: read }', '    steps:', '      - run: make test', '      - run: echo done', '        if: always()'])],
+  ];
+  it('G7-R3 4: the four probe-Q shapes keep deploy gated with its head check; the workflow is not a gap', async () => {
+    for (const [what, text] of Q) {
+      const w = world('keyless', [[A, text]]);
+      expect(w.v.gaps, what).toEqual([]);
+      const ins = w.v.inserts[0] as VerifyPlan['inserts'][number];
+      expect(ins.inserted.needs.map((n) => n.job), what).toEqual(['test', 'deploy']);
+      expect(ins.inserted.headCheck, what).toEqual(['deploy']);
+      const steps = (jobsIn(ins.text).deploy as Obj).steps as Obj[];
+      expect(steps[0]?.id, what).toBe('pipegen-head-check');
+      expect(((jobsIn(ins.text).test as Obj).steps as Obj[])[0]?.id, what).not.toBe('pipegen-head-check');
+      // test waits for the check (needs only), and the note says what that leaves open
+      expect(w.v.notes.join('\n'), what).toMatch(/"test" waits for pipegen-verify but gets no head check[\s\S]*an older commit can still run after an approval wait or a re-run of this job alone/);
+      expect(shown(await judge(w)), what).toBe('');
+    }
+  });
+
+  it('G7-R3 4: an ubuntu+windows matrix test job without always(): needs only, no head check', async () => {
+    const text = wf(['    strategy: { matrix: { os: [ubuntu-latest, windows-latest] } }', '    runs-on: ${{ matrix.os }}', '    permissions: { contents: read }', '    steps:', '      - run: make test']);
+    const w = world('keyless', [[A, text]]);
+    const ins = w.v.inserts[0] as VerifyPlan['inserts'][number];
+    expect(ins.inserted.needs.map((n) => n.job)).toEqual(['test', 'deploy']);
+    expect(ins.inserted.headCheck).toEqual(['deploy']);
+    expect(w.v.preview.join('\n')).toMatch(/"test" counts as a deploy job: it runs on a runner of its own/);
+    expect(shown(await judge(w))).toBe('');
+  });
+
+  it('G7-R3 4: round-1 probe R1 (a read-only terraform job on [self-hosted, prod-vpc]) stays gated', async () => {
+    const text = ['on: { push: { branches: [main] } }', 'jobs:', '  stage:', '    runs-on: ubuntu-latest', '    environment: staging', '    steps:', '      - run: ./stage.sh', '  prod:', '    runs-on: [self-hosted, prod-vpc]', '    permissions: { contents: read }', '    steps:', '      - run: terraform apply -auto-approve', ''].join('\n');
+    const w = world('keyless', [[A, text]]);
+    expect(w.v.gaps).toEqual([]);
+    expect(w.v.inserts[0]?.inserted.needs.map((n) => n.job)).toContain('prod');
+    expect(shown(await judge(w))).toBe('');
+  });
+
+  it('G7-R3 4: a STRONG job with a step-level always() is still a gap that names why the job counts', () => {
+    const text = DEPLOY_A.replace('      - run: ./scripts/ship.sh\n', '      - run: ./scripts/ship.sh\n        if: always()\n');
+    const w = world('keyless', [[A, text]]);
+    expect(w.v.inserts).toEqual([]);
+    expect(w.v.gaps[0]?.why).toMatch(/a step of its job "deploy" \(it has an environment\) has an if:/);
+  });
+
+  it('G7-R3 1a: a WEAK job whose job-level if: defeats needs is left out with a preview line and a note; the workflow is not a gap', async () => {
+    const text = wf(['    runs-on: [self-hosted, linux]', '    if: always()', '    permissions: { contents: read }', '    steps:', '      - run: make test']);
+    const w = world('keyless', [[A, text]]);
+    expect(w.v.gaps).toEqual([]);
+    expect(w.v.inserts[0]?.inserted.needs.map((n) => n.job)).toEqual(['deploy']);
+    const line = /"test" may deploy \(it runs on a runner of its own[^)]*\), but its if: could run it even when pipegen's check fails, so pipegen leaves it out/;
+    expect(w.v.preview.join('\n')).toMatch(line);
+    expect(w.v.notes.join('\n')).toMatch(line);
+    expect(shown(await judge(w))).toBe('');
+  });
+
+  it('G7-R3 1b: checkEdit, renewVerifyJob and the referee take a needs-only WEAK job; the referee refuses needs-only on a STRONG job', async () => {
+    const [, text] = Q[0] as [string, string];
+    const w = world('keyless', [[A, text]]);
+    const ins = w.v.inserts[0] as VerifyPlan['inserts'][number];
+    expect(ins.inserted.needsOnly).toEqual(['test']);
+    expect(renewVerifyJob(ins.text, ins.inserted, w.a.verify as Job)).toBe(ins.text);
+    // a mark that calls the real deploy job needs-only (and drops its head check) is refused
+    const d = parseDocument(ins.text);
+    (d.getIn(['jobs', 'deploy', 'steps']) as YAMLSeq).items.shift();
+    const forged = { ...ins.file, content: d.toString({ lineWidth: 0 }), inserted: { ...ins.inserted, headCheck: [], needsOnly: ['test', 'deploy'] } };
+    const r = await judge(w, [forged]);
+    expect(r.issues.some((i) => /"deploy" may not wait without pipegen's head check: it has an environment/.test(i.message)), shown(r)).toBe(true);
+  });
+
+  it('G7-R3 2: the vars rule catches vars[\'X\'], VARS.X and toJSON(vars)', () => {
+    const w = world('keyless', [[A, INFRA]]);
+    for (const ref of ["${{ vars['HOOK_URL'] }}", '${{ VARS.HOOK_URL }}', '${{ toJSON(vars) }}']) {
+      const text = INFRA.replace('      - run: npm run lint\n', `      - run: curl -X POST "${ref}"\n`);
+      expect(planVerifyInserts(w.a.draft, new Map([[A, text]]), w.a.verify).inserts[0]?.inserted.needs.map((n) => n.job), ref).toContain('lint');
+    }
+  });
+
+  it('G7-R3 3: only GitHub\'s own image labels count as hosted; ubuntu-prod-vpc is a runner of its own', () => {
+    for (const label of ['ubuntu-latest', 'ubuntu-24.04', 'ubuntu-22.04', 'ubuntu-24.04-arm', 'windows-latest', 'windows-2022', 'windows-2025', 'windows-11-arm', 'macos-latest', 'macos-14', 'macos-15', 'macos-15-xlarge', 'macos-14-large']) {
+      expect(githubHosted(label), label).toBe(true);
+    }
+    for (const label of ['ubuntu-prod-vpc', 'ubuntu-latest-8-cores', 'windows-gpu', 'macos-mine', 'self-hosted', 'ubuntu', 'Ubuntu-latest']) {
+      expect(githubHosted(label), label).toBe(false);
+    }
+    const w = world('keyless', [[A, INFRA]]);
+    const text = INFRA.replace('  lint:\n    runs-on: ubuntu-latest\n', '  lint:\n    runs-on: ubuntu-prod-vpc\n');
+    expect(planVerifyInserts(w.a.draft, new Map([[A, text]]), w.a.verify).inserts[0]?.inserted.needs.map((n) => n.job)).toContain('lint');
+  });
+
+  it('G7-R3 5: HEAD_CHECK_ENV has its own doc comment', () => {
+    const src = readFileSync('src/engine/deploy-steps.ts', 'utf8');
+    expect(src).toMatch(/\/\*\*[^\n]*\*\/\nexport const HEAD_CHECK_ENV:/);
   });
 });

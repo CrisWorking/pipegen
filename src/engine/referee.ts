@@ -61,6 +61,7 @@ import { slotProblem, type SlotKind } from './slots.js';
 import { expectedSigningSteps, signedImageOwner } from './signing.js';
 import { NO_IMAGE_CATEGORIES, noImageServices, publishedImageServices, WORKFLOW_LINT_TOOL } from './needs.js';
 import { FIND_RUN_STEP_ID, renderDigestStep, renderHeadCheckStep, renderPublishDigestStep } from './deploy-steps.js';
+import { strongReason } from './deploy-gating.js';
 import { ARCHIVE_TOOL_IDS, imageBuildTag, renderImageArchiveScan, renderImageBuild } from './image-handoff.js';
 import { dastStartOf, renderDastRun, renderDastScrub } from './dast-handoff.js';
 import { SHARED_CDN_SETS } from './egress.js';
@@ -2122,9 +2123,18 @@ function judgeEdited(fc: FileCtx, parsed: Parsed, mark: PipegenInserted): void {
     const heads: unknown[] = mark.headCheck === undefined ? [] : Array.isArray(mark.headCheck) ? mark.headCheck : [null];
     let want: unknown = null;
     try { want = stepsToYaml([renderHeadCheckStep(fc.draft.profile.defaultBranch)]).toJSON()[0]; } catch (e) { if (!(e instanceof RenderError)) throw e; }
+    // G7-R3: a job may wait without the head check (needsOnly) only when its one reason to wait is WEAK (its runner or vars): a job with a
+    // STRONG reason (a deploy, an environment, a secret, a write or OIDC permission, unset permissions, a call) always starts with the check
+    const only: unknown[] = mark.needsOnly === undefined ? [] : Array.isArray(mark.needsOnly) ? mark.needsOnly : [null];
+    for (const id of only) {
+      const o = typeof id === 'string' && isObj(origJobs[id]) ? origJobs[id] : undefined;
+      if (typeof id !== 'string' || o === undefined || !mark.needs.some((n) => isObj(n) && n.job === id) || heads.includes(id)) { bad('template', `The job ${show(id)} marked to wait without a head check is not a job pipegen gates without one.`); continue; }
+      const strong = strongReason(o, orig.parsed.js.permissions);
+      if (strong !== null) bad('template', `The job ${show(id)} may not wait without pipegen's head check: ${strong}.`);
+    }
     for (const n of mark.needs) {
       const j = isObj(n) && typeof n.job === 'string' ? restJobs[n.job] : undefined;
-      if (isObj(j) && j.uses === undefined && !heads.includes(n.job)) bad('template', `The job ${show(n.job)} waits for pipegen-verify but does not start with pipegen's head check, so a re-run of that job alone, or one that waited for an approval, would not be checked.`);
+      if (isObj(j) && j.uses === undefined && !heads.includes(n.job) && !only.includes(n.job)) bad('template', `The job ${show(n.job)} waits for pipegen-verify but does not start with pipegen's head check, so a re-run of that job alone, or one that waited for an approval, would not be checked.`);
     }
     for (const id of heads) {
       const j = typeof id === 'string' ? restJobs[id] : undefined;

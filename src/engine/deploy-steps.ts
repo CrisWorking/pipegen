@@ -42,9 +42,9 @@ export function publishedImageRepo(owner: string, repo: string, service: string)
   return r;
 }
 
-/** The one expression each step's env holds, exactly (job-rules.ts checkExpressions accepts these and nothing else for these ids). */
 /** The head check's working-directory (G7-R2 1a): the one expression checkExpressions accepts in that field, on that step only. */
 export const HEAD_CHECK_DIR = '${{ runner.temp }}';
+/** The one expression each step's env holds, exactly (job-rules.ts checkExpressions accepts these and nothing else for these ids). */
 export const HEAD_CHECK_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_HEAD_TOKEN: '${{ github.token }}' });
 export const DIGEST_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({
   PIPEGEN_RUN_ID: `\${{ steps.${FIND_RUN_STEP_ID}.outputs.run-id }}`, PIPEGEN_DIGEST_TOKEN: '${{ github.token }}',

@@ -21,6 +21,7 @@ import { statfsSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import type { Octokit } from '@octokit/rest';
 import { Document, isMap, isScalar, isSeq, parseDocument, type Node as YamlNode, type Pair } from 'yaml';
+import { callsWorkflow, plainUbuntu, readsContents, strongReason, weakReason } from '../engine/deploy-gating.js';
 import { BUILD_PUSH_STEP_ID, HEAD_CHECK_STEP_ID, imageDigestArtifact, publishedImageRepo, PUBLISH_TAG, renderPublishDigestStep } from '../engine/deploy-steps.js';
 import type { RateClock } from '../engine/github-rate.js';
 import { CALLER_WORKFLOW, isDangerousName, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PUSH_WORKFLOW, type RenderedStep } from '../engine/job-rules.js';
@@ -158,7 +159,8 @@ const JOB = 2;
  * the file without pipegen's job, needs and head checks is the original exactly (parsed), and the job is the verify job exactly; anything
  * else throws (a gap).
  */
-export function insertVerify(original: string, deployJobs: readonly string[], verify: Job): { text: string; inserted: PipegenInserted; insertions: Insertion[] } {
+export function insertVerify(original: string, deployJobs: readonly string[], verify: Job, needsOnly: readonly string[] = []): { text: string; inserted: PipegenInserted; insertions: Insertion[] } {
+  if (needsOnly.some((id) => !deployJobs.includes(id))) refuse('a job that waits without the head check must be one it gates');
   if (deployJobs.length === 0) refuse('no job to gate');
   const { map } = parsedDoc(original);
   if (pairOf(map, VERIFY_JOB) !== undefined) refuse(`it already has a job named ${VERIFY_JOB}; rename that job, then run pipegen again`);
@@ -208,7 +210,8 @@ export function insertVerify(original: string, deployJobs: readonly string[], ve
       } else refuse(`the needs of its job ${show(id)} are not a list of job names`);
     }
     // G7-R1 sec I1: the head check, first, in every gated job that has steps (a call of another workflow has none)
-    if (pairOf(job, 'uses') !== undefined) continue;
+    // G7-R3: a WEAK job that can not take the step (needsOnly) waits with needs only
+    if (pairOf(job, 'uses') !== undefined || needsOnly.includes(id)) continue;
     const steps = pairOf(job, 'steps');
     const sv = steps?.value;
     if (steps === undefined || !isSeq(sv) || sv.flow === true || sv.items.length === 0) refuse(`its job ${show(id)} has no block list of steps to start with pipegen's head check; write its steps as a - list, then run pipegen again`);
@@ -227,7 +230,7 @@ export function insertVerify(original: string, deployJobs: readonly string[], ve
   let from = 0;
   for (const i of ranked) { text += original.slice(from, i.at) + i.text; from = i.at; }
   text += original.slice(from);
-  const inserted: PipegenInserted = { original, jobs: [VERIFY_JOB], needs: [...new Set(deployJobs)].map((job) => ({ job, added: [VERIFY_JOB] })), headCheck: headJobs };
+  const inserted: PipegenInserted = { original, jobs: [VERIFY_JOB], needs: [...new Set(deployJobs)].map((job) => ({ job, added: [VERIFY_JOB] })), headCheck: headJobs, ...(needsOnly.length > 0 ? { needsOnly: [...new Set(needsOnly)] } : {}) };
   checkEdit(text, inserted, verify);
   return { text, inserted, insertions: ranked.map(({ at, text: t }) => ({ at, text: t })) };
 }
@@ -313,46 +316,10 @@ function userTopProblem(js: Obj): string | null {
   return null;
 }
 
-/** Whether a job is a call of another workflow (job-level `uses`): it has no steps of its own to start with the head check. */
-const callsWorkflow = (job: unknown): boolean => isObj(job) && job.uses !== undefined;
 /** The jobs an insert started with the head check. */
 const headCheckJobs = (mark: PipegenInserted): string[] => mark.headCheck ?? [];
-/** A job's permissions: its own, else the workflow's (undefined: the repository's default, which may be write). */
-const permissionsOf = (job: unknown, top: unknown): unknown => (isObj(job) && job.permissions !== undefined ? job.permissions : top);
-/** Whether the job's token can read the branch (the head check's API call): no permissions set, read-all or write-all, or contents read or write. */
-function readsContents(job: unknown, top: unknown): boolean {
-  const p = permissionsOf(job, top);
-  if (p === undefined || p === 'read-all' || p === 'write-all') return true;
-  return isObj(p) && (p.contents === 'read' || p.contents === 'write');
-}
-/** A GitHub-hosted runner label, written plainly (no expression, list or map): ubuntu-*, windows-* or macos-*. */
-const githubHosted = (runsOn: unknown): boolean => typeof runsOn === 'string' && /^(?:ubuntu|windows|macos)-[a-z0-9.-]{1,40}$/.test(runsOn);
-/** G7-R2 1c: a runner pipegen's head check is written for (a GitHub-hosted ubuntu label, no job container): bash, curl and jq on the fixed PATH. */
-const plainUbuntu = (job: unknown): boolean => isObj(job) && job.container === undefined && typeof job['runs-on'] === 'string' && /^ubuntu-[a-z0-9.-]{1,40}$/.test(job['runs-on']);
 /** G7-R-sec1: every step's if: of a job runs only when the steps before it passed (the job-level rule, gatedIfAllowed, per step). */
 const stepsGated = (job: unknown): boolean => isObj(job) && (!Array.isArray(job.steps) || job.steps.every((st) => !isObj(st) || gatedIfAllowed(st.if)));
-/**
- * G7-R1 sec I2: why a job the deploy detector does not flag may still deploy (so it waits for the check), or null when it plainly can not:
- * it names no secret but the workflow token (and no `secrets:` of a call), its permissions (its own, else the workflow's) are set and only
- * read (no write, no id-token), it has no environment and it calls no other workflow. Unset permissions may be the repository's write default.
- */
-function mayDeploy(job: unknown, top: unknown): string | null {
-  if (!isObj(job)) return 'it can not be read';
-  if (callsWorkflow(job)) return 'it calls another workflow';
-  if (job.environment !== undefined && job.environment !== null) return 'it has an environment';
-  // G7-R2 2 (sec M2): a runner of the user's own (self-hosted, a group or label map, an expression) may hold credentials of its own, and a
-  // configuration variable may hold a deploy hook: either may deploy without a secret
-  if (!githubHosted(job['runs-on'])) return 'it runs on a runner of its own, which may hold credentials';
-  if (/\bvars\s*\./.test(JSON.stringify(job))) return 'it reads a configuration variable (vars), which may be a deploy hook';
-  const text = JSON.stringify(job).replace(/\bsecrets\s*\.\s*GITHUB_TOKEN\b/gi, '');
-  if (/\bsecrets\b/i.test(text)) return 'it uses a secret';
-  const p = permissionsOf(job, top);
-  if (p === undefined) return 'it sets no permissions, so it may get a write token';
-  if (p === 'read-all') return null;
-  if (!isObj(p)) return 'its permissions are not read only';
-  for (const [k, v] of Object.entries(p)) if (v === 'write' || (k === 'id-token' && v !== 'none')) return 'it has a write permission or an OIDC token';
-  return null;
-}
 
 /**
  * The verify inserts of a draft's deploy workflows (see the file header). `texts`: each workflow's text as read (path → text); `verify`: the
@@ -381,22 +348,36 @@ export function planVerifyInserts(draft: PipelineDraft, texts: ReadonlyMap<strin
     if (top !== null) { gap(`pipegen can not add its job: ${top}`, triggers); continue; }
     const jobs = isObj(js.jobs) ? js.jobs : {};
     const ids = Object.keys(jobs);
-    // S15 and G7-R1 sec I2: the deploy detector per job, and a job is left out only when it plainly can not deploy (no secret but the
-    // workflow token, only read permissions of its own, no environment, no call of another workflow); when the detector tells no job apart,
-    // every job waits for the check
+    // S15, G7-R1 sec I2, G7-R3: why each job waits (src/engine/deploy-gating.ts). When the detector tells no job apart, every job waits (a
+    // STRONG reason: pipegen could not tell). The workflow-level gap rules apply to STRONG jobs only; a WEAK job (only its runner or vars)
+    // never makes the workflow a gap
     const found = ids.filter((id) => jobDeploys(jobs[id]));
-    const deployJobs = found.length === 0 ? ids : ids.filter((id) => jobDeploys(jobs[id]) || mayDeploy(jobs[id], js.permissions) !== null);
-    const left = ids.filter((id) => !deployJobs.includes(id));
-    const ungated = deployJobs.filter((id) => !gatedIfAllowed(isObj(jobs[id]) ? (jobs[id] as Obj).if : undefined));
-    if (ungated.length > 0) { gap(`its job ${ungated.map(show).join(', ')} has an if: that could run it even when pipegen's check fails (always(), failure(), or a top-level ||); change it to success() && <your condition>`, triggers); continue; }
+    const strong = new Map<string, string>();
+    const weak = new Map<string, string>();
+    for (const id of ids) {
+      const sr = found.length === 0 ? 'pipegen could not tell which job deploys, so every job waits' : strongReason(jobs[id], js.permissions);
+      if (sr !== null) { strong.set(id, sr); continue; }
+      const wr = weakReason(jobs[id]);
+      if (wr !== null) weak.set(id, wr);
+    }
+    const why = (id: string): string => `${show(id)} (${strong.get(id) ?? weak.get(id) ?? ''})`;
+    const strongIds = [...strong.keys()];
+    const ungated = strongIds.filter((id) => !gatedIfAllowed(isObj(jobs[id]) ? (jobs[id] as Obj).if : undefined));
+    if (ungated.length > 0) { gap(`its job ${ungated.map(why).join(', ')} has an if: that could run it even when pipegen's check fails (always(), failure(), or a top-level ||); change it to success() && <your condition>`, triggers); continue; }
     // G7-R-sec1: a later step whose if: can run when an earlier step failed (always(), failure(), cancelled(), a top-level ||) would still
     // deploy after pipegen's head check failed, so such a job is not protected: the workflow is a gap
-    const stepIfs = deployJobs.filter((id) => !callsWorkflow(jobs[id]) && !stepsGated(jobs[id]));
-    if (stepIfs.length > 0) { gap(`a step of its job ${stepIfs.map(show).join(', ')} has an if: that could run it after pipegen's head check failed (always(), failure(), cancelled(), or a top-level ||); change it to success() && <your condition>`, triggers); continue; }
-    const noContents = deployJobs.filter((id) => !callsWorkflow(jobs[id]) && !readsContents(jobs[id], js.permissions));
-    if (noContents.length > 0) { gap(`its job ${noContents.map(show).join(', ')} sets permissions without contents: read, which pipegen's head check in that job needs to read the branch; add contents: read to that job's permissions`, triggers); continue; }
+    const stepIfs = strongIds.filter((id) => !callsWorkflow(jobs[id]) && !stepsGated(jobs[id]));
+    if (stepIfs.length > 0) { gap(`a step of its job ${stepIfs.map(why).join(', ')} has an if: that could run it after pipegen's head check failed (always(), failure(), cancelled(), or a top-level ||); change it to success() && <your condition>`, triggers); continue; }
+    const noContents = strongIds.filter((id) => !callsWorkflow(jobs[id]) && !readsContents(jobs[id], js.permissions));
+    if (noContents.length > 0) { gap(`its job ${noContents.map(why).join(', ')} sets permissions without contents: read, which pipegen's head check in that job needs to read the branch; add contents: read to that job's permissions`, triggers); continue; }
+    // G7-R3 1: a WEAK job whose own if: defeats needs is left out (said so); else it waits, with the head check only when it can take it
+    const weakOut = [...weak.keys()].filter((id) => !gatedIfAllowed(isObj(jobs[id]) ? (jobs[id] as Obj).if : undefined));
+    const weakIn = [...weak.keys()].filter((id) => !weakOut.includes(id));
+    const needsOnly = weakIn.filter((id) => !(plainUbuntu(jobs[id]) && stepsGated(jobs[id]) && readsContents(jobs[id], js.permissions)));
+    const deployJobs = ids.filter((id) => strong.has(id) || weakIn.includes(id));
+    const left = ids.filter((id) => !strong.has(id) && !weak.has(id));
     let edit: ReturnType<typeof insertVerify>;
-    try { edit = insertVerify(text, deployJobs, verify); } catch (e) {
+    try { edit = insertVerify(text, deployJobs, verify, needsOnly); } catch (e) {
       if (!(e instanceof EditRefused || e instanceof RenderError)) throw e;
       gap(`pipegen can not add its check without changing the rest of the file: ${safeText(e.message, 200)}`, triggers);
       continue;
@@ -404,8 +385,18 @@ export function planVerifyInserts(draft: PipelineDraft, texts: ReadonlyMap<strin
     const file: CreatedFile = { path: wf.path, content: edit.text, part: 'deploy-verify', reason: `Adds the ${VERIFY_JOB} job, which proves the commit passed the gate (and, for an image, that pipegen signed it) before ${deployJobs.length === 1 ? 'the deploy job runs' : 'the deploy jobs run'}, and starts each of them with pipegen's head check.`, repo: 'app', inserted: edit.inserted };
     out.inserts.push({ path: wf.path, text: edit.text, inserted: edit.inserted, insertions: edit.insertions, file });
     out.preview.push(`${wf.path}: pipegen adds the job ${VERIFY_JOB}, and ${deployJobs.map(show).join(', ')} ${deployJobs.length === 1 ? 'waits' : 'wait'} for it${found.length === 0 ? ' (pipegen could not tell which job deploys, so every job waits)' : ''}.`);
+    // G7-R3: each gated job's reason (why pipegen counts it as a deploy)
+    if (found.length > 0) for (const id of deployJobs) out.preview.push(`${wf.path}: ${show(id)} counts as a deploy job: ${strong.get(id) ?? weak.get(id) ?? ''}.`);
+    for (const id of weakOut) {
+      const line = `${wf.path}: ${show(id)} may deploy (${weak.get(id) ?? ''}), but its if: could run it even when pipegen's check fails, so pipegen leaves it out; change its if: to success() && <your condition> to have it wait for ${VERIFY_JOB}.`;
+      out.preview.push(line);
+      out.notes.push(line);
+    }
+    for (const id of needsOnly) {
+      out.notes.push(`${wf.path}: ${show(id)} waits for ${VERIFY_JOB} but gets no head check (${weak.get(id) ?? ''}; it is not on GitHub's ubuntu runner, or has a step that runs after a failure, or no contents: read), so it waits for the check; an older commit can still run after an approval wait or a re-run of this job alone. Re-run all jobs (never this job alone) after a newer commit.`);
+    }
     for (const id of left) {
-      const line = `${wf.path}: ${show(id)} does not wait for ${VERIFY_JOB}: it shows no deploy, uses no secret but the workflow token, has only read permissions, no environment, and calls no other workflow.`;
+      const line = `${wf.path}: ${show(id)} does not wait for ${VERIFY_JOB}: it shows no deploy, uses no secret but the workflow token, has only read permissions, no environment, calls no other workflow, runs on a GitHub-hosted runner, and reads no configuration variable.`;
       out.preview.push(line);
       out.notes.push(line);
     }
