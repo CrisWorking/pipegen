@@ -1183,6 +1183,20 @@ describe('G7-R3: STRONG and WEAK reasons; a job gated only by its runner or vars
     expect(r.issues.some((i) => /"deploy" may not wait without pipegen's head check: it has an environment/.test(i.message)), shown(r)).toBe(true);
   });
 
+  it('G7-R3 1b: a WEAK job on plain GitHub ubuntu (vars only, contents: read, no status if) gets needs and the head check; only the others are needs-only', async () => {
+    const text = wf(['    runs-on: ubuntu-latest', '    permissions: { contents: read }', '    steps:', '      - run: curl -X POST "${{ vars.HOOK_URL }}"']);
+    const w = world('keyless', [[A, text]]);
+    expect(w.v.gaps).toEqual([]);
+    const ins = w.v.inserts[0] as VerifyPlan['inserts'][number];
+    expect(ins.inserted.needs.map((n) => n.job)).toEqual(['test', 'deploy']);
+    expect(ins.inserted.headCheck).toEqual(['test', 'deploy']);
+    expect(ins.inserted.needsOnly).toBeUndefined();
+    expect(((jobsIn(ins.text).test as Obj).steps as Obj[])[0]?.id).toBe('pipegen-head-check');
+    expect(w.v.preview.join('\n')).toMatch(/"test" counts as a deploy job: it reads a configuration variable \(vars\)/);
+    expect(w.v.notes.join('\n')).not.toMatch(/"test" waits for pipegen-verify but gets no head check/);
+    expect(shown(await judge(w))).toBe('');
+  });
+
   it('G7-R3 2: the vars rule catches vars[\'X\'], VARS.X and toJSON(vars)', () => {
     const w = world('keyless', [[A, INFRA]]);
     for (const ref of ["${{ vars['HOOK_URL'] }}", '${{ VARS.HOOK_URL }}', '${{ toJSON(vars) }}']) {
