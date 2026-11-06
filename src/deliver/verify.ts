@@ -13,6 +13,7 @@
 //     required workflow rule's every workflow entry pinned to record.orgRuleset.pinnedSha, that commit on the central default branch; a lock
 //     stricter than pipegen set it (more approvals, a review switch on that pipegen leaves off) is a note ("stricter"), not drift;
 //   - the pinned central commit (record.centralSha) on the central default branch's history.
+//   - G13 (carry 62): key-env only, the signing environment pipegen-signing is still limited to the default branch (one custom branch rule).
 // It also warns (G29) about CODEOWNERS rules after pipegen's block that name only teams (the workflow's own token can't read a team's
 // members, so the gate can't check those approvals), and says (G26) that a key rotation resets the baseline.
 import type { Octokit } from '@octokit/rest';
@@ -26,8 +27,8 @@ import { clockOf } from '../github/client.js';
 import { CENTRAL_RULESET, CO_PLACES, GATE_RULESET, REVIEWS_RULESET } from '../layers/locks.js';
 import { GATE_CHECK_INTEGRATION_ID, GATE_CHECK_NAME, PROTECTED_PATHS_BASE, type InstallRecord } from '../types.js';
 import { safeText } from '../util/safe-text.js';
-import { SETUP_BRANCH } from './deliver.js';
-import { compareStatus, readBlobText, readHead, readRepo, readTree, statusOf, type RepoRef, type TreeEntry } from './git-data.js';
+import { readEnv, SETUP_BRANCH } from './deliver.js';
+import { compareStatus, DeliverError, readBlobText, readHead, readRepo, readTree, statusOf, type RepoRef, type TreeEntry } from './git-data.js';
 import { centralOf, readLocalRecord, readRecord, RecordError, recordMarkerOf, recordPath, type LocalRecordDeps } from './record.js';
 import { classicPutForm, holdsWanted, isObj, SettingsApi } from './settings-api.js';
 
@@ -102,6 +103,29 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
     const v = await api.readOr404('GET /repos/{owner}/{repo}/environments/{environment_name}/variables/{name}', { owner: app.owner, repo: app.repo, environment_name: SIGNING_ENVIRONMENT, name: 'PIPEGEN_COSIGN_PUB' });
     const actual = isObj(v) && typeof v.value === 'string' ? pubKeySha256(v.value) : null;
     if (actual !== r.cosignPubSha256) drift.push({ what: 'PIPEGEN_COSIGN_PUB (sha256)', expected: r.cosignPubSha256, actual });
+  }
+
+  // G13 (carry 62): key-env signing is safe only while pipegen-signing stays usable from the default branch alone (S11, DEC #86): one custom
+  // branch rule naming the default branch, nothing else. A missing environment or policy, protected branches, another rule: drift.
+  if (r.planned.signingMode === 'key-env' || r.cosignPubSha256 !== undefined) {
+    const what = `environment ${SIGNING_ENVIRONMENT} (default branch only)`;
+    const expected = `only ${show(r.app.defaultBranch, 100)} may use it`;
+    let actual: string | null;
+    try {
+      const e = await readEnv(gh, app, clock);
+      const dbp = e?.settings.deployment_branch_policy;
+      if (e === null || e === undefined) actual = null;
+      else if (dbp === null || dbp === undefined) actual = 'any branch';
+      else if (dbp.custom_branch_policies !== true || dbp.protected_branches !== false) actual = dbp.protected_branches ? 'protected branches' : 'no branch rule';
+      else {
+        const only = e.policies.length === 1 && e.policies[0]?.type === 'branch' && e.policies[0].name === r.app.defaultBranch;
+        actual = only ? '' : e.policies.length === 0 ? 'no branch rule' : e.policies.map((x) => `${x.type} ${show(x.name, 60)}`).join(', ');
+      }
+    } catch (err) {
+      if (!(err instanceof DeliverError)) throw err;
+      actual = `unreadable (${show(err.message, 160)})`;
+    }
+    if (actual !== '') drift.push({ what, expected, actual });
   }
 
   // a commit on the central default branch's history: compare says the branch is the commit or ahead of it (null: GitHub can't compare)

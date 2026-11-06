@@ -805,6 +805,33 @@ describe('G11 verify', () => {
     expect((await v(s)).drift).toEqual([{ what: 'PIPEGEN_COSIGN_PUB (sha256)', expected: pubKeySha256(PUB), actual: pubKeySha256(cosignPub(99)) }]);
   });
 
+  it('verify: pipegen-signing no longer limited to the default branch → drift', async () => {
+    const what = 'environment pipegen-signing (default branch only)';
+    const env = (s: Seed) => s.g.repo('o/r').envs.get('pipegen-signing') as NonNullable<ReturnType<ReturnType<Seed['g']['repo']>['envs']['get']>>;
+    // missing policy (any branch may deploy)
+    let s = await finished({ keyEnv: true });
+    env(s).deployment_branch_policy = null;
+    expect((await v(s)).drift.filter((d) => d.what === what)).toEqual([{ what, expected: 'only main may use it', actual: 'any branch' }]);
+    // not custom: protected branches instead of the one default-branch rule
+    s = await finished({ keyEnv: true });
+    env(s).deployment_branch_policy = { protected_branches: true, custom_branch_policies: false };
+    expect((await v(s)).drift.filter((d) => d.what === what)).toEqual([{ what, expected: 'only main may use it', actual: 'protected branches' }]);
+    // a second branch rule, and a tag rule
+    s = await finished({ keyEnv: true });
+    env(s).policies.push({ id: 900, name: 'dev', type: 'branch' });
+    expect((await v(s)).drift.filter((d) => d.what === what)).toEqual([{ what, expected: 'only main may use it', actual: 'branch main, branch dev' }]);
+    s = await finished({ keyEnv: true });
+    env(s).policies.splice(0, 1, { id: 901, name: 'main', type: 'tag' });
+    expect((await v(s)).drift.filter((d) => d.what === what)).toEqual([{ what, expected: 'only main may use it', actual: 'tag main' }]);
+    // the environment gone
+    s = await finished({ keyEnv: true });
+    s.g.repo('o/r').envs.delete('pipegen-signing');
+    expect((await v(s)).drift.filter((d) => d.what === what)).toEqual([{ what, expected: 'only main may use it', actual: null }]);
+    // not key-env: no such check
+    s = await finished();
+    expect((await v(s)).drift).toEqual([]);
+  });
+
   it('verify: warns on team-only protected paths and says a key rotation resets the baseline', async () => {
     const s = await finished({ keyEnv: true });
     const co = s.g.filesAt('o/r', s.g.head('o/r')).get('CODEOWNERS') as string;
