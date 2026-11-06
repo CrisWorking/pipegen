@@ -382,7 +382,7 @@ export function planVerifyInserts(draft: PipelineDraft, texts: ReadonlyMap<strin
       gap(`pipegen can not add its check without changing the rest of the file: ${safeText(e.message, 200)}`, triggers);
       continue;
     }
-    const file: CreatedFile = { path: wf.path, content: edit.text, part: 'deploy-verify', reason: `Adds the ${VERIFY_JOB} job, which proves the commit passed the gate (and, for an image, that pipegen signed it) before ${deployJobs.length === 1 ? 'the deploy job runs' : 'the deploy jobs run'}, and starts each of them with pipegen's head check.`, repo: 'app', inserted: edit.inserted };
+    const file: CreatedFile = { path: wf.path, content: edit.text, part: 'deploy-verify', reason: `Adds the ${VERIFY_JOB} job, which proves the commit passed the gate (and, for an image, that pipegen signed it) before ${deployJobs.length === 1 ? 'the deploy job runs' : 'the deploy jobs run'}, and starts each of them with pipegen's head check, except a job that calls another workflow, or one pipegen gates only for its runner or vars and can not start with the check (see the notes).`, repo: 'app', inserted: edit.inserted };
     out.inserts.push({ path: wf.path, text: edit.text, inserted: edit.inserted, insertions: edit.insertions, file });
     out.preview.push(`${wf.path}: pipegen adds the job ${VERIFY_JOB}, and ${deployJobs.map(show).join(', ')} ${deployJobs.length === 1 ? 'waits' : 'wait'} for it${found.length === 0 ? ' (pipegen could not tell which job deploys, so every job waits)' : ''}.`);
     // G7-R3: each gated job's reason (why pipegen counts it as a deploy)
@@ -393,7 +393,9 @@ export function planVerifyInserts(draft: PipelineDraft, texts: ReadonlyMap<strin
       out.notes.push(line);
     }
     for (const id of needsOnly) {
-      out.notes.push(`${wf.path}: ${show(id)} waits for ${VERIFY_JOB} but gets no head check (${weak.get(id) ?? ''}; it is not on GitHub's ubuntu runner, or has a step that runs after a failure, or no contents: read), so it waits for the check; an older commit can still run after an approval wait or a re-run of this job alone. Re-run all jobs (never this job alone) after a newer commit.`);
+      const line = `${wf.path}: ${show(id)} waits for ${VERIFY_JOB} but gets no head check (${weak.get(id) ?? ''}; it is not on GitHub's ubuntu runner, or has a step that runs after a failure, or no contents: read), so it waits for the check; an older commit can still run after an approval wait or a re-run of this job alone. Re-run all jobs (never this job alone) after a newer commit.`;
+      out.preview.push(line);
+      out.notes.push(line);
     }
     for (const id of left) {
       const line = `${wf.path}: ${show(id)} does not wait for ${VERIFY_JOB}: it shows no deploy, uses no secret but the workflow token, has only read permissions, no environment, calls no other workflow, runs on a GitHub-hosted runner, and reads no configuration variable.`;
@@ -422,7 +424,7 @@ export function planVerifyInserts(draft: PipelineDraft, texts: ReadonlyMap<strin
   if (out.inserts.length > 0) {
     out.notes.push(`The ${VERIFY_JOB} job outputs the verified image digest (needs.${VERIFY_JOB}.outputs.digest): a signature protects only a deploy that uses that digest.`);
     // G7-R1 sec I1 (for G9's PIPEGEN.md): what the head check in the deploy job covers, and how to re-run and queue deploys
-    out.notes.push(`Each deploy job starts with pipegen's head check, so a deploy that waited for an approval, or a re-run of an older run, stops once a newer commit is on the default branch. When a deploy fails, use "Re-run all jobs": "Re-run failed jobs" reuses ${VERIFY_JOB}'s earlier result. To keep two deploys from overlapping, give each deploy job a concurrency group, for example \`concurrency: { group: deploy-production, cancel-in-progress: false }\`.`);
+    out.notes.push(`Each deploy job starts with pipegen's head check, except a job that calls another workflow, or one pipegen gates only for its runner or vars and can not start with the check (see the notes), so a deploy that waited for an approval, or a re-run of an older run, stops once a newer commit is on the default branch. When a deploy fails, use "Re-run all jobs": "Re-run failed jobs" reuses ${VERIFY_JOB}'s earlier result. To keep two deploys from overlapping, give each deploy job a concurrency group, for example \`concurrency: { group: deploy-production, cancel-in-progress: false }\`.`);
   }
   return out;
 }

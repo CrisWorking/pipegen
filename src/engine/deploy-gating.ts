@@ -12,12 +12,20 @@ type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => v !== null && typeof v === 'object' && !Array.isArray(v);
 
 /**
- * GitHub's own runner image labels, a closed list (G7-R3 3): ubuntu latest/24.04/22.04 (and -arm), windows latest/2025/2022/2019 and 11-arm,
- * macos latest/26/15/14/13 (and the documented -large, -xlarge and -intel). A label of any other shape (`ubuntu-prod-vpc`, a larger runner's
- * name the organization chose, `self-hosted`, a list, a map, an expression) is a runner of the user's own.
+ * GitHub's own runner image labels, a closed list of exact names (G7-R3 3, G7-R3b M4), from GitHub's docs page "GitHub-hosted runners
+ * reference" (docs.github.com/en/actions/reference/runners/github-hosted-runners), with the retired windows-2019 and macos-13 images left out.
+ * Any other label (`ubuntu-latest-arm`, `ubuntu-prod-vpc`, a larger runner's name the organization chose, `self-hosted`, a list, a map, an
+ * expression, a label GitHub adds later) is a runner of the user's own: that fails safe (the job waits for the check).
  */
-const HOSTED_RE = /^(?:ubuntu-(?:latest|24\.04|22\.04)(?:-arm)?|windows-(?:latest|2025|2022|2019)|windows-11-arm|macos-(?:latest|26|15|14|13)(?:-large|-xlarge|-intel)?)$/;
-export const githubHosted = (runsOn: unknown): boolean => typeof runsOn === 'string' && HOSTED_RE.test(runsOn);
+const HOSTED_LABELS: ReadonlySet<string> = new Set([
+  'ubuntu-latest', 'ubuntu-24.04', 'ubuntu-22.04', 'ubuntu-24.04-arm', 'ubuntu-22.04-arm',
+  'windows-latest', 'windows-2025', 'windows-2022', 'windows-11-arm',
+  'macos-latest', 'macos-26', 'macos-15', 'macos-14',
+  'macos-latest-large', 'macos-15-large', 'macos-14-large',
+  'macos-latest-xlarge', 'macos-15-xlarge', 'macos-14-xlarge',
+  'macos-15-intel',
+]);
+export const githubHosted = (runsOn: unknown): boolean => typeof runsOn === 'string' && HOSTED_LABELS.has(runsOn);
 /** A job pipegen's head check is written for (G7-R2 1c): a GitHub-hosted ubuntu label and no job container (bash, curl, jq on the fixed PATH). */
 export const plainUbuntu = (job: unknown): boolean => isObj(job) && job.container === undefined && githubHosted(job['runs-on']) && String(job['runs-on']).startsWith('ubuntu-');
 /** A call of another workflow (job-level `uses`): no steps of its own. */
@@ -31,12 +39,24 @@ export function readsContents(job: unknown, top: unknown): boolean {
   return isObj(p) && (p.contents === 'read' || p.contents === 'write');
 }
 
+/**
+ * Every key and string of a parsed job as raw text, one per line (G7-R3b M1): the secrets and vars scans run on what the user wrote, not on
+ * JSON.stringify's escapes (which turn a newline or a tab right before `secrets` into `\n` / `\t` and defeat `\b`).
+ */
+function rawText(v: unknown, out: string[] = []): string[] {
+  if (typeof v === 'string') out.push(v);
+  else if (typeof v === 'number' || typeof v === 'boolean') out.push(String(v));
+  else if (Array.isArray(v)) for (const x of v) rawText(x, out);
+  else if (isObj(v)) for (const [k, x] of Object.entries(v)) { out.push(k); rawText(x, out); }
+  return out;
+}
+
 /** The STRONG reason a job may deploy (see the header), or null. `top`: the workflow's own permissions. */
 export function strongReason(job: unknown, top: unknown): string | null {
   if (!isObj(job)) return 'it can not be read';
   if (jobDeploys(job)) return job.environment !== undefined && job.environment !== null ? 'it has an environment' : 'it deploys';
   if (callsWorkflow(job)) return 'it calls another workflow';
-  const text = JSON.stringify(job).replace(/\bsecrets\s*\.\s*GITHUB_TOKEN\b/gi, '');
+  const text = rawText(job).join('\n').replace(/\bsecrets\s*\.\s*GITHUB_TOKEN\b/gi, '');
   if (/\bsecrets\b/i.test(text)) return 'it uses a secret';
   const p = permissionsOf(job, top);
   if (p === undefined) return 'it sets no permissions, so it may get a write token';
@@ -50,6 +70,6 @@ export function strongReason(job: unknown, top: unknown): string | null {
 export function weakReason(job: unknown): string | null {
   if (!isObj(job)) return null;
   if (!githubHosted(job['runs-on'])) return 'it runs on a runner of its own, which may hold credentials';
-  if (/\bvars\b/i.test(JSON.stringify(job))) return 'it reads a configuration variable (vars), which may be a deploy hook';
+  if (/\bvars\b/i.test(rawText(job).join('\n'))) return 'it reads a configuration variable (vars), which may be a deploy hook';
   return null;
 }

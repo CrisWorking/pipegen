@@ -1217,6 +1217,38 @@ describe('G7-R3: STRONG and WEAK reasons; a job gated only by its runner or vars
     expect(planVerifyInserts(w.a.draft, new Map([[A, text]]), w.a.verify).inserts[0]?.inserted.needs.map((n) => n.job)).toContain('lint');
   });
 
+  it('G7-R3b M1: a newline or tab right before secrets or vars does not hide it', () => {
+    const w = world('keyless', [[A, INFRA]]);
+    const cases: [string, string, RegExp][] = [
+      ['newline before secrets', '      - run: |\n          curl -H "X-Hook: ${{\n          secrets.HOOK_TOKEN }}" https://hooks.example.com/x\n', /it uses a secret/],
+      ['tab before secrets', '      - run: "curl -H \\"A: ${{\\tsecrets.HOOK_TOKEN }}\\" https://hooks.example.com/x"\n', /it uses a secret/],
+      ['newline before vars', '      - run: |\n          curl -X POST "${{\n          vars.HOOK_URL }}"\n', /it reads a configuration variable/],
+    ];
+    for (const [what, step, reason] of cases) {
+      const text = INFRA.replace('      - run: npm run lint\n', step);
+      expect(text, what).not.toBe(INFRA);
+      const v = planVerifyInserts(w.a.draft, new Map([[A, text]]), w.a.verify);
+      expect(v.inserts[0]?.inserted.needs.map((n) => n.job), what).toContain('lint');
+      expect(v.preview.join('\n'), what).toMatch(new RegExp(`"lint" counts as a deploy job: ${reason.source}`));
+    }
+  });
+
+  it('G7-R3b M4: only exact current GitHub image labels count as hosted (no free suffixes, no retired images)', () => {
+    for (const label of ['ubuntu-latest-arm', 'windows-2019', 'macos-14-intel', 'macos-13', 'macos-13-large', 'macos-13-xlarge', 'macos-latest-intel', 'ubuntu-slim']) {
+      expect(githubHosted(label), label).toBe(false);
+    }
+    for (const label of ['ubuntu-22.04-arm', 'macos-15-intel', 'macos-latest-xlarge', 'macos-15-large', 'windows-2025']) expect(githubHosted(label), label).toBe(true);
+  });
+
+  it('G7-R3b M5: the needs-only line is in the preview; the reason and the generic note name both exceptions', () => {
+    const [, text] = Q[0] as [string, string];
+    const w = world('keyless', [[A, text]]);
+    expect(w.v.preview.join('\n')).toMatch(/"test" waits for pipegen-verify but gets no head check/);
+    const exc = /except a job that calls another workflow, or one pipegen gates only for its runner or vars and can not start with the check \(see the notes\)/;
+    expect(w.v.inserts[0]?.file.reason).toMatch(exc);
+    expect(w.v.notes.join('\n')).toMatch(new RegExp(`Each deploy job starts with pipegen's head check, ${exc.source}`));
+  });
+
   it('G7-R3 5: HEAD_CHECK_ENV has its own doc comment', () => {
     const src = readFileSync('src/engine/deploy-steps.ts', 'utf8');
     expect(src).toMatch(/\/\*\*[^\n]*\*\/\nexport const HEAD_CHECK_ENV:/);
