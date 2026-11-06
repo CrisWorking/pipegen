@@ -843,7 +843,7 @@ function realStages(io: CliIO, deps: RunDeps): RunStages {
       if (sha === undefined) return false;
       try { await f.gh.request('GET /repos/{owner}/{repo}/commits/{ref}', { owner, repo, ref: sha }); return true; } catch { return false; }
     },
-    proofRepos: (f, p, auth, store, runId, actions) => checkProofRepos(f.gh, p, { auth, actions, runId, clock: f.clock, onCreated: onCreatedFor(store, p.repo), createPermit: () => store.createPermit() }, io),
+    proofRepos: (f, p, auth, store, runId, actions) => checkProofRepos(f.gh, p, { auth, actions, runId, clock: f.clock, onCreated: onCreatedFor(store, p.repo), onAccessChanged: (previous) => { store.recordActionsAccess(previous); }, createPermit: () => store.createPermit() }, io),
     needs: (p, caps, bundle, ai, writers, knownValues) => planNeeds(p, caps, bundle, ai, writers, { knownValues }),
     async discover(needs, p, f, reviewed, ai, onUsage) {
       // stage 10 (carry 48): discover per need; an unreviewed action candidate is pinned with its image read, or dropped

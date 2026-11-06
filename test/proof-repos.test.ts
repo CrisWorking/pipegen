@@ -637,3 +637,27 @@ describe('E1 fix round 1: marker (M5), default-branch failures (M4), reads are G
     expect((await githubRead(g.gh, 'GET /user', {})).data).toMatchObject({ login: OWNER });
   });
 });
+
+describe('G13-R2: the Actions access level is reported the moment it changed (ruling G13-R2 3)', () => {
+  it('access: onAccessChanged gets the earlier level right after the PUT, even when the next read fails (PUT ok, then GET 500)', async () => {
+    const seen: string[] = [];
+    const g = world({ repos: both });
+    let put = false;
+    g.gh.hook.wrap('request', async (req, options) => {
+      const route = `${String(options.method)} ${String(options.url)}`;
+      if (put && route.startsWith('GET ')) throw Object.assign(new Error('Server Error'), { status: 500, response: { status: 500, data: { message: 'Server Error' }, headers: {} } });
+      const res = await req(options);
+      if (route === 'PUT /repos/{owner}/{repo}/actions/permissions/access') put = true;
+      return res;
+    });
+    const i = io(true);
+    await expect(checkProofRepos(g.gh, app(), opts({ createPermit: permitFor(app()), onAccessChanged: (previous) => { seen.push(previous); } }), i)).rejects.toThrow();
+    expect(put).toBe(true);
+    expect(seen).toEqual(['none']);
+    // not changed: not called
+    const seen2: string[] = [];
+    const g2 = world({ repos: both, access: 'user' });
+    await checkProofRepos(g2.gh, app(), opts({ createPermit: permitFor(app()), onAccessChanged: (p) => { seen2.push(p); } }), i);
+    expect(seen2).toEqual([]);
+  });
+});
