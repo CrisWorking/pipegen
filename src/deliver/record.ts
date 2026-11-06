@@ -475,18 +475,22 @@ export async function centralPrBase(gh: Octokit, central: RepoRef, appRepo: stri
 }
 
 /**
- * Writes the record to all three places in one call: the central repo (a direct commit, or the central pull request; a direct commit the
- * branch refuses goes through the pull request instead), the setup PR body's marker line, and the local record file. The record is checked
- * against the schema before anything is sent.
+ * How far a writeRecord that threw got (G12-R2 N3, G12-R3 M2): `at: 'central'` = the record is in the central repo (`via`: a direct commit on
+ * the default branch, or the central pull request) but the local record file and the setup PR marker are not updated; `at: 'local'` = central
+ * and the local file are, the setup PR marker is not; undefined = the central record was not written. The error itself is passed through
+ * unchanged (a rate stop stays a rate stop).
  */
+export interface RecordWriteProgress { at: 'central' | 'local'; via: 'direct' | 'pr' }
+export const recordWriteReached = (e: unknown): RecordWriteProgress | undefined => (typeof e === 'object' && e !== null ? REACHED.get(e) : undefined);
+const REACHED = new WeakMap<object, RecordWriteProgress>();
+const reached = (e: unknown, at: RecordWriteProgress['at'], via: RecordWriteProgress['via']): unknown => { if (typeof e === 'object' && e !== null) REACHED.set(e, { at, via }); return e; };
+
 /**
- * How far a writeRecord that threw got (G12-R2 N3): `central` = the record is in the central repo (direct commit or central PR) but the local
- * record file and the setup PR marker are not updated; `local` = central and the local file are, the setup PR marker is not; undefined = the
- * central record was not written. The error itself is passed through unchanged (a rate stop stays a rate stop).
+ * Writes the record to all three places in one call, in this order: the central repo (a direct commit, or the central pull request; a direct
+ * commit the branch refuses goes through the pull request instead), then the local record file (it vouches for what was just written), then
+ * the setup PR body's marker line. The record is checked against the schema before anything is sent. A failure after the central write
+ * carries how far it got (recordWriteReached).
  */
-export const recordWriteReached = (e: unknown): 'central' | 'local' | undefined => (typeof e === 'object' && e !== null ? REACHED.get(e) : undefined);
-const REACHED = new WeakMap<object, 'central' | 'local'>();
-const reached = (e: unknown, at: 'central' | 'local'): unknown => { if (typeof e === 'object' && e !== null) REACHED.set(e, at); return e; };
 
 export async function writeRecord(gh: Octokit, args: WriteRecordArgs): Promise<WriteRecordResult> {
   const clock = args.clock ?? clockOf(gh);
@@ -538,12 +542,12 @@ export async function writeRecord(gh: Octokit, args: WriteRecordArgs): Promise<W
   // it even when the marker below fails), then the setup pull request's body: every earlier marker removed, the new one on the last line
   try {
     await writeLocalRecord(app, { recordHash: hash, setupPr: args.setupPr, updatedAt: (args.now?.() ?? new Date()).toISOString() }, args.local ?? {});
-  } catch (e) { throw reached(e, 'central'); }
+  } catch (e) { throw reached(e, 'central', via); }
   try {
     const pr = await ghRead(gh, 'GET /repos/{owner}/{repo}/pulls/{pull_number}', app, { pull_number: args.setupPr }, clock) as { body?: unknown } | null;
     const body = typeof pr?.body === 'string' ? pr.body : '';
     await ghWrite(gh, 'PATCH /repos/{owner}/{repo}/pulls/{pull_number}', app, { pull_number: args.setupPr, body: withRecordMarker(body, hash) }, clock);
-  } catch (e) { throw reached(e, 'local'); }
+  } catch (e) { throw reached(e, 'local', via); }
   return { recordHash: hash, commit, via, ...(centralPr === undefined ? {} : { centralPr }), notes };
 }
 

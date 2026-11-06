@@ -695,7 +695,8 @@ describe('G12 fix round 2 (G12-R2)', () => {
     const res = await update(w.g.octokit(), app, deps(w));
     expect(res.done).toBe(false);
     expect(prsOf(w, 'o/r')).toEqual([]);   // deploy.yml's gate swap held back too
-    expect(res.notes.join(' ')).toMatch(/doesn't re-pin.*npx pipegen/s);
+    expect(res.notes.join(' ')).toMatch(/doesn't re-pin.*Bring the central file back to pipegen's text, or merge the change by hand/s);
+    expect(res.notes.join(' ')).not.toMatch(/`npx pipegen`/);   // G12-R3 M1: npx pipegen can't re-pin a merged central file
     // public: one file skipped on purpose (m3), another changed: the PR states the skip and closes nothing
     const written = gateFile(NEW, NEW_V);
     const w2 = shell({ [PIPEGEN_YML]: written, [PUSH_YML]: gateFile(OLD, OLD_V) }, false);
@@ -709,7 +710,7 @@ describe('G12 fix round 2 (G12-R2)', () => {
     const r2 = await update(w2.g.octokit(), app, deps(w2));
     expect(r2.done).toBe(true);
     const body = prsOf(w2, 'o/r')[0]?.body ?? '';
-    expect(body).toMatch(/Left on its old pin on purpose.*npx pipegen/s);
+    expect(body).toMatch(/Left on its old pin on purpose.*an edit of yours/s);
     expect(body).not.toContain(`Closes #${prompt.number as number}`);
   });
 
@@ -730,7 +731,14 @@ describe('G12 fix round 2 (G12-R2)', () => {
     // when the central record ref moves, the local record file's place becomes a folder: saving the file then fails
     w2.g.hooks.unshift((call) => { if (call.route === 'PATCH /repos/{owner}/{repo}/git/refs/{ref}' && call.params.repo === 'pipelines') { rmSync(file, { force: true }); mkdirSync(file); writeFileSync(join(file, 'x'), 'x'); } return undefined; });
     const r2 = await update(w2.g.octokit(), app, deps(w2));
-    expect(r2.notes.join(' ')).toMatch(/written in the central repo, but this machine's local record file was not updated.*npx pipegen/);
+    expect(r2.notes.join(' ')).toMatch(/written on the central default branch, but this machine's local record file was not updated.*Remove .*npx pipegen/);
+    // the central PR path (the default branch refuses a direct commit): the trusted record is unchanged, so update again works
+    const w3 = await publicWorld();
+    const file3 = localRecordPath(app, { home: w3.home, env: {} });
+    w3.g.hooks.unshift((call) => (call.route === 'PATCH /repos/{owner}/{repo}/git/refs/{ref}' && call.params.repo === 'pipelines' && call.params.ref === 'heads/main' ? { status: 422 } : undefined));
+    w3.g.hooks.unshift((call) => { if (call.route === 'POST /repos/{owner}/{repo}/git/refs' && call.params.repo === 'pipelines') { rmSync(file3, { force: true }); mkdirSync(file3); writeFileSync(join(file3, 'x'), 'x'); } return undefined; });
+    const r3 = await update(w3.g.octokit(), app, deps(w3));
+    expect(r3.notes.join(' ')).toMatch(/went to the central pull request.*run `pipegen update` again/);
   });
 
   it('N6/N7: central calls match the owner in any case but the path exactly; the m3 note says what differs, also for a quoted gate', async () => {
@@ -743,5 +751,36 @@ describe('G12 fix round 2 (G12-R2)', () => {
     expect(res.notes.join(' ')).toMatch(/pins a value pipegen can't update .*plain form/);
     const w2 = await publicWorld({ written, current: written.replace(`gate@${NEW} # gate-v${NEW_V}`, `gate@${OTHER} # gate-v${NEW_V}`) });
     expect((await update(w2.g.octokit(), app, deps(w2))).notes.join(' ')).toMatch(/pins pipegen's gate at a commit other than the reviewed one/);
+  });
+});
+
+describe('G12 exception round (G12-R3)', () => {
+  const spoofLine = `      - uses: crisworking/pipegen/gate@${OTHER} # gate-v99.0.0`;
+  it('H1: an owner line with a spoofed newer comment is a conflict on run 1, never merged around and laundered into the record', async () => {
+    const written = gateFile(OLD, OLD_V);
+    const edited = written.replace('          mode: nightly', `          mode: nightly\n  spoof:\n    runs-on: ubuntu-24.04\n    steps:\n${spoofLine}`);
+    const w = await publicWorld({ written, current: edited });
+    const res = await update(w.g.octokit(), app, deps(w));
+    expect(res.conflicts.map((c) => c.path)).toEqual([PIPEGEN_YML]);
+    expect(res.conflicts[0]?.why).toMatch(/can't vouch for.*newer/);
+    expect(res.notes.join(' ')).not.toMatch(/a newer pipegen wrote this/);
+    expect(writes(w)).toEqual([]);
+    // the laundered state (a merged blob recorded with ownerEdited): its recorded sha proves nothing about that line
+    const w2 = await publicWorld({ written, current: edited });
+    await vouch(w2, { ...w2.record, files: w2.record.files.map((f) => (f.path === PIPEGEN_YML ? { ...f, shas: [...f.shas, gitBlobSha(edited)], ownerEdited: true as const } : f)) });
+    const r2 = await update(w2.g.octokit(), app, deps(w2));
+    expect(r2.conflicts.map((c) => c.path)).toEqual([PIPEGEN_YML]);
+    expect(r2.notes.join(' ')).not.toMatch(/a newer pipegen wrote this/);
+  });
+
+  it('H1: a verify-job edit (the owner\'s file) with a newer comment is a conflict, not believed', async () => {
+    const deploy = `name: deploy\non: { push: { branches: [main] } }\npermissions: {}\njobs:\n  pipegen-verify:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: crisworking/pipegen/gate@${OLD} # gate-v${OLD_V}\n        with:\n          mode: find-run\n  mine:\n    runs-on: ubuntu-24.04\n    steps:\n${spoofLine}\n`;
+    const w = await publicWorld();
+    w.g.commitOn('o/r', 'main', { '.github/workflows/deploy.yml': deploy }, 'deploy');
+    await vouch(w, { ...w.record, edits: [{ repo: 'app', path: '.github/workflows/deploy.yml', kind: 'verify-job', jobs: ['pipegen-verify'], needs: [], originalSha: gitBlobSha('x'), writtenShas: [gitBlobSha(deploy)] }] });
+    const res = await update(w.g.octokit(), app, deps(w));
+    expect(res.conflicts.find((c) => c.path === '.github/workflows/deploy.yml')?.why).toMatch(/can't vouch for.*newer/);
+    expect(res.notes.join(' ')).not.toMatch(/a newer pipegen wrote this/);
+    expect(appFile(w, '.github/workflows/deploy.yml', UPDATE_BRANCH)).toBe(deploy);   // not written
   });
 });

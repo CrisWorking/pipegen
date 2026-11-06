@@ -37,7 +37,7 @@ import { CENTRAL_REPO } from '../proof/target.js';
 import { FLOOR_NEEDS, type InstallRecord, type RecordRepo, type ReviewedTool } from '../types.js';
 import { safeMarkdown, safeText } from '../util/safe-text.js';
 import { commitFiles, DeliverError, ghRead, statusOf, openOrUpdatePr, readBlobText, readHead, readRepo, readTree, setBranch, type RepoRef, type TreeEntry } from './git-data.js';
-import { centralOf, centralUpdateBranch, readLocalRecord, RecordError, recordWriteReached, writeRecord, type LocalRecordDeps } from './record.js';
+import { centralOf, centralUpdateBranch, localRecordPath, readLocalRecord, RecordError, recordWriteReached, writeRecord, type LocalRecordDeps } from './record.js';
 import { trustedPrevious } from './trust.js';
 
 // ---------- constants ----------
@@ -532,16 +532,17 @@ export function deriveNotProven(text: string, promote: readonly string[]): { tex
 
 // ---------- planning (reads only) ----------
 
-interface Touchable { repo: RecordRepo; path: string; entry: 'file' | 'edit'; shas: readonly string[] }
+/** ownerEdited: the record's marker (a file `pipegen update` merged into the owner's text, or any verify-job edit: the owner's file). */
+interface Touchable { repo: RecordRepo; path: string; entry: 'file' | 'edit'; shas: readonly string[]; ownerEdited: boolean }
 /** The record entries update may touch: this project's workflows written whole (app, and central `<name>--*`), and its verify-job edits. */
 function touchable(r: InstallRecord): Touchable[] {
   const out: Touchable[] = [];
   for (const f of r.files) {
     if (!WORKFLOW_RE.test(f.path)) continue;
     if (f.repo === 'central' && !centralFilesOf(r.app.repo).includes(f.path)) continue;
-    out.push({ repo: f.repo, path: f.path, entry: 'file', shas: f.shas });
+    out.push({ repo: f.repo, path: f.path, entry: 'file', shas: f.shas, ownerEdited: f.ownerEdited === true });
   }
-  for (const e of r.edits) if (e.kind === 'verify-job' && WORKFLOW_RE.test(e.path)) out.push({ repo: e.repo, path: e.path, entry: 'edit', shas: e.writtenShas });
+  for (const e of r.edits) if (e.kind === 'verify-job' && WORKFLOW_RE.test(e.path)) out.push({ repo: e.repo, path: e.path, entry: 'edit', shas: e.writtenShas, ownerEdited: true });
   return out;
 }
 
@@ -575,10 +576,16 @@ async function derive(gh: Octokit, st: RepoState, items: readonly Touchable[], s
     const ownerEdited = !t.shas.includes(e.sha);
     // I2: a file a newer pipegen pinned is left alone (never moved back to an older gate). G12-R2 N1: only a file pipegen wrote (its blob is a
     // recorded sha) is believed; anyone's `# gate-v99` on an unvouched file goes through the merge, where it is a conflict
+    // G12-R3 H1: a recorded sha proves pipegen wrote every line only for a whole file pipegen alone wrote (ownWholeFile: not a merged
+    // ownerEdited file, never a verify-job edit, which is the owner's file); anywhere else a newer comment is a conflict, never merged around
     const probe = swapPins(current, swaps);
-    if (!ownerEdited && 'newer' in probe && probe.newer !== undefined) {
-      const why = `${label(t.repo, show(t.path))}: a newer pipegen wrote this (gate v${probe.newer}); pipegen leaves it as it is. Run \`npx pipegen@latest update\`.`;
-      out.notes.push(why); out.held.push(why); continue;
+    if ('newer' in probe && probe.newer !== undefined) {
+      if (t.entry === 'file' && !t.ownerEdited && !ownerEdited) {
+        const why = `${label(t.repo, show(t.path))}: a newer pipegen wrote this (gate v${probe.newer}); pipegen leaves it as it is. Run \`npx pipegen@latest update\`.`;
+        out.notes.push(why); out.held.push(why); continue;
+      }
+      out.conflicts.push({ repo: t.repo, path: t.path, why: `a gate line pipegen can't vouch for carries a version comment newer than this pipegen's (v${probe.newer}); check that line and merge by hand` });
+      continue;
     }
     let base = current;
     if (ownerEdited) {
@@ -748,7 +755,7 @@ function appPrBody(p: Plan): string {
   if (p.repin !== null) lines.push('', `The calls of the central workflows now pin \`${p.repin}\`, the central commit that holds the updated files.`);
   const conflicts = p.conflicts.filter((c) => c.repo === 'app');
   if (conflicts.length > 0) lines.push('', 'Not changed (merge by hand; pipegen never overwrites your edits):', ...conflicts.map((c) => `- \`${safeMarkdown(c.path, 200)}\`: ${safeMarkdown(c.why, 300)}`));
-  if (p.held.length > 0) lines.push('', 'Left on its old pin on purpose (this pull request doesn\'t finish the update; run `npx pipegen` in this repo to re-check the setup and re-pin):', ...p.held.map((h) => `- ${safeMarkdown(h, 400)}`));
+  if (p.held.length > 0) lines.push('', 'Left on its old pin on purpose (this pull request doesn\'t finish the update; what to do is on each line):', ...p.held.map((h) => `- ${safeMarkdown(h, 400)}`));
   const closes = p.acted.filter((x) => x.in === 'app' && answers(x, p));
   if (closes.length > 0) lines.push('', ...closes.map((x) => `Closes #${x.issue}`));
   return lines.join('\n');
@@ -767,7 +774,7 @@ function centralPrBody(p: Plan): string {
     `pipegen moves the gate pin of the central workflows of ${safeMarkdown(p.name, 100)} to v${safeMarkdown(p.gate.version, 20)} (\`${p.gate.sha}\`), the pin of its reviewed list, and records what it wrote in the install record. After this pull request is merged, run \`pipegen update\` again: it then pins the app to the merged commit.`,
     '', 'Files:', ...p.central.map((c) => `- \`${safeMarkdown(c.path, 200)}\`${c.ownerEdited ? ' (merged with your edits)' : ''}`),
   ];
-  if (p.held.length > 0) lines.push('', 'Left on its old pin on purpose (run `npx pipegen` in the app repo to re-check the setup):', ...p.held.map((h) => `- ${safeMarkdown(h, 400)}`));
+  if (p.held.length > 0) lines.push('', 'Left on its old pin on purpose (what to do is on each line):', ...p.held.map((h) => `- ${safeMarkdown(h, 400)}`));
   const conflicts = p.conflicts.filter((c) => c.repo === 'central');
   if (conflicts.length > 0) lines.push('', 'Not changed (merge by hand):', ...conflicts.map((c) => `- \`${safeMarkdown(c.path, 200)}\`: ${safeMarkdown(c.why, 300)}`));
   const closes = p.acted.filter((x) => x.in === 'central' && answers(x, p));
@@ -859,8 +866,10 @@ export async function update(gh: Octokit, app: RepoRef, deps: UpdateDeps): Promi
   let appChanges = d.changes.filter((c) => c.repo === 'app');
   if (repin !== null && 'refused' in repin) {
     // G12-R2 N2: the app is never half-updated (its verify job on the new gate, its calls on the old central commit): nothing of the app goes out
-    if (appChanges.length > 0) notes.push('pipegen holds back the app\'s own pin changes too, so the app is never half-updated. Run `npx pipegen` in this repo to re-check the setup and re-pin the app.');
-    d.held.push(repin.refused);
+    // G12-R3 M1: npx pipegen can't help here (a merged central file is the owner's); the way on is the central file itself
+    const wayOn = 'Bring the central file back to pipegen\'s text, or merge the change by hand; then run `pipegen update` again.';
+    notes.push(appChanges.length > 0 ? `pipegen holds back the app's own pin changes too, so the app is never half-updated. ${wayOn}` : wayOn);
+    d.held.push(`${repin.refused} ${wayOn}`);
     appChanges = [];
   }
   if (central.length > 0) {
@@ -903,11 +912,15 @@ export async function update(gh: Octokit, app: RepoRef, deps: UpdateDeps): Promi
     const why = show(e instanceof DeliverError || e instanceof RecordError || e instanceof UpdateError ? e.message : 'GitHub refused or did not answer', 300);
     // G12-R2 N3: the note says exactly how far the record got
     const at = recordWriteReached(e);
-    const note = at === 'local'
+    const file = localRecordPath(app, deps.local ?? {});
+    const note = at?.at === 'local'
       ? `The pull request ${prUrl} is open and the install record is written (central repo and this machine), but the setup pull request's record marker was not updated (${why}); \`pipegen verify\` reports that until pipegen writes the record again.`
-      : at === 'central'
-        ? `The pull request ${prUrl} is open and the install record is written in the central repo, but this machine's local record file was not updated (${why}), so pipegen can't trust that record from here. Run \`npx pipegen\` in this repo to re-check the setup and vouch for it again.`
-        : `The pull request ${prUrl} is open, but the install record was not written (${why}); run \`pipegen update\` again to record it.`;
+      : at?.at === 'central' && at.via === 'direct'
+        // G12-R3 M2: the central default branch holds the new record and this machine's file the old hash: they no longer match
+        ? `The pull request ${prUrl} is open and the install record is written on the central default branch, but this machine's local record file was not updated (${why}), so the two no longer match. Remove ${show(file, 300)}, then run \`npx pipegen\` in this repo (it re-checks the setup and writes a record this machine vouches for); then run update again.`
+        : at?.at === 'central'
+          ? `The pull request ${prUrl} is open and the install record went to the central pull request, but this machine's local record file was not updated (${why}). The record this machine trusts is unchanged, so run \`pipegen update\` again: it rebuilds the central pull request.`
+          : `The pull request ${prUrl} is open, but the install record was not written (${why}); run \`pipegen update\` again to record it.`;
     return { done: true, ...base, notes: [...notes, note], prUrl };
   }
   return { done: true, ...base, notes: [...notes, ...written.notes], ...(prUrl === undefined ? {} : { prUrl }), ...(written.centralPr === undefined ? {} : { centralPrUrl: written.centralPr.url }), recordHash: written.recordHash };
