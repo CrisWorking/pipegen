@@ -7,6 +7,7 @@ import { isRunnable } from '../src/engine/needs.js';
 import { NotGitHubRepoError, readProject } from '../src/read/project.js';
 import { cleanupRepos, makeRepo, writeIn } from './helpers/make-repo.js';
 import { fake } from './helpers/secret-repo.js';
+import { expectScaling } from './helpers/scaling.js';
 
 const CP_FNS = ['spawn', 'exec', 'execFile', 'fork', 'spawnSync', 'execSync', 'execFileSync'] as const;
 
@@ -303,22 +304,29 @@ describe('read', () => {
     expect(await readProject(makeRepo('node-npm', 'https://github.com/o-1/my.repo_x-y.git'))).toMatchObject({ owner: 'o-1', repo: 'my.repo_x-y' });
   });
 
-  it('read: finding Dockerfile services next to Node workspaces is linear (P50 I3: 9,990 Dockerfile folders, about 20k files)', async () => {
+  // G17: bounded as a ratio (expectScaling), not a wall-clock budget, so a loaded machine doesn't fail it
+  it('read: finding Dockerfile services next to Node workspaces is linear (P50 I3: Dockerfile folders next to a workspace)', async () => {
     // the reviewer's probe: before the fix, each Dockerfile folder scanned every file for a requirements file
-    const dir = repo('node-library');
-    writeIn(dir, 'package.json', JSON.stringify({ name: 'root', workspaces: ['frontend'] }));
-    writeIn(dir, 'frontend/package.json', JSON.stringify({ name: 'frontend', scripts: { dev: 'vite' } }));
-    for (let i = 0; i < 9990; i++) {
-      writeIn(dir, `s/d${i}/Dockerfile`, 'FROM nginx\n');
-      writeIn(dir, `s/d${i}/a.txt`, 'x\n');
-    }
-    writeIn(dir, 's/d5/requirements.txt', 'flask\n');
-    const t = performance.now();
-    const p = await readProject(dir);
-    const ms = performance.now() - t;
-    expect(p.services.map((s) => s.path)).toEqual(['frontend', 's/d5']);
-    expect(ms).toBeLessThan(5000);
-  }, 60_000);
+    const repoOf = (folders: number) => {
+      const dir = repo('node-library');
+      writeIn(dir, 'package.json', JSON.stringify({ name: 'root', workspaces: ['frontend'] }));
+      writeIn(dir, 'frontend/package.json', JSON.stringify({ name: 'frontend', scripts: { dev: 'vite' } }));
+      for (let i = 0; i < folders; i++) {
+        writeIn(dir, `s/d${i}/Dockerfile`, 'FROM nginx\n');
+        writeIn(dir, `s/d${i}/a.txt`, 'x\n');
+      }
+      writeIn(dir, 's/d5/requirements.txt', 'flask\n');
+      return dir;
+    };
+    const dirs = { small: repoOf(1000), big: repoOf(8000) };
+    expect((await readProject(dirs.big)).services.map((s) => s.path)).toEqual(['frontend', 's/d5']);
+    // 8 times the folders: linear is at most about 8 times the time, a scan of every file per folder about 64 times
+    await expectScaling('Dockerfile folders', async (size) => {
+      const t = performance.now();
+      await readProject(dirs[size]);
+      return performance.now() - t;
+    }, 16);
+  }, 180_000);
 
   it('read: a go.mod makes a Go service, and *_test.go files are its tests (DoD cobra)', async () => {
     const p = await readProject(repo('go-module'));
