@@ -71,7 +71,7 @@ export function workflowBuildRefs(texts: readonly string[], out: Set<string> = n
   // GJ-R-sec1: line by line over regexLines (each line bounded, like the other parsers), `[ \t]*` at the anchor.
   // GJ-R4 (N1): `\`-continued lines are joined first, within the same per-line budget (a longer one is dropped whole)
   for (const t of texts) {
-    for (const line of joinedLines(t).map(blankExpressions)) {
+    for (const line of scanLines(t)) {
       const ctxKey = /^[ \t]*(?:-[ \t]+)?context:[ \t]*("[^"]+"|'[^']+'|[^\s"'#]+)/.exec(line);
       if (ctxKey !== null) add(ctxKey[1]);
       const fileKey = /^[ \t]*(?:-[ \t]+)?file:[ \t]*("[^"]+"|'[^']+'|[^\s"'#]+)/.exec(line);
@@ -126,34 +126,49 @@ const MAX_EXPR_DEPTH = 16;
 /**
  * GJ-R5 (H1): each `${{ … }}` and `$( … )` span of a (bounded) line becomes one EXPR character, so an `||` or a space inside it never ends a
  * build line or splits a word. A character loop, no regex; an unclosed span, or `$(` nested deeper than MAX_EXPR_DEPTH, blanks the rest of
- * the line.
+ * the line. GJ-R6 (Ha): the inner text of each `$( … )` span (blanked the same way) goes to `inner`, to be read as a line of its own
+ * (`IMG=$(docker build -q -f Dockerfile.prod .)`); (perf) a line with no `$` is returned as it is, and the text between spans is copied by slice.
  */
-function blankExpressions(line: string): string {
+function blankExpressions(line: string, inner: string[]): string {
+  let i = line.indexOf('$');
+  if (i < 0) return line;
   let out = '';
-  let i = 0;
-  while (i < line.length) {
+  let last = 0;
+  while (i >= 0) {
     if (line.startsWith('${{', i)) {
       const j = line.indexOf('}}', i + 3);
-      if (j < 0) return out + EXPR;
-      out += EXPR;
-      i = j + 2;
+      if (j < 0) return out + line.slice(last, i) + EXPR;
+      out += line.slice(last, i) + EXPR;
+      last = j + 2;
+      i = line.indexOf('$', last);
       continue;
     }
-    if (line.charCodeAt(i) === 36 && line.charCodeAt(i + 1) === 40) {
+    if (line.charCodeAt(i + 1) === 40) {
       let depth = 0;
       let j = i + 1;
       for (; j < line.length; j++) {
         const c = line.charCodeAt(j);
-        if (c === 40 && ++depth > MAX_EXPR_DEPTH) return out + EXPR;
+        if (c === 40 && ++depth > MAX_EXPR_DEPTH) return out + line.slice(last, i) + EXPR;
         if (c === 41 && --depth === 0) break;
       }
-      if (j >= line.length) return out + EXPR;
-      out += EXPR;
-      i = j + 1;
+      if (j >= line.length) return out + line.slice(last, i) + EXPR;
+      inner.push(blankExpressions(line.slice(i + 2, j), inner));
+      out += line.slice(last, i) + EXPR;
+      last = j + 1;
+      i = line.indexOf('$', last);
       continue;
     }
-    out += line[i];
-    i++;
+    i = line.indexOf('$', i + 1);
+  }
+  return out + line.slice(last);
+}
+
+/** The joined lines of `t` with expressions blanked, each followed by the inner texts of its `$( … )` spans (GJ-R6 Ha). */
+function scanLines(t: string): string[] {
+  const out: string[] = [];
+  for (const l of joinedLines(t)) {
+    const inner: string[] = [];
+    out.push(blankExpressions(l, inner), ...inner);
   }
   return out;
 }

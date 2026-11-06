@@ -9,6 +9,7 @@ import { applyTypeOverrides } from '../src/read/project-type.js';
 import { readProject } from '../src/read/project.js';
 import { wouldCreateOf } from '../src/audit/model.js';
 import { workflowBuildRefs } from '../src/read/container-file.js';
+import { regexLines } from '../src/read/limits.js';
 import { readWorkflows } from '../src/read/workflows.js';
 import type { Capabilities, ProjectType, RepoProfile, Service, ServiceType } from '../src/types.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
@@ -1059,8 +1060,8 @@ describe('GJ-R4 (review GJ-r3 N1-N5, N7): continued build lines, a container ove
       const p = await read(files, notes);
       expect(p.services.map((s) => [s.path, s.language])).toEqual([['.', 'node']]);
       expect(needsOf(p, p.services[0]?.name as string)).toContain('image-build');
-      if (folder !== null) expect(notes.join('\n')).toContain(`The folder ${folder} has a container file but no app manifest or code`);
-      else expect(notes.join('\n')).not.toMatch(/has a container file but no app manifest/);
+      if (folder !== null) expect(notes.join('\n')).toContain(`The folder ${folder} has container files but no plain Dockerfile or Containerfile, and no workflow, compose or bake file builds it, so pipegen takes it as part of the root app`);
+      else expect(notes.join('\n')).not.toMatch(/takes it as part of the root app/);
       const { a, issues } = await assembled(p);
       expect(issues).toBe('');
       expect(Object.keys(a.merge).some((k) => /image/.test(k))).toBe(true);
@@ -1135,7 +1136,7 @@ describe('GJ-R5 (review GJ-r4 R1, H1): code next to a suffixed container file is
       const notes: string[] = [];
       const p = await read(files, notes);
       expect(p.services.map((s) => [s.path, s.language])).toEqual([['.', 'node']]);
-      expect(notes.join('\n')).toMatch(/has a container file but no app manifest/);
+      expect(notes.join('\n')).toMatch(/has container files but no plain Dockerfile or Containerfile, and no workflow, compose or bake file builds it/);
       const { a, issues } = await assembled(p);
       expect(issues).toBe('');
       expect(Object.keys(a.merge).some((k) => /image/.test(k))).toBe(true);
@@ -1179,7 +1180,7 @@ describe('GJ-R5 (review GJ-r4 R1, H1): code next to a suffixed container file is
     const notes: string[] = [];
     const p = await read(express({ 'nginx/Dockerfile': 'FROM nginx:1.27\n' }), notes);
     expect(p.services.map((s) => s.path)).toEqual(['.']);
-    expect(notes.join('\n')).toContain('The folder nginx has a container file but no app manifest');
+    expect(notes.join('\n')).toContain('The folder nginx has a plain Dockerfile but no app manifest or code, and no workflow, compose or bake file builds it');
   });
   it('H1: docker build apps/web -t img:${{ github.sha }} keeps its context', () => {
     expect([...workflowBuildRefs(['docker build apps/web -t img:${{ github.sha }}'])]).toEqual(['apps/web']);
@@ -1203,5 +1204,72 @@ describe('GJ-R5 (review GJ-r4 R1, H1): code next to a suffixed container file is
     const p = await read(files, notes);
     expect(notes.join('\n')).toContain('Only the first 20 compose files were read for image builds.');
     expect((p.services.find((s) => s.name === 'web') as Service).containerHint).toContain('apps/web');
+  });
+});
+
+describe('GJ-R6 (review GJ-r5 Ra, Ha, perf): suffixed app folders are the root\'s unless built; builds inside $( … ) count', () => {
+  const LOCK = '{"lockfileVersion":3,"packages":{}}';
+  const read = async (files: Record<string, string>, notes: string[] = []): Promise<RepoProfile> => ({ ...(await readProject(repo(files), { notes })), private: false, ownerType: 'User', plan: 'free' } as RepoProfile);
+  const assembled = async (p: RepoProfile) => { const a = assemble(planned(p, { over: { skipped: [{ part: 'deploy' as const, reason: 't' }] } })); return { a, issues: shown(await judge(files(a), a.draft)) }; };
+  const express = (extra: Record<string, string>) => ({ 'package.json': pkg({ name: 'api', scripts: { start: 'node index.js', test: 'vitest run' }, dependencies: { express: '4.0.0' } }), 'package-lock.json': LOCK, 'index.js': "require('express')().listen(3000);\n", 'index.test.js': 'test("x", () => {});\n', Dockerfile: 'FROM node:24\nEXPOSE 3000\nCMD ["node", "index.js"]\n', ...extra });
+  const wf = (cmd: string) => `on: { push: { branches: [main] } }\njobs:\n  img:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ${cmd}\n`;
+  const cases: [string, string, Record<string, string>][] = [
+    ['client/Dockerfile.dev (a React app with its own package.json)', 'client', { 'client/package.json': pkg({ name: 'client', scripts: { start: 'react-scripts start', build: 'react-scripts build' }, dependencies: { react: '19.0.0', 'react-scripts': '5.0.1' } }), 'client/src/App.jsx': 'export default function App() { return null; }\n', 'client/Dockerfile.dev': 'FROM node:24\nEXPOSE 3000\n' }],
+    ['admin/Dockerfile.prod (a Vite app)', 'admin', { 'admin/package.json': pkg({ name: 'admin', scripts: { dev: 'vite', build: 'vite build' }, devDependencies: { vite: '7.0.0' } }), 'admin/index.html': '<html></html>\n', 'admin/src/main.ts': 'export {};\n', 'admin/Dockerfile.prod': 'FROM nginx:1.27\n' }],
+    ['worker/Dockerfile.worker (requirements.txt + run.py)', 'worker', { 'worker/requirements.txt': 'requests==2.32.0\n', 'worker/run.py': 'print(1)\n', 'worker/Dockerfile.worker': 'FROM python:3.12\n' }],
+  ];
+  for (const [label, folder, extra] of cases) {
+    it(`Ra: root express + Dockerfile + ${label} is the root only, with the note, and assembles cleanly`, async () => {
+      const notes: string[] = [];
+      const p = await read(express(extra), notes);
+      expect(p.services.map((s) => s.path)).toEqual(['.']);
+      expect(notes.join('\n')).toContain(`The folder ${folder} has container files but no plain Dockerfile or Containerfile, and no workflow, compose or bake file builds it`);
+      const { a, issues } = await assembled(p);
+      expect(issues).toBe('');
+      expect(Object.keys(a.merge).some((k) => /image/.test(k))).toBe(true);
+    });
+  }
+  it('Ra (b): the same folder is a service when a workflow, compose or bake file builds one of its container files (a pushed image)', async () => {
+    const admin = cases[1]?.[2] as Record<string, string>;
+    const byWorkflow = await read(express({ ...admin, '.github/workflows/img.yml': wf('docker build -f admin/Dockerfile.prod -t ghcr.io/o/admin admin && docker push ghcr.io/o/admin') }));
+    expect(byWorkflow.services.map((s) => s.path).sort()).toEqual(['.', 'admin']);
+    expect(byWorkflow.services.find((s) => s.path === 'admin')?.dockerfile).toBe('admin/Dockerfile.prod');
+    const byCompose = await read(express({ ...admin, 'compose.yaml': 'services:\n  admin:\n    build:\n      context: ./admin\n      dockerfile: Dockerfile.prod\n' }));
+    expect(byCompose.services.map((s) => s.path).sort()).toEqual(['.', 'admin']);
+    // a context alone (no container file of the folder named) is not a build of its files
+    const ctxOnly = await read(express({ ...admin, '.github/workflows/img.yml': wf('docker build -t x admin') }));
+    expect(ctxOnly.services.map((s) => s.path)).toEqual(['.']);
+  });
+  it('Ra: the note says "no plain Dockerfile" also for a folder that holds code', async () => {
+    const notes: string[] = [];
+    await read(express({ 'docker/Dockerfile.dev': 'FROM node:24\n', 'docker/healthcheck.js': '1;\n' }), notes);
+    expect(notes.join('\n')).toContain('The folder docker has container files but no plain Dockerfile or Containerfile');
+    expect(notes.join('\n')).not.toMatch(/docker has .*no app manifest or code/);
+  });
+
+  it('Ha: a docker build inside $( … ) is read as a line of its own', async () => {
+    expect([...workflowBuildRefs(['IMG=$(docker buildx build -q --load -f apps/web/Dockerfile.ci apps/web)'])].sort()).toEqual(['apps/web', 'apps/web/Dockerfile.ci']);
+    expect([...workflowBuildRefs(['echo "image=$(docker build -q -f docker/web.Dockerfile apps/web)" >> "$GITHUB_OUTPUT"'])].sort()).toEqual(['apps/web', 'docker/web.Dockerfile']);
+    expect([...workflowBuildRefs(['docker run --rm $(podman build -q $(pwd)/x svc)'])]).toEqual(['svc']);
+    const ws = {
+      'package.json': JSON.stringify({ name: 'mono', private: true, workspaces: ['apps/*'] }), 'package-lock.json': LOCK,
+      'apps/web/package.json': pkg({ name: 'web', scripts: { dev: 'next dev', build: 'next build' }, dependencies: { next: '15.0.0' } }), 'apps/web/next.config.mjs': "export default { output: 'export' };\n", 'apps/web/app/page.tsx': PAGE,
+      '.github/workflows/img.yml': wf('IMG=$(docker buildx build -q --load -f apps/web/Dockerfile.ci apps/web) && docker push "$IMG"'),
+    };
+    const p = await read(ws);
+    expect((p.services.find((s) => s.name === 'web') as Service).containerHint).toContain('apps/web');
+  });
+  it('Ha: IMG=$(docker build -q -f Dockerfile.prod .) picks Dockerfile.prod', async () => {
+    const p = await read(express({ 'Dockerfile.prod': 'FROM node:24\nEXPOSE 3000\n', '.github/workflows/img.yml': wf('IMG=$(docker build -q -f Dockerfile.prod .) && docker push "$IMG"') }));
+    expect(p.services[0]?.dockerfile).toBe('Dockerfile.prod');
+  });
+
+  it('perf: 1 MB of plain lines costs about what the line regexes alone cost (8c5c368), not a character copy per line', () => {
+    const text = Array.from({ length: 25_000 }, (_, i) => `      - name: step ${i} runs the usual things here`).join('\n');
+    const lineRegexes = () => { for (const line of regexLines(text)) { /^[ \t]*(?:-[ \t]+)?context:/.exec(line); /^[ \t]*(?:-[ \t]+)?file:/.exec(line); for (const _m of line.matchAll(/\b(?:docker(?:[ \t]+buildx)?|podman)[ \t]+build\b([^&|;]*)/g)) void _m; } };
+    const best = (f: () => void) => { let m = Infinity; for (let k = 0; k < 5; k++) { const t0 = performance.now(); f(); m = Math.min(m, performance.now() - t0); } return m; };
+    const base = best(lineRegexes);
+    const ours = best(() => workflowBuildRefs([text]));
+    expect(ours, `ours ${ours.toFixed(1)} ms vs line regexes ${base.toFixed(1)} ms`).toBeLessThan(base * 2.5 + 5);
   });
 });

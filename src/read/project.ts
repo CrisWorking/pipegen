@@ -401,6 +401,31 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
   const pnpmWs = ctx.fileSet.has('pnpm-workspace.yaml') ? await readYaml(ctx, 'pnpm-workspace.yaml') : null;
   const patterns = usablePatterns(ctx, workspacePatterns(pnpmWs, rootPkg));
 
+  // GJ-R6 (Ra): read before the service folders are chosen (a folder a build names is a service)
+  // GJ-R2 (N1, N4): the paths the workflows build from, read as text (never run). GJ-R3 (B1): the first MAX_WORKFLOWS in the workflow
+  // reader's order, each parsed as it is read; (H1 b) and the build contexts of the compose and bake files, capped the same way
+  const workflowRefs = new Set<string>();
+  for (const f of [...ctx.fileSet].filter((x) => WORKFLOW_FILE.test(x)).sort().slice(0, MAX_WORKFLOWS)) { const t = await readFile(ctx, f); if (t !== null) workflowBuildRefs([t], workflowRefs); }
+  // GJ-R4 (N5): at most MAX_BUILD_FILES of each kind and MAX_BUILD_FILE_BYTES of text in all, each skip noted
+  const buildFileRefs = new Set<string>();
+  let buildFileBytes = 0;
+  for (const [kind, re, parse] of [
+    ['compose', COMPOSE_FILE_RE, (f: string, t: string) => composeBuildRefs(f, parseYamlLimited(t), buildFileRefs)],
+    ['bake', BAKE_FILE_RE, (f: string, t: string) => bakeBuildRefs(f, t, buildFileRefs)],
+  ] as const) {
+    // GJ-R5: shallow paths first (then by name), so the cap never pushes out the root compose file
+    const depth = (x: string) => x.split('/').length;
+    const all = [...ctx.fileSet].filter((x) => re.test(baseOf(x))).sort((a, b) => depth(a) - depth(b) || (a < b ? -1 : a > b ? 1 : 0));
+    if (all.length > MAX_BUILD_FILES) note(ctx, `Only the first ${MAX_BUILD_FILES} ${kind} files were read for image builds.`);
+    for (const f of all.slice(0, MAX_BUILD_FILES)) {
+      const t = await readFile(ctx, f);
+      if (t === null) continue;
+      buildFileBytes += Buffer.byteLength(t);
+      if (buildFileBytes > MAX_BUILD_FILE_BYTES) { note(ctx, `Skipped ${safeText(f, PATH_SHOWN_MAX)}: the compose and bake files pipegen reads for image builds are over 2 MB together.`); continue; }
+      try { parse(f, t); } catch { note(ctx, `Skipped ${safeText(f, PATH_SHOWN_MAX)}: it could not be parsed.`); }
+    }
+  }
+  const allBuildRefs: ReadonlySet<string> = new Set([...workflowRefs, ...buildFileRefs]);
   // Which directories are services: workspace packages that can run, else directories with a Dockerfile, else the root.
   let dirs: string[] = [];
   for (const pkgDir of patterns.length > 0 ? workspaceDirs(ctx, patterns) : []) {
@@ -425,12 +450,19 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
     // container files all have suffixed names (docker/Dockerfile.dev + healthcheck.js) is the root app's, whatever code it holds
     const codeDirs = new Set<string>();
     for (const f of ctx.fileSet) if (CODE_FILE_RE.test(baseOf(f))) for (let d = dirOf(f); d !== '.' && !codeDirs.has(d); d = dirOf(d)) codeDirs.add(d);
+    // GJ-R6 (Ra): outside a workspace a folder is a service only (a) with a plain Dockerfile or Containerfile and an app manifest or code,
+    // as at 2450960, or (b) when a workflow, compose or bake file builds one of its container files (a pushed image, GJ-r1 N2); a folder
+    // with its own manifest and only suffixed container files (client/Dockerfile.dev) is the root app's too
     const plainContainer = (d: string) => ctx.fileSet.has(inDir(d, 'Dockerfile')) || ctx.fileSet.has(inDir(d, 'Containerfile'));
-    const ownApp = (d: string) => appManifest(d) || (codeDirs.has(d) && plainContainer(d));
+    const built = (d: string) => containerFilesIn(ctx.fileSet, d).some((f) => allBuildRefs.has(f));
+    const ownApp = (d: string) => (plainContainer(d) && (appManifest(d) || codeDirs.has(d))) || built(d);
     const subs = dockerDirs.filter((d) => d !== '.');
     if (appManifest('.') && subs.some((d) => !ownApp(d))) {
       dirs = ['.', ...subs.filter(ownApp)];
-      for (const d of subs.filter((x) => !ownApp(x))) note(ctx, `The folder ${plainPath(d)} has a container file but no app manifest or code, so pipegen takes it as part of the root app and does not build or scan its image.`);
+      for (const d of subs.filter((x) => !ownApp(x))) {
+        const why = plainContainer(d) ? 'a plain Dockerfile but no app manifest or code' : 'container files but no plain Dockerfile or Containerfile';
+        note(ctx, `The folder ${plainPath(d)} has ${why}, and no workflow, compose or bake file builds it, so pipegen takes it as part of the root app and does not build or scan its image.`);
+      }
     } else dirs = dockerDirs.length > 0 ? dockerDirs : ['.'];
   } else {
     // A Node workspace list names Node packages only (DoD run, fastapi/full-stack-fastapi-template: backend/ was lost). A
@@ -468,32 +500,9 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
     shared.copies.push(...sources.map((source) => ({ dockerDir: dirOf(f), source })));
     shared.fileCopies.push(...sources.map((source) => ({ file: f, source })));
   }
-  // GJ-R2 (N1, N4): the paths the workflows build from, read as text (never run). GJ-R3 (B1): the first MAX_WORKFLOWS in the workflow
-  // reader's order, each parsed as it is read; (H1 b) and the build contexts of the compose and bake files, capped the same way
-  const workflowRefs = new Set<string>();
-  for (const f of [...ctx.fileSet].filter((x) => WORKFLOW_FILE.test(x)).sort().slice(0, MAX_WORKFLOWS)) { const t = await readFile(ctx, f); if (t !== null) workflowBuildRefs([t], workflowRefs); }
-  // GJ-R4 (N5): at most MAX_BUILD_FILES of each kind and MAX_BUILD_FILE_BYTES of text in all, each skip noted
-  const buildFileRefs = new Set<string>();
-  let buildFileBytes = 0;
-  for (const [kind, re, parse] of [
-    ['compose', COMPOSE_FILE_RE, (f: string, t: string) => composeBuildRefs(f, parseYamlLimited(t), buildFileRefs)],
-    ['bake', BAKE_FILE_RE, (f: string, t: string) => bakeBuildRefs(f, t, buildFileRefs)],
-  ] as const) {
-    // GJ-R5: shallow paths first (then by name), so the cap never pushes out the root compose file
-    const depth = (x: string) => x.split('/').length;
-    const all = [...ctx.fileSet].filter((x) => re.test(baseOf(x))).sort((a, b) => depth(a) - depth(b) || (a < b ? -1 : a > b ? 1 : 0));
-    if (all.length > MAX_BUILD_FILES) note(ctx, `Only the first ${MAX_BUILD_FILES} ${kind} files were read for image builds.`);
-    for (const f of all.slice(0, MAX_BUILD_FILES)) {
-      const t = await readFile(ctx, f);
-      if (t === null) continue;
-      buildFileBytes += Buffer.byteLength(t);
-      if (buildFileBytes > MAX_BUILD_FILE_BYTES) { note(ctx, `Skipped ${safeText(f, PATH_SHOWN_MAX)}: the compose and bake files pipegen reads for image builds are over 2 MB together.`); continue; }
-      try { parse(f, t); } catch { note(ctx, `Skipped ${safeText(f, PATH_SHOWN_MAX)}: it could not be parsed.`); }
-    }
-  }
   shared.workflowRefs = workflowRefs;
   shared.buildFileRefs = buildFileRefs;
-  shared.buildRefs = new Set([...workflowRefs, ...buildFileRefs]);
+  shared.buildRefs = allBuildRefs;
   const services: Service[] = [];
   for (const d of dirs) services.push(await readService(ctx, d, shared));
   uniqueServiceNames(ctx, services);
