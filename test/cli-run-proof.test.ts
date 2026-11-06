@@ -10,8 +10,12 @@ vi.mock('../src/util/exit-hooks.js', async (orig) => {
   return { ...real, interrupting: () => stop.on };
 });
 
-import { guardedKeys, midRunConfirm, nextCandidateFrom, proofWorkflowsOf, REPOS_NOT_READY, CENTRAL_CHANGED } from '../src/cli/run-proof.js';
+import { guardedKeys, midRunConfirm, nextCandidateFrom, proofWorkflowsOf, REPOS_NOT_READY, CENTRAL_CHANGED, PRIVATE_REASON } from '../src/cli/run-proof.js';
 import { proofAssembler } from '../src/cli/run-parts.js';
+import { assemble } from '../src/layers/assemble.js';
+import { node, p as PLAT, planned, profileOf } from './helpers/assemble.js';
+import { REVIEWED } from './helpers/debate-fixtures.js';
+import type { ReviewedTool } from '../src/types.js';
 import { keyOffers } from '../src/debate/builder.js';
 import { PROOF_SIGNING_MODE } from '../src/proof/harness.js';
 import type { EvalContext } from '../src/proof/evaluate.js';
@@ -22,6 +26,7 @@ import type { CreatedFile, PipelineDraft } from '../src/types.js';
 import { cleanHomes, failOn, PASS, proofWorld, RUN_ID, TYPED } from './helpers/proof-world.js';
 
 afterAll(cleanHomes);
+const GATE_TOOL = REVIEWED.find((x) => x.id === 'pipegen-gate') as ReviewedTool;
 const SCR2 = { owner: 'CrisWorking', repo: 'pipegen-scratch' } as never;
 const RN_FIELD = ['record', 'Secret', 'Names'].join('');
 const GA_FIELD = ['get', 'Auth'].join('') as 'getAuth';
@@ -306,17 +311,74 @@ describe('G14: disputes and the carries', () => {
     const iSetup = at(w.tl, 'setup');
     const iA = at(w.tl, 'pushBranch:dispute-d1-a');
     const iB = at(w.tl, 'pushBranch:dispute-d1-b');
-    const iMain = at(w.tl, 'pushBranch:main@parent');
-    const iPl = at(w.tl, 'pushBranch:planted@parent');
+    // sec M2: the winners' main and planted as a fresh round off the base (never an overlay on the setup's heads)
+    const iMain = at(w.tl, 'pushBranch:main#2');
+    const iPl = at(w.tl, 'pushBranch:planted#2');
     const iMerge = at(w.tl, 'variant:main:merge');
     expect(iSetup).toBeLessThan(iA);
     expect(iA).toBeLessThan(iB);
     expect(Math.max(iB, iMain, iPl)).toBeLessThan(iMerge);
     expect(iMain).toBeGreaterThan(iB);
+    expect(w.tl.some((x) => x.includes('@parent'))).toBe(false);
+    // spec I1: the merge run and the planted run are the winners' heads, not the setup's
+    const winMain = w.pushed.findIndex((x) => x.variant === 'main' && x.round === 2);
+    expect(winMain).toBeGreaterThan(-1);
+    const mergeRun = w.variants.find((x) => x.variant === 'main' && x.merge);
+    const setupMain = w.variants.length > 0 ? w.variants.filter((x) => x.variant === 'main') : [];
+    expect(mergeRun).toBeDefined();
+    expect(setupMain).toHaveLength(1);
+    expect(mergeRun?.sha).not.toBe('1'.padStart(40, 'a'));
+    expect(w.variants.find((x) => x.variant === 'planted')?.sha).not.toBe('2'.padStart(40, 'a'));
+    // the judge's tool is the one the merge run's branch carries
+    const judgeId = (await disputed() as unknown as { options: { choice: { chosen: { tool: { id: string } } } }[] }[])[0]?.options[1]?.choice.chosen.tool.id as string;
+    expect(JSON.stringify(w.pushed[winMain]?.files)).toContain(`sast:${judgeId}`);
     // keepOpen false: each variant's PR is closed after its runs
     expect(w.tl.filter((x) => x.startsWith('variant:dispute')).every((x) => !x.endsWith(':open'))).toBe(true);
     // each variant carries the planted files
     expect(w.pushed.filter((x) => x.variant.startsWith('dispute')).every((x) => x.files.some((f) => String(f.path).startsWith('pipegen-planted/')))).toBe(true);
+  });
+
+  it('run: a dispute the minutes can\'t pay for goes to the judge without a run (canProve from the minutes meter)', async () => {
+    const w = await proofWorld({ disputes: await disputed(), input: { variantMinutes: 1000 } });
+    const r = await w.run();
+    expect(r.ok).toBe(true);
+    expect(w.tl.some((x) => x.startsWith('pushBranch:dispute'))).toBe(false);
+    expect(r.draft?.scoreboard.join('\n')).toContain('not enough Actions minutes are left for it');
+  });
+
+  it('run: a private app\'s disputes are decided before the setup; the setup pushes and the proof runs the winner\'s central workflows (C1)', async () => {
+    const ds = await disputed();
+    const judgeId = (ds as unknown as { options: { choice: { chosen: { tool: { id: string } } } }[] }[])[0]?.options[1]?.choice.chosen.tool.id as string;
+    const w = await proofWorld({ private: true, centralOnly: true, disputes: ds });
+    const r = await w.run();
+    expect(r.ok).toBe(true);
+    // decided without a run, before the setup: no dispute branch, and the setup's central workflow holds the winner
+    expect(w.tl.some((x) => x.startsWith('pushBranch:dispute'))).toBe(false);
+    const central = w.setupCentral.map((f) => String(f.content)).join('\n');
+    expect(central).toContain(`sast:${judgeId}`);
+    // the delivered tool is the one that ran, and the saved draft (proofOk) holds it
+    const tool = r.draft?.steps.find((x) => x.needId === 'sast' && x.service === 'api')?.tool.id;
+    expect(tool).toBe(judgeId);
+    expect(w.store.state?.proofOk).toBe(true);
+    expect(w.store.state?.draft?.steps.find((x) => x.needId === 'sast' && x.service === 'api')?.tool.id).toBe(judgeId);
+    // the scoreboard names the real reason, never the minutes
+    expect(r.draft?.scoreboard.join('\n')).toContain(PRIVATE_REASON);
+    expect(r.draft?.scoreboard.join('\n')).not.toContain('minutes');
+  });
+
+  it('run: a draft whose central files differ from the pushed ones never runs, even on the first proof (C1)', async () => {
+    const w = await proofWorld({ private: true, centralOnly: true });
+    // the fix loop proves another draft at once (a tool swapped): its central workflow was never pushed
+    w.ops.fixLoop = async (d, deps) => {
+      const other = { ...d, steps: d.steps.map((x) => (x.needId === 'secrets' ? { ...x, tool: { ...x.tool, id: 'swapped' } } : x)) } as PipelineDraft;
+      await deps.prove(other, 'full');
+      throw new Error('the proof should have stopped');
+    };
+    const r = await w.run();
+    expect(r.ok).toBe(false);
+    expect(r.stopped).toContain(CENTRAL_CHANGED.slice(0, 50));
+    expect(w.tl.some((x) => x.startsWith('variant:'))).toBe(false);
+    expect(w.tl.some((x) => x.startsWith('cleanup:'))).toBe(true);
   });
 
   it('run: a decided dispute\'s winner reaches the draft by key; the scoreboard is written as is', async () => {
@@ -419,10 +481,35 @@ describe('G14: disputes and the carries', () => {
 });
 
 describe('G14: the workflows a proof waits for', () => {
-  it('proofWorkflowsOf: push and pull_request from each workflow\'s `on:` (string, list or map); other files ignored', () => {
+  it('proofWorkflowsOf: push, pull_request and the merge push, each with its branches and paths filters (sec I1)', () => {
     const f = (path: string, on: string) => ({ path, content: `on: ${on}\njobs: {}\n` });
-    expect(proofWorkflowsOf([f('.github/workflows/a.yml', '[push, pull_request]'), f('.github/workflows/b.yml', 'pull_request'), f('.github/workflows/c.yml', '{push: {branches: [main]}}'), f('README.md', 'push')]))
-      .toEqual({ push: ['.github/workflows/a.yml', '.github/workflows/c.yml'], pullRequest: ['.github/workflows/a.yml', '.github/workflows/b.yml'], merge: ['.github/workflows/a.yml', '.github/workflows/c.yml'] });
+    const at = { branch: 'proof/r1/main', defaultBranch: 'main' };
+    expect(proofWorkflowsOf([
+      f('.github/workflows/a.yml', '[push, pull_request]'), f('.github/workflows/b.yml', 'pull_request'),
+      f('.github/workflows/c.yml', '{push: {branches: [main]}}'), f('.github/workflows/d.yml', '{push: {branches-ignore: [main]}}'),
+      f('.github/workflows/e.yml', '{push: {branches: ["proof/**", "!proof/*/planted"]}, pull_request: {branches: [release]}}'),
+      f('.github/workflows/g.yml', '{push: {paths: ["docs/**"]}}'), f('.github/workflows/h.yml', '{push: {paths-ignore: [".github/**"]}}'),
+      f('.github/workflows/i.yml', '{push: {branches: 7}}'), f('README.md', 'push'),
+    ], at)).toEqual({
+      // h.yml: README.md is a changed path outside .github/ (paths-ignore ignores only when every changed path is ignored)
+      push: ['.github/workflows/a.yml', '.github/workflows/d.yml', '.github/workflows/e.yml', '.github/workflows/h.yml'],
+      pullRequest: ['.github/workflows/a.yml', '.github/workflows/b.yml'],
+      merge: ['.github/workflows/a.yml', '.github/workflows/c.yml', '.github/workflows/h.yml'],
+    });
+    expect(proofWorkflowsOf([f('.github/workflows/h.yml', '{push: {paths-ignore: [".github/**"]}}')], at).push).toEqual([]);
+    // the planted branch is not one e.yml runs on
+    expect(proofWorkflowsOf([f('.github/workflows/e.yml', '{push: {branches: ["proof/**", "!proof/*/planted"]}}')], { branch: 'proof/r1/planted', defaultBranch: 'main' }).push).toEqual([]);
+  });
+
+  it('proofWorkflowsOf over the REAL assembled files: the push runs pipegen-push.yml, the merge pipegen.yml (sec I1)', () => {
+    const x = planned(profileOf([node()]));
+    const files = proofAssembler(x.draft, (d, mode) => assemble(d, { gate: GATE_TOOL, reviewed: REVIEWED, platform: PLAT, mode, layout: 'local', plan: x.plan }))('none', undefined);
+    const wf = proofWorkflowsOf(files, { branch: 'proof/20261106-000000-abcdef/main', defaultBranch: x.draft.profile.defaultBranch });
+    expect(wf.push).toContain('.github/workflows/pipegen-push.yml');
+    expect(wf.push).not.toContain('.github/workflows/pipegen.yml');
+    expect(wf.merge).toContain('.github/workflows/pipegen.yml');
+    expect(wf.merge).not.toContain('.github/workflows/pipegen-push.yml');
+    expect(wf.pullRequest.length).toBeGreaterThan(0);
   });
 });
 
@@ -432,7 +519,8 @@ import { tmpdir } from 'node:os';
 import type { Octokit } from '@octokit/rest';
 import { fullRun, PROOF_FILE_IN_DELIVERY, PUBLIC_FILES_CHANGED, type Built, type BuildInput, type RunDeps, type RunStages } from '../src/cli/run.js';
 import { makeRunProof } from '../src/cli/run-proof.js';
-import { StateStore } from '../src/proof/state.js';
+import { StateStore, type AgreedTerms } from '../src/proof/state.js';
+import { DEFAULT_MODEL } from '../src/types.js';
 import { armProofCleanup } from '../src/proof/cleanup.js';
 import { HARNESS_PATH } from '../src/proof/harness.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
@@ -559,12 +647,14 @@ describe('G14: the proof inside pipegen run', () => {
 
 // ---------- pipegen resume ----------
 /** A saved run of CrisWorking/r in `home`: the pre-fix draft saved at proving, then the proof's verdict with the AI-fixed draft. */
-async function savedRun(home: string, o: { ok?: boolean; stoppedBy?: 'proof-failed' | 'ai-cost'; then?: 'interrupted' | 'cleaned'; aiCap?: number; spent?: number } = {}) {
+async function savedRun(home: string, o: { ok?: boolean; stoppedBy?: 'proof-failed' | 'ai-cost'; then?: 'interrupted' | 'cleaned'; aiCap?: number; spent?: number; agreed?: AgreedTerms | null } = {}) {
   const p = profile({ owner: OWN, repo: 'r', private: false, monorepo: 'none', services: [svc({ name: 'app', path: '.', scripts: ['test', 'start'] })], generatedDirs: [] });
   const pre = { profile: p, capabilities: CAPS, needs: [], steps: [], created: [{ repo: 'app', path: 'test/app.test.js', content: 'old\n', part: 'tests', reason: 'r' }], notProven: [], testDecisions: [], layersSkipped: [], scoreboard: [], requireDeployApproval: false, skipped: [], suggestions: [] } as unknown as PipelineDraft;
   const fixed = { ...pre, created: [{ repo: 'app', path: 'test/app.test.js', content: 'fixed by the AI\n', part: 'tests', reason: 'r', aiEdited: true }] } as PipelineDraft;
   const s = await StateStore.open(p, { home, env: {} });
-  s.begin(RUN_ID, { owner: OWN, repo: 'r', private: false, ownerType: 'User', defaultBranch: 'main' }, { cap: 100, aiCap: o.aiCap ?? 5 });
+  // the terms agreed at consent: runWorld's provider (scripted: claude, DEFAULT_MODEL), standard, betterleaks, 50 minutes a month
+  const agreed = o.agreed === null ? undefined : o.agreed ?? { provider: 'claude' as const, model: DEFAULT_MODEL, strictness: 'standard', scanner: 'betterleaks' as const, monthlyMinutes: 50 };
+  s.begin(RUN_ID, { owner: OWN, repo: 'r', private: false, ownerType: 'User', defaultBranch: 'main' }, { cap: 100, aiCap: o.aiCap ?? 5, ...(agreed === undefined ? {} : { agreed }) });
   for (const x of ['planned', 'debated', 'created'] as const) s.setStage(x);
   s.update((n) => { n.draft = pre; });
   s.setStage('proving');

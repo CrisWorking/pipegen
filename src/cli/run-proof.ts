@@ -154,19 +154,62 @@ export const realProofOps: ProofOps = {
 
 const isWorkflow = (path: string): boolean => /^\.github\/workflows\/[^/]+\.ya?ml$/i.test(path);
 
-/** The ProofWorkflows of a file set: which workflow files run on a push of the proof branch, which on its PR (`on:` read as YAML). */
-export function proofWorkflowsOf(files: readonly { path: string; content: string | Uint8Array }[]): ProofWorkflows {
+/**
+ * The ProofWorkflows of a file set (sec I1): which workflow files run on a push of the proof branch `at.branch`, which on its PR (to the
+ * default branch), and which on the merge commit's push to `at.defaultBranch`. Each event's `branches` / `branches-ignore` and
+ * `paths` / `paths-ignore` filters are applied (GitHub's filter patterns: `*`, `**`, `?`, a leading `!`); the changed paths are the
+ * set's own files. `on:` is read as YAML.
+ */
+export function proofWorkflowsOf(files: readonly { path: string; content: string | Uint8Array }[], at: { branch: string; defaultBranch: string }): ProofWorkflows {
   const push: string[] = [];
   const pullRequest: string[] = [];
+  const merge: string[] = [];
+  const changed = files.map((f) => f.path);
   for (const f of files) {
     if (!isWorkflow(f.path)) continue;
     const text = typeof f.content === 'string' ? f.content : Buffer.from(f.content).toString('utf8');
     const on: unknown = parseDocument(text).toJS()?.on;
-    const events = typeof on === 'string' ? [on] : Array.isArray(on) ? on.map(String) : typeof on === 'object' && on !== null ? Object.keys(on) : [];
-    if (events.includes('push')) push.push(f.path);
-    if (events.includes('pull_request')) pullRequest.push(f.path);
+    const events: Record<string, unknown> = typeof on === 'string' ? { [on]: null } : Array.isArray(on) ? Object.fromEntries(on.map((e) => [String(e), null])) : typeof on === 'object' && on !== null ? on as Record<string, unknown> : {};
+    if (Object.hasOwn(events, 'push') && runsOn(events.push, at.branch, changed)) push.push(f.path);
+    if (Object.hasOwn(events, 'pull_request') && runsOn(events.pull_request, at.defaultBranch, changed)) pullRequest.push(f.path);
+    if (Object.hasOwn(events, 'push') && runsOn(events.push, at.defaultBranch, changed)) merge.push(f.path);
   }
-  return { push, pullRequest, merge: push };
+  return { push, pullRequest, merge };
+}
+
+/** One event's filters against a branch and the changed paths (GitHub's rules: a filter it can't read means no run, fail closed). */
+function runsOn(cfg: unknown, branch: string, changed: readonly string[]): boolean {
+  if (cfg === null || cfg === undefined) return true;
+  if (typeof cfg !== 'object' || Array.isArray(cfg)) return false;
+  const c = cfg as Record<string, unknown>;
+  const list = (k: string): string[] | null | undefined => (c[k] === undefined ? undefined : Array.isArray(c[k]) ? (c[k] as unknown[]).map(String) : typeof c[k] === 'string' ? [c[k] as string] : null);
+  const br = list('branches'), brIgnore = list('branches-ignore'), paths = list('paths'), pathsIgnore = list('paths-ignore');
+  if (br === null || brIgnore === null || paths === null || pathsIgnore === null) return false;
+  if (br !== undefined && !filterMatches(br, branch)) return false;
+  if (brIgnore !== undefined && brIgnore.some((x) => globMatch(x, branch))) return false;
+  if (paths !== undefined && !changed.some((x) => filterMatches(paths, x))) return false;
+  if (pathsIgnore !== undefined && changed.every((x) => pathsIgnore.some((g) => globMatch(g, x)))) return false;
+  return true;
+}
+/** A filter list with `!` negations: the last pattern that matches decides. */
+function filterMatches(patterns: readonly string[], value: string): boolean {
+  let hit = false;
+  for (const raw of patterns) {
+    const neg = raw.startsWith('!');
+    if (globMatch(neg ? raw.slice(1) : raw, value)) hit = !neg;
+  }
+  return hit;
+}
+/** GitHub's filter pattern: `**` any characters, `*` any but `/`, `?` one character; the rest literal. */
+function globMatch(pattern: string, value: string): boolean {
+  let re = '';
+  for (let k = 0; k < pattern.length; k++) {
+    const ch = pattern[k] as string;
+    if (ch === '*' && pattern[k + 1] === '*') { re += '.*'; k++; } else if (ch === '*') re += '[^/]*';
+    else if (ch === '?') re += '.';
+    else re += ch.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  }
+  return new RegExp(`^${re}$`).test(value);
 }
 
 /** One proof's files of a draft: the central draft (private apps) and the app branch's files (assembled at signing none, the created app files, the harness, the compat copies). */
@@ -206,11 +249,38 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
       const app = await paf.appFiles(centralSha);
       return { central, app, last: paf.last() };
     };
+    // C1 (G14-R1): one computation per draft and central sha, so a proof never runs files other than the draft's own (no stale set)
+    const cache = new WeakMap<PipelineDraft, Map<string, Promise<DraftFiles>>>();
+    const filesAt = (d: PipelineDraft, centralSha: string | undefined): Promise<DraftFiles> => {
+      let byKey = cache.get(d);
+      if (byKey === undefined) { byKey = new Map(); cache.set(d, byKey); }
+      const k = centralSha ?? '';
+      let f = byKey.get(k);
+      if (f === undefined) { f = filesOf(d, centralSha); byKey.set(k, f); }
+      return f;
+    };
     const pushed = (f: DraftFiles): PushedWorkflow[] => [...f.app.filter((x) => isWorkflow(x.path)), ...f.central.filter((x) => isWorkflow(x.path))].map((x) => ({ path: x.path, content: x.content }));
     const pipegenWorkflows = (f: DraftFiles): Set<string> => new Set(f.app.filter((x) => isWorkflow(x.path)).map((x) => x.path));
+    // sec M3: the workflows a proof's evaluation reads (the main proof and every dispute option alike): never the harness or a compat copy
+    const evalWorkflows = (f: DraftFiles): string[] => [...pipegenWorkflows(f)].filter((x) => x !== HARNESS_PATH && !x.startsWith('.github/workflows/pipegen-compat-'));
+    const workflowsAt = (f: DraftFiles, br: ProofBranch): ProofWorkflows => proofWorkflowsOf(f.app, { branch: br.branch, defaultBranch: t.defaultBranch });
+
+    // C1 (G14-R1): a private app proves ONE central draft per session (Plan E), so its disputes are decided before the setup, without a
+    // proof run, and the setup pushes (and the proof runs) the winners' central workflows
+    const debate = i.debate;
+    const disputes = i.resume !== true && debate !== undefined && debate.disputes.length > 0 ? debate : undefined;
+    let startDraft = i.draft;
+    if (disputes !== undefined && p.private) {
+      const planted0 = plantedFiles(p, { basePaths: await o.basePaths(i.dir) });
+      const decision = await o.decide(disputes.disputes, {
+        expected: planted0.expected, placements: [], choices: disputes.choices, canProve: () => false,
+        prove: async () => { throw new ProofStopError('pipegen proves no dispute of a private app.'); },
+      });
+      startDraft = winnersDraft(i, decision, startDraft, (l) => l.replace(MINUTES_REASON, PRIVATE_REASON));
+    }
 
     // E-b11: the scratch keys read the names of the assembled proof workflows
-    const first = await filesOf(i.draft, undefined);
+    const first = await filesAt(startDraft, undefined);
     const readBy = workflowSecretNames(pushed(first));
     const raw = o.keys(gh, t, vault, { io, leftover: (x) => store.record(x), ...(readBy === null ? {} : { readByWorkflows: readBy }) });
     const keys = guardedKeys(raw, store);
@@ -221,12 +291,14 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
     i.arm((ctx) => cleanup(ctx.signal), meters);
     // the draft the proof starts from, saved for a resume (S20), then the stage (S3: 16 proving)
     if (i.resume !== true) {
-      store.update((n) => { n.draft = structuredClone(i.draft); });
+      store.update((n) => { n.draft = structuredClone(startDraft); });
       store.setStage('proving');
     }
 
     let repos: ProofRepos | undefined;
     const declined = new Set<string>();
+    // spec M2: the draft the latest proof ran (the fix loop's), saved with a stop's verdict
+    let latest = startDraft;
     const prove = async (): Promise<FixOutcome> => {
       // 8. the helper repos, inside prove (E-a7, ruling G14-R0 1): a throw here is cleaned up too
       repos = i.checkRepos !== undefined ? await i.checkRepos() : await o.checkRepos(gh, st0.app, {
@@ -265,77 +337,77 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
       const setup = await o.setup({
         target: t, dir: i.dir, ...(repos.defaultBranchState === undefined ? {} : { defaultBranchState: repos.defaultBranchState }),
         ...(first.central.length === 0 ? {} : { central: { files: first.central } }),
-        appFiles: async (sha) => (await filesOf(i.draft, sha)).app, plantedFiles: planted.files,
-        dockerServices: p.services.filter((s) => s.dockerfile !== undefined || i.draft.created.some((f) => f.path === dockerfileAt(s))),
+        appFiles: async (sha) => (await filesAt(startDraft, sha)).app, plantedFiles: planted.files,
+        dockerServices: p.services.filter((s) => s.dockerfile !== undefined || startDraft.created.some((f) => f.path === dockerfileAt(s))),
       }, { gh, transport, io, storeSecrets: storeStep });
       const centralSha = setup.centralSha;
       const centralKey = fileKey(first.central);
       const ctxOf = (f: DraftFiles, placements: readonly PlantedPlacement[]): EvalContext => ({
         userMain: userMainMap, notCompared: f.last?.compat.notCompared ?? [], planted: placements, plantedItems: planted.expected, matchPlanted,
         keys: raw.mode, harnessJobs: f.last?.harness.jobs.map((j) => j.id) ?? [], harnessNotes: f.last?.harness.notes ?? [], carried: setup.notProven,
-        pipegenWorkflows: [...pipegenWorkflows(f)].filter((x) => x !== HARNESS_PATH && !x.startsWith('.github/workflows/pipegen-compat-')), minutesUsed: m.used,
+        pipegenWorkflows: evalWorkflows(f), minutesUsed: m.used,
       });
       const userMainMap = await o.userMain(gh, p);
 
       // the current branches: main and planted as the setup pushed them
       let cur: { d: PipelineDraft; files: DraftFiles; main: ProofBranch; planted: ProofBranch; placements: readonly PlantedPlacement[] } = {
-        d: i.draft, files: await filesOf(i.draft, centralSha), main: setup.branches.main, planted: setup.branches.planted, placements: setup.planted,
+        d: startDraft, files: await filesAt(startDraft, centralSha), main: setup.branches.main, planted: setup.branches.planted, placements: setup.planted,
       };
-      let draft = i.draft;
+      // C1: the files the setup pushed are the start draft's, central included (anything else stops the proof)
+      if (fileKey(cur.files.central) !== centralKey) throw new ProofStopError(CENTRAL_CHANGED);
+      let round = 1;
+      let merged = false;
+      // sec M2: main and planted of a draft as a fresh round off the base, with fresh C1b placements
+      const freshRound = async (d: PipelineDraft, f: DraftFiles): Promise<typeof cur> => {
+        round++;
+        if (merged) { await o.resetBase(setup.session, setup.base, transport); merged = false; }
+        const c1b = o.placements(setup.base.paths, setup.base.gitleaksIgnore);
+        const main = await o.pushBranch(setup.session, 'main', [f.app], { transport, pipegenWorkflows: pipegenWorkflows(f), round });
+        const pl = await o.pushBranch(setup.session, 'planted', [[...f.app, ...planted.files, ...c1b.files]], { transport, pipegenWorkflows: pipegenWorkflows(f), round });
+        return { d, files: f, main, planted: pl, placements: c1b.expected };
+      };
 
-      // F-7: the disputes, after pushProofSetup and before the main merge
-      const debate = i.debate;
-      if (i.resume !== true && debate !== undefined && debate.disputes.length > 0) {
-        let proven = 0;
-        const decision: Decision = await o.decide(debate.disputes, {
-          expected: planted.expected, placements: setup.planted, choices: debate.choices,
-          // the minutes meter: the next dispute's runs must fit what is left of the cap; a private app's central draft is pushed once, so none
-          canProve: (runs) => !p.private && m.cap - m.used >= runs * Math.max(1, i.variantMinutes),
+      // F-7: a public app's disputes, after pushProofSetup and before the main merge
+      if (disputes !== undefined && !p.private) {
+        const decision: Decision = await o.decide(disputes.disputes, {
+          expected: planted.expected, placements: setup.planted, choices: disputes.choices,
+          // the minutes meter: the next dispute's runs must fit what is left of the cap
+          canProve: (runs) => m.cap - m.used >= runs * Math.max(1, i.variantMinutes),
           prove: async (variant, choices) => {
-            proven++;
-            const od = withSteps(draft, choices);
-            const f = await filesOf(od, centralSha);
+            const od = withSteps(cur.d, choices);
+            const f = await filesAt(od, centralSha);
+            if (fileKey(f.central) !== centralKey) throw new ProofStopError(CENTRAL_CHANGED);
             const c1b = o.placements(setup.base.paths, setup.base.gitleaksIgnore);
             const br = await o.pushBranch(setup.session, variant, [[...f.app, ...planted.files, ...c1b.files]], { transport, pipegenWorkflows: pipegenWorkflows(f) });
-            const vp = await o.variant(gh, t, { branch: br, merge: false, workflows: proofWorkflowsOf(f.app), keepOpen: false }, wait);
-            return { run: optionRunOf({ variant, ...vp }, { optionLabel: variant, expected: planted.expected, placements: c1b.expected, toolOfKey: toolsByKey(choices), pipegenWorkflows: [...pipegenWorkflows(f)] }) };
+            const vp = await o.variant(gh, t, { branch: br, merge: false, workflows: workflowsAt(f, br), keepOpen: false }, wait);
+            return { run: optionRunOf({ variant, ...vp }, { optionLabel: variant, expected: planted.expected, placements: c1b.expected, toolOfKey: toolsByKey(choices), pipegenWorkflows: evalWorkflows(f) }) };
           },
         });
-        void proven;
         // carry 22: the winners by key over the debate's choices, through draftFromDebate; the scoreboard as it is
-        const won = i.withWinners === undefined ? withSteps(draft, [...decision.winners.values()]) : i.withWinners(decision.winners);
-        draft = { ...won, scoreboard: [...decision.scoreboard] };
-        // a judge win: main and planted again with the winners' files, before the main merge (pushed on top of their heads)
-        const f = await filesOf(draft, centralSha);
-        if (fileKey(f.app) !== fileKey(cur.files.app)) {
-          const main = await o.pushBranch(setup.session, 'main', [f.app], { transport, pipegenWorkflows: pipegenWorkflows(f), parent: cur.main.sha });
-          const pl = await o.pushBranch(setup.session, 'planted', [[...f.app, ...planted.files]], { transport, pipegenWorkflows: pipegenWorkflows(f), parent: cur.planted.sha });
-          cur = { ...cur, d: draft, files: f, main, planted: pl };
-        } else cur = { ...cur, d: draft };
+        const draft = winnersDraft(i, decision, cur.d);
+        // a judge win: main and planted again with the winners' files (a fresh round off the base), before the main merge
+        const f = await filesAt(draft, centralSha);
+        if (fileKey(f.central) !== centralKey) throw new ProofStopError(CENTRAL_CHANGED);
+        cur = fileKey(f.app) !== fileKey(cur.files.app) ? await freshRound(draft, f) : { ...cur, d: draft, files: f };
       }
 
       // FixDeps.prove: the first call runs the branches as pushed; every later one a fresh round off the base (B3)
       let calls = 0;
-      let round = 1;
-      let merged = false;
       let last: { d: PipelineDraft; files: DraftFiles; runs: VariantRuns[]; placements: readonly PlantedPlacement[] } | null = null;
       const proveDraft = async (d: PipelineDraft, scope: 'pr' | 'full'): Promise<ProofRun> => {
-        const f = calls === 0 && d === cur.d ? cur.files : await filesOf(d, centralSha);
+        latest = d;
+        // C1: the draft's own files, every call; a central change after the setup can't be pushed again (one central draft per session)
+        const f = await filesAt(d, centralSha);
         if (fileKey(f.central) !== centralKey) throw new ProofStopError(CENTRAL_CHANGED);
-        let main = cur.main, pl = cur.planted, placements = cur.placements;
+        let { main, planted: pl, placements } = cur;
         if (calls > 0 || fileKey(f.app) !== fileKey(cur.files.app)) {
-          round++;
-          if (merged) { await o.resetBase(setup.session, setup.base, transport); merged = false; }
-          const c1b = o.placements(setup.base.paths, setup.base.gitleaksIgnore);
-          main = await o.pushBranch(setup.session, 'main', [f.app], { transport, pipegenWorkflows: pipegenWorkflows(f), round });
-          pl = await o.pushBranch(setup.session, 'planted', [[...f.app, ...planted.files, ...c1b.files]], { transport, pipegenWorkflows: pipegenWorkflows(f), round });
-          placements = c1b.expected;
+          const r = await freshRound(d, f);
+          main = r.main; pl = r.planted; placements = r.placements;
         }
         calls++;
-        const wf = proofWorkflowsOf(f.app);
-        const mv = await o.variant(gh, t, { branch: main, merge: scope === 'full', workflows: wf }, wait);
+        const mv = await o.variant(gh, t, { branch: main, merge: scope === 'full', workflows: workflowsAt(f, main) }, wait);
         if (mv.mergeSha !== undefined) merged = true;
-        const pv = await o.variant(gh, t, { branch: pl, merge: false, workflows: wf, keepOpen: false }, wait);
+        const pv = await o.variant(gh, t, { branch: pl, merge: false, workflows: workflowsAt(f, pl), keepOpen: false }, wait);
         const runs: VariantRuns[] = [{ variant: 'main', ...mv }, { variant: 'planted', ...pv }];
         last = { d, files: f, runs, placements };
         const ev = await o.evaluate((await build.rebuild(d)).assembled, runs, ctxOf(f, placements));
@@ -359,11 +431,11 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
         ai: meter.provider,
         prove: proveDraft, rerun,
         nextCandidate: nextCandidateFrom(i.resume === true ? undefined : i.debate, p, i.reviewed, () => last?.runs ?? []),
-        ...(i.bundle === undefined ? {} : { dockerfileFor: dockerfileFrom(i.bundle, meter, i.dir) }),
+        ...(i.bundle === undefined ? {} : { dockerfileFor: dockerfileFrom(i.bundle, meter) }),
         referee: (d) => build.referee(d),
         guard: (files) => build.guard(files),
         keys, vault, scanner: await i.scanner(), secretNames: names,
-        workflowsOf: async (d) => pushed(await filesOf(d, centralSha)),
+        workflowsOf: async (d) => pushed(await filesAt(d, centralSha)),
         confirm: async (files) => {
           const yes = await midRunConfirm(io)(files);
           if (!yes) for (const f of files) declined.add(f.path);
@@ -388,7 +460,16 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
     try {
       res = await proveThenClean(store, prove, () => cleanup());
     } catch (e) {
-      if (e instanceof ProofStopError) return { ok: false, stopped: stopLine(e.message), ...(repos === undefined ? {} : { repos }), notes };
+      if (e instanceof ProofStopError) {
+        // spec M2: a stop mid-proof keeps the fix loop's draft for a resume (not proven), like a cap stop (G0-R1 I2)
+        if (store.state?.stage === 'proving') {
+          try {
+            store.recordVerdict({ ok: false, draft: latest, stopped: e.message });
+            store.setStage('stopped', { stoppedBy: 'proof-failed' });
+          } catch { /* the stop below is what matters; a resume proves the saved draft again */ }
+        }
+        return { ok: false, stopped: stopLine(e.message), ...(repos === undefined ? {} : { repos }), notes };
+      }
       throw e;
     }
     const out = res.outcome;
@@ -416,13 +497,29 @@ export function dropDeclined(out: FixOutcome, declined: ReadonlySet<string>): Fi
   if (gone.length === 0) return out;
   const parts = [...new Set(gone.map((f) => f.part))];
   const testsFloor = out.draft.needs.some((n) => n.floor === true && /tests$/.test(n.category ?? n.id)) && !out.draft.skipped.some((x) => x.part === 'tests');
-  const floorHit = parts.some((x) => FLOOR_PARTS.has(x) || (x === 'tests' && testsFloor));
-  const notProven = [...out.draft.notProven, ...parts.filter((x) => !out.draft.notProven.some((n) => n.part === x && n.reason === DECLINED_REASON)).map((part) => ({ part, missingSecrets: [], reason: DECLINED_REASON }))];
+  // sec M1: every part whose jobs read a dropped path ran with a file that is not delivered: not proven either. A job reads the paths of
+  // its service (the service's folder; a service at the root reads every path). Repo-wide jobs (no service) only scan text, and a file
+  // less never adds a finding, so they keep their result.
+  const owners = new Set(out.draft.profile.services.filter((sv) => gone.some((f) => owns(sv.path, f.path))).map((sv) => sv.name));
+  const readers = out.draft.steps.filter((st) => st.service !== undefined && owners.has(st.service)).map((st) => st.needId);
+  const hit = out.result.parts.filter((x) => x.needId !== undefined && readers.includes(x.needId) && x.status === 'proven');
+  const floorNeed = hit.some((x) => out.draft.needs.some((n) => n.id === x.needId && n.floor === true));
+  const floorHit = floorNeed || parts.some((x) => FLOOR_PARTS.has(x) || (x === 'tests' && testsFloor));
+  const add = [
+    ...parts.map((part) => ({ part, missingSecrets: [], reason: DECLINED_REASON })),
+    ...hit.map((x) => ({ part: x.part, needId: x.needId as string, missingSecrets: [], reason: `${DECLINED_REASON} (this job read them)` })),
+  ].filter((n) => !out.draft.notProven.some((o) => o.part === n.part && o.reason === n.reason && o.needId === (n as { needId?: string }).needId));
+  const notProven = [...out.draft.notProven, ...add];
   const draft: PipelineDraft = { ...out.draft, created: out.draft.created.filter((f) => !gone.includes(f)), notProven } as PipelineDraft;
+  const result = { ...out.result, parts: out.result.parts.map((x) => (hit.includes(x) ? { ...x, status: 'not-proven' as const, detail: DECLINED_REASON } : x)) };
   return floorHit
-    ? { ...out, draft, result: { ...out.result, ok: false }, stopped: `${out.stopped === undefined ? '' : `${out.stopped}; `}${DECLINED_REASON}, and the ${parts.join(', ')} part must be proven` }
-    : { ...out, draft };
+    ? { ...out, draft, result: { ...result, ok: false }, stopped: `${out.stopped === undefined ? '' : `${out.stopped}; `}${DECLINED_REASON}, and the ${[...parts, ...hit.map((x) => x.needId as string)].join(', ')} part must be proven` }
+    : { ...out, draft, result };
 }
+const owns = (servicePath: string, path: string): boolean => {
+  const sp = servicePath.replace(/^(?:\.\/)+/, '').replace(/\/+$/, '');
+  return sp === '' || sp === '.' || path === sp || path.startsWith(`${sp}/`);
+};
 
 /**
  * A resumed run whose proof passed but whose cleanup didn't finish (stage proven): the same cleanup (cleanupAfterProof with the token's
@@ -430,15 +527,25 @@ export function dropDeclined(out: FixOutcome, declined: ReadonlySet<string>): Fi
  */
 export function makeCleanupOnly(over: Partial<ProofOps> = {}) {
   const o: ProofOps = { ...realProofOps, ...over };
-  return async (i: Pick<ProofInput, 'store' | 'gh' | 'vault' | 'io' | 'auth'>): Promise<CleanupResult> => {
+  return async (i: Pick<ProofInput, 'store' | 'gh' | 'vault' | 'io' | 'auth' | 'ai'>): Promise<CleanupResult> => {
     const st0 = i.store.state;
     if (st0 === null) throw new Error('The cleanup needs the run\'s state.');
     const t = proofTarget(st0.app, { runId: st0.runId });
     const keys = o.keys(i.gh, t, i.vault, { io: i.io, leftover: (x) => i.store.record(x) });
-    const r = await o.cleanup(i.gh, t, i.store, keys as unknown as ScratchKeys, { canDeleteRepo: i.auth.canDeleteRepos === true });
+    // carry 14: the meters reach the cleanup (the AI spend restored on the resume's meter)
+    const r = await o.cleanup(i.gh, t, i.store, keys as unknown as ScratchKeys, { canDeleteRepo: i.auth.canDeleteRepos === true, meters: () => ({ ai: i.ai.meter }) });
     i.store.setStage('cleaned');
     return r;
   };
+}
+
+/** decide.ts's words for a dispute it decided without a run for lack of minutes; a private app's real reason replaces them (C1). */
+const MINUTES_REASON = 'not enough Actions minutes are left for it';
+export const PRIVATE_REASON = 'a private app proves one central draft per session, so no option ran on its own';
+/** Carry 22: the winners by key over the debate's choices (through draftFromDebate), with the scoreboard as decide wrote it. */
+function winnersDraft(i: Pick<ProofInput, 'withWinners'>, decision: Decision, d: PipelineDraft, line: (l: string) => string = (l) => l): PipelineDraft {
+  const won = i.withWinners === undefined ? withSteps(d, [...decision.winners.values()]) : i.withWinners(decision.winners);
+  return { ...won, scoreboard: decision.scoreboard.map(line) };
 }
 
 const stopLine = (why: string): string => `pipegen stopped: the proof did not pass (${safeText(why, 900)}), so nothing was delivered. exit code 2.`;
@@ -534,11 +641,10 @@ export function nextCandidateFrom(debate: DebateResult | undefined, p: RepoProfi
 const dockerfileAt = (s: { path: string }): string => { const r = s.path.replace(/^(?:\.\/)+/, '').replace(/\/+$/, '').replace(/^\.$/, ''); return r === '' ? 'Dockerfile' : `${r}/Dockerfile`; };
 
 /** S10: the created Dockerfile at `path` made again from base image `baseId`, through the run's metered provider (E-a5), with its .dockerignore. */
-function dockerfileFrom(bundle: CodeBundle, meter: AiSpendMeter, dir: string): NonNullable<FixDeps['dockerfileFor']> {
+function dockerfileFrom(bundle: CodeBundle, meter: AiSpendMeter): NonNullable<FixDeps['dockerfileFor']> {
   return async (path, baseId, d) => {
     const svc = d.profile.services.find((s) => dockerfileAt(s) === path);
     if (svc === undefined) return [];
-    void dir;
     return (await createDockerfile(svc, d.profile, bundle, meter.provider, undefined, { baseId })).files;
   };
 }

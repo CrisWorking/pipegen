@@ -110,7 +110,8 @@ const APP_CONFIGURE = 'GitHub → Settings → Applications → Installed GitHub
 /** `gh repo create <owner>/<name> --private --description "…"` for each name (validated GitHub names, a fixed description). */
 export function createCommands(owner: string, names: string[]): string[] {
   checkRepoNames(owner, names);
-  return names.map((n) => `gh repo create ${owner}/${n} --private --description "${helperDescription(n === CENTRAL_REPO ? 'central' : 'scratch')}"`);
+  // ruling V3-wiki (G14-R1 sec M5): no wiki (gh has no flag for projects; checkProofRepos names them when they are on)
+  return names.map((n) => `gh repo create ${owner}/${n} --private --disable-wiki --description "${helperDescription(n === CENTRAL_REPO ? 'central' : 'scratch')}"`);
 }
 
 // ---------- GitHub reads ----------
@@ -136,6 +137,8 @@ type Seen = { exists: false } | {
   exists: true; visibility: 'private' | 'public' | 'internal'; defaultBranch: string;
   /** null: GitHub didn't say. */
   description: string | null; allowForking: boolean | null;
+  /** G14-R1 (sec M5): the wiki and projects switches (null: GitHub didn't say). */
+  hasWiki?: boolean | null; hasProjects?: boolean | null;
 };
 
 /**
@@ -160,7 +163,7 @@ async function readHelper(gh: Octokit, owner: string, name: string, clock: RateC
     if (statusOf(e) === 404) return { exists: false };
     throw new GitHubAccessError(`pipegen couldn't read ${owner}/${name} (${saidOf(e)}).`, { status: statusOf(e) });
   }
-  const d = (data ?? {}) as { full_name?: unknown; default_branch?: unknown; description?: unknown; allow_forking?: unknown };
+  const d = (data ?? {}) as { full_name?: unknown; default_branch?: unknown; description?: unknown; allow_forking?: unknown; has_wiki?: unknown; has_projects?: unknown };
   if (typeof d.full_name !== 'string' || d.full_name.toLowerCase() !== `${owner}/${name}`.toLowerCase()) {
     throw new ProofStopError(`GitHub answered for ${safeText(String(d.full_name), 160)} when pipegen asked for ${owner}/${name} (renamed or transferred), `
       + `so pipegen won't use it. Rename or move that repo away from ${owner}/${name}, then run pipegen again.`);
@@ -171,6 +174,7 @@ async function readHelper(gh: Octokit, owner: string, name: string, clock: RateC
     exists: true, visibility, defaultBranch: d.default_branch,
     description: typeof d.description === 'string' ? d.description : null,
     allowForking: typeof d.allow_forking === 'boolean' ? d.allow_forking : null,
+    hasWiki: typeof d.has_wiki === 'boolean' ? d.has_wiki : null, hasProjects: typeof d.has_projects === 'boolean' ? d.has_projects : null,
   };
 }
 
@@ -697,6 +701,15 @@ export async function checkProofRepos(gh: Octokit, app: ProofApp, opts: ProofRep
         io.out(`Created the private repo ${r.fullName}.`);
       }
     }
+  }
+
+  // G14-R1 (sec M5, ruling V3-wiki): a helper repo holds only what pipegen puts there; a wiki or projects switched on is named (pipegen
+  // never turns a setting of a repo it didn't make; the ones it makes have both off)
+  for (const r of helpers) {
+    const s = seen.get(r) as Seen;
+    if (!s.exists || result.created.includes(r.repo)) continue;
+    const on = [s.hasWiki === true ? 'wiki' : '', s.hasProjects === true ? 'projects' : ''].filter((x) => x !== '');
+    if (on.length > 0) io.err(`${r.fullName} has its ${on.join(' and ')} turned on. A helper repo should hold only what pipegen puts there: gh repo edit ${r.fullName} --enable-wiki=false --enable-projects=false`);
   }
 
   result.repos = helpers.map((r) => {

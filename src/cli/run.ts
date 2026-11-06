@@ -78,9 +78,9 @@ import { makeCleanupOnly, makeRunProof, type ProofBuild, type ProofInput, type P
 import { keyOffers, type Choice } from '../debate/builder.js';
 import { restoreAiSpend } from '../proof/cleanup.js';
 import { nextStage, STAGE_ORDER } from '../proof/state.js';
-import { StateStore, type RunState, type StateDeps } from '../proof/state.js';
+import { StateStore, type AgreedTerms, type RunState, type StateDeps } from '../proof/state.js';
 import { CENTRAL_REPO } from '../proof/target.js';
-import type { Auth, Capabilities, Candidate, CreatedFile, KnownValueCheck, PipelineDraft, RepoProfile, ReviewedTool, SkippablePart } from '../types.js';
+import type { AiProvider, Auth, Capabilities, Candidate, CreatedFile, KnownValueCheck, PipelineDraft, RepoProfile, ReviewedTool, SkippablePart } from '../types.js';
 import { signingMode, type SigningMode } from '../github/signing-mode.js';
 import { safeText } from '../util/safe-text.js';
 import { pubKeySha256 } from '../engine/signing.js';
@@ -150,6 +150,17 @@ export const PUBLIC_FILES_CHANGED = 'pipegen stopped: the files it would deliver
 export const NOTHING_TO_RESUME = 'pipegen has no stopped run of this repository to resume. Run `npx pipegen run`. exit code 1.';
 export const ALREADY_DELIVERED = 'The saved run of this repository was already delivered; there is nothing to resume. exit code 1.';
 export const NOT_PROVING_YET = 'The saved run stopped before its proof, so there is nothing to resume: run `npx pipegen run` again (it starts over). exit code 1.';
+/** G14-R1 (sec I2): a saved run with no agreed terms (an older state): a resume can't tell which AI the user agreed to. */
+export const NO_AGREED_TERMS = 'pipegen stopped: the saved run does not say which AI you agreed to, so it can\'t go on with it. Run `npx pipegen cleanup`, then `npx pipegen run`. exit code 2.';
+/** G14-R1 (sec I2): a resume whose AI (provider, model or Ollama host) is not the one agreed to: nothing is sent. */
+export const AI_NOT_AGREED = (agreed: AgreedTerms, now: Pick<AgreedTerms, 'provider' | 'model' | 'host'>): string =>
+  `pipegen stopped: you agreed to ${aiLabel(agreed)}, but this shell sets up ${aiLabel(now)}. Nothing was sent to an AI. Set the same AI as before (the API key and --model), or run \`npx pipegen cleanup\` and start again. exit code 2.`;
+const aiLabel = (t: Pick<AgreedTerms, 'provider' | 'model' | 'host'>): string => safeText(`${t.provider} (${t.model}${t.host === undefined ? '' : ` at ${t.host}`})`, 300);
+/** The agreed AI of a provider: its name, model and Ollama host (never a key). */
+export const aiTermsOf = (p: AiProvider): Pick<AgreedTerms, 'provider' | 'model' | 'host'> => {
+  const host = ollamaHostOf(p);
+  return { provider: p.name, model: p.model, ...(host === null ? {} : { host }) };
+};
 export const KEY_PAIR_GONE = 'pipegen stopped: the saved draft signs with a key pair that lived only in memory during the stopped run, so it can\'t be delivered. Run `npx pipegen cleanup`, then `npx pipegen run`. exit code 2.';
 /**
  * S20 (resume): the plan of a saved draft. Its steps are the tools the stopped run chose (reviewed entries only); assemble checks them against
@@ -397,6 +408,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     const est = estimate(p, consentJobs(p, facts.caps), 2, activity, provider, { needKeys: needKeyCount(floor) });
     let bundle: CodeBundle | undefined;
     let scannerName: 'gitleaks' | 'betterleaks' = chooseSecretScanner(io.env);
+    let agreedMinutes = est.monthlyMinutes;
     if (counted !== undefined) {
       const consent = await st.consent(facts, p, provider, est, counted, auth, extra);
       if (consent === null) { err('No consent: nothing was created, nothing was sent to an AI and no secret was asked for. exit code 1.'); return 1; }
@@ -421,13 +433,25 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
       if (next === null) { err(ALREADY_DELIVERED); return 1; }
       if (STAGE_ORDER.indexOf(next) < STAGE_ORDER.indexOf('proving')) { err(NOT_PROVING_YET); return 1; }
       if (saved0.draft === undefined) { err('pipegen stopped: the saved run holds no draft to go on with. Run `npx pipegen cleanup`, then `npx pipegen run`. exit code 2.'); return 2; }
+      // G14-R1 (sec I2, M6): the AI, strictness, scanner and minutes the user agreed to; a resume never sends code to another AI
+      const agreed = saved0.agreed;
+      if (agreed === undefined) { err(NO_AGREED_TERMS); return 2; }
+      const now0 = aiTermsOf(provider);
+      if (now0.provider !== agreed.provider || now0.model !== agreed.model || (now0.host ?? '') !== (agreed.host ?? '')) { err(AI_NOT_AGREED(agreed, now0)); return 2; }
+      if (agreed.strictness !== undefined) level = parseStrictness(agreed.strictness);
+      if (agreed.scanner !== undefined) scannerName = agreed.scanner;
+      if (agreed.monthlyMinutes !== undefined) agreedMinutes = agreed.monthlyMinutes;
       runId = saved0.runId;
       store.acquireLease(runId);
     } else {
       runId = (deps.runId ?? (() => newRunId(now())))();
       // S20: one pipegen per app repo on this machine
       store.acquireLease(runId);
-      store.begin(runId, { owner: p.owner, repo: p.repo, private: p.private, ownerType: p.ownerType, defaultBranch: p.defaultBranch }, { cap: est.setupMinutesCap, aiCap: est.aiCostCapUsd });
+      store.begin(runId, { owner: p.owner, repo: p.repo, private: p.private, ownerType: p.ownerType, defaultBranch: p.defaultBranch }, {
+        cap: est.setupMinutesCap, aiCap: est.aiCostCapUsd,
+        // G14-R1 (sec I2, M6): the consent's terms, for a resume (names only)
+        agreed: { ...aiTermsOf(provider), strictness: level, scanner: scannerName, monthlyMinutes: est.monthlyMinutes },
+      });
     }
     // carry 47: one meter per consent token; every AI closure goes through it. E-a6: a resume builds it on the SAVED aiCap, then restores
     // the spend so far (restoreAiSpend)
@@ -537,7 +561,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     let proof: ProofReturn;
     if (resume && next !== 'proving') {
       if (next === 'cleaned') {
-        const c = await (deps.cleanupOnly ?? makeCleanupOnly())({ store, gh: facts.gh, vault, io, auth });
+        const c = await (deps.cleanupOnly ?? makeCleanupOnly())({ store, gh: facts.gh, vault, io, auth, ai: { meter } });
         for (const l of c.leftovers) err(`Left behind: ${safeText(l, 300)}`);
       }
       proof = { ok: true };
@@ -567,7 +591,9 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     const repos: Pick<ProofRepos, 'created' | 'createdIds' | 'actionsAccess'> = proof.repos ?? { created: [] };
     if (!proof.ok) { err(safeText(proof.stopped ?? 'pipegen stopped: the proof did not pass, so nothing was delivered. exit code 2.', 1200)); return 2; }
     const saved = store.load();
-    if (saved === null || saved.stage !== 'cleaned' || saved.proofOk !== true) { err('pipegen stopped: the proof did not end cleaned up with a passed verdict, so nothing was delivered. exit code 2.'); return 2; }
+    // sec M4: a Ctrl-C after the cleanup (the preview, the delivery) leaves it interrupted or stopped AT cleaned: still cleaned, with its verdict
+    const cleanedNow = saved !== null && (saved.stage === 'cleaned' || ((saved.stage === 'interrupted' || saved.stage === 'stopped') && saved.interruptedAt === 'cleaned'));
+    if (saved === null || !cleanedNow || saved.proofOk !== true) { err('pipegen stopped: the proof did not end cleaned up with a passed verdict, so nothing was delivered. exit code 2.'); return 2; }
     // G13-R1 (sec I3): deliver only the draft saved with the passing verdict of THIS run
     const proven = provenDraft(saved, runId, proof.draft);
     if ('stop' in proven) { err(proven.stop); return 2; }
@@ -604,8 +630,8 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     if (built.files.some((f) => isPlantedPath(f.path) || f.path === HARNESS_PATH || f.path.startsWith(COMPAT_PREFIX))) { err(PROOF_FILE_IN_DELIVERY); return 2; }
     // ruling G13-R0 3: the preview estimate from the assembled jobs; asked again when it is higher than what was agreed
     const est2 = estimate(p, built.minutes.jobs, 2, activity, provider, { needKeys: needKeyCount(built.assembled.draft.needs) });
-    if (est2.monthlyMinutes > est.monthlyMinutes) {
-      const again = await ask(`The pipeline as built needs about ${est2.monthlyMinutes} Actions minutes a month, more than the ${est.monthlyMinutes} you agreed to. Go on?`);
+    if (est2.monthlyMinutes > agreedMinutes) {
+      const again = await ask(`The pipeline as built needs about ${est2.monthlyMinutes} Actions minutes a month, more than the ${agreedMinutes} you agreed to. Go on?`);
       if (!again) { err('Nothing was delivered: you said no to the higher minutes. The secrets you typed were wiped.'); return 1; }
     }
     const input: DeliveryInput = {
@@ -669,13 +695,13 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
  * Carries 16 and 24: what deliver records of the helper repos: the central repo pipegen created (with GitHub's id) and the Actions access
  * level it changed there (checkProofRepos), the scratch repo pipegen created (the state file's id).
  */
-export function proofReposFor(repos: Pick<ProofRepos, 'created' | 'createdIds' | 'actionsAccess'>, saved: { scratchRepoId?: number; actionsAccessPrevious?: string }): NonNullable<DeliveryInput['proofRepos']> {
+export function proofReposFor(repos: Pick<ProofRepos, 'created' | 'createdIds' | 'actionsAccess'>, saved: { scratchRepoId?: number; actionsAccessPrevious?: string; centralCreated?: boolean }): NonNullable<DeliveryInput['proofRepos']> {
   const id = repos.createdIds?.[CENTRAL_REPO];
   // sec M3: the level saved the moment it changed (an earlier, interrupted run's included) wins over this run's read
   const previous = saved.actionsAccessPrevious ?? repos.actionsAccess?.previous;
   return {
     central: {
-      ...(id === undefined ? { createdByPipegen: repos.created.includes(CENTRAL_REPO) } : { repoId: id, createdByPipegen: true }),
+      ...(id === undefined ? { createdByPipegen: repos.created.includes(CENTRAL_REPO) || saved.centralCreated === true } : { repoId: id, createdByPipegen: true }),
       ...(previous === undefined ? {} : { actionsAccess: { previous } }),
     },
     scratch: { ...(saved.scratchRepoId === undefined ? {} : { repoId: saved.scratchRepoId }), createdByPipegen: saved.scratchRepoId !== undefined },
@@ -734,8 +760,10 @@ const sameFiles = (a: readonly CreatedFile[], b: readonly CreatedFile[]): boolea
 };
 
 /** sec I5: only the scratch repo (pipegen-proof-<repo>) is the state's scratch repo; the central repo checkProofRepos also creates is not. */
-export const onCreatedFor = (store: Pick<StateStore, 'scratchCreated'>, repo: string) => (name: string, id: number): void => {
+export const onCreatedFor = (store: Pick<StateStore, 'scratchCreated' | 'update'>, repo: string) => (name: string, id: number): void => {
   if (name === `pipegen-proof-${repo}`) store.scratchCreated(id);
+  // G14-R1 (spec M1): a resume's delivery record still says pipegen made the central repo
+  if (name === CENTRAL_REPO) store.update((n) => { n.centralCreated = true; });
 };
 
 /** sec M4: the key-env pair's secret parts (the password and each line of the private key's body) as known values. */

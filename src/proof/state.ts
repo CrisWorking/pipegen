@@ -58,6 +58,16 @@ export class StateError extends Error {
 
 export interface RecordedBranch { repo: 'scratch' | 'central'; ref: string }
 export interface RecordedPr { head: string; number?: number }
+/** G14-R1: the consent's terms a resume goes on with (names only: never a key). */
+export interface AgreedTerms {
+  provider: 'claude' | 'openai' | 'ollama';
+  model: string;
+  host?: string;
+  strictness?: string;
+  scanner?: 'gitleaks' | 'betterleaks';
+  monthlyMinutes?: number;
+}
+
 export interface RunState {
   version: typeof STATE_VERSION;
   runId: string;
@@ -109,6 +119,14 @@ export interface RunState {
    * changes and carried into the next run's state, so a stop before delivery doesn't lose it (uninstall puts it back).
    */
   actionsAccessPrevious?: 'none' | 'user' | 'organization' | 'enterprise';
+  /**
+   * G14-R1 (sec I2, sec M6): what the user agreed to at the consent screen, saved at begin(): the AI provider, its model and (Ollama)
+   * host, the strictness, the secret scanner and the monthly Actions minutes estimate. A resume uses these, and refuses an AI that
+   * isn't the agreed one (no key is ever saved).
+   */
+  agreed?: AgreedTerms;
+  /** G14-R1 (spec M1): pipegen created the central `pipelines` repo in this run (kept for a resume's delivery record). */
+  centralCreated?: boolean;
   /** The cleanup of this run finished with nothing left behind (cleanupAfterProof). */
   cleanupDone?: boolean;
   /** What the cleanup couldn't remove (plain text, names only), for `pipegen cleanup`. */
@@ -175,6 +193,11 @@ const stateSchema = z.strictObject({
   scratchRepoId: z.number().int().positive().optional(),
   scratchDeleted: z.boolean().optional(),
   actionsAccessPrevious: z.enum(['none', 'user', 'organization', 'enterprise']).optional(),
+  agreed: z.strictObject({
+    provider: z.enum(['claude', 'openai', 'ollama']), model: z.string().max(200), host: z.string().max(300).optional(),
+    strictness: z.string().max(40).optional(), scanner: z.enum(['gitleaks', 'betterleaks']).optional(), monthlyMinutes: nonNeg.optional(),
+  }).optional(),
+  centralCreated: z.boolean().optional(),
   cleanupDone: z.boolean().optional(),
   leftovers: z.array(text).max(1000),
   notes: z.array(text).max(1000),
@@ -345,7 +368,7 @@ export class StateStore {
    * GitHub (leftovers recorded, or a proof that reached GitHub and wasn't cleaned up to the end) is a stop: `pipegen cleanup`
    * first (or `pipegen resume`), so nothing an earlier run left is forgotten when its state is replaced.
    */
-  begin(runId: string, app: ProofApp, init: { cap: number; aiCap: number | null; draft?: PipelineDraft }): RunState {
+  begin(runId: string, app: ProofApp, init: { cap: number; aiCap: number | null; draft?: PipelineDraft; agreed?: AgreedTerms }): RunState {
     if (!RUN_ID_RE.test(runId)) throw new StateError('The run id is not of the form YYYYMMDD-HHMMSS-<6 hex>.');
     const old = this.#state;
     if (old !== null && old.runId !== runId && !settled(old)) {
@@ -361,6 +384,7 @@ export class StateStore {
       ...(keepId ? { scratchRepoId: old.scratchRepoId } : {}),
       ...(old !== null && old.actionsAccessPrevious !== undefined && old.app.owner.toLowerCase() === app.owner.toLowerCase() && old.app.repo.toLowerCase() === app.repo.toLowerCase() ? { actionsAccessPrevious: old.actionsAccessPrevious } : {}),
       ...(init.draft === undefined ? {} : { draft: init.draft }),
+      ...(init.agreed === undefined ? {} : { agreed: structuredClone(init.agreed) }),
       leftovers: [], notes: [], updatedAt: '',
     };
     this.#write(s);

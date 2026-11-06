@@ -1275,10 +1275,13 @@ describe('G13-R1: the meter, the state, the helper repos', () => {
 
   it('run: onCreated records the scratch repo only; the probe-P4 shape (pipelines, 4242) is not recorded (sec I5)', () => {
     const ids: number[] = [];
-    const cb = onCreatedFor({ scratchCreated: (id: number) => { ids.push(id); } } as never, 'r');
+    const st: { centralCreated?: boolean } = {};
+    const cb = onCreatedFor({ scratchCreated: (id: number) => { ids.push(id); }, update: (f: (n: typeof st) => void) => { f(st); } } as never, 'r');
     cb('pipelines', 4242);
     cb('pipegen-proof-other', 1);
     expect(ids).toEqual([]);
+    // G14-R1 (spec M1): the central repo pipegen made is remembered for a resume's record (never as the scratch id)
+    expect(st.centralCreated).toBe(true);
     cb('pipegen-proof-r', 77);
     expect(ids).toEqual([77]);
   });

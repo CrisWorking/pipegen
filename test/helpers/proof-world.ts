@@ -61,10 +61,16 @@ export interface WorldOpts {
   draft?: (d: PipelineDraft) => PipelineDraft;
   input?: Partial<ProofInput>;
   stage?: 'created';
+  /** The real central layout (C1): the app caller is the same for every draft; the steps' tools live only in the central workflow. */
+  centralOnly?: boolean;
 }
 export interface World {
   tl: string[]; store: StateStore; input: ProofInput; ops: Partial<ProofOps>; asked: string[]; vault: SecretVault; meter: AiSpendMeter;
   pushed: { variant: string; files: { path: string | Uint8Array }[]; parent?: string; round?: number }[];
+  /** Every variant run: the branch's variant, its sha, merge or not. */
+  variants: { variant: string; sha: string; merge: boolean }[];
+  /** The central files the setup pushed (private apps). */
+  setupCentral: { path: string; content: string | Uint8Array }[];
   evals: { d: PipelineDraft; ctx: Parameters<ProofOps['evaluate']>[2] }[]; cleanupOpts: Parameters<ProofOps['cleanup']>[4][]; checkOpts: unknown[];
   asm: { mode: string; sha: string | undefined; draft: PipelineDraft }[]; disarm: () => void; run(): Promise<ProofReturn>;
   armed: { cleanup: Parameters<ProofInput['arm']>[0]; meters: Parameters<ProofInput['arm']>[1] }[];
@@ -112,6 +118,8 @@ export async function proofWorld(o: WorldOpts = {}): Promise<World> {
   const cleanupOpts: World['cleanupOpts'] = [];
   const checkOpts: unknown[] = [];
   const asm: World['asm'] = [];
+  const variants: World['variants'] = [];
+  const setupCentral: World['setupCentral'] = [];
   const SCR = { kind: 'scratch', target: { defaultBranch: 'main' } } as never;
   let runN = 100;
   let sha = 0;
@@ -130,6 +138,7 @@ export async function proofWorld(o: WorldOpts = {}): Promise<World> {
     transport: () => ({ push: async (_to, _from, refs) => { tl.push(`push:${refs.map((r) => String(r.branch)).join(',')}`); } }),
     setup: async (input, deps) => {
       tl.push('setup');
+      setupCentral.push(...(input.central?.files ?? []));
       const app = await input.appFiles(input.central === undefined ? undefined : 'c'.repeat(40));
       await deps.transport.push(SCR, {} as never, [{ branch: `proof/${RUN_ID}/main` } as never]);
       await deps.storeSecrets(SCR, { baseSha: 'b'.repeat(40) });
@@ -149,6 +158,7 @@ export async function proofWorld(o: WorldOpts = {}): Promise<World> {
     resetBase: async () => { tl.push('resetBase'); },
     variant: async (_gh, _t, v) => {
       tl.push(`variant:${v.branch.variant}:${v.merge ? 'merge' : 'no-merge'}${v.keepOpen === true ? ':open' : ''}`);
+      variants.push({ variant: v.branch.variant, sha: v.branch.sha, merge: v.merge });
       return { outcomes: [outcome(v.branch.sha)], closed: !v.merge, stopped: false, missing: [], leftovers: [], ...(v.merge ? { mergeSha: 'f'.repeat(40) } : {}) };
     },
     rerunFailed: async (_gh, _t, runs) => { tl.push(`rerunFailed:${runs.map((r) => r.handle.runId).join(',')}`); return runs.map((r) => ({ ...outcome(r.handle.headSha), handle: r.handle, attempt: r.attempt + 1 })); },
@@ -177,7 +187,9 @@ export async function proofWorld(o: WorldOpts = {}): Promise<World> {
     draft, assembled: draft, files: [], assemble: async () => [CALLER()],
     assembleFor: async (d) => async (mode, centralSha) => {
       asm.push({ mode, sha: centralSha, draft: d });
-      const own = [CALLER(d.steps.map((s) => `\n# ${s.needId}:${s.tool.id}`).join(''))];
+      const tools = d.steps.map((s) => `\n# ${s.needId}:${s.tool.id}`).join('');
+      if (o.centralOnly === true) return [CALLER(), ...(d.centralPin === undefined ? [] : [wf('.github/workflows/r--merge.yml', `on: workflow_call\njobs: {}\n${tools}`, 'central')])];
+      const own = [CALLER(tools)];
       return d.centralPin === undefined ? own : [...own, wf('.github/workflows/r--merge.yml', 'on: workflow_call\njobs: {}\n', 'central')];
     },
     build: {
@@ -195,7 +207,7 @@ export async function proofWorld(o: WorldOpts = {}): Promise<World> {
     ...o.input,
   };
   return {
-    tl, store, input, ops, asked, vault, meter, pushed, evals, cleanupOpts, checkOpts, asm, armed, keysMode: () => mode,
+    tl, store, input, ops, asked, vault, meter, pushed, variants, setupCentral, evals, cleanupOpts, checkOpts, asm, armed, keysMode: () => mode,
     get disarm() { return disarm; },
     run: async () => { try { return await makeRunProof(ops)(input); } finally { disarm(); } },
   };
