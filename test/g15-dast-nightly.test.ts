@@ -15,7 +15,7 @@ import type { Job } from '../src/layers/jobs.js';
 import type { CreatedFile, ReviewedTool, StepSpec } from '../src/types.js';
 import { assemble, CAPS, editJob, files, judge, node, planned, profileOf, SEC, shown, type Obj } from './helpers/assemble.js';
 import { REVIEWED } from './helpers/debate-fixtures.js';
-import { parse as parseYaml } from 'yaml';
+import { parse as parseYaml, parseDocument } from 'yaml';
 import { assemble as assembleFiles, judgeAssembled } from '../src/layers/assemble.js';
 import { LINTERS, p as P } from './helpers/assemble.js';
 
@@ -149,5 +149,16 @@ describe('G15a round 4 (b3): the nightly DAST scan', () => {
     const checkSteps = (a.nightly['dast--app'] as Job).steps;
     const checkInMerge = editJob(merge, 'dast--app', (j) => { j.steps = JSON.parse(JSON.stringify(checkSteps)); });
     expect(shown(await judge(withFile(fs, checkInMerge), a.draft))).not.toBe('');
+    // 8. the nightly run job copied whole under another job id of the nightly file (mutant N2)
+    const d2 = parseDocument(night.content);
+    d2.setIn(['jobs', 'other-scan'], (d2.getIn(['jobs', 'dast-run--app']) as { clone: () => unknown }).clone());
+    expect(shown(await judge(withFile(fs, { ...night, content: d2.toString({ lineWidth: 0 }) }), a.draft))).toMatch(/the nightly DAST step "pipegen: run nuclei[^"]*" runs only in its own job dast-run--app/);
+  });
+
+  it('referee: the nightly scan is recognised only for a DAST check of the merge layer (mutant N12)', async () => {
+    const { a, fs } = world();
+    const draft = { ...a.draft, needs: a.draft.needs.map((n) => (n.id === 'dast' ? { ...n, layer: 'push' as const } : n)) };
+    expect(shown(await judge(fs, draft))).toMatch(/"pipegen: install nuclei" is not a step pipegen renders/);
+    expect(shown(await judge(fs, a.draft))).toBe('');
   });
 });
