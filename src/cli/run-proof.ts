@@ -124,6 +124,8 @@ export interface ProofOps {
   placements: (basePaths: ReadonlySet<string>, ignore: Uint8Array | null) => { files: ProofFile[]; expected: PlantedPlacement[] };
   fixLoop: typeof proveWithFixes;
   decide: typeof decideDisputes;
+  /** proofAppFiles (the assembled files at signing none, the harness, the compat copies of HEAD). */
+  appFiles: typeof proofAppFiles;
 }
 
 export const realProofOps: ProofOps = {
@@ -147,6 +149,7 @@ export const realProofOps: ProofOps = {
   placements: (basePaths, ignore) => plantedSecretPlacements(basePaths, { existingIgnore: ignore }),
   fixLoop: proveWithFixes,
   decide: decideDisputes,
+  appFiles: proofAppFiles,
 };
 
 const isWorkflow = (path: string): boolean => /^\.github\/workflows\/[^/]+\.ya?ml$/i.test(path);
@@ -198,7 +201,7 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
       const asm = await i.assembleFor(d);
       const own = await created(d);
       const appOnly: ProofAssemble = async (mode, sha) => [...own, ...(await asm(mode, sha)).filter((f) => f.repo === 'app')];
-      const paf = proofAppFiles(d, { assemble: appOnly, harness: { platform: i.platform, reviewed: i.reviewed, createdTests: false, signing: d.signing?.mode ?? 'none' }, dir: i.dir });
+      const paf = o.appFiles(d, { assemble: appOnly, harness: { platform: i.platform, reviewed: i.reviewed, createdTests: false, signing: d.signing?.mode ?? 'none' }, dir: i.dir });
       const central = d.centralPin === undefined ? [] : (await asm('none', undefined)).filter((f) => f.repo === 'central');
       const app = await paf.appFiles(centralSha);
       return { central, app, last: paf.last() };
@@ -223,6 +226,7 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
     }
 
     let repos: ProofRepos | undefined;
+    const declined = new Set<string>();
     const prove = async (): Promise<FixOutcome> => {
       // 8. the helper repos, inside prove (E-a7, ruling G14-R0 1): a throw here is cleaned up too
       repos = i.checkRepos !== undefined ? await i.checkRepos() : await o.checkRepos(gh, st0.app, {
@@ -360,7 +364,11 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
         guard: (files) => build.guard(files),
         keys, vault, scanner: await i.scanner(), secretNames: names,
         workflowsOf: async (d) => pushed(await filesOf(d, centralSha)),
-        confirm: midRunConfirm(io),
+        confirm: async (files) => {
+          const yes = await midRunConfirm(io)(files);
+          if (!yes) for (const f of files) declined.add(f.path);
+          return yes;
+        },
         meters: { minutes: m, ai: meter },
         // E-b18, G0-R1 I2: stopAtCap with saveStopState; its CapReachedError is the loop's stop (it returns `stopped` with its draft)
         onCap: async (cap: CapReached) => {
@@ -372,7 +380,8 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
         },
         log: say,
       };
-      return o.fixLoop(cur.d, fix);
+      const out = await o.fixLoop(cur.d, fix);
+      return declined.size === 0 ? out : dropDeclined(out, declined);
     };
 
     let res: { outcome: FixOutcome; cleanup: CleanupResult };
@@ -393,6 +402,26 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
     }
     return { ok: true, draft: out.draft, ...(repos === undefined ? {} : { repos }), cleanup: res.cleanup, notes };
   };
+}
+
+/** The fix loop's words for a part whose AI-written files the user declined to run with the keys. */
+export const DECLINED_REASON = 'you chose not to run AI-written code with your keys, so pipegen left those files out';
+const FLOOR_PARTS: ReadonlySet<string> = new Set(['pipeline', 'deploy-verify']);
+/**
+ * Plan l. 504 (carry 29): a declined mid-run confirmation drops those AI-written files from the draft (they never run with the real keys and
+ * are never delivered); their parts end not proven. A pipeline, deploy-verify or a tests part the floor needs can't end not proven: no pass.
+ */
+export function dropDeclined(out: FixOutcome, declined: ReadonlySet<string>): FixOutcome {
+  const gone = out.draft.created.filter((f) => f.repo === 'app' && declined.has(f.path));
+  if (gone.length === 0) return out;
+  const parts = [...new Set(gone.map((f) => f.part))];
+  const testsFloor = out.draft.needs.some((n) => n.floor === true && /tests$/.test(n.category ?? n.id)) && !out.draft.skipped.some((x) => x.part === 'tests');
+  const floorHit = parts.some((x) => FLOOR_PARTS.has(x) || (x === 'tests' && testsFloor));
+  const notProven = [...out.draft.notProven, ...parts.filter((x) => !out.draft.notProven.some((n) => n.part === x && n.reason === DECLINED_REASON)).map((part) => ({ part, missingSecrets: [], reason: DECLINED_REASON }))];
+  const draft: PipelineDraft = { ...out.draft, created: out.draft.created.filter((f) => !gone.includes(f)), notProven } as PipelineDraft;
+  return floorHit
+    ? { ...out, draft, result: { ...out.result, ok: false }, stopped: `${out.stopped === undefined ? '' : `${out.stopped}; `}${DECLINED_REASON}, and the ${parts.join(', ')} part must be proven` }
+    : { ...out, draft };
 }
 
 const stopLine = (why: string): string => `pipegen stopped: the proof did not pass (${safeText(why, 900)}), so nothing was delivered. exit code 2.`;
