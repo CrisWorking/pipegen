@@ -219,8 +219,8 @@ describe('referee: the renderer and the referee agree', () => {
     const entries = gateJobList(d);
     jobs.gate = job([...harden, download(), renderGateStep(GATE, d), ...renderGateUploads(platform())], { name: GATE_CHECK_NAME.split(' / ')[1], if: 'always()', needs: entries.map((e) => e.job), permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } });
     const r = await run([wf(jobs, { on: { push: defaultPushTrigger('main'), pull_request: null } })], d, { list: [...reviewedList(), GATE, WATCHER] });
-    // (G15a round 3: the weekly scorecard job belongs to the nightly file only; round 4: the full-history upload job is written only there too; both are judged end to end in test/g15-scorecard.test.ts and test/g15-history-nightly.test.ts)
-    for (const id of Object.keys(JOB_STEP_POLICY).filter((x) => x !== 'pipegen-verify' && x !== 'scorecard' && x !== 'code-scanning-history' && x !== 'workflow-lint-online')) expect(Object.keys(jobs), id).toContain(id);
+    // (G15a round 3: the weekly scorecard job belongs to the nightly file only; round 4: the full-history upload job and the nightly DAST upload job (test/g15-dast-nightly.test.ts) are written only there too; both are judged end to end in test/g15-scorecard.test.ts and test/g15-history-nightly.test.ts)
+    for (const id of Object.keys(JOB_STEP_POLICY).filter((x) => x !== 'pipegen-verify' && x !== 'scorecard' && x !== 'code-scanning-history' && x !== 'workflow-lint-online' && x !== 'code-scanning-dast')) expect(Object.keys(jobs), id).toContain(id);
     expect(show(r)).toBe('');
     expect(r.ok).toBe(true);
     expect(r.demoted).toEqual([]);
@@ -469,7 +469,7 @@ describe('referee: permissions by exact job id', () => {
     expect(has(await withPerms('pipegen-verify', p), 'permissions')).toBe(false);   // no environments on this plan
   });
   it('the table is keyed by exact job id and every job may read contents', () => {
-    expect(Object.keys(JOB_PERMISSIONS).sort()).toEqual(['base-scan', 'baseline-check', 'code-scanning', 'code-scanning-history', 'gate', 'image-publish', 'merged-red', 'nightly', 'notify', 'pipegen-verify', 'pr-check', 'scorecard', 'sign', 'watch'].sort());
+    expect(Object.keys(JOB_PERMISSIONS).sort()).toEqual(['base-scan', 'baseline-check', 'code-scanning', 'code-scanning-dast', 'code-scanning-history', 'gate', 'image-publish', 'merged-red', 'nightly', 'notify', 'pipegen-verify', 'pr-check', 'scorecard', 'sign', 'watch'].sort());
     expect(JOB_PERMISSIONS.scorecard).toEqual({ actions: 'read' });
     expect(JOB_PERMISSIONS['code-scanning']).toEqual({ 'security-events': 'write', actions: 'read' });
   });

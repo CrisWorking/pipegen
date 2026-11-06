@@ -46,7 +46,7 @@ import { docRecomputeProblem } from '../deliver/docs.js';
 import { createdFileProblems, duplicatePathProblems, type CreatedInputs, type CreatedRule } from './created-files.js';
 import {
   ACTION_PATH_RE, CALLER_WORKFLOW, checkExpressions, createdPathProblem, checkJobOrder, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, gateResultUploadProblems, IF_VALUES,
-  CALLER_TRIGGERS, IMAGE_ARCHIVE_STEP_ID, IMAGE_BUILD_NEED, imageBuildJobId, imageBuildSlugOf, imageCheckStepId, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, LOCAL_MERGE_WORKFLOW, narrowingChoiceProblem, NIGHTLY_CONCURRENCY, NIGHTLY_WORKFLOW, SCORECARD_IF, SCORECARD_JOB, PR_CHECK_IF, PR_CHECK_JOB, ZIZMOR_ONLINE_JOB,
+  CALLER_TRIGGERS, IMAGE_ARCHIVE_STEP_ID, IMAGE_BUILD_NEED, imageBuildJobId, imageBuildSlugOf, imageCheckStepId, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, LOCAL_MERGE_WORKFLOW, narrowingChoiceProblem, NIGHTLY_CONCURRENCY, NIGHTLY_WORKFLOW, SCORECARD_IF, SCORECARD_JOB, PR_CHECK_IF, PR_CHECK_JOB, ZIZMOR_ONLINE_JOB, DAST_UPLOAD_JOB,
   PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, REQUIRED_JOB, REQUIRED_NAME, requiredWorkflowForm, renderRangeFetchStep, SECRET_REF_RE, SIGN_STEP_ID_RE, ATTEST_DIGEST_STEP_ID_RE, attestDigestRef, attestDigestStepId, BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, DAST_HANDOFF_STEP_ID, dastAppStepId, dastCheckStepId, dastRunJobId, dastRunSlugOf, DAST_CHECK_ID_RE, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, BASELINE_STEP_IFS,
   STEP_KEYS as STEP_KEY_LIST, WORKFLOW_CONCURRENCY, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact,
 } from './job-rules.js';
@@ -63,7 +63,7 @@ import { NO_IMAGE_CATEGORIES, noImageServices, publishedImageServices, WORKFLOW_
 import { FIND_RUN_STEP_ID, renderDigestStep, renderHeadCheckStep, renderPublishDigestStep } from './deploy-steps.js';
 import { strongReason } from './deploy-gating.js';
 import { ARCHIVE_TOOL_IDS, imageBuildTag, renderImageArchiveScan, renderImageBuild } from './image-handoff.js';
-import { dastStartOf, renderDastRun, renderDastScrub } from './dast-handoff.js';
+import { dastStartOf, nightlyDastSpec, NIGHTLY_DAST_TOOL, renderDastRun, renderDastScrub } from './dast-handoff.js';
 import { ATTEST_VERIFY_REFUSAL, ATTEST_VERIFY_SETS, KEYLESS_VERIFY_SETS, SHARED_CDN_SETS } from './egress.js';
 import { EGRESS_DOMAIN_SETS, GITHUB_ATTEST_SET, SIGSTORE_SET } from './egress-sets.js';
 import { allowedDomainsProblem, ARGV_POLICIES, BULLFROG_USES, CACHE_LOCKS, GATE_OPTIONAL_UPLOADS, PLAIN_REL_RE, PLATFORM_USES, RANGE_TOOL, RENDERER_INPUTS, rendererInputProblems, SCRUB_SECRET, uploadIfNoFiles } from './tool-flags.js';
@@ -107,6 +107,8 @@ export const JOB_PERMISSIONS: Readonly<Record<string, Readonly<Record<string, Le
   'code-scanning': { 'security-events': 'write', actions: 'read' },
   // G15a round 4 (b1): the full-history scan's own upload job, the code-scanning job's twin
   'code-scanning-history': { 'security-events': 'write', actions: 'read' },
+  // G15a round 4 (b3): the nightly DAST scan's upload job (nightly file only, judgeStepPolicy)
+  [DAST_UPLOAD_JOB]: { 'security-events': 'write', actions: 'read' },
   gate: { actions: 'read', 'pull-requests': 'read' },
   'base-scan': { actions: 'read' },
   'baseline-check': { actions: 'read' },
@@ -174,6 +176,7 @@ export const JOB_STEP_POLICY: Readonly<Record<string, readonly StepKind[]>> = Ob
   'pipegen-verify': ['harden', 'gate', 'verify'],
   'code-scanning': ['harden', 'download-artifact', 'upload-sarif'],
   'code-scanning-history': ['harden', 'download-artifact', 'upload-sarif'],
+  [DAST_UPLOAD_JOB]: ['harden', 'download-artifact', 'upload-sarif'],
   // G15a round 5 (b2): zizmor online, nightly: egress, the checkout, its install and run (kind tool, the online source only: judgeStepPolicy)
   [ZIZMOR_ONLINE_JOB]: ['harden', 'checkout', 'tool'],
   // no checkout: the gate never reads the workspace (Plan C ruling S21); it reads the event, the job outputs and the API
@@ -308,7 +311,7 @@ const PUBLISH_DIGEST_SOURCE = 'publish-digest';
 const SOURCE_KIND: Readonly<Record<string, StepKind>> = Object.freeze({ [SIGN_SOURCE]: 'sign', [VERIFY_SOURCE]: 'verify', [IMAGE_ARCHIVE_SOURCE]: 'image-archive', [IMAGE_CHECK_SOURCE]: 'image-check',
   [DEPLOY_HEAD_SOURCE]: 'verify', [DEPLOY_DIGEST_SOURCE]: 'verify', [PUBLISH_DIGEST_SOURCE]: 'publish-digest',
   // G4-R1: the raw DAST result's hash check (it reads a download and the run job's output only, like a checker)
-  'dast-check': 'tool' });
+  'dast-check': 'tool', 'nightly-dast-check': 'tool' });
 const sourceKind = (source: string): StepKind | undefined => { const head = source.slice(0, source.indexOf(':')); return source.includes(':') ? own(SOURCE_KIND, head) : undefined; };
 /** The service slug a source of the image hand-off names (`image-archive:<slug>`, `image-check:<slug>`). */
 const sourceSlug = (source: string): string => source.slice(source.indexOf(':') + 1);
@@ -710,6 +713,35 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
       notes.push(`zizmor's online run can not be rendered, so no step may claim to be it: ${safeText(e.message, 200)}`);
     }
   }
+  // G15a round 4 (b3, P-4): the nightly DAST scan of each app the merge layer scans: the reviewed nuclei entry (nightlyDastSpec, nothing
+  // chosen) in the same run and scrub jobs, rendered as blocking (no narrowing value); its scan and its hash check belong to the nightly file
+  // only (judgeDastJobs). The app start, the archive check and the hand-off are the merge pair's own sources (job-bound there)
+  const nucleiT = byId.get(NIGHTLY_DAST_TOOL);
+  if (nucleiT !== undefined && isReviewed(nucleiT.candidate)) {
+    for (const spec of draft.steps) {
+      if (!hasNeed(spec) || own(NEED_ID_CATEGORY as Readonly<Record<string, string>>, spec.needId) !== 'dast' || typeof spec.service !== 'string') continue;
+      if (!draft.needs.some((n) => n.layer === 'merge' && n.id === spec.needId && n.service === spec.service)) continue;
+      try {
+        const start = dastStartOf(draft, spec.service);
+        if ('problem' in start) continue;
+        const ns = nightlyDastSpec(spec, nucleiT);
+        const s = slug(spec.service);
+        record(`${NIGHTLY_DAST_SOURCE}:${s}`, ctxs.map((c) => renderStep(ns, nucleiT, platform, { ...c, blocking: true }).steps), false, true, readsWorkspace(nucleiT.id), undefined, undefined);
+        const run = renderDastRun(ns, nucleiT, platform, draft, start, { blocking: true, checkout: [] }).steps;
+        const handoff = run.filter((x) => x.id === DAST_HANDOFF_STEP_ID);
+        record(`${DAST_HANDOFF_SOURCE}:${s}`, [handoff, handoff], false, true, false, undefined, undefined);
+        const app = run.filter((x) => x.id === dastAppStepId(spec.service as string));
+        if (app.length > 0) record(`${DAST_APP_SOURCE}:${s}`, [app, app], false, true, false, undefined, undefined);
+        const archiveCheck = run.filter((x) => x.id === imageCheckStepId(spec.service as string));
+        if (archiveCheck.length > 0) record(`${IMAGE_CHECK_SOURCE}:${s}`, [archiveCheck, archiveCheck], false, true, false, undefined, undefined);
+        const check = renderDastScrub(ns, nucleiT, platform, draft, ex.byId.get(PIPEGEN_ACTION_IDS.gate) ?? nucleiT, start.url).steps.filter((x) => x.id === dastCheckStepId(spec.service as string));
+        record(`${NIGHTLY_DAST_CHECK_SOURCE}:${s}`, [check, check], false, true, false, undefined, undefined);
+      } catch (e) {
+        if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e;
+        notes.push(`The nightly DAST scan can not be rendered, so no step may claim to be it: ${safeText(e.message, 200)}`);
+      }
+    }
+  }
   // the project's own scripts its needs call for (ruling S10): the only other run steps pipegen makes
   for (const need of draft.needs) {
     for (const s of draft.profile.services) {
@@ -859,6 +891,9 @@ const PR_CHECK_SOURCE = 'pr-check';
 const DAST_HANDOFF_SOURCE = 'dast-handoff';
 const DAST_APP_SOURCE = 'dast-app';
 const DAST_CHECK_SOURCE = 'dast-check';
+/** G15a round 4 (b3): the nightly DAST scan's own steps (run job) and the hash check of its raw result (scrub job): nightly file only. */
+const NIGHTLY_DAST_SOURCE = 'nightly-dast';
+const NIGHTLY_DAST_CHECK_SOURCE = 'nightly-dast-check';
 /** G4 (C9r1): the source name of the pre-push head fetch step of the secrets job. */
 const RANGE_FETCH_SOURCE = 'range-fetch';
 /** The gate job's own name (the second half of GATE_CHECK_NAME). */
@@ -1392,6 +1427,9 @@ function judgeDastJobs(fc: FileCtx, id: string, where: string, j: Obj, judged: r
     const spec = m === null ? undefined : fc.draft.steps[Number(m[1])];
     const dast = spec !== undefined && isObj(spec) && own(NEED_ID_CATEGORY as Readonly<Record<string, string>>, spec.needId) === 'dast' && typeof spec.service === 'string';
     if (dast && id !== safeRunId(spec.service as string)) bad('permissions', `${where}: the DAST step ${show(x.step.name)} runs only in its own job ${show(safeRunId(spec.service as string))}, which holds no key and no secret.`);
+    // G15a round 4 (b3): the nightly DAST scan and its hash check belong to the nightly file; the scan to its own run job only
+    if ((src.startsWith(`${NIGHTLY_DAST_SOURCE}:`) || src.startsWith(`${NIGHTLY_DAST_CHECK_SOURCE}:`)) && !isNightlyFile(fc)) bad('permissions', `${where}: the step ${show(x.step.name)} is the nightly DAST scan's, so it runs only in the nightly file.`);
+    if (src.startsWith(`${NIGHTLY_DAST_SOURCE}:`) && id !== `dast-run--${src.slice(NIGHTLY_DAST_SOURCE.length + 1)}`) bad('permissions', `${where}: the nightly DAST step ${show(x.step.name)} runs only in its own job dast-run--${src.slice(NIGHTLY_DAST_SOURCE.length + 1)}, which holds no key and no secret.`);
     for (const head of [DAST_HANDOFF_SOURCE, DAST_APP_SOURCE]) {
       if (src.startsWith(`${head}:`) && id !== `dast-run--${src.slice(head.length + 1)}`) bad('permissions', `${where}: the step ${show(x.step.name)} belongs to the DAST run job dast-run--${src.slice(head.length + 1)} only.`);
     }
@@ -1763,6 +1801,7 @@ function judgeStepPolicy(fc: FileCtx, id: string, where: string, j: Obj, judged:
   const row = own(JOB_STEP_POLICY, id);
   const power = privileged(j, secrets, fc.ex);
   if (id === SCORECARD_JOB && !isNightlyFile(fc)) bad('permissions', `${where}: the job ${SCORECARD_JOB} is the weekly Scorecard job of the nightly file only.`);
+  if (id === DAST_UPLOAD_JOB && !isNightlyFile(fc)) bad('permissions', `${where}: the job ${DAST_UPLOAD_JOB} uploads the nightly DAST results of the nightly file only.`);
   // G15a round 5 (b2): the online zizmor steps (they carry the job's token) run only in the job ZIZMOR_ONLINE_JOB of the nightly file, and that
   // job runs no other tool step
   const onlineJob = id === ZIZMOR_ONLINE_JOB && isNightlyFile(fc);
@@ -1917,6 +1956,9 @@ function judgeJobSteps(fc: FileCtx, where: string, steps: unknown[], job: boolea
     const dspec = dc === null ? undefined : fc.draft.steps[Number(dc[1])];
     const dformat = dspec === undefined || !isObj(dspec) || !isObj(dspec.tool) ? undefined : fc.ex.byId.get(dspec.tool.id)?.step.output.format;
     if (dspec !== undefined && x.step.id !== undefined && x.harmlessId && (dformat === 'sarif' || dformat === 'zap-json')) scans.set(x.step.id, { tool: dspec.tool.id, format: dformat });
+    // G15a round 4 (b3): the nightly DAST hash check stands for its nuclei scan
+    const nformat = fc.ex.byId.get(NIGHTLY_DAST_TOOL)?.step.output.format;
+    if (x.match?.source.startsWith(`${NIGHTLY_DAST_CHECK_SOURCE}:`) === true && x.step.id !== undefined && x.harmlessId && nformat === 'sarif') scans.set(x.step.id, { tool: NIGHTLY_DAST_TOOL, format: nformat });
     // C9: the commit-range scan, recognised by content as the range source's own step
     if ((x.match?.source === 'range:secrets' || x.match?.source === 'history:secrets') && x.match.final && x.kind === 'tool' && x.harmlessId && x.step.id !== undefined) scans.set(x.step.id, { tool: RANGE_TOOL, format: 'sarif' });
   }

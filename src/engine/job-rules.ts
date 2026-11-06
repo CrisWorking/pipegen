@@ -491,6 +491,13 @@ export const SECRETS_HISTORY_CATEGORY = 'pipegen-secrets-history';
  * run with the job's read token. `contents: read` only; a job-status check, never gated. Its steps and file are held by the referee.
  */
 export const ZIZMOR_ONLINE_JOB = 'workflow-lint-online';
+/**
+ * G15a round 4 (b3, P-4): the nightly DAST scan (dast-handoff.ts nightlyDastSpec: nuclei against each app the merge layer scans) runs in the same
+ * job pair as the merge layer's (dast-run--<svc>, dast--<svc>) of the nightly file; this job downloads each scrubbed result and uploads it
+ * to code scanning, one category per service. Reported, never gated.
+ */
+export const DAST_UPLOAD_JOB = 'code-scanning-dast';
+export const dastNightlyCategory = (service: string): string => `pipegen-dast-nightly--${slug(service)}`;
 /** G15a round 3 (PF-3): the reviewed tools whose result a scrub reads but that run as a docker step (no argv policy): Scorecard. */
 export const SCRUB_ONLY_TOOLS: ReadonlySet<string> = new Set(['scorecard-action']);
 /** A `docker://<image>@sha256:<64 hex>` uses of an image in DOCKER_STEP_IMAGES (the shape only; the referee checks the reviewed digest). */

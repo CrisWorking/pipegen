@@ -25,6 +25,24 @@ import { pipegenScriptStep } from './pipegen-script.js';
 import { RenderError } from './render-error.js';
 import { renderComposeUp, renderPlatformStep, renderRuntimeEnv, renderScrub, renderStep, renderUpload, scrubbedPath, type RenderResult } from './render-step.js';
 
+/**
+ * G15a round 4 (b3, P-4): the nightly DAST tool. Nuclei 3.11.1 with its pinned templates: its result is SARIF, and the gate's nuclei reader
+ * was checked against a real run of the pinned binary (test/fixtures/sarif/nuclei.sarif). ZAP's active scan (an Automation Framework plan)
+ * is not run: its report could not be taken from the pinned zap-stable image (gate/src/zap.ts ZAP_JSON_VERIFIED), so it stays refused.
+ */
+export const NIGHTLY_DAST_TOOL = 'nuclei';
+export const ZAP_ACTIVE_REFUSED_NOTE = "ZAP's active scan is not run nightly: the report of the pinned ZAP image is not verified yet, so pipegen can not read it. Nuclei scans the app nightly instead.";
+
+/**
+ * The nightly DAST spec of a merge-layer DAST check: the same check and service, run by the reviewed nuclei entry with nothing chosen (no AI
+ * value reaches it). Shared by the assembler and the referee, so both render the same steps.
+ */
+export function nightlyDastSpec(spec: StepSpec, nuclei: ReviewedTool): StepSpec {
+  if (typeof spec.service !== 'string') throw new RenderError('A DAST check belongs to one service.');
+  if (nuclei.id !== NIGHTLY_DAST_TOOL || nuclei.candidate.id !== NIGHTLY_DAST_TOOL) throw new RenderError('The nightly DAST scan runs only the reviewed nuclei entry.');
+  return { needId: spec.needId, service: spec.service, tool: nuclei.candidate, choices: {}, output: nuclei.step.output };
+}
+
 /** Where the app runs for the DAST check of one service: pipegen's compose file, or the image archive; the port it is published on. */
 export type DastStart = { kind: 'compose'; port: number; url: string; env: RuntimeEnv } | { kind: 'archive'; port: number; url: string };
 
