@@ -186,7 +186,7 @@ describe('mapCoverage (rulings)', () => {
     }
     for (const config of [
       withHook('        args: ["#", "--exit-code=0"]\n'), withHook('        args: [--verbose]\n'), withHook('        pass_filenames: true\n'),
-      `default_stages: [pre-push]\n${withHook('        stages: []\n')}`, canonical.replace('v8.30.1', 'master'), canonical.replace('id: gitleaks', 'id: gitleaks-system'),
+      `default_stages: [pre-push]\n${withHook('        stages: []\n')}`, canonical.replace('v8.30.1', 'master'), canonical.replace('v8.30.1', '83d9cd684c87d95d656c1458ef04895a7f1cbd8e'), canonical.replace('id: gitleaks', 'id: gitleaks-system'),
       local('        entry: "gitleaks git --pre-commit --redact --staged\\n--exit-code=0"\n        pass_filenames: false\n'),
       local('        entry: gitleaks git --pre-commit --redact --staged # --exit-code=0\n        pass_filenames: false\n'),
       local('        entry: gitleaks git --pre-commit --redact --staged --verbose\n'),

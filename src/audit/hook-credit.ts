@@ -5,7 +5,7 @@
 // The rule is the module's own: a harmless duplicate, never a missing scan. Only ONE form is credited, the canonical remote gitleaks hook
 // as gitleaks publishes it (https://github.com/gitleaks/gitleaks/blob/master/.pre-commit-hooks.yaml: `gitleaks git --pre-commit --redact
 // --staged --verbose`, language golang, pass_filenames false):
-//   - the official repo (or its old zricethezav URL, which redirects to it), at a pinned rev (a full commit sha or a v8+ release tag);
+//   - the official repo (or its old zricethezav URL, which redirects to it), at a v8+ release tag (never a bare commit sha, G6-R-sec3);
 //   - id `gitleaks`, with no `entry`, `language` or `args` of the user's (pre-commit runs shlex.split(entry) + args with no shell, so a
 //     `#`, a newline or `--exit-code=0` there is a real word, review H1 a), `pass_filenames` not true (gitleaks then reads a one-file
 //     commit's file name as its repo path, H1 b), no file filter and no key pipegen doesn't read;
@@ -20,8 +20,11 @@ import { MAX_HOOKS } from './coverage/bounds.js';
 
 type Obj = Record<string, unknown>;
 const GITLEAKS_REPOS: ReadonlySet<string> = new Set(['https://github.com/gitleaks/gitleaks', 'https://github.com/zricethezav/gitleaks']);
-/** A full commit sha, or a gitleaks v8+ release tag (v8 is the first whose hook reads only the staged changes). */
-const PINNED_REV = /^(?:[0-9a-f]{40}|v(?:[89]|[1-9]\d)\.\d{1,4}\.\d{1,4})$/;
+/**
+ * A gitleaks v8+ release tag (v8 is the first whose hook reads only the staged changes). G6-R-sec3: never a bare commit sha: GitHub
+ * serves a commit of any fork in the network through the upstream URL, so a sha may be one never released (a hook that does nothing).
+ */
+const PINNED_REV = /^v(?:[89]|[1-9]\d)\.\d{1,4}\.\d{1,4}$/;
 /** The hook keys that don't change what the canonical hook runs or which files it sees. */
 const COSMETIC_KEYS: ReadonlySet<string> = new Set(['id', 'name', 'alias', 'description', 'stages', 'verbose', 'log_file', 'require_serial', 'always_run', 'fail_fast', 'pass_filenames']);
 const TOP_FILTER_KEYS = ['files', 'exclude'] as const;

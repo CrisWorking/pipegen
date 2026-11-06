@@ -242,11 +242,11 @@ describe('G6: carries (G1-R2 m5, m6; secrets hook; Plan J G-J1)', () => {
   it('precommit: an existing secrets hook gets no second one, with a note', async () => {
     // G6-R3 (H1): credited only as the canonical remote gitleaks hook: the official repo, a pinned rev, id gitleaks, no
     // entry, language or args of the user's, pass_filenames not true, at the commit stage (stages, else default_stages)
-    const withGitleaks = `${PRE_COMMIT}  - repo: https://github.com/gitleaks/gitleaks\n    rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e\n    hooks:\n      - id: gitleaks\n`;
+    const withGitleaks = `${PRE_COMMIT}  - repo: https://github.com/gitleaks/gitleaks\n    rev: v8.30.1\n    hooks:\n      - id: gitleaks\n`;
     const hookWith = (extra: string) => withGitleaks.replace('      - id: gitleaks\n', `      - id: gitleaks\n${extra}`);
     const credited = [
       withGitleaks,
-      withGitleaks.replace('83d9cd684c87d95d656c1458ef04895a7f1cbd8e', 'v8.30.1'),
+      withGitleaks.replace('v8.30.1', 'v10.0.0'),
       withGitleaks.replace('https://github.com/gitleaks/gitleaks', 'https://github.com/gitleaks/gitleaks.git'),
       withGitleaks.replace('https://github.com/gitleaks/gitleaks', 'https://github.com/zricethezav/gitleaks'),
       hookWith('        name: scan for keys\n        verbose: true\n        pass_filenames: false\n'),
@@ -286,9 +286,13 @@ describe('G6: carries (G1-R2 m5, m6; secrets hook; Plan J G-J1)', () => {
       // not the canonical hook: another id, no pinned rev, a fork, a key pipegen doesn't read
       ['pre-commit', withGitleaks.replace('id: gitleaks', 'id: gitleaks-docker')],
       ['pre-commit', withGitleaks.replace('id: gitleaks', 'id: gitleaks-system')],
-      ['pre-commit', withGitleaks.replace('    rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e\n', '')],
-      ['pre-commit', withGitleaks.replace('83d9cd684c87d95d656c1458ef04895a7f1cbd8e', 'master')],
-      ['pre-commit', withGitleaks.replace('83d9cd684c87d95d656c1458ef04895a7f1cbd8e', 'v7.6.1')],
+      ['pre-commit', withGitleaks.replace('    rev: v8.30.1\n', '')],
+      ['pre-commit', withGitleaks.replace('v8.30.1', 'master')],
+      ['pre-commit', withGitleaks.replace('v8.30.1', 'v7.6.1')],
+      ['pre-commit', withGitleaks.replace('v8.30.1', 'v8.30')],
+      // G6-R-sec3: a bare commit sha may be a fork-network commit reachable through the upstream URL, never released: no credit
+      ['pre-commit', withGitleaks.replace('v8.30.1', '83d9cd684c87d95d656c1458ef04895a7f1cbd8e')],
+      ['pre-commit', withGitleaks.replace('v8.30.1', '83d9cd684c87d95d656c1458ef04895a7f1cbd8e  # v8.30.1')],
       ['pre-commit', withGitleaks.replace('github.com/gitleaks/gitleaks', 'github.com/someone/gitleaks')],
       ['pre-commit', hookWith('        additional_dependencies: [x]\n')],
       ['pre-commit', hookWith('        stages: pre-commit\n')],
