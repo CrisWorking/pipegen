@@ -17,7 +17,7 @@
 //   each: `pipegen/uninstall` (app), `pipegen/uninstall-<name>` (central).
 // - goneOr (V-S11): a 404 is "gone" only after a read of the parent succeeds (GitHub answers 404 for "no access" on a private repo); a 403 is
 //   a leftover with the exact manual step; a 401 stops.
-// - deleteCentralRepo (V-B5, scan §4.5): the one repo delete of uninstall. The scratch repo goes only through E's deleteScratchRepo.
+// - deleteCentralRepo (V-B5, scan §4.5): the one repo delete of uninstall. The scratch repo goes only through E's own scratch delete (src/proof).
 // No other file of src/uninstall sends a GitHub write (a source scan in test/uninstall-target.test.ts keeps it so).
 import type { Octokit } from '@octokit/rest';
 import type { Prompter } from '../cli/io.js';
