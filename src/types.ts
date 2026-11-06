@@ -328,7 +328,12 @@ export interface InstallRecord {
   central?: { repoId?: number; createdByPipegen: boolean; rulesetId?: number; rulesetCreatedAt?: string; codeowners?: { path: string; created: boolean }; actionsAccess?: { previous: string } };
   scratch?: { repoId?: number; createdByPipegen: boolean };
   planned: InstallPlanned;
-  protectedPaths: string[];                                            // used by the gate's integrity rule and `pipegen verify`
+  /**
+   * The effective protected paths, repo-relative: a root-anchored `/name` is kept as `./name` (protectedPathsForRecord; read back by
+   * protectedPathsOfRecord). Read by `pipegen finish` (the CODEOWNERS block) and `pipegen verify`; the gate does not read this field (it gets
+   * its protected paths from its inputs and the reviewed list).
+   */
+  protectedPaths: string[];
   cosignPubSha256?: string; blockFrom?: string;
   /**
    * G11: the public key's exact text (key-env), what `finish` sets as PIPEGEN_COSIGN_PUB after the merge (deliver stores the key pair before

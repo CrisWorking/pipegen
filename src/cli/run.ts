@@ -569,12 +569,13 @@ async function pinnedScanner(name: 'gitleaks' | 'betterleaks'): Promise<{ name: 
   return { name, path, version: pins[name].version };
 }
 
-/**
- * G13-R1 (sec I1), the audit's pattern: after the yes, the scanner the consent screen named (name and version) over exactly the files it
- * counted. A token that is not askConsent's 'full' one, another scanner, or a bundle with a file that was not counted is refused (thrown).
- */
 /** What the run agreed to at consent: the provider (name, model, Ollama host) and the AI cost cap of the estimate. */
 export interface Agreed { ai: ReturnType<typeof makeProvider>; capUsd: number | null }
+/**
+ * G13-R1 (sec I1), the audit's pattern: after the yes, the scanner the consent screen named (name and version) over exactly the files it
+ * counted. A token that is not askConsent's 'full' one, a spent one, another folder, provider, model or cap (G13-R2 5), another scanner, or a
+ * bundle with a file that was not counted is refused (thrown).
+ */
 export async function scanCounted(dir: string, consent: ConsentToken, knownValues: string[], ensure: NonNullable<RunDeps['secretScanner']>, agreed: Agreed): Promise<CodeBundle> {
   const c: unknown = consent;
   if (!ConsentToken.isToken(c) || c.terms.mode !== 'full') throw new Error('pipegen run needs the consent askConsent gives for its own screen; nothing was sent.');
