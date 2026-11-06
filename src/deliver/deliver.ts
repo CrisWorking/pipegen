@@ -28,6 +28,7 @@
 import type { Octokit } from '@octokit/rest';
 import type { Prompter } from '../cli/io.js';
 import { gitBlobSha } from '../create/guard.js';
+import { hookFileMode } from '../engine/created-builders.js';
 import { editOf } from '../create/package-edit.js';
 import { COSIGN_KEY_SECRET, generateFpKey, storeCosignKey, storeEnvSecret, storeSecrets, type SecretVault } from '../create/secrets.js';
 import { isPlantedPath } from '../debate/planted.js';
@@ -668,7 +669,8 @@ function checkBase(files: readonly CreatedFile[], entries: ReadonlyMap<string, T
       if (!mine && e.sha === gitBlobSha(f.content)) adopted.add(f);
       else if (!mine) throw new DeliverError(`${show(f.path)} already exists in ${repo === 'app' ? 'your repository' : 'the central repo'} and pipegen didn't write it; pipegen never overwrites your files.`);
     }
-    if (e?.sha !== gitBlobSha(f.content)) changed.set(f, e?.mode === '100755' ? '100755' : '100644');
+    // a file keeps its mode; a new one is 100644, except a new husky script (G6, carry m5: git runs it directly, so it is executable)
+    if (e?.sha !== gitBlobSha(f.content)) changed.set(f, e?.mode === '100755' ? '100755' : e === undefined && repo === 'app' ? hookFileMode(f.path) ?? '100644' : '100644');
   }
   return changed;
 }

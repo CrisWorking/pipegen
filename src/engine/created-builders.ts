@@ -3,6 +3,7 @@
 // so the producer and the referee can not drift. A leaf: types, the protected-path leaf and the gate's LOGIN_RE only.
 import { LOGIN_RE, MAX_LINE, PIPEGEN_BLOCK_BEGIN, PIPEGEN_BLOCK_END } from '../../gate/src/integrity.js';
 import type { PipelineDraft, ReviewedTool } from '../types.js';
+import { packageVersion } from '../util/package-data.js';
 import { effectiveProtectedPaths } from './protected-paths.js';
 import { isObj, parseYaml } from './yaml-parse.js';
 
@@ -194,9 +195,42 @@ const HOOKS_NOTE = "pipegen's reviewed hooks; the install record holds this text
  * hook form is reviewed; G6 adds rows here (and only here) under review, and the judge follows, since it calls the same builder.
  */
 export const HOOK_COMMANDS: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  // biome checks format and lint of the staged files only (PC3), and passes when none of them is one it reads
-  biome: Object.freeze(['biome', 'check', '--staged', '--no-errors-on-unmatched']),
+  // biome checks format and lint of the staged files only (PC3), and passes when none of them is one it reads. --staged reads the staged
+  // list through biome's VCS integration, so the hook turns it on with the reviewed flags (G6, carry m6) instead of relying on the repo's config
+  biome: Object.freeze(['biome', 'check', '--staged', '--no-errors-on-unmatched', '--vcs-enabled=true', '--vcs-client-kind=git']),
 });
+/** The id of pipegen's own secrets hook (G6): pipegen at its exact version runs its pinned gitleaks on the staged changes (`pipegen hook secrets`). */
+export const SECRETS_HOOK_ID = 'pipegen-secrets';
+/** npm's own registry: the hook names it on the command line, so a repository's .npmrc can not point npx at another one (ruling S30's safe form). */
+export const NPM_REGISTRY = 'https://registry.npmjs.org';
+/**
+ * The secrets hook's command line (G6): pipegen at exactly `version`, from npm's own registry (the S30 safe-run form; `--yes` lets npx fetch that
+ * one version once, never another), running `pipegen hook secrets`, which checks and runs pipegen's pinned gitleaks (data/pinned-binaries.yml,
+ * ensurePinnedBinary). No exact version: throws, so no hook ever runs whatever owns the name today (ruling U18).
+ */
+export function secretsHookRun(version: string | null): string {
+  if (typeof version !== 'string' || !NPM_EXACT_VERSION_RE.test(version)) throw new Error('pipegen can not tell its own exact version, so it can not write the secrets hook (it runs pipegen at that exact version)');
+  return `npx --yes --registry=${NPM_REGISTRY} pipegen@${version} hook secrets`;
+}
+/**
+ * The git mode a NEW hook file gets (G6, carry m5): `.husky/pre-commit` is a script git hooks run directly (husky v4 to v8 need the
+ * executable bit), so it is written 100755; null for every other path (the delivery's default, 100644, or the mode the file already has).
+ */
+export function hookFileMode(path: string): '100755' | null {
+  return path === HOOK_FILES.husky ? '100755' : null;
+}
+/** The shebang of a new husky script (G6, carry m5). */
+const HUSKY_SHEBANG = '#!/usr/bin/env sh\n';
+/** Secret scanners a hook may already run (G6, Plan J G-J1: a check the repo already has is not added again). */
+const SECRET_SCANNERS_RE = /(?:^|[^A-Za-z0-9_-])(?:gitleaks|betterleaks|trufflehog|detect-secrets|ggshield|git-secrets|talisman|secretlint|pipegen hook secrets)(?![A-Za-z0-9_])/m;
+/**
+ * Whether the user's hook file already runs a secret scanner (G6): a known scanner's name outside a comment line. Then pipegen adds no
+ * secrets hook of its own (the CI secrets scan and the gate still run). Read from the file text, the same in the builder and the judge.
+ */
+export function existingSecretsHook(original: string): boolean {
+  if (typeof original !== 'string') return false;
+  return SECRET_SCANNERS_RE.test(original.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n'));
+}
 /** One hook pipegen appends: its id (`pipegen-<tool>`) and its command line. */
 export interface HookCommand { id: string; run: string }
 const HOOK_RUN_RE = /^[A-Za-z0-9 ._@=:/-]{1,300}$/;
@@ -216,8 +250,12 @@ const sameReviewed = (a: unknown, t: ReviewedTool): boolean => {
  * the hook runs from the repository root, where every manager starts it), each reviewed tool of its steps (the entry at its reviewed pin,
  * installed by npm) that has a reviewed hook command. Empty: no hook to append (the builder then gives a note, the judge refuses any file).
  */
-export function hookCommands(draft: PipelineDraft, reviewed: readonly ReviewedTool[]): HookCommand[] {
+export function hookCommands(draft: PipelineDraft, reviewed: readonly ReviewedTool[], version: string | null = packageVersion()): HookCommand[] {
   const out: HookCommand[] = [];
+  // G6: the secrets hook, from the floor's pre-commit secrets need, when the reviewed gitleaks entry (the pinned binary it runs) is in the list
+  if (draft.needs.some((n) => n.layer === 'pre-commit' && n.id === 'secrets') && reviewed.some((t) => t.id === 'gitleaks' && t.categories.includes('secrets'))) {
+    out.push({ id: SECRETS_HOOK_ID, run: secretsHookRun(version) });
+  }
   for (const need of draft.needs) {
     if (need.layer !== 'pre-commit' || need.id !== 'format-lint') continue;
     const svc = draft.profile.services.find((s) => s.name === need.service);
@@ -229,6 +267,9 @@ export function hookCommands(draft: PipelineDraft, reviewed: readonly ReviewedTo
       const install = t?.step.cli?.install;
       if (t === undefined || argv === undefined || !sameReviewed(spec.tool, t) || install?.method !== 'npm') continue;
       if (!NPM_PACKAGE_RE.test(install.package) || typeof install.version !== 'string' || !NPM_EXACT_VERSION_RE.test(install.version)) throw new Error(`the reviewed package of ${t.id} is not an npm name at an exact version`);
+      // G6: `npx --no` runs only what the repository installed, so the hook is added only when the service's lockfile holds the reviewed
+      // version (never read from a package.json range); otherwise it would fail every commit. pipegen does not add the devDependency (B2)
+      if (!installedAt(svc, install.package, install.version)) continue;
       const hook: HookCommand = { id: `pipegen-${t.id}`, run: ['npx', '--no', `--package=${install.package}@${install.version}`, '--', ...argv].join(' ') };
       if (!HOOK_ID_RE.test(hook.id) || !HOOK_RUN_RE.test(hook.run)) throw new Error(`the hook command of ${t.id} is not plain text pipegen can write`);
       if (!out.some((h) => h.id === hook.id)) out.push(hook);
@@ -236,6 +277,12 @@ export function hookCommands(draft: PipelineDraft, reviewed: readonly ReviewedTo
   }
   return out;
 }
+
+/** Whether the service's lockfile holds `pkg` at exactly `version` (ServiceQuality.versions, not from a package.json range). */
+const installedAt = (svc: PipelineDraft['profile']['services'][number], pkg: string, version: string): boolean => {
+  const q = svc.quality as { versions?: Record<string, unknown>; fromRange?: unknown } | undefined;
+  return q?.versions?.[pkg] === version && Array.isArray(q.fromRange) && !q.fromRange.includes(pkg);
+};
 
 /** pipegen's block for one manager: pre-commit a `repo: local` item at `indent` (no rev: it fetches nothing), husky plain lines, lefthook a `pre-commit` key. */
 export function hookBlock(manager: HookManager, commands: readonly HookCommand[], indent = ''): string {
@@ -259,6 +306,8 @@ export function hookFile(manager: HookManager, original: string, draft: Pipeline
   if (typeof original !== 'string') return { note: 'the original text of the hook file is missing' };
   let commands: HookCommand[];
   try { commands = hookCommands(draft, reviewed); } catch (e) { return { note: e instanceof Error ? e.message : 'the hook commands can not be built' }; }
+  // G6 (Plan J G-J1): a hook file that already runs a secret scanner gets no second one
+  if (existingSecretsHook(original)) commands = commands.filter((c) => c.id !== SECRETS_HOOK_ID);
   if (commands.length === 0) return { note: 'pipegen has no reviewed hook command for this repository (a format and lint check of the root npm service with a tool whose hook form is reviewed), so it adds no hook' };
   if (original.includes(HOOKS_MARKER)) return { note: `the ${HOOK_FILES[manager]} file already holds pipegen's hooks, so pipegen adds them no second time` };
   const by = (why: string): { note: string } => ({ note: `pipegen can not add its hooks to ${HOOK_FILES[manager]} safely (${why}); add them by hand:\n${hookBlock(manager, commands)}` });
@@ -276,7 +325,8 @@ export function hookFile(manager: HookManager, original: string, draft: Pipeline
     if (/\\\s*$/.test(lines[lines.length - 1] ?? '')) return by('its last line continues onto the next');
     const why = huskyAppendProblem(original);
     if (why !== null) return by(why);
-    return done(hookBlock('husky', commands));
+    // G6 (carry m5): a new husky script starts with a shebang (and is written executable, hookFileMode)
+    return done(original === '' ? `${HUSKY_SHEBANG}${hookBlock('husky', commands)}` : hookBlock('husky', commands));
   }
   if (manager === 'lefthook') {
     if (original !== '') {
@@ -346,6 +396,9 @@ export function huskyAppendProblem(original: string): string | null {
   }
   if (quote !== null) return 'it leaves a quote open at its end';
   if (/\b(?:exit|exec)\b/.test(code)) return 'it has an exit or exec, after which appended lines would not run';
+  // G6 (G1 r1 minor): eval can run an exit, return ends a sourced script, and a sourced file (`.` or `source`) can do either
+  if (/\b(?:eval|return|source)\b/.test(code)) return 'it has an eval, a return or a source, after which appended lines might not run';
+  if (/(?:^|[;&|(){}!]|\b(?:then|do|else|elif)\b)[ \t]*\.(?=[ \t]|$)/m.test(code)) return 'it sources another file with `.`, after which appended lines might not run';
   if (code.includes('<<')) return 'it has a here-document or here-string';
   const n = (re: RegExp): number => (code.match(re) ?? []).length;
   const word = (w: string): RegExp => new RegExp(`(?:^|[\\s;&|(){}])${w}(?=$|[\\s;&|(){}])`, 'g');

@@ -394,8 +394,10 @@ describe('G1-R-sec: the pr-check skip never runs under a gate', () => {
 // ---------- B4: the hook managers' files ----------
 
 const fmtNeed: Need = { id: 'format-lint', layer: 'pre-commit', category: 'format-lint', service: 'app', why: 't', blocking: true, floor: false };
+/** G6: the biome hook is added only when the root service's lockfile holds the reviewed @biomejs/biome, so the fixture installs it. */
+const biomeInstalled = prof.services.map((s, i) => (i !== 0 ? s : { ...s, quality: { ...s.quality, versions: { ...s.quality.versions, '@biomejs/biome': entry('biome').step.cli?.install.version as string }, fromRange: [] } }));
 const hookDraft = (precommit: PipelineDraft['profile']['precommit'], over: Partial<PipelineDraft> = {}): PipelineDraft =>
-  draftOf({ profile: { ...prof, precommit }, needs: [...d.needs, fmtNeed], steps: [...d.steps, specFor(entry('biome'), { needId: 'format-lint', service: 'app' })], ...over });
+  draftOf({ profile: { ...prof, precommit, services: biomeInstalled }, needs: [...d.needs, fmtNeed], steps: [...d.steps, specFor(entry('biome'), { needId: 'format-lint', service: 'app' })], ...over });
 const hookCreated = (path: string, original: string, content: string, over: Partial<CreatedFile> = {}): CreatedFile => ({ path, content, part: 'precommit', reason: 't', repo: 'app', edited: { original }, ...over });
 const judge = (f: CreatedFile, draft: PipelineDraft): string[] => createdFileProblems(f, draft, CREATED_RULES, { reviewed: reviewedList(), inputs: {} }).problems;
 const built = (manager: keyof typeof HOOK_FILES, original: string, draft: PipelineDraft): string => {
@@ -411,7 +413,7 @@ describe('G1: pre-commit, husky and lefthook appends (B4)', () => {
   it('referee: pre-commit, husky and lefthook edits judged byte-exact as appends of reviewed hook text', async () => {
     expect(HOOK_FILES).toEqual({ 'pre-commit': '.pre-commit-config.yaml', husky: '.husky/pre-commit', lefthook: 'lefthook.yml' });
     // the reviewed command: the root service's pinned biome, from its own lockfile install (npx --no never downloads)
-    expect(hookCommands(hookDraft('husky'), reviewedList())).toEqual([{ id: 'pipegen-biome', run: `npx --no --package=@biomejs/biome@${entry('biome').step.cli?.install.version as string} -- biome check --staged --no-errors-on-unmatched` }]);
+    expect(hookCommands(hookDraft('husky'), reviewedList())).toEqual([{ id: 'pipegen-biome', run: `npx --no --package=@biomejs/biome@${entry('biome').step.cli?.install.version as string} -- biome check --staged --no-errors-on-unmatched --vcs-enabled=true --vcs-client-kind=git` }]);
     const cases = [
       ['pre-commit', PRE_COMMIT, hookDraft('pre-commit')], ['pre-commit', PRE_COMMIT.replace(/^ {2}/gm, ''), hookDraft('pre-commit')],
       ['husky', HUSKY, hookDraft('husky')], ['husky', '', hookDraft('husky')], ['husky', 'npm test', hookDraft('husky')],
@@ -572,10 +574,13 @@ describe('G1 fix round 1 (ruling G1-R2)', () => {
     const biome = entry('biome');
     const install = biome.step.cli?.install as { package: string; version: string };
     const [hook] = hookCommands(hookDraft('husky'), reviewedList());
-    expect(hook?.run).toBe(`npx --no --package=${install.package}@${install.version} -- biome check --staged --no-errors-on-unmatched`);
+    expect(hook?.run).toBe(`npx --no --package=${install.package}@${install.version} -- biome check --staged --no-errors-on-unmatched --vcs-enabled=true --vcs-client-kind=git`);
     // the version comes from the reviewed entry, never a bare name: another reviewed version gives another command
     const bumped = reviewedList().map((t) => (t.id !== 'biome' || t.step.cli === undefined ? t : { ...t, step: { ...t.step, cli: { ...t.step.cli, install: { ...t.step.cli.install, version: '9.9.9' } } } }));
-    expect(hookCommands(hookDraft('husky'), bumped)[0]?.run).toContain(`--package=${install.package}@9.9.9 `);
+    // (G6: and only when the lockfile holds that version, so the bumped entry's draft installs 9.9.9)
+    const at999 = hookDraft('husky', { profile: { ...prof, precommit: 'husky', services: biomeInstalled.map((s, i) => (i !== 0 ? s : { ...s, quality: { ...s.quality, versions: { '@biomejs/biome': '9.9.9' } } })) } });
+    expect(hookCommands(at999, bumped)[0]?.run).toContain(`--package=${install.package}@9.9.9 `);
+    expect(hookCommands(hookDraft('husky'), bumped)).toEqual([]);
     // a bare-name hook (no --package pin) is refused by the judge
     const draft = hookDraft('husky');
     const ok = built('husky', HUSKY, draft);

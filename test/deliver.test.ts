@@ -184,6 +184,21 @@ describe('G10 delivery: preview', () => {
 });
 
 describe('G10 delivery: what goes out', () => {
+  it('deliver: a new .husky/pre-commit is written executable (100755); an existing hook file keeps its mode (G6, carry m5)', async () => {
+    const w = world();
+    const p = profile();
+    const c = await deliverCentral(w.g.octokit(), p, centralFiles(), { clock: { budget: newRateBudget(), sleep: async () => {} }, ...cdeps(w) });
+    if (c.kind !== 'pinned') throw new Error('expected a pin');
+    const base = input(p, c.sha);
+    const husky = cf(HOOK_FILES.husky, '#!/usr/bin/env sh\n# pipegen:hooks begin: x\nnpm test\n# pipegen:hooks end\n', 'precommit', { edited: { original: '' } });
+    await deliver(w.g.octokit(), p, planDelivery({ ...base, files: [...base.files, husky] }), w.vault, deps(w));
+    const head = w.g.head('o/r', SETUP_BRANCH);
+    expect(w.g.modeAt('o/r', head, HOOK_FILES.husky)).toBe('100755');
+    expect(w.g.modeAt('o/r', head, HOOK_FILES['pre-commit'])).toBe('100644');
+    expect(w.g.modeAt('o/r', head, 'PIPEGEN.md')).toBe('100644');
+    expect((await record(w))?.edits.find((e) => e.path === HOOK_FILES.husky)).toMatchObject({ kind: 'hooks', originalSha: null });
+  });
+
   it('deliver: needsConfirm declined → those files excluded, rest delivered', async () => {
     const w = world();
     const { res } = await firstRun(w, {}, {}, { confirmRunCode: false });

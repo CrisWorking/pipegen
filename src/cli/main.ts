@@ -10,6 +10,7 @@ import { hideToken, permissionsTable } from '../github/client.js';
 import { packageVersion } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
 import { AI_CHOICES, audit, normalizeAiFlag, unsafeFolderStop, type AiChoice } from './audit.js';
+import { hookSecrets } from './hook.js';
 import { inspect } from './inspect.js';
 import { processIO, type CliIO } from './io.js';
 import { parseTypeFlags } from './type-confirm.js';
@@ -31,6 +32,7 @@ function usage(): string[] {
     '  pipegen audit      Report which checks your CI already runs, what is missing at each layer, and what the full',
     '                     setup would add, cost and need. Read-only: it changes nothing; no AI unless --ai.',
     '  pipegen inspect    Read this repo and its GitHub settings and print a summary. Read-only; no AI.',
+    '  pipegen hook secrets  What pipegen\'s pre-commit hook runs: its pinned gitleaks on the staged changes.',
     '',
     'Safe mode, for a repo you don\'t trust: run pipegen from OUTSIDE it, with an exact version and npm\'s own registry,',
     'so the repo\'s .npmrc or node_modules can\'t change which pipegen runs:',
@@ -126,6 +128,15 @@ export async function run(argv: string[], io: CliIO): Promise<number> {
     return 0;
   }
   const command = given ?? 'audit';
+  // G6: the pre-commit secrets hook's command (exactly `pipegen hook secrets`, optionally --dir); it runs only the pinned gitleaks
+  if (command === 'hook') {
+    const extra = Object.keys(values).find((k) => k !== 'dir' && (values as Record<string, unknown>)[k] !== undefined);
+    if (rest.length !== 1 || rest[0] !== 'secrets' || extra !== undefined) {
+      fail('Use: pipegen hook secrets (what pipegen\'s pre-commit hook runs). It takes no other argument or option but --dir.');
+      return 1;
+    }
+    return hookSecrets(io, resolve(io.cwd ?? process.cwd(), values.dir ?? '.'));
+  }
   if (command !== 'inspect' && command !== 'audit') {
     fail(`Unknown command "${safeText(command, 60)}".`);
     for (const line of usage()) fail(line);
