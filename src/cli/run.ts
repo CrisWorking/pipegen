@@ -164,6 +164,8 @@ export interface Built {
   environments: { name: string; reviewers: boolean }[];
   /** spec I7: what environmentPlan could not do (also in doc.notes); shown at the preview. */
   envNotes: string[];
+  /** G13-R2 7: hooks already in place that the trusted install record does not hold (uninstall would leave them); also in doc.notes, shown at the preview. */
+  hookNotes: string[];
   /** The files judged besides AssembledFiles (PIPEGEN.md, the inserted verify jobs, CODEOWNERS, the org required workflow): judgeAssembled's `extra`. */
   extra: CreatedFile[];
   /** The jobs as assembled, for the preview estimate (carry 43) and the PR wait. */
@@ -498,6 +500,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
       st.preview(input), ...(note === null ? [] : ['', note]),
       // spec I7: what the environment plan couldn't do (an approval with no environment to put it on), said before the yes
       ...(built.envNotes.length === 0 ? [] : ['', ...built.envNotes.map((n) => safeText(n, 600))]),
+      ...(built.hookNotes.length === 0 ? [] : ['', ...built.hookNotes.map((n) => safeText(n, 600))]),
       '', `A pull request waits about ${built.minutes.prWait} minutes at most for the checks; about ${est2.monthlyMinutes} Actions minutes a month.`,
     ].join('\n');
     if (!(await ask(`${preview}\n\nOpen the setup pull request with these changes?`))) { err('Nothing was delivered: you said no. The secrets you typed were wiped. exit code 1.'); return 1; }
@@ -715,6 +718,9 @@ export async function buildFiles(i: BuildInput, f: Pick<BuildFacts, 'texts' | 'a
   // carry 37: the hook files go into draft.created (G9 reads them), through the guard and the referee with everything else
   const precommit: PrecommitResult = skip('precommit') ? { files: [], edits: [], setupCommand: '', notes: [] } as unknown as PrecommitResult : await precommitFiles(d0, reviewed, i.dir, (i.prev?.edits ?? []).filter((e) => e.repo === 'app' && e.kind === 'hooks').map((e) => ({ path: e.path, inserted: (e as { inserted: string }).inserted })));
   const withHooks: PipelineDraft = { ...d0, created: [...d0.created, ...precommit.files] };
+  // G13-R2 7: hooks in place that the trusted record holds no hooks edit for are not removed by an uninstall: said in the doc and the preview
+  const hookNotes = (precommit.inPlace ?? []).filter((h) => !(i.prev?.edits ?? []).some((e) => e.repo === 'app' && e.kind === 'hooks' && e.path === h.path)).map((h) =>
+    `pipegen's hooks are already in ${h.path}, but the install record pipegen trusts does not list them, so an uninstall would leave them: remove pipegen's lines from ${h.path} by hand (the block that starts with the pipegen:hooks comment) if you uninstall.`);
   const opts = { gate: gateOf(reviewed), reviewed, platform, mode: (d0.signing?.mode ?? 'none') as SigningMode, layout: p.private ? 'central' as const : 'local' as const, plan: i.plan, ...(deploy === undefined ? {} : { deploy }) };
   const first = assemble(withHooks, opts);
   // carry 26: the verify plan's not-proven entries are rendered, so assemble runs again with them
@@ -741,7 +747,7 @@ export async function buildFiles(i: BuildInput, f: Pick<BuildFacts, 'texts' | 'a
   // carries 31-34: the doc is filled before the judge
   const doc = docFor({
     transcript: i.transcript, verify, locks: { notes: locks.notes, gateRequired: locks.rulesets !== undefined || locks.classic !== undefined }, precommit,
-    jobs: { notes: jobs.notes, uncoveredMinimum: jobs.uncoveredMinimum }, assembledNotes: [...a0.notes, ...envNotes], testNotes: i.testNotes, credits: i.credits ?? [],
+    jobs: { notes: jobs.notes, uncoveredMinimum: jobs.uncoveredMinimum }, assembledNotes: [...a0.notes, ...envNotes, ...hookNotes], testNotes: i.testNotes, credits: i.credits ?? [],
     estimates: i.est, prWaitMinutes: prWait, strictness: i.strictness,
   });
   const finalDraft: PipelineDraft = { ...a0.draft, doc };
@@ -752,7 +758,7 @@ export async function buildFiles(i: BuildInput, f: Pick<BuildFacts, 'texts' | 'a
   const extra = [pipegenMd, ...inserted, ...(locks.codeowners === undefined ? [] : [locks.codeowners.file]), ...(locks.centralCodeowners === undefined ? [] : [locks.centralCodeowners.file]), ...(locks.orgRequiredWorkflow === undefined ? [] : [locks.orgRequiredWorkflow.file])];
   return {
     assembled, verify, locks, precommit, doc: pipegenMd, extra, files: [...finalDraft.created, ...a0.files, ...extra],
-    environments: env.envs.map((e) => ({ name: e.name, reviewers: e.reviewers })), envNotes,
+    environments: env.envs.map((e) => ({ name: e.name, reviewers: e.reviewers })), envNotes, hookNotes,
     minutes: { jobs: assembledJobs(jobs, a0.draft.needs, p), prWait },
   };
 }

@@ -111,7 +111,7 @@ function builtOf(i: BuildInput, over: Partial<Built> = {}): Built {
     locks: { owners: { app: [], central: [] }, notes: [] } as unknown as Built['locks'],
     precommit: { files: [], edits: [], setupCommand: '', notes: [] } as unknown as Built['precommit'],
     doc: files[0] as CreatedFile, extra: [], files, report: { issues: [] } as unknown as Built['report'], guardProblems: [], environments: [],
-    minutes: { jobs: { 'pre-commit': [], push: [], merge: [], deploy: [], nightly: [] }, prWait: 7 }, envNotes: [], ...over,
+    minutes: { jobs: { 'pre-commit': [], push: [], merge: [], deploy: [], nightly: [] }, prWait: 7 }, envNotes: [], hookNotes: [], ...over,
   };
 }
 
@@ -1308,6 +1308,13 @@ describe('G13-R1: what the user is told', () => {
     expect(await run(w, i)).toBe(0);
     const out = i.lines.join('\n');
     for (const s of ['done: the branch', 'skipped: secret API_TK (no value was given; set it yourself)', 'n1', 'https://github.com/x/r/pull/3', 'https://github.com/x/pipelines/pull/8']) expect(out).toContain(s);
+  });
+
+  it('run: the note about hooks the install record does not hold reaches the preview (ruling G13-R2 7)', async () => {
+    const w = world({ built: (i) => builtOf(i, { hookNotes: ['pipegen\'s hooks are already in lefthook.yml, but the install record pipegen trusts does not list them'] }) });
+    const i = io();
+    expect(await run(w, i)).toBe(0);
+    expect(i.asked.find((q) => /Open the setup pull request/.test(q))).toContain('the install record pipegen trusts does not list them');
   });
 
   it('run: the environment plan\'s notes reach the preview (spec I7)', async () => {

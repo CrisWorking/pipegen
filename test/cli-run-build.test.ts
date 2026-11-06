@@ -219,6 +219,31 @@ describe('G13-R1: a second run over hooks pipegen already wrote (spec I5, G9-R3 
   });
 });
 
+describe('G13-R2: hooks in place that the install record does not hold (ruling G13-R2 7)', () => {
+  it('build: with no trusted record (or one without that hooks edit) PIPEGEN.md and the preview say uninstall would leave them, and how to remove them', async () => {
+    const i = input(false);
+    const first = await buildFiles(i, FACTS);
+    const hook = first.files.find((f) => f.part === 'precommit') as { path: string; content: string };
+    const edit = first.precommit.edits[0] as { path: string; inserted: string };
+    writeFileSync(join(i.dir, hook.path), hook.content);
+    const NOTE = /pipegen's hooks are already in lefthook\.yml, but the install record pipegen trusts does not list them, so an uninstall would leave them: remove pipegen's lines from lefthook\.yml by hand/;
+    const none = await buildFiles(i, FACTS);
+    expect(none.hookNotes.join('\n')).toMatch(NOTE);
+    expect(none.doc.content.replace(/\s+/g, ' ')).toMatch(NOTE);
+    // a record without a hooks edit for that path: the same
+    const prevOther = { edits: [{ repo: 'app', path: '.husky/pre-commit', kind: 'hooks', inserted: 'x', originalSha: null, writtenShas: [] }], files: [] } as unknown as BuildInput['prev'];
+    expect((await buildFiles({ ...i, prev: prevOther }, FACTS)).hookNotes.join('\n')).toMatch(NOTE);
+    // the record holds the hooks edit for that file: no note (uninstall removes them)
+    const prev = { edits: [{ repo: 'app', path: edit.path, kind: 'hooks', inserted: edit.inserted, originalSha: null, writtenShas: [] }], files: [] } as unknown as BuildInput['prev'];
+    const held = await buildFiles({ ...i, prev }, FACTS);
+    expect(held.precommit.inPlace?.length).toBe(1);
+    expect(held.hookNotes).toEqual([]);
+    expect(held.doc.content.replace(/\s+/g, ' ')).not.toMatch(NOTE);
+    // a first run writes the file: no note
+    expect(first.hookNotes).toEqual([]);
+  });
+});
+
 describe('G13-R1: draft.doc.hooksInPlace is read fail-closed (spec I5)', () => {
   it('docs: the shape check refuses a bad list; another path or another command does not count as a set-up hook', async () => {
     expect(docShapeProblem({ ...DOC0, hooksInPlace: 'lefthook.yml' })).toMatch(/hooksInPlace/);
