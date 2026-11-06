@@ -1382,6 +1382,9 @@ describe('G13: the head check in a local called workflow (G7-R2 carry, BINDING)'
     const end = ins.text.indexOf('      - run: ./smoke.sh');
     const unmarked = { ...ins.file, content: ins.text.slice(0, head) + ins.text.slice(end), inserted: { ...ins.inserted, headCheck: ['deploy'] } } as CreatedFile;
     expect(shown(await judge(w, [caller, unmarked]))).toMatch(/Every job of a called workflow pipegen edits must start with its head check/);
+    // (j3) a job added to the called file is named as such (the rest compare refuses it too)
+    const added = { ...ins.file, content: `${ins.text.trimEnd()}\n  extra:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n` } as CreatedFile;
+    expect(shown(await judge(w, [caller, added]))).toMatch(/adds or removes a job of the user's called workflow/);
     // (k) update can not renew a verify job in a called file (it holds none)
     expect(() => renewVerifyJob(ins.text, ins.inserted, w.a.verify as Job)).toThrow(/no pipegen-verify job/);
   });
