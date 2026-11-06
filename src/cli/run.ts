@@ -698,7 +698,7 @@ export async function buildFiles(i: BuildInput, f: Pick<BuildFacts, 'texts' | 'a
   // carry 25: releaseJobs into AssembleOpts.deploy
   const deploy = skip('deploy') ? undefined : releaseJobs(d0, { platform });
   // carry 37: the hook files go into draft.created (G9 reads them), through the guard and the referee with everything else
-  const precommit: PrecommitResult = skip('precommit') ? { files: [], edits: [], setupCommand: '', notes: [] } as unknown as PrecommitResult : await precommitFiles(d0, reviewed, i.dir);
+  const precommit: PrecommitResult = skip('precommit') ? { files: [], edits: [], setupCommand: '', notes: [] } as unknown as PrecommitResult : await precommitFiles(d0, reviewed, i.dir, (i.prev?.edits ?? []).filter((e) => e.repo === 'app' && e.kind === 'hooks').map((e) => ({ path: e.path, inserted: (e as { inserted: string }).inserted })));
   const withHooks: PipelineDraft = { ...d0, created: [...d0.created, ...precommit.files] };
   const opts = { gate: gateOf(reviewed), reviewed, platform, mode: (d0.signing?.mode ?? 'none') as SigningMode, layout: p.private ? 'central' as const : 'local' as const, plan: i.plan, ...(deploy === undefined ? {} : { deploy }) };
   const first = assemble(withHooks, opts);
