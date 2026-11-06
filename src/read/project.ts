@@ -7,10 +7,10 @@ import { PATH_SHOWN_MAX, safeText } from '../util/safe-text.js';
 import { CODE_FILE_RE, PLAIN_PATH_RE, PORT_RULES, REQUIREMENTS_FILE_RE, asObj, asString, asStrings, baseOf, dirOf, inDir, isTestFile, pythonNames, readPyproject, requirementLines, type Obj } from './manifest.js';
 import { readEnv } from './env.js';
 import { copySources, dockerfilesOf, notStandaloneOf, type DockerCopy } from './service-kind.js';
-import { chooseContainerFile, containerFilesIn, containerHintOf, isContainerFileName, workflowBuildRefs } from './container-file.js';
+import { bakeBuildRefs, chooseContainerFile, composeBuildRefs, containerFilesIn, containerHintOf, isContainerFileName, workflowBuildRefs } from './container-file.js';
 import { finishProjectTypes, projectTypeOf, untrackedIgnoredOf } from './project-type.js';
 import { newQualityRun, npmLockfileVersion as npmLockfileVersionOf, readRepoFiles, readServiceQuality, type QualityRun } from './quality.js';
-import { readPrecommit, readWorkflows } from './workflows.js';
+import { MAX_WORKFLOWS, readPrecommit, readWorkflows, WORKFLOW_FILE } from './workflows.js';
 import { IGNORED_DIRS, MAX_FILES_TEXT, SKIP_REASON, listFiles, parseYamlLimited, readTextLimitedWithReason, regexLines, regexSafe } from './limits.js';
 
 export class NotGitHubRepoError extends Error {}
@@ -106,10 +106,14 @@ const MAX_WORKSPACE_PATTERNS = 100;
 /** Manifests of an app that isn't a Node package: a folder holding one (and a Dockerfile) is a service next to Node workspaces. */
 const OTHER_APP_MANIFESTS = ['pyproject.toml', 'setup.py', 'go.mod'];
 const NOT_SERVICE_DIRS = ['.devcontainer', 'test', 'tests', '__tests__', 'fixtures', 'examples', 'docs'];
+/** GJ-R3 (H1 b): the compose and bake files whose build contexts count as image builds, at most MAX_BUILD_FILES of each (as MAX_WORKFLOWS). */
+const COMPOSE_FILE_RE = /^(?:docker-)?compose(?:\.[\w-]+)?\.ya?ml$/i;
+const BAKE_FILE_RE = /^docker-bake(?:\.[\w-]+)?\.hcl$/i;
+const MAX_BUILD_FILES = MAX_WORKFLOWS;
 // Root files read by direct path so the file cap can never hide them.
 const ROOT_FILES = ['package.json', 'pnpm-workspace.yaml', 'turbo.json', 'nx.json', '.nvmrc', '.node-version', '.python-version', 'pyproject.toml', 'setup.py', 'Dockerfile', ...NODE_LOCKS.map(([f]) => f), ...PYTHON_LOCKS.map(([f]) => f)];
 
-interface Ctx { root: string; fileSet: Set<string>; notes: string[] }
+interface Ctx { root: string; fileSet: Set<string>; notes: string[]; links: string[] }
 
 
 const isUnder = (file: string, dir: string) => dir === '.' || file.startsWith(`${dir}/`);
@@ -265,7 +269,7 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
   if (chosen?.note != null && !ctx.notes.includes(chosen.note)) ctx.notes.push(chosen.note);
   const dockerfile = chosen?.file;
   // GJ-R2 (N1): no file of its own, but built into an image anyway (deeper file, a workflow, another container file's COPY): never static
-  const containerHint = dockerfile !== undefined ? undefined : containerHintOf(dir, ctx.fileSet, shared.serviceDirs, shared.buildRefs, shared.fileCopies);
+  const containerHint = dockerfile !== undefined ? undefined : containerHintOf(dir, ctx.fileSet, shared.serviceDirs, shared.buildRefs, shared.fileCopies, ctx.links);
   const deps = asObj(pkg?.dependencies);
   const devDeps = asObj(pkg?.devDependencies);
   const pkgScripts = asObj(pkg?.scripts);
@@ -380,8 +384,10 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
   const notes = opts?.notes ?? [];
   const { owner, repo } = await readOrigin(dir);
   const ignore = IGNORED_DIRS.map((d) => `**/${d}/**`);
-  const listing = await listFiles(dir, ['**/*'], ignore);
-  const ctx: Ctx = { root: dir, fileSet: new Set(listing.files.filter(regexSafe)), notes };
+  // GJ-R3 (H1 a): symbolic links are collected by name (never followed), so a linked container file is a hint
+  const found = { links: [] as string[] };
+  const listing = await listFiles(dir, ['**/*'], ignore, found);
+  const ctx: Ctx = { root: dir, fileSet: new Set(listing.files.filter(regexSafe)), notes, links: found.links.filter(regexSafe) };
   const listingIncomplete = listing.truncated || ctx.fileSet.size < listing.files.length;
   if (listing.truncated) note(ctx, `Only the first ${MAX_FILES_TEXT} files were read. Results may be incomplete.`);
   for (const name of ROOT_FILES) if (!ctx.fileSet.has(name) && (await lstat(joinOs(dir, name)).catch(() => null))) ctx.fileSet.add(name);
@@ -399,18 +405,23 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
   const workspaceMembers = [...dirs];
   const isAppDockerfile = (f: string) => isContainerFileName(baseOf(f)) && !dirOf(f).split('/').some((s) => NOT_SERVICE_DIRS.includes(s));   // GJ-R2 (N2)
   const dockerDirs = [...new Set([...ctx.fileSet].filter(isAppDockerfile).map(dirOf))].sort();
-  if (dirs.length === 0) dirs = dockerDirs.length > 0 ? dockerDirs : ['.'];
-  else {
+  // P50 (I3): one pass over the files for the folders holding a requirements file, and a Set of the service folders,
+  // so this stays linear in the number of files (it was a scan of every file per Dockerfile folder)
+  const requirementDirs = new Set<string>();
+  for (const f of ctx.fileSet) if (REQUIREMENTS_FILE_RE.test(baseOf(f))) requirementDirs.add(dirOf(f));
+  const otherApp = (d: string) => !ctx.fileSet.has(inDir(d, 'package.json'))
+    && (OTHER_APP_MANIFESTS.some((m) => ctx.fileSet.has(inDir(d, m))) || requirementDirs.has(d));
+  const appManifest = (d: string) => ctx.fileSet.has(inDir(d, 'package.json')) || otherApp(d);
+  if (dirs.length === 0) {
+    // GJ-R3 (O1): the root app with no container file of its own, and a container file in a folder with no app manifest (docker/Dockerfile.dev,
+    // deploy/Dockerfile.prod): that file builds the root (its hint names it), so the root stays the service, as otherApp does below
+    if (!dockerDirs.includes('.') && appManifest('.') && dockerDirs.some((d) => !appManifest(d))) dirs = ['.', ...dockerDirs.filter(appManifest)];
+    else dirs = dockerDirs.length > 0 ? dockerDirs : ['.'];
+  } else {
     // A Node workspace list names Node packages only (DoD run, fastapi/full-stack-fastapi-template: backend/ was lost). A
     // folder with a Dockerfile and a Python or Go manifest beside it is a service the list can't name; a Dockerfile
     // folder without one (an nginx or database image) stays out, as before.
-    // P50 (I3): one pass over the files for the folders holding a requirements file, and a Set of the service folders,
-    // so this stays linear in the number of files (it was a scan of every file per Dockerfile folder)
-    const requirementDirs = new Set<string>();
-    for (const f of ctx.fileSet) if (REQUIREMENTS_FILE_RE.test(baseOf(f))) requirementDirs.add(dirOf(f));
     const taken = new Set(dirs);
-    const otherApp = (d: string) => !ctx.fileSet.has(inDir(d, 'package.json'))
-      && (OTHER_APP_MANIFESTS.some((m) => ctx.fileSet.has(inDir(d, m))) || requirementDirs.has(d));
     for (const d of dockerDirs) {
       if (d === '.' || taken.has(d) || !otherApp(d)) continue;
       taken.add(d);
@@ -442,10 +453,13 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
     shared.copies.push(...sources.map((source) => ({ dockerDir: dirOf(f), source })));
     shared.fileCopies.push(...sources.map((source) => ({ file: f, source })));
   }
-  // GJ-R2 (N1, N4): the paths the workflows build from, read as text (never run)
-  const wfTexts: string[] = [];
-  for (const f of [...ctx.fileSet].filter((x) => /^\.github\/workflows\/[^/]+\.ya?ml$/.test(x)).sort()) { const t = await readFile(ctx, f); if (t !== null) wfTexts.push(t); }
-  shared.buildRefs = workflowBuildRefs(wfTexts);
+  // GJ-R2 (N1, N4): the paths the workflows build from, read as text (never run). GJ-R3 (B1): the first MAX_WORKFLOWS in the workflow
+  // reader's order, each parsed as it is read; (H1 b) and the build contexts of the compose and bake files, capped the same way
+  const buildRefs = new Set<string>();
+  for (const f of [...ctx.fileSet].filter((x) => WORKFLOW_FILE.test(x)).sort().slice(0, MAX_WORKFLOWS)) { const t = await readFile(ctx, f); if (t !== null) workflowBuildRefs([t], buildRefs); }
+  for (const f of [...ctx.fileSet].filter((x) => COMPOSE_FILE_RE.test(baseOf(x))).sort().slice(0, MAX_BUILD_FILES)) { const doc = await readYaml(ctx, f); if (doc !== null) composeBuildRefs(f, doc, buildRefs); }
+  for (const f of [...ctx.fileSet].filter((x) => BAKE_FILE_RE.test(baseOf(x))).sort().slice(0, MAX_BUILD_FILES)) { const t = await readFile(ctx, f); if (t !== null) bakeBuildRefs(f, t, buildRefs); }
+  shared.buildRefs = buildRefs;
   const services: Service[] = [];
   for (const d of dirs) services.push(await readService(ctx, d, shared));
   uniqueServiceNames(ctx, services);

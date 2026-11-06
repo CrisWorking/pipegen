@@ -151,8 +151,8 @@ export interface CheckRule {
 }
 
 const NO_SERVICES = 'no services found';
-/** Plan J J2 (ruling S2): why a static site gets no image, DAST or API DAST check. */
-export const STATIC_SKIP = 'this service is a static site: nothing runs as a server or in a container';
+/** Plan J J2 (ruling S2): why a static site gets no image, DAST or API DAST check. GJ-R3 (H1 c): what pipegen assumed, and how to say otherwise. */
+export const STATIC_SKIP = 'no image build found; if a workflow builds one, use --type SERVICE=container';
 /** Ruling S2: why a service that doesn't run gets no image or DAST check (today's "doesn't run as a server" wording). */
 const NOT_RUNNABLE_SKIP = "this service doesn't run as a server, so there is no image to build or running app to scan";
 /** A static site that isn't also a container (the case isRunnable turns off). */

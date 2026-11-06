@@ -11,7 +11,7 @@ import { mapCoverage } from '../src/audit/coverage.js';
 import { buildAudit, buildsNoImage, CURRENT_MILESTONE, needLabel, type AuditDeps, type AuditReport } from '../src/audit/model.js';
 import { renderJson, renderMarkdown, renderTerminal } from '../src/audit/render.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
-import { floorNeeds, jobCategories } from '../src/engine/needs.js';
+import { floorNeeds, jobCategories, STATIC_SKIP } from '../src/engine/needs.js';
 import { estimate } from '../src/estimate/estimate.js';
 import { readProject } from '../src/read/project.js';
 import { skippedWorkflowCount } from '../src/read/workflows.js';
@@ -1302,7 +1302,7 @@ describe('buildAudit: a static site gets no image, DAST or Dockerfile checks (Pl
         for (const c of ['image-build', 'image-scan', 'dast', 'api-dast', 'dockerfile-lint']) expect(cats, c).not.toContain(c);
         for (const c of ['secrets', 'deps', 'sast', 'workflow-lint', 'workflow-pin-check', 'gate']) expect(cats, c).toContain(c);
         expect(r.wouldCreate.map((w) => w.what)).not.toContain('docker');
-        const skipped = r.skipped.find((g) => g.why === 'this service is a static site: nothing runs as a server or in a container');
+        const skipped = r.skipped.find((g) => g.why === STATIC_SKIP);
         expect(skipped?.categories).toEqual(expect.arrayContaining(['image-build', 'image-scan', 'dast', 'api-dast']));
         const signing = r.coverage.filter((c) => c.need.category === 'signing');
         if (priv) {

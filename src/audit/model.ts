@@ -776,8 +776,9 @@ export function wouldCreateOf(p: RepoProfile): { what: Part; why: string }[] {
   const out: { what: Part; why: string }[] = [];
   if (p.precommit === null) out.push({ what: 'precommit', why: 'No git hook manager found: pipegen would set up pre-commit hooks that check each commit.' });
   for (const s of p.services) {
-    // GJ-R2 (N1): built into an image pipegen can't build (no container file in the folder itself): named, never "would create one"
-    if (isRunnable(s) && (s.dockerfile ?? '') === '' && s.containerHint !== undefined) out.push({ what: 'docker', why: `${s.name} is built into an image pipegen can't build or scan yet (${s.containerHint}), so that image is not checked: not covered.` });
+    // GJ-R2 (N1): built into an image pipegen can't build (no container file in the folder itself): named, never "would create one".
+    // GJ-R3 (W1): worded as an entry of "pipegen would also create:" (it creates nothing), shown whether or not the service runs
+    if ((s.dockerfile ?? '') === '' && s.containerHint !== undefined) out.push({ what: 'docker', why: `nothing for ${s.name}, which is built into an image elsewhere (${s.containerHint}): pipegen can't build or scan that image yet, so it is not covered.` });
     else if (isRunnable(s) && (s.dockerfile ?? '') === '') out.push({ what: 'docker', why: `${s.name} runs but has no Dockerfile: pipegen would create one, so the image can be built and scanned.` });
   }
   // hand checks (P55 batch B): a database named only in a .env file (a sample's DATABASE_URL) isn't one the code uses

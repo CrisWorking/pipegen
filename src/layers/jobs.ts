@@ -564,7 +564,10 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     if (categoryOf(s.needId) !== 'dast' || s.service === undefined || !draft.needs.some((n) => n.layer === 'merge' && n.id === s.needId && n.service === s.service)) continue;
     const st = dastStartOf(draft, s.service, list);
     if (!('problem' in st)) { starts.set(s, st); continue; }
-    if (blocks(draft, s.needId, s.service)) fail(`The blocking check ${where(s)} can not run: ${st.problem}. pipegen never makes it warn-only or leaves it out.`);
+    // GJ-R3 (O3): an unsure type is a server by rule; the user may say it is a static site
+    const unsure = draft.profile.services.find((x) => x.name === s.service)?.projectType?.unsure === true;
+    const tip = unsure ? ` Its type is unsure, so pipegen treats it as a server; if it is a static site, run with --type ${safeText(s.service, 60)}=static-site.` : '';
+    if (blocks(draft, s.needId, s.service)) fail(`The blocking check ${where(s)} can not run: ${st.problem}. pipegen never makes it warn-only or leaves it out.${tip}`);
     addNote(notes, `The non-blocking check ${where(s)} is not run: ${st.problem}.`);
     for (const n of draft.needs) if (n.id === s.needId && n.service === s.service) noStart.add(n);
   }
