@@ -171,7 +171,10 @@ describe('G13-R1: package.json reads (sec M6)', () => {
     mkdirSync(join(dir, 'd'));
     writeFileSync(join(dir, 'd', 'package.json'), 'x'.repeat(1025));
     expect(await readRegular(dir, 'package.json', 1024)).toBe('{"name":"x"}');
-    for (const rel of ['a/package.json', 'b/package.json', 'c/package.json', 'd/package.json', 'missing/package.json']) expect(await readRegular(dir, rel, 1024), rel).toBeNull();
+    // a link to a file inside the folder is still a link: not read
+    mkdirSync(join(dir, 'e'));
+    symlinkSync(join(dir, 'package.json'), join(dir, 'e', 'package.json'));
+    for (const rel of ['e/package.json', 'a/package.json', 'b/package.json', 'c/package.json', 'd/package.json', 'missing/package.json']) expect(await readRegular(dir, rel, 1024), rel).toBeNull();
   });
 
   it('runCreators: a service package.json that is a link is never read (the starter gets none)', async () => {
