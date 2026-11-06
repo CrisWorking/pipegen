@@ -102,7 +102,7 @@ const MAX_TYPED_NAME = 120;
  */
 export async function askTypedName(deps: Pick<UninstallDeps, 'io' | 'interactive'>, expected: string, question: string): Promise<boolean> {
   if (typeof expected !== 'string' || expected.trim() === '') throw new UninstallError('pipegen asked for a typed confirmation with no name to type; it stopped here: nothing more was changed.');
-  if (expected.length > MAX_TYPED_NAME || safeText(expected, MAX_TYPED_NAME) !== expected) return false;
+  if (safeText(expected, MAX_TYPED_NAME) !== expected) return false;   // safeText cuts a longer one, so it differs then
   const io = terminalOf(deps, `type ${expected} to confirm`);
   const q = String(question).split('\n').map((l) => safeText(l, 300)).join('\n');
   let typed: string;

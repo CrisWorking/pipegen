@@ -302,6 +302,9 @@ describe('uninstall: load and trust the install record (V1)', () => {
     const e = await stops(loadUninstallRecord(gh(w), APP, { local: local(w), io: io(w, 'o/r'), interactive: true }), /no install record for o\/r that it trusts/);
     expect(e.message).toContain(localRecordPath(APP, local(w)));
     expect(e.message).toMatch(/[Mm]ove .* away.*run .*again.*type/s);
+    // spec M1 (V1-R1): trustedPrevious's note without its deliver clause (uninstall writes no new record)
+    expect(e.message).toMatch(/doesn't match the hash in this machine's local record file, so pipegen claims nothing from it\./);
+    expect(e.message).not.toMatch(/writes a new record/);
     expect(w.asked).toEqual([]);
     expect(writes(w)).toEqual([]);
   });
@@ -437,6 +440,15 @@ describe('uninstall: load and trust the install record, fix round 1 (V1-R1)', ()
     w.g.hooks.push((c) => { if (isMainRef(c) && ++seen === n) swapTo(w, { ...r, pipegenVersion: '0.2.9' }); return undefined; });
     await stops(loadUninstallRecord(gh(w), APP, { local: local(w) }), /changed while pipegen read it/);
     expect(writes(w)).toEqual([]);
+    // swapped for another repo's record (vouched by the local file) after the first read: the trusted record's id is checked again → stop
+    const w4 = world();
+    const r4 = sampleRecord(w4.appId);
+    putRecord(w4, recordFileText(r4));
+    const foreign = sampleRecord(w4.appId + 1);
+    await writeLocalRecord(APP, { recordHash: recordHash(foreign), updatedAt: 'x' }, local(w4));
+    let seen4 = 0;
+    w4.g.hooks.push((c) => { if (isMainRef(c) && ++seen4 === 2) swapTo(w4, foreign); return undefined; });
+    await stops(loadUninstallRecord(gh(w4), APP, { local: local(w4) }), /not the repository pipegen was installed in/);
   });
 
   it('record: a record of another repo id is refused before anything is asked or vouched (sec M1, spec M3, probe P2)', async () => {
