@@ -28,7 +28,7 @@
 //   SARIF; findSecretLike runs over every file (S18). The workflow linters (actionlint, zizmor) run through `deps.runLinters`
 //   (default: linters.ts runLinters, 7b), which tests replace with a stub.
 import { isDeepStrictEqual } from 'node:util';
-import { isMap, isScalar, LineCounter, visit, type Document, type Node as YamlNode, type Pair } from 'yaml';
+import { isMap, isScalar, isSeq, LineCounter, visit, type Document, type Node as YamlNode, type Pair } from 'yaml';
 import { findSecretLike } from '../ai/redact.js';
 import { activeSafeText as safeText, anyString, anyYamlScalar, scrubForDisplay, vaultHolds, withActiveVault } from '../util/known-values.js';
 import { GATE_CHECK_NAME, type CreatedFile, type KnownValueCheck, type OutputFormat, type PipegenInserted, type PipelineDraft, type ReviewedTool, type RuntimeEnv, type Service, type StepSpec } from '../types.js';
@@ -51,7 +51,7 @@ import {
   STEP_KEYS as STEP_KEY_LIST, WORKFLOW_CONCURRENCY, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact,
 } from './job-rules.js';
 import { signingMode } from '../github/signing-mode.js';
-import { containerRefusal, RenderError, renderComposeUp, renderProjectScript, renderRepoTool, renderRuntimeEnv, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
+import { containerRefusal, RenderError, renderComposeUp, renderProjectScript, renderRepoTool, renderRuntimeEnv, renderStep, sameDedupeContent, stepsToYaml, type RenderContext } from './render-step.js';
 import { COMPOSE_PATH, planCompose } from '../create/compose.js';
 import { dockerfilesOf } from './created-judges/compose.js';
 import { loadBaseImages } from './base-images.js';
@@ -160,8 +160,9 @@ const ENTRY_KIND: Readonly<Record<string, StepKind>> = Object.freeze({
  */
 export const JOB_STEP_POLICY: Readonly<Record<string, readonly StepKind[]>> = Object.freeze({
   'pr-check': ['harden', 'checkout', 'pr-check'],
-  // G2: the verify steps of the draft's signing plan (B3 b, d); G7: the head check and the digest step are verify steps too (deploy-steps.ts)
-  'pipegen-verify': ['harden', 'checkout', 'download-artifact', 'gate', 'verify'],
+  // G2: the verify steps of the draft's signing plan (B3 b, d); G7: the head check and the digest step are verify steps too (deploy-steps.ts).
+  // G7-R1 sec M3: no checkout and no artifact download: the digest comes through the API by the gated run's id, and nothing may overwrite it
+  'pipegen-verify': ['harden', 'gate', 'verify'],
   'code-scanning': ['harden', 'download-artifact', 'upload-sarif'],
   // no checkout: the gate never reads the workspace (Plan C ruling S21); it reads the event, the job outputs and the API
   // C5b: the gate's own uploads (result, baseline, clean-run marker) after the gate step, and no other upload (checkJobOrder, gateUploadProblems)
@@ -337,6 +338,13 @@ export function pipegenLines(file: CreatedFile): ReadonlySet<number> | null {
   for (const id of mark.jobs) {
     const p = jobPair(doc, id);
     if (p?.key?.range && p.value?.range) linesOf(lines, p.key.range[0], p.value.range[1], out);
+  }
+  // G7-R1 sec I1: the head check pipegen put first in a gated job is its line too
+  for (const id of Array.isArray(mark.headCheck) ? mark.headCheck : []) {
+    const p = typeof id === 'string' ? jobPair(doc, id) : undefined;
+    const steps = isMap(p?.value) ? p.value.get('steps', true) : undefined;
+    const first = isSeq(steps) ? (steps.items[0] as YamlNode | undefined) : undefined;
+    if (first?.range) linesOf(lines, first.range[0], first.range[1], out);
   }
   for (const n of mark.needs) {
     const p = jobPair(doc, n.job);
@@ -722,7 +730,7 @@ interface FileCtx {
 const issueFor = (fc: FileCtx) => (check: RefereeCheck, message: string): void => fc.add(fc.file.path, check, message);
 
 /** The event names of an `on:` value (a name, a list of names, or a map by name); null when it is none of those. */
-function triggersOf(on: unknown): string[] | null {
+export function triggersOf(on: unknown): string[] | null {
   if (typeof on === 'string') return [on];
   if (Array.isArray(on)) return on.every((x) => typeof x === 'string') ? (on as string[]) : null;
   if (isObj(on)) return Object.keys(on);
@@ -2108,7 +2116,29 @@ function judgeEdited(fc: FileCtx, parsed: Parsed, mark: PipegenInserted): void {
     else if (typeof before === 'string' && kept.length === 1) j.needs = kept[0];
     else j.needs = kept;
   }
-  if (!isDeepStrictEqual(rest, orig.parsed.js)) bad('template', 'The edit changes the user\'s workflow beyond the job and needs pipegen inserted.');
+  // G7-R1 sec I1: every job that waits for pipegen-verify and has steps starts with pipegen's head check (the verify job's own, of this
+  // repository's default branch, exactly), so the check runs in the deploy job after an approval wait and on every re-run of that job
+  if (mark.jobs.includes('pipegen-verify')) {
+    const heads: unknown[] = mark.headCheck === undefined ? [] : Array.isArray(mark.headCheck) ? mark.headCheck : [null];
+    let want: unknown = null;
+    try { want = stepsToYaml([renderHeadCheckStep(fc.draft.profile.defaultBranch)]).toJSON()[0]; } catch (e) { if (!(e instanceof RenderError)) throw e; }
+    for (const n of mark.needs) {
+      const j = isObj(n) && typeof n.job === 'string' ? restJobs[n.job] : undefined;
+      if (isObj(j) && j.uses === undefined && !heads.includes(n.job)) bad('template', `The job ${show(n.job)} waits for pipegen-verify but does not start with pipegen's head check, so a re-run of that job alone, or one that waited for an approval, would not be checked.`);
+    }
+    for (const id of heads) {
+      const j = typeof id === 'string' ? restJobs[id] : undefined;
+      if (typeof id !== 'string' || !isObj(j) || !mark.needs.some((n) => isObj(n) && n.job === id)) { bad('template', `The head check pipegen added is on ${show(id)}, which is not a job it gates.`); continue; }
+      const steps = Array.isArray(j.steps) ? j.steps : [];
+      const p = jobPair(parsed.doc, id);
+      const stepsNode = isMap(p?.value) ? p.value.get('steps', true) : undefined;
+      const first = isSeq(stepsNode) ? stepsNode.items[0] : undefined;
+      if (hasAnchorOrAlias(first)) bad('injection', `The head check pipegen added to ${show(id)} uses a YAML anchor or alias.`);
+      if (want === null || !isDeepStrictEqual(steps[0], want)) { bad('template', `The job ${show(id)} does not start with pipegen's head check exactly (the step pipegen writes for the default branch, first).`); continue; }
+      steps.shift();
+    }
+  }
+  if (!isDeepStrictEqual(rest, orig.parsed.js)) bad('template', 'The edit changes the user\'s workflow beyond the job, needs and head checks pipegen inserted.');
   // G1 (C5a, C7s): the jobs pipegen inserts follow the same layout rules under the user's triggers (no gate on a push to another branch, no find-run on schedule)
   judgeLayoutJobs(fc, parsed.js.on, triggersOf(parsed.js.on), jobs, mark.jobs);
   judgeJobs(fc, jobs, mark.jobs);

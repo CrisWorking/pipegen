@@ -21,12 +21,12 @@ import { statfsSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import type { Octokit } from '@octokit/rest';
 import { Document, isMap, isScalar, isSeq, parseDocument, type Node as YamlNode, type Pair } from 'yaml';
-import { BUILD_PUSH_STEP_ID, imageDigestArtifact, publishedImageRepo, PUBLISH_TAG, renderPublishDigestStep } from '../engine/deploy-steps.js';
+import { BUILD_PUSH_STEP_ID, HEAD_CHECK_STEP_ID, imageDigestArtifact, publishedImageRepo, PUBLISH_TAG, renderPublishDigestStep } from '../engine/deploy-steps.js';
 import type { RateClock } from '../engine/github-rate.js';
-import { CALLER_WORKFLOW, isDangerousName, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PUSH_WORKFLOW } from '../engine/job-rules.js';
+import { CALLER_WORKFLOW, isDangerousName, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PUSH_WORKFLOW, type RenderedStep } from '../engine/job-rules.js';
 import { publishedImageServices } from '../engine/needs.js';
 import type { PlatformActions } from '../engine/pin.js';
-import { gatedIfAllowed, SIGNING_ENVIRONMENT } from '../engine/referee.js';
+import { gatedIfAllowed, SIGNING_ENVIRONMENT, triggersOf } from '../engine/referee.js';
 import { RenderError } from '../engine/render-error.js';
 import { renderJobPrelude, renderPlatformStep, stepsToYaml } from '../engine/render-step.js';
 import { parseYaml } from '../engine/yaml-parse.js';
@@ -72,14 +72,6 @@ const refuse = (m: string): never => { throw new EditRefused(m); };
 
 // ---------- triggers ----------
 
-/** A workflow's trigger names, whatever form `on` takes (a name, a list, a map). Null when it can not be read. */
-export function triggerNames(on: unknown): string[] | null {
-  if (typeof on === 'string') return [on];
-  if (Array.isArray(on)) return on.every((t) => typeof t === 'string') ? (on as string[]) : null;
-  if (isObj(on)) return Object.keys(on);
-  return null;
-}
-
 /** 'push' when push is the only trigger, 'workflow_run' when that is the only one, else 'other' (plan Task 4). */
 export function deployTriggers(wf: Pick<ExistingWorkflow, 'triggers'>): DeployTrigger {
   const t = Array.isArray(wf.triggers) ? [...new Set(wf.triggers)] : [];
@@ -90,13 +82,14 @@ export function deployTriggers(wf: Pick<ExistingWorkflow, 'triggers'>): DeployTr
 
 /** Why a push trigger is not "the default branch only" (a filter of exactly that branch, no tags), or null. */
 function pushBranchProblem(on: unknown, defaultBranch: string): string | null {
+  const fix = `; pipegen's check passes only on the default branch, so limit its push to \`branches: [${safeText(defaultBranch, 100)}]\``;
   const push = isObj(on) ? on.push : undefined;
-  if (!isObj(push)) return 'its push runs on every branch and tag, and verify-first only passes on the default branch';
-  if (push['branches-ignore'] !== undefined || push.tags !== undefined || push['tags-ignore'] !== undefined) return 'its push also runs on tags or on branches other than the default one, and verify-first only passes on the default branch';
+  if (!isObj(push)) return `its push runs on every branch and tag${fix}`;
+  if (push['branches-ignore'] !== undefined || push.tags !== undefined || push['tags-ignore'] !== undefined) return `its push also runs on tags or on other branches${fix}`;
   const b = push.branches;
   const list = typeof b === 'string' ? [b] : Array.isArray(b) ? b : null;
-  if (list === null || list.length === 0) return 'its push runs on every branch, and verify-first only passes on the default branch';
-  if (!list.every((x) => x === defaultBranch)) return 'its push runs on branches other than the default one, and verify-first only passes on the default branch';
+  if (list === null || list.length === 0) return `its push runs on every branch${fix}`;
+  if (!list.every((x) => x === defaultBranch)) return `its push runs on other branches too${fix}`;
   return null;
 }
 
@@ -133,93 +126,144 @@ function parsedDoc(text: string): JobsNode {
 }
 const pairOf = (map: { items: Pair[] }, key: string): Pair<YamlNode, YamlNode> | undefined => map.items.find((p) => isScalar(p.key) && p.key.value === key) as Pair<YamlNode, YamlNode> | undefined;
 
+/** The file's line ending: CRLF when the file uses it, so every line pipegen adds ends the same way (G7-R1 minor). */
+const eolOf = (text: string): string => (text.includes('\r\n') ? '\r\n' : '\n');
+/** The head check the verify job holds (the same step goes first into every gated job that has steps), or a refusal. */
+function headCheckOf(verify: Job): RenderedStep {
+  const h = verify.steps.find((s) => s.id === HEAD_CHECK_STEP_ID);
+  return h === undefined ? refuse(`the ${VERIFY_JOB} job has no head check`) : h;
+}
+/** One step as a block list item at indent 0, without a trailing newline (stepsToYaml, like the verify job's steps). */
+function stepItemYaml(step: RenderedStep): string {
+  const doc = new Document();
+  doc.contents = stepsToYaml([step]);
+  return doc.toString({ lineWidth: 0 }).replace(/\n+$/, '');
+}
+/** The parsed form of a step (what a reader of the edited file sees), to compare a job's first step with. */
+const stepJs = (step: RenderedStep): unknown => (parseDocument(stepItemYaml(step)).toJS() as unknown[])[0];
+
+/** Insertion order at one offset (spec review I1): needs first, then the head-check step, then the job (so a job that ends with its needs keeps them). */
+const NEEDS = 0;
+const STEP = 1;
+const JOB = 2;
+
 /**
- * Adds the verify job and a `needs: pipegen-verify` entry to each of `deployJobs`, and changes nothing else (Review Focus 2): the job goes at
- * the end of the block `jobs:` map, at the indentation of the user's job keys; a need goes into a flow list before its `]`, as a new item of
- * a block list at that list's indentation, around a single job id written plain (`needs: build` becomes `needs: [build, pipegen-verify]`),
- * or as a new first line `needs: [pipegen-verify]` of a job that has none. Then the result is checked the way the referee checks it: the file
- * without pipegen's job and needs is the original exactly (parsed), and the job is the verify job exactly; anything else throws (a gap).
+ * Adds the verify job and a `needs: pipegen-verify` entry to each of `deployJobs`, puts pipegen's head check (the verify job's own, exactly)
+ * as the FIRST step of each of them that has steps (G7-R1 sec I1: it runs inside the deploy job, after any approval wait and on every
+ * re-run), and changes nothing else (Review Focus 2): the job goes at the end of the block `jobs:` map, at the indentation of the user's
+ * job keys; a need goes into a one-line flow list before its `]`, as a new item of a block list at that list's indentation, around a single
+ * job id written plain (`needs: build` becomes `needs: [build, pipegen-verify]`), or as a new first line `needs: [pipegen-verify]` of a job
+ * that has none; the head check goes before the first item of the job's block `steps:` list, at its indentation. At one offset the needs go
+ * in before the job (spec review I1). Lines end like the file's (CRLF stays CRLF). Then the result is checked the way the referee checks it:
+ * the file without pipegen's job, needs and head checks is the original exactly (parsed), and the job is the verify job exactly; anything
+ * else throws (a gap).
  */
 export function insertVerify(original: string, deployJobs: readonly string[], verify: Job): { text: string; inserted: PipegenInserted; insertions: Insertion[] } {
   if (deployJobs.length === 0) refuse('no job to gate');
   const { map } = parsedDoc(original);
-  if (pairOf(map, VERIFY_JOB) !== undefined) refuse(`it already has a job named ${VERIFY_JOB}`);
-  const insertions: Insertion[] = [];
-  // the job: at the end of the jobs map (its value end is the start of the line after the last job, or the end of the text)
+  if (pairOf(map, VERIFY_JOB) !== undefined) refuse(`it already has a job named ${VERIFY_JOB}; rename that job, then run pipegen again`);
+  const eol = eolOf(original);
+  const nl = (t: string): string => t.replace(/\r?\n/g, eol);
+  const head = headCheckOf(verify);
+  const ranked: (Insertion & { rank: number })[] = [];
+  const add = (at: number, text: string, rank: number): void => { ranked.push({ at, text: nl(text), rank }); };
   const first = map.items[0]?.key as YamlNode | undefined;
   const keyAt = first?.range?.[0];
   const indent = keyAt === undefined ? null : spacesBefore(original, keyAt);
   const end = map.range?.[1];
-  if (indent === null || end === undefined) return refuse('its job keys do not start their own lines');
-  const lead = end > 0 && original[end - 1] !== '\n' ? '\n' : '';
-  insertions.push({ at: end, text: `${lead}${indentLines(verifyJobYaml(verify), indent)}\n` });
-  // the needs
+  if (indent === null || end === undefined) return refuse('its job names do not each start their own line');
+  const headJobs: string[] = [];
   for (const id of [...new Set(deployJobs)]) {
     const p = pairOf(map, id);
-    if (p === undefined || !isMap(p.value) || p.value.flow === true || p.value.items.length === 0) refuse(`its job ${show(id)} is not a block map pipegen can add a need to`);
+    if (p === undefined || !isMap(p.value) || p.value.flow === true || p.value.items.length === 0) refuse(`its job ${show(id)} is written in { } on one line; write it as an indented block, then run pipegen again`);
     const job = (p as Pair<YamlNode, YamlNode>).value as unknown as { items: Pair[] };
     const needs = pairOf(job, 'needs');
     if (needs === undefined) {
       const k = job.items[0]?.key as YamlNode | undefined;
       const at = k?.range?.[0];
       const col = at === undefined ? null : spacesBefore(original, at);
-      if (at === undefined || col === null) return refuse(`the keys of its job ${show(id)} do not start their own lines`);
-      insertions.push({ at: lineStart(original, at), text: `${' '.repeat(col)}needs: [${VERIFY_JOB}]\n` });
-      continue;
+      if (at === undefined || col === null) return refuse(`the keys of its job ${show(id)} do not each start their own line`);
+      add(lineStart(original, at), `${' '.repeat(col)}needs: [${VERIFY_JOB}]\n`, NEEDS);
+    } else {
+      const v = needs.value;
+      const r = v?.range;
+      if (v === null || v === undefined || r === undefined || r === null) return refuse(`the needs of its job ${show(id)} are empty; list the jobs it waits for, or remove the needs line`);
+      if (v.anchor !== undefined || (isScalar(v) && v.type !== 'PLAIN')) refuse(`the needs of its job ${show(id)} use a YAML anchor or a quoted job name; write the job names plainly`);
+      if (isScalar(v)) {
+        if (typeof v.value !== 'string' || original.slice(r[0], r[1]) !== v.value) refuse(`the needs of its job ${show(id)} are not one plain job name`);
+        add(r[0], '[', NEEDS);
+        add(r[1], `, ${VERIFY_JOB}]`, NEEDS);
+      } else if (isSeq(v) && v.flow === true) {
+        if (/\r?\n/.test(original.slice(r[0], r[1]))) refuse(`its job ${show(id)} lists its needs over several lines inside [ ]; write them on one line, or as a - list, then run pipegen again`);
+        const close = original.lastIndexOf(']', r[1] - 1);
+        if (close < r[0]) return refuse(`the needs of its job ${show(id)} do not end with ]`);
+        add(close, v.items.length === 0 ? VERIFY_JOB : `, ${VERIFY_JOB}`, NEEDS);
+      } else if (isSeq(v) && v.items.length > 0) {
+        const item = v.items[0] as YamlNode;
+        const dash = item.range === undefined || item.range === null ? -1 : original.lastIndexOf('-', item.range[0] - 1);
+        const col = dash < 0 ? null : spacesBefore(original, dash);
+        if (col === null) return refuse(`the needs list of its job ${show(id)} does not start each item on its own line`);
+        const lead = r[1] > 0 && original[r[1] - 1] !== '\n' ? '\n' : '';
+        add(r[1], `${lead}${' '.repeat(col)}- ${VERIFY_JOB}\n`, NEEDS);
+      } else refuse(`the needs of its job ${show(id)} are not a list of job names`);
     }
-    const v = needs.value;
-    const r0 = v?.range;
-    if (v === null || v === undefined || r0 === undefined || r0 === null) return refuse(`the needs of its job ${show(id)} can not be read`);
-    const r = r0;
-    if (v.anchor !== undefined || (isScalar(v) && v.type !== 'PLAIN')) refuse(`the needs of its job ${show(id)} use an anchor or a quoted id`);
-    if (isScalar(v)) {
-      if (typeof v.value !== 'string' || original.slice(r[0], r[1]) !== v.value) refuse(`the needs of its job ${show(id)} are not one plain job id`);
-      insertions.push({ at: r[0], text: '[' }, { at: r[1], text: `, ${VERIFY_JOB}]` });
-    } else if (isSeq(v) && v.flow === true) {
-      const close = original.lastIndexOf(']', r[1] - 1);
-      if (close < r[0]) return refuse(`the needs of its job ${show(id)} can not be read`);
-      insertions.push({ at: close, text: v.items.length === 0 ? VERIFY_JOB : `, ${VERIFY_JOB}` });
-    } else if (isSeq(v) && v.items.length > 0) {
-      const item = v.items[0] as YamlNode;
-      const dash = item.range === undefined || item.range === null ? -1 : original.lastIndexOf('-', item.range[0] - 1);
-      const col = dash < 0 ? null : spacesBefore(original, dash);
-      if (col === null) return refuse(`the needs list of its job ${show(id)} can not be read`);
-      const lead2 = r[1] > 0 && original[r[1] - 1] !== '\n' ? '\n' : '';
-      insertions.push({ at: r[1], text: `${lead2}${' '.repeat(col)}- ${VERIFY_JOB}\n` });
-    } else refuse(`the needs of its job ${show(id)} are not a list of job ids`);
+    // G7-R1 sec I1: the head check, first, in every gated job that has steps (a call of another workflow has none)
+    if (pairOf(job, 'uses') !== undefined) continue;
+    const steps = pairOf(job, 'steps');
+    const sv = steps?.value;
+    if (steps === undefined || !isSeq(sv) || sv.flow === true || sv.items.length === 0) refuse(`its job ${show(id)} has no block list of steps to start with pipegen's head check; write its steps as a - list, then run pipegen again`);
+    const item0 = (sv as unknown as { items: YamlNode[] }).items[0] as YamlNode;
+    const dash = item0.range === undefined || item0.range === null ? -1 : original.lastIndexOf('-', item0.range[0] - 1);
+    const col = dash < 0 ? null : spacesBefore(original, dash);
+    if (col === null) return refuse(`the steps of its job ${show(id)} do not start each item on its own line`);
+    add(lineStart(original, dash), `${indentLines(stepItemYaml(head), col)}\n`, STEP);
+    headJobs.push(id);
   }
-  insertions.sort((a, b) => a.at - b.at);
+  // the job: at the end of the jobs map (its value end is the start of the line after the last job, or the end of the text), after the needs
+  const lead = end > 0 && original[end - 1] !== '\n' ? '\n' : '';
+  add(end, `${lead}${indentLines(verifyJobYaml(verify), indent)}\n`, JOB);
+  ranked.sort((a, b) => a.at - b.at || a.rank - b.rank);
   let text = '';
   let from = 0;
-  for (const i of insertions) { text += original.slice(from, i.at) + i.text; from = i.at; }
+  for (const i of ranked) { text += original.slice(from, i.at) + i.text; from = i.at; }
   text += original.slice(from);
-  const inserted: PipegenInserted = { original, jobs: [VERIFY_JOB], needs: [...new Set(deployJobs)].map((job) => ({ job, added: [VERIFY_JOB] })) };
+  const inserted: PipegenInserted = { original, jobs: [VERIFY_JOB], needs: [...new Set(deployJobs)].map((job) => ({ job, added: [VERIFY_JOB] })), headCheck: headJobs };
   checkEdit(text, inserted, verify);
-  return { text, inserted, insertions };
+  return { text, inserted, insertions: ranked.map(({ at, text: t }) => ({ at, text: t })) };
 }
 
 /**
  * The referee's check of an edited workflow (judgeEdited), done before the file leaves: the edit parses in the user mode, its verify job is
- * exactly `verify`, and without pipegen's job and needs it is the original exactly.
+ * exactly `verify`, every job the mark gates still needs it (sec M4), every job of `headCheck` starts with the verify job's head check
+ * exactly, and without pipegen's job, needs and head checks it is the original exactly.
  */
 function checkEdit(text: string, mark: PipegenInserted, verify: Job): void {
   const now = parseYaml(text, 'user');
   const was = parseYaml(mark.original, 'user');
-  if (!('parsed' in now) || !('parsed' in was)) return refuse('the edited file can not be read back');
+  if (!('parsed' in now) || !('parsed' in was)) return refuse('with pipegen\'s job added the file would not be valid YAML');
   const jobs = now.parsed.js.jobs as Obj;
-  if (!isDeepStrictEqual(jobs[VERIFY_JOB], parseDocument(verifyJobYaml(verify)).toJS()[VERIFY_JOB])) refuse('the inserted job does not read back as the verify job');
+  if (!isDeepStrictEqual(jobs[VERIFY_JOB], parseDocument(verifyJobYaml(verify)).toJS()[VERIFY_JOB])) refuse(`the ${VERIFY_JOB} job in the file is not the one pipegen writes`);
   const rest = structuredClone(now.parsed.js);
   const restJobs = rest.jobs as Obj;
   delete restJobs[VERIFY_JOB];
   const origJobs = was.parsed.js.jobs as Obj;
   for (const n of mark.needs) {
-    const j = restJobs[n.job] as Obj;
+    const j = restJobs[n.job];
+    if (!isObj(j)) return refuse(`the job ${show(n.job)} is no longer in the file`);
     const list = Array.isArray(j.needs) ? j.needs : j.needs === undefined ? [] : [j.needs];
+    for (const a of n.added) if (!list.includes(a)) refuse(`the job ${show(n.job)} no longer waits for ${a}; add ${a} back to its needs`);
     const kept = list.filter((x) => !n.added.includes(x as string));
     const before = (origJobs[n.job] as Obj).needs;
     if (before === undefined && kept.length === 0) delete j.needs;
     else if (typeof before === 'string' && kept.length === 1) j.needs = kept[0];
     else j.needs = kept;
+  }
+  const want = stepJs(headCheckOf(verify));
+  for (const id of mark.headCheck ?? []) {
+    const j = restJobs[id];
+    const steps = isObj(j) && Array.isArray(j.steps) ? j.steps : [];
+    if (!isDeepStrictEqual(steps[0], want)) refuse(`the job ${show(id)} does not start with pipegen's head check; put it back as the job's first step`);
+    steps.shift();
   }
   if (!isDeepStrictEqual(rest, was.parsed.js)) refuse('pipegen could not add its job without changing the rest of the file');
 }
@@ -237,8 +281,8 @@ export function renewVerifyJob(text: string, mark: PipegenInserted, verify: Job)
   const col = from === undefined ? null : spacesBefore(text, from);
   if (p === undefined || from === undefined || to === undefined || col === null) return refuse(`the file holds no ${VERIFY_JOB} job pipegen can renew`);
   const start = lineStart(text, from);
-  const tail = text.slice(start, to).endsWith('\n') ? '\n' : '';
-  const out = `${text.slice(0, start)}${indentLines(verifyJobYaml(verify), col)}${tail}${text.slice(to)}`;
+  const tail = text.slice(start, to).endsWith('\n') ? eolOf(text) : '';
+  const out = `${text.slice(0, start)}${indentLines(verifyJobYaml(verify), col).replace(/\n/g, eolOf(text))}${tail}${text.slice(to)}`;
   checkEdit(out, mark, verify);
   return out;
 }
@@ -269,6 +313,35 @@ function userTopProblem(js: Obj): string | null {
   return null;
 }
 
+/** Whether a job is a call of another workflow (job-level `uses`): it has no steps of its own to start with the head check. */
+const callsWorkflow = (job: unknown): boolean => isObj(job) && job.uses !== undefined;
+/** A job's permissions: its own, else the workflow's (undefined: the repository's default, which may be write). */
+const permissionsOf = (job: unknown, top: unknown): unknown => (isObj(job) && job.permissions !== undefined ? job.permissions : top);
+/** Whether the job's token can read the branch (the head check's API call): no permissions set, read-all or write-all, or contents read or write. */
+function readsContents(job: unknown, top: unknown): boolean {
+  const p = permissionsOf(job, top);
+  if (p === undefined || p === 'read-all' || p === 'write-all') return true;
+  return isObj(p) && (p.contents === 'read' || p.contents === 'write');
+}
+/**
+ * G7-R1 sec I2: why a job the deploy detector does not flag may still deploy (so it waits for the check), or null when it plainly can not:
+ * it names no secret but the workflow token (and no `secrets:` of a call), its permissions (its own, else the workflow's) are set and only
+ * read (no write, no id-token), it has no environment and it calls no other workflow. Unset permissions may be the repository's write default.
+ */
+function mayDeploy(job: unknown, top: unknown): string | null {
+  if (!isObj(job)) return 'it can not be read';
+  if (callsWorkflow(job)) return 'it calls another workflow';
+  if (job.environment !== undefined && job.environment !== null) return 'it has an environment';
+  const text = JSON.stringify(job).replace(/\bsecrets\s*\.\s*GITHUB_TOKEN\b/gi, '');
+  if (/\bsecrets\b/i.test(text)) return 'it uses a secret';
+  const p = permissionsOf(job, top);
+  if (p === undefined) return 'it sets no permissions, so it may get a write token';
+  if (p === 'read-all') return null;
+  if (!isObj(p)) return 'its permissions are not read only';
+  for (const [k, v] of Object.entries(p)) if (v === 'write' || (k === 'id-token' && v !== 'none')) return 'it has a write permission or an OIDC token';
+  return null;
+}
+
 /**
  * The verify inserts of a draft's deploy workflows (see the file header). `texts`: each workflow's text as read (path → text); `verify`: the
  * verify job (assemble's AssembledFiles.verify; null when the deploy part is skipped, and then nothing is inserted and nothing is a gap).
@@ -285,34 +358,51 @@ export function planVerifyInserts(draft: PipelineDraft, texts: ReadonlyMap<strin
     const parsed = parseYaml(text, 'user');
     if (!('parsed' in parsed)) { gap(`pipegen can not edit it safely (${safeText(parsed.problems.join('; '), 200)})`); continue; }
     const js = parsed.parsed.js;
-    const triggers = triggerNames(js.on);
-    if (triggers === null) { gap('its triggers can not be read'); continue; }
+    const triggers = triggersOf(js.on);
+    if (triggers === null) { gap('its triggers can not be read; write `on:` as a name, a list or a map of events'); continue; }
     const kind = deployTriggers({ triggers });
-    if (kind === 'workflow_run') { gap('it deploys after another workflow run (workflow_run), which runs with the target\'s power on what that run did; pipegen does not edit such a workflow (the referee refuses it), so it is not verified', triggers); continue; }
-    if (kind === 'other') { gap(`it is started by ${triggers.filter((t) => t !== 'push').map((t) => safeText(t, 40)).join(', ') || 'no push'}, not only by a push, so pipegen adds no verify job (only a push deploy is verified)`, triggers); continue; }
+    if (kind === 'workflow_run') { gap('it deploys after another workflow run (workflow_run), which runs with full rights on what that run produced, so pipegen adds no check to it; to have the check, deploy from a push to the default branch', triggers); continue; }
+    if (kind === 'other') { gap(`it is started by ${triggers.filter((t) => t !== 'push').map((t) => safeText(t, 40)).join(', ') || 'no push'}, not only by a push, so pipegen adds no check to it; to have the check, start it only on a push to the default branch`, triggers); continue; }
     const branch = pushBranchProblem(js.on, def);
     if (branch !== null) { gap(branch, triggers); continue; }
     const top = userTopProblem(js);
     if (top !== null) { gap(`pipegen can not add its job: ${top}`, triggers); continue; }
     const jobs = isObj(js.jobs) ? js.jobs : {};
     const ids = Object.keys(jobs);
-    // S15: the deploy detector per job; when it tells none apart, every job waits for the check
+    // S15 and G7-R1 sec I2: the deploy detector per job, and a job is left out only when it plainly can not deploy (no secret but the
+    // workflow token, only read permissions of its own, no environment, no call of another workflow); when the detector tells no job apart,
+    // every job waits for the check
     const found = ids.filter((id) => jobDeploys(jobs[id]));
-    const deployJobs = found.length > 0 ? found : ids;
+    const deployJobs = found.length === 0 ? ids : ids.filter((id) => jobDeploys(jobs[id]) || mayDeploy(jobs[id], js.permissions) !== null);
+    const left = ids.filter((id) => !deployJobs.includes(id));
     const ungated = deployJobs.filter((id) => !gatedIfAllowed(isObj(jobs[id]) ? (jobs[id] as Obj).if : undefined));
-    if (ungated.length > 0) { gap(`its job ${ungated.map(show).join(', ')} has an if: that could run it even when pipegen's check fails (always(), failure(), a top-level ||), so the check would not stop that deploy`, triggers); continue; }
+    if (ungated.length > 0) { gap(`its job ${ungated.map(show).join(', ')} has an if: that could run it even when pipegen's check fails (always(), failure(), or a top-level ||); change it to success() && <your condition>`, triggers); continue; }
+    const noContents = deployJobs.filter((id) => !callsWorkflow(jobs[id]) && !readsContents(jobs[id], js.permissions));
+    if (noContents.length > 0) { gap(`its job ${noContents.map(show).join(', ')} sets permissions without contents: read, which pipegen's head check in that job needs to read the branch; add contents: read to that job's permissions`, triggers); continue; }
     let edit: ReturnType<typeof insertVerify>;
     try { edit = insertVerify(text, deployJobs, verify); } catch (e) {
       if (!(e instanceof EditRefused || e instanceof RenderError)) throw e;
-      gap(`pipegen can not add its job without changing the rest of the file: ${safeText(e.message, 200)}`, triggers);
+      gap(`pipegen can not add its check without changing the rest of the file: ${safeText(e.message, 200)}`, triggers);
       continue;
     }
-    const file: CreatedFile = { path: wf.path, content: edit.text, part: 'deploy-verify', reason: `Adds the ${VERIFY_JOB} job, which proves the commit passed the gate (and, for an image, that pipegen signed it) before ${deployJobs.length === 1 ? 'the deploy job runs' : 'the deploy jobs run'}.`, repo: 'app', inserted: edit.inserted };
+    const file: CreatedFile = { path: wf.path, content: edit.text, part: 'deploy-verify', reason: `Adds the ${VERIFY_JOB} job, which proves the commit passed the gate (and, for an image, that pipegen signed it) before ${deployJobs.length === 1 ? 'the deploy job runs' : 'the deploy jobs run'}, and starts each of them with pipegen's head check.`, repo: 'app', inserted: edit.inserted };
     out.inserts.push({ path: wf.path, text: edit.text, inserted: edit.inserted, insertions: edit.insertions, file });
     out.preview.push(`${wf.path}: pipegen adds the job ${VERIFY_JOB}, and ${deployJobs.map(show).join(', ')} ${deployJobs.length === 1 ? 'waits' : 'wait'} for it${found.length === 0 ? ' (pipegen could not tell which job deploys, so every job waits)' : ''}.`);
-    out.notProven.push({ part: 'deploy-verify', reason: `pipegen's edit of ${wf.path} (the ${VERIFY_JOB} job and its needs) is not proven: the proof never runs a user's workflow beside real keys, so only the referee checked it.`, missingSecrets: [] });
+    for (const id of left) {
+      const line = `${wf.path}: ${show(id)} does not wait for ${VERIFY_JOB}: it shows no deploy, uses no secret but the workflow token, has only read permissions, no environment, and calls no other workflow.`;
+      out.preview.push(line);
+      out.notes.push(line);
+    }
+    for (const id of deployJobs.filter((x) => callsWorkflow(jobs[x]))) {
+      out.notes.push(`${wf.path}: the job ${show(id)} calls another workflow, so pipegen can not start it with its head check: only ${VERIFY_JOB} checks that the commit is still the head of the default branch, before the job starts. After a newer commit, re-run all jobs (not this job alone), or move the deploy into a job with steps.`);
+    }
+    out.notProven.push({ part: 'deploy-verify', reason: `pipegen's edit of ${wf.path} (the ${VERIFY_JOB} job, its needs and the head checks) is not proven: the proof never runs a user's workflow beside real keys, so only the referee checked it.`, missingSecrets: [] });
   }
-  if (out.inserts.length > 0) out.notes.push(`The ${VERIFY_JOB} job outputs the verified image digest (needs.${VERIFY_JOB}.outputs.digest): a signature protects only a deploy that uses that digest.`);
+  if (out.inserts.length > 0) {
+    out.notes.push(`The ${VERIFY_JOB} job outputs the verified image digest (needs.${VERIFY_JOB}.outputs.digest): a signature protects only a deploy that uses that digest.`);
+    // G7-R1 sec I1 (for G9's PIPEGEN.md): what the head check in the deploy job covers, and how to re-run and queue deploys
+    out.notes.push(`Each deploy job starts with pipegen's head check, so a deploy that waited for an approval, or a re-run of an older run, stops once a newer commit is on the default branch. When a deploy fails, use "Re-run all jobs": "Re-run failed jobs" reuses ${VERIFY_JOB}'s earlier result. To keep two deploys from overlapping, give each deploy job a concurrency group, for example \`concurrency: { group: deploy-production, cancel-in-progress: false }\`.`);
+  }
   return out;
 }
 
@@ -377,17 +467,30 @@ function environmentNames(text: string): { names: string[]; dynamic: boolean } {
  * repository has environments (verify-first runs in it; key-env holds the key there), never with reviewers (pipegen's jobs never wait for a
  * person, G41). Every one is limited to the default branch. No environments at all on a repository without them (private Free).
  */
-export async function environmentPlan(gh: Octokit, p: RepoProfile, caps: Capabilities, requireApproval: boolean, opts: { texts: ReadonlyMap<string, string>; clock?: RateClock; notes?: string[] }): Promise<EnvironmentPlan[]> {
+export async function environmentPlan(gh: Octokit, p: RepoProfile, caps: Capabilities, requireApproval: boolean, opts: { texts: ReadonlyMap<string, string>; inserted: readonly string[]; clock?: RateClock; notes?: string[] }): Promise<EnvironmentPlan[]> {
   if (caps.environments !== true) return [];
   const names = new Set<string>();
+  // G7-R1 minor: only the environments of workflows pipegen protects (its verify job inserted) are limited to the default branch; the others
+  // (a deploy from another branch, a gap) are left as they are, with a note
+  const others = new Map<string, string>();
   let dynamic = false;
+  const inserted = new Set(opts.inserted);
   for (const wf of p.existingWorkflows) {
     if (wf.deploys !== true || OWN_WORKFLOWS.has(wf.path)) continue;
     const t = opts.texts.get(wf.path);
     if (typeof t !== 'string') continue;
     const e = environmentNames(t);
-    for (const n of e.names) if (n.toLowerCase() !== SIGNING_ENVIRONMENT) names.add(n);
-    dynamic ||= e.dynamic;
+    for (const n of e.names) {
+      if (n.toLowerCase() === SIGNING_ENVIRONMENT) continue;
+      if (inserted.has(wf.path)) names.add(n);
+      else if (!others.has(n)) others.set(n, wf.path);
+    }
+    if (inserted.has(wf.path)) dynamic ||= e.dynamic;
+  }
+  for (const [n, path] of [...others].sort(([a], [b]) => a.localeCompare(b))) {
+    opts.notes?.push(names.has(n)
+      ? `The environment ${show(n)} is also used by ${path}, which pipegen does not protect; pipegen limits ${show(n)} to the default branch, so a deploy of ${path} from another branch stops. Give that deploy its own environment if it needs one.`
+      : `The environment ${show(n)} is used only by ${path}, which pipegen does not protect, so pipegen leaves it as it is (not limited to the default branch, no approval rule).`);
   }
   if (dynamic) opts.notes?.push('A deploy job names its environment with an expression, so pipegen can not tell which environment to protect; set its approval rules yourself.');
   if (requireApproval && names.size === 0) opts.notes?.push('pipegen asks for a deploy approval only on an environment your deploy jobs use; add `environment: <name>` to your deploy job to have one.');
@@ -418,11 +521,12 @@ export const isMemoryFolder = (dir: string): boolean => {
  * A new encrypted cosign key pair (key-env, B3 c), made only in memory: the pinned cosign (resolved right before the exec, S24) writes it into
  * a fresh 0700 folder of a memory-backed filesystem, the texts are read back and checked, and the folder is removed whatever happens
  * (makeCosignKeyPair). A folder that is not memory-backed is refused, so the key never reaches a disk. Not yet called: `finish` still makes
- * the pair with makeCosignKeyPair in its tmpDir (carry to G13, which wires finish to this).
+ * the pair with makeCosignKeyPair in its tmpDir. BINDING carry G7-R1 → G13: finish calls this (and a finish-level test shows no key file
+ * on a disk-backed folder).
  */
 export async function generateCosignKeys(cosignBin: CosignResolver, deps: { exec?: CosignExec; base?: string; isMemory?: (dir: string) => boolean } = {}): Promise<{ privateKey: string; publicKey: string; password: string }> {
   const base = deps.base ?? MEMORY_DIR;
-  if (!(deps.isMemory ?? isMemoryFolder)(base)) throw new DeliverError(`pipegen makes the signing key only in a memory-backed folder (a tmpfs such as ${MEMORY_DIR}), so it never reaches a disk, and ${show(base)} is not one; make the key on a Linux machine, or with the commands \`npx pipegen finish\` prints.`);
+  if (!(deps.isMemory ?? isMemoryFolder)(base)) throw new DeliverError(`pipegen makes the signing key only in memory (a tmpfs folder such as ${MEMORY_DIR}), so it never touches a disk, and ${show(base)} is not one on this machine. Run this step on Linux, where ${MEMORY_DIR} is in memory (WSL or a Linux container works too).`);
   const pair = await makeCosignKeyPair(cosignBin, deps.exec, base);
   return { privateKey: pair.key, publicKey: pair.pub, password: pair.password };
 }

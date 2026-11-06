@@ -4,6 +4,8 @@
 import { FIND_RUN_STEP_ID, renderHeadCheckStep } from '../../src/engine/deploy-steps.js';
 import type { RenderedStep } from '../../src/engine/job-rules.js';
 import type { RepoProfile } from '../../src/types.js';
+import { isSeq, type Document } from 'yaml';
+import { stepsToYaml } from '../../src/engine/render-step.js';
 
 /** The find-run step with its id, and the head check of the default branch. */
 export const verifyTail = (find: RenderedStep, branch = 'main'): RenderedStep[] => [{ ...find, id: FIND_RUN_STEP_ID }, renderHeadCheckStep(branch)];
@@ -11,3 +13,12 @@ export const verifyTail = (find: RenderedStep, branch = 'main'): RenderedStep[] 
 export const VERIFY_LIMIT = 45;
 /** The profile with no Dockerfile on any service: no image is published, so the verify job needs no digest step or signature check. */
 export const noImages = (p: RepoProfile): RepoProfile => ({ ...p, services: p.services.map(({ dockerfile: _d, ...s }) => s) });
+
+/** G7-R1 sec I1: puts pipegen's head check (of `branch`) first into each of `jobs`' steps, as insertVerify does; the mark lists them in `headCheck`. */
+export function withHeadCheck(doc: Document, jobs: readonly string[], branch = 'main'): void {
+  for (const id of jobs) {
+    const steps = doc.getIn(['jobs', id, 'steps'], true);
+    if (!isSeq(steps)) throw new Error(`the job ${id} has no block steps`);
+    steps.items.unshift(stepsToYaml([renderHeadCheckStep(branch)]).items[0] as never);
+  }
+}

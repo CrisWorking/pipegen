@@ -19,7 +19,7 @@ import { fake } from './helpers/secret-repo.js';
 import { renderGateUploads, renderRangeBlock, renderStage as renderStageC1c } from '../src/engine/render-step.js';
 import { ARGV_POLICIES, isStagedTool } from '../src/engine/tool-flags.js';
 import { withEgress } from './helpers/egress-step.js';
-import { noImages, verifyTail, VERIFY_LIMIT } from './helpers/verify-tail.js';
+import { noImages, verifyTail, VERIFY_LIMIT, withHeadCheck } from './helpers/verify-tail.js';
 import { dastStartOf, renderDastRun, renderDastScrub } from '../src/engine/dast-handoff.js';
 import { renderImageBuild } from '../src/engine/image-handoff.js';
 
@@ -776,11 +776,12 @@ describe('referee: an edited user workflow is judged only where pipegen inserted
     const text = `${src}  pipegen-verify:\n    runs-on: ubuntu-latest\n    timeout-minutes: ${VERIFY_LIMIT}\n    permissions:\n      contents: read\n      actions: read\n      packages: read\n      attestations: read\n    cache-mode: none\n    steps: []\n`;
     const doc = parseDocument(text);
     doc.setIn(['jobs', 'pipegen-verify', 'steps'], stepsToYaml(withEgress(steps)));
+    withHeadCheck(doc, ['deploy']);
     extra(doc);
     return doc.toString({ lineWidth: 0 });
   };
   const userFile = (text: string, over: Partial<NonNullable<CreatedFile['inserted']>> = {}): CreatedFile =>
-    file(text, '.github/workflows/deploy.yml', { part: 'deploy-verify', inserted: { original, jobs: ['pipegen-verify'], needs: [{ job: 'deploy', added: ['pipegen-verify'] }], ...over } });
+    file(text, '.github/workflows/deploy.yml', { part: 'deploy-verify', inserted: { original, jobs: ['pipegen-verify'], needs: [{ job: 'deploy', added: ['pipegen-verify'] }], headCheck: ['deploy'], ...over } });
   const d = (): PipelineDraft => draftOf([], { profile: { ...noImages(prof), existingWorkflows: [{ path: '.github/workflows/deploy.yml', triggers: ['push'], deploys: true, [`${SEC_FIELD}Used`]: [], jobs: ['deploy'] } as unknown as ExistingWorkflow] } });
   it('the user\'s own jobs (a tag pin, anchors, no permissions) are not judged; pipegen\'s job is', async () => {
     const r = await run([userFile(edited())], d(), { list: [...reviewedList(), GATE] });
@@ -1043,7 +1044,8 @@ describe('fix round 1: an edited user workflow\'s own top level is judged where 
     const src = original.replace('  deploy:\n', '  deploy:\n    needs: [pipegen-verify]\n');
     const doc = parseDocument(`${src}  pipegen-verify:\n    runs-on: ubuntu-latest\n    timeout-minutes: ${VERIFY_LIMIT}\n    permissions:\n${Object.entries(VERIFYP).map(([k, v]) => `      ${k}: ${v}\n`).join('')}    cache-mode: none\n    steps: []\n`);
     doc.setIn(['jobs', 'pipegen-verify', 'steps'], stepsToYaml(withEgress(steps)));
-    return file(doc.toString({ lineWidth: 0 }), '.github/workflows/deploy.yml', { part: 'deploy-verify', inserted: { original, jobs: ['pipegen-verify'], needs: [{ job: 'deploy', added: ['pipegen-verify'] }] } });
+    withHeadCheck(doc, ['deploy']);
+    return file(doc.toString({ lineWidth: 0 }), '.github/workflows/deploy.yml', { part: 'deploy-verify', inserted: { original, jobs: ['pipegen-verify'], needs: [{ job: 'deploy', added: ['pipegen-verify'] }], headCheck: ['deploy'] } });
   };
   const userWf = (top: string, deployIf = ''): string => ['name: deploy', ...top.split('\n').filter(Boolean), 'jobs:', '  deploy:', ...(deployIf === '' ? [] : [`    if: ${deployIf}`]), '    runs-on: ubuntu-latest', '    steps:', '      - uses: actions/checkout@v4', '      - run: ./deploy.sh', ''].join('\n');
   const d = (): PipelineDraft => draftOf([], { profile: { ...noImages(prof), existingWorkflows: [{ path: '.github/workflows/deploy.yml', triggers: ['push'], deploys: true, [`${SEC_FIELD}Used`]: [], jobs: ['deploy'] } as unknown as ExistingWorkflow] } });
@@ -1122,7 +1124,8 @@ describe('fix round 2: the re-review probes are refused', () => {
       + `  pipegen-verify:\n    runs-on: ubuntu-latest\n    timeout-minutes: ${VERIFY_LIMIT}\n    permissions:\n      contents: read\n      actions: read\n      packages: read\n      attestations: read\n    cache-mode: none\n    steps: []\n`;
     const doc = parseDocument(text);
     doc.setIn(['jobs', 'pipegen-verify', 'steps'], stepsToYaml(withEgress(verifyTail(verifyStep()))));
-    const f = file(doc.toString({ lineWidth: 0 }), '.github/workflows/deploy.yml', { inserted: { original, jobs: ['pipegen-verify'], needs: [{ job: 'deploy', added: ['pipegen-verify'] }] } });
+    withHeadCheck(doc, ['deploy']);
+    const f = file(doc.toString({ lineWidth: 0 }), '.github/workflows/deploy.yml', { inserted: { original, jobs: ['pipegen-verify'], needs: [{ job: 'deploy', added: ['pipegen-verify'] }], headCheck: ['deploy'] } });
     const d = draftOf([], { profile: { ...noImages(prof), existingWorkflows: [{ path: '.github/workflows/deploy.yml', triggers: ['push'], deploys: true, [`${SEC_FIELD}Used`]: [], jobs: ['deploy'] } as unknown as ExistingWorkflow] } });
     return { f, d };
   };

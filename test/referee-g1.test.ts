@@ -6,7 +6,7 @@ import {
   BASELINE_CHECK_STEP_ID, CALLER_WORKFLOW, defaultPushTrigger, DEPLOY_PUSH_IF, DIGEST_STEP_ID, featurePushTrigger, jobOutputsFor, jobOutputsProblems, PR_CHECK_IF,
   checkExpressions, PR_CHECK_STEP_ID, PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, stepOutputForm, CONCURRENCY_GROUP, NIGHTLY_CONCURRENCY, WORKFLOW_CONCURRENCY, type RenderedStep,
 } from '../src/engine/job-rules.js';
-import { Document } from 'yaml';
+import { Document, parseDocument } from 'yaml';
 import { renderBaselineCheckStep, renderFindRunStep, renderJobPrelude, renderNightlyStep, stepsToYaml } from '../src/engine/render-step.js';
 import { createdFileProblems, CREATED_RULES } from '../src/engine/created-files.js';
 import { HOOK_FILES, hookBlock, hookCommands, hookDataProblem, hookFile } from '../src/engine/created-builders.js';
@@ -14,7 +14,7 @@ import { GATE_CHECK_NAME, type CreatedFile, type ExistingWorkflow, type Need, ty
 import { draftOf, GATE, job, jobsOf, p, prof, run, show, workflow as stepsWorkflow, type Job } from './helpers/gate-pipeline.js';
 import { entry, reviewedList, specFor } from './helpers/render.js';
 import { withEgress } from './helpers/egress-step.js';
-import { noImages, verifyTail, VERIFY_LIMIT } from './helpers/verify-tail.js';
+import { noImages, verifyTail, VERIFY_LIMIT, withHeadCheck } from './helpers/verify-tail.js';
 
 const d = draftOf();
 /** The helper's workflow, also with reusable-workflow caller jobs (a job with `uses` and no steps). */
@@ -46,8 +46,13 @@ function editedUser(on: string, insertedId: string, steps: RenderedStep[], perms
   const ins = new Document();
   ins.contents = ins.createNode({ [insertedId]: { 'runs-on': 'ubuntu-latest', ...extra, permissions: perms, 'cache-mode': 'none' } });
   ins.setIn([insertedId, 'steps'], stepsToYaml(withEgress(steps)));
-  const text = `${text0}${ins.toString({ lineWidth: 0 }).split('\n').map((l) => (l === '' ? l : `  ${l}`)).join('\n')}`;
-  const f: CreatedFile = { path: '.github/workflows/deploy.yml', content: text, part: 'deploy-verify', reason: 't', repo: 'app', inserted: { original, jobs: [insertedId], needs: [{ job: 'deploy', added: [insertedId] }] } };
+  const text1 = `${text0}${ins.toString({ lineWidth: 0 }).split('\n').map((l) => (l === '' ? l : `  ${l}`)).join('\n')}`;
+  // G7-R1 sec I1: a verify insert also starts the gated job with pipegen's head check
+  const heads = insertedId === 'pipegen-verify' ? ['deploy'] : [];
+  const full = parseDocument(text1);
+  withHeadCheck(full, heads);
+  const text = heads.length === 0 ? text1 : full.toString({ lineWidth: 0 });
+  const f: CreatedFile = { path: '.github/workflows/deploy.yml', content: text, part: 'deploy-verify', reason: 't', repo: 'app', inserted: { original, jobs: [insertedId], needs: [{ job: 'deploy', added: [insertedId] }], ...(heads.length === 0 ? {} : { headCheck: heads }) } };
   const draft = draftOf({ profile: { ...prof, existingWorkflows: [{ path: '.github/workflows/deploy.yml', triggers: ['push'], deploys: true, [SEC_USED]: [], jobs: ['deploy'] } as unknown as ExistingWorkflow] } });
   return { f, draft };
 }

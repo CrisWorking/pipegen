@@ -177,7 +177,11 @@ export interface KnownValueCheck { containsKnownValue(text: string): boolean; /*
  * the user's. Linter findings on lines outside the added jobs and needs become notes (referee.ts `pipegenLines`).
  * A file without this field was written by pipegen whole, and every line is judged.
  */
-export interface PipegenInserted { original: string; jobs: string[]; needs: { job: string; added: string[] }[] }
+/**
+ * `headCheck` (G7-R1 sec I1): the user's jobs whose FIRST step pipegen inserted, its head check (deploy-steps.ts renderHeadCheckStep of the
+ * default branch, exactly), so the check runs inside the deploy job itself: after an approval wait and on every re-run of that job.
+ */
+export interface PipegenInserted { original: string; jobs: string[]; needs: { job: string; added: string[] }[]; headCheck?: string[] }
 export interface NotProven { part: Part; needId?: string; reason: string; missingSecrets: string[] }
 export interface TestDecision { service: string; current?: string; proposed?: string; reasons: string[]; choice: 'keep' | 'switch' | 'none' }
 export interface PipelineDraft {

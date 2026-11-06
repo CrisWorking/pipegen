@@ -108,7 +108,7 @@ describe('G2: signing and verification steps (B3 b, d)', () => {
       expect(run).toContain("ref='ghcr.io/o/r-app'\"@$digest\"");
     }
     const ke = lastRun(keyEnv);
-    expect(ke.run).toContain('sign --yes --key env://PIPEGEN_COSIGN_KEY --tlog-upload=false --use-signing-config=false "$ref"');
+    expect(ke.run).toContain('sign --yes --key env://PIPEGEN_COSIGN_KEY --tlog-upload=false --use-signing-config=false -a pipegen.commit="$GITHUB_SHA" "$ref"');
     // (G3-R3: both modes also carry the job's own token, which the step's cosign login reads from stdin)
     const regTok = { [REG_TOK_NAME]: `${'$'}{{ ${['sec', 'rets'].join('')}.GITHUB_TOKEN }}` };
     expect(ke.env).toEqual({ BASH_ENV: '', ENV: '', PIPEGEN_COSIGN_KEY: '${{ secrets.PIPEGEN_COSIGN_KEY }}', [PW_NAME]: `${'$'}{{ secrets.${PW_NAME} }}`, ...regTok });
@@ -172,7 +172,7 @@ describe('G2: signing and verification steps (B3 b, d)', () => {
     // the literal pipegen recorded, checked against the variable's exact text BEFORE cosign reads the key, and the checked file is the key used
     expect(run).toContain(`want='${PUB_SHA}'`);
     const check = run.indexOf('if [ "$got" != "$want" ]');
-    const verify = run.indexOf(' verify --key "$keydir/cosign.pub" --insecure-ignore-tlog=true "$ref"');
+    const verify = run.indexOf(' verify --key "$keydir/cosign.pub" --insecure-ignore-tlog=true -a pipegen.commit="$GITHUB_SHA" "$ref"');
     expect(check).toBeGreaterThan(-1);
     expect(verify).toBeGreaterThan(check);
     expect(run.indexOf('printf \'%s\' "$PIPEGEN_COSIGN_PUB" > "$keydir/cosign.pub"')).toBeLessThan(check);
@@ -186,7 +186,7 @@ describe('G2: signing and verification steps (B3 b, d)', () => {
     const klDraft = signingDraft(KEYLESS);
     const kl = lastRun(renderVerifySteps(COSIGN, klDraft, IMG)).run as string;
     expect(keylessIdentity(prof)).toBe('https://github.com/o/r/.github/workflows/pipegen.yml@refs/heads/main');
-    expect(kl).toContain(`verify --certificate-identity '${keylessIdentity(prof)}' --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' "$ref"`);
+    expect(kl).toContain(`verify --certificate-identity '${keylessIdentity(prof)}' --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' --certificate-github-workflow-sha "$GITHUB_SHA" --certificate-github-workflow-trigger push --certificate-github-workflow-repository '${prof.owner}/${prof.repo}' "$ref"`);
     // attest: the reviewed pinned gh release (installed by its sha256), never the runner's gh
     const at = signingDraft(ATTEST);
     const gh = ghEntry();

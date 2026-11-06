@@ -52,7 +52,7 @@ import { renderFindRunStep, stepsToYaml } from '../engine/render-step.js';
 import { FIND_RUN_STEP_ID, renderDigestStep, renderHeadCheckStep } from '../engine/deploy-steps.js';
 import { slug } from '../engine/artifact-names.js';
 import { egressSetsForTool } from '../engine/egress.js';
-import type { EgressSet } from '../engine/egress-sets.js';
+import { E3_EGRESS_SETS, REVIEWED_EGRESS_LABELS, type EgressSet } from '../engine/egress-sets.js';
 import { publishedImageServices } from '../engine/needs.js';
 import { COSIGN_ID, GH_ID, renderVerifySteps, type SignedImage } from '../engine/signing.js';
 import type { BaseImage } from '../engine/base-images.js';
@@ -99,8 +99,20 @@ const DEPENDABOT_PLACES: readonly string[] = ['.github/dependabot.yml', '.github
 const JOB_ID_RE = /^[A-Za-z_][A-Za-z0-9_-]{0,99}$/;
 /** A secret name the referee accepts in a caller's mapping (SECRET_REF_RE's name). */
 const SECRET_NAME_RE = /^[A-Z][A-Z0-9_]{0,99}$/;
-/** The jobs the verify job's permission row gives: read the runs, the image and its attestations. */
-const VERIFY_PERMISSIONS: Readonly<Record<string, 'read'>> = Object.freeze({ contents: 'read', actions: 'read', packages: 'read', attestations: 'read' });
+/**
+ * G7-R1 sec M7: what the verify job reads, per mode and per published image: always the branch head (contents) and the gated run and its
+ * artifacts (actions); the registry (packages) only when it checks an image's signature; attestations only in attest mode.
+ */
+export function verifyPermissions(draft: PipelineDraft): Record<string, 'read'> {
+  const out: Record<string, 'read'> = { contents: 'read', actions: 'read' };
+  const plan = draft.signing;
+  if (plan === undefined || plan === null || publishedImageServices(draft.profile, draft.capabilities).length === 0) return out;
+  out.packages = 'read';
+  if (plan.mode === 'attest') out.attestations = 'read';
+  return out;
+}
+/** G7-R1 spec I4: the network set keyless verification needs (Sigstore's TUF root, Fulcio and Rekor); not a reviewed set until G15. */
+const SIGSTORE_SET = 'sigstore';
 /** The job ids pipegen.yml reserves for its own jobs (a deploy job may not take one). */
 const RESERVED_IDS: ReadonlySet<string> = new Set([MERGE_CALLER_JOB, SIGN_JOB_ID, VERIFY_JOB_ID, PUSH_CALLER_JOB, NIGHTLY_CALLER_JOB, PR_CHECK_JOB, 'gate']);
 
@@ -398,6 +410,12 @@ export function assemble(input: PipelineDraft, opts: AssembleOpts): AssembledFil
     const waitMinutes = runMinutes + VERIFY_GRACE_MINUTES;
     if (waitMinutes + VERIFY_MARGIN_MINUTES > MAX_JOB_MINUTES) fail(`The gated run can take ${runMinutes} minutes, longer than the verify job can wait (a job runs at most ${MAX_JOB_MINUTES} minutes).`);
     verify = verifyJob(draft, { gate: opts.gate, reviewed: opts.reviewed, platform: opts.platform, waitMinutes });
+    // G7-R1 spec I4 (a release blocker until G15): keyless verification reads Sigstore's hosts, which no reviewed network set holds yet, so
+    // under the network lock the verify job fails closed and every deploy of the image stops
+    const keyless = draft.signing?.mode === 'keyless' && publishedImageServices(draft.profile, draft.capabilities).length > 0;
+    if (keyless && !(REVIEWED_EGRESS_LABELS as readonly string[]).includes(SIGSTORE_SET) && !(E3_EGRESS_SETS as readonly string[]).includes(SIGSTORE_SET)) {
+      addNote(notes, 'Your deploys stop for now: pipegen checks a keyless signature with Sigstore, whose hosts are not in a reviewed network set yet, so the verify job can not reach them behind the network lock and fails. This is fixed before release (G15); until then a deploy of this image does not pass pipegen-verify.');
+    }
   }
 
   // 8. Dependabot (P-6, D0b): the github-actions entry appended to the user's file, or a new file; Renovate is kept
@@ -445,7 +463,7 @@ export function verifyJob(draft: PipelineDraft, deps: { gate: ReviewedTool; revi
   // the verified digest (G22): the job output of the digest step, when there is an image (a static deploy has none)
   const outputs = jobOutputsFor(steps);
   return {
-    'runs-on': JOB_RUNNER, 'timeout-minutes': wait + VERIFY_MARGIN_MINUTES, permissions: { ...VERIFY_PERMISSIONS },
+    'runs-on': JOB_RUNNER, 'timeout-minutes': wait + VERIFY_MARGIN_MINUTES, permissions: verifyPermissions(draft),
     ...(draft.capabilities.environments === true ? { environment: SIGNING_ENVIRONMENT } : {}), 'cache-mode': 'none',
     ...(Object.keys(outputs).length > 0 ? { outputs } : {}), steps,
   };

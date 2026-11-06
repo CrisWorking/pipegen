@@ -123,6 +123,8 @@ function refLines(repo: string, artifact: string): string[] {
   ];
 }
 const runStep = pipegenScriptStep;
+/** G7-R1 sec M1: the commit a signature names (the run's GITHUB_SHA), checked before cosign reads it. */
+const COMMIT_LINE = 'if ! [[ "${GITHUB_SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then pg_fail "this run\'s commit is not a 40-character commit, so the signature can not name it"; fi';
 
 /** The sign steps of one image (job `sign` only): the reviewed cosign, then the sign of `<repo>@<digest>`. */
 export function renderSignSteps(cosign: ReviewedTool, mode: 'key-env' | 'keyless', image: SignedImage): RenderedStep[] {
@@ -152,7 +154,8 @@ export function renderSignSteps(cosign: ReviewedTool, mode: 'key-env' | 'keyless
     'unset PIPEGEN_REGISTRY_TOKEN',
   ];
   const sign = mode === 'key-env'
-    ? [`COSIGN_PASSWORD="$PIPEGEN_COSIGN_PASSWORD" ${bin} sign --yes --key env://PIPEGEN_COSIGN_KEY --tlog-upload=false --use-signing-config=false "$ref"`]
+    // G7-R1 sec M1: the signature carries the commit it was made for (the gated push run's GITHUB_SHA); the verify step requires the same
+    ? [COMMIT_LINE, `COSIGN_PASSWORD="$PIPEGEN_COSIGN_PASSWORD" ${bin} sign --yes --key env://PIPEGEN_COSIGN_KEY --tlog-upload=false --use-signing-config=false -a pipegen.commit="$GITHUB_SHA" "$ref"`]
     : [`${bin} sign --yes --oidc-provider=github-actions "$ref"`];
   const env = mode === 'key-env' ? { ...SIGN_STEP_ENV } : { PIPEGEN_REGISTRY_TOKEN: SIGN_STEP_ENV.PIPEGEN_REGISTRY_TOKEN as string };
   return [install.step, runStep(signStepId(repo), `pipegen: sign ${repo} (${mode})`, [...refLines(repo, artifact), ...recheck, ...login, ...sign], env)];
@@ -206,10 +209,15 @@ export function renderVerifySteps(tool: ReviewedTool, draft: PipelineDraft, imag
   const token = { PIPEGEN_REGISTRY_TOKEN: VERIFY_STEP_ENV.PIPEGEN_REGISTRY_TOKEN as string };
   if (!repo.startsWith(`${SIGN_REGISTRY}/`)) throw new RenderError(`The image ${show(repo)} is not on ${SIGN_REGISTRY}: the verify step logs in with the workflow token, which goes to ${SIGN_REGISTRY} only.`);
   if (plan.mode === 'keyless') {
+    const app = `${draft.profile.owner}/${draft.profile.repo}`;
+    if (!isGitHubRepo(app)) throw new RenderError(`The repository ${show(app)} is not a plain GitHub owner/name.`);
     return [install.step, runStep(id, name, [
       ...refLines(repo, artifact),
       ...login,
-      `${bin} verify --certificate-identity ${q(keylessIdentity(draft.profile))} --certificate-oidc-issuer ${q(GITHUB_OIDC_ISSUER)} "$ref" > /dev/null`,
+      COMMIT_LINE,
+      // G7-R1 sec M1: the certificate's workflow run is a push of this repository for the deployed commit, so an older pipegen-signed image
+      // put in the digest's place (another artifact, an older digest) does not pass
+      `${bin} verify --certificate-identity ${q(keylessIdentity(draft.profile))} --certificate-oidc-issuer ${q(GITHUB_OIDC_ISSUER)} --certificate-github-workflow-sha "$GITHUB_SHA" --certificate-github-workflow-trigger push --certificate-github-workflow-repository ${q(app)} "$ref" > /dev/null`,
     ], token)];
   }
   if (plan.mode !== 'key-env') throw new RenderError(`The signing mode ${show(String(plan.mode))} is not one pipegen verifies.`);
@@ -225,7 +233,9 @@ export function renderVerifySteps(tool: ReviewedTool, draft: PipelineDraft, imag
     'if [ "$got" != "$want" ]; then pg_fail "PIPEGEN_COSIGN_PUB is not the public key pipegen recorded (its sha256 differs), so this deploy is not verified"; fi',
     ...refLines(repo, artifact),
     ...login,
-    `${bin} verify --key "$keydir/cosign.pub" --insecure-ignore-tlog=true "$ref" > /dev/null`,
+    // G7-R1 sec M1: only a signature made for this commit (the sign step's annotation) passes
+    COMMIT_LINE,
+    `${bin} verify --key "$keydir/cosign.pub" --insecure-ignore-tlog=true -a pipegen.commit="$GITHUB_SHA" "$ref" > /dev/null`,
   ], { PIPEGEN_COSIGN_PUB: VERIFY_STEP_ENV.PIPEGEN_COSIGN_PUB as string, ...token })];
 }
 

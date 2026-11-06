@@ -66,7 +66,11 @@ const artifactOf = (service: string): string => {
 };
 /** The lines that fail unless `$1` (a variable name) holds a plain positive id (a run or an artifact). */
 const idCheck = (v: string, what: string): string => `if ! [[ "$${v}" =~ ^[1-9][0-9]{0,19}$ ]]; then pg_fail "${what}"; fi`;
-const CURL = "curl -fsS --proto '=https' --max-time 60 -H \"Authorization: Bearer $TOKEN\" -H 'Accept: application/vnd.github+json'";
+/**
+ * A call with the job's token: the header goes to curl on stdin (`-H @-`), never on its command line, where any process of the runner could
+ * read it (G3-R3 "token on stdin only"; G7-R1 sec M5).
+ */
+const CURL = "printf 'Authorization: Bearer %s\\n' \"$TOKEN\" | curl -fsS --proto '=https' --max-time 60 -H @- -H 'Accept: application/vnd.github+json'";
 
 /**
  * The head check of the verify job (carry G1→G7): this run is a push to the default branch, and the deployed commit (GITHUB_SHA, the
@@ -77,7 +81,10 @@ export function renderHeadCheckStep(defaultBranch: string): RenderedStep {
   const branch = branchOf(defaultBranch);
   return pipegenScriptStep(HEAD_CHECK_STEP_ID, 'pipegen: the deployed commit is the head of the default branch', [
     `want=${q(branch)}`,
-    'if [ "$GITHUB_REF" != "refs/heads/$want" ]; then pg_fail "this deploy is not a push to the default branch, so it is not verified"; fi',
+    // G7-R1 sec M2: a push only. For workflow_run, issue_comment or pull_request_target GITHUB_REF is the default branch and GITHUB_SHA its
+    // head, while the job may deploy another commit (the other run's, a pull request's)
+    'if [ "$GITHUB_EVENT_NAME" != "push" ]; then pg_fail "this run is not a push (it is $GITHUB_EVENT_NAME), so pipegen does not let it deploy; deploy by pushing to the default branch"; fi',
+    'if [ "$GITHUB_REF" != "refs/heads/$want" ]; then pg_fail "this push is not to the default branch, so pipegen does not let it deploy"; fi',
     'if ! [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]; then pg_fail "the deployed commit is not a 40-character commit"; fi',
     'TOKEN="$PIPEGEN_HEAD_TOKEN"',
     'unset PIPEGEN_HEAD_TOKEN',
@@ -102,12 +109,13 @@ export function renderDigestStep(service: string): RenderedStep {
     `list="$(${CURL} "$api/actions/runs/$run_id/artifacts?name=${artifact}&per_page=2")"`,
     `id="$(printf '%s' "$list" | jq -er --arg n ${q(artifact)} --arg run "$run_id" 'if (.artifacts | type) == "array" and (.artifacts | length) == 1 and .artifacts[0].name == $n and (.artifacts[0].workflow_run.id | tostring) == $run then .artifacts[0].id | tostring else error("not exactly one digest artifact of the gated run") end')"`,
     idCheck('id', 'the gated run has no digest artifact of this image'),
-    `if [ "$(printf '%s' "$list" | jq -r '.artifacts[0].expired')" != "false" ]; then pg_fail "the gated run's image digest has expired (the run is past the artifact retention period); push to the default branch again to deploy"; fi`,
+    `if ! printf '%s' "$list" | jq -e '.artifacts[0].expired == false' > /dev/null; then pg_fail "the gated run's image digest has expired (the run is past the artifact retention period); push to the default branch again to deploy"; fi`,
     `dir="$RUNNER_TEMP/pipegen-out/${artifact}"`,
     'mkdir -p "$RUNNER_TEMP/pipegen-out"',
     'mkdir "$dir"',
     'zip="$(mktemp "$RUNNER_TEMP/pipegen-digest.XXXXXX")"',
-    `${CURL.replace("--proto '=https'", "--proto '=https' --proto-redir '=https' -L --max-filesize 65536")} "$api/actions/artifacts/$id/zip" -o "$zip"`,
+    // one redirect only (GitHub sends the zip from its results storage; sec M6); curl drops the token on a redirect to another host
+    `${CURL.replace("--proto '=https'", "--proto '=https' --proto-redir '=https' -L --max-redirs 1 --max-filesize 65536")} "$api/actions/artifacts/$id/zip" -o "$zip"`,
     'unset TOKEN',
     `unzip -p -- "$zip" ${q(DIGEST_FILE)} | head -c 100 > "$dir/${DIGEST_FILE}"`,
     'rm -f -- "$zip"',
@@ -131,13 +139,4 @@ export function renderPublishDigestStep(service: string): RenderedStep {
     'mkdir "$dir"',
     `printf '%s' "$digest" > "$dir/${DIGEST_FILE}"`,
   ], { ...PUBLISH_DIGEST_ENV });
-}
-
-/** Whether a step has a field set that pipegen never sets on its own run steps (a condition, continue-on-error, a time limit, a folder). */
-const extra = (s: RenderedStep): boolean => s.if !== undefined || s['continue-on-error'] !== undefined || s['timeout-minutes'] !== undefined || s['working-directory'] !== undefined;
-/** Whether a step is exactly this render (every field that runs; the name aside). */
-export function sameRunStep(s: RenderedStep, want: RenderedStep): boolean {
-  if (extra(s)) return false;
-  const runs = (x: RenderedStep): unknown[] => [x.id, x.uses, x.with, x.run, x.shell, x.env];
-  return JSON.stringify(runs(s)) === JSON.stringify(runs(want));
 }

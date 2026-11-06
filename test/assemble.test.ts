@@ -18,6 +18,7 @@ import {
 import { protectedMatcher } from '../src/engine/protected-match.js';
 import { referee, type RefereeReport } from '../src/engine/referee.js';
 import { DIGEST_STEP_ID, FIND_RUN_STEP_ID, renderHeadCheckStep } from '../src/engine/deploy-steps.js';
+import { insertVerify } from '../src/layers/deploy.js';
 import { renderFindRunStep, renderJobPrelude, renderPlatformStep, stepsToYaml } from '../src/engine/render-step.js';
 import {
   assemble, callerPermissions, callerSecrets, judgeAssembled, MERGE_CALLER_JOB, NIGHTLY_CRON, NOT_PROVEN_MARK, verifyJob, VERIFY_GRACE_MINUTES, VERIFY_MARGIN_MINUTES,
@@ -335,7 +336,8 @@ describe('G5: the delivered files and their callers', () => {
     const v = a.verify as Job;
     expect(v).not.toBeNull();
     expect(v.environment).toBe('pipegen-signing');
-    expect(v.permissions).toEqual({ contents: 'read', actions: 'read', packages: 'read', attestations: 'read' });
+    // G7-R1 sec M7: key-env reads the registry for the signature; no attestations outside attest mode
+    expect(v.permissions).toEqual({ contents: 'read', actions: 'read', packages: 'read' });
     expect(v['cache-mode']).toBe('none');
     expect(v.steps[0]?.uses).toMatch(/^bullfrogsec\/bullfrog@/);
     const find = v.steps[1] as Obj;
@@ -587,12 +589,8 @@ const assembleJobsPush = (x: Planned): Record<string, Job> => assembleJobs(x.dra
 
 /** A user's deploy workflow with pipegen's verify job inserted (G7's insertion; the Plan B marker). */
 function insertedDeploy(j: Job): CreatedFile {
+  // G7-R1: the deploy layer's own insert (the verify job, the needs, the head check first in the deploy job)
   const original = 'on:\n  push:\n    branches: [main]\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ./deploy.sh\n';
-  const text0 = original.replace('  deploy:\n    runs-on', '  deploy:\n    needs: [pipegen-verify]\n    runs-on');
-  const ins = new Document();
-  const { steps, ...rest } = j;
-  ins.contents = ins.createNode({ 'pipegen-verify': rest });
-  ins.setIn(['pipegen-verify', 'steps'], stepsToYaml(steps));
-  const text = `${text0}${ins.toString({ lineWidth: 0 }).split('\n').map((l) => (l === '' ? l : `  ${l}`)).join('\n')}`;
-  return { path: '.github/workflows/deploy.yml', content: text, part: 'deploy-verify', reason: 't', repo: 'app', inserted: { original, jobs: ['pipegen-verify'], needs: [{ job: 'deploy', added: ['pipegen-verify'] }] } };
+  const e = insertVerify(original, ['deploy'], j);
+  return { path: '.github/workflows/deploy.yml', content: e.text, part: 'deploy-verify', reason: 't', repo: 'app', inserted: e.inserted };
 }
