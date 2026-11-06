@@ -29,7 +29,7 @@ import { closureRootDependencies, loadNpmClosure, NpmClosureError, pinOk, type N
 import { EXPR, own, refuse, show } from './render-error.js';
 import type { RenderContext, RenderedStep, RenderResult } from './render-step.js';
 import { slotProblem, type SlotKind } from './slots.js';
-import { ARGV_POLICIES, HISTORY_STEP_ENV, historyScanStepId, PIP_CLOSURES, PLAIN_REL_RE, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, runsRepoCode, sha16, TEST_COMMANDS, type ArgvPolicy } from './tool-flags.js';
+import { ARGV_POLICIES, HISTORY_STEP_ENV, historyScanStepId, JOB_TOKEN_REF, PIP_CLOSURES, ZIZMOR_ONLINE_POLICY, PLAIN_REL_RE, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, runsRepoCode, sha16, TEST_COMMANDS, type ArgvPolicy } from './tool-flags.js';
 
 export { sha16 };   // defined in tool-flags.ts (the job rules need it too); re-exported for the callers that import it from here
 import { EXTRA_RULES_AT, tuningEffects, type TuningEffects } from './tuning.js';
@@ -492,6 +492,12 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
     env.PIPEGEN_TUNED_CONFIG = tunedCfg.content;
   }
   if (tuned.extraRules.length > 0 && (archive === undefined || kind !== 'docker')) return refuse(`${show(tool.id)} has no rules archive to add rule folders from.`);
+  // G15a round 5 (b2): the online zizmor policy alone passes the job's own read token (contents: read), under its reviewed name, to a release binary
+  if (pol.tokenEnv !== undefined) {
+    if (pol !== ZIZMOR_ONLINE_POLICY || kind !== 'github-release' || pol.tokenEnv !== 'GH_TOKEN') return refuse(`${show(tool.id)} may not take the job's token.`);
+    env[pol.tokenEnv] = JOB_TOKEN_REF;
+    passed.push(pol.tokenEnv);
+  }
   for (const name of secrets) {
     if (!NAME_RE.test(name) || hooks.isDangerousName(name)) return refuse(`The secret name ${show(name)} can't be passed to a tool.`);
     env[name] = `\${{ secrets.${name} }}`;

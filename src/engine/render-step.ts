@@ -25,12 +25,12 @@ import type { PlatformActions } from './pin.js';
 import { tuningProblems } from './tuning.js';
 import { APP_RUNNING_CATEGORIES, projectScriptSteps, renderCliTool, renderRangeScan, repoToolSteps, sha16, type CliHooks, type RenderOptions } from './render-cli.js';
 import { ArtifactNameError, resultArtifactName, SECRETS_HISTORY_ARTIFACT, SECRETS_RANGE_ARTIFACT } from './artifact-names.js';
-import { repoToolFor, type ProjectScriptStep, type RepoToolStep } from './reviewed.js';
+import { argvPolicyProblems, repoToolFor, type ProjectScriptStep, type RepoToolStep, type ReviewedEntry } from './reviewed.js';
 import { own, RenderError, show } from './render-error.js';
 import { BASE_CHECKOUT_ID, BASELINE_CHECK_STEP_ID, checkExpressions, checkJobOrder, isDangerousName, isReviewed, narrowingChoiceProblem, STEP_KEYS, type JobContext, type RenderedStep, type ScanFact } from './job-rules.js';
 import { GateJobListError } from './gate-job-list.js';
 import { gateStepInputs, nightlyStepInputs } from './gate-inputs.js';
-import { allowedDomainsProblem, BULLFROG_USES, egressDomains, BASE_CHECKOUT_REF, DOCKER_ACTION_USES, DOCKER_STEP_IMAGES, DOCKER_STEP_INPUTS, GATE_UPLOAD_FILES, gateUploadPath, uploadIfNoFiles, IMAGE_BUILT_ACTION_USES, isStagedTool, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath, scrubStepId, stagePath, stageStepId } from './tool-flags.js';
+import { ARGV_POLICIES, ZIZMOR_ONLINE_HOST, ZIZMOR_ONLINE_ID, ZIZMOR_ONLINE_POLICY, allowedDomainsProblem, BULLFROG_USES, egressDomains, BASE_CHECKOUT_REF, DOCKER_ACTION_USES, DOCKER_STEP_IMAGES, DOCKER_STEP_INPUTS, GATE_UPLOAD_FILES, gateUploadPath, uploadIfNoFiles, IMAGE_BUILT_ACTION_USES, isStagedTool, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath, scrubStepId, stagePath, stageStepId } from './tool-flags.js';
 
 export { RenderError };
 // the job rules live in job-rules.ts (one copy for the renderer, the emitter, the referee and the linters); re-exported for the callers that import them here
@@ -576,6 +576,28 @@ export function renderHistoryBlock(tool: ReviewedTool, platform: PlatformActions
   const scan = scanFactOf(result, tool.id) as { stepId: string; fact: ScanFact };
   const artifact = SECRETS_HISTORY_ARTIFACT;
   return { steps: [...result.steps, renderScrub(artifact, out.path, tool.id, 'sarif', gate), renderUpload(artifact, scrubbedPath(out.path), platform)], artifact, scan, result };
+}
+
+/**
+ * G15a round 5 (b2, P-4): zizmor online, for the nightly job ZIZMOR_ONLINE_JOB. The reviewed zizmor entry, which must be exactly in its reviewed
+ * offline form (command `zizmor --offline <positionals>`, args `--offline`, no follow-up, no env, no output), is run with
+ * `--gh-hostname github.com` in place of `--offline` under the second argv policy (ZIZMOR_ONLINE_POLICY, which the online form must pass), with the job's read token as GH_TOKEN, under its own artifact
+ * and step ids (ZIZMOR_ONLINE_ID). The install is the offline one's. A job-status check: no result file.
+ */
+export function renderZizmorOnline(tool: ReviewedTool, platform: PlatformActions, ctx: RenderContext): RenderResult {
+  if (!isReviewed(tool.candidate)) throw new RenderError(`${show(tool.id)} is not a reviewed tool, and pipegen never renders a tool that isn't.`);
+  const pol = own(ARGV_POLICIES, tool.id);
+  const cli = tool.step.cli;
+  if (tool.id !== ZIZMOR_ONLINE_POLICY.exe || pol === undefined || cli === undefined || tool.candidate.kind === 'action') throw new RenderError(`zizmor online runs the reviewed zizmor entry only, not ${show(tool.id)}.`);
+  const positionals = ZIZMOR_ONLINE_POLICY.positionals ?? [];
+  const offlineForm = isDeepStrictEqual(cli.command, [pol.exe, '--offline', ...positionals]) && isDeepStrictEqual(tool.fixedInputs.args, ['--offline'])
+    && cli.then === undefined && cli.env === undefined && tool.fixedInputs.env === undefined && tool.step.output.format === 'none' && tool.step.output.path === '';
+  if (!offlineForm) throw new RenderError(`The reviewed zizmor entry is not in its reviewed offline form (zizmor --offline ${positionals.join(' ')}), so pipegen does not run it online.`);
+  const online = { ...tool, step: { ...tool.step, cli: { ...cli, command: [pol.exe, '--gh-hostname', ZIZMOR_ONLINE_HOST, ...positionals] } }, fixedInputs: { ...tool.fixedInputs, args: ['--gh-hostname', ZIZMOR_ONLINE_HOST] } } as ReviewedTool;
+  const problems = argvPolicyProblems(online as unknown as ReviewedEntry, { [tool.id]: ZIZMOR_ONLINE_POLICY });
+  if (problems.length > 0) throw new RenderError(`The online form of zizmor does not pass its argv policy: ${problems.map((x) => x.message).join('; ')}.`);
+  const spec = { needId: ZIZMOR_ONLINE_ID, tool: tool.candidate, choices: {} } as unknown as StepSpec;
+  return renderCliTool({ spec, tool: online, service: undefined, ctx: { profile: ctx.profile }, hooks: cliHooks(platform), options: { policies: { [tool.id]: ZIZMOR_ONLINE_POLICY } } });
 }
 
 /** G15a round 3 (PF-3): the Scorecard result's artifact and the id of the step that moves its raw file under the runner temp folder. */

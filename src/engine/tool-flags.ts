@@ -157,6 +157,11 @@ export interface ArgvPolicy extends CommandPolicy {
    */
   readonly staged?: { readonly ignoreFiles: readonly string[] };
   readonly env?: readonly string[];
+  /**
+   * G15a round 5 (b2, P-4): the name the job's own read token (`${{ github.token }}`, JOB_TOKEN_REF) is passed to the tool under, in the
+   * step's env and through the env -i allowlist. Only ZIZMOR_ONLINE_POLICY has it; no policy of ARGV_POLICIES does (a test holds that).
+   */
+  readonly tokenEnv?: 'GH_TOKEN';
   readonly then?: readonly CommandPolicy[];
   readonly dedicated?: true;
   /**
@@ -435,6 +440,7 @@ const READS_ONLY: readonly string[] = [
 export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze(Object.fromEntries(
   Object.entries(POLICIES as Record<string, ArgvPolicy>).map(([id, pol]) => [id, READS_ONLY.includes(id) ? { ...pol, readsOnly: true as const } : pol]),
 ));
+
 
 /**
  * Whether the run step of a reviewed entry is a repo-code step (the order rule applies to it). This IS the renderer's rule,
@@ -920,6 +926,31 @@ export const rangeScanStepId = `checker-run-${sha16(SECRETS_RANGE_ARTIFACT)}`;
 export const HISTORY_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_HISTORY_HEAD: '${{ github.sha }}' });
 /** G15a round 4 (b1): the id of the full-history scan step (a checker step: the hash of the history artifact). */
 export const historyScanStepId = `checker-run-${sha16(SECRETS_HISTORY_ARTIFACT)}`;
+
+/** G15a round 5 (b2): the job's own token, read-only in a job whose permissions are `contents: read`. */
+export const JOB_TOKEN_REF = '${{ github.token }}';
+/** G15a round 5 (b2): the only GitHub host the online zizmor run talks to (its `--gh-hostname`, required by ZIZMOR_ONLINE_POLICY). */
+export const ZIZMOR_ONLINE_HOST = 'github.com';
+/**
+ * G15a round 5 (b2, P-4): zizmor online, run nightly only (job-rules.ts ZIZMOR_ONLINE_JOB). The second argv policy of the reviewed zizmor entry:
+ * the offline policy (ARGV_POLICIES.zizmor) without `--offline`, so zizmor's online audits run (impostor-commit, ref-confusion,
+ * known-vulnerable-actions, stale-action-refs and the others that read GitHub). Flags read from the pinned zizmor 1.31.1's own `--help`
+ * (Network Options: `-o, --offline` [env: ZIZMOR_OFFLINE]; `--gh-token` [env: GH_TOKEN or GITHUB_TOKEN or ZIZMOR_GITHUB_TOKEN]; `--gh-hostname`
+ * [env: GH_HOST, default github.com]). The token goes in by env (GH_TOKEN), never as a word of the command. In place of `--offline` the
+ * command names the host itself (`--gh-hostname github.com`, required): the token can only ever be sent to github.com's API, whatever the
+ * environment (GH_HOST is not passed through env -i either). The online reads (strings of the pinned binary, crates/zizmor/src/github.rs: `https://` + `api.` + the host,
+ * and `.git/git-upload-pack` for the ref listing) go to api.github.com and github.com, both in github-core (the live checklist verifies).
+ * The entry's output stays `none`: a job-status check (exit 0 clean, 10-14 findings, anything else a failure), so no output format is read.
+ */
+export const ZIZMOR_ONLINE_POLICY: ArgvPolicy = Object.freeze((({ flags: _flags, required: _required, ...rest }: ArgvPolicy): ArgvPolicy => ({
+  ...rest, flags: { 'gh-hostname': { values: [ZIZMOR_ONLINE_HOST] } }, required: { 'gh-hostname': ZIZMOR_ONLINE_HOST }, tokenEnv: 'GH_TOKEN',
+}))(ARGV_POLICIES.zizmor as ArgvPolicy));
+/** G15a round 5 (b2): the one expression of the online zizmor run step's env: the job's own read token, as GH_TOKEN. */
+export const ZIZMOR_ONLINE_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ GH_TOKEN: JOB_TOKEN_REF });
+/** G15a round 5 (b2): the need-like id of the online run (its own artifact `pipegen-out-workflow-lint-online` and step ids, apart from the PR run). */
+export const ZIZMOR_ONLINE_ID = 'workflow-lint-online';
+/** G15a round 5 (b2): the id of the online zizmor run step (renderCliTool's `tool-run-<sha16(artifact)>`). */
+export const zizmorOnlineStepId = `tool-run-${sha16(`${RESULT_ARTIFACT_PREFIX}${ZIZMOR_ONLINE_ID}`)}`;
 
 /**
  * Ruling S15: the inputs the renderer sets on a platform action, by the same `owner/repo[/path]` key as ACTION_POLICIES,

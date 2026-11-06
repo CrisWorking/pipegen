@@ -7,7 +7,7 @@ import {
   BUILD_PUSH_STEP_ID, DIGEST_STEP_ENV, DIGEST_STEP_ID, FIND_RUN_STEP_ID, HEAD_CHECK_DIR, HEAD_CHECK_ENV, HEAD_CHECK_STEP_ID, imageDigestArtifact, PUBLISH_DIGEST_ENV, PUBLISH_DIGEST_STEP_ID,
 } from './deploy-steps.js';
 import { GATE_RESULT_ARTIFACT, resultArtifactName, SECRETS_HISTORY_ARTIFACT, SECRETS_RANGE_ARTIFACT, slug } from './artifact-names.js';
-import { ARGV_POLICIES, ATTEST_DIGEST_STEP_ID_RE, DOCKER_STEP_IMAGES, attestDigestRef, attestDigestStepId, BASE_CHECKOUT_REF, GATE_OPTIONAL_UPLOADS, HISTORY_STEP_ENV, historyScanStepId, RANGE_BEFORE_REF, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, isGateUploadName, CHECKER_STEP_ID_RE, GATE_USES_RE, isStagedTool, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, stagePath, stageStepId, STAGE_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
+import { ARGV_POLICIES, ATTEST_DIGEST_STEP_ID_RE, DOCKER_STEP_IMAGES, attestDigestRef, attestDigestStepId, BASE_CHECKOUT_REF, GATE_OPTIONAL_UPLOADS, HISTORY_STEP_ENV, historyScanStepId, ZIZMOR_ONLINE_STEP_ENV, zizmorOnlineStepId, RANGE_BEFORE_REF, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, isGateUploadName, CHECKER_STEP_ID_RE, GATE_USES_RE, isStagedTool, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, stagePath, stageStepId, STAGE_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
 
 /** One step of a job, as pipegen renders it. `usesComment` becomes the trailing `# <version>` comment on `uses:`. */
 export interface RenderedStep {
@@ -486,6 +486,11 @@ export const CODE_SCANNING_JOB = 'code-scanning';
 export const SECRETS_HISTORY_JOB = 'secrets-history';
 export const HISTORY_UPLOAD_JOB = 'code-scanning-history';
 export const SECRETS_HISTORY_CATEGORY = 'pipegen-secrets-history';
+/**
+ * G15a round 5 (b2, P-4): the nightly job that runs zizmor online (render-step.ts renderZizmorOnline): egress, a checkout, the install and the
+ * run with the job's read token. `contents: read` only; a job-status check, never gated. Its steps and file are held by the referee.
+ */
+export const ZIZMOR_ONLINE_JOB = 'workflow-lint-online';
 /** G15a round 3 (PF-3): the reviewed tools whose result a scrub reads but that run as a docker step (no argv policy): Scorecard. */
 export const SCRUB_ONLY_TOOLS: ReadonlySet<string> = new Set(['scorecard-action']);
 /** A `docker://<image>@sha256:<64 hex>` uses of an image in DOCKER_STEP_IMAGES (the shape only; the referee checks the reviewed digest). */
@@ -978,6 +983,8 @@ export function checkExpressions(step: RenderedStep): void {
         if (step.id === rangeScanStepId && step.run !== undefined && step.uses === undefined && Object.hasOwn(RANGE_STEP_ENV, k) && RANGE_STEP_ENV[k] === v) continue;
         // G15a round 4 (b1): the full-history scan step carries only the commit the run checked out
         if (step.id === historyScanStepId && step.run !== undefined && step.uses === undefined && own(HISTORY_STEP_ENV, k) === v) continue;
+        // G15a round 5 (b2): the online zizmor run step carries only the job's own read token, as GH_TOKEN
+        if (step.id === zizmorOnlineStepId && step.run !== undefined && step.uses === undefined && own(ZIZMOR_ONLINE_STEP_ENV, k) === v) continue;
         // G4 (C9r1): the pre-push head fetch step carries exactly its own forms (the event's earlier head and the job's own token)
         if (step.id === RANGE_FETCH_STEP_ID && step.run !== undefined && step.uses === undefined && own(RANGE_FETCH_STEP_ENV, k) === v) continue;
         // G1 (BP-6): the pr-check lookup step, exactly as renderPrCheckStep writes it (every field that runs), carries the job's own token
