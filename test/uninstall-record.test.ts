@@ -246,6 +246,12 @@ describe('uninstall: load and trust the install record (V1)', () => {
     w.g.repo('o/r').pulls.push({ number: 7, head: 'pipegen/update', base: 'main', title: 'pipegen update', body: '', state: 'open', html_url: 'https://github.com/o/r/pull/7' });
     const got = await loadUninstallRecord(w.g.octokit(), APP, { local: local(w) });
     expect(got.record).toEqual(r);
+    // GitHub's list answer is checked branch by branch: an open central PR on another branch is not pipegen's update PR, and a listed app PR
+    // on another branch is never taken as the setup PR
+    w.g.hooks.push((c) => (c.route === 'GET /repos/{owner}/{repo}/pulls' ? { status: 200, data: [{ number: 12, state: 'open', head: { ref: 'feature' }, base: { ref: 'main' }, body: '' }] } : undefined));
+    const other = await loadUninstallRecord(w.g.octokit(), APP, { local: { ...local(w) } });
+    expect(other.record).toEqual(r);
+    expect(other.setupPr).toBe(5);   // the local file's #5 (on pipegen/setup), not the listed #12
   });
 
   it('record: a trusted record only on the central pull request branch → stop (the default branch holds another)', async () => {
