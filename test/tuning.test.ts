@@ -400,7 +400,7 @@ describe('each option renders as ruled', () => {
   it('the start-script comment does not claim the app was started: it says Plan G does it', () => {
     const st = runStep(spec('zap-baseline', { 'start-script': ['start'] }, { service: 'api', needId: 'dast' }));
     const line = (st.run as string).split('\n').find((l) => l.startsWith('# tuning:')) as string;
-    expect(line).toMatch(/Plan G starts the app/);
+    expect(line).toMatch(/pipegen starts the app/);
     expect(line).not.toMatch(/is started/);
   });
 
@@ -453,7 +453,7 @@ describe('describeTuning', () => {
     expect(describeTuning(spec('eslint', {}))).toEqual([]);
     expect(describeTuning(spec('eslint', { 'skip-generated': ['vendor', 'services/api/dist'] }))).toEqual(['skips the vendored or generated folders vendor, services/api/dist for this lint or SAST tool only']);
     expect(describeTuning(spec('lefthook', { hooks: ['lint'] }, { service: 'api', needId: 'hooks-ci' }))).toEqual(['runs the service\'s own lint script as a pre-commit hook (adds coverage)']);
-    expect(describeTuning(spec('zap-baseline', { 'start-script': ['start'] }, { needId: 'dast' }))).toEqual(['Plan G starts the app with its own start script before the scan (adds coverage)']);
+    expect(describeTuning(spec('zap-baseline', { 'start-script': ['start'] }, { needId: 'dast' }))).toEqual(['pipegen starts the app with its own start script before the scan (adds coverage)']);
   });
 
   it('every line is clean text: no control characters, no markup, short, even for hostile values', () => {

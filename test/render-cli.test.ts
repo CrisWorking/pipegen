@@ -598,7 +598,7 @@ describe('6b: every reviewed CLI entry', () => {
       } catch (e) {
         expect(e, t.id).toBeInstanceOf(RenderError);
         outcome[t.id] = (e as Error).message;
-        expect((e as Error).message, t.id).toMatch(/does not have|Plan G|not available yet|job service|Go is not supported/);
+        expect((e as Error).message, t.id).toMatch(/does not have|pipegen's own|not available yet|job service|Go is not supported/);
       }
     }
     expect(rendered).toBeGreaterThan(20);
