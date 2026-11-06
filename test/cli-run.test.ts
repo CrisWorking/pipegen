@@ -1249,6 +1249,11 @@ describe('G13-R1: delivery is bound to the proven draft', () => {
     expect(w.builds[1]?.draft.suggestions.map((s) => s.name)).toEqual(['PROVEN']);
     expect(w.builds[1]?.draft.centralPin?.sha).toBe(UNPINNED);
     expect((w.got.deliverCentral?.[0] as CreatedFile[])[0]?.content).toBe('tag: PROVEN\n');
+    // a proven draft that carries the proof's own central commit is still rebuilt at the stand-in (deliverCentral gives the real one)
+    const pinned = (d: PipelineDraft): PipelineDraft => ({ ...PROVEN(d), centralPin: { repo: `${OWN}/pipelines`, sha: 'e'.repeat(40) } });
+    const wp = world({ proof: proofSaving(pinned, 'saved') });
+    expect(await run(wp)).toBe(0);
+    expect(wp.builds[1]?.draft.centralPin?.sha).toBe(UNPINNED);
     // the rebuilt draft that fails its checks stops before deliverCentral
     let n = 0;
     const w2 = world({ proof: proofSaving(PROVEN, 'saved'), built: (i) => builtOf(i, n++ === 1 ? { guardProblems: ['bad'] } : {}) });
