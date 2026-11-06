@@ -38,10 +38,10 @@ import type { KnownValueCheck } from '../types.js';
 export const HISTORY_REWRITE_NOTE = 'After rewriting main\'s history (a force-push), the gate may stay in block mode until 10 green pushes to main have followed.';
 /**
  * The gate's ZAP rule (gate/src/zap.ts ZAP_TOOL, ZAP_JSON_VERIFIED): while ZAP's report is unverified the gate judges every non-floor check that runs ZAP as
- * not proven (a warning, never a block). Copied, not imported (gate/ is bundled); a test keeps both equal.
+ * not proven (a warning, never a block). Verified since G15a round 5 (real reports of the pinned image), so the not-proven lines are not written. Copied, not imported (gate/ is bundled); a test keeps both equal.
  */
 export const ZAP_TOOL = 'zap-baseline';
-export const ZAP_JSON_VERIFIED = false;
+export const ZAP_JSON_VERIFIED = true;
 /** The start of GJ's hooks-ci note for husky (src/layers/jobs.ts HOOKS_CI_NOTES.husky): it says what G6's husky note says, so only one of them is printed. */
 const GJ_HUSKY_NOTE_START = "husky's hooks are shell scripts";
 

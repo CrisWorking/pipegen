@@ -122,12 +122,12 @@ describe('gitleaks: completeness is not provable', () => {
   });
 });
 
-describe('zap-json is unverified', () => {
-  it('ZAP_JSON_VERIFIED is false and every zap result says so', () => {
-    expect(ZAP_JSON_VERIFIED).toBe(false);
+describe('zap-json is verified (G15a round 5)', () => {
+  it('ZAP_JSON_VERIFIED is true and no zap result carries the unverified note', () => {
+    expect(ZAP_JSON_VERIFIED).toBe(true);
     const report = { '@programName': 'ZAP', site: [{ alerts: [] }] };
-    expect(parseZapJson(report, 'zap-baseline').notes).toEqual(['zap-json parsing is unverified against a real zap-baseline -J report']);
-    expect(parseZapJsonText(JSON.stringify(report), 'zap-baseline').notes).toHaveLength(1);
+    expect(parseZapJson(report, 'zap-baseline').notes).toEqual([]);
+    expect(parseZapJsonText(JSON.stringify(report), 'zap-baseline').notes).toHaveLength(0);
     expect(parseZapJson({}, 'zap-baseline').toolError).toBeDefined();
   });
   it('riskcode strings that only look like numbers are high with a note ("3abc", "0.5", "-0", "0x3", " 3")', () => {

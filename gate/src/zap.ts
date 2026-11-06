@@ -15,14 +15,13 @@ import { safeText } from '../../src/util/safe-text.js';
 export const ZAP_TOOL = 'zap-baseline';
 
 /**
- * UNVERIFIED. The only report this parser has been run on is a unit-test output of the ZAP reports add-on
- * (zap-extensions, `@version: "Dev Build"`), not a `zap-baseline.py -J` run of the pinned image, and there is no clean
- * report at all (so "no site is a tool error" has never been checked against a real clean run: if a clean run writes
- * `site: []`, every clean DAST run would block). A real `-J` capture from the pinned image digest, clean and with
- * alerts, is required before ZAP gates anything. Until then a blocking DAST need on ZAP is judged as not proven
- * (a warning), which is C2's rule, and every result of this parser carries a note saying so.
+ * VERIFIED (G15a round 5). The reader was run on real reports of the pinned image (zaproxy/zap-stable@sha256:5ccfff9a…, ZAP 2.17.0;
+ * test/fixtures/zap/README.md): the merge-layer `zap-baseline.py -J` run and the Automation Framework's traditional-json report (the
+ * same template: zap-baseline.py 2.17.0 itself runs through the AF), each clean and with alerts. A clean run writes one site with an
+ * empty alert list, so "no site is a tool error" never fires on a clean scan; a target that does not answer writes no report at all
+ * (baseline exit 3, AF exit 1), and the run step fails. A required DAST check on ZAP blocks like any other required check.
  */
-export const ZAP_JSON_VERIFIED = false;
+export const ZAP_JSON_VERIFIED = true;
 const UNVERIFIED_NOTE = 'zap-json parsing is unverified against a real zap-baseline -J report';
 const MAX_PLUGIN_ID = 256;
 const MAX_URL_PATH = 2048;
@@ -105,7 +104,7 @@ export function parseZapJson(json: unknown, toolId: string, opts: ZapOptions = {
         }
       }
     }
-    notes.push(UNVERIFIED_NOTE);
+    if (!ZAP_JSON_VERIFIED) notes.push(UNVERIFIED_NOTE);
     if (unknownRisk > 0) notes.push(`${unknownRisk} alert(s) had an unknown riskcode and are counted as high`);
     return findings;
   });

@@ -237,7 +237,7 @@ describe('scrub: zap', () => {
     expect(back.findings[0]).toMatchObject({ tool: 'zap-baseline', file: '/a/b' });
     expect(back.findings[0].fingerprint).toBe(sha([back.findings[0].ruleId, 'GET', '/a/b'].join('\0')));
     expect(out.sha256).toBe(sha(out.bytes));
-    expect(back.notes.join()).toMatch(/unverified/);
+    expect(back.notes).toEqual([]);   // G15a round 5: ZAP is verified, no note
   });
   it('zap-json needs no key and never carries one: a zap run is scrubbed with an empty key on a non-fork event', () => {
     const out = ok(scrubBytes(readFileSync(ZAP), { tool: 'zap-baseline', format: 'zap-json', fpKey: '', eventText: PUSH_EVENT }));

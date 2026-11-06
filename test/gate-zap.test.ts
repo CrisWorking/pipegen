@@ -8,7 +8,6 @@ import { MAX_RAW_BYTES } from '../gate/src/sarif.js';
 import { parseZapJson, parseZapJsonText } from '../gate/src/zap.js';
 
 type Obj = Record<string, unknown>;
-const ZAP_UNVERIFIED_NOTE = 'zap-json parsing is unverified against a real zap-baseline -J report';
 const SF = ('sec' + 'ret') as 'secret';   // the finding's flag, spelled so no secret-like `name: value` sits in a committed test file
 const FIXTURE = join(import.meta.dirname, 'fixtures', 'zap', 'zap-traditional-json.json');
 
@@ -158,7 +157,7 @@ describe('zap: the real report (zaproxy/zap-extensions at a pinned commit)', () 
   it('fixture zap-traditional-json.json: no toolError, two findings (one alert on one url, twice), high, path /example_3, nothing of the evidence', () => {
     const out = parseZapJsonText(readFileSync(FIXTURE), 'zap-baseline');
     expect(out.toolError).toBeUndefined();
-    expect(out.notes).toEqual([ZAP_UNVERIFIED_NOTE]);
+    expect(out.notes).toEqual([]);   // G15a round 5: verified, no note
     expect(out.findings).toEqual([
       { tool: 'zap-baseline', ruleId: '1', severity: 'high', file: '/example_3', message: 'XSS', method: 'GET', uriUnmapped: false, [SF]: false },
       { tool: 'zap-baseline', ruleId: '1', severity: 'high', file: '/example_3', message: 'XSS', method: 'GET', uriUnmapped: false, [SF]: false },
