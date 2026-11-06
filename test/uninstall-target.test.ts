@@ -80,7 +80,8 @@ const orgEntry = (over: Partial<NonNullable<InstallRecord['orgRuleset']>> = {}):
 
 /** GitHub's answers to the settings reads, as pipegen left them (sec N-M5). */
 const pipegenSa = { security_and_analysis: { [SS]: { status: 'enabled' }, [SP]: { status: 'enabled' } } };
-const settingsNow = (over: { perms?: unknown; access?: unknown; alerts?: number } = {}): Handler => (route) => {
+const settingsNow = (over: { perms?: unknown; access?: unknown; alerts?: number; autofix?: unknown } = {}): Handler => (route) => {
+  if (route === 'GET /repos/{owner}/{repo}/automated-security-fixes') { if (typeof over.autofix === 'number') throw httpErr(over.autofix); return over.autofix ?? { enabled: false, paused: false }; }
   if (route === 'GET /repos/{owner}/{repo}/actions/permissions') return over.perms ?? { enabled: true, allowed_actions: 'all', sha_pinning_required: true };
   if (route === 'GET /repos/{owner}/{repo}/actions/permissions/access') return over.access ?? { access_level: 'organization' };
   if (route === 'GET /repos/{owner}/{repo}/vulnerability-alerts') { if (over.alerts === 404) throw httpErr(404); return undefined; }
@@ -251,6 +252,7 @@ function importProblems(src: string): string[] {
   }
   return out;
 }
+const OCTOKIT_NAMESPACES: readonly string[] = ['actions', 'activity', 'apps', 'billing', 'checks', 'codeScanning', 'codesOfConduct', 'codespaces', 'copilot', 'dependabot', 'dependencyGraph', 'emojis', 'gists', 'git', 'gitignore', 'interactions', 'issues', 'licenses', 'markdown', 'meta', 'migrations', 'oidc', 'orgs', 'packages', 'projects', 'pulls', 'rateLimit', 'reactions', 'repos', 'search', 'secretScanning', 'securityAdvisories', 'teams', 'users'];
 /** `<x>.<namespace>.<method>(`: an Octokit endpoint method (with or without `.rest`); an array method on a list of that name is not one. */
 const OCTOKIT_ENDPOINT_RE = /\.\s*(?:actions|activity|apps|billing|checks|codeScanning|codesOfConduct|codespaces|copilot|dependabot|dependencyGraph|emojis|gists|git|gitignore|interactions|issues|licenses|markdown|meta|migrations|oidc|orgs|packages|projects|pulls|rateLimit|reactions|repos|search|secretScanning|securityAdvisories|teams|users)\s*\.\s*(?!(?:filter|map|find|findIndex|findLast|findLastIndex|some|every|forEach|reduce|includes|indexOf|slice|concat|flat|flatMap|join|sort|toSorted|at|keys|values|entries)\b)[A-Za-z]+\s*\(/;
 /** What the scan finds wrong in one file of src/uninstall (target.ts is the one that writes). */
@@ -640,13 +642,14 @@ describe('V3 target: deleteCentralRepo', () => {
     tree: [{ path: 'README.md', sha: gitBlobSha(readme) }, { path: '.github/CODEOWNERS', sha: gitBlobSha('owners') }], ...w,
   });
   /** A central world answering every read deleteCentralRepo makes. */
-  const centralHandler = (w: World, state: { deleted: boolean }, head: () => string = () => SHA): Handler => (route) => {
+  const centralHandler = (w: World, state: { deleted: boolean }, head: () => string = () => SHA): Handler => (route, p) => {
     if (route === 'GET /repos/{owner}/{repo}') { if (state.deleted) { if (w.afterDelete === 'there') return w.repo; throw httpErr(w.afterDelete === 'error' ? 500 : 404); } return w.repo; }
     if (route === 'GET /repos/{owner}/{repo}/branches') return (w.branches ?? ['main']).map((name) => ({ name }));
     if (route === 'GET /repos/{owner}/{repo}/git/ref/{ref}') { if (w.afterDelete === 'empty') throw httpErr(409); return { object: { sha: head() } }; }
     if (route === 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}') return { tree: { sha: SHA }, parents: [] };
     if (route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}') return { truncated: false, tree: w.tree.map((e) => ({ path: e.path, sha: e.sha, mode: '100644', type: e.type ?? 'blob' })) };
-    if (route === 'GET /repos/{owner}/{repo}/git/matching-refs/{ref}') return w.tags ?? [];
+    if (route === 'GET /repos/{owner}/{repo}/git/matching-refs/{ref}') return p.ref === '' ? [{ ref: 'refs/heads/main' }] : w.tags ?? [];
+    if (route === 'GET /repos/{owner}/{repo}/comments') return [];
     if (route === 'GET /repos/{owner}/{repo}/releases') return w.releases ?? [];
     if (route === 'GET /repos/{owner}/{repo}/issues') return w.issues ?? [];
     if (route === 'GET /repos/{owner}/{repo}/pulls') return w.pulls ?? [];
@@ -829,13 +832,14 @@ describe('V3 fix round 1', () => {
     const ourPr = { number: 4, head: { ref: 'pipegen/update-shop', repo: { id: CENTRAL_ID } } };
     const go = async (w: { repo?: Record<string, unknown>; tags?: unknown[]; releases?: unknown[]; issues?: unknown[]; pulls?: unknown[]; secrets?: unknown[]; variables?: unknown[]; environments?: unknown[] }) => {
       const state = { deleted: false };
-      const f = fakeGh((route) => {
+      const f = fakeGh((route, p) => {
         if (route === 'GET /repos/{owner}/{repo}') { if (state.deleted) throw httpErr(404); return w.repo ?? base; }
         if (route === 'GET /repos/{owner}/{repo}/branches') return [{ name: 'main' }];
         if (route === 'GET /repos/{owner}/{repo}/git/ref/{ref}') return { object: { sha: SHA } };
         if (route === 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}') return { tree: { sha: SHA }, parents: [] };
         if (route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}') return { truncated: false, tree: [{ path: 'README.md', sha: gitBlobSha(readme), mode: '100644', type: 'blob' }] };
-        if (route === 'GET /repos/{owner}/{repo}/git/matching-refs/{ref}') return w.tags ?? [];
+        if (route === 'GET /repos/{owner}/{repo}/git/matching-refs/{ref}') return p.ref === '' ? [{ ref: 'refs/heads/main' }] : w.tags ?? [];
+        if (route === 'GET /repos/{owner}/{repo}/comments') return [];
         if (route === 'GET /repos/{owner}/{repo}/releases') return w.releases ?? [];
         if (route === 'GET /repos/{owner}/{repo}/issues') return w.issues ?? [];
         if (route === 'GET /repos/{owner}/{repo}/pulls') return w.pulls ?? [];
@@ -1124,7 +1128,7 @@ describe('V3 fix round 2', () => {
   });
   const base = { id: CENTRAL_ID, name: 'pipelines', full_name: 'acme/pipelines', owner: { login: OWNER }, description: DESC, default_branch: 'main', forks_count: 0, has_wiki: false, has_discussions: false };
   const ourPr = { number: 4, head: { ref: 'pipegen/update-shop', repo: { id: CENTRAL_ID } } };
-  interface W { repo?: Record<string, unknown>; refs?: unknown[]; refsAnswer?: unknown; pulls?: unknown[]; dependabot?: unknown[] | number; codespaces?: unknown[] | number; dependabotLater?: number }
+  interface W { repo?: Record<string, unknown>; refs?: unknown[]; refsAnswer?: unknown; pulls?: unknown[]; dependabot?: unknown[] | number; codespaces?: unknown[] | number; dependabotLater?: number; comments?: unknown[] | number }
   const listOf = (x: unknown[] | number | undefined) => { if (typeof x === 'number') throw httpErr(x); return { total_count: (x ?? []).length, [LIST]: x ?? [] }; };
   const go = async (w: W) => {
     const state = { deleted: false };
@@ -1142,6 +1146,7 @@ describe('V3 fix round 2', () => {
       if (route === 'GET /repos/{owner}/{repo}/codespaces/secrets') return listOf(w.codespaces);
       if (route.endsWith('/secrets') || route.endsWith('/variables') || route.endsWith('/environments')) return { total_count: 0, [LIST]: [], variables: [], environments: [] };
       if (route === 'GET /repos/{owner}/{repo}/releases') return [];
+      if (route === 'GET /repos/{owner}/{repo}/comments') { if (typeof w.comments === 'number') throw httpErr(w.comments); return w.comments ?? []; }
       if (route === 'DELETE /repos/{owner}/{repo}') { state.deleted = true; return {}; }
       throw httpErr(500);
     }, { raw: true });
@@ -1185,7 +1190,10 @@ describe('V3 fix round 2', () => {
       const r = await go(w);
       expect(r.deleted, JSON.stringify(w)).toBe(true);
       expect(r.asked.length).toBe(1);
-      expect(r.asked[0]?.question).toMatch(/couldn't read .*(Dependabot|Codespaces)/);
+      const lines = r.asked[0]?.question.split('\n') ?? [];
+      expect(lines.length).toBe(2);
+      expect(lines[1]).toMatch(/^pipegen couldn't read .*(Dependabot|Codespaces)/);
+      expect(lines.every((l) => l.length <= 300)).toBe(true);
       expect(r.out.unchecked?.join(' ')).toMatch(/Dependabot|Codespaces/);
     }
     // every secret list and the refs are read again after the typed name
@@ -1243,11 +1251,12 @@ describe('V3 fix round 2', () => {
     const sha = (n: number) => String(n).repeat(40).slice(0, 40);
     const mk = () => api((route) => {
       if (route === 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}') return { sha: SHA, tree: { sha: SHA } };
+      if (route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}') return { truncated: false, tree: [{ path: '.github/CODEOWNERS', sha: sha(3), mode: '100644', type: 'blob' }] };
       if (route === 'POST /repos/{owner}/{repo}/git/trees') return { sha: sha(1) };
       if (route === 'POST /repos/{owner}/{repo}/git/commits') return { sha: sha(2) };
       return {};
     });
-    const edit = (path: string, originalSha: string | null): InstallRecord['edits'][number] => ({ repo: 'central', path, kind: 'codeowners', inserted: 'x', originalSha, writtenShas: [] });
+    const edit = (path: string, originalSha: string | null): InstallRecord['edits'][number] => ({ repo: 'central', path, kind: 'codeowners', inserted: 'x', originalSha, writtenShas: [sha(3)] });
     const file = (path: string) => ({ path, content: '* @evil\n', mode: '100644' });
     const commit = (a: UninstallApi, files: { path: string; content: string; mode: string }[], deletes: string[], recordEdits?: InstallRecord['edits']) =>
       a.commitUninstall('central', { parent: SHA, baseTree: SHA, files, deletes, message: 'm', ...(recordEdits === undefined ? {} : { recordEdits }) });
@@ -1298,15 +1307,14 @@ describe('V3 fix round 2', () => {
       return out;
     };
     // Actions permissions: Actions turned off since, narrowed, or the pin already off → kept; never turned back on or widened
-    const off = await keptNoWrite(api(settingsNow({ perms: { enabled: false, sha_pinning_required: true } })), perms, { ...app, enabled: true, sha_pinning_required: false });
-    expect(off).toMatchObject({ manual: expect.stringContaining('repos/acme/shop/actions/permissions') });
+    await keptNoWrite(api(settingsNow({ perms: { enabled: false, sha_pinning_required: true } })), perms, { ...app, enabled: true, sha_pinning_required: false });   // no manual step: R2b M-r2-3
     await keptNoWrite(api(settingsNow({ perms: { enabled: true, allowed_actions: 'selected', sha_pinning_required: true } })), perms, { ...app, enabled: true, allowed_actions: 'all', sha_pinning_required: false });
     await keptNoWrite(api(settingsNow({ perms: { enabled: true, allowed_actions: 'all', sha_pinning_required: false } })), perms, { ...app, enabled: true, sha_pinning_required: false });
     await keptNoWrite(api(settingsNow({ perms: {} })), perms, { ...app, enabled: true, sha_pinning_required: false });
-    // as pipegen set it: only the pin is sent back, allowed_actions never
+    // as pipegen set it: the pin is sent back, with GitHub's allowed_actions as they are (R2b M-r2-2)
     const p = api(settingsNow({ perms: { enabled: true, allowed_actions: 'selected', sha_pinning_required: true } }));
     expect(await p.api.write(perms, { ...app, enabled: true, allowed_actions: 'selected', sha_pinning_required: false })).toEqual({ status: 'done' });
-    expect(p.writes()).toEqual([{ route: perms, params: { ...app, enabled: true, sha_pinning_required: false } }]);
+    expect(p.writes()).toEqual([{ route: perms, params: { ...app, enabled: true, allowed_actions: 'selected', sha_pinning_required: false } }]);
     // Dependabot alerts already off → kept, nothing sent; on → DELETE
     await keptNoWrite(api(settingsNow({ alerts: 404 })), 'DELETE /repos/{owner}/{repo}/vulnerability-alerts', app);
     // secret scanning: only the switch still on is turned off; both off already, or unknown → kept
@@ -1329,5 +1337,134 @@ describe('V3 fix round 2', () => {
     expect(ok.writes()).toEqual([{ route: access, params: central }]);
     // each live read comes after the repo id check and right before its write
     expect(ok.calls.map((c) => c.route)).toEqual(['GET /repos/{owner}/{repo}', 'GET /repos/{owner}/{repo}/actions/permissions/access', access]);
+  });
+
+  describe('V3 fix round 2b (ruling V3-R2b)', () => {
+    const app = { owner: OWNER, repo: 'shop' };
+    const perms = 'PUT /repos/{owner}/{repo}/actions/permissions';
+    const patch = 'PATCH /repos/{owner}/{repo}';
+    const alerts = 'DELETE /repos/{owner}/{repo}/vulnerability-alerts';
+
+    it('R2b sec M-r2-2: the pin restore sends GitHub\'s allowed_actions back as they are; an unknown value keeps the setting', async () => {
+      for (const allowed of ['all', 'local_only', 'selected']) {
+        const f = api(settingsNow({ perms: { enabled: true, allowed_actions: allowed, sha_pinning_required: true } }));
+        expect(await f.api.write(perms, { ...app, enabled: true, sha_pinning_required: false }), allowed).toEqual({ status: 'done' });
+        expect(f.writes()).toEqual([{ route: perms, params: { ...app, enabled: true, allowed_actions: allowed, sha_pinning_required: false } }]);
+      }
+      for (const allowed of [undefined, null, 'everything', 1]) {
+        const f = api(settingsNow({ perms: { enabled: true, allowed_actions: allowed, sha_pinning_required: true } }));
+        const out = await f.api.write(perms, { ...app, enabled: true, sha_pinning_required: false });
+        expect(out.status, String(allowed)).toBe('kept');
+        expect(out).toMatchObject({ manual: expect.stringContaining('repos/acme/shop/actions/permissions') });
+        expect(f.writes()).toEqual([]);
+      }
+    });
+
+    it('R2b sec M-r2-1: Dependabot alerts stay on while security updates are on (or unknown); secret scanning stays on while another secret_scanning switch is on', async () => {
+      for (const autofix of [{ enabled: true, paused: false }, { enabled: true, paused: true }, {}, 403, 404, 500]) {
+        const f = api(settingsNow({ autofix }));
+        const out = await f.api.write(alerts, app);
+        expect(out.status, JSON.stringify(autofix)).toBe('kept');
+        expect(out).toMatchObject({ manual: expect.stringMatching(/Dependabot security updates[\s\S]*Dependabot alerts/) });
+        expect(f.writes()).toEqual([]);
+      }
+      const off = api(settingsNow({ autofix: { enabled: false, paused: false } }));
+      expect(await off.api.write(alerts, app)).toEqual({ status: 'done' });
+      expect(off.calls.map((c) => c.route)).toEqual(['GET /repos/{owner}/{repo}', 'GET /repos/{owner}/{repo}/vulnerability-alerts', 'GET /repos/{owner}/{repo}/automated-security-fixes', alerts]);
+
+      const both = { ...app, security_and_analysis: { [SS]: { status: 'disabled' }, [SP]: { status: 'disabled' } } };
+      for (const extra of [`${SS}_validity_checks`, `${SS}_non_provider_patterns`, `${SS}_ai_detection`, `${SS}_delegated_bypass`]) {
+        const f = api(settingsNow(), { repo: { security_and_analysis: { ...pipegenSa.security_and_analysis, [extra]: { status: 'enabled' } } } });
+        const out = await f.api.write(patch, both);
+        expect(out.status, extra).toBe('kept');
+        expect(out).toMatchObject({ why: expect.stringContaining(extra), manual: expect.stringContaining(extra) });
+        expect(f.writes()).toEqual([]);
+      }
+      // secret scanning alone turned off while push protection (which needs it) stays on
+      const pp = api(settingsNow(), { repo: pipegenSa });
+      expect((await pp.api.write(patch, { ...app, security_and_analysis: { [SS]: { status: 'disabled' } } })).status).toBe('kept');
+      expect(pp.writes()).toEqual([]);
+      // a switch that is off, or not a secret_scanning one, doesn't keep it
+      const ok = api(settingsNow(), { repo: { security_and_analysis: { ...pipegenSa.security_and_analysis, [`${SS}_validity_checks`]: { status: 'disabled' }, advanced_security: { status: 'enabled' } } } });
+      expect(await ok.api.write(patch, both)).toEqual({ status: 'done' });
+    });
+
+    it('R2b sec M-r2-3: no manual step turns Actions back on; the shared central access level\'s step says to check the other projects first', async () => {
+      const off = await api(settingsNow({ perms: { enabled: false, sha_pinning_required: true } })).api.write(perms, { ...app, enabled: true, sha_pinning_required: false });
+      expect(off).not.toHaveProperty('manual');
+      const access = await api(settingsNow({ access: { access_level: 'enterprise' } })).api.write('PUT /repos/{owner}/{repo}/actions/permissions/access', { owner: OWNER, repo: 'pipelines', access_level: 'none' }, { pipegenSet: 'organization' });
+      expect(access).toMatchObject({ status: 'kept', manual: expect.stringMatching(/^Check first that no other project of acme\/pipelines relies on/) });
+    });
+
+    it('R2b sec M-r2-7: the all-refs answer must list the default branch, else the central repo is kept', async () => {
+      const r = await go({ refsAnswer: [] });
+      expect(r.deleted).toBe(false);
+      expect(r.out.why).toMatch(/refs\/heads\/main/);
+    });
+
+    it('R2b sec M-r2-8: a commit comment (or an unreadable list of them) keeps the central repo', async () => {
+      const ok = await go({});
+      expect(ok.out).toEqual({ deleted: true });
+      const reads = ok.calls.filter((c) => c.route === 'GET /repos/{owner}/{repo}/comments');
+      expect(reads.length).toBe(2);
+      expect(reads[0]?.params).toEqual({ owner: OWNER, repo: 'pipelines', per_page: 1 });
+      for (const comments of [[{ id: 1, body: 'note' }], 403, 500, {}] as W['comments'][]) {
+        const r = await go({ comments });
+        expect(r.deleted, JSON.stringify(comments)).toBe(false);
+        expect(r.out.why).toMatch(/comment/);
+      }
+    });
+
+    it('R2b sec M-r2-5: the central CODEOWNERS is deleted only while the parent tree holds a version pipegen wrote', async () => {
+      const sha = (n: number) => String(n).repeat(40).slice(0, 40);
+      const mk = (tree: unknown) => api((route) => {
+        if (route === 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}') return { sha: SHA, tree: { sha: SHA } };
+        if (route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}') return tree;
+        if (route === 'POST /repos/{owner}/{repo}/git/trees') return { sha: sha(1) };
+        if (route === 'POST /repos/{owner}/{repo}/git/commits') return { sha: sha(2) };
+        return {};
+      });
+      const created: InstallRecord['edits'] = [{ repo: 'central', path: '.github/CODEOWNERS', kind: 'codeowners', inserted: 'x', originalSha: null, writtenShas: [sha(3), sha(4)] }];
+      const entry = (s: string, over: Record<string, unknown> = {}) => ({ path: '.github/CODEOWNERS', sha: s, mode: '100644', type: 'blob', ...over });
+      const del = (a: UninstallApi) => a.commitUninstall('central', { parent: SHA, baseTree: SHA, files: [], deletes: ['.github/CODEOWNERS', 'installs/shop.json'], message: 'm', recordEdits: created });
+      for (const tree of [
+        { truncated: false, tree: [entry(sha(5))] },                    // the owner's version: a sha pipegen never wrote
+        { truncated: false, tree: [{ ...entry(sha(3)), path: 'CODEOWNERS' }] },   // not at the record's path
+        { truncated: false, tree: [] },
+        { truncated: true, tree: [entry(sha(3))] },                     // a partial list
+        { truncated: false, tree: [entry(sha(3), { type: 'commit' })] },
+        {},
+      ]) {
+        const g = mk(tree);
+        await expect(del(g.api), JSON.stringify(tree)).rejects.toBeInstanceOf(UninstallRefusal);
+        expect(g.writes()).toEqual([]);
+      }
+      const ok = mk({ truncated: false, tree: [{ path: 'README.md', sha: sha(6), mode: '100644', type: 'blob' }, entry(sha(4))] });
+      expect(await del(ok.api)).toEqual({ commit: sha(2), tree: sha(1) });
+      expect(ok.calls.filter((c) => c.route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}').map((c) => c.params)).toEqual([{ owner: OWNER, repo: 'pipelines', tree_sha: SHA, recursive: '1' }]);
+    });
+
+    it('R2b sec M-r2-4: the scan takes the Octokit namespaces from a client and refuses destructured, aliased, ?., bracket and .call forms and code inside ${…}', () => {
+      expect(OCTOKIT_NAMESPACES).toEqual(expect.arrayContaining(['repos', 'pulls', 'git', 'issues', 'campaigns', 'codeSecurity', 'credentials', 'enterpriseTeamMemberships', 'enterpriseTeamOrganizations', 'enterpriseTeams', 'hostedCompute', 'privateRegistries']));
+      for (const bad of [
+        // a namespace destructured or aliased
+        'const { repos } = gh;', 'const { repos: r } = api.gh;', 'const { rest: { repos } } = gh;', 'const { git, pulls } = this.gh;', 'const r = gh.repos;', 'const r = gh.rest;', 'const r = api.gh?.pulls;',
+        // ?. anywhere in the chain
+        'await gh?.repos.delete(p);', 'await gh.repos?.delete(p);', 'await gh?.repos?.delete(p);', 'await gh.repos.delete?.(p);', 'await gh.rest?.repos.delete(p);',
+        // a bracket after (or around) a namespace
+        'await gh.repos[\'delete\'](p);', 'await gh.repos[m](p);', 'await gh.repos?.[m](p);', 'await gh[\'repos\'].delete(p);', 'await gh.rest[\'git\'].deleteRef(p);',
+        // .call / .apply / .bind on an endpoint method
+        'await gh.repos.delete.call(gh, p);', 'await gh.pulls.update.apply(gh, [p]);', 'const f = gh.git.deleteRef.bind(gh);',
+        // code inside a template literal's ${…}
+        'const s = `${await gh.repos.delete(p)}`;', 'const s = `a ${`b ${gh.git.deleteRef(p)}`} c`;', 'const s = `${{ x: 1 }.x} ${gh.request(r)}`;',
+        // the namespaces the hand-written list missed
+        'await o.codeSecurity.deleteConfiguration(p);', 'await o.privateRegistries.deleteOrgPrivateRegistry(p);', 'await o.hostedCompute.deleteNetworkConfigurationFromOrg(p);',
+        'await o.campaigns.deleteCampaign(p);', 'await o.credentials.revoke(p);', 'await o.enterpriseTeams.delete(p);', 'await o.enterpriseTeamMemberships.remove(p);', 'await o.enterpriseTeamOrganizations.delete(p);',
+      ]) expect(scanProblems('plan.ts', bad), bad).not.toEqual([]);
+      for (const ok of [
+        'const n = d.issues[0];', 'const s = `${d.issues.length} issues`;', 'const s = `gh.repos.delete(p)`;', 'const open = d.issues?.filter((x) => x.open);',
+        'const s = `${a}-${b}`;', 'if (x) { const y = `${z}`; }', 'const t = { a: `${b}` };',
+      ]) expect(scanProblems('plan.ts', ok), ok).toEqual([]);
+    });
   });
 });
