@@ -24,7 +24,7 @@ import { NEED_IDS, toolCoversNeed } from './need-ids.js';
 import type { PlatformActions } from './pin.js';
 import { tuningProblems } from './tuning.js';
 import { APP_RUNNING_CATEGORIES, projectScriptSteps, renderCliTool, renderRangeScan, repoToolSteps, sha16, type CliHooks, type RenderOptions } from './render-cli.js';
-import { ArtifactNameError, resultArtifactName, SECRETS_RANGE_ARTIFACT } from './artifact-names.js';
+import { ArtifactNameError, resultArtifactName, SECRETS_HISTORY_ARTIFACT, SECRETS_RANGE_ARTIFACT } from './artifact-names.js';
 import { repoToolFor, type ProjectScriptStep, type RepoToolStep } from './reviewed.js';
 import { own, RenderError, show } from './render-error.js';
 import { BASE_CHECKOUT_ID, BASELINE_CHECK_STEP_ID, checkExpressions, checkJobOrder, isDangerousName, isReviewed, narrowingChoiceProblem, STEP_KEYS, type JobContext, type RenderedStep, type ScanFact } from './job-rules.js';
@@ -514,7 +514,7 @@ export function renderScrub(artifact: string, rawPath: string, tool: string, for
   const out = scrubbedPath(rawPath);
   // C1c: the scrub of a secrets scan reads the stage folder's manifest, to map the findings back and to prove coverage by the canaries; the
   // commit-range scan (C9) reads the history, not a stage folder (its canaries are commits: the range facts beside its raw result)
-  const staged: Record<string, string> = isStagedTool(tool) && artifact !== SECRETS_RANGE_ARTIFACT ? { stage: stagePath(artifact) } : {};
+  const staged: Record<string, string> = isStagedTool(tool) && artifact !== SECRETS_RANGE_ARTIFACT && artifact !== SECRETS_HISTORY_ARTIFACT ? { stage: stagePath(artifact) } : {};
   const step = actionStep(gate, 'pipegen: scrub the result', {}, { mode: 'scrub', artifact, tool, format, raw: rawPath, out, 'fp-key': '${{ secrets.PIPEGEN_FP_KEY }}', ...staged });
   return { id: scrubStepId(artifact), ...step, if: 'always()' };
 }
@@ -562,6 +562,20 @@ export function renderRangeBlock(tool: ReviewedTool, platform: PlatformActions, 
   const artifact = SECRETS_RANGE_ARTIFACT;
   const scrub = renderScrub(artifact, out.path, tool.id, 'sarif', gate);
   return { steps: [...result.steps, scrub, renderUpload(artifact, scrubbedPath(out.path), platform)], artifact, scan, result };
+}
+
+/**
+ * G15a round 4 (b1, P-4): the nightly full-history secrets block, the range block's twin under SECRETS_HISTORY_ARTIFACT: the reviewed
+ * betterleaks entry's install, the history scan (renderRangeScan mode history), its scrub (no stage folder; the history facts) and its upload.
+ * The job's checkout takes the whole history (`result.fullHistory`).
+ */
+export function renderHistoryBlock(tool: ReviewedTool, platform: PlatformActions, gate: ReviewedTool): { steps: RenderedStep[]; artifact: string; scan: { stepId: string; fact: ScanFact }; result: RenderResult } {
+  if (!isReviewed(tool.candidate)) throw new RenderError(`${show(tool.id)} is not a reviewed tool, and pipegen never renders a tool that isn't.`);
+  const result = renderRangeScan(tool, 'history');
+  const out = result.output as NonNullable<RenderResult['output']>;
+  const scan = scanFactOf(result, tool.id) as { stepId: string; fact: ScanFact };
+  const artifact = SECRETS_HISTORY_ARTIFACT;
+  return { steps: [...result.steps, renderScrub(artifact, out.path, tool.id, 'sarif', gate), renderUpload(artifact, scrubbedPath(out.path), platform)], artifact, scan, result };
 }
 
 /** G15a round 3 (PF-3): the Scorecard result's artifact and the id of the step that moves its raw file under the runner temp folder. */

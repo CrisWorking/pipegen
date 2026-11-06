@@ -23,13 +23,13 @@
 //   tool needs at run time (image, local URL, Dockerfile, base ref) are slots from the render context (ruling B6): slots.ts.
 // Nothing here uploads (ruling B3).
 import { isDeepStrictEqual } from 'node:util';
-import { ArtifactNameError, RANGE_CANARY_FILES, RANGE_FACTS_FILE, resultArtifactName, SECRETS_RANGE_ARTIFACT } from './artifact-names.js';
+import { ArtifactNameError, RANGE_CANARY_FILES, RANGE_FACTS_FILE, resultArtifactName, SECRETS_HISTORY_ARTIFACT, SECRETS_RANGE_ARTIFACT } from './artifact-names.js';
 import { ASSET_RE, COMMIT_SHA_RE, DIGEST_RE, isGitHubRepo, isNpmName, isPypiName, parseImageRef, pep503, SHA256_RE, SRI_SHA512_RE, TAG_RE } from './names.js';
 import { closureRootDependencies, loadNpmClosure, NpmClosureError, pinOk, type NpmPin } from './npm-closure.js';
 import { EXPR, own, refuse, show } from './render-error.js';
 import type { RenderContext, RenderedStep, RenderResult } from './render-step.js';
 import { slotProblem, type SlotKind } from './slots.js';
-import { ARGV_POLICIES, PIP_CLOSURES, PLAIN_REL_RE, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, runsRepoCode, sha16, TEST_COMMANDS, type ArgvPolicy } from './tool-flags.js';
+import { ARGV_POLICIES, HISTORY_STEP_ENV, historyScanStepId, PIP_CLOSURES, PLAIN_REL_RE, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, runsRepoCode, sha16, TEST_COMMANDS, type ArgvPolicy } from './tool-flags.js';
 
 export { sha16 };   // defined in tool-flags.ts (the job rules need it too); re-exported for the callers that import it from here
 import { EXTRA_RULES_AT, tuningEffects, type TuningEffects } from './tuning.js';
@@ -812,8 +812,14 @@ export const RANGE_PIPEGEN_NOTE = [
  * `{ skipped: 'no-range' }` and exits 0; the gate reads that as not applicable on those events only, and blocks on a pull request event.
  * Any other failure fails the step and leaves no raw result (the scrub then reports a tool error). A merge from the default branch brings
  * that branch's newer commits into the range: a secret there blocks too (false blocks only, fail closed).
+ * G15a round 4 (b1, P-4), mode `history`: the nightly scan of the whole history is this step with no base. Its only outside value is the
+ * commit the run checked out (HISTORY_STEP_ENV, 40 hex digits, in the checkout); the stream is every ref of the full checkout (`--all`: the
+ * branches and tags `fetch-depth: 0` fetched) plus the tip canary, so the order check, the octopus check and the scanner read the same
+ * revisions. It writes the history form of the facts (gate/src/range.ts HistoryFacts) under SECRETS_HISTORY_ARTIFACT, never a skip: with no
+ * head it fails. Not covered: refs the checkout did not fetch (pull request heads, deleted branches), and commit messages, as for the range.
  */
-export function renderRangeScan(tool: ReviewedTool): RenderResult {
+export function renderRangeScan(tool: ReviewedTool, mode: 'range' | 'history' = 'range'): RenderResult {
+  const history = mode === 'history';
   const pol = own(ARGV_POLICIES, tool.id);
   if (tool.id !== RANGE_TOOL || pol === undefined || pol.method !== 'github-release') return refuse(`The commit-range scan runs the reviewed ${RANGE_TOOL} entry only, not ${show(tool.id)}.`);
   const install = checkInstall(tool, pol);
@@ -821,7 +827,7 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
   if (config === null || !config.content.startsWith('[extend]\n')) return refuse(`The pinned config of ${show(tool.id)} does not start with its [extend] table, so the range scan can not put its prefilter first.`);
   const out = tool.step.output.path;
   if (!PLAIN_OUT_RE.test(out) || tool.step.output.format !== 'sarif') return refuse(`${show(tool.id)} does not write a SARIF file with a plain name.`);
-  const artifact = SECRETS_RANGE_ARTIFACT;
+  const artifact = history ? SECRETS_HISTORY_ARTIFACT : SECRETS_RANGE_ARTIFACT;
   const exe = pol.exe;
   const outDir = `$RUNNER_TEMP/pipegen-raw/${artifact}`;
   const zero = '0'.repeat(40);
@@ -833,6 +839,13 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
     `work="$RUNNER_TEMP/pipegen-work/${artifact}"`,
     'mkdir -p "$RUNNER_TEMP/pipegen-work"',
     'mkdir "$work"',
+    ...(history ? [
+    // G15a round 4 (b1): the whole history from the commit this run checked out (40 hex digits; no range, no skip)
+    'head="$PIPEGEN_HISTORY_HEAD"',
+    `case "$head" in *[!0-9a-f]*|"") pg_fail "the commit the run checked out is not given as a commit sha, so the history is not scanned" ;; esac`,
+    `[ "\${#head}" -eq 40 ] || pg_fail "the commit the run checked out is not given as a commit sha, so the history is not scanned"`,
+    `[ "$head" != ${zero} ] || pg_fail "the commit the run checked out is not given as a commit sha, so the history is not scanned"`,
+    ] : [
     // the range: this event's base, head and (on a synchronize) before, each a commit sha (the hex test also stops `HEAD~000…`, which git resolves)
     'base="$PIPEGEN_RANGE_BASE"',
     'head="$PIPEGEN_RANGE_HEAD"',
@@ -854,6 +867,7 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
     'event="$PIPEGEN_RANGE_EVENT"',
     'case "$event" in pull_request|pull_request_review|merge_group|push|workflow_dispatch|schedule|workflow_call) ;; *) pg_fail "the event name is not one the range scan knows, so it is not scanned" ;; esac',
     `if [ "$base" = ${zero} ] || [ "$head" = ${zero} ]; then skip no-range "this event has no commit range (a push that made the branch, workflow_dispatch or schedule), so no commit range is scanned"; fi`,
+    ]),
     'git=(',
     '  "${sys[@]}"',
     '  GIT_CONFIG_NOSYSTEM=1',
@@ -880,6 +894,7 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
     'case "$gmaj$gmin" in *[!0-9]*|"") pg_fail "the version of git could not be read, so merge commits can not be scanned" ;; esac',
     `if [ "$gmaj" -lt ${REMERGE_GIT[0]} ] || { [ "$gmaj" -eq ${REMERGE_GIT[0]} ] && [ "$gmin" -lt ${REMERGE_GIT[1]} ]; }; then pg_fail "git $gv can not show what a merge commit added (--remerge-diff needs git ${REMERGE_GIT.join('.')}), so the commit range is not scanned"; fi`,
     '"${git[@]}" cat-file -e "$head^{commit}" 2> /dev/null || pg_fail "the commit $head is not in the checkout: the secrets job checks out the whole history (fetch-depth: 0)"',
+    ...(history ? [] : [
     // fix round 2 (m2): a push that rewrote the branch (its old head is not an ancestor of the new one): scan from where they meet; when the
     // old head is gone from the checkout, there is no such point, and the push is not scanned (on a push the range is informational)
     'forced=false',
@@ -902,6 +917,7 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
     '  fi',
     '  revs+=("$before")',
     'fi',
+    ]),
     'gitdir="$("${git[@]}" rev-parse --absolute-git-dir)"',
     'if [ -L "$gitdir" ] || [ ! -d "$gitdir" ]; then pg_fail "the git folder of the checkout is not a real folder"; fi',
     // two canary commits on the head, each its parent's tree plus one canary file (local objects only, dated after every real commit)
@@ -926,7 +942,7 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
     'done',
     'last="$parent"',
     // the stream: everything reachable from the tip canary (and before), not from the base; the two canaries must be its last commits
-    '"${git[@]}" rev-list --reverse "^$base" "$last" "${revs[@]}" > "$work/order.txt"',
+    history ? '"${git[@]}" rev-list --reverse --all "$last" > "$work/order.txt"' : '"${git[@]}" rev-list --reverse "^$base" "$last" "${revs[@]}" > "$work/order.txt"',
     'want="$("${sys[@]}" wc -l < "$work/order.txt")"',
     'case "$want" in *[!0-9]*|"") pg_fail "the commits of the range could not be counted" ;; esac',
     '[ "$want" -ge 2 ] || pg_fail "the commits of the range could not be counted"',
@@ -934,7 +950,7 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
     '[ "$tail2" = "${canaries[0]} ${canaries[1]} " ] || pg_fail "a commit of the range is dated after the canary commits, so the canary is not the last commit the scanner reads and the stream can not be proven read to its end"',
     'own=$((want - 2))',
     // fix round 2 (m3): --remerge-diff shows nothing of a merge with three or more parents, so a range that holds one is not scanned
-    '"${git[@]}" rev-list --min-parents=3 "^$base" "$last" "${revs[@]}" > "$work/octopus.txt"',
+    history ? '"${git[@]}" rev-list --min-parents=3 --all "$last" > "$work/octopus.txt"' : '"${git[@]}" rev-list --min-parents=3 "^$base" "$last" "${revs[@]}" > "$work/octopus.txt"',
     'if [ -s "$work/octopus.txt" ]; then pg_fail "the commit range holds an octopus merge (commit $("${sys[@]}" head -n 1 -- "$work/octopus.txt"), three or more parents), whose own changes can not be shown, so the range is not scanned: merge one branch at a time"; fi',
     // the scanner runs from an empty folder whose .git file names the checkout's git folder (no ignore file of the checkout is read)
     'src="$work/src"',
@@ -942,7 +958,7 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
     'printf \'gitdir: %s\\n\' "$gitdir" > "$src/.git"',
     `printf '%s' "$PIPEGEN_CONFIG" > "$work/${config.fileName}"`,
     `out="$work/${out}"`,
-    'logopts="--reverse --remerge-diff --text ^$base $last${revs[0]:+ ${revs[0]}}"',
+    history ? 'logopts="--reverse --remerge-diff --text --all $last"' : 'logopts="--reverse --remerge-diff --text ^$base $last${revs[0]:+ ${revs[0]}}"',
     'cd -- "$src"',
     ...allowlist(FIXED_PATH, []),
     'rc=0',
@@ -955,18 +971,24 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
     'if [ -f "$out" ] && [ ! -L "$out" ]; then',
     '  mkdir -p "$RUNNER_TEMP/pipegen-raw"',
     `  mkdir "${outDir}"`,
-    '  bjson=null',
-    `  [ "$before" = ${zero} ] || bjson="\\"$before\\""`,
-    `  printf '{"pipegenRange":1,"base":"%s","head":"%s","before":%s,"forced":%s,"commits":%s,"canaries":[{"commit":"%s","path":"${c1}"},{"commit":"%s","path":"${c2}"}]}\\n' "$base" "$head" "$bjson" "$forced" "$own" "\${canaries[0]}" "\${canaries[1]}" > "${outDir}/${RANGE_FACTS_FILE}"`,
+    ...(history ? [
+      `  printf '{"pipegenRange":1,"history":true,"head":"%s","commits":%s,"canaries":[{"commit":"%s","path":"${c1}"},{"commit":"%s","path":"${c2}"}]}\\n' "$head" "$own" "\${canaries[0]}" "\${canaries[1]}" > "${outDir}/${RANGE_FACTS_FILE}"`,
+    ] : [
+      '  bjson=null',
+      `  [ "$before" = ${zero} ] || bjson="\\"$before\\""`,
+      `  printf '{"pipegenRange":1,"base":"%s","head":"%s","before":%s,"forced":%s,"commits":%s,"canaries":[{"commit":"%s","path":"${c1}"},{"commit":"%s","path":"${c2}"}]}\\n' "$base" "$head" "$bjson" "$forced" "$own" "\${canaries[0]}" "\${canaries[1]}" > "${outDir}/${RANGE_FACTS_FILE}"`,
+    ]),
     `  mv -- "$out" "${outDir}/${out}"`,
     `  chmod -R a-w "${outDir}"`,
     'else',
     '  pg_fail "the tool left no regular result file"',
     'fi',
   ]);
-  const env: Record<string, string> = { ...RANGE_STEP_ENV, PIPEGEN_CONFIG: RANGE_PREFILTER + config.content };
+  const env: Record<string, string> = { ...(history ? HISTORY_STEP_ENV : RANGE_STEP_ENV), PIPEGEN_CONFIG: RANGE_PREFILTER + config.content };
   return {
-    steps: [releaseInstall(tool, install, exe, artifact), runStep('pipegen: scan the pull request\'s commits for secrets', run, env, rangeScanStepId)],
+    steps: [releaseInstall(tool, install, exe, artifact), history
+      ? runStep('pipegen: scan the whole history for secrets', run, env, historyScanStepId)
+      : runStep('pipegen: scan the pull request\'s commits for secrets', run, env, rangeScanStepId)],
     output: { path: `\${{ runner.temp }}/pipegen-raw/${artifact}/${out}`, format: 'sarif' },
     fullHistory: true,
   };

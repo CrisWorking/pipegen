@@ -5,7 +5,7 @@
 
 import { createHash } from 'node:crypto';
 import { NEED_CATEGORIES, RESULT_ARTIFACT_PREFIX, type PackageManager } from '../types.js';
-import { BASELINE_ARTIFACT, CLEAN_RUN_ARTIFACT, GATE_RESULT_ARTIFACT, SECRETS_RANGE_ARTIFACT, SECRETS_RANGE_TOOL } from './artifact-names.js';
+import { BASELINE_ARTIFACT, CLEAN_RUN_ARTIFACT, GATE_RESULT_ARTIFACT, SECRETS_HISTORY_ARTIFACT, SECRETS_RANGE_ARTIFACT, SECRETS_RANGE_TOOL } from './artifact-names.js';
 import type { SlotKind } from './slots.js';
 import { isLockfileKind, TRIVY_LICENCE_LOCKFILES } from './licence-lockfiles.js';
 // the gate's policy rule (C2): a leaf that imports only types.ts, so the engine and the gate check a policy with one function
@@ -913,6 +913,13 @@ export const RANGE_EVENT_REF = '${{ github.event_name }}';
 export const RANGE_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_RANGE_BASE: BASE_CHECKOUT_REF, PIPEGEN_RANGE_HEAD: RANGE_HEAD_REF, PIPEGEN_RANGE_BEFORE: RANGE_BEFORE_REF, PIPEGEN_RANGE_EVENT: RANGE_EVENT_REF });
 /** C9: the id of the commit-range scan step (a checker step: the hash of the range artifact). */
 export const rangeScanStepId = `checker-run-${sha16(SECRETS_RANGE_ARTIFACT)}`;
+/**
+ * G15a round 4 (b1, P-4): the env of the nightly full-history scan step that holds an expression: exactly the commit the run checked out
+ * (the scan starts from it; every other ref of the full checkout is read too), on that step only.
+ */
+export const HISTORY_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_HISTORY_HEAD: '${{ github.sha }}' });
+/** G15a round 4 (b1): the id of the full-history scan step (a checker step: the hash of the history artifact). */
+export const historyScanStepId = `checker-run-${sha16(SECRETS_HISTORY_ARTIFACT)}`;
 
 /**
  * Ruling S15: the inputs the renderer sets on a platform action, by the same `owner/repo[/path]` key as ACTION_POLICIES,
