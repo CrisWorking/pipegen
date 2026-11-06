@@ -37,7 +37,9 @@ function usage(): string[] {
     '  pipegen inspect    Read this repo and its GitHub settings and print a summary. Read-only; no AI.',
     '  pipegen run        The full setup: reads the repo, asks before anything costs money or reaches an AI, builds the',
     '                     pipeline and opens one setup pull request you review once it has passed a proof on a private',
-    '                     test copy. This version has no proof step yet, so run stops before it asks to spend anything.',
+    '                     test copy (the proof), with its keys and branches cleaned up right after.',
+    '  pipegen resume     Goes on with a run that stopped or was interrupted during its proof: it checks the saved draft',
+    '                     again, then proves it again (or delivers it, when its proof had passed). Takes no --skip, --type or --strictness.',
     '  pipegen finish     After you merge the setup pull request: applies the settings (branch rules, environments,',
     '                     variables). --print prints the commands instead; --rotate-key makes a new signing key pair.',
     '  pipegen verify     Compares the repo with what pipegen recorded and lists any drift (exit code 1 on drift).',
@@ -88,7 +90,7 @@ const OPTION_COMMANDS: Readonly<Record<string, readonly string[]>> = {
   type: ['audit', 'run'], skip: ['run'], strictness: ['run'], print: ['finish'], 'rotate-key': ['finish'],
 };
 /** The commands G13 adds (each reads the folder's origin; unsafeFolderStop first, ruling G13-R0 14). */
-const SETUP_COMMANDS: ReadonlySet<string> = new Set(['run', 'finish', 'verify', 'update', 'cleanup']);
+const SETUP_COMMANDS: ReadonlySet<string> = new Set(['run', 'resume', 'finish', 'verify', 'update', 'cleanup']);
 /** The option no command but `cmds` takes, as the one plain line. */
 function optionProblem(values: Record<string, unknown>, command: string): string | null {
   for (const [o, cmds] of Object.entries(OPTION_COMMANDS)) {
@@ -265,6 +267,8 @@ async function setupCommand(command: string, dir: string, values: { type?: strin
     if (command === 'run') {
       return await c.fullRun(dir, io, { flags: { types: types as Exclude<typeof types, string>, allowBroad, ...(values.skip === undefined ? {} : { skip: values.skip }), ...(values.strictness === undefined ? {} : { strictness: values.strictness }) }, local: { env: io.env }, state: { env: io.env } });
     }
+    // G14 (ruling G13-R0 10, G14-R0 Q3): the saved draft only; --skip, --type and --strictness are refused above (optionProblem)
+    if (command === 'resume') return await c.fullRun(dir, io, { resume: true, flags: { allowBroad }, local: { env: io.env }, state: { env: io.env } });
     if (command === 'cleanup') return await c.cleanup(dir, io, { allowBroad });
     const { app, g, token: t } = await c.connect(io, dir, { allowBroad, mode: command === 'verify' ? 'read' : 'write' });
     token = t;

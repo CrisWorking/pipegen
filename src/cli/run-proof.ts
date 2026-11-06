@@ -424,6 +424,23 @@ export function dropDeclined(out: FixOutcome, declined: ReadonlySet<string>): Fi
     : { ...out, draft };
 }
 
+/**
+ * A resumed run whose proof passed but whose cleanup didn't finish (stage proven): the same cleanup (cleanupAfterProof with the token's
+ * canDeleteRepos), then the stage cleaned.
+ */
+export function makeCleanupOnly(over: Partial<ProofOps> = {}) {
+  const o: ProofOps = { ...realProofOps, ...over };
+  return async (i: Pick<ProofInput, 'store' | 'gh' | 'vault' | 'io' | 'auth'>): Promise<CleanupResult> => {
+    const st0 = i.store.state;
+    if (st0 === null) throw new Error('The cleanup needs the run\'s state.');
+    const t = proofTarget(st0.app, { runId: st0.runId });
+    const keys = o.keys(i.gh, t, i.vault, { io: i.io, leftover: (x) => i.store.record(x) });
+    const r = await o.cleanup(i.gh, t, i.store, keys as unknown as ScratchKeys, { canDeleteRepo: i.auth.canDeleteRepos === true });
+    i.store.setStage('cleaned');
+    return r;
+  };
+}
+
 const stopLine = (why: string): string => `pipegen stopped: the proof did not pass (${safeText(why, 900)}), so nothing was delivered. exit code 2.`;
 
 /** The actions the proof runs: every pinned reviewed action (checkProofRepos checks the scratch repo's Actions settings against them). */

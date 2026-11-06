@@ -944,6 +944,31 @@ describe('G13: main dispatch', () => {
   };
   const mio = (cwd: string) => { const i = io({}, { cwd }); return i; };
 
+  it('main: argv → main → resume; help lists resume; resume refuses --skip, --type and --strictness', async () => {
+    const dir = repoDir();
+    const { got, cmds } = fakes();
+    expect(await main(['resume', '--dir', dir, '--allow-broad-token'], mio(tmpdir()), cmds)).toBe(0);
+    expect(got.fullRun?.[0]).toBe(dir);
+    expect(got.fullRun?.[2]).toMatchObject({ resume: true, flags: { allowBroad: true } });
+    expect((got.fullRun?.[2] as RunDeps).flags).toEqual({ allowBroad: true });
+    for (const bad of [['--skip', 'tests'], ['--type', 'app=static-site'], ['--strictness', 'starter']]) {
+      const f = fakes();
+      const e = mio(tmpdir());
+      expect(await main(['resume', '--dir', dir, ...bad], e, f.cmds)).toBe(1);
+      expect(e.errs.join('\n')).toMatch(new RegExp(`${bad[0]} works with pipegen (audit and pipegen )?run only`));
+      expect(f.got.fullRun).toBeUndefined();
+    }
+    const h = mio(tmpdir());
+    expect(await main(['--help'], h)).toBe(0);
+    expect(h.lines.join('\n')).toMatch(/pipegen resume\s+Goes on with a run that stopped/);
+    // fullRun itself refuses them too (a caller other than main)
+    const w = world();
+    const i = io();
+    expect(await fullRun('/repo', i, { ...w.deps, resume: true, flags: { skip: 'tests' } })).toBe(1);
+    expect(i.errs.join('\n')).toMatch(/resume takes no --skip, --type or --strictness/);
+    expect(w.calls).toEqual([]);
+  });
+
   it('main: argv → main → cleanupCommand (--dir, --allow-broad-token); help lists run, finish, verify, update, cleanup', async () => {
     const dir = repoDir();
     const { got, cmds } = fakes();
@@ -957,7 +982,9 @@ describe('G13: main dispatch', () => {
     expect(help).toMatch(/npx pipegen\s+Audit this folder/);
     // spec M5: the help says what run does in this version (no proof step yet: it stops before spending anything)
     expect(help).not.toMatch(/proves it on a private test copy, then opens/);
-    expect(help).toMatch(/no proof step yet, so run stops before it asks to spend anything/);
+    // G14: the proof exists now; the help says so (spec M5's "no proof step yet" is gone)
+    expect(help).toMatch(/test copy \(the proof\), with its keys and branches cleaned up right after/);
+    expect(help).not.toMatch(/no proof step yet/);
   });
 
   it('main: no command is still the audit; run, finish, verify, update take only their own flags', async () => {

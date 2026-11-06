@@ -170,7 +170,14 @@ describe('G14: the brief\'s tests (preflight §7 G14)', () => {
     expect(seen?.ai).toBe(w.meter.provider);
     expect(seen?.meters.ai).toBe(w.meter);
     expect(typeof seen?.dockerfileFor).toBe('function');
-    // the resume half is in the resume tests below (fullRun with resume)
+    // E-a6: a resumed run builds its meter on the SAVED aiCap (not a fresh estimate), then restores the spend so far
+    const r = await runWorld();
+    await savedRun(r.home, { then: 'interrupted', aiCap: 3, spent: 1.25 });
+    let m: { capUsd: number | null; usedUsd: number } | undefined;
+    r.deps.proof = async (x) => { m = { capUsd: x.ai.meter.capUsd, usedUsd: x.ai.meter.usedUsd }; return { ok: false }; };
+    await fullRun('/repo', r.io, { ...r.deps, resume: true });
+    expect(m?.capUsd).toBe(3);
+    expect(m?.usedUsd).toBeCloseTo(1.25, 6);
   });
 
   it('run: nextCandidate comes from Choice.ranked[1…] of the failing key through specFor', async () => {
@@ -503,5 +510,105 @@ describe('G14: the proof inside pipegen run', () => {
     expect(await fullRun('/repo', a.io, a.deps)).toBe(0);
     expect(a.got.proofRepos?.[1]).toBe(true);
     expect(at(a.tl, 'arm')).toBeLessThan(at(a.tl, 'stage:proofRepos'));
+  });
+});
+
+// ---------- pipegen resume ----------
+/** A saved run of CrisWorking/r in `home`: the pre-fix draft saved at proving, then the proof's verdict with the AI-fixed draft. */
+async function savedRun(home: string, o: { ok?: boolean; stoppedBy?: 'proof-failed' | 'ai-cost'; then?: 'interrupted' | 'cleaned'; aiCap?: number; spent?: number } = {}) {
+  const p = profile({ owner: OWN, repo: 'r', private: false, monorepo: 'none', services: [svc({ name: 'app', path: '.', scripts: ['test', 'start'] })], generatedDirs: [] });
+  const pre = { profile: p, capabilities: CAPS, needs: [], steps: [], created: [{ repo: 'app', path: 'test/app.test.js', content: 'old\n', part: 'tests', reason: 'r' }], notProven: [], testDecisions: [], layersSkipped: [], scoreboard: [], requireDeployApproval: false, skipped: [], suggestions: [] } as unknown as PipelineDraft;
+  const fixed = { ...pre, created: [{ repo: 'app', path: 'test/app.test.js', content: 'fixed by the AI\n', part: 'tests', reason: 'r', aiEdited: true }] } as PipelineDraft;
+  const s = await StateStore.open(p, { home, env: {} });
+  s.begin(RUN_ID, { owner: OWN, repo: 'r', private: false, ownerType: 'User', defaultBranch: 'main' }, { cap: 100, aiCap: o.aiCap ?? 5 });
+  for (const x of ['planned', 'debated', 'created'] as const) s.setStage(x);
+  s.update((n) => { n.draft = pre; });
+  s.setStage('proving');
+  s.saveMeters({ aiUsedUsd: o.spent ?? 0 });
+  if (o.ok === true) {
+    s.recordVerdict({ ok: true, draft: fixed });
+    s.setStage('proven');
+    if (o.then === 'cleaned') s.setStage('cleaned');
+  } else {
+    if (o.stoppedBy === 'ai-cost') s.setStage('stopped', { stoppedBy: 'ai-cost' });
+    s.recordVerdict({ ok: false, draft: fixed, stopped: 'the proof failed' });
+    if (s.state?.stage === 'proving') s.setStage('stopped', { stoppedBy: 'proof-failed' });
+  }
+  if (o.then === 'interrupted') s.setStage('interrupted');
+  return { pre, fixed };
+}
+
+describe('G14: pipegen resume (S20, contracts §6 step 2)', () => {
+  it('run: failed proof returned, Ctrl-C at the preview, resume → proving, never delivery, never the pre-fix draft', async () => {
+    for (const stoppedBy of ['proof-failed', 'ai-cost'] as const) {
+      const w = await runWorld();
+      const { pre, fixed } = await savedRun(w.home, { stoppedBy, then: 'interrupted' });
+      let seen: { draft: PipelineDraft; stage: string | undefined; resume?: boolean; debate?: unknown } | undefined;
+      w.deps.proof = async (x) => { seen = { draft: x.draft, stage: x.store.state?.stage, resume: x.resume, debate: x.debate }; return { ok: false, stopped: 'pipegen stopped: the proof did not pass (again), so nothing was delivered. exit code 2.' }; };
+      expect(await fullRun('/repo', w.io, { ...w.deps, resume: true })).toBe(2);
+      expect(seen?.stage).toBe('proving');
+      expect(seen?.resume).toBe(true);
+      expect(seen?.debate).toBeUndefined();
+      // the AI-fixed draft the verdict saved (G0-R1 I2 for the cap stop), never the pre-fix one
+      expect(seen?.draft).toEqual(fixed);
+      expect(seen?.draft).not.toEqual(pre);
+      for (const s of ['preview', 'deliverCentral', 'deliver']) expect(w.calls).not.toContain(s);
+      expect(w.calls).not.toContain('consent');
+    }
+    // a proof that "passed" but whose seam never cleaned up: still no delivery
+    const w2 = await runWorld();
+    await savedRun(w2.home, { stoppedBy: 'proof-failed', then: 'interrupted' });
+    w2.deps.proof = async () => ({ ok: true });
+    expect(await fullRun('/repo', w2.io, { ...w2.deps, resume: true })).toBe(2);
+    expect(w2.calls).not.toContain('deliver');
+  });
+
+  it('resume: the saved draft is re-refereed and re-guarded before any push', async () => {
+    // a refusal of the saved draft stops before the proof (no GitHub write)
+    const bad = await runWorld({ built: () => ({ report: { ok: false, issues: [{ file: 'test/app.test.js', check: 'template', message: 'refused' }], demoted: [], notes: [] }, guardProblems: ['test/app.test.js: the guard refused it'] }) });
+    await savedRun(bad.home, { then: 'interrupted' });
+    let called = false;
+    bad.deps.proof = async () => { called = true; return { ok: false }; };
+    expect(await fullRun('/repo', bad.io, { ...bad.deps, resume: true })).toBe(2);
+    expect(called).toBe(false);
+    expect(bad.errs.join('\n')).toMatch(/did not pass its own checks/);
+    // a clean one: the saved draft is what the build judged, before the proof's first write
+    const good = await runWorld();
+    const { fixed } = await savedRun(good.home, { then: 'interrupted' });
+    let judged: PipelineDraft | undefined;
+    const build = good.stages.build as RunStages['build'];
+    good.stages.build = async (i) => { judged ??= i.draft; return build(i); };
+    good.deps.proof = async (x) => { good.tl.push('proof'); return { ok: false }; };
+    await fullRun('/repo', good.io, { ...good.deps, resume: true });
+    expect(judged).toEqual(fixed);
+    expect(at(good.tl, 'stage:build')).toBeLessThan(at(good.tl, 'proof'));
+  });
+
+  it('resume: a passed proof whose cleanup did not finish is cleaned, then delivered from cleaned; nothing proven again', async () => {
+    const w = await runWorld();
+    const { fixed } = await savedRun(w.home, { ok: true, then: 'interrupted' });
+    let proved = false;
+    w.deps.proof = async () => { proved = true; return { ok: false }; };
+    let cleaned = 0;
+    w.deps.cleanupOnly = async (i) => { cleaned++; i.store.setStage('cleaned'); return { repoDeleted: false, leftovers: [] }; };
+    expect(await fullRun('/repo', w.io, { ...w.deps, resume: true })).toBe(0);
+    expect(proved).toBe(false);
+    expect(cleaned).toBe(1);
+    expect(w.calls).toContain('deliver');
+    const s = await StateStore.open({ owner: OWN, repo: 'r' }, { home: w.home, env: {} });
+    expect(s.load()?.draft).toEqual(fixed);
+    expect(s.load()?.stage).toBe('delivered');
+  });
+
+  it('resume: nothing saved, already delivered, or stopped before the proof → nothing to resume (exit 1)', async () => {
+    const none = await runWorld();
+    expect(await fullRun('/repo', none.io, { ...none.deps, resume: true })).toBe(1);
+    expect(none.errs.join('\n')).toMatch(/no stopped run of this repository to resume/);
+    const early = await runWorld();
+    const s = await StateStore.open({ owner: OWN, repo: 'r' }, { home: early.home, env: {} });
+    s.begin(RUN_ID, { owner: OWN, repo: 'r', private: false, ownerType: 'User', defaultBranch: 'main' }, { cap: 1, aiCap: 1 });
+    s.setStage('interrupted');
+    expect(await fullRun('/repo', early.io, { ...early.deps, resume: true })).toBe(1);
+    expect(early.errs.join('\n')).toMatch(/stopped before its proof/);
   });
 });
