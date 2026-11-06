@@ -116,7 +116,7 @@ export interface FinishResult {
 type EnvEntry = InstallRecord['environments'][number];
 type VarEntry = InstallRecord['variables'][number];
 type SecretEntry = InstallRecord['secrets'][number];
-interface CoFacts { path: string | null; text: string; isSymlink: boolean; block: string | null }
+export interface CoFacts { path: string | null; text: string; isSymlink: boolean; block: string | null }
 interface Ctx {
   gh: Octokit; api: SettingsApi; app: RepoRef; central: RepoRef; clock: RateClock; deps: FinishDeps; print: boolean; rotate: boolean;
   rec: InstallRecord; typed: boolean; planned: InstallPlanned; fresh: LockPlan; profile: RepoProfile; caps: Capabilities; shaRead: ShaPinningRead;
@@ -239,7 +239,7 @@ function ownersOf(block: string | null): string[] {
   for (const line of block.split('\n').slice(1, -1)) for (const t of line.trim().split(/\s+/).slice(1)) if (/^@[A-Za-z0-9-]+$/.test(t) && !out.includes(t)) out.push(t);
   return out;
 }
-async function coFacts(gh: Octokit, r: RepoRef, entries: ReadonlyMap<string, TreeEntry>, clock: RateClock): Promise<CoFacts> {
+export async function coFacts(gh: Octokit, r: RepoRef, entries: ReadonlyMap<string, TreeEntry>, clock: RateClock): Promise<CoFacts> {
   for (const path of CO_PLACES) {
     const e = entries.get(path);
     if (e === undefined) continue;

@@ -3,8 +3,8 @@
 // type with its evidence and asks "Is this right? (Y/n)"; No asks for each service's type (or "keep"). Repo text (service
 // names; the evidence holds only fixed wording and checked paths) is shown through safeText. Only a user cancel (Ctrl+C,
 // Esc) is 'cancel'; the CLI then exits 0 with nothing read from GitHub.
-import { SERVICE_TYPES, type TypeOverride } from '../read/project-type.js';
-import type { Service, ServiceType } from '../types.js';
+import { applyTypeOverrides, SERVICE_TYPES, type TypeOverride } from '../read/project-type.js';
+import type { RepoProfile, Service, ServiceType } from '../types.js';
 import { safeText } from '../util/safe-text.js';
 import { PromptCancelledError, type Prompter } from './io.js';
 
@@ -84,4 +84,23 @@ export function parseTypeFlags(values: readonly string[]): TypeOverride[] | stri
     out.push({ service, type: type as ServiceType });
   }
   return out;
+}
+
+/**
+ * The type step every command that reads services shares (the audit's step 2b; `run` stage 1, G13 carry 2), before any GitHub call:
+ * `--type` values checked against the services read (applyTypeOverrides throws for an unknown service or type); without them, at a
+ * terminal, the type question. `{ cancel: true }`: the user cancelled (exit 0, nothing read from GitHub). `{ error }`: a bad --type.
+ */
+export async function typeStep(prompt: Prompter, ask: boolean, local: { services: readonly Service[] }, flagTypes: readonly TypeOverride[]): Promise<{ overrides: readonly TypeOverride[] } | { cancel: true } | { error: string }> {
+  if (flagTypes.length > 0) {
+    try {
+      applyTypeOverrides(local as Pick<RepoProfile, 'services'>, flagTypes);
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : String(e) };
+    }
+    return { overrides: flagTypes };
+  }
+  if (!ask || local.services.length === 0) return { overrides: [] };
+  const answer = await confirmTypes(prompt, local.services);
+  return answer === 'cancel' ? { cancel: true } : { overrides: answer };
 }
