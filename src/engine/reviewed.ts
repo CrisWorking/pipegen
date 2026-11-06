@@ -158,8 +158,21 @@ const KEY_URL_RE = /^https:\/\/raw\.githubusercontent\.com\/([A-Za-z0-9-]{1,39})
  * by the sha256 of the reviewed binary, and the attestation is recorded in its entry comment as information only.
  */
 export const MUST_VERIFY: ReadonlySet<string> = new Set([
-  'betterleaks/betterleaks', 'aquasecurity/trivy', 'stackrox/kube-linter', 'securego/gosec',
+  'betterleaks/betterleaks', 'aquasecurity/trivy', 'stackrox/kube-linter', 'securego/gosec', 'cli/cli',
 ]);
+
+/**
+ * The one reviewed branch signer (G15a round 3, item c): cli/cli builds its releases with deployment.yml on trunk, started by
+ * workflow_dispatch, so its build-provenance attestation has no tag identity to bind. It is accepted only as this exact identity, a GitHub
+ * attestation of the pinned asset itself (the install package, whose sha256 is the pin), with the source commit the attestation recorded
+ * (sourceDigest). Checked live 2026-11-06 with an independent gh (progress LIVE line; L/fixtures-G15/v.json). Every other repo: tag only.
+ */
+export const BRANCH_SIGNERS: Readonly<Record<string, string>> = Object.freeze({
+  'cli/cli': 'https://github.com/cli/cli/.github/workflows/deployment.yml@refs/heads/trunk',
+});
+const COMMIT_RE = /^[0-9a-f]{40}$/;
+/** A MUST_VERIFY repo whose tool is not named like the repo: cli/cli's tool is gh (a repo or package named `cli` is not gh). */
+const MUST_VERIFY_TOOL: Readonly<Record<string, string>> = Object.freeze({ 'cli/cli': 'gh' });
 
 /**
  * A value pipegen writes into a workflow: bounded, never a workflow expression, and printable (one line; only a
@@ -227,6 +240,8 @@ const keylessSchema = z.strictObject({
   asset: z.string().max(255),
   identity: z.string().max(400),
   issuer: z.literal(OIDC_ISSUER),
+  /** The source commit the attestation records: required for a branch signer (BRANCH_SIGNERS), refused otherwise. */
+  sourceDigest: z.string().max(64).optional(),
   verifiedOn: z.string().max(10),
 });
 /** A check with a cosign key held in the entry's own repo (P10: kube-linter, gosec). */
@@ -636,7 +651,7 @@ function runsTool(e: Entry, repo: string, tool: string): boolean {
 function mustVerifyRepo(e: Entry): string | null {
   const name = lower(e.candidate.repo).split('/')[1];
   for (const r of MUST_VERIFY) {
-    const tool = r.slice(r.indexOf('/') + 1);
+    const tool = Object.hasOwn(MUST_VERIFY_TOOL, r) ? MUST_VERIFY_TOOL[r] as string : r.slice(r.indexOf('/') + 1);
     if (lower(e.candidate.repo) === r || name === tool || runsTool(e, r, tool)) return r;
   }
   return null;
@@ -667,6 +682,16 @@ function verifiedWithProblems(e: Entry): Problem[] {
     if (!SHA256_RE.test(v.keySha256)) bad("verifiedWith.keySha256 must be the key file's sha256 (64 hex characters)", 'keySha256');
     return out;
   }
+  const branchSigner = Object.hasOwn(BRANCH_SIGNERS, repo) ? BRANCH_SIGNERS[repo] : undefined;
+  if (branchSigner !== undefined && v.identity === branchSigner) {
+    // the reviewed branch signer: a GitHub attestation of the pinned asset, bound to the source commit it recorded
+    if (v.method !== 'github-attestation') bad(`verifiedWith.method must be github-attestation for ${c.repo}'s branch signer`, 'method');
+    if (v.sourceDigest === undefined || !COMMIT_RE.test(v.sourceDigest)) bad('verifiedWith.sourceDigest must be the source commit the attestation records (40 lowercase hex characters)', 'sourceDigest');
+    const pkg = e.step.cli?.install?.method === 'github-release' ? e.step.cli.install.package : undefined;
+    if (pkg === undefined || v.asset !== pkg) bad(`verifiedWith.asset must be the pinned install package (${pkg ?? 'none'}): a branch signer's attestation binds the asset itself`, 'asset');
+    return out;
+  }
+  if (v.sourceDigest !== undefined) bad(`verifiedWith.sourceDigest is recorded only for a reviewed branch signer; ${c.repo}'s identity is checked by its tag`, 'sourceDigest');
   const m = IDENTITY_RE.exec(v.identity);
   if (m === null) bad(`verifiedWith.identity must be the exact certificate identity https://github.com/${c.repo}/.github/workflows/<file>@refs/tags/${c.version} (never a regex, a branch or a commit)`, 'identity');
   else if (lower(`${m[1]}/${m[2]}`) !== repo) bad(`verifiedWith.identity is a workflow of ${m[1]}/${m[2]}, not of ${c.repo}`, 'identity');

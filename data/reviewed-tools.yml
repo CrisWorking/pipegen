@@ -832,8 +832,11 @@ tools:
   #   --source-ref, --signer-digest, --cert-identity, --deny-self-hosted-runners and --signer-workflow (pkg/cmd/attestation/verify/verify.go:259-268,
   #   read by the controller at the tag; not re-read offline here). --signer-workflow is a ^-anchored prefix regex with unescaped dots: pipegen
   #   uses it only together with --signer-digest. The live checklist runs each flag on this version.
-  # The release's build-provenance attestation is not checked yet (G15-R0 4): the controller checks it live with an independent gh before the
-  #   tag, then records verifiedWith here and adds cli/cli to MUST_VERIFY (src/engine/reviewed.ts) in the same change.
+  # verifiedWith: the release's build-provenance attestation, checked live 2026-11-06 with an independent gh 2.87.3 (`gh attestation verify
+  #   --repo cli/cli` on the pinned archive exits 0; a negative control exits 1). The subject is this archive's sha256 (the pin). Signer
+  #   deployment.yml@refs/heads/trunk (workflow_dispatch, github-hosted), issuer token.actions.githubusercontent.com, source commit 63837fb7…
+  #   cli/cli signs from a branch, so this identity is the one reviewed branch signer (BRANCH_SIGNERS in src/engine/reviewed.ts), bound to the
+  #   archive itself and the recorded source commit; cli/cli is on MUST_VERIFY.
   - id: gh
     categories: ["deploy-verify"]
     languages: ["any"]
@@ -857,6 +860,13 @@ tools:
     fixedInputs: {}
     choices: {}
     configFiles: []
+    verifiedWith:
+      method: github-attestation
+      asset: "gh_2.103.3_linux_amd64.tar.gz"
+      identity: "https://github.com/cli/cli/.github/workflows/deployment.yml@refs/heads/trunk"
+      issuer: "https://token.actions.githubusercontent.com"
+      sourceDigest: "63837fb778d6a39f02be0ce76ff89f2bc8d74bdc"
+      verifiedOn: "2026-11-06"
     reviewedBy: Claude delegated DECISIONS 105
     reviewedAt: "2026-11-06"
     proofs: 0

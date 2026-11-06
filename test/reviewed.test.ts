@@ -903,7 +903,8 @@ describe('loader rules (Plan P Task 5)', () => {
   it('reviewed: MUST_VERIFY repo without verifiedWith refused', () => {
     // ruling P12: jscpd is pinned by sha256 only (branch-signed release, advisory check, DEC #93); ruling P16: so is
     // hadolint, whose v2.15.1 attestation is signed from refs/heads/master (no tag identity to bind it to)
-    expect([...MUST_VERIFY].sort()).toEqual(['aquasecurity/trivy', 'betterleaks/betterleaks', 'securego/gosec', 'stackrox/kube-linter']);
+    // G15a round 3 (item c): cli/cli joins, its gh release attestation checked live 2026-11-06 (BRANCH_SIGNERS)
+    expect([...MUST_VERIFY].sort()).toEqual(['aquasecurity/trivy', 'betterleaks/betterleaks', 'cli/cli', 'securego/gosec', 'stackrox/kube-linter']);
     expect(load([jscpdEntry({ verifiedWith: null })])).toHaveLength(1);
     const hadolint = rawFile().tools.find((t) => t.id === 'hadolint') as Entry;
     expect(hadolint.verifiedWith).toBeUndefined();
@@ -915,6 +916,7 @@ describe('loader rules (Plan P Task 5)', () => {
       'securego/gosec': (v, repo) => binEntry(repo ?? 'securego/gosec', { verifiedWith: v }),
     };
     for (const repo of MUST_VERIFY) {
+      if (repo === 'cli/cli') continue;   // the real gh entry, below (its own pinnedOn and its branch signer; test/g15-gh.test.ts)
       const make = entries[repo] as (v: Entry | null, repo?: string) => Entry;
       rejects([make(null)], /verifiedWith is required/);
       rejects([make(null, repo.toUpperCase())], /verifiedWith is required/);
@@ -923,6 +925,12 @@ describe('loader rules (Plan P Task 5)', () => {
       const v = verified(repo);
       expect(load([make(v)])[0]?.verifiedWith, repo).toEqual(v); // it stays on the ReviewedTool (PS24)
     }
+    // cli/cli's tool is gh: the real entry without its check, or under another owner or name, is refused; a repo named `cli` is not gh
+    const ghReal = (): Entry => structuredClone(rawFile().tools.find((t) => t.id === 'gh') as Entry);
+    expect(loadAtReal([ghReal()])[0]?.verifiedWith).toMatchObject({ method: 'github-attestation' });
+    const noCheck = (repo: string): Entry => { const e = ghReal(); delete e.verifiedWith; e.candidate = { ...e.candidate, repo, name: repo }; return e; };
+    for (const r of ['cli/cli', 'CLI/cli', 'someone/gh', 'someone/mirror']) expect(() => loadAtReal([noCheck(r)]), r).toThrow(/verifiedWith is required/);
+    expect(load([binEntry('someone/cli')])).toHaveLength(1);
     // found by what it runs, whatever the repo is called
     rejects([binEntry('someone/scanner', { command: ['kube-linter', 'lint'], args: [] })], /verifiedWith is required/);
     // any entry may record one; it is checked the same way
@@ -1822,7 +1830,8 @@ describe('data/reviewed-tools.yml', () => {
     for (const t of list) {
       const must = [...MUST_VERIFY].some((r) => t.candidate.repo.toLowerCase() === r);
       expect(t.verifiedWith !== undefined, t.id).toBe(must);
-      if (t.verifiedWith !== undefined) expect(t.verifiedWith.verifiedOn, t.id).toBe(pinnedDay);
+      // an entry with its own pinnedOn (gh, G15a) is checked on that day
+      if (t.verifiedWith !== undefined) expect(t.verifiedWith.verifiedOn, t.id).toBe(t.id === 'gh' ? '2026-11-06' : pinnedDay);
     }
     // key-based checks (P10): the upstream key file at the entry's tag, pinned by its sha256
     expect(byId(list, 'kube-linter')[0]?.verifiedWith).toEqual({

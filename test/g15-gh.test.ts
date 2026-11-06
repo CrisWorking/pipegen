@@ -64,6 +64,50 @@ describe('G15a carries 5-7: the reviewed pinned gh entry', () => {
     }
   });
 
+  it('reviewed: the gh entry records its live attestation check (deployment.yml on trunk, the issuer, the source commit) and cli/cli is on MUST_VERIFY', () => {
+    // the LIVE line of 2026-11-06: gh attestation verify --repo cli/cli exits 0 for the pinned linux amd64 archive (L/fixtures-G15/v.json)
+    const gh = loadReviewed().find((t) => t.id === GH_ID);
+    expect(MUST_VERIFY.has('cli/cli')).toBe(true);
+    expect(gh?.verifiedWith).toEqual({
+      method: 'github-attestation', asset: 'gh_2.103.3_linux_amd64.tar.gz',
+      identity: 'https://github.com/cli/cli/.github/workflows/deployment.yml@refs/heads/trunk',
+      issuer: 'https://token.actions.githubusercontent.com', sourceDigest: '63837fb778d6a39f02be0ce76ff89f2bc8d74bdc', verifiedOn: '2026-11-06',
+    });
+    const file = raw();
+    const tryLoad = (patch: (e: Obj) => void): (() => unknown) => {
+      const e = structuredClone(ghRaw());
+      patch(e);
+      const dir = makeTempDir();
+      writeIn(dir, 'reviewed-tools.yml', stringify({ pinnedOn: file.pinnedOn, tools: [e] }));
+      return () => loadReviewed(`${dir}/reviewed-tools.yml`);
+    };
+    const vw = (e: Obj): Obj => e.verifiedWith as Obj;
+    expect(tryLoad(() => undefined)).not.toThrow();
+    // a branch-signed identity is accepted only as the one reviewed signer of this repo, a GitHub attestation of the pinned asset itself,
+    // with the source commit recorded: anything else is the tag-only rule's refusal
+    expect(tryLoad((e) => { delete vw(e).sourceDigest; })).toThrow(/sourceDigest/);
+    expect(tryLoad((e) => { vw(e).sourceDigest = '63837fb'; })).toThrow(ReviewedListError);
+    expect(tryLoad((e) => { vw(e).sourceDigest = '63837FB778D6A39F02BE0CE76FF89F2BC8D74BDC'; })).toThrow(ReviewedListError);
+    expect(tryLoad((e) => { vw(e).method = 'cosign-bundle'; })).toThrow(/github-attestation/);
+    expect(tryLoad((e) => { vw(e).asset = 'gh_2.103.3_checksums.txt'; })).toThrow(/asset/);
+    expect(tryLoad((e) => { vw(e).identity = 'https://github.com/cli/cli/.github/workflows/deployment.yml@refs/heads/main'; })).toThrow(/identity/);
+    expect(tryLoad((e) => { vw(e).identity = 'https://github.com/cli/cli/.github/workflows/other.yml@refs/heads/trunk'; })).toThrow(/identity/);
+    expect(tryLoad((e) => { vw(e).identity = 'https://github.com/evil/cli/.github/workflows/deployment.yml@refs/heads/trunk'; })).toThrow(/identity/);
+    expect(tryLoad((e) => { vw(e).issuer = 'https://example.com'; })).toThrow(ReviewedListError);
+    // a recorded source commit on a tag identity claims nothing the tag rule checks: refused, so it never reads as a binding
+    const trivy = structuredClone(raw().tools.find((t) => t.id === 'trivy-config') as Obj);
+    (trivy.verifiedWith as Obj).sourceDigest = '63837fb778d6a39f02be0ce76ff89f2bc8d74bdc';
+    const dir = makeTempDir();
+    writeIn(dir, 'reviewed-tools.yml', stringify({ pinnedOn: file.pinnedOn, tools: [trivy] }));
+    expect(() => loadReviewed(`${dir}/reviewed-tools.yml`)).toThrow(/sourceDigest/);
+    // the trunk identity is cli/cli's alone: another repo's entry may not claim a branch signer
+    const tb = structuredClone(raw().tools.find((t) => t.id === 'trivy-config') as Obj);
+    Object.assign(tb.verifiedWith as Obj, { method: 'github-attestation', identity: 'https://github.com/aquasecurity/trivy/.github/workflows/reusable-release.yaml@refs/heads/main', sourceDigest: '63837fb778d6a39f02be0ce76ff89f2bc8d74bdc' });
+    const dir2 = makeTempDir();
+    writeIn(dir2, 'reviewed-tools.yml', stringify({ pinnedOn: file.pinnedOn, tools: [tb] }));
+    expect(() => loadReviewed(`${dir2}/reviewed-tools.yml`)).toThrow(/identity/);
+  });
+
   it('reviewed: an entry pin day is never before the list\'s, never in the future, and its cooldown, review and check dates count from it', () => {
     const file = raw();
     const gh = structuredClone(ghRaw());
