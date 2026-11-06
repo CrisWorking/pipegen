@@ -505,12 +505,19 @@ describe('G13 finish: the real re-probe (carry 59)', () => {
     expect(r.workflowPins).toEqual({ tagPinned: 1, unchecked: false });
     expect(Object.keys(r.caps).sort()).toEqual(['attestations', 'branchProtection', 'codeScanning', 'deploymentBranchPolicies', 'envRequiredReviewers', 'environments', 'keylessSigningAllowed']);
     expect(r.caps.keylessSigningAllowed).toBe(false);   // a private repo
-    expect(typeof r.centralBranchProtection).toBe('boolean');
+    // G13-R1: the values, not only the keys (a private User repo on Pro: rulesets read, no environments or code scanning answer)
+    expect(r.caps).toEqual({ branchProtection: true, environments: false, deploymentBranchPolicies: false, envRequiredReviewers: false, attestations: false, codeScanning: false, keylessSigningAllowed: false });
+    expect(r.centralBranchProtection).toBe(true);
     // it read the app's and the central repo's capabilities, and the app's workflow file on its default branch
     const read = s.g.calls.map((c) => `${c.route} ${String(c.params.repo)}`);
     expect(read).toContain('GET /repos/{owner}/{repo}/rulesets r');
     expect(read).toContain('GET /repos/{owner}/{repo}/rulesets pipelines');
     expect(read.some((c) => c.startsWith('GET /repos/{owner}/{repo}/git/blobs/{file_sha} r'))).toBe(true);
+    // the central value is the central repo's own ruleset read: GitHub refusing rulesets there (an upgrade message) makes it false, the app's stays true
+    s.g.hooks.push((c) => (c.route === 'GET /repos/{owner}/{repo}/rulesets' && c.params.repo === 'pipelines' ? { status: 403, data: { message: 'Upgrade to GitHub Pro or make this repository public to enable this feature.' } } : undefined));
+    const r2 = await githubFinishProbe('o')(gh, { owner: 'o', repo: 'r' }, { private: true, ownerType: 'User', defaultBranch: 'main', centralDefaultBranch: 'main' }, [], clock());
+    expect(r2.caps.branchProtection).toBe(true);
+    expect(r2.centralBranchProtection).toBe(false);
   });
 });
 
