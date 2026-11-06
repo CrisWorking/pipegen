@@ -54,7 +54,8 @@ import { emptyRepoFiles } from '../read/quality.js';
 import { MAX_WORKFLOWS, tagPinnedOf, WORKFLOW_FILE } from '../read/workflows.js';
 import { PROTECTED_PATHS_BASE, type Capabilities, type CreatedFile, type EnvSettings, type ExistingWorkflow, type InstallEdit, type InstallPlanned, type InstallRecord, type Plan, type RepoProfile } from '../types.js';
 import { safeText } from '../util/safe-text.js';
-import { makeCosignKeyPair, type CosignExec, type CosignResolver } from './cosign-keys.js';
+import { generateCosignKeys } from '../layers/deploy.js';
+import type { CosignExec, CosignResolver } from './cosign-keys.js';
 import { ensureSigningEnvironment, plannedOfLocks, readEnv, SETUP_BRANCH } from './deliver.js';
 import { DeliverError, isoAt, readBlobText, readHead, readRepo, readTree, statusOf, type RepoRef, type TreeEntry } from './git-data.js';
 import { centralOf, centralUpdateBranch, localFinishPendingPath, readFinishPending, readLocalRecord, RecordError, writeFinishPending, writeRecord, type FinishPending, type LocalRecordDeps } from './record.js';
@@ -97,8 +98,13 @@ export interface FinishDeps {
   clock?: RateClock; now?: () => Date; local?: LocalRecordDeps;
   /** The trust question (G10-R-sec6): only an interactive run (a terminal, no --yes, not CI) may ask it. */
   io?: Prompter; interactive?: boolean;
-  /** Where the key pair is made (a fresh 0700 folder in it, removed after). Default: the OS temp folder. */
-  tmpDir?: string;
+  /**
+   * G13 (carry 28, BINDING): where the key pair is made, a fresh 0700 folder in it, removed after (generateCosignKeys). It must be a memory
+   * folder (tmpfs or ramfs), so the key never reaches a disk; anything else is refused before cosign runs. Default: /dev/shm.
+   */
+  keyBase?: string;
+  /** Test seam: whether a folder is a memory folder (default: the statfs check, isMemoryFolder). */
+  isMemory?: (dir: string) => boolean;
 }
 export interface FinishResult {
   applied: string[]; skipped: { what: string; why: string }[]; notes: string[];
@@ -677,7 +683,12 @@ async function signing(x: Ctx): Promise<void> {
     let made = false;
     let fresh = '';
     await step(x, whatKey, async () => {
-      const pair = await makeCosignKeyPair(x.deps.cosignBin, x.deps.exec, x.deps.tmpDir);
+      // G13 (carry 28): only in a memory folder (generateCosignKeys refuses any other, before cosign runs)
+      const keys = await generateCosignKeys(x.deps.cosignBin, {
+        ...(x.deps.exec === undefined ? {} : { exec: x.deps.exec }), ...(x.deps.keyBase === undefined ? {} : { base: x.deps.keyBase }),
+        ...(x.deps.isMemory === undefined ? {} : { isMemory: x.deps.isMemory }),
+      });
+      const pair = { key: keys.privateKey, password: keys.password, pub: keys.publicKey };
       const stores: [string, () => Promise<void>][] = [
         [COSIGN_KEY_SECRET, () => storeCosignKey(x.gh, x.app, SIGNING_ENVIRONMENT, pair.key, x.clock)],
         [PASSWORD_SECRET, () => storeEnvSecret(x.gh, x.app, SIGNING_ENVIRONMENT, PASSWORD_SECRET, pair.password, x.clock)],

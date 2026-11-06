@@ -3,10 +3,10 @@
 // the merge locks, the environments, the signing environment's key and PIPEGEN_COSIGN_PUB, PIPEGEN_BLOCK_FROM, sha pinning, then the central
 // ruleset and CODEOWNERS last, and updates the install record; `pipegen verify` reports drift between the repos and the record. Every GitHub
 // call goes to an in-memory GitHub (test/helpers/finish-github.ts); cosign is a fake exec; no network.
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { gitBlobSha } from '../src/create/guard.js';
 import { storeCosignKey, storeEnvSecret } from '../src/create/secrets.js';
@@ -14,10 +14,11 @@ import { centralWorkflowFile } from '../src/engine/central-path.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { pubKeySha256 } from '../src/engine/signing.js';
 import { ensureSigningEnvironment, plannedOfLocks, readEnv, SETUP_BRANCH } from '../src/deliver/deliver.js';
-import { finish, FinishError, FINISH_WRITE_ROUTES, type FinishDeps, type FinishProbe } from '../src/deliver/finish.js';
+import { finish, FinishError, FINISH_WRITE_ROUTES, githubFinishProbe, type FinishDeps, type FinishProbe } from '../src/deliver/finish.js';
 import { checkRecord, localFinishPendingPath, readLocalRecord, readRecord, recordHash, recordMarkerOf, writeFinishPending, writeLocalRecord, writeRecord } from '../src/deliver/record.js';
 import { SettingsApi } from '../src/deliver/settings-api.js';
 import { verify } from '../src/deliver/verify.js';
+import { isMemoryFolder } from '../src/layers/deploy.js';
 import { planLocks, type LockPlan } from '../src/layers/locks.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
 import type { Capabilities, CreatedFile, InstallPlanned, InstallRecord, Plan, RepoProfile } from '../src/types.js';
@@ -132,8 +133,12 @@ async function seed(o: SeedOpts = {}): Promise<Seed> {
     probes.push(g.calls.length);
     return { plan: plan.value, caps: caps.value, centralBranchProtection: caps.value.branchProtection || plan.value === 'unknown', workflowPins: { tagPinned: 0, unchecked: false } };
   };
+  // G13 (carry 28): finish makes the key pair with generateCosignKeys, only in a memory folder; the tests name a folder they treat as one
+  const shm = join(home, 'shm');
+  mkdirSync(shm);
   const deps = (over: Partial<FinishDeps> = {}): FinishDeps => ({
     out: (l) => { lines.push(l); }, probe, clock: clock(), now: () => new Date('2026-11-07T10:00:00Z'), local: { home, env: {} },
+    keyBase: shm, isMemory: (d) => d === shm,
     cosignBin: async () => { n++; resolves.push(`/opt/cosign-${n}`); return `/opt/cosign-${n}`; },
     exec: async (bin, args, opts) => {
       execs.push(bin);
@@ -144,7 +149,7 @@ async function seed(o: SeedOpts = {}): Promise<Seed> {
     },
     ...over,
   });
-  return { g, home, record, pin, pr, locks, lines, probes, resolves, execs, deps, caps, plan };
+  return { g, home, shm, record, pin, pr, locks, lines, probes, resolves, execs, deps, caps, plan };
 }
 
 const recordOn = async (s: Seed, branch?: string) => (await readRecord(s.g.octokit(), { owner: 'o', repo: 'pipelines' }, 'r', branch === undefined ? {} : { branch }))?.record as InstallRecord;
@@ -432,6 +437,80 @@ describe('G11 finish: print, rotate, the signing key', () => {
     await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, { rotateKey: true }, deps);
     // one resolve right before each exec, and each exec runs exactly the path just resolved (never one kept from before)
     expect(order).toEqual(['resolve /opt/cosign-1', 'exec /opt/cosign-1', 'resolve /opt/cosign-2', 'exec /opt/cosign-2']);
+  });
+});
+
+describe('G13 finish: the key pair only in memory (carry 28, BINDING)', () => {
+  /** A folder on a disk: the repo's own folder when the OS temp folder is a tmpfs. */
+  const diskFolder = (): string => {
+    for (const base of [tmpdir(), resolve(import.meta.dirname, '..')]) {
+      if (isMemoryFolder(base)) continue;
+      const d = mkdtempSync(join(base, '.pg-disk-'));
+      homes.push(d);
+      return d;
+    }
+    throw new Error('no disk-backed folder to test with');
+  };
+
+  it('finish: the cosign key is made in memory; no key file on a disk-backed folder', async () => {
+    const s = await seed({ keyEnv: true, keysStored: false });
+    const disk = diskFolder();
+    // the real memory check (no isMemory override) on a folder that is on a disk: refused before cosign runs
+    const res = await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, {}, s.deps({ keyBase: disk, isMemory: undefined }));
+    expect(s.execs).toEqual([]);
+    expect(s.resolves).toEqual([]);
+    expect(readdirSync(disk)).toEqual([]);
+    const why = res.skipped.find((x) => /signing key/.test(x.what))?.why ?? '';
+    expect(why).toMatch(/only in memory/);
+    expect(why).toMatch(/keyless signing/);
+    expect(why).not.toMatch(/npx pipegen finish/);
+    expect(s.g.repo('o/r').envs.get('pipegen-signing')?.stored.has('PIPEGEN_COSIGN_KEY') ?? false).toBe(false);
+    expect(envVarOf(s, 'pipegen-signing', 'PIPEGEN_COSIGN_PUB')).toBeUndefined();
+  });
+
+  it('finish: a memory folder gets the key pair, and the pair folder is gone afterwards', async () => {
+    const s = await seed({ keyEnv: true, keysStored: false });
+    const dirs: string[] = [];
+    const d = s.deps();
+    await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, {}, s.deps({
+      exec: async (bin, args, opts) => { dirs.push(opts.cwd); await (d.exec as NonNullable<FinishDeps['exec']>)(bin, args, opts); },
+    }));
+    expect(dirs).toHaveLength(1);
+    expect((dirs[0] as string).startsWith(`${s.shm}/`)).toBe(true);
+    expect(readdirSync(s.shm)).toEqual([]);
+    expect(envVarOf(s, 'pipegen-signing', 'PIPEGEN_COSIGN_PUB')?.value).toBe(cosignPub(41));
+  });
+});
+
+describe('G13 finish: the real re-probe (carry 59)', () => {
+  it('finish: githubFinishProbe re-reads plan, capabilities and workflow pins', async () => {
+    const s = await seed();
+    s.g.commitOn('o/r', 'main', {
+      '.github/workflows/ci.yml': `on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/setup-node@${'a'.repeat(40)}\n`,
+    }, 'ci');
+    const base = s.g.octokit() as unknown as { request: unknown; rest: Record<string, Record<string, unknown>> };
+    const req = (route: string) => async (p: Record<string, unknown> = {}) => s.g.request(route, p);
+    const gh = {
+      ...base,
+      rest: {
+        ...base.rest,
+        users: { getAuthenticated: async () => ({ status: 200, data: { login: 'o', type: 'User', plan: { name: 'pro' } }, headers: {} }) },
+        repos: { ...base.rest.repos, getRepoRulesets: req('GET /repos/{owner}/{repo}/rulesets'), getAllEnvironments: req('GET /repos/{owner}/{repo}/environments') },
+        codeScanning: { listRecentAnalyses: req('GET /repos/{owner}/{repo}/code-scanning/analyses') },
+      },
+    } as unknown as Parameters<typeof finish>[0];
+    const notes: string[] = [];
+    const r = await githubFinishProbe('o')(gh, { owner: 'o', repo: 'r' }, { private: true, ownerType: 'User', defaultBranch: 'main', centralDefaultBranch: 'main' }, notes, clock());
+    expect(r.plan).toBe('pro');
+    expect(r.workflowPins).toEqual({ tagPinned: 1, unchecked: false });
+    expect(Object.keys(r.caps).sort()).toEqual(['attestations', 'branchProtection', 'codeScanning', 'deploymentBranchPolicies', 'envRequiredReviewers', 'environments', 'keylessSigningAllowed']);
+    expect(r.caps.keylessSigningAllowed).toBe(false);   // a private repo
+    expect(typeof r.centralBranchProtection).toBe('boolean');
+    // it read the app's and the central repo's capabilities, and the app's workflow file on its default branch
+    const read = s.g.calls.map((c) => `${c.route} ${String(c.params.repo)}`);
+    expect(read).toContain('GET /repos/{owner}/{repo}/rulesets r');
+    expect(read).toContain('GET /repos/{owner}/{repo}/rulesets pipelines');
+    expect(read.some((c) => c.startsWith('GET /repos/{owner}/{repo}/git/blobs/{file_sha} r'))).toBe(true);
   });
 });
 

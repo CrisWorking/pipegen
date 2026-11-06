@@ -543,13 +543,13 @@ export const isMemoryFolder = (dir: string): boolean => {
 /**
  * A new encrypted cosign key pair (key-env, B3 c), made only in memory: the pinned cosign (resolved right before the exec, S24) writes it into
  * a fresh 0700 folder of a memory-backed filesystem, the texts are read back and checked, and the folder is removed whatever happens
- * (makeCosignKeyPair). A folder that is not memory-backed is refused, so the key never reaches a disk. Not yet called: `finish` still makes
- * the pair with makeCosignKeyPair in its tmpDir. BINDING carry G7-R1 → G13: finish calls this (and a finish-level test shows no key file
- * on a disk-backed folder).
+ * (makeCosignKeyPair). A folder that is not memory-backed is refused, so the key never reaches a disk. `finish` makes every pair it stores
+ * with this (G13, carry 28; test "finish: the cosign key is made in memory; no key file on a disk-backed folder"), and so does the full
+ * run for the pair deliver stores (key-env).
  */
 export async function generateCosignKeys(cosignBin: CosignResolver, deps: { exec?: CosignExec; base?: string; isMemory?: (dir: string) => boolean } = {}): Promise<{ privateKey: string; publicKey: string; password: string }> {
   const base = deps.base ?? MEMORY_DIR;
-  if (!(deps.isMemory ?? isMemoryFolder)(base)) throw new DeliverError(`pipegen makes the signing key only in memory (a tmpfs folder such as ${MEMORY_DIR}), so it never touches a disk, and ${show(base)} is not one on this machine. Run this step on Linux, where ${MEMORY_DIR} is in memory (WSL or a Linux container works too).`);
+  if (!(deps.isMemory ?? isMemoryFolder)(base)) throw new DeliverError(`pipegen makes the signing key only in memory (a tmpfs folder such as ${MEMORY_DIR}), so it never touches a disk, and ${show(base)} is not one on this machine. Run this step on Linux, where ${MEMORY_DIR} is in memory (WSL or a Linux container works too), or, on a public repository, use keyless signing, which needs no key.`);
   const pair = await makeCosignKeyPair(cosignBin, deps.exec, base);
   return { privateKey: pair.key, publicKey: pair.pub, password: pair.password };
 }
