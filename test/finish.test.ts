@@ -15,7 +15,7 @@ import { newRateBudget } from '../src/engine/github-rate.js';
 import { pubKeySha256 } from '../src/engine/signing.js';
 import { ensureSigningEnvironment, plannedOfLocks, readEnv, SETUP_BRANCH } from '../src/deliver/deliver.js';
 import { finish, FinishError, FINISH_WRITE_ROUTES, githubFinishProbe, type FinishDeps, type FinishProbe } from '../src/deliver/finish.js';
-import { checkRecord, localFinishPendingPath, readLocalRecord, readRecord, recordHash, recordMarkerOf, writeFinishPending, writeLocalRecord, writeRecord } from '../src/deliver/record.js';
+import { checkRecord, protectedPathsForRecord, recordFileText, recordPath, localFinishPendingPath, readLocalRecord, readRecord, recordHash, recordMarkerOf, writeFinishPending, writeLocalRecord, writeRecord } from '../src/deliver/record.js';
 import { SettingsApi } from '../src/deliver/settings-api.js';
 import { verify } from '../src/deliver/verify.js';
 import { isMemoryFolder } from '../src/layers/deploy.js';
@@ -1680,3 +1680,40 @@ async function runPrinted(g: FinishGitHub, cmd: string): Promise<void> {
   if (cmd.startsWith('#') || cmd.startsWith('gh api --method GET')) return;
   throw new Error(`the test can't run: ${cmd.split('\n')[0]}`);
 }
+
+describe('G13-R2b: protected paths in the record (m7, m1)', () => {
+  const v = (s: Seed) => verify(s.g.octokit(), { owner: 'o', repo: 'r' }, { local: { home: s.home, env: {} }, clock: clock() });
+
+  it('finish: a record with protectedPaths [./trivy.yaml, .github/workflows/**] applies with no LockError (m7)', async () => {
+    const s = await seed({ recordOver: (r) => { r.protectedPaths = ['./trivy.yaml', '.github/workflows/**']; } });
+    const res = await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, {}, s.deps());
+    expect(res.applied.length).toBeGreaterThan(0);
+    expect((await recordOn(s)).protectedPaths).toEqual(['./trivy.yaml', '.github/workflows/**']);
+  });
+
+  it('verify: a root trivy.yaml is labelled protected, sub/trivy.yaml is not (m7)', async () => {
+    const s = await seed({ recordOver: (r) => {
+      r.protectedPaths = ['./trivy.yaml', '.github/workflows/**', 'CODEOWNERS'];
+      r.files.push({ repo: 'app', path: 'trivy.yaml', part: 'pipeline', shas: ['a'.repeat(40)] } as never, { repo: 'app', path: 'sub/trivy.yaml', part: 'pipeline', shas: ['b'.repeat(40)] } as never);
+    } });
+    await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, {}, s.deps());
+    const what = (await v(s)).drift.map((d) => d.what);
+    expect(what).toContain('app file trivy.yaml (protected)');
+    expect(what).toContain('app file sub/trivy.yaml');
+  });
+
+  it('record: ./, .//x and ././x are refused by checkRecord; verify reports such a record as drift, never a crash (m1)', async () => {
+    const s = await seed();
+    const r = await recordOn(s);
+    for (const bad of ['./', './/x', '././x', 'a//b', 'a/./b', '.', '']) expect(() => checkRecord({ ...r, protectedPaths: [bad] }), JSON.stringify(bad)).toThrow(/protectedPaths/);
+    for (const ok of ['./trivy.yaml', '.github/workflows/**', 'CODEOWNERS', 'svc/.gitleaks.toml']) expect(checkRecord({ ...r, protectedPaths: [ok] }).protectedPaths).toEqual([ok]);
+    // the conversion refuses what it can't keep exactly
+    for (const bad of ['//x', '/./x', '/a//b', '/']) expect(() => protectedPathsForRecord([bad]), bad).toThrow();
+    expect(protectedPathsForRecord(['/trivy.yaml', 'CODEOWNERS'])).toEqual(['./trivy.yaml', 'CODEOWNERS']);
+    // a record on the central default branch with such a path: verify says so as drift
+    s.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: recordFileText({ ...r, protectedPaths: ['.//x'] }) });
+    const res = await v(s);
+    expect(res.drift.length).toBeGreaterThan(0);
+    expect(res.drift[0]?.what).toBe('install record');
+  });
+});
