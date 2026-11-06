@@ -7,9 +7,10 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { isMap, parse, parseDocument, type YAMLSeq } from 'yaml';
+import { isMap, parse, parseDocument, type YAMLMap, type YAMLSeq } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { DIGEST_STEP_ID, FIND_RUN_STEP_ID, HEAD_CHECK_STEP_ID, imageDigestArtifact, PUBLISH_DIGEST_STEP_ID } from '../src/engine/deploy-steps.js';
+import { isFindRunStep, isKnownHarmless } from '../src/engine/job-rules.js';
 import { floorNeeds } from '../src/engine/needs.js';
 import { RenderError } from '../src/engine/render-error.js';
 import { renderVerifySteps } from '../src/engine/signing.js';
@@ -329,7 +330,10 @@ describe('G7 verify job: what pipegen-verify proves before a deploy', () => {
     expect(artifact).toBe('pipegen-out-image-digest--app');
     expect(run).toContain(`/actions/runs/$run_id/artifacts?name=${artifact}`);
     expect(run).toContain('(.artifacts[0].workflow_run.id | tostring) == $run');
-    expect(run).toContain('.artifacts[0].expired');
+    // anything but expired false fails closed (a missing field too), before the download
+    const expired = `if [ "$(printf '%s' "$list" | jq -r '.artifacts[0].expired')" != "false" ]; then pg_fail`;
+    expect(run).toContain(expired);
+    expect(run.indexOf(expired)).toBeLessThan(run.indexOf('/actions/artifacts/$id/zip'));
     expect(run).toMatch(/past the artifact retention period/);
     expect(run).toContain('if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]');
     expect(run.indexOf('=~ ^sha256:[0-9a-f]{64}$')).toBeLessThan(run.indexOf('echo "digest=$digest" >> "$GITHUB_OUTPUT"'));
@@ -499,9 +503,32 @@ describe('G7: the release jobs, the referee and the carries', () => {
     for (const bad of [
       withSteps((items) => { items.push(parseDocument('x').createNode(extra)); }),
       withSteps((items) => { items.splice(buildAt + 1, 0, parseDocument('x').createNode(extra)); }),
+      // repository code before the build (it could rewrite what is built or uploaded): the tail is no exception then
+      withSteps((items) => { items.splice(buildAt, 0, parseDocument('x').createNode({ name: 'x', run: 'make', shell: 'bash' })); }),
+      // a second build (the policy allows build-push in this job) before the tail's: not known harmless, so the tail is no exception
+      withSteps((items) => { const twin = (items[buildAt] as YAMLMap).clone() as YAMLMap; twin.delete('id'); items.splice(buildAt, 0, twin); }),
+      // the upload of another folder than the digest step wrote (the tail is that one folder, by name and path)
+      withSteps((items) => { const up = (items.at(-1) as YAMLMap).get('with') as YAMLMap; up.set('name', imageDigestArtifact('other')); up.set('path', `\${{ runner.temp }}/pipegen-out/${imageDigestArtifact('other')}`); }),
+      withSteps((items) => { ((items.at(-1) as YAMLMap).get('with') as YAMLMap).set('path', '${{ runner.temp }}/pipegen-out'); }),
+      // a build that does not push: not the publish tail (nothing was pushed, so no digest of a pushed image)
+      withSteps((items) => { ((items[buildAt] as YAMLMap).get('with') as YAMLMap).set('push', 'false'); }),
+      // the same steps in a job of another name: the exception is image-publish's only
+      (() => { const d = parseDocument(pub.content); const jobs = d.get('jobs') as YAMLMap; const j = jobs.get('image-publish'); jobs.set('image-publish-2', j); return { ...pub, content: d.toString({ lineWidth: 0 }) }; })(),
     ]) {
       const rb = await judgeAssembled({ ...w.a, files: w.a.files.map((f) => (f === pub ? bad : f)) }, { ...JD, extra: w.v.inserts.map((i) => i.file) });
       expect(rb.ok, shown(rb)).toBe(false);
+    }
+  });
+
+  it('G7 referee: the find-run step is known harmless only in its exact form (its id, the gate action, mode find-run)', () => {
+    const w = world('keyless');
+    const find = (w.a.verify as Job).steps.find((s) => s.id === FIND_RUN_STEP_ID) as Job['steps'][number];
+    expect(isFindRunStep(find)).toBe(true);
+    expect(isKnownHarmless(find)).toBe(true);
+    const { id: _id, ...noId } = find;
+    expect(isFindRunStep(noId)).toBe(true);
+    for (const bad of [{ ...find, id: 'other' }, { ...find, with: { ...find.with, mode: 'gate' } }, { ...find, run: 'echo' }, { ...find, uses: 'evil/gate@' + 'a'.repeat(40) }]) {
+      expect(isFindRunStep(bad), JSON.stringify(bad).slice(0, 80)).toBe(false);
     }
   });
 
@@ -544,6 +571,12 @@ describe('G7: the release jobs, the referee and the carries', () => {
       const r = await judge(w, [strip(id)]);
       expect(r.issues.some((i) => msg.test(i.message)), `${id}: ${shown(r)}`).toBe(true);
     }
+    // the find-run step without its id: the digest step could not read its run id
+    const d = parseDocument(f.content);
+    const steps = d.getIn(['jobs', 'pipegen-verify', 'steps']) as YAMLSeq;
+    for (const it of steps.items) if (isMap(it) && it.get('id') === FIND_RUN_STEP_ID) it.delete('id');
+    const noId = await judge(w, [{ ...f, content: d.toString({ lineWidth: 0 }) }]);
+    expect(noId.issues.some((i) => /gives its find-run step the id pipegen-find-run/.test(i.message)), shown(noId)).toBe(true);
   });
 
   it('G7: the deploy layer\'s sbom and egress needs leave the draft with a note (never counted as covered, carry G4→G7)', () => {
