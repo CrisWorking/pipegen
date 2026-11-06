@@ -215,7 +215,7 @@ export function proofLayout(files: readonly CreatedFile[]): CreatedFile[] {
 }
 
 /** The ProofAssemble closure G14 calls: the draft at `centralSha`, assembled with PROOF_SIGNING_MODE, in the proof layout. */
-export function proofAssembleWith(draft: PipelineDraft, assembleIn: (d: PipelineDraft, mode: typeof PROOF_SIGNING_MODE) => { files: CreatedFile[] }): (mode: typeof PROOF_SIGNING_MODE, centralSha: string | undefined) => CreatedFile[] {
+export function proofAssembler(draft: PipelineDraft, assembleIn: (d: PipelineDraft, mode: typeof PROOF_SIGNING_MODE) => { files: CreatedFile[] }): (mode: typeof PROOF_SIGNING_MODE, centralSha: string | undefined) => CreatedFile[] {
   return (mode, centralSha) => {
     if (mode !== PROOF_SIGNING_MODE) throw new Error('The proof is assembled with signing mode none only.');
     const pinned: PipelineDraft = centralSha === undefined || draft.centralPin === undefined ? draft : { ...draft, centralPin: { repo: draft.centralPin.repo, sha: centralSha } };

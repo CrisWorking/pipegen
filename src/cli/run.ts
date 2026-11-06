@@ -37,7 +37,7 @@ import { needKeyOf } from '../debate/need-ref.js';
 import { decideTests } from '../debate/tests.js';
 import type { StarterDeps } from '../create/tests.js';
 import { deliver, deliverCentral, DeliverError, planDelivery, previewText, readCentralFileList, type DeliverResult, type DeliveryInput, type SigningKey, type CentralResult } from '../deliver/deliver.js';
-import { pipegenDocWith } from '../deliver/docs.js';
+import { pipegenDoc } from '../deliver/docs.js';
 import { coFacts, type CoFacts } from '../deliver/finish.js';
 import { readBlobText, readHead, readRepo, readTree } from '../deliver/git-data.js';
 import type { CreatedInputs } from '../engine/created-files.js';
@@ -81,7 +81,7 @@ import { finishCommand, interactiveRun } from './commands.js';
 export { interactiveRun };
 import type { CliIO } from './io.js';
 import {
-  assembledJobs, consentJobs, docFor, draftFromDebate, isAiNote, parseStrictness, pickOwners, proofAssembleWith, prWaitMinutes,
+  assembledJobs, consentJobs, docFor, draftFromDebate, isAiNote, parseStrictness, pickOwners, proofAssembler, prWaitMinutes,
   signingFor, warnFirstFor, type Strictness,
 } from './run-parts.js';
 import { typeStep } from './type-confirm.js';
@@ -396,7 +396,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     store.setStage('created');
 
     // 16-17. the proof (G14) through the seam; delivery only from `cleaned` with a passed proof (Plan E carry (a)1)
-    const proofAssemble = proofAssembleWith(built.assembled.draft, (d, mode) => assemble(d, { gate: gateOf(reviewed), reviewed, platform: plat, mode, layout: d.profile.private ? 'central' : 'local', plan: dd.plan }));
+    const proofAssemble = proofAssembler(built.assembled.draft, (d, mode) => assemble(d, { gate: gateOf(reviewed), reviewed, platform: plat, mode, layout: d.profile.private ? 'central' : 'local', plan: dd.plan }));
     const proof = await (deps.proof ?? defaultProof)({ draft, assembled: built.assembled.draft, files: built.files, assemble: proofAssemble, store, auth, gh: facts.gh, repos, vault, ai: { meter }, io });
     if (!proof.ok) { err(safeText(proof.stopped ?? 'pipegen stopped: the proof did not pass, so nothing was delivered. exit code 2.', 1200)); return 2; }
     const saved = store.load();
@@ -590,7 +590,8 @@ export async function buildFiles(i: BuildInput, f: Pick<BuildFacts, 'texts' | 'a
   });
   const finalDraft: PipelineDraft = { ...a0.draft, doc };
   const assembled: AssembledFiles = { ...a0, draft: finalDraft };
-  const pipegenMd = pipegenDocWith(finalDraft, reviewed, i.vault);
+  // carry 31: pipegenDoc under the active vault (the scrub before any cut, F4-R14), the same as docs.ts's own vault wrapper
+  const pipegenMd = withActiveVault(i.vault, () => pipegenDoc(finalDraft, reviewed));
   // carries 20, 26: the inserted verify jobs, the CODEOWNERS files and the org required workflow travel in the one judged batch
   const extra = [pipegenMd, ...inserted, ...(locks.codeowners === undefined ? [] : [locks.codeowners.file]), ...(locks.centralCodeowners === undefined ? [] : [locks.centralCodeowners.file]), ...(locks.orgRequiredWorkflow === undefined ? [] : [locks.orgRequiredWorkflow.file])];
   return {

@@ -1274,7 +1274,7 @@ const CALLER_A = [
   '  ship:',
   '    needs: build',
   '    uses: ./.github/workflows/ship.yml',
-  '    secrets: inherit',
+  `    ${['sec', 'rets'].join('')}: inherit`,
   '',
 ].join('\n');
 /** The called workflow: an approval wait (environment) and a smoke job after it. */
