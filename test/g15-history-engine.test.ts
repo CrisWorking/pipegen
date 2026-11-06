@@ -13,6 +13,9 @@ import { ensurePinnedBinary } from '../src/engine/linters.js';
 import { renderRangeScan } from '../src/engine/render-cli.js';
 import { renderHistoryBlock, renderRangeBlock, type RenderedStep } from '../src/engine/render-step.js';
 import { HISTORY_STEP_ENV, historyScanStepId, rangeScanStepId } from '../src/engine/tool-flags.js';
+import { checkExpressions, rangeChainProblems } from '../src/engine/job-rules.js';
+import { RenderError } from '../src/engine/render-error.js';
+import { renderJobPrelude } from '../src/engine/render-step.js';
 import { GATE, p } from './helpers/gate-pipeline.js';
 import { entry } from './helpers/render.js';
 import { sandbox, stepEnv, type Sandbox } from './helpers/step-harness.js';
@@ -59,6 +62,24 @@ describe('the history scan step', () => {
     expect(upload?.with).toMatchObject({ name: H });
     expect(b.steps).toHaveLength(4);
     expect(renderRangeBlock(entry('betterleaks'), p, GATE).artifact).toBe(A);
+  });
+
+  it('job rules: the history scan step holds only its own head expression, and follows exactly one full checkout (mutants H9, H10)', () => {
+    const b = renderHistoryBlock(entry('betterleaks'), p, GATE);
+    const scan = b.steps[1] as RenderedStep;
+    expect(() => checkExpressions(scan)).not.toThrow();
+    expect(() => checkExpressions({ ...scan, env: { ...scan.env, PIPEGEN_HISTORY_HEAD: '${{ github.event.inputs.head }}' } })).toThrow(RenderError);
+    expect(() => checkExpressions({ ...scan, env: { ...scan.env, PIPEGEN_OTHER: '${{ github.sha }}' } })).toThrow(RenderError);
+    expect(() => checkExpressions({ ...scan, env: { ...scan.env, PIPEGEN_RANGE_BASE: '${{ github.sha }}' } })).toThrow(RenderError);
+    // the history head form only on the history step's id
+    expect(() => checkExpressions({ ...scan, id: rangeScanStepId })).toThrow(RenderError);
+    const scans = new Map([[b.scan.stepId, b.scan.fact]]);
+    const full = renderJobPrelude({ fetchDepth: '0' }, p).steps;
+    const shallow = renderJobPrelude({}, p).steps;
+    expect(rangeChainProblems([...full, ...b.steps], scans)).toEqual([]);
+    expect(rangeChainProblems([...shallow, ...b.steps], scans).join('\n')).toMatch(/fetch-depth: '0'/);
+    expect(rangeChainProblems([...b.steps, ...full], scans).join('\n')).toMatch(/fetch-depth: '0'/);
+    expect(rangeChainProblems([...full, ...b.steps], new Map()).join('\n')).toMatch(/scan fact/);
   });
 
   it('render: the history scan runs only the reviewed betterleaks entry', () => {
@@ -131,6 +152,8 @@ describe.skipIf(!live)('live: the full-history scan, the pinned betterleaks 1.9.
       commit(g2, 'x');
       const r = scanHistory(sb2, bad);
       expect(r.status, bad).not.toBe(0);
+      // the hex test and the zero test name the reason; a sha that is not in the checkout fails on its own check (mutant H8)
+      expect(r.stdout + r.stderr, bad).toMatch(bad === 'e'.repeat(40) ? /is not in the checkout/ : /not given as a commit sha/);
       expect(r.scrub.status, bad).toBe('tool-error');
     }
   }, 120_000);
