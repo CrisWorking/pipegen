@@ -703,6 +703,11 @@ export interface BuildFacts {
   centralBranchProtection: boolean;
   pipegenDoc: { baseSha: string | null; recordSha: string | null };
   serviceTypes: Record<string, 'module' | 'commonjs'>;
+  /**
+   * G14 (controller addendum, BINDING): the central repo's file list (its default-branch tree), for the referee's central CODEOWNERS re-run check.
+   * A re-run after a complete install has a central CODEOWNERS holding pipegen's block, and without the list the first build is refused.
+   */
+  centralFiles?: readonly string[];
 }
 
 /** The block pipegen wrote before: the trusted record's codeowners edit, when the file still holds it exactly once (else none: fail closed). */
@@ -770,15 +775,17 @@ export async function buildFiles(i: BuildInput, f: Pick<BuildFacts, 'texts' | 'a
 }
 
 /** The referee's delivery inputs (carry 50): seven arguments, the vault's check, the central file list (carry 15); never isolatedTestJob (carry 54). */
-export function createdInputsFor(i: Pick<BuildInput, 'vault' | 'centralFiles'>, f: Pick<BuildFacts, 'appCo' | 'centralCo' | 'pipegenDoc' | 'serviceTypes'>): CreatedInputs {
+export function createdInputsFor(i: Pick<BuildInput, 'vault' | 'centralFiles'>, f: Pick<BuildFacts, 'appCo' | 'centralCo' | 'pipegenDoc' | 'serviceTypes' | 'centralFiles'>): CreatedInputs {
   const vault = i.vault;
+  // readCentralFileList after deliverCentral (carry 15) wins; before it, the central tree readBuildFacts read (G14 addendum)
+  const centralFiles = i.centralFiles ?? f.centralFiles;
   return {
     centralCodeowners: f.centralCo.path,
     pipegenDoc: f.pipegenDoc,
     codeownersFacts: { app: { isSymlink: f.appCo.isSymlink, inserted: f.appCo.inserted }, central: { isSymlink: f.centralCo.isSymlink, inserted: f.centralCo.inserted } },
     serviceTypes: f.serviceTypes,
     containsKnownValue: (t: string) => vault.containsKnownValue(t),
-    ...(i.centralFiles === undefined ? {} : { centralFiles: i.centralFiles }),
+    ...(centralFiles === undefined ? {} : { centralFiles }),
   };
 }
 
@@ -787,7 +794,7 @@ export const guardRecord = (prev: InstallRecord | null): GuardInstallRecord | nu
   files: prev.files.filter((x) => x.repo === 'app' && x.shas.length > 0).map((x) => ({ path: x.path, part: x.part, sha: x.shas[x.shas.length - 1] as string, created: x.adopted !== true && x.ownerEdited !== true })),
 });
 
-async function readBuildFacts(i: BuildInput): Promise<BuildFacts> {
+export async function readBuildFacts(i: BuildInput): Promise<BuildFacts> {
   const { gh, clock } = i.facts;
   const p = i.draft.profile;
   const app = { owner: p.owner, repo: p.repo };
@@ -823,6 +830,8 @@ async function readBuildFacts(i: BuildInput): Promise<BuildFacts> {
     centralBranchProtection: centralCaps?.branchProtection ?? false,
     pipegenDoc: { baseSha: tree.entries.get('PIPEGEN.md')?.sha ?? null, recordSha: doc?.shas[doc.shas.length - 1] ?? null },
     serviceTypes,
+    // G14 addendum: the central tree's files (blobs and links: every path the CODEOWNERS block could own)
+    centralFiles: [...cTree.entries()].filter(([, e]) => (e as { type?: string }).type !== 'tree').map(([path]) => path as string),
   };
 }
 
@@ -941,7 +950,7 @@ function realStages(io: CliIO, deps: RunDeps): RunStages {
  * The referee (seven arguments, against AssembledFiles.draft: carries 11, 50) and the guard on the same batch (carry 51). Never
  * isolatedTestJob (carry 54). The guard's refusals and the referee's issues both stop the run.
  */
-export async function judgeBuilt(i: BuildInput, files: Pick<Built, 'assembled' | 'files' | 'verify' | 'extra'>, facts: Pick<BuildFacts, 'appCo' | 'centralCo' | 'pipegenDoc' | 'serviceTypes' | 'baseTree'>, deps: { linters?: () => ReturnType<typeof ensureLinters>; judge?: typeof judgeAssembled; guard?: typeof guardCreatedFiles } = {}): Promise<{ report: RefereeReport; guardProblems: string[] }> {
+export async function judgeBuilt(i: BuildInput, files: Pick<Built, 'assembled' | 'files' | 'verify' | 'extra'>, facts: Pick<BuildFacts, 'appCo' | 'centralCo' | 'pipegenDoc' | 'serviceTypes' | 'baseTree' | 'centralFiles'>, deps: { linters?: () => ReturnType<typeof ensureLinters>; judge?: typeof judgeAssembled; guard?: typeof guardCreatedFiles } = {}): Promise<{ report: RefereeReport; guardProblems: string[] }> {
   const report = await (deps.judge ?? judgeAssembled)(files.assembled, {
     platform: i.platform, reviewed: i.reviewed, linters: (deps.linters ?? ensureLinters)(), ghToken: i.auth.token ?? '',
     refereeDeps: { vault: i.vault, createdInputs: createdInputsFor(i, facts) }, extra: files.extra,

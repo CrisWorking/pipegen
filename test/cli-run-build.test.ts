@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import type { Octokit } from '@octokit/rest';
-import { buildFiles, judgeBuilt, readRegular, runCreators, workflowTexts, type BuildInput, type BuildFacts } from '../src/cli/run.js';
+import { buildFiles, judgeBuilt, readBuildFacts, readRegular, runCreators, workflowTexts, type BuildInput, type BuildFacts } from '../src/cli/run.js';
 import { strictNeeds, warnFirstFor } from '../src/cli/run-parts.js';
 import { judgeAssembled } from '../src/layers/assemble.js';
 import { ADVISORY_TOOLS } from '../src/debate/builder.js';
@@ -20,7 +20,7 @@ import { SecretVault } from '../src/create/secrets.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { floorNeeds, MINIMUM_CATEGORIES } from '../src/engine/needs.js';
 import type { Estimates } from '../src/estimate/estimate.js';
-import type { Need, PipelineDraft } from '../src/types.js';
+import type { InstallRecord, Need, PipelineDraft } from '../src/types.js';
 import { CAPS, LINTERS, node, p, planned, profileOf } from './helpers/assemble.js';
 import { REVIEWED } from './helpers/debate-fixtures.js';
 
@@ -320,3 +320,30 @@ describe('G13-R2: no user text tells the user to re-run with bare `npx pipegen` 
     expect(bad).toEqual([]);
   });
 });
+
+describe('G14 (controller addendum, BINDING): a re-run after a complete install builds', () => {
+  it('build: a re-run whose central CODEOWNERS already holds pipegen\'s block, through readBuildFacts and the real build, passes (centralFiles from the central tree)', async () => {
+    // the first install: pipegen's block went into the user's own central CODEOWNERS
+    const first = input(false);
+    const userCo = '* @someone\n';
+    const f1 = await buildFiles(first, { ...FACTS, centralCo: { path: '.github/CODEOWNERS', text: userCo, isSymlink: false, block: null, inserted: null } });
+    const edit = f1.locks.centralCodeowners?.edit;
+    const delivered = f1.locks.centralCodeowners?.file.content;
+    expect(edit?.inserted).toMatch(/pipegen/);
+    expect(delivered).toContain(edit?.inserted as string);
+    // the re-run: the central repo holds that file; the trusted record names the block pipegen inserted
+    const g = new FakeGitHub();
+    g.addRepo(`${OWN}/r`, { private: false, files: { 'package.json': readFileSync(join(first.dir, 'package.json'), 'utf8'), 'package-lock.json': readFileSync(join(first.dir, 'package-lock.json'), 'utf8') } });
+    g.addRepo(`${OWN}/pipelines`, { private: true, files: { 'README.md': 'central\n', '.github/CODEOWNERS': delivered as string, 'installs/r.json': '{}\n' } });
+    const prev = { files: [], edits: [{ repo: 'central', kind: 'codeowners', path: '.github/CODEOWNERS', inserted: edit?.inserted, anchor: edit?.anchor }] } as unknown as InstallRecord;
+    const i = { ...input(false), prev, facts: { ...first.facts, gh: g.octokit() } };
+    const facts = await readBuildFacts(i);
+    expect([...(facts.centralFiles ?? [])].sort()).toEqual(['.github/CODEOWNERS', 'README.md', 'installs/r.json']);
+    expect(facts.centralCo.inserted).toBe(edit?.inserted);
+    const files = await buildFiles(i, facts);
+    const judged = await judgeBuilt(i, files, facts, { linters: judgeDeps.linters, judge: noLinters });
+    expect(judged.report.issues.map((x) => `${x.file}: ${x.message}`)).toEqual([]);
+    expect(judged.guardProblems).toEqual([]);
+  });
+});
+
