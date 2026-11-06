@@ -1239,6 +1239,30 @@ describe('G10 fix round 2 (review-G10-r1, ruling G10-R3)', () => {
     expect(body2).toMatch(/This run rewrites a file that an earlier run adopted .*`PIPEGEN.md`/);
   });
 
+  it('G9-R1 (spec I1): a re-run keeps the adopted files in the PR body (the central one and the one this run does not rewrite), minus the one it rewrites', async () => {
+    const w = world({ appFiles: { 'README.md': 'hi\n', CODEOWNERS: CO_ORIG, [HOOK_FILES['pre-commit']]: HOOK_ORIG, 'package.json': PJ, 'package-lock.json': LOCK, '.github/workflows/deploy.yml': DEPLOY_ORIG, 'PIPEGEN.md': '# pipegen\n' } });
+    w.g.commitOn('o/pipelines', 'main', { '.github/workflows/r--merge.yml': 'name: mine\n' });
+    w.g.commitOn('o/pipelines', 'main', { '.github/workflows/r--merge.yml': centralFiles()[0]?.content as string });
+    const p = profile();
+    const c = await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w));
+    await deliver(w.g.octokit(), p, planDelivery(input(p, (c as { sha: string }).sha)), w.vault, deps(w));
+    const body1 = w.g.repo('o/r').pulls[0]?.body as string;
+    expect(body1).toContain('`PIPEGEN.md`');
+    expect(body1).toContain('`.github/workflows/r--merge.yml` (central repo)');
+    // the second run: PIPEGEN.md is rewritten, the central file is adopted still and not rewritten
+    w.g.repo('o/r').refs.set('heads/main', w.g.head('o/r', SETUP_BRANCH));
+    const pin2 = (await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w)) as { sha: string }).sha;
+    const v2 = new SecretVault();
+    v2.set(KEY, KEY_VALUE);
+    const again = appFiles(pin2, { withPkg: false }).filter((f) => f.edited === undefined && f.inserted === undefined).map((f) => (f.path === 'PIPEGEN.md' ? { ...f, content: '# pipegen v2\n' } : f));
+    await deliver(w.g.octokit(), p, planDelivery(input(p, pin2, { files: [...centralFiles(), ...again], locks: locks({ codeowners: undefined }) })), v2, deps(w));
+    const body2 = w.g.repo('o/r').pulls[0]?.body as string;
+    expect(body2).toContain('Already there and identical to what pipegen writes');
+    expect(body2).toContain('`.github/workflows/r--merge.yml` (central repo)');
+    expect(body2).toMatch(/This run rewrites a file that an earlier run adopted .*`PIPEGEN.md`/);
+    expect(body2.split('\n').find((l) => l.startsWith('Already there')) ?? '').not.toContain('`PIPEGEN.md`');
+  });
+
   it('fix 2: a pre-existing pipegen-signing that pipegen narrowed goes into the leftovers with its previous settings (N3)', async () => {
     const w = world();
     w.g.repo('o/r').envs.set('pipegen-signing', { id: 5, created_at: '2026-01-01T00:00:00Z', wait_timer: 3, prevent_self_review: false, reviewers: [], can_admins_bypass: false, deployment_branch_policy: null, policies: [], stored: new Map() });

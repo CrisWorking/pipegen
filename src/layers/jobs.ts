@@ -109,8 +109,8 @@ const GATE_JOB_NAME = 'gate';
 
 /** v0.2 limits: categories pipegen does not render yet, each with the line the notes (and PIPEGEN.md) carry. */
 export const NOT_RENDERED_V02: Readonly<Partial<Record<NeedCategory, string>>> = Object.freeze({
-  'api-dast': 'API testing against the API spec is not available yet: its tool (schemathesis) needs a reviewed hash-locked closure of its Python dependencies, planned for v0.4 (S31).',
-  scorecard: 'OpenSSF Scorecard is not run yet: its action runs a tag-pinned container image, and pipegen runs only images pinned by digest (PF-3).',
+  'api-dast': 'API testing against the API spec is not available yet: its tool (schemathesis) needs a reviewed hash-locked closure of its Python dependencies, planned for v0.4.',
+  scorecard: 'OpenSSF Scorecard is not run yet: its action runs a tag-pinned container image, and pipegen runs only images pinned by digest.',
   fuzzing: 'Fuzzing is built in v0.3.',
 });
 /** The PyPI publish action (S31): it builds or pulls a container at run time, so it is not rendered in v0.2. */
@@ -124,7 +124,7 @@ export const HOOKS_CI_NOTES: Readonly<Record<string, string>> = Object.freeze({
 export const POUTINE_NOT_RUN = `A workflow runs on pull_request_target or issue_comment, which takes untrusted input, but pipegen can't offer ${WORKFLOW_LINT_EXTRA} for this run (it is not on the reviewed list, or not yet proven for a full run), so ${WORKFLOW_LINT_EXTRA} is not run; ${WORKFLOW_LINT_TOOL} still lints the workflows.`;
 /** GJ (DECISIONS #122): the note when zizmor, workflow lint's one tool, is not on the reviewed list. */
 export const WORKFLOW_LINT_SUGGESTION = `Workflow lint runs ${WORKFLOW_LINT_TOOL} only, and ${WORKFLOW_LINT_TOOL} is not on pipegen's reviewed list in this version, so it is only a suggestion: add ${WORKFLOW_LINT_TOOL} to your own CI to lint the workflows.`;
-export const PYPI_PUBLISH_NOTE = 'Publishing to PyPI is not rendered yet: the publish action builds or pulls a container at run time, and pipegen runs only images pinned by digest (S31).';
+export const PYPI_PUBLISH_NOTE = 'Publishing to PyPI is not rendered yet: the publish action builds or pulls a container at run time, and pipegen runs only images pinned by digest.';
 
 /**
  * The needs a part skipped with --skip takes out of the jobs: tests the gate's own list (SKIPPED_PART_NEEDS, so the gate shows them as skipped);
@@ -662,7 +662,7 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
   if (deps.mode !== 'none' && !input.skipped.some((p) => p.part === 'deploy') && !imageNone) {
     try { sign = signJob(draft, deps.mode, { reviewed: deps.reviewed, platform: deps.platform }); } catch (e) {
       if (!(e instanceof RenderError) || deps.mode !== 'attest') throw e;
-      addNote(notes, 'The images are not signed yet: attest signing lands with the gate re-pin batch (G15), and pipegen never falls back to another mode.');
+      addNote(notes, 'The images are not signed yet: attest signing lands in a later pipegen release, and pipegen never falls back to another mode.');
     }
   }
   if (deps.mode === 'none' || input.skipped.some((p) => p.part === 'deploy') || imageNone) { const { signing: _s, ...rest } = draft; draft = rest; }

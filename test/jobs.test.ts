@@ -265,7 +265,7 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
     });
     const at = assemble(att, 'attest');
     expect(at.sign).toBeNull();
-    expect(at.notes.join('\n')).toMatch(/not signed yet.*G15.*never falls back/);
+    expect(at.notes.join('\n')).toMatch(/not signed yet.*later pipegen release.*never falls back/);
   });
 
   it('assemble: steps only from specFor over keyOffers(DebateResult); advisory tools non-blocking', async () => {

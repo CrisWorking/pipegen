@@ -695,7 +695,10 @@ async function checkPin(gh: Octokit, d: DeliveryPlan, c: RepoRef, defaultBranch:
 }
 
 /** The setup pull request's body (the record's marker line is added by writeRecord). */
-export function prBody(d: DeliveryPlan, commits: readonly { part: Part; files: CreatedFile[] }[], left: number, adopted: readonly CreatedFile[] = [], rewritten: readonly CreatedFile[] = []): string {
+export function prBody(d: DeliveryPlan, commits: readonly { part: Part; files: CreatedFile[] }[], left: number, adopted: readonly Pick<CreatedFile, 'repo' | 'path'>[] = [], rewritten: readonly Pick<CreatedFile, 'repo' | 'path'>[] = []): string {
+  // the body is markdown: a path pipegen would not write (anything outside the plain created-path alphabet) is never printed
+  adopted = adopted.filter((f) => createdPathProblem(f.path) === null);
+  rewritten = rewritten.filter((f) => createdPathProblem(f.path) === null);
   const lines = ['pipegen sets up the security checks of this repository. One commit per part:', ''];
   for (const c of commits) lines.push(`- ${PART_TITLE[c.part]} (${c.part}): ${c.files.length} file${c.files.length === 1 ? '' : 's'}`);
   // G10-R4 P3 (G9-R0 1): the files that were already there, byte-identical to what pipegen writes, are named; pipegen never rewrites them
@@ -836,8 +839,13 @@ export async function deliver(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vaul
     }
     if (await setBranch(gh, app, SETUP_BRANCH, parent, true, clock) === 'created') stored.push({ kind: 'branch', name: SETUP_BRANCH, repo: `${p.owner}/${p.repo}` });
     // N2/G9: the adopted files named in the body; an adopted file of the record that this run rewrites is said so
-    const adoptedHere = [...adopted];
     const rewrittenAdopted = commits.flatMap((c) => c.files).filter((f) => prev?.files.find((r) => r.repo === f.repo && r.path === f.path)?.adopted === true);
+    // adopted on an earlier run and still there (a re-run does not add them to `adopted` again: the record already holds their sha), minus the ones this run rewrites
+    const adoptedHere: Pick<CreatedFile, 'repo' | 'path'>[] = [...adopted].map((f) => ({ repo: f.repo, path: f.path }));
+    for (const r of prev?.files ?? []) {
+      if (r.adopted !== true || adoptedHere.some((a) => a.repo === r.repo && a.path === r.path) || rewrittenAdopted.some((f) => f.repo === r.repo && f.path === r.path)) continue;
+      if ((r.repo === 'app' ? baseTree.entries : centralTree.entries).has(r.path)) adoptedHere.push({ repo: r.repo, path: r.path });
+    }
     const pr = await openOrUpdatePr(gh, app, { head: SETUP_BRANCH, base: appRepo.defaultBranch, title: 'pipegen: set up the security pipeline', body: prBody(d, commits, left, adoptedHere, rewrittenAdopted) }, clock);
     if (pr.opened) stored.push({ kind: 'pull-request', name: `#${pr.number}`, repo: `${p.owner}/${p.repo}` });
     done.push(`${pr.opened ? 'opened' : 'updated'} the setup pull request ${pr.url}`);

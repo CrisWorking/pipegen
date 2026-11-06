@@ -228,7 +228,7 @@ export interface PipelineDraft {
  * - `transcript`: the debate's short transcript lines (Plan F, doc-final).
  * - `deployGaps`: DeployGap[] of the deploy layer (src/layers/deploy.ts): the workflow, its triggers, why it is not protected.
  * - `lockNotes`: LockPlan.notes, in order.
- * - `estimates`: monthly Actions minutes (Estimates.monthlyMinutes, includedMinutes) and, when known, the wait of a pull request in minutes.
+ * - `estimates`: monthly Actions minutes (Estimates.monthlyMinutes, includedMinutes) and, when known, the wait of a pull request in minutes and the chosen strictness level (G13 fills both).
  * - `setupCommand`: PrecommitResult.setupCommand ('' when no hook file is written).
  * - `testNotes`: the notes of the test and Docker creators and of the tests decision. The creator's own AI note ("The AI explained ...") is dropped.
  * - `uncoveredMinimum`: AssembledJobs.uncoveredMinimum (minimum checks left without a job), shown as not covered.
@@ -240,7 +240,7 @@ export interface PipelineDoc {
   transcript: string[];
   deployGaps: { path: string; triggers: string[]; why: string }[];
   lockNotes: string[];
-  estimates: { monthlyMinutes: number; includedMinutes: number | null; prWaitMinutes?: number };
+  estimates: { monthlyMinutes: number; includedMinutes: number | null; prWaitMinutes?: number; strictness?: 'Starter' | 'Standard' | 'Strict' };
   setupCommand: string;
   testNotes: string[];
   uncoveredMinimum: { category: string; why: string; service?: string }[];

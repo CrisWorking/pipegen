@@ -42,7 +42,7 @@ export interface PrecommitResult {
 /** The note of a husky repository (PIPEGEN.md prints it only when GJ's hooks-ci note for husky is not there: one line per hook manager, G9-R0 3). */
 export const HUSKY_NO_CI_NOTE = 'husky hooks are shell scripts, so CI does not re-run them (no hooks-ci command); the CI secret scan still runs on every push.';
 const REASON = "pipegen's reviewed pre-commit hooks: a secret scan of the staged changes, and format and lint where the repository asks for it";
-const ADVISORY = (scripts: readonly string[]): string => `The per-repo lefthook hooks (${scripts.join(', ')}) stay advisory: they run the repository's own scripts, so pipegen does not add them as local hooks (item 63); add them yourself if you want them.`;
+const ADVISORY = (scripts: readonly string[]): string => `The per-repo lefthook hooks (${scripts.join(', ')}) stay advisory: they run the repository's own scripts, so pipegen does not add them as local hooks; add them yourself if you want them.`;
 const HOOK_SCRIPT_RE = /^[a-z][a-z:-]{0,30}$/;
 
 /** The tuning picks of the hooks-ci lefthook step (item 63), cleaned to plain script names. */
