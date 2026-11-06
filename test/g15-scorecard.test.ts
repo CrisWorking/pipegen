@@ -88,6 +88,10 @@ import type { CreatedFile, ReviewedTool } from '../src/types.js';
 import { CAPS, LINTERS, p as P, planned, profileOf, shown } from './helpers/assemble.js';
 import { REVIEWED } from './helpers/debate-fixtures.js';
 import { NIGHTLY_WORKFLOW } from '../src/engine/job-rules.js';
+import { SCORECARD_MOVE_STEP_ID } from '../src/engine/render-step.js';
+import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { makeTempDir } from './helpers/make-repo.js';
 
 /** Built at runtime: the fixtures check (no-secret-literals) reads a token input with its value as a secret. */
 const TOK = ['repo', 'token'].join('_');
@@ -164,5 +168,23 @@ describe('G15a round 3 (a): Scorecard weekly in the nightly file', () => {
     await refused('another condition', (d) => { jobsOfDoc(d).scorecard!.if = "github.event.schedule != ''"; });
     await refused('the weekly condition on the nightly job', (d) => { jobsOfDoc(d).nightly!.if = SCORECARD_IF; });
     await refused('the scorecard job without its condition (it would run nightly)', (d) => { delete jobsOfDoc(d).scorecard!.if; });
+    // (mutant A7) in a job with no power of its own (contents: read only), which no step-policy row covers
+    await refused('the image in an unprivileged job', (d) => {
+      jobsOfDoc(d).other = { 'runs-on': 'ubuntu-latest', 'timeout-minutes': 30, permissions: { contents: 'read' }, 'cache-mode': 'none', steps: [structuredClone((jobsOfDoc(d).scorecard!.steps as Obj[])[0]), structuredClone(cardStep(d))] };
+    }, /docker step runs only in the weekly job/);
+  });
+
+  it('render: the move step takes only the regular result file Scorecard wrote, never a link (mutant A10)', () => {
+    const w = cardWorld();
+    const move = (jobsOfDoc(w.doc).scorecard!.steps as Obj[]).find((x) => x.id === SCORECARD_MOVE_STEP_ID) as Obj;
+    const runIn = (setup: (ws: string) => void): number => {
+      const root = makeTempDir();
+      const ws = `${root}/ws`; mkdirSync(ws); mkdirSync(`${root}/tmp`);
+      setup(ws);
+      return spawnSync('bash', ['-c', String(move.run)], { env: { PATH: process.env.PATH, GITHUB_WORKSPACE: ws, RUNNER_TEMP: `${root}/tmp` } }).status ?? -1;
+    };
+    expect(runIn((ws) => writeFileSync(`${ws}/scorecard.sarif`, '{}'))).toBe(0);
+    expect(runIn((ws) => { writeFileSync(`${ws}/../target`, '{}'); symlinkSync(`${ws}/../target`, `${ws}/scorecard.sarif`); })).not.toBe(0);
+    expect(runIn(() => undefined)).not.toBe(0);
   });
 });
