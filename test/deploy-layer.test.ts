@@ -1377,6 +1377,11 @@ describe('G13: the head check in a local called workflow (G7-R2 carry, BINDING)'
     // (j) the mark names a head check on a job the file does not have
     const ghost = { ...ins.file, inserted: { ...ins.inserted, headCheck: [...(ins.inserted.headCheck as string[]), 'ghost'] } } as CreatedFile;
     expect(shown(await judge(w, [caller, ghost]))).toMatch(/Every job of a called workflow|not a job of the workflow/);
+    // (j2) a job left without the head check, and the mark leaving it out too: only the list check sees it
+    const head = ins.text.indexOf('      - id: pipegen-head-check', ins.text.indexOf('  smoke:'));
+    const end = ins.text.indexOf('      - run: ./smoke.sh');
+    const unmarked = { ...ins.file, content: ins.text.slice(0, head) + ins.text.slice(end), inserted: { ...ins.inserted, headCheck: ['deploy'] } } as CreatedFile;
+    expect(shown(await judge(w, [caller, unmarked]))).toMatch(/Every job of a called workflow pipegen edits must start with its head check/);
     // (k) update can not renew a verify job in a called file (it holds none)
     expect(() => renewVerifyJob(ins.text, ins.inserted, w.a.verify as Job)).toThrow(/no pipegen-verify job/);
   });
