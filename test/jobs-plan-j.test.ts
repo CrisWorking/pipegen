@@ -310,7 +310,7 @@ describe('GJ-R1: fix round 1 (reviews GJ security and spec)', () => {
     // the draft keeps only poutine for workflow lint
     const poutineOnly = { ...a.draft, steps: a.draft.steps.filter((st) => !(st.needId === 'workflow-lint' && st.tool.id === WORKFLOW_LINT_TOOL)) };
     const r = await judge(files(a), poutineOnly);
-    expect(r.issues.some((i) => /workflow lint runs zizmor/.test(i.message)), shown(r)).toBe(true);
+    expect(r.issues.some((i) => /The draft's workflow lint check has no zizmor step/.test(i.message)), shown(r)).toBe(true);
     // the job loses its zizmor steps (the draft still holds the spec)
     const f = files(a)[0] as NonNullable<ReturnType<typeof files>[number]>;
     const cut = editJob(f, 'workflow-lint', (j) => { j.steps = j.steps.filter((st: { name?: string }) => !/zizmor/.test(String(st.name))); });
