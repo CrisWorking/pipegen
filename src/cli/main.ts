@@ -36,7 +36,8 @@ function usage(): string[] {
     '                     setup would add, cost and need. Read-only: it changes nothing; no AI unless --ai.',
     '  pipegen inspect    Read this repo and its GitHub settings and print a summary. Read-only; no AI.',
     '  pipegen run        The full setup: reads the repo, asks before anything costs money or reaches an AI, builds the',
-    '                     pipeline, proves it on a private test copy, then opens one setup pull request you review.',
+    '                     pipeline and opens one setup pull request you review once it has passed a proof on a private',
+    '                     test copy. This version has no proof step yet, so run stops before it asks to spend anything.',
     '  pipegen finish     After you merge the setup pull request: applies the settings (branch rules, environments,',
     '                     variables). --print prints the commands instead; --rotate-key makes a new signing key pair.',
     '  pipegen verify     Compares the repo with what pipegen recorded and lists any drift (exit code 1 on drift).',
@@ -81,8 +82,6 @@ function usage(): string[] {
   ];
 }
 
-/** Options only `pipegen audit` takes. */
-const AUDIT_ONLY = ['out', 'force', 'json', 'ai', 'model', 'effort', 'type', 'verbose'] as const;
 /** G13 (carry 4): the commands each command-specific option works with. --dir and --allow-broad-token work everywhere. */
 const OPTION_COMMANDS: Readonly<Record<string, readonly string[]>> = {
   out: ['audit'], force: ['audit'], json: ['audit'], ai: ['audit'], model: ['audit'], effort: ['audit'], verbose: ['audit'],
@@ -200,11 +199,6 @@ export async function run(argv: string[], io: CliIO, cmds: Partial<Commands> = {
   if (SETUP_COMMANDS.has(command)) return setupCommand(command, dir, values, io, c);
 
   if (command === 'inspect') {
-    const extra = AUDIT_ONLY.find((o) => values[o] !== undefined);
-    if (extra !== undefined) {
-      fail(`--${extra} works with pipegen audit only.`);
-      return 1;
-    }
     const stopped = await stopIfUnsafe(io, dir);
     if (stopped !== null) return stopped;
     try {

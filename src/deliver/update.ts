@@ -838,7 +838,7 @@ export async function update(gh: Octokit, app: RepoRef, deps: UpdateDeps): Promi
   const record = trusted.record;
   // G12-R1 C1: a record trusted by typing is a view (edits, plans and settings dropped); update never writes it back as the record
   // N5: from what the trust decision returned, never a second read of the file
-  if (trusted.typed === true) throw new UpdateError('pipegen can\'t update from a record you only confirmed by name. Run `npx pipegen` in this repo first (it re-checks the full setup), then run update again.');
+  if (trusted.typed === true) throw new UpdateError('pipegen can\'t update from a record you only confirmed by name. Run `npx pipegen run` in this repo first (it re-checks the full setup), then run update again.');
   const appRepo = await readRepo(gh, app, clock);
   if (appRepo === null || appRepo.id !== record.app.repoId) throw new UpdateError(`The install record is for another repository than ${show(`${app.owner}/${app.repo}`, 140)} (its id differs), so pipegen changes nothing.`);
   const centralSt = await repoState(gh, centralRef, clock);
@@ -883,7 +883,7 @@ export async function update(gh: Octokit, app: RepoRef, deps: UpdateDeps): Promi
     });
     if (stale.length > 0) {
       for (const t of stale) {
-        const why = `${label(t.repo, show(t.path))}: its pipegen-verify job names the central commit in a run line that \`pipegen update\` can't rebuild, so pipegen doesn't re-pin this verify job or the rest of the app (a verify job on an old central commit fails closed). Run \`npx pipegen\` again to re-pin it.`;
+        const why = `${label(t.repo, show(t.path))}: its pipegen-verify job names the central commit in a run line that \`pipegen update\` can't rebuild, so pipegen doesn't re-pin this verify job or the rest of the app (a verify job on an old central commit fails closed). Run \`npx pipegen run\` again to re-pin it.`;
         notes.push(why);
         d.held.push(why);
       }

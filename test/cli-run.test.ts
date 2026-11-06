@@ -19,6 +19,7 @@ vi.mock('../src/engine/reviewed.js', async (orig) => {
 
 import type { Octokit } from '@octokit/rest';
 import { AiSpendMeter } from '../src/ai/spend-meter.js';
+import type { mapCoverage } from '../src/audit/coverage.js';
 import type { CodeBundle } from '../src/ai/redact.js';
 import { proofReposFor, onCreatedFor, provenDraft, NOT_IN_SCOPE, NO_MEMORY_FOLDER, SECRET_FOUND, notProvableNotes, auditCredits, createdInputsFor, dastWayPast, defaultProof, fullRun, judgeBuilt, NEVER_SKIPPED, parseSkip, PROOF_NOT_BUILT, runCreators, SCOPE_LINE, UNPINNED, WINDOWS_REFUSAL, GATE_UNREACHABLE, guardRecord, insertedBlock, type Built, type BuildInput, type GitHubFacts, type RunDeps, type RunStages } from '../src/cli/run.js';
 import { assembledJobs, consentJobs, docFor, draftFromDebate, isAiNote, parseStrictness, pickOwners, prWaitMinutes, proofAssembler, proofLayout, warnFirstFor, signingFor } from '../src/cli/run-parts.js';
@@ -504,6 +505,20 @@ describe('G13: stages 8-15', () => {
     expect(childCalls).toEqual([]);
     expect(Array.isArray(credits)).toBe(true);
     for (const c of credits ?? []) expect(['push-default', 'hooks-ci', 'signing', 'deploy-gate']).toContain(c.kind);
+    // spec M4: the audit's own options: the skipped workflows counted from the reader's notes, buildsNoImage, no branchGuess
+    mkdirSync(join(dir, '.github', 'workflows'), { recursive: true });
+    writeFileSync(join(dir, '.github', 'workflows', 'bad.yml'), 'on: [push\njobs: {\n');
+    let opts: Parameters<typeof mapCoverage>[3] | undefined;
+    const seen = await auditCredits(LOCAL({ services: [svc({ name: 'app', path: '.' }), svc({ name: 'img', path: 'img', dockerfile: 'Dockerfile' })] }), { capabilities: CAPS }, dir, async (_p, _n, _d, o) => {
+      opts = o;
+      return [{ credit: 'c1', creditKind: 'hooks-ci', status: 'covered' }, { credit: 'c1', creditKind: 'hooks-ci', status: 'covered' }, { status: 'missing' }] as never;
+    });
+    expect(seen).toEqual([{ text: 'c1', kind: 'hooks-ci' }]);
+    expect(opts?.skippedWorkflows).toBe(1);
+    expect(opts?.capabilities).toBe(CAPS);
+    expect(opts).not.toHaveProperty('branchGuess');
+    expect(opts?.noImage?.({ service: 'app' } as Need)).toBe(true);
+    expect(opts?.noImage?.({ service: 'img' } as Need)).toBe(false);
     // and the run passes them to the build (doc.credits)
     const w = world();
     await run(w);
@@ -856,9 +871,13 @@ describe('G13: two-step delivery and after', () => {
   });
 
   it('run: a hinted server\'s DAST stop names the way past', async () => {
-    const msg = 'The blocking check dast (merge, svc-a) can not run: no container. pipegen never makes it warn-only or leaves it out.';
-    const lines = dastWayPast(msg, [{ name: 'svc-a', containerHint: 'compose.yml builds svc-a' }, { name: 'other' }]);
+    // the message as jobs.ts writes it (spec M3)
+    const msg = 'The blocking check "dast" for "svc-a" can not run: no container. pipegen never makes it warn-only or leaves it out.';
+    const lines = dastWayPast(msg, [{ name: 'svc-a', containerHint: 'compose.yml builds svc-a' }, { name: 'other' }, { name: 'svc', containerHint: 'x' }, { name: 'a', containerHint: 'x' }]);
     expect(lines).toHaveLength(1);
+    // a hinted service whose name is only part of another's gets no line; another check's stop gives none
+    expect(dastWayPast('The blocking check "dast" for "svc-ab" can not run: x.', [{ name: 'svc-a', containerHint: 'x' }])).toEqual([]);
+    expect(dastWayPast('The blocking check "unit-tests" for "svc-a" can not run: x.', [{ name: 'svc-a', containerHint: 'x' }])).toEqual([]);
     expect(lines[0]).toMatch(/--type svc-a=static-site/);
     expect(lines[0]).toMatch(/add a Dockerfile/);
     expect(lines[0]).toMatch(/never skips the DAST check/);
@@ -913,6 +932,9 @@ describe('G13: main dispatch', () => {
     const help = h.lines.join('\n');
     for (const c of ['run', 'finish', 'verify', 'update', 'cleanup']) expect(help).toMatch(new RegExp(`pipegen ${c}\\b`));
     expect(help).toMatch(/npx pipegen\s+Audit this folder/);
+    // spec M5: the help says what run does in this version (no proof step yet: it stops before spending anything)
+    expect(help).not.toMatch(/proves it on a private test copy, then opens/);
+    expect(help).toMatch(/no proof step yet, so run stops before it asks to spend anything/);
   });
 
   it('main: no command is still the audit; run, finish, verify, update take only their own flags', async () => {

@@ -417,7 +417,7 @@ describe('G12 update: central files, owner edits, the record', () => {
     expect(prsOf(w, 'o/r')).toEqual([]);
     const said = res.notes.join(' ');
     expect(said).toMatch(/deploy\.yml.*can't rebuild.*verify job/);
-    expect(said).toMatch(/Run `npx pipegen` again to re-pin it/);
+    expect(said).toMatch(/Run `npx pipegen run` again to re-pin it/);
   });
 
   it('update: preview declined → no PR', async () => {
@@ -516,7 +516,7 @@ describe('G12 fix round 1 (G12-R1)', () => {
     // the local file says the hash was vouched by typing (an earlier interactive pipegen run): trustedPrevious gives the view, update stops
     await writeLocalRecord(app, { recordHash: recordHash(w.record), typed: true, updatedAt: '2026-11-01T00:00:00Z' }, { home: w.home, env: {} });
     const before = centralFile(w, recordPath('r'));
-    await expect(update(w.g.octokit(), app, deps(w))).rejects.toThrow(/only confirmed by name.*npx pipegen/);
+    await expect(update(w.g.octokit(), app, deps(w))).rejects.toThrow(/only confirmed by name.*Run `npx pipegen run` in this repo first/);
     expect(writes(w)).toEqual([]);
     expect(centralFile(w, recordPath('r'))).toBe(before);
   });

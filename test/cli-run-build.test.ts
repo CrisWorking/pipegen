@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import type { Octokit } from '@octokit/rest';
-import { buildFiles, judgeBuilt, workflowTexts, type BuildInput, type BuildFacts } from '../src/cli/run.js';
+import { buildFiles, judgeBuilt, readRegular, runCreators, workflowTexts, type BuildInput, type BuildFacts } from '../src/cli/run.js';
 import { strictNeeds, warnFirstFor } from '../src/cli/run-parts.js';
 import { judgeAssembled } from '../src/layers/assemble.js';
 import { ADVISORY_TOOLS } from '../src/debate/builder.js';
@@ -153,5 +153,37 @@ describe('G13-R1: workflowTexts (carry 25)', () => {
     const got = await workflowTexts(dir, ['.github/workflows/ci.yml', '.github/workflows/link.yml', '.github/workflows/big.yml', '.github/workflows/edge.yaml', '.github/workflows/dir.yml', 'other/x.yml', '.github/workflows/../../other/x.yml', '.github/workflows/missing.yml']);
     expect([...got.keys()].sort()).toEqual(['.github/workflows/ci.yml', '.github/workflows/edge.yaml']);
     expect(got.get('.github/workflows/ci.yml')).toBe('on: push\n');
+  });
+});
+
+describe('G13-R1: package.json reads (sec M6)', () => {
+  it('readRegular: a regular file under the cap only; a link, a linked folder, a folder or a large file is not read', async () => {
+    const dir = tmp();
+    const out = tmp();
+    writeFileSync(join(out, 'package.json'), '{"type":"module"}');
+    writeFileSync(join(dir, 'package.json'), '{"name":"x"}');
+    mkdirSync(join(dir, 'a'));
+    symlinkSync(join(out, 'package.json'), join(dir, 'a', 'package.json'));
+    symlinkSync(out, join(dir, 'b'));
+    mkdirSync(join(dir, 'c', 'package.json'), { recursive: true });
+    mkdirSync(join(dir, 'd'));
+    writeFileSync(join(dir, 'd', 'package.json'), 'x'.repeat(1025));
+    expect(await readRegular(dir, 'package.json', 1024)).toBe('{"name":"x"}');
+    for (const rel of ['a/package.json', 'b/package.json', 'c/package.json', 'd/package.json', 'missing/package.json']) expect(await readRegular(dir, rel, 1024), rel).toBeNull();
+  });
+
+  it('runCreators: a service package.json that is a link is never read (the starter gets none)', async () => {
+    const dir = tmp();
+    const out = tmp();
+    writeFileSync(join(out, 'package.json'), JSON.stringify({ name: 'elsewhere', scripts: { test: 'SECRET-OUTSIDE' } }));
+    symlinkSync(join(out, 'package.json'), join(dir, 'package.json'));
+    const x = planned(profileOf([node()], { owner: OWN }));
+    let seen: string | undefined;
+    await runCreators(x.draft, { files: [] } as never, {} as never, dir, new SecretVault(), REVIEWED, {
+      dockerfile: async () => ({ files: [], notes: [] }) as never,
+      tests: async (_s, _p, _b, o) => { seen = o.starter?.packageJson; return { decision: { service: 'app' } as never, files: [] } as never; },
+      compose: () => ({ file: null, notes: [] }) as never,
+    });
+    expect(seen).toBe('');
   });
 });

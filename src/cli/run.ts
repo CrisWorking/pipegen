@@ -16,8 +16,8 @@
 //      (asked again when the minutes went up), one confirmation.   19. deliver.   20. the merge wait, then finish.   21. the summary.
 // Exit codes: 0 done; 1 a refusal, a declined question or an error; 2 a stopped run (the proof, the central PR, a refused batch, audit-only);
 // 4 the unsafe folder (main.ts). The vault is wiped on every exit.
-import { lstat, readFile, readdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { lstat, readFile, readdir, realpath } from 'node:fs/promises';
+import { join, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import type { Octokit } from '@octokit/rest';
 import { makeProvider } from '../ai/provider.js';
@@ -25,6 +25,8 @@ import { bundleCode, chooseSecretScanner, type CodeBundle } from '../ai/redact.j
 import { ConsentToken, CountingSummary, countingSummary } from '../audit/consent-token.js';
 import { AiSpendMeter, meteredProvider } from '../ai/spend-meter.js';
 import { mapCoverage } from '../audit/coverage.js';
+import { buildsNoImage } from '../audit/model.js';
+import { readWorkflows, skippedWorkflowCount } from '../read/workflows.js';
 import { readOrigin, readProject } from '../read/project.js';
 import { applyTypeOverrides, type TypeOverride } from '../read/project-type.js';
 import { supportLevel } from '../read/support.js';
@@ -628,8 +630,9 @@ export function notProvableNotes(p: Pick<RepoProfile, 'services'>): string[] {
  * makes it warn-only or drops it); the stop names the way past: the --type flag, or a Dockerfile pipegen can see. Nothing skips DAST.
  */
 export function dastWayPast(message: string, services: readonly { name: string; containerHint?: string }[]): string[] {
-  if (!/The blocking check .* can not run/.test(message)) return [];
-  return services.filter((s) => s.containerHint !== undefined && message.includes(s.name)).map((s) =>
+  // spec M3: the service named exactly as jobs.ts writes it (`The blocking check "dast" for "<name>" can not run`), never a substring
+  const named = (name: string): boolean => message.includes(`The blocking check ${JSON.stringify('dast')} for ${JSON.stringify(safeText(name, 60))} can not run`);
+  return services.filter((s) => s.containerHint !== undefined && named(s.name)).map((s) =>
     `The service ${safeText(s.name, 60)} is built into an image elsewhere (${safeText(s.containerHint as string, 200)}), but pipegen sees no Dockerfile of its own to start it for the DAST check. Either add a Dockerfile in its folder, or, if it is a static site, run again with --type ${safeText(s.name, 60)}=static-site (at a terminal, the type question asks the same). pipegen never skips the DAST check.`);
 }
 
@@ -776,7 +779,8 @@ async function readBuildFacts(i: BuildInput): Promise<BuildFacts> {
   for (const s of p.services) {
     if (s.language !== 'node') continue;
     const root = s.path.replace(/^(?:\.\/)+/, '').replace(/\/+$/, '').replace(/^\.$/, '');
-    const pj = await readFile(join(i.dir, root, 'package.json'), 'utf8').then((t) => JSON.parse(t) as { type?: unknown }).catch(() => null);
+    const text = await readRegular(i.dir, root === '' ? 'package.json' : `${root}/package.json`, MAX_PACKAGE_JSON);
+    const pj = text === null ? null : (() => { try { return JSON.parse(text) as { type?: unknown } | null; } catch { return null; } })();
     serviceTypes[root] = pj?.type === 'module' ? 'module' : 'commonjs';
   }
   return {
@@ -917,8 +921,12 @@ export async function judgeBuilt(i: BuildInput, files: Pick<Built, 'assembled' |
 }
 
 /** Ruling G13-R0 13: the credits from the audit's coverage map (local files only: no child process, no AI). */
-export async function auditCredits(p: RepoProfile, draft: Pick<PipelineDraft, 'capabilities'>, dir: string): Promise<NonNullable<NonNullable<PipelineDraft['doc']>['credits']>> {
-  const rows = await mapCoverage(p, floorNeeds(p, draft.capabilities), dir, { capabilities: draft.capabilities });
+export async function auditCredits(p: RepoProfile, draft: Pick<PipelineDraft, 'capabilities'>, dir: string, map: typeof mapCoverage = mapCoverage): Promise<NonNullable<NonNullable<PipelineDraft['doc']>['credits']>> {
+  // spec M4: the options buildAudit passes (src/audit/model.ts coverageOf): the skipped workflow count from the workflow reader's notes,
+  // buildsNoImage, the capabilities; no branchGuess (the GitHub context is read, so the branch is known)
+  const readerNotes: string[] = [];
+  await readWorkflows(dir, undefined, readerNotes);
+  const rows = await map(p, floorNeeds(p, draft.capabilities), dir, { skippedWorkflows: skippedWorkflowCount(readerNotes), noImage: (need) => buildsNoImage(need, p), capabilities: draft.capabilities });
   const out: { text: string; kind: 'push-default' | 'hooks-ci' | 'signing' | 'deploy-gate' }[] = [];
   for (const r of rows) if (r.credit !== undefined && r.creditKind !== undefined && !out.some((o) => o.text === r.credit)) out.push({ text: r.credit, kind: r.creditKind });
   return out;
@@ -939,7 +947,8 @@ export async function runCreators(draft: PipelineDraft, bundle: CodeBundle, ai: 
   const notProven: PipelineDraft['notProven'] = [];
   const repoPaths = await listFiles(dir);
   // carry 52 (fail closed): with npm workspaces at the root, every service below the root counts as a member (its lockfile isn't edited)
-  const rootWorkspaces = await readFile(join(dir, 'package.json'), 'utf8').then((t) => (JSON.parse(t) as { workspaces?: unknown }).workspaces !== undefined).catch(() => false);
+  const rootPj = await readRegular(dir, 'package.json', MAX_PACKAGE_JSON);
+  const rootWorkspaces = rootPj !== null && (() => { try { return (JSON.parse(rootPj) as { workspaces?: unknown }).workspaces !== undefined; } catch { return false; } })();
   return withActiveVault(vault, async () => {
     if (!skip('docker')) {
       for (const s of p.services) {
@@ -955,8 +964,9 @@ export async function runCreators(draft: PipelineDraft, bundle: CodeBundle, ai: 
       // carries 52, 54: the service's package.json and lock as on disk, workspaceMember, the reviewed list; never isolatedTestJob
       const root = s.path.replace(/^(?:\.\/)+/, '').replace(/\/+$/, '').replace(/^\.$/, '');
       const at = (name: string): string => (root === '' ? name : `${root}/${name}`);
-      const packageJson = s.language === 'node' ? await readFile(join(dir, at('package.json')), 'utf8').catch(() => '') : '';
-      const packageLock = s.language === 'node' && repoPaths.includes(at('package-lock.json')) ? await readFile(join(dir, at('package-lock.json')), 'utf8') : null;
+      // sec M6: regular files only (listFiles holds no link), under a size cap
+      const packageJson = s.language === 'node' && repoPaths.includes(at('package.json')) ? await readRegular(dir, at('package.json'), MAX_PACKAGE_JSON) ?? '' : '';
+      const packageLock = s.language === 'node' && repoPaths.includes(at('package-lock.json')) ? await readRegular(dir, at('package-lock.json'), MAX_PACKAGE_LOCK) : null;
       const starter: StarterDeps = { fileExists: (path: string) => repoPaths.includes(path), packageJson, packageLock, reviewed, ...(root !== '' && rootWorkspaces ? { workspaceMember: true } : {}) };
       const r = await (c.tests ?? decideTests)(s, p, bundle, { ai, skip: skip('tests'), starter });
       testDecisions.push(r.decision);
@@ -972,6 +982,19 @@ export async function runCreators(draft: PipelineDraft, bundle: CodeBundle, ai: 
     }
     return { files, notes, testNotes, testDecisions, notProven };
   });
+}
+
+const MAX_PACKAGE_JSON = 1024 * 1024;
+const MAX_PACKAGE_LOCK = 32 * 1024 * 1024;
+/** sec M6: a file of the folder read only when it is a regular file (never a link, a folder or a device) no larger than `max`; else null. */
+export async function readRegular(dir: string, rel: string, max: number): Promise<string | null> {
+  const full = join(dir, rel);
+  const st = await lstat(full).catch(() => null);
+  if (st === null || !st.isFile() || st.size > max) return null;
+  // a linked folder on the way (svc -> /elsewhere) is outside the folder too
+  const [real, root] = await Promise.all([realpath(full).catch(() => null), realpath(dir).catch(() => null)]);
+  if (real === null || root === null || !real.startsWith(root.endsWith(sep) ? root : root + sep)) return null;
+  return readFile(full, 'utf8').catch(() => null);
 }
 
 async function listFiles(dir: string): Promise<string[]> {
