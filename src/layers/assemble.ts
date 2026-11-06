@@ -50,6 +50,7 @@ import { JOB_PERMISSIONS, referee, SIGNING_ENVIRONMENT, type Linters, type Refer
 import { RenderError } from '../engine/render-error.js';
 import { renderFindRunStep, stepsToYaml } from '../engine/render-step.js';
 import { FIND_RUN_STEP_ID, renderDigestStep, renderHeadCheckStep } from '../engine/deploy-steps.js';
+import { slug } from '../engine/artifact-names.js';
 import { egressSetsForTool } from '../engine/egress.js';
 import type { EgressSet } from '../engine/egress-sets.js';
 import { publishedImageServices } from '../engine/needs.js';
@@ -462,12 +463,14 @@ export function verifyTail(draft: PipelineDraft, reviewed: readonly ReviewedTool
   if (images.length > 1) fail(`pipegen publishes and verifies one image per repository in v0.2, and this one would publish ${images.length} (${images.map(show).join(', ')}).`);
   const plan = draft.signing;
   const planned = plan === undefined || plan === null || !Array.isArray(plan.images) ? [] : plan.images;
-  for (const i of planned) if (!images.includes(i?.service)) fail(`The signing plan signs the image of ${show(i?.service)}, which pipegen does not publish here.`);
+  // GJ-R1 (sec M3): a plan image belongs to a service by slug, the identity the signing checks use
+  const sameSlug = (a: unknown, b: string): boolean => { try { return slug(String(a)) === slug(b); } catch { return false; } };
+  for (const i of planned) if (!images.some((s) => sameSlug(i?.service, s))) fail(`The signing plan signs the image of ${show(i?.service)}, which pipegen does not publish here.`);
   const sets = new Set<EgressSet>();
   for (const service of images) {
     steps.push(guard(() => renderDigestStep(service)));
     if (plan === undefined || plan === null) continue;
-    const image = planned.find((i) => i.service === service);
+    const image = planned.find((i) => sameSlug(i?.service, service));
     if (image === undefined) fail(`The image of ${show(service)} is published, but the signing plan does not sign it, so a deploy of it could not be verified.`);
     const tool = reviewed.find((t) => t.id === (plan.mode === 'attest' ? GH_ID : COSIGN_ID));
     if (tool === undefined) fail(plan.mode === 'attest' ? 'Attest-mode deploys are verified with the reviewed pinned gh release, which is not on the reviewed list yet (it lands with the re-pin batch, G15), so this deploy can not be verified.' : 'The reviewed list has no cosign entry, so no deploy can be verified.');

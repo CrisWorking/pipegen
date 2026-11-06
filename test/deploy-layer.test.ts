@@ -577,6 +577,14 @@ describe('G7: the release jobs, the referee and the carries', () => {
     for (const it of steps.items) if (isMap(it) && it.get('id') === FIND_RUN_STEP_ID) it.delete('id');
     const noId = await judge(w, [{ ...f, content: d.toString({ lineWidth: 0 }) }]);
     expect(noId.issues.some((i) => /gives its find-run step the id pipegen-find-run/.test(i.message)), shown(noId)).toBe(true);
+    // only the egress block may come before find-run: a checkout of the repository there is refused
+    const pubJobs = (parse((w.a.files.find((x) => x.path === '.github/workflows/pipegen.yml') as CreatedFile).content) as Obj).jobs as Obj;
+    const checkout = (pubJobs['image-publish'].steps as Obj[]).find((x) => /^actions\/checkout@/.test(String(x.uses)));
+    expect(checkout).toBeDefined();
+    const d2 = parseDocument(f.content);
+    (d2.getIn(['jobs', 'pipegen-verify', 'steps']) as YAMLSeq).items.splice(1, 0, d2.createNode(checkout));
+    const early = await judge(w, [{ ...f, content: d2.toString({ lineWidth: 0 }) }]);
+    expect(early.issues.some((i) => /comes before its find-run step; only the egress block may/.test(i.message)), shown(early)).toBe(true);
   });
 
   it('G7: the deploy layer\'s sbom and egress needs leave the draft with a note (never counted as covered, carry G4→G7)', () => {
@@ -597,6 +605,10 @@ describe('G7: the release jobs, the referee and the carries', () => {
     expect(renewed).not.toContain(`central-sha: ${PIN.sha}`);
     // the same as a fresh insert of the new job into the original: only the job's bytes moved
     expect(renewed).toBe(insertVerify(DEPLOY_A, ['deploy'], again.verify as Job).text);
+    // a file the user changed since the insert is not renewed: the self-check holds the rest to the recorded original
+    const userChanged = ins.text.replace(/^(\s*)runs-on: (.*)$/m, '$1runs-on: self-hosted');
+    expect(userChanged).not.toBe(ins.text);
+    expect(() => renewVerifyJob(userChanged, ins.inserted, again.verify as Job)).toThrow(/without changing the rest of the file/);
   });
 
   it('G7: a static site\'s deploy gets the find-run check and the head check only, no digest (handoff G7)', async () => {

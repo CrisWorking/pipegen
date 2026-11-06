@@ -1152,7 +1152,7 @@ function judgeVerifyJob(fc: FileCtx, where: string, j: Obj, judged: readonly Jud
     const digest = at(`${DEPLOY_DIGEST_SOURCE}:${s}`);
     if (digest < 0 || digest < find) { bad(`holds the digest step of ${show(service)} after its find-run step (the image is published here, so its digest comes from the gated run's artifact, checked as sha256:<64 hex>).`); continue; }
     if (mode === 'none') continue;
-    const k = plan === undefined || plan === null || !Array.isArray(plan.images) ? -1 : plan.images.findIndex((i) => i?.service === service);
+    const k = plan === undefined || plan === null || !Array.isArray(plan.images) ? -1 : plan.images.findIndex((i) => { try { return slug(String(i?.service)) === s; } catch { return false; } });
     const verify = k < 0 ? -1 : at(`${VERIFY_SOURCE}:${k}`);
     if (verify < 0 || verify < digest) bad(`must check the signature of the image of ${show(service)} after its digest step: this repository signs in mode ${mode}, so a deploy of an image pipegen did not sign (or one verified in mode none) is never let through.`);
   }
