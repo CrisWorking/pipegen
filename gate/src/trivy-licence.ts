@@ -30,14 +30,14 @@ const MAX_RESULTS = 100_000;
 
 export interface TrivyLicenceOptions { limits?: Partial<ParseLimits> }
 
-function str(o: Obj, key: string, where: string, required: boolean): string {
+function ownText(o: Obj, key: string, where: string, required: boolean): string {
   const v = getOwn(o, key);
   if (v === undefined && !required) return '';
   if (typeof v !== 'string' || (required && v === '')) fail(`${where}: ${key} is not a non-empty string (${shown(v)})`);
   if (v.length > MAX_ID_CHARS) fail(`${where}: ${key} is longer than ${MAX_ID_CHARS}`);
   return v;
 }
-function list(o: Obj, key: string, where: string): unknown[] {
+function ownList(o: Obj, key: string, where: string): unknown[] {
   const v = getOwn(o, key);
   if (v === undefined || v === null) return [];
   if (!Array.isArray(v)) fail(`${where}: ${key} is not a list`);
@@ -52,7 +52,7 @@ export function parseTrivyLicenceJson(json: unknown, toolId: string, opts: Trivy
     if (getOwn(json, 'SchemaVersion') !== 2) fail(`the report's SchemaVersion is ${shown(getOwn(json, 'SchemaVersion'))}, not 2 (the pinned trivy's)`);
     if (getOwn(json, 'ArtifactType') !== 'filesystem') fail('the report is not of a filesystem scan (ArtifactType)');
     const limits = limitsFrom(opts.limits);
-    const results = list(json, 'Results', 'the report');
+    const results = ownList(json, 'Results', 'the report');
     if (results.length > MAX_RESULTS) fail(`the report has more than ${MAX_RESULTS} results`);
     const findings: ParsedFinding[] = [];
     let unknownSeverity = 0;
@@ -69,28 +69,28 @@ export function parseTrivyLicenceJson(json: unknown, toolId: string, opts: Trivy
     for (const [n, r] of results.entries()) {
       const at = `result ${n}`;
       if (!isObj(r)) fail(`${at} is not an object`);
-      const target = str(r, 'Target', at, true);
-      const cls = str(r, 'Class', at, true);
+      const target = ownText(r, 'Target', at, true);
+      const cls = ownText(r, 'Class', at, true);
       if (PACKAGE_CLASSES.has(cls)) {
-        for (const [k, p] of list(r, 'Packages', at).entries()) {
+        for (const [k, p] of ownList(r, 'Packages', at).entries()) {
           const where = `${at} package ${k}`;
           if (!isObj(p)) fail(`${where} is not an object`);
-          const name = str(p, 'Name', where, true);
-          const lics = list(p, 'Licenses', where);
+          const name = ownText(p, 'Name', where, true);
+          const lics = ownList(p, 'Licenses', where);
           for (const l of lics) if (typeof l !== 'string') fail(`${where}: Licenses holds a value that is not a string`);
           if (lics.length > 0) continue;   // its licences are in the result of class license
           push(`${name}${NO_LICENCE_RULE_SUFFIX}`, 'info', target,
             `Artifact: ${target}\nPkgName: ${name}\n No licence data: the package names no licence, so it counts as Unknown (a person checks it)`);
         }
       } else if (LICENCE_CLASSES.has(cls)) {
-        for (const [k, l] of list(r, 'Licenses', at).entries()) {
+        for (const [k, l] of ownList(r, 'Licenses', at).entries()) {
           const where = `${at} licence ${k}`;
           if (!isObj(l)) fail(`${where} is not an object`);
-          const name = str(l, 'Name', where, true);
-          const pkg = str(l, 'PkgName', where, false);
-          const path = str(l, 'FilePath', where, false) || target;
-          const category = str(l, 'Category', where, false);
-          const word = str(l, 'Severity', where, false);
+          const name = ownText(l, 'Name', where, true);
+          const pkg = ownText(l, 'PkgName', where, false);
+          const path = ownText(l, 'FilePath', where, false) || target;
+          const category = ownText(l, 'Category', where, false);
+          const word = ownText(l, 'Severity', where, false);
           let severity = Object.hasOwn(SEVERITY, word) ? SEVERITY[word] : undefined;
           if (severity === undefined) { severity = 'high'; unknownSeverity++; }
           push(pkg === '' ? name : `${pkg}:${name}`, severity, path,
