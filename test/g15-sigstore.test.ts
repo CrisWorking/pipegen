@@ -146,5 +146,15 @@ describe('G15a carries 2-3: only the keyless verify job reaches Sigstore', () =>
     steps[0] = renderEgressStep(['ghcr', 'github-releases', SIGSTORE_SET], { dockerNetworks: false }) as unknown as Obj;
     const files = w.a.files.map((x) => (x === f ? { ...f, content: JSON.stringify(doc) } : x));
     expect(shown(await judgeAssembled({ ...w.a, files }, { ...JD, extra: w.v.inserts.map((i) => i.file) }))).toMatch(/Sigstore/);
+    // the key-env verify job (same job id as the keyless one) may not open them either: the mode is the repository's, not the job's name
+    const ins = w.v.inserts[0]?.file as CreatedFile;
+    const vdoc = parse(ins.content) as Obj;
+    const vj = (vdoc.jobs as Obj)['pipegen-verify'] as Obj;
+    const vsteps = vj.steps as Obj[];
+    expect(String(vsteps[0]?.uses)).toMatch(/bullfrog/);
+    const had = String(((vsteps[0] as Obj).with as Obj)['allowed-domains']).split('\n');
+    const sets = ['ghcr', 'github-releases', SIGSTORE_SET].filter((x) => x !== SIGSTORE_SET || !had.includes('rekor.sigstore.dev'));
+    vsteps[0] = renderEgressStep(sets as never, { dockerNetworks: false }) as unknown as Obj;
+    expect(shown(await judge(w, [{ ...ins, content: JSON.stringify(vdoc) }]))).toMatch(/pipegen-verify[\s\S]*Sigstore/);
   });
 });

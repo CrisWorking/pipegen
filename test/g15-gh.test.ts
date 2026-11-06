@@ -76,7 +76,9 @@ describe('G15a carries 5-7: the reviewed pinned gh entry', () => {
     // without its own pin day the release is younger than the cooldown before the list's pinnedOn
     const noDay = structuredClone(gh); delete noDay.pinnedOn;
     expect(tryLoad(noDay)).toThrow(/cooldown/);
-    expect(tryLoad({ ...structuredClone(gh), pinnedOn: '2026-10-01T00:00:00Z' })).toThrow(/pinnedOn/);
+    expect(tryLoad({ ...structuredClone(gh), pinnedOn: '2026-10-01T00:00:00Z' })).toThrow(/pinnedOn is before the list's/);
+    // the day before the list's: refused for that reason alone (the release is older than both days)
+    expect(tryLoad({ ...structuredClone(gh), releasedAt: '2026-10-01T00:00:00Z', pinnedOn: '2026-10-27T00:00:00Z' })).toThrow(/pinnedOn is before the list's/);
     expect(tryLoad({ ...structuredClone(gh), pinnedOn: '2999-01-01T00:00:00Z' })).toThrow(/future/);
     expect(tryLoad({ ...structuredClone(gh), pinnedOn: '2026-10-30T00:00:00Z' })).toThrow(/cooldown/);
     expect(tryLoad({ ...structuredClone(gh), reviewedAt: '2026-11-01' })).toThrow(/reviewedAt is before/);
