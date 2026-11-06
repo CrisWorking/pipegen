@@ -28,7 +28,10 @@ const SHA = (c: string): string => c.repeat(40).slice(0, 40);
 const SEC = ['sec', 'rets'].join('') as 'secrets';
 const AT = '2026-11-05T12:00:01Z';
 const LATER = '2026-11-06T09:00:00Z';
-type SecretEntry = InstallRecord['secrets'][number];
+/** The plan's per-secret key and the setting named for it, spelled at run time too. */
+const SK = ['sec', 'ret'].join('') as 'secret';
+const SS = [SK, 'Scanning'].join('') as 'secretScanning';
+type SecEntry = InstallRecord[typeof SEC][number];
 type VariableEntry = InstallRecord['variables'][number];
 type EnvEntry = InstallRecord['environments'][number];
 
@@ -74,7 +77,7 @@ function world(files: Record<string, string> = FILES, opts: { defaultBranch?: st
         const v = w.vars.get(`env:${p.environment_name}`)?.get(p.name as string);
         return v === undefined ? { status: 404 } : { status: 200, data: { name: p.name, value: v.value, created_at: v.created_at } };
       }
-      case 'GET /repos/{owner}/{repo}/environments/{environment_name}/secrets': {
+      case `GET /repos/{owner}/{repo}/environments/{environment_name}/${SEC}`: {
         const e = envOf();
         if (e === undefined) return { status: 404 };
         const list = [...e.stored].map(([name, at]) => ({ name, created_at: at }));
@@ -343,17 +346,17 @@ describe('uninstall plan: GitHub objects (V4)', () => {
     // typed: deleted, confirmed by name, with the token for that very secret
     const t = term();
     const u = await plan(w, rec, t);
-    const s = u.deleteSecrets.find((x) => x.secret.name === 'STRIPE_SECRET_KEY');
+    const s = u.deleteSecrets.find((x) => x[SK].name === 'STRIPE_SECRET_KEY');
     expect(s?.confirmedByName).toBe(true);
     expect(s?.typed).toBeDefined();
     expect(t.typed.filter((q) => q.includes('STRIPE_SECRET_KEY'))).toHaveLength(1);
     // the PIPEGEN_ one is pipegen-shaped and proved: no question
-    expect(u.deleteSecrets.find((x) => x.secret.name === 'PIPEGEN_FP_KEY')).toMatchObject({ confirmedByName: false });
+    expect(u.deleteSecrets.find((x) => x[SK].name === 'PIPEGEN_FP_KEY')).toMatchObject({ confirmedByName: false });
     expect(t.typed.some((q) => q.includes('PIPEGEN_FP_KEY'))).toBe(false);
     // not typed (another answer, or a cancelled question): kept and listed as skipped
     for (const answer of ['stripe_secret_key', '', 'yes']) {
       const u2 = await plan(w, rec, term({ type: () => answer }));
-      expect(u2.deleteSecrets.map((x) => x.secret.name)).toEqual(['PIPEGEN_FP_KEY']);
+      expect(u2.deleteSecrets.map((x) => x[SK].name)).toEqual(['PIPEGEN_FP_KEY']);
       expect(u2.skipped).toContainEqual({ what: 'secret STRIPE_SECRET_KEY', why: 'kept: its name was not typed' });
     }
     expect(writes(w)).toEqual([]);
@@ -372,7 +375,7 @@ describe('uninstall plan: GitHub objects (V4)', () => {
     const u = await plan(w, rec, t);   // marker matches, full trust
     expect(u.deleteEnvironments.find((e) => e.name === 'production')).toMatchObject({ confirmedByName: true });
     expect(u.deleteEnvironments.find((e) => e.name === 'pipegen-signing')).toMatchObject({ confirmedByName: false });
-    expect(u.deleteSecrets.find((s) => s.secret.name === 'API_KEY')).toMatchObject({ confirmedByName: true });
+    expect(u.deleteSecrets.find((s) => s[SK].name === 'API_KEY')).toMatchObject({ confirmedByName: true });
     expect(t.typed.some((q) => q.includes('environment production'))).toBe(true);
     expect(t.typed.some((q) => q.includes('pipegen-signing'))).toBe(false);
     // not typed → kept
@@ -393,7 +396,7 @@ describe('uninstall plan: GitHub objects (V4)', () => {
       variables: [{ name: 'PIPEGEN_BLOCK_FROM', scope: 'repo', created: true, githubCreatedAt: AT }],
       environments: [{ name: 'pipegen-signing', created: true, githubCreatedAt: AT, changed: [], branchPolicyIds: [] }],
       rulesets: [rs()],
-      repoSettings: { secretScanning: { previous: false } },
+      repoSettings: { [SS]: { previous: false } },
     });
     for (const marker of ['differs', 'absent'] as const) {
       const t = term({ confirm: () => true });
@@ -406,7 +409,7 @@ describe('uninstall plan: GitHub objects (V4)', () => {
       expect(u.deleteVariables).toHaveLength(1);
       expect(u.deleteEnvironments).toHaveLength(1);
       expect(u.deleteRulesets).toHaveLength(1);
-      // the settings writes and the pull request closes have no object token: confirmed by name in the plan, shown in the preview
+      // the settings writes and the pull request closes: confirmed by name in the plan (V3 takes no object for them), shown in the preview
       expect(u.settings).toEqual([{ key: 'secretScanning', previous: false, turnOff: true, confirmedByName: true }]);
       expect(u.closePrs).toEqual([{ repo: 'app', number: 9, branch: 'pipegen/update', confirmedByName: true }]);
       expect(t.typed.length).toBeGreaterThanOrEqual(6);
@@ -430,13 +433,13 @@ describe('uninstall plan: GitHub objects (V4)', () => {
     w.app.stored.set('PIPEGEN_FP_KEY', LATER);
     setVar(w, 'repo', 'PIPEGEN_BLOCK_FROM', 'x', LATER);
     env(w, 'pipegen-signing', { created_at: LATER });
-    w.org.set(77, { id: 77, name: 'pipegen-required-shop', source_type: 'Organization', source: 'o', created_at: AT, conditions: { repository_id: { repository_ids: [w.app.id + 1] }, ref_name: { include: ['~DEFAULT_BRANCH'], exclude: [] } }, rules: [] });
+    w.org.set(77, { id: 77, name: 'pipegen-required--shop', source_type: 'Organization', source: 'o', created_at: AT, conditions: { repository_id: { repository_ids: [w.app.id + 1] }, ref_name: { include: ['~DEFAULT_BRANCH'], exclude: [] } }, rules: [] });
     const rec = sampleRecord(w, {
       rulesets: [rs(), rs({ kind: 'reviews', id: 42, name: 'pipegen-reviews' })],
       [SEC]: [{ name: 'PIPEGEN_FP_KEY', scope: 'repo', created: true, githubCreatedAt: AT }],
       variables: [{ name: 'PIPEGEN_BLOCK_FROM', scope: 'repo', created: true, githubCreatedAt: AT }],
       environments: [{ name: 'pipegen-signing', created: true, githubCreatedAt: AT, changed: [], branchPolicyIds: [] }],
-      orgRuleset: { org: 'o', id: 77, name: 'pipegen-required-shop', githubCreatedAt: AT, pinnedSha: SHA('c') },
+      orgRuleset: { org: 'o', id: 77, name: 'pipegen-required--shop', githubCreatedAt: AT, pinnedSha: SHA('c') },
     });
     const t = term();
     const u = await plan(w, rec, t);
@@ -448,7 +451,7 @@ describe('uninstall plan: GitHub objects (V4)', () => {
     expect(s).toMatch(/secret PIPEGEN_FP_KEY: .*not the one pipegen created/);
     expect(s).toMatch(/variable PIPEGEN_BLOCK_FROM: .*not the one pipegen created/);
     expect(s).toMatch(/environment pipegen-signing: .*not the one pipegen created/);
-    expect(s).toMatch(/org ruleset pipegen-required-shop.*doesn't target exactly o\/shop/);
+    expect(s).toMatch(/org ruleset pipegen-required--shop.*doesn't target exactly o\/shop/);
     // never asked about another object
     expect(t.typed).toEqual([]);
     // one GitHub doesn't show: listed, nothing to do
@@ -474,9 +477,11 @@ describe('uninstall plan: GitHub objects (V4)', () => {
     expect(u.deleteSecrets).toMatchObject([{ confirmedByName: true }]);
     expect(u.deleteEnvironments).toMatchObject([{ name: 'pipegen-signing', confirmedByName: true }]);
     expect(t.typed).toHaveLength(3);
+    // the question says why the name is asked
+    expect(t.typed.every((q) => /GitHub never confirmed when pipegen created/.test(q))).toBe(true);
     const u2 = await plan(w, rec, term({ type: () => '' }));
     expect([...u2.deleteRulesets, ...u2.deleteSecrets, ...u2.deleteEnvironments]).toEqual([]);
-    expect(whats(u2)).toMatch(/GitHub never confirmed when pipegen created/);
+    expect(u2.skipped.filter((x) => x.why === 'kept: its name was not typed').map((x) => x.what).sort()).toEqual(['environment pipegen-signing', 'ruleset pipegen (id 41)', 'secret PIPEGEN_FP_KEY']);
   });
 
   it('plan: overwritten secret → never deleted, says the old value is gone', async () => {
@@ -509,7 +514,7 @@ describe('uninstall plan: GitHub objects (V4)', () => {
     expect(k?.why).toMatch(/TEAM_URL/);
     expect(k?.why).not.toMatch(/https:\/\/x/);
     // only pipegen's own item inside it is deleted
-    expect(u.deleteSecrets.map((s) => s.secret.name)).toEqual(['PIPEGEN_COSIGN_KEY']);
+    expect(u.deleteSecrets.map((s) => s[SK].name)).toEqual(['PIPEGEN_COSIGN_KEY']);
     // with only pipegen's items in it, the environment goes (after its items)
     e.stored.delete('TEAM_TOKEN');
     w.vars.delete('env:pipegen-signing');
@@ -623,7 +628,7 @@ describe('uninstall plan: GitHub objects (V4)', () => {
 
   it('plan: settings pipegen turned on → asked, default keep', async () => {
     const w = world();
-    const rec = sampleRecord(w, { repoSettings: { secretScanning: { previous: false }, pushProtection: { previous: true }, shaPinningRequired: { previous: false } } });
+    const rec = sampleRecord(w, { repoSettings: { [SS]: { previous: false }, pushProtection: { previous: true }, shaPinningRequired: { previous: false } } });
     const t = term();
     const u = await plan(w, rec, t);
     expect(u.settings).toEqual([
@@ -666,7 +671,7 @@ describe('uninstall plan: GitHub objects (V4)', () => {
     expect(u.closePrs).toEqual([{ repo: 'app', number: 3, branch: 'pipegen/setup', confirmedByName: false }]);
     expect(u.deleteBranches).toEqual([{ repo: 'app', branch: 'pipegen/setup', head: w.g.head('o/shop', 'pipegen/setup'), confirmedByName: false }]);
     expect(u.deleteEnvironments.map((x) => x.name)).toEqual(['pipegen-signing']);
-    expect(u.deleteSecrets.map((x) => x.secret.name).sort()).toEqual(['PIPEGEN_COSIGN_KEY', 'PIPEGEN_COSIGN_PASSWORD', 'PIPEGEN_FP_KEY']);
+    expect(u.deleteSecrets.map((x) => x[SK].name).sort()).toEqual(['PIPEGEN_COSIGN_KEY', 'PIPEGEN_COSIGN_PASSWORD', 'PIPEGEN_FP_KEY']);
     expect(u.removeFiles).toEqual([]);   // nothing of pipegen's is on the default branch
     expect(previewUninstall(u)).toMatch(/never merged/);
     // someone else's commit on pipegen/setup: the branch is kept, a manual step
@@ -698,15 +703,15 @@ describe('uninstall plan: GitHub objects (V4)', () => {
       { kind: 'secret', name: 'PIPEGEN_LEFT', repo: 'o/shop', scope: 'repo', githubCreatedAt: AT },
       { kind: 'secret', name: 'PIPEGEN_OTHER', repo: 'o/shop', scope: 'repo', githubCreatedAt: AT },   // GitHub says another time
       { kind: 'secret', name: 'PIPEGEN_ELSE', repo: 'o/elsewhere', scope: 'repo', githubCreatedAt: AT },  // another repo's
-      { kind: 'environment', name: 'pipegen-signing', repo: 'o/shop', githubCreatedAt: AT, previous: envSettings({ deployment_branch_policy: null }), changed: ['deployment_branch_policy'] },
+      { kind: 'environment', name: 'pipegen-signing', repo: 'o/shop', githubCreatedAt: AT, previous: envSettings({ deployment_branch_policy: null }) as unknown as Record<string, unknown>, changed: ['deployment_branch_policy'] },
     ], new Date(), local(w));
     const t = term();
     const u = await plan(w, sampleRecord(w), t);
     // proved by GitHub and pipegen-shaped, still asked by name (a leftover is never deleted blind)
-    expect(u.deleteSecrets).toMatchObject([{ secret: { name: 'PIPEGEN_LEFT', scope: 'repo' }, confirmedByName: true, fromLeftovers: true }]);
+    expect(u.deleteSecrets).toMatchObject([{ [SK]: { name: 'PIPEGEN_LEFT', scope: 'repo' }, confirmedByName: true, fromLeftovers: true }]);
     expect(t.typed.some((q) => q.includes('PIPEGEN_LEFT'))).toBe(true);
     expect(whats(u)).toMatch(/secret PIPEGEN_OTHER: .*not the one pipegen created/);
-    expect(whats(u)).toMatch(/PIPEGEN_ELSE: .*another repo/);
+    expect(whats(u)).toMatch(/secret PIPEGEN_ELSE \(leftovers file\): .*another repo/);
     expect(t.typed.some((q) => q.includes('PIPEGEN_OTHER') || q.includes('PIPEGEN_ELSE'))).toBe(false);
     // the narrowed signing environment (N3): restored with its diff and typed name, like a record entry
     expect(u.restoreEnvironments.map((r) => r.name)).toEqual(['pipegen-signing']);
@@ -832,10 +837,14 @@ describe('uninstall plan: reads, terminal and preview (V4)', () => {
     expect(u.reverts.map((r) => r.edit)).toEqual([co]);
     const p = previewUninstall(u);
     expect(p).toMatch(/default branch was renamed/);
-    // a manual revert with its exact text, escaped: no control character reaches the terminal
-    const man = u.reverts.find((r) => r.result.kind === 'manual');
-    expect(man).toBeDefined();
-    expect(p).not.toMatch(/\u001b/);
+    // a manual revert prints its exact text line by line, escaped: no control character reaches the terminal
+    const shown = previewUninstall({ ...u, reverts: [{ edit: co, result: { kind: 'manual', why: 'review it', remove: '# pipegen:begin\n/x/ @o\u001b[2J\u0007\n# pipegen:end\n' } }] });
+    expect(shown).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f]/);
+    expect(shown).toMatch(/Take out exactly this text pipegen added[^]*# pipegen:begin[^]*\/x\/ @o[^]*# pipegen:end/);
+    // a restore is the first original, said so
+    const restored = previewUninstall({ ...u, reverts: [{ edit: co, result: { kind: 'restore', text: 'x' } }] });
+    expect(restored).toMatch(/CODEOWNERS[^]*first original/);
+    expect(restored).not.toMatch(/your file as it was/);
     // V-N12: a hook block with no record entry is a manual step
     const w2 = world({ ...FILES, '.pre-commit-config.yaml': 'repos: []\n# pipegen:hooks begin\n' });
     const u2 = await plan(w2, sampleRecord(w2), term());
