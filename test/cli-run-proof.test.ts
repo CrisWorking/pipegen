@@ -22,6 +22,7 @@ import type { CreatedFile, PipelineDraft } from '../src/types.js';
 import { cleanHomes, failOn, PASS, proofWorld, RUN_ID, TYPED } from './helpers/proof-world.js';
 
 afterAll(cleanHomes);
+const SCR2 = { owner: 'CrisWorking', repo: 'pipegen-scratch' } as never;
 const RN_FIELD = ['record', 'Secret', 'Names'].join('');
 const GA_FIELD = ['get', 'Auth'].join('') as 'getAuth';
 const SV_FIELD = ['sec', 'rets'].join('') as 'secrets';
@@ -155,6 +156,34 @@ describe('G14: the brief\'s tests (preflight §7 G14)', () => {
     expect(w.store.state?.secretNames).toEqual(expect.arrayContaining(['API_TOKEN', 'PIPEGEN_FP_KEY']));
   });
 
+  it('run: a second store of the scratch secrets is refused (the proof stops, cleaned up)', async () => {
+    const w = await proofWorld({ ops: { setup: async (_input, deps) => {
+      w.tl.push('setup');
+      await deps.storeSecrets(SCR2, { baseSha: 'b'.repeat(40) });
+      await deps.storeSecrets(SCR2, { baseSha: 'b'.repeat(40) });
+      throw new Error('unreachable');
+    } } });
+    const r = await w.run().catch((e: unknown) => ({ ok: false, stopped: String(e) }));
+    expect(r.ok).toBe(false);
+    expect(r.stopped).toContain('stores the scratch secrets once');
+    expect(w.tl.filter((x) => x === 'secretStore')).toHaveLength(1);
+    expect(w.tl.some((x) => x.startsWith('cleanup:'))).toBe(true);
+  });
+
+  it('run: a re-run of the failed jobs (deps.rerun) stores no secret either', async () => {
+    const w = await proofWorld({ results: [failOn('sast'), PASS], failLog: 'API rate limit exceeded' });
+    const during: string[] = [];
+    let reruns = 0;
+    w.ops.fixLoop = spyLoop(w, (deps) => ({
+      ...deps,
+      rerun: async (ids) => { reruns++; const n = w.tl.length; const r = await deps.rerun(ids); during.push(...w.tl.slice(n)); return r; },
+    }));
+    await w.run();
+    expect(reruns).toBe(1);
+    expect(during.some((x) => x.startsWith('rerunFailed:'))).toBe(true);
+    expect(during.filter((x) => x.startsWith('keys.') || x === 'secretStore' || x === 'setup')).toEqual([]);
+  });
+
   it('run: every ProofRun carries workflows; FixDeps.workflowsOf given', async () => {
     for (const priv of [false, true]) {
       const w = await proofWorld({ private: priv, results: [failOn('sast'), PASS] });
@@ -213,6 +242,9 @@ describe('G14: the brief\'s tests (preflight §7 G14)', () => {
     expect(got.service).toBe(api.chosen.service);
     // its ranked list is used up: null, and the web key (whose job did not fail) is never switched
     expect(await next('sast', w.input.draft)).toBeNull();
+    // only another job failed (not one of this need's keys): null, never a switch of a key whose job did not fail
+    const other = [{ variant: 'main', outcomes: [{ jobs: [{ name: 'gate', conclusion: 'failure' }, { name: 'sast--api', conclusion: 'success' }] }] }] as never;
+    expect(await nextCandidateFrom(debate, p, w.input.reviewed, () => other)('sast', w.input.draft)).toBeNull();
     // no failed job named: null (never a guess)
     expect(await nextCandidateFrom(debate, p, w.input.reviewed, () => [])('sast', w.input.draft)).toBeNull();
     // a private app (its central workflows are pushed once) and a resume (no debate): null
@@ -637,3 +669,28 @@ describe('G14: the production proof on a resume', () => {
   });
 });
 
+
+describe('G14: the production arm', () => {
+  it('run: defaultArm passes the meters to armProofCleanup (an interrupt saves them)', async () => {
+    vi.resetModules();
+    const eh = await import('../src/util/exit-hooks.js');
+    const st = await import('../src/proof/state.js');
+    const { defaultArm } = await import('../src/cli/run.js');
+    const { MinutesMeter } = await import('../src/proof/minutes.js');
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    try {
+      const p = profile({ owner: OWN, repo: 'r', private: false });
+      const store = await st.StateStore.open(p, { home: mkdtempSync(join(tmpdir(), 'pg-arm-')), env: {} });
+      store.begin(RUN_ID, { owner: OWN, repo: 'r', private: false, ownerType: 'User', defaultBranch: 'main' }, { cap: 10, aiCap: 1 });
+      store.setStage('planned');
+      const off = defaultArm(store, async () => undefined, () => ({ minutes: new MinutesMeter(10, 1_000) }));
+      expect(store.armed).toBe(true);
+      await eh.interrupt('SIGINT');
+      expect(store.load()).toMatchObject({ stage: 'interrupted', proofStart: { at: 1_000 } });
+      off();
+      expect(store.armed).toBe(false);
+    } finally {
+      kill.mockRestore();
+    }
+  });
+});

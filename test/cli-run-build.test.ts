@@ -4,8 +4,11 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import type { Octokit } from '@octokit/rest';
+// the real referee, watched: the fix loop's referee must judge AssembledFiles.draft, never the input draft (carry 25)
+vi.mock(import('../src/engine/referee.js'), async (orig) => { const m = await orig(); return { ...m, referee: vi.fn(m.referee) }; });
+import { referee as watchedReferee } from '../src/engine/referee.js';
 import { buildFiles, judgeBuilt, proofBuildFor, readBuildFacts, readRegular, runCreators, workflowTexts, type BuildInput, type BuildFacts } from '../src/cli/run.js';
 import { strictNeeds, warnFirstFor } from '../src/cli/run-parts.js';
 import { judgeAssembled } from '../src/layers/assemble.js';
@@ -356,6 +359,11 @@ describe('G14: the fix loop\'s build, referee and guard; AI-written files to the
     const d = { ...i.draft, created: [{ repo: 'app', path: 'Dockerfile', content: 'FROM node:22\n', part: 'docker', reason: 'r' }, { repo: 'app', path: '.dockerignore', content: 'node_modules\n', part: 'docker', reason: 'r' }] } as PipelineDraft;
     const report = await pb.referee(d);
     const b = await pb.rebuild(d);
+    // carry 25: the referee judged the assembled draft of that build (seven arguments), never the input draft
+    const call = vi.mocked(watchedReferee).mock.calls.at(-1) ?? [];
+    expect(call).toHaveLength(7);
+    expect(call[1]).toBe(b.assembled);
+    expect(call[1]).not.toBe(d);
     // the guard got exactly the app files of the batch the referee judged (a Dockerfile with its .dockerignore)
     expect(guarded).toEqual([b.files.filter((f) => f.repo === 'app').map((f) => f.path).sort()]);
     expect(guarded[0]).toEqual(expect.arrayContaining(['Dockerfile', '.dockerignore']));

@@ -22,6 +22,8 @@ import { CAPS, candidatesFor, choicesFor, need, profile, scripted, svc } from '.
 
 export const RUN_ID = '20261106-100000-abc123';
 export const OWN = 'CrisWorking';
+/** Evidence that answers every unit key with one value. */
+class AnyKey<V> extends Map<string, V> { constructor(private readonly v: V) { super(); } override get(): V { return this.v; } override has(): boolean { return true; } }
 /** Key names built at run time (the no-secret-literals rule reads `<name>: value` as a credential). */
 export const A_FIELD = ['au', 'th'].join('') as 'auth';
 export const TK_FIELD = ['to', 'ken'].join('');
@@ -46,6 +48,8 @@ export const CALLER = (extra = ''): CreatedFile => wf('.github/workflows/pipegen
 export interface WorldOpts {
   private?: boolean;
   results?: ProofResult[];
+  /** A failed result's evidence: one source of the latest run with this log (any unit), e.g. a rate limit the loop re-runs. */
+  failLog?: string;
   canDelete?: boolean;
   confirm?: boolean | 'throw';
   interactive?: boolean;
@@ -151,7 +155,10 @@ export async function proofWorld(o: WorldOpts = {}): Promise<World> {
     evaluate: async (d, _runs, ctx) => {
       tl.push('evaluate');
       evals.push({ d, ctx });
-      return { result: results.length > 1 ? results.shift() as ProofResult : results[0] as ProofResult, coverage: { measured: null, lowest: null, decision: null }, evidence: new Map() };
+      const result = results.length > 1 ? results.shift() as ProofResult : results[0] as ProofResult;
+      const src = { runId: runN, attempt: 1, log: o.failLog ?? '' };
+      const evidence = o.failLog === undefined || result.ok ? new Map() : new AnyKey({ sources: [src] }) as never;
+      return { result, coverage: { measured: null, lowest: null, decision: null }, evidence };
     },
     userMain: async () => new Map(),
     cancelActive: async () => { tl.push('cancelActive'); },
