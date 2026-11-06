@@ -2,7 +2,7 @@
 // GitHub is a fake Octokit (a request function and a log of what was sent); the prompt is a fake; nothing touches the network.
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { Octokit } from '@octokit/rest';
+import { Octokit } from '@octokit/rest';
 import { describe, expect, it } from 'vitest';
 import { gitBlobSha } from '../src/create/guard.js';
 import { centralWorkflowFile } from '../src/engine/central-path.js';
@@ -222,9 +222,39 @@ describe('V3 target: routes', () => {
   });
 });
 
-/** The code of a file without its comments and string literals (so "pull request" in a message is not a `request`). */
+/**
+ * The code of a file without its comments and string literals (so "pull request" in a message is not a `request`). A template literal's
+ * text goes, but the code of each `${…}` in it stays (sec M-r2-4), nested templates and braces included.
+ */
 function codeOnly(src: string): string {
-  return src.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' ').replace(/'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`/g, "''");
+  let out = '';
+  let depth = 0;
+  const open: number[] = [];   // the brace depth at each `${` still open
+  let i = 0;
+  /** A template's text from `i` to its end or its next `${`. */
+  const templateText = (): void => {
+    while (i < src.length && src[i] !== '`' && !(src[i] === '$' && src[i + 1] === '{')) i += src[i] === '\\' ? 2 : 1;
+    out += "''";
+    if (src[i] === '$') { open.push(depth); out += ' '; i += 2; } else i += 1;
+  };
+  while (i < src.length) {
+    const ch = src[i] as string;
+    const next = src[i + 1];
+    if (ch === '/' && next === '*') { const e = src.indexOf('*/', i + 2); i = e < 0 ? src.length : e + 2; out += ' '; continue; }
+    if (ch === '/' && next === '/') { const e = src.indexOf('\n', i); i = e < 0 ? src.length : e; out += ' '; continue; }
+    if (ch === "'" || ch === '"') {
+      let j = i + 1;
+      while (j < src.length && src[j] !== ch && src[j] !== '\n') j += src[j] === '\\' ? 2 : 1;
+      i = j + 1; out += "''"; continue;
+    }
+    if (ch === '`') { i += 1; templateText(); continue; }
+    if (ch === '}' && open.length > 0 && open[open.length - 1] === depth) { open.pop(); i += 1; templateText(); continue; }
+    if (ch === '{') depth += 1;
+    if (ch === '}') depth -= 1;
+    out += ch;
+    i += 1;
+  }
+  return out;
 }
 /** Per module of src/, the value names another file of src/uninstall may import (sec I7: an allow-list, not a deny-list). */
 const GIT_DATA_READS = ['DeliverError', 'ISO_RE', 'isoAt', 'statusOf', 'refusedMove', 'checkBranch', 'ghRead', 'readRepo', 'readHead', 'readTree', 'readBlobText', 'compareStatus', 'findOpenPr'];
@@ -252,9 +282,32 @@ function importProblems(src: string): string[] {
   }
   return out;
 }
-const OCTOKIT_NAMESPACES: readonly string[] = ['actions', 'activity', 'apps', 'billing', 'checks', 'codeScanning', 'codesOfConduct', 'codespaces', 'copilot', 'dependabot', 'dependencyGraph', 'emojis', 'gists', 'git', 'gitignore', 'interactions', 'issues', 'licenses', 'markdown', 'meta', 'migrations', 'oidc', 'orgs', 'packages', 'projects', 'pulls', 'rateLimit', 'reactions', 'repos', 'search', 'secretScanning', 'securityAdvisories', 'teams', 'users'];
-/** `<x>.<namespace>.<method>(`: an Octokit endpoint method (with or without `.rest`); an array method on a list of that name is not one. */
-const OCTOKIT_ENDPOINT_RE = /\.\s*(?:actions|activity|apps|billing|checks|codeScanning|codesOfConduct|codespaces|copilot|dependabot|dependencyGraph|emojis|gists|git|gitignore|interactions|issues|licenses|markdown|meta|migrations|oidc|orgs|packages|projects|pulls|rateLimit|reactions|repos|search|secretScanning|securityAdvisories|teams|users)\s*\.\s*(?!(?:filter|map|find|findIndex|findLast|findLastIndex|some|every|forEach|reduce|includes|indexOf|slice|concat|flat|flatMap|join|sort|toSorted|at|keys|values|entries)\b)[A-Za-z]+\s*\(/;
+/**
+ * Sec M-r2-4: the client's own namespaces, read from an Octokit at test time (every key whose value is an object of functions:
+ * `repos`, `pulls`, … and whatever a later @octokit/rest adds), never a hand-written list.
+ */
+const OCTOKIT_NAMESPACES: readonly string[] = (() => {
+  const o = new Octokit() as unknown as Record<string, unknown>;
+  return Object.keys(o).filter((k) => {
+    const v = o[k];
+    return typeof v === 'object' && v !== null && Object.keys(v).length > 0 && Object.values(v).every((f) => typeof f === 'function');
+  });
+})();
+/** A namespace of the client, or `rest` (which holds them all). */
+const NS = `(?:${[...OCTOKIT_NAMESPACES, 'rest'].join('|')})`;
+/** `.` or `?.` */
+const DOT = String.raw`\s*\??\.\s*`;
+const ARRAY_METHODS = 'filter|map|find|findIndex|findLast|findLastIndex|some|every|forEach|reduce|includes|indexOf|slice|concat|flat|flatMap|join|sort|toSorted|at|keys|values|entries|length';
+/** `<x>.<namespace>.<method>(` (`?.` anywhere): an Octokit endpoint method (with or without `.rest`); an array method on a list of that name is not one. */
+const OCTOKIT_ENDPOINT_RE = new RegExp(String.raw`${DOT}${NS}${DOT}(?!(?:${ARRAY_METHODS})\b)[A-Za-z]+\s*(?:\?\.\s*)?\(`);
+/** `<namespace>.<method>.call(` / `.apply(` / `.bind(`. */
+const ENDPOINT_CALL_RE = new RegExp(String.raw`${DOT}${NS}${DOT}[A-Za-z]+${DOT}(?:call|apply|bind)\b`);
+/** A bracket right after a namespace (`gh.repos['delete']`, `gh.repos[m]`, `?.[`), a number index of a list excepted. */
+const NS_BRACKET_RE = new RegExp(String.raw`${DOT}${NS}\s*(?:\?\.\s*)?\[(?!\s*\d+\s*\])`);
+/** A namespace in a destructuring pattern (`const { repos } = gh`, `{ repos: r }`, `{ rest: { repos } }`); a `...rest` element is not one. */
+const NS_DESTRUCTURE_RE = new RegExp(String.raw`\{[^{}]*(?<!\.\.\.\s*)\b${NS}\b[^{}]*\}(?:\s*\})*\s*=(?![=>])`);
+/** A namespace given a name of its own (`const r = gh.repos;`, `= api.gh?.pulls`). */
+const NS_ALIAS_RE = new RegExp(String.raw`=\s*[\w$.?]+?${DOT}${NS}\s*(?:[;,)}\]]|$)`, 'm');
 /** What the scan finds wrong in one file of src/uninstall (target.ts is the one that writes). */
 function scanProblems(file: string, src: string): string[] {
   const out: string[] = [];
@@ -265,7 +318,7 @@ function scanProblems(file: string, src: string): string[] {
   no(/\.graphql\s*[(.`]/, 'a graphql call', code);
   no(/\{[^{}]*\b(?:request|graphql)\b[^{}]*\}\s*=\s*[\w.]+/, 'a destructured request');
   no(/\b(?:gh|octokit)\s*\[/, 'bracket access on a client', code);
-  no(/\[\s*['"`](?:request|graphql|rest)['"`]\s*\]/, 'bracket access on a client');
+  no(new RegExp(String.raw`\[\s*['"\`](?:request|graphql|paginate|hook|${NS.slice(3, -1)})['"\`]\s*\]`), 'bracket access on a client');
   no(/\.(?:request|graphql)\s*\.(?:bind|call|apply)\b/, 'a bound request', code);
   no(/=\s*[\w.]+\.(?:request|graphql)\s*[;,)\n]/, 'an aliased request', code);
   if (file === 'target.ts') return out;
@@ -279,6 +332,11 @@ function scanProblems(file: string, src: string): string[] {
   // sec N-I2: @octokit/rest also hangs every endpoint method on the client itself (legacyRestEndpointMethods: gh.repos.delete, …), and
   // paginate / graphql / hook send whatever their route or query says; none of them belongs outside target.ts
   no(OCTOKIT_ENDPOINT_RE, 'an Octokit endpoint method', code);
+  // sec M-r2-4: the same methods reached another way
+  no(ENDPOINT_CALL_RE, 'an endpoint method called through .call, .apply or .bind', code);
+  no(NS_BRACKET_RE, 'a bracket after an Octokit namespace', code);
+  no(NS_DESTRUCTURE_RE, 'a destructured Octokit namespace', code);
+  no(NS_ALIAS_RE, 'an aliased Octokit namespace', code);
   no(/\bpaginate\b/, 'paginate', code);
   no(/\bgraphql\b/, 'graphql', code);
   no(/\.\s*hook\b|\bhook\s*[,}]/, 'an Octokit hook', code);
@@ -945,7 +1003,7 @@ describe('V3 fix round 1', () => {
   it('R1 sec M3: a write is refused when GitHub\'s id of the app (or of central) is not the recorded one', async () => {
     const other = new UninstallApi(fakeGh((route) => (route === 'GET /repos/{owner}/{repo}' ? { id: 999 } : { name: 'PIPEGEN_X', created_at: AT }), { raw: true }).gh, APP, { clock: clock(), askName: asker() });
     await expect(other.deleteIfPipegens({ kind: 'secret', entry: { name: 'PIPEGEN_X', scope: 'repo', created: true, unconfirmed: true } }, { typed: await typedOn(other, { kind: 'secret', entry: { name: 'PIPEGEN_X', scope: 'repo', created: true, unconfirmed: true } }) })).rejects.toBeInstanceOf(UninstallRefusal);
-    const f = fakeGh((route, p) => (route === 'GET /repos/{owner}/{repo}' ? { id: p.repo === 'pipelines' ? 777 : 101 } : {}), { raw: true });
+    const f = fakeGh((route, p) => (route === 'GET /repos/{owner}/{repo}' ? { id: p.repo === 'pipelines' ? 777 : 101 } : route.endsWith('/automated-security-fixes') ? { enabled: false } : {}), { raw: true });
     const c = new UninstallApi(f.gh, APP, { clock: clock(), centralRepoId: CENTRAL_ID });
     await expect(c.write('PUT /repos/{owner}/{repo}/actions/permissions/access', { owner: OWNER, repo: 'pipelines', access_level: 'none' })).rejects.toBeInstanceOf(UninstallRefusal);
     await expect(c.deleteBranch('central', 'pipegen/update-shop')).rejects.toBeInstanceOf(UninstallRefusal);
@@ -1081,7 +1139,7 @@ describe('V3 fix round 1', () => {
     expect((await gonePr.api.closePr('app', 3)).status).toBe('gone');
     const ref = api((route) => { if (route.startsWith('GET ')) return {}; throw httpErr(422); });
     expect(await ref.api.deleteBranch('app', 'pipegen/setup')).toMatchObject({ status: 'leftover', manual: 'gh api -X DELETE repos/acme/shop/git/refs/heads/pipegen/setup' });
-    const w = api((route) => { if (route.startsWith('GET ')) return {}; throw httpErr(403); });
+    const w = api((route) => { if (route.startsWith('GET ')) return route.endsWith('/automated-security-fixes') ? { enabled: false } : {}; throw httpErr(403); });
     expect(await w.api.write('DELETE /repos/{owner}/{repo}/vulnerability-alerts', { owner: OWNER, repo: 'shop' })).toMatchObject({ status: 'leftover', manual: expect.stringContaining('gh api -X DELETE repos/acme/shop/vulnerability-alerts') });
   });
 
@@ -1094,13 +1152,14 @@ describe('V3 fix round 1', () => {
     };
     const go = async (readme: string, after: 'gone' | 'error') => {
       let deleted = false;
-      const f = fakeGh((route) => {
+      const f = fakeGh((route, p) => {
         if (route === 'GET /repos/{owner}/{repo}') { if (deleted) throw httpErr(after === 'gone' ? 404 : 500); return { id: CENTRAL_ID, name: 'pipelines', full_name: 'acme/pipelines', owner: { login: OWNER }, description: DESC, default_branch: 'main', forks_count: 0, has_wiki: false, has_discussions: false }; }
         if (route === 'GET /repos/{owner}/{repo}/branches') return [{ name: 'main' }];
         if (route === 'GET /repos/{owner}/{repo}/git/ref/{ref}') return { object: { sha: SHA } };
         if (route === 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}') return { tree: { sha: SHA }, parents: [] };
         if (route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}') return { truncated: false, tree: [{ path: 'README.md', sha: gitBlobSha(readme), mode: '100644', type: 'blob' }] };
         if (route.endsWith('/secrets') || route.endsWith('/variables') || route.endsWith('/environments')) return { total_count: 0, [LIST]: [], variables: [], environments: [] };
+        if (route === 'GET /repos/{owner}/{repo}/git/matching-refs/{ref}' && p.ref === '') return [{ ref: 'refs/heads/main' }];
         if (route.startsWith('GET ')) return [];
         if (route === 'DELETE /repos/{owner}/{repo}') { deleted = true; return {}; }
         throw httpErr(500);
@@ -1464,6 +1523,7 @@ describe('V3 fix round 2', () => {
       for (const ok of [
         'const n = d.issues[0];', 'const s = `${d.issues.length} issues`;', 'const s = `gh.repos.delete(p)`;', 'const open = d.issues?.filter((x) => x.open);',
         'const s = `${a}-${b}`;', 'if (x) { const y = `${z}`; }', 'const t = { a: `${b}` };',
+        'const { githubCreatedAt: _drop, ...rest } = e;',
       ]) expect(scanProblems('plan.ts', ok), ok).toEqual([]);
     });
   });

@@ -1,4 +1,4 @@
-// v0.2 Plan V V3 (rulings V-B5, V-B6, V-S11, V-S13, V-S16, V-N2, V-N7; fix rounds: V3-R1, V3-R2): the one module of src/uninstall that
+// v0.2 Plan V V3 (rulings V-B5, V-B6, V-S11, V-S13, V-S16, V-N2, V-N7; fix rounds: V3-R1, V3-R2, V3-R2b): the one module of src/uninstall that
 // sends a GitHub write.
 //
 // - UNINSTALL_WRITE_ROUTES is the fixed list of settings writes uninstall sends (the allow-list pattern of FINISH_WRITE_ROUTES, G11 carry).
@@ -8,10 +8,12 @@
 //   (`baseUrl`, `headers`, …) reaches any request. Before the first write to a repo, GitHub's id of it must be the recorded one (the app's
 //   `repoId`; central's `central.repoId` when recorded). A 401 stops the run (githubTokenRejected); a rate stop is rethrown; no write
 //   starts once a stop has begun (interrupting()).
-// - A settings write (fix round 2, ruling V3-R2) reads the setting first and puts back only what is still as pipegen set it; reads never
-//   hold a `.` or `..` segment. The classic protection, the central CODEOWNERS and the central repo delete each look at every field,
-//   path or object GitHub holds that pipegen's own form would not show (signed commits, Discussions, Dependabot and Codespaces secrets,
-//   other refs) and keep what pipegen didn't make.
+// - A settings write (fix round 2, ruling V3-R2) reads the setting first and puts back only what is still as pipegen set it, never a
+//   setting that needs the one turned off (V3-R2b: Dependabot security updates, the other secret_scanning switches) and never with a
+//   value it didn't read (the live allowed_actions go back with the pin); reads never hold a `.` or `..` segment. The classic
+//   protection, the central CODEOWNERS (its sha in the parent tree too) and the central repo delete each look at every field, path or
+//   object GitHub holds that pipegen's own form would not show (signed commits, Discussions, Dependabot and Codespaces secrets, other
+//   refs, commit comments) and keep what pipegen didn't make.
 // - The deletes that remove an object pipegen created (rulesets, the org rule, secrets, variables, environments) are not open through
 //   `write`: deleteIfPipegens reads the object from GitHub right before the DELETE and sends it only when isPipegens says `yes` (GitHub's id,
 //   name, source and created_at equal the recorded ones), or `ask` with a typed name for that very object. An environment is deleted only
@@ -136,6 +138,8 @@ const envBody: BodyCheck = (b) => {
   }
   return null;
 };
+/** The values of GitHub's `allowed_actions` the actions-permissions PUT takes. */
+const ALLOWED_ACTIONS: readonly string[] = ['all', 'local_only', 'selected'];
 const STATUS = (v: unknown): boolean => isObj(v) && keysIn(v, ['status']) && (v.status === 'enabled' || v.status === 'disabled');
 const BODIES: Readonly<Record<string, { repos: readonly Where[] | 'org'; body: BodyCheck }>> = {
   [ROUTES.repoRuleset]: { repos: ['app', 'central'], body: none },
@@ -153,7 +157,7 @@ const BODIES: Readonly<Record<string, { repos: readonly Where[] | 'org'; body: B
   [ROUTES.actionsPermissions]: {
     repos: ['app'],
     body: (b) => (keysIn(b, ['enabled', 'allowed_actions', 'sha_pinning_required']) && b.enabled === true && bool(b.sha_pinning_required)
-      && (!('allowed_actions' in b) || ['all', 'local_only', 'selected'].includes(b.allowed_actions as string)) ? null : 'it takes only enabled (true), allowed_actions and sha_pinning_required'),
+      && (!('allowed_actions' in b) || ALLOWED_ACTIONS.includes(b.allowed_actions as string)) ? null : 'it takes only enabled (true), allowed_actions and sha_pinning_required'),
   },
   [ROUTES.vulnerabilityAlerts]: { repos: ['app'], body: none },
   [ROUTES.repoPatch]: {
@@ -577,35 +581,49 @@ export class UninstallApi {
     const what = `the setting ${show(ghPath(route, params))}`;
     try {
       await this.#verify(where);
-      const now = await this.#settingNow(route, path, body, opts.pipegenSet);
-      if (typeof now === 'string') return { status: 'kept', why: `${what}: ${now}, so pipegen leaves it`, ...(now.startsWith('already') ? {} : { manual }) };
-      await this.#send(route, { ...now, ...path });
+      const now = await this.#settingNow(route, path, body, opts.pipegenSet, manual);
+      if ('keep' in now) return { status: 'kept', why: `${what}: ${now.keep}, so pipegen leaves it`, ...(now.manual === null ? {} : { manual: now.manual }) };
+      await this.#send(route, { ...now.send, ...path });
     } catch (e) { return this.#outcome(e, where, what, manual); }
     return { status: 'done' };
   }
 
   /**
-   * Sec N-M5: GitHub's setting now, against what pipegen set; the body to send, or why nothing is sent. Pipegen only turns these on (the
-   * sha pin, Dependabot alerts, secret scanning and push protection) or sets the central Actions access, so each is put back only while
-   * it is still that: never Actions turned back on, its allowed actions widened, a switch the owner changed since, or an access level
-   * another project set.
+   * Sec N-M5: GitHub's setting now, against what pipegen set; the body to send, or why nothing is sent with the manual step (`manual`, the
+   * command of this very write, unless said otherwise; null: none). Pipegen only turns these on (the sha pin, Dependabot alerts, secret
+   * scanning and push protection) or sets the central Actions access, so each is put back only while it is still that: never Actions
+   * turned back on, its allowed actions changed, a switch the owner changed since, a setting that needs the one turned off, or an access
+   * level another project set.
    */
-  async #settingNow(route: string, path: Record<string, unknown>, body: Body, pipegenSet: string | undefined): Promise<Body | string> {
+  async #settingNow(route: string, path: Record<string, unknown>, body: Body, pipegenSet: string | undefined, manual: string): Promise<{ send: Body } | { keep: string; manual: string | null }> {
+    const keep = (why: string, m: string | null = manual) => ({ keep: why, manual: m });
     switch (route) {
       case ROUTES.actionsPermissions: {
         const d = (await this.read('GET /repos/{owner}/{repo}/actions/permissions', path)).data;
-        if (!isObj(d) || d.enabled !== true) return 'Actions is off now (or GitHub doesn\'t say), and pipegen doesn\'t turn it back on';
-        if ('allowed_actions' in body && body.allowed_actions !== d.allowed_actions) return 'its allowed actions are not what pipegen read at install (changed since), and pipegen never changes them';
-        if (d.sha_pinning_required !== true) return 'the full-length sha pin is not on as pipegen set it (changed since, or GitHub doesn\'t say)';
-        if (body.sha_pinning_required === true) return 'already as it was before pipegen';
-        return { enabled: true, sha_pinning_required: body.sha_pinning_required };
+        // sec M-r2-3: no manual step either: the command would turn Actions back on
+        if (!isObj(d) || d.enabled !== true) return keep('Actions is off now (or GitHub doesn\'t say), and pipegen doesn\'t turn it back on', null);
+        if ('allowed_actions' in body && body.allowed_actions !== d.allowed_actions) return keep('its allowed actions are not what pipegen read at install (changed since), and pipegen never changes them');
+        // sec M-r2-2: the PUT carries GitHub's own allowed_actions (an omitted one may be reset to `all`); one pipegen doesn't know keeps it
+        if (!ALLOWED_ACTIONS.includes(d.allowed_actions as string)) return keep('GitHub doesn\'t say which actions are allowed (or names a value pipegen doesn\'t know), and pipegen never changes them');
+        if (d.sha_pinning_required !== true) return keep('the full-length sha pin is not on as pipegen set it (changed since, or GitHub doesn\'t say)');
+        if (body.sha_pinning_required === true) return keep('already as it was before pipegen', null);
+        return { send: { enabled: true, allowed_actions: d.allowed_actions, sha_pinning_required: body.sha_pinning_required } };
       }
       case ROUTES.vulnerabilityAlerts: {
         try { await this.read('GET /repos/{owner}/{repo}/vulnerability-alerts', path); } catch (e) {
-          if (!(e instanceof UninstallRefusal) && statusOf(e) === 404) return 'already off';
+          if (!(e instanceof UninstallRefusal) && statusOf(e) === 404) return keep('already off', null);
           throw e;
         }
-        return {};
+        // sec M-r2-1: Dependabot security updates need the alerts, and GitHub turns them off with the alerts
+        const both = `Dependabot security updates need Dependabot alerts: to turn both off, turn off Dependabot security updates first, then Dependabot alerts, in the repo's settings (Code security), or gh api -X DELETE ${ghPath('DELETE /repos/{owner}/{repo}/automated-security-fixes', path)}, then ${manual}`;
+        let fixes: unknown;
+        try { fixes = (await this.read('GET /repos/{owner}/{repo}/automated-security-fixes', path)).data; } catch (e) {
+          if (e instanceof UninstallRefusal) throw e;
+          hardStop(e);
+          return keep('GitHub doesn\'t say whether Dependabot security updates are on (they need the alerts)', both);
+        }
+        if (!isObj(fixes) || fixes.enabled !== false) return keep('Dependabot security updates are on (or GitHub doesn\'t say), and turning the alerts off would turn them off too', both);
+        return { send: {} };
       }
       case ROUTES.repoPatch: {
         const d = (await this.read('GET /repos/{owner}/{repo}', path)).data;
@@ -614,20 +632,31 @@ export class UninstallApi {
         const want = body.security_and_analysis as Record<string, { status: string }>;
         const send: Record<string, { status: string }> = {};
         for (const [k, v] of Object.entries(want)) {
-          if (v.status !== 'disabled') return `pipegen only turns ${k} on, so it never turns it on again`;
+          if (v.status !== 'disabled') return keep(`pipegen only turns ${k} on, so it never turns it on again`);
           const live = isObj(sa[k]) ? (sa[k] as { status?: unknown }).status : undefined;
-          if (live !== 'enabled' && live !== 'disabled') return `GitHub doesn't say whether ${k} is on`;
+          if (live !== 'enabled' && live !== 'disabled') return keep(`GitHub doesn't say whether ${k} is on`);
           if (live === 'enabled') send[k] = v;
         }
-        return Object.keys(send).length === 0 ? 'already as it was before pipegen' : { security_and_analysis: send };
+        // sec M-r2-1: every other secret_scanning switch (push protection, validity checks, non-provider patterns, …) needs secret scanning
+        if ('secret_scanning' in send) {
+          const on = Object.entries(sa).filter(([k, v]) => k.startsWith('secret_scanning_') && !(k in want) && isObj(v) && v.status === 'enabled')
+            .map(([k]) => (/^secret_scanning_[a-z0-9_]{1,60}$/.test(k) ? k : 'another secret_scanning switch'));
+          if (on.length > 0) {
+            const names = on.slice(0, MAX_LISTED).join(', ');
+            return keep(`${names} ${on.length === 1 ? 'is' : 'are'} on and need secret scanning`, `${names} need secret scanning: to turn secret scanning off too, turn ${on.length === 1 ? 'it' : 'them'} off first in the repo's settings (Code security), then: ${manual}`);
+          }
+        }
+        return Object.keys(send).length === 0 ? keep('already as it was before pipegen', null) : { send: { security_and_analysis: send } };
       }
       case ROUTES.actionsAccess: {
-        if (pipegenSet !== 'organization' && pipegenSet !== 'user') return 'pipegen doesn\'t know the access level it set';
+        // sec M-r2-3: the access level is shared by every project of the central repo: the step is advice, after a check
+        const shared = `Check first that no other project of ${this.app.owner}/${CENTRAL_REPO} relies on this access level, then: ${manual}`;
+        if (pipegenSet !== 'organization' && pipegenSet !== 'user') return keep('pipegen doesn\'t know the access level it set', shared);
         const d = (await this.read('GET /repos/{owner}/{repo}/actions/permissions/access', path)).data;
         const live = isObj(d) ? d.access_level : undefined;
-        if (live !== pipegenSet) return `the access level is not the one pipegen set (${pipegenSet}): another project or the owner may rely on it`;
-        if (body.access_level === pipegenSet) return 'already as it was before pipegen';
-        return body;
+        if (live !== pipegenSet) return keep(`the access level is not the one pipegen set (${pipegenSet}): another project or the owner may rely on it`, shared);
+        if (body.access_level === pipegenSet) return keep('already as it was before pipegen', null);
+        return { send: body };
       }
       default: return refuse(`"${show(route)}" is not a settings write uninstall makes.`);
     }
@@ -919,6 +948,7 @@ export class UninstallApi {
       seen.add(p as string);
       return p as string;
     };
+    let codeownersEdit: CodeownersEdit | undefined;
     const tree = [
       ...c.files.map((f) => {
         if (f.mode !== '100644' && f.mode !== '100755') refuse(`${show(String(f.path), 100)} has a mode uninstall doesn't write.`);
@@ -933,6 +963,7 @@ export class UninstallApi {
       const eds = (Array.isArray(c.recordEdits) ? c.recordEdits : []).filter((x): x is CodeownersEdit => isObj(x) && x.repo === 'central' && x.kind === 'codeowners');
       const edit: CodeownersEdit | undefined = owners.length === 0 ? undefined
         : eds.length === 1 ? eds[0] : refuse('the record doesn\'t name exactly one central CODEOWNERS pipegen edited, so uninstall changes none.');
+      codeownersEdit = edit;
       for (const f of c.files) {
         if (!CODEOWNERS_PATHS.includes(f.path)) refuse(`${show(f.path, 100)} is not a central file uninstall writes (it only puts the central CODEOWNERS back).`);
         if (f.path !== edit?.path) refuse(`${show(f.path, 100)} is not the CODEOWNERS the record says pipegen edited.`);
@@ -950,6 +981,15 @@ export class UninstallApi {
     await this.#verify(where);
     const pc = (await this.read('GET /repos/{owner}/{repo}/git/commits/{commit_sha}', { ...r, commit_sha: c.parent })).data;
     if (!isObj(pc) || !isObj(pc.tree) || pc.tree.sha !== c.baseTree) refuse('the base tree is not the tree of the parent commit, so the commit would undo other changes.');
+    const ownersGone = where === 'central' ? c.deletes.find((p) => CODEOWNERS_PATHS.includes(p)) : undefined;
+    if (ownersGone !== undefined) {
+      // sec M-r2-5: the record's flags are not proof: the file in the parent tree must be a version pipegen wrote (its sha in writtenShas)
+      const t = (await this.read('GET /repos/{owner}/{repo}/git/trees/{tree_sha}', { ...r, tree_sha: c.baseTree, recursive: '1' })).data;
+      const entries = isObj(t) && t.truncated === false && Array.isArray(t.tree) ? t.tree : [];
+      const e = entries.find((x) => isObj(x) && x.path === ownersGone);
+      const written = codeownersEdit !== undefined && Array.isArray(codeownersEdit.writtenShas) ? codeownersEdit.writtenShas : [];
+      if (!isObj(e) || e.type !== 'blob' || typeof e.sha !== 'string' || !written.includes(e.sha)) refuse(`${show(ownersGone, 100)} on ${show(`${r.owner}/${r.repo}`)} is not a version pipegen wrote (changed since, or GitHub's file list could not be read), so uninstall doesn't remove it.`);
+    }
     const t = (await ghWrite(this.gh, 'POST /repos/{owner}/{repo}/git/trees', r, { base_tree: c.baseTree, tree }, this.clock) as Body | null)?.sha;
     if (typeof t !== 'string' || !SHA_RE.test(t)) throw new UninstallRefusal('GitHub\'s answer to the new file tree could not be read.');
     const commit = (await ghWrite(this.gh, 'POST /repos/{owner}/{repo}/git/commits', r, { message: c.message, tree: t, parents: [c.parent] }, this.clock) as Body | null)?.sha;
@@ -994,7 +1034,7 @@ const listed = (xs: readonly unknown[]): string => `${xs.slice(0, MAX_LISTED).ma
  * Deletes `<owner>/pipelines`, only when every one of these holds, read from GitHub right before the DELETE (and again after the typed name):
  * the exact name under the app's owner; pipegen's central marker as its description; the id the record says pipegen created it with
  * (`central.repoId`, `createdByPipegen`); no fork, the wiki and Discussions off; its default branch is its only branch; no ref but that
- * branch and pipegen's own PR refs; no tag, no release, no issue, and no pull request but pipegen's own (a central pipegen branch of this
+ * branch and pipegen's own PR refs (and the list holds that branch); no tag, no release, no commit comment, no issue, and no pull request but pipegen's own (a central pipegen branch of this
  * repo); no Actions secret but pipegen's (created_at equal), no Dependabot or Codespaces secret (a list the token can't read is named in
  * the question and in `unchecked`), no variable, no environment; no `installs/` file left (this project's record or another's); every file left is one pipegen wrote there (a
  * central file of this record at a sha it wrote, not adopted or owner-edited; the central CODEOWNERS pipegen created; GitHub's own first
@@ -1036,13 +1076,17 @@ export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: Inst
     return null;
   };
   /** Sec I4, N-M2: nothing else of the user's goes with the repo (tags, refs, releases, issues, PRs, secrets, variables, environments). */
-  const others = async (def: string, unread: string[]): Promise<string | null> => {
+  const others = async (def: string, head: string | null, unread: string[]): Promise<string | null> => {
     const tags = await get('GET /repos/{owner}/{repo}/git/matching-refs/{ref}', { ref: 'tags', per_page: 100 }, 'the tags');
     if ('why' in tags) return tags.why;
     if (!Array.isArray(tags.data) || tags.data.length > 0) return `${full} has tags, so pipegen doesn't delete it`;
     const rel = await get('GET /repos/{owner}/{repo}/releases', { per_page: 1 }, 'the releases');
     if ('why' in rel) return rel.why;
     if (!Array.isArray(rel.data) || rel.data.length > 0) return `${full} has releases, so pipegen doesn't delete it`;
+    // sec M-r2-8: commit comments are the user's too, and go with the repo
+    const com = await get('GET /repos/{owner}/{repo}/comments', { per_page: 1 }, 'the commit comments');
+    if ('why' in com) return com.why;
+    if (!Array.isArray(com.data) || com.data.length > 0) return `${full} has commit comments (or they could not be read), so pipegen doesn't delete it`;
     const iss = await get('GET /repos/{owner}/{repo}/issues', { state: 'all', per_page: 100 }, 'the issues');
     if ('why' in iss) return iss.why;
     if (!Array.isArray(iss.data) || iss.data.length >= 100) return `${full} has 100 or more issues and pull requests (or they could not be read); pipegen can't check them all, so it doesn't delete it`;
@@ -1058,6 +1102,8 @@ export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: Inst
     const refs = await get('GET /repos/{owner}/{repo}/git/matching-refs/{ref}', { ref: '' }, 'the refs');
     if ('why' in refs) return refs.why;
     if (!Array.isArray(refs.data)) return `GitHub's list of the refs of ${full} could not be read, so pipegen doesn't delete it`;
+    // sec M-r2-7: a list without the default branch (which has a commit) is not the list of every ref
+    if (head !== null && !refs.data.some((r) => isObj(r) && r.ref === `refs/heads/${def}`)) return `GitHub's list of the refs of ${full} doesn't hold refs/heads/${show(def, 100)}, so pipegen can't tell it is whole and doesn't delete it`;
     const foreignRefs = refs.data.map((r) => (isObj(r) && typeof r.ref === 'string' ? r.ref : '(unreadable ref)')).filter((r) => {
       if (r === `refs/heads/${def}`) return false;
       const n = /^refs\/pull\/([1-9][0-9]{0,9})\/(?:head|merge)$/.exec(r)?.[1];
@@ -1131,13 +1177,14 @@ export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: Inst
       if (foreign.length > 0) return { why: `${full} holds files pipegen didn't write (${listed(foreign)}), so pipegen doesn't delete it` };
     }
     const unread: string[] = [];
-    const why = await others(def, unread);
+    const why = await others(def, head, unread);
     return why === null ? { head, unread } : { why };
   };
 
   const first = await check();
   if ('why' in first) return notDeleted(first.why);
-  const unread = first.unread.length > 0 ? ` pipegen couldn't read ${first.unread.join(' or ')} (the token has no permission for them): whatever is there goes with it too.` : '';
+  // sec M-r2-6: a line of its own (askTypedName cuts each line of the question at 300 characters)
+  const unread = first.unread.length > 0 ? `\npipegen couldn't read ${first.unread.join(' or ')} (the token has no permission for them): whatever is there goes with it too.` : '';
   const yes = await io.askName(CENTRAL_REPO, `Delete the repo ${show(full)} (id ${repoId})? Its workflows, its history, its pull requests and everything else in it go with it, and GitHub can't undo it.${unread}`);
   if (yes !== true) return notDeleted(`the name typed was not ${CENTRAL_REPO}`);
   const again = await check();
