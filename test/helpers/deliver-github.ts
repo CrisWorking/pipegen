@@ -214,7 +214,7 @@ export class FakeGitHub {
       }
       case 'GET /repos/{owner}/{repo}/pulls': {
         const head = String(p.head ?? '');
-        return ok(repo.pulls.filter((x) => (p.state === undefined || x.state === p.state) && (head === '' || `${repo.owner}:${x.head}` === head)).map((x) => ({ number: x.number, html_url: x.html_url, state: x.state, head: { ref: x.head }, base: { ref: x.base }, body: x.body, title: x.title })));
+        return ok(repo.pulls.filter((x) => (p.state === undefined || p.state === 'all' || x.state === p.state) && (head === '' || `${repo.owner}:${x.head}` === head)).map((x) => ({ number: x.number, html_url: x.html_url, state: x.state, head: { ref: x.head }, base: { ref: x.base }, body: x.body, title: x.title })));
       }
       case 'POST /repos/{owner}/{repo}/pulls': {
         if (repo.pulls.some((x) => x.state === 'open' && x.head === p.head)) fail(422, 'A pull request already exists');

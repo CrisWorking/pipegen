@@ -33,6 +33,8 @@ export interface TrustedRecord {
    * vouched it). finish may only take it as an earlier date, never a later one.
    */
   unvouchedBlockFrom?: string;
+  /** G12-R2 N5: the record is confirmView's view (trusted by typing, now or earlier): a caller that writes a record must not build on it. */
+  typed?: true;
 }
 
 /** The question step 2 asks (G10-R-sec6): only when `interactive`; never in a --yes or CI run. */
@@ -64,7 +66,8 @@ export const TYPED_VIEW_FIELDS = {
     fresh: ['edits', 'planned', 'serviceRoots', 'protectedPaths'],
     drop: ['mergedAt', 'blockFrom', 'cosignPubSha256', 'cosignPub', 'central', 'scratch', 'orgRuleset', 'classicProtection', 'repoSettings'],
   },
-  files: { keep: ['repo', 'path', 'part', 'shas', 'aiEdited', 'adopted'] },
+  // ownerEdited (G12) is kept: it only makes a file the owner's (dropping it would make a merged file look like pipegen's own)
+  files: { keep: ['repo', 'path', 'part', 'shas', 'aiEdited', 'adopted', 'ownerEdited'] },
   secrets: { keep: ['name', 'scope', 'created', 'overwritten', 'githubCreatedAt', 'unconfirmed'] },
   variables: { keep: ['name', 'scope', 'created', 'githubCreatedAt', 'unconfirmed'], drop: ['previous'] },
   environments: { keep: ['name', 'created', 'githubCreatedAt', 'unconfirmed'], fresh: ['changed', 'branchPolicyIds'], drop: ['previous'] },
@@ -158,13 +161,13 @@ export async function trustedPrevious(gh: Octokit, app: RepoRef, central: RepoRe
     // a hash the user vouched for by typing grants only the view they were shown (G10-R-sec8)
     if (file.typed !== true) return { record: r.record, exists };
     const cv = confirmView(r.record);
-    if ('view' in cv) return { record: cv.view, exists, ...unvouched(r.record) };
+    if ('view' in cv) return { record: cv.view, exists, typed: true, ...unvouched(r.record) };
   }
   // 2. no local file: the user confirms the default branch's record by typing the repo name; it is then vouched into the local file
   const typed = file === null && onDefault !== null && onDefault !== 'unreadable' ? await askToTrust(confirm, app, central, centralBranch, onDefault.record, notes) : null;
   if (typed !== null && onDefault !== null && onDefault !== 'unreadable') {
     await writeLocalRecord(app, { recordHash: onDefault.hash, typed: true, updatedAt: new Date().toISOString() }, local);
-    return { record: typed, exists, ...unvouched(onDefault.record) };
+    return { record: typed, exists, typed: true, ...unvouched(onDefault.record) };
   }
   // 3. nothing: say which record, and why
   const where = [onDefault === null ? null : `the default branch ${safeText(centralBranch, 100)}`, onBranch === null || updateBranch === null ? null : `the central pull request branch ${safeText(updateBranch, 100)}`].filter((x) => x !== null).join(' and ');

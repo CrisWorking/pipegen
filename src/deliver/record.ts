@@ -81,9 +81,10 @@ const ENV_SETTINGS = z.strictObject({
 /** An entry carries GitHub's created_at, or says it is unconfirmed: exactly one of the two. */
 const oneOfAt = (x: { githubCreatedAt?: string; unconfirmed?: true }): boolean => (x.githubCreatedAt === undefined) !== (x.unconfirmed === undefined);
 const ENV_KEYS = ['wait_timer', 'prevent_self_review', 'reviewers', 'can_admins_bypass', 'deployment_branch_policy', 'branch_policies'] as const;
-const EDIT_BASE = { path: PATH, originalSha: SHA, writtenShas: SHAS };
+const OWNER_EDITED = { ownerEdited: z.literal(true).optional() };
+const EDIT_BASE = { path: PATH, originalSha: SHA, writtenShas: SHAS, ...OWNER_EDITED };
 const EDIT = z.discriminatedUnion('kind', [
-  z.strictObject({ repo: REPO_KIND, path: PATH, kind: z.enum(['codeowners', 'hooks', 'dependabot']), inserted: z.string().max(256 * 1024), originalSha: SHA.nullable(), writtenShas: SHAS }),
+  z.strictObject({ repo: REPO_KIND, path: PATH, kind: z.enum(['codeowners', 'hooks', 'dependabot']), inserted: z.string().max(256 * 1024), originalSha: SHA.nullable(), writtenShas: SHAS, ...OWNER_EDITED }),
   z.strictObject({ repo: z.literal('app'), ...EDIT_BASE, kind: z.literal('verify-job'), jobs: z.array(z.string().max(100)).min(1).max(50), needs: z.array(z.strictObject({ job: z.string().max(100), added: z.array(z.string().max(100)).max(50) })).max(200) }),
   z.strictObject({ repo: z.literal('app'), ...EDIT_BASE, kind: z.literal('package-json'), add: z.record(z.string().max(214).refine((k) => !PROTO_KEYS.has(k)), z.string().max(100)), setTest: z.boolean(), previousTest: z.string().max(10_000).optional(), lock: PATH.optional() }),
   z.strictObject({ repo: z.literal('app'), ...EDIT_BASE, kind: z.literal('package-lock'), json: PATH }),
@@ -98,7 +99,7 @@ export const InstallRecordSchema = z.strictObject({
   app: z.strictObject({ owner: OWNER, repo: REPO, repoId: ID, defaultBranch: BRANCH, private: z.boolean(), ownerType: z.enum(['User', 'Organization']) }),
   name: z.string().regex(/^[a-z0-9_][a-z0-9._-]{0,99}$/),
   serviceRoots: z.array(z.union([z.literal('.'), REL])).max(200),
-  files: z.array(z.strictObject({ repo: REPO_KIND, path: PATH, part: PART, shas: SHAS.min(1), aiEdited: z.literal(true).optional(), adopted: z.literal(true).optional() })).max(5000),
+  files: z.array(z.strictObject({ repo: REPO_KIND, path: PATH, part: PART, shas: SHAS.min(1), aiEdited: z.literal(true).optional(), adopted: z.literal(true).optional(), ...OWNER_EDITED })).max(5000),
   edits: z.array(EDIT).max(500),
   secrets: z.array(z.strictObject({ name: SECRET_NAME, scope: z.union([z.literal('repo'), z.literal('central'), SCOPE_ENV]), created: z.boolean(), overwritten: z.literal(true).optional(), githubCreatedAt: ISO.optional(), unconfirmed: z.literal(true).optional() })).max(500),
   variables: z.array(z.strictObject({ name: SECRET_NAME, scope: z.union([z.literal('repo'), SCOPE_ENV]), created: z.boolean(), previous: z.string().max(10_000).optional(), githubCreatedAt: ISO.optional(), unconfirmed: z.literal(true).optional() })).max(200),
@@ -246,10 +247,20 @@ export function recordMarkerOf(body: string | null | undefined): string | null {
 
 // ---------- the guard's view ----------
 
-/** The app files pipegen wrote whole, each with the sha it wrote last (the guard's "pipegen's own earlier file"). */
+/**
+ * The app files pipegen wrote whole, each with the sha it wrote last (the guard's "pipegen's own earlier file"). A file `pipegen update`
+ * merged into the owner's edits (ownerEdited, G12) is the owner's: it is left out, so nothing treats it as pipegen's to replace.
+ */
 export function guardRecordOf(r: InstallRecord): GuardInstallRecord {
-  return { files: r.files.filter((f) => f.repo === 'app').map((f) => ({ path: f.path, part: f.part, sha: f.shas.at(-1) as string, created: true })) };
+  return { files: r.files.filter((f) => f.repo === 'app' && f.ownerEdited !== true).map((f) => ({ path: f.path, part: f.part, sha: f.shas.at(-1) as string, created: true })) };
 }
+
+/**
+ * Whether `sha` is a version of a whole file pipegen wrote and may replace (G12): one of its recorded shas, and not a file `pipegen update`
+ * merged into the owner's edits (ownerEdited: from then on the file is the owner's, never overwritten whole).
+ */
+export const ownWholeFile = (entry: InstallRecord['files'][number] | undefined, sha: string | undefined): boolean =>
+  entry !== undefined && sha !== undefined && entry.ownerEdited !== true && entry.shas.includes(sha);
 
 // ---------- the local record file ----------
 
@@ -441,6 +452,8 @@ export interface WriteRecordArgs {
    */
   base?: string;
   clock?: RateClock; now?: () => Date; local?: LocalRecordDeps;
+  /** The central pull request's title and body (G12: `pipegen update` says what its central change is); the record marker is always the body's last line. */
+  pr?: { title: string; body: string };
 }
 export interface WriteRecordResult { recordHash: string; commit: string; via: 'direct' | 'pr'; centralPr?: { number: number; url: string }; notes: string[] }
 
@@ -462,10 +475,23 @@ export async function centralPrBase(gh: Octokit, central: RepoRef, appRepo: stri
 }
 
 /**
- * Writes the record to all three places in one call: the central repo (a direct commit, or the central pull request; a direct commit the
- * branch refuses goes through the pull request instead), the setup PR body's marker line, and the local record file. The record is checked
- * against the schema before anything is sent.
+ * How far a writeRecord that threw got (G12-R2 N3, G12-R3 M2): `at: 'central'` = the record is in the central repo (`via`: a direct commit on
+ * the default branch, or the central pull request) but the local record file and the setup PR marker are not updated; `at: 'local'` = central
+ * and the local file are, the setup PR marker is not; undefined = the central record was not written. The error itself is passed through
+ * unchanged (a rate stop stays a rate stop).
  */
+export interface RecordWriteProgress { at: 'central' | 'local'; via: 'direct' | 'pr' }
+export const recordWriteReached = (e: unknown): RecordWriteProgress | undefined => (typeof e === 'object' && e !== null ? REACHED.get(e) : undefined);
+const REACHED = new WeakMap<object, RecordWriteProgress>();
+const reached = (e: unknown, at: RecordWriteProgress['at'], via: RecordWriteProgress['via']): unknown => { if (typeof e === 'object' && e !== null) REACHED.set(e, { at, via }); return e; };
+
+/**
+ * Writes the record to all three places in one call, in this order: the central repo (a direct commit, or the central pull request; a direct
+ * commit the branch refuses goes through the pull request instead), then the local record file (it vouches for what was just written), then
+ * the setup PR body's marker line. The record is checked against the schema before anything is sent. A failure after the central write
+ * carries how far it got (recordWriteReached).
+ */
+
 export async function writeRecord(gh: Octokit, args: WriteRecordArgs): Promise<WriteRecordResult> {
   const clock = args.clock ?? clockOf(gh);
   const record = checkRecord(JSON.parse(canonicalRecordJson(args.record)));
@@ -504,16 +530,24 @@ export async function writeRecord(gh: Octokit, args: WriteRecordArgs): Promise<W
     if (b.note !== undefined) notes.push(b.note);
     commit = (await commitFiles(gh, central, { parent: b.parent, baseTree: b.tree, files, message }, clock)).commit;
     await setBranch(gh, central, branch, commit, true, clock);
-    const pr = await openOrUpdatePr(gh, central, { head: branch, base: repo.defaultBranch, title: `pipegen: install record for ${record.app.repo}`, body: `pipegen's install record for ${safeText(`${app.owner}/${app.repo}`, 140)} (what it wrote, and what \`pipegen finish\` applies after the setup pull request is merged).\n\nMerge this pull request so \`pipegen finish\`, \`verify\` and uninstall can read it.\n\n${recordMarker(hash)}` }, clock);
+    const title = args.pr?.title ?? `pipegen: install record for ${record.app.repo}`;
+    const body = args.pr === undefined
+      ? `pipegen's install record for ${safeText(`${app.owner}/${app.repo}`, 140)} (what it wrote, and what \`pipegen finish\` applies after the setup pull request is merged).\n\nMerge this pull request so \`pipegen finish\`, \`verify\` and uninstall can read it.\n\n${recordMarker(hash)}`
+      : withRecordMarker(args.pr.body, hash);
+    const pr = await openOrUpdatePr(gh, central, { head: branch, base: repo.defaultBranch, title, body }, clock);
     centralPr = { number: pr.number, url: pr.url };
   }
 
-  // the setup pull request's body: every earlier marker removed, the new one on the last line
-  const pr = await ghRead(gh, 'GET /repos/{owner}/{repo}/pulls/{pull_number}', app, { pull_number: args.setupPr }, clock) as { body?: unknown } | null;
-  const body = typeof pr?.body === 'string' ? pr.body : '';
-  await ghWrite(gh, 'PATCH /repos/{owner}/{repo}/pulls/{pull_number}', app, { pull_number: args.setupPr, body: withRecordMarker(body, hash) }, clock);
-
-  await writeLocalRecord(app, { recordHash: hash, setupPr: args.setupPr, updatedAt: (args.now?.() ?? new Date()).toISOString() }, args.local ?? {});
+  // G12-R2 N3: the local record file right after the central write (it vouches for the record pipegen just wrote, so a later run can trust
+  // it even when the marker below fails), then the setup pull request's body: every earlier marker removed, the new one on the last line
+  try {
+    await writeLocalRecord(app, { recordHash: hash, setupPr: args.setupPr, updatedAt: (args.now?.() ?? new Date()).toISOString() }, args.local ?? {});
+  } catch (e) { throw reached(e, 'central', via); }
+  try {
+    const pr = await ghRead(gh, 'GET /repos/{owner}/{repo}/pulls/{pull_number}', app, { pull_number: args.setupPr }, clock) as { body?: unknown } | null;
+    const body = typeof pr?.body === 'string' ? pr.body : '';
+    await ghWrite(gh, 'PATCH /repos/{owner}/{repo}/pulls/{pull_number}', app, { pull_number: args.setupPr, body: withRecordMarker(body, hash) }, clock);
+  } catch (e) { throw reached(e, 'local', via); }
   return { recordHash: hash, commit, via, ...(centralPr === undefined ? {} : { centralPr }), notes };
 }
 
