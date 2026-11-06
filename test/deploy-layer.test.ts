@@ -774,6 +774,11 @@ describe('G7-R1 sec I1: the head check runs inside every gated deploy job (after
       const r = await judge(w, [{ ...f, content: d.toString({ lineWidth: 0 }) }]);
       expect(r.ok, `${what}: ${shown(r)}`).toBe(false);
     }
+    // the step and its mark both gone (a file whose mark no longer lists the job): the referee still requires the head check in every gated job
+    const d = parseDocument(f.content);
+    (d.getIn(['jobs', 'deploy', 'steps']) as YAMLSeq).items.shift();
+    const unmarked = await judge(w, [{ ...f, content: d.toString({ lineWidth: 0 }), inserted: { ...(f.inserted as NonNullable<CreatedFile['inserted']>), headCheck: [] } }]);
+    expect(unmarked.issues.some((i) => /waits for pipegen-verify but does not start with pipegen's head check/.test(i.message)), shown(unmarked)).toBe(true);
   });
 
   it('G7-R1 sec I1 / M4: renewVerifyJob refuses a file whose job no longer needs pipegen-verify or lost its head check', () => {
@@ -787,6 +792,17 @@ describe('G7-R1 sec I1: the head check runs inside every gated deploy job (after
     const d = parseDocument(ins.text);
     (d.getIn(['jobs', 'deploy', 'steps']) as YAMLSeq).items.shift();
     expect(() => renewVerifyJob(d.toString({ lineWidth: 0 }), ins.inserted, v)).toThrow(/head check/);
+  });
+
+  it('G7-R1 sec I1: a gated job whose token can not read the branch (permissions without contents) is a gap that says what to add', () => {
+    const noContents = DEPLOY_A.replace('    environment: production\n', '    environment: production\n    permissions:\n      deployments: write\n');
+    const w = world('keyless', [[A, noContents]]);
+    expect(w.v.inserts).toEqual([]);
+    expect(w.v.gaps[0]?.why).toMatch(/its job "deploy" sets permissions without contents: read[\s\S]*add contents: read to that job's permissions/);
+    // with contents: read it is inserted
+    const ok = planVerifyInserts(w.a.draft, new Map([[A, noContents.replace('      deployments: write\n', '      deployments: write\n      contents: read\n')]]), w.a.verify);
+    expect(ok.gaps).toEqual([]);
+    expect(ok.inserts).toHaveLength(1);
   });
 
   it('G7-R1 sec I1: a gated job that calls another workflow gets no step (it has none), and the note says what is not checked', () => {
@@ -818,6 +834,16 @@ describe('G7-R1 sec I2: a job is left ungated only when it plainly can not deplo
     // a job with no permissions of its own may get a write token (the repository's default): it waits too
     const noPerms = INFRA.replace('  lint:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n', '  lint:\n    runs-on: ubuntu-latest\n');
     expect(planVerifyInserts(w.a.draft, new Map([[A, noPerms]]), w.a.verify).inserts[0]?.inserted.needs.map((n) => n.job)).toEqual(['lint', 'infra', 'release', 'site']);
+    // an OIDC token (or any write permission) in the lint job gates it, whatever it runs
+    for (const perm of [`${['id', 'token'].join('-')}: write`, 'packages: write', 'contents: write']) {
+      const powered = INFRA.replace('  lint:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n', `  lint:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      ${perm}\n`.replace('      contents: read\n      contents: write\n', '      contents: write\n'));
+      expect(powered, perm).not.toBe(INFRA);
+      expect(planVerifyInserts(w.a.draft, new Map([[A, powered]]), w.a.verify).inserts[0]?.inserted.needs.map((n) => n.job), perm).toContain('lint');
+    }
+    // a call of another workflow is gated even with read-only permissions of its own (the called workflow may deploy)
+    const readCall = INFRA.replace('    uses: ./.github/workflows/ship.yml\n', '    permissions:\n      contents: read\n    uses: ./.github/workflows/ship.yml\n');
+    expect(readCall).not.toBe(INFRA);
+    expect(planVerifyInserts(w.a.draft, new Map([[A, readCall]]), w.a.verify).inserts[0]?.inserted.needs.map((n) => n.job)).toContain('release');
     // a secret in the lint job (anything but the workflow token) gates it
     const withCfg = INFRA.replace('      - run: npm run lint', ['      - run: npm run lint', '        env:', ['          LINT_CFG:', '$' + '{{', `${['sec', 'rets'].join('')}.LINT_CFG`, '}}'].join(' ')].join('\n'));
     expect(planVerifyInserts(w.a.draft, new Map([[A, withCfg]]), w.a.verify).inserts[0]?.inserted.needs.map((n) => n.job)).toContain('lint');
