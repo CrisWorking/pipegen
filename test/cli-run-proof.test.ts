@@ -374,3 +374,134 @@ describe('G14: the workflows a proof waits for', () => {
       .toEqual({ push: ['.github/workflows/a.yml', '.github/workflows/c.yml'], pullRequest: ['.github/workflows/a.yml', '.github/workflows/b.yml'], merge: ['.github/workflows/a.yml', '.github/workflows/c.yml'] });
   });
 });
+
+// ---------- the proof inside `pipegen run` (fullRun with fake stages and the production proof over fake GitHub ops) ----------
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import type { Octokit } from '@octokit/rest';
+import { fullRun, PROOF_FILE_IN_DELIVERY, PUBLIC_FILES_CHANGED, type Built, type BuildInput, type RunDeps, type RunStages } from '../src/cli/run.js';
+import { makeRunProof } from '../src/cli/run-proof.js';
+import { StateStore } from '../src/proof/state.js';
+import { armProofCleanup } from '../src/proof/cleanup.js';
+import { HARNESS_PATH } from '../src/proof/harness.js';
+import { newRateBudget } from '../src/engine/github-rate.js';
+import { CAPS, candidatesFor, choicesFor, profile, scripted, svc } from './helpers/debate-fixtures.js';
+import { CALLER, NEEDS2, OWN } from './helpers/proof-world.js';
+
+interface RunWorld { tl: string[]; calls: string[]; deps: RunDeps; stages: Partial<RunStages>; home: string; errs: string[]; lines: string[]; got: Record<string, unknown[]>; io: CliIO }
+async function runWorld(o: { private?: boolean; results?: import('../src/types.js').ProofResult[]; canDelete?: boolean; built?: (i: BuildInput, n: number) => Partial<Built>; missing?: string[]; canCreate?: boolean; preview?: boolean } = {}): Promise<RunWorld> {
+  const pw = await proofWorld({ results: o.results ?? [PASS] });
+  const tl = pw.tl;
+  pw.ops.appFiles = () => ({ appFiles: async () => [CALLER(), { repo: 'app', path: HARNESS_PATH, content: 'on: [pull_request]\njobs: {}\n', part: 'pipeline', reason: 'r' }], last: () => ({ harness: { file: CALLER(), jobs: [], notes: [] }, compat: { files: [], notCompared: [] } }) });
+  const home = mkdtempSync(join(tmpdir(), 'pg-runproof-'));
+  const calls: string[] = [];
+  const got: Record<string, unknown[]> = {};
+  const errs: string[] = [];
+  const lines: string[] = [];
+  const rec = (n: string, ...a: unknown[]): void => { calls.push(n); tl.push(`stage:${n}`); got[n] = a; };
+  const p = profile({ owner: OWN, repo: 'r', private: o.private === true, monorepo: 'none', services: [svc({ name: 'app', path: '.', scripts: ['test', 'start'] })], generatedDirs: [] });
+  const ai = scripted(() => ({}));
+  let builds = 0;
+  const stages: Partial<RunStages> = {
+    readOrigin: async () => ({ owner: OWN, repo: 'r' }), localProject: async () => p,
+    getAuth: async () => ({ kind: o.canCreate === true ? 'app' : 'fine-grained', token: 'tok-made-up-0000000000', canCreateRepos: o.canCreate === true, canDeleteRepos: o.canDelete === true } as never),
+    readProject: async () => ({ gh: {} as Octokit, clock: { budget: newRateBudget() }, login: 'alice', context: { private: o.private === true, ownerType: 'User', plan: 'pro', defaultBranch: 'main' }, caps: CAPS, writers: ['alice', 'bob'], lockWriters: { app: ['alice', 'bob'], central: ['alice', 'bob'] }, orgAdmin: null, shaPinning: { required: false } as never, ids: { app: 1, central: 2 } }),
+    provider: () => ai.ai, bundle: async () => ({ files: [] } as never), scan: async () => ({ files: [], found: { names: [], values: [], tokens: [] } } as never),
+    activity: async () => ({ pushes: 1, prs: 1, capped: false }), consent: async () => { rec('consent'); return {} as never; },
+    state: async (pp, g) => StateStore.open(pp, { home, env: {}, ...g }), gateReachable: async () => true,
+    helperRepos: async () => { rec('helperRepos'); return o.missing ?? []; },
+    proofRepos: async (_f, _p, auth, store) => { rec('proofRepos', auth, store.armed); return { ready: true, target: {} as never, repos: [], created: [] }; },
+    needs: async () => ({ needs: [...NEEDS2], notes: [], requireDeployApproval: false, layersSkipped: [], usage: [] } as never),
+    discover: async () => candidatesFor(NEEDS2, p),
+    debate: async () => ({ choices: choicesFor(NEEDS2, p, {}, {}, undefined, candidatesFor(NEEDS2, p)), needs: [...NEEDS2], candidates: candidatesFor(NEEDS2, p), disputes: [], suggestions: [], transcript: [], requireDeployApproval: false, byCode: [], uncovered: [] } as never),
+    creators: async () => ({ files: [], notes: [], testNotes: [], testDecisions: [], notProven: [] }),
+    secrets: async (_p, _c, vault) => { vault.set('API_TOKEN', TYPED); return { names: vault.names(), missing: [], notes: [] }; },
+    credits: async () => [],
+    build: async (i) => {
+      rec('build');
+      const n = builds++;
+      const files: CreatedFile[] = [{ repo: 'app', path: 'PIPEGEN.md', content: '# x\n', part: 'docs', reason: 'r' }];
+      return {
+        assembled: { draft: i.draft, files: [], verify: null, notes: [], uncoveredMinimum: [] }, verify: { inserts: [], notProven: [], gaps: [], notes: [], preview: [] } as never,
+        locks: { owners: { app: [], central: [] }, notes: [] } as never, precommit: { files: [], edits: [], setupCommand: '', notes: [] } as never, doc: files[0] as CreatedFile, extra: [],
+        files, report: { ok: true, issues: [], demoted: [], notes: [] }, guardProblems: [], environments: [], envNotes: [], hookNotes: [],
+        minutes: { jobs: { 'pre-commit': [], push: [], merge: [], deploy: [], nightly: [] } as never, prWait: 5 },
+        proof: { rebuild: async (d) => ({ files: [], assembled: d }), referee: async () => ({ ok: true, issues: [], demoted: [], notes: [] }), guard: async (f) => ({ ok: f, refused: [], notes: [] }) },
+        ...o.built?.(i, n),
+      } as Built;
+    },
+    trusted: async () => ({ record: null, notes: [] }),
+    deliverCentral: async () => { rec('deliverCentral'); return { kind: 'pinned', sha: 'c'.repeat(40), done: [] }; },
+    readCentralFileList: async () => { rec('readCentralFileList'); return []; },
+    preview: () => { rec('preview'); return 'THE PREVIEW'; },
+    deliver: async () => { rec('deliver'); return { prUrl: 'u', prNumber: 3, centralSha: null, recordHash: 'h', done: [], skipped: [], notes: [] } as never; },
+    prState: async () => 'merged', finish: async () => 0,
+  };
+  const io: CliIO = { prompt: { confirm: async (m) => { tl.push(`ask:${m.slice(0, 30)}`); return /Open the setup pull request/.test(m) ? o.preview ?? true : true; }, select: async () => { throw new Error('x'); }, text: async () => { throw new Error('x'); } }, out: (s) => { lines.push(s); }, err: (s) => { errs.push(s); }, env: {}, interactive: true };
+  const deps: RunDeps = {
+    platform: 'linux', today: () => '2026-11-06', now: () => Date.parse('2026-11-06T10:00:00Z'), sleep: async () => {}, stages, runId: () => RUN_ID,
+    proof: makeRunProof(pw.ops), reviewed: () => pw.input.reviewed, platformActions: async () => ({}) as never,
+    secretScanner: async (n) => ({ name: n, path: '/bin/x', version: '1' }),
+    arm: (s, c, m) => { tl.push('arm'); return armProofCleanup(s, c, { meters: m }); },
+  };
+  return { tl, calls, deps, stages, home, errs, lines, got, io };
+}
+
+describe('G14: the proof inside pipegen run', () => {
+  it('run: cleanup runs right after the proof, before the preview', async () => {
+    const w = await runWorld();
+    expect(await fullRun('/repo', w.io, w.deps)).toBe(0);
+    const iClean = at(w.tl, 'cleanup:');
+    expect(iClean).toBeGreaterThan(at(w.tl, 'evaluate'));
+    expect(iClean).toBeLessThan(at(w.tl, 'stage:preview'));
+    expect(iClean).toBeLessThan(at(w.tl, 'stage:deliver'));
+  });
+
+  it('run: scratch secrets deleted before the preview is shown', async () => {
+    const w = await runWorld();
+    expect(await fullRun('/repo', w.io, w.deps)).toBe(0);
+    const del = w.tl.lastIndexOf('keys.deleteAll');
+    expect(del).toBeGreaterThan(at(w.tl, 'keys.setup'));
+    expect(del).toBeLessThan(at(w.tl, 'stage:preview'));
+    expect(del).toBeLessThan(at(w.tl, 'ask:THE PREVIEW'));
+  });
+
+  it('run: stopped proof → cleanup done, exit 2 with reason (in the run)', async () => {
+    const w = await runWorld({ results: [failOn('sast', 'semgrep found a problem')] });
+    expect(await fullRun('/repo', w.io, w.deps)).toBe(2);
+    expect(w.errs.join('\n')).toMatch(/pipegen stopped: the proof did not pass \(.*\), so nothing was delivered\. exit code 2\./);
+    expect(w.tl.some((x) => x.startsWith('cleanup:'))).toBe(true);
+    for (const s of ['preview', 'deliverCentral', 'deliver']) expect(w.calls).not.toContain(s);
+  });
+
+  it('run: no planted file, harness file or compat copy reaches the delivered batch', async () => {
+    for (const path of ['pipegen-planted/config.txt', 'api/pipegen-planted/x.py', HARNESS_PATH, '.github/workflows/pipegen-compat-ci.yml']) {
+      const w = await runWorld({ built: () => ({ files: [{ repo: 'app', path, content: 'x', part: 'pipeline', reason: 'r' }] }) });
+      expect(await fullRun('/repo', w.io, w.deps)).toBe(2);
+      expect(w.errs).toContain(PROOF_FILE_IN_DELIVERY);
+      expect(w.calls).not.toContain('deliver');
+    }
+  });
+
+  it('run: a public app whose app files change with the central file list stops (controller addendum)', async () => {
+    const w = await runWorld({ built: (_i, n) => (n === 0 ? { files: [{ repo: 'app', path: 'a.yml', content: '1', part: 'pipeline', reason: 'r' }, { repo: 'central', path: '.github/CODEOWNERS', content: 'x', part: 'pipeline', reason: 'r' }] } : { files: [{ repo: 'app', path: 'a.yml', content: '2', part: 'pipeline', reason: 'r' }, { repo: 'central', path: '.github/CODEOWNERS', content: 'x', part: 'pipeline', reason: 'r' }] }) });
+    expect(await fullRun('/repo', w.io, w.deps)).toBe(2);
+    expect(w.errs).toContain(PUBLIC_FILES_CHANGED);
+    expect(w.calls).not.toContain('deliver');
+    // the same app files: delivered
+    const same = await runWorld({ built: () => ({ files: [{ repo: 'app', path: 'a.yml', content: '1', part: 'pipeline', reason: 'r' }, { repo: 'central', path: '.github/CODEOWNERS', content: 'x', part: 'pipeline', reason: 'r' }] }) });
+    expect(await fullRun('/repo', same.io, same.deps)).toBe(0);
+  });
+
+  it('run: helper repos the token can\'t create are named before consent (read only); the writing check runs inside the proof, armed', async () => {
+    const w = await runWorld({ missing: ['pipelines'] });
+    expect(await fullRun('/repo', w.io, w.deps)).toBe(2);
+    expect(w.errs.join('\n')).toContain('gh repo create CrisWorking/pipelines --private');
+    expect(w.calls).not.toContain('consent');
+    // an App that may create them goes on; checkProofRepos then runs inside the proof on an armed store
+    const a = await runWorld({ missing: ['pipelines'], canCreate: true });
+    expect(await fullRun('/repo', a.io, a.deps)).toBe(0);
+    expect(a.got.proofRepos?.[1]).toBe(true);
+    expect(at(a.tl, 'arm')).toBeLessThan(at(a.tl, 'stage:proofRepos'));
+  });
+});

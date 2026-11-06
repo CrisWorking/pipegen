@@ -42,6 +42,7 @@ import type { CreatedFile, InstallRecord, Need, PipelineDraft, RepoProfile } fro
 import { fake } from './helpers/secret-repo.js';
 import { betterleaksAt, CLEAN, makeStub } from './helpers/gitleaks-stub.js';
 import { loadPinnedBinaries } from '../src/engine/linters.js';
+import { proofWorld } from './helpers/proof-world.js';
 import { API, CAPS, candidatesFor, choicesFor, need, NEEDS, profile, REVIEWED, scripted, svc } from './helpers/debate-fixtures.js';
 
 const homes: string[] = [];
@@ -386,6 +387,18 @@ describe('G13: stages 8-15', () => {
     // every pinned reviewed action the proof could run is checked against the scratch repo's settings
     expect((w.got.proofRepos?.[5] as string[]).length).toBeGreaterThan(0);
     expect((w.got.proofRepos?.[5] as string[]).every((a) => /^[^/]+\/[^@]+@[0-9a-f]{40}$/.test(a))).toBe(true);
+    // G14, the cleanupAfterProof half: the proof gets getAuth's answer, and the production proof hands its canDeleteRepos to
+    // cleanupAfterProof (after the proof and in the armed Ctrl-C hook)
+    for (const may of [true, false]) {
+      let auth: { canDeleteRepos?: boolean } | undefined;
+      const w2 = world({ who: { kind: 'app', canCreateRepos: true, canDeleteRepos: may }, proof: async (x) => { auth = x.auth; return passingProof(x); } });
+      expect(await run(w2)).toBe(0);
+      expect(auth?.canDeleteRepos).toBe(may);
+      const pw = await proofWorld({ input: { auth: auth as never } });
+      await pw.run();
+      await pw.armed[0]?.cleanup({ signal: new AbortController().signal } as never);
+      expect(pw.cleanupOpts.map((o) => o.canDeleteRepo)).toEqual([may, may]);
+    }
   });
 
   it('run: works with a GitHub App token', async () => {
