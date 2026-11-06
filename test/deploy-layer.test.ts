@@ -1364,6 +1364,8 @@ describe('G13: the head check in a local called workflow (G7-R2 carry, BINDING)'
     const withDefaults = (d: string, t: string): string => t.replace('jobs:\n', `${d}jobs:\n`);
     const wd = 'defaults:\n  run:\n    working-directory: elsewhere\n';
     expect(shown(await judge(w, [caller, both(withDefaults(wd, ins.text), withDefaults(wd, CALLED_A))]))).toMatch(/defaults that would change pipegen's head check/);
+    const pwsh = 'defaults:\n  run:\n    shell: pwsh\n';
+    expect(shown(await judge(w, [caller, both(withDefaults(pwsh, ins.text), withDefaults(pwsh, CALLED_A))]))).toMatch(/defaults that would change pipegen's head check/);
     const shell = 'defaults:\n  run:\n    shell: bash\n';
     expect(shown(await judge(w, [caller, both(withDefaults(shell, ins.text), withDefaults(shell, CALLED_A))]))).toBe('');
     // (h) a workflow env that changes how the check runs
