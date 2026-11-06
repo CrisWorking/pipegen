@@ -11,8 +11,8 @@
 //   7. the consent (estimate from the floor needs, needKeys, 2 variants, nightly; one AI meter), assertBootstrapAllowed first.
 //   8. checkProofRepos.   9. planNeeds.   10. discover + pin.   11. debate.   12. the creators.   13. the secrets, PIPEGEN_FP_KEY.
 //   14. nothing (Slack: --skip slack is accepted and does nothing in v0.2).   15. assemble, the deploy layer, pre-commit, locks, PIPEGEN.md,
-//      one referee call (seven arguments) and the guard on the same batch.   16-17. the proof seam (G14). Delivery only from the stage
-//      `cleaned` with a passed proof.   18. deliverCentral, the re-pin, readCentralFileList once, assemble and judge again, the preview
+//      one referee call (seven arguments) and the guard on the same batch.   16-17. the proof (G14, run-proof.ts: the helper repos,
+//      the setup, the disputes, the fix loop, the cleanup). Delivery only from the stage `cleaned` with a passed proof.   18. deliverCentral, the re-pin, readCentralFileList once, assemble and judge again, the preview
 //      (asked again when the minutes went up), one confirmation.   19. deliver.   20. the merge wait, then finish.   21. the summary.
 // Exit codes: 0 done; 1 a refusal, a declined question or an error; 2 a stopped run (the proof, the central PR, a refused batch, audit-only);
 // 4 the unsafe folder (main.ts). The vault is wiped on every exit.
@@ -68,8 +68,13 @@ import { environmentPlan, generateCosignKeys, isMemoryFolder, MEMORY_DIR, planVe
 import { AssembleError, assembleJobs } from '../layers/jobs.js';
 import { planLocks, type LockPlan } from '../layers/locks.js';
 import { precommitFiles, type PrecommitResult } from '../layers/precommit.js';
-import { checkProofRepos, type ProofRepos } from '../proof/repos.js';
-import type { ProofAssemble } from '../proof/harness.js';
+import { checkProofRepos, createCommands, type ProofRepos } from '../proof/repos.js';
+import { armProofCleanup, type ProofMeters } from '../proof/cleanup.js';
+import { makeFixGuard, makeFixReferee } from '../proof/fix.js';
+import { COMPAT_PREFIX, HARNESS_PATH } from '../proof/harness.js';
+import { isPlantedPath } from '../debate/planted.js';
+import type { InterruptContext } from '../util/exit-hooks.js';
+import { makeRunProof, type ProofBuild, type ProofInput, type RunProof } from './run-proof.js';
 import { StateStore, type RunState, type StateDeps } from '../proof/state.js';
 import { CENTRAL_REPO } from '../proof/target.js';
 import type { Auth, Capabilities, Candidate, CreatedFile, KnownValueCheck, PipelineDraft, RepoProfile, ReviewedTool, SkippablePart } from '../types.js';
@@ -116,8 +121,6 @@ export function parseSkip(value: string | undefined, today: string): PipelineDra
 export const SCOPE_LINE = 'pipegen v0.2 sets up repositories owned by CrisWorking only; anything else is refused before any change.';
 /** Carry 56 (E-b16): the proof needs `pipegen cleanup`, which can't run on native Windows. */
 export const WINDOWS_REFUSAL = 'pipegen run needs Linux or macOS (WSL works): on native Windows pipegen can\'t clean up after its proof, so it changes nothing. exit code 1.';
-/** Ruling G13-R0 1: the production proof seam until G14 builds it. */
-export const PROOF_NOT_BUILT = 'pipegen stopped before delivery: the proof step (running the new pipeline on a private test copy first) is not built in this version yet, so nothing was delivered. exit code 2.';
 /** Ruling G13-R0 12 (carry 58, S28 b). */
 export const GATE_UNREACHABLE = 'pipegen stopped before the proof: this repository is public, and the pipegen gate its pull requests would load can\'t be read at its pinned commit, so every pull request would be blocked. Nothing was changed. exit code 2.';
 /** The stand-in central commit of a private draft before deliverCentral (never delivered: the run re-pins before it judges for delivery). */
@@ -133,16 +136,16 @@ export const NO_MEMORY_FOLDER = `pipegen stopped before anything was spent: this
 export const MERGE_POLL_MS = 30_000;
 export const MERGE_WAIT_MS = 30 * 60_000;
 
-/** What the proof seam is given (G14 runs proveThenClean with it). */
-export interface ProofInput {
-  /** The draft before assembly (what the proof's fix loop changes and returns); `assembled` is AssembledFiles.draft of `files`. */
-  draft: PipelineDraft; assembled: PipelineDraft; files: readonly CreatedFile[]; assemble: ProofAssemble; store: StateStore; auth: Auth; gh: Octokit; repos: ProofRepos;
-  vault: SecretVault; ai: { meter: AiSpendMeter }; io: CliIO;
-}
-/** `draft`: the pre-assembly draft after the proof (absent: unchanged). The run builds and judges it again before delivery. */
-export type RunProof = (i: ProofInput) => Promise<{ ok: boolean; draft?: PipelineDraft; stopped?: string }>;
-/** Ruling G13-R0 1: never skips the proof; stops before delivery. */
-export const defaultProof: RunProof = async () => ({ ok: false, stopped: PROOF_NOT_BUILT });
+export type { ProofInput, RunProof };
+/** G14: the production proof (run-proof.ts); no RunDeps path skips it (ruling G14-R0 2 replaces G13-R0 1). */
+export const defaultProof: RunProof = makeRunProof();
+/** G14 (carries 8, 33): the production arm, only through armProofCleanup (S4: never StateStore.markArmed from Plan G code). */
+export const defaultArm = (store: StateStore, cleanup: (ctx: InterruptContext) => Promise<unknown>, meters: () => ProofMeters | undefined): (() => void) =>
+  armProofCleanup(store, cleanup, { meters });
+/** G14 (controller addendum): a public app's app files changed between the build of the proven draft and the one delivered. */
+export const PUBLIC_FILES_CHANGED = 'pipegen stopped: the files it would deliver are not the ones it built from the proven draft, so nothing was delivered. exit code 2.';
+/** Carries 23, 31: a planted file, the proof harness or a compat copy in the delivered batch. */
+export const PROOF_FILE_IN_DELIVERY = 'pipegen stopped: a file of the proof (a planted test problem, the proof harness or a compat copy) is in what it would deliver, so nothing was delivered. exit code 2.';
 
 /** What stage 3 reads from GitHub. */
 export interface GitHubFacts {
@@ -168,6 +171,8 @@ export interface Built {
   hookNotes: string[];
   /** The files judged besides AssembledFiles (PIPEGEN.md, the inserted verify jobs, CODEOWNERS, the org required workflow): judgeAssembled's `extra`. */
   extra: CreatedFile[];
+  /** G14: the same build for another draft, with the fix loop's referee and guard over it (the real stage sets it; absent: the proof refuses). */
+  proof?: ProofBuild;
   /** The jobs as assembled, for the preview estimate (carry 43) and the PR wait. */
   minutes: { jobs: ReturnType<typeof assembledJobs>; prWait: number };
 }
@@ -204,6 +209,8 @@ export interface RunStages {
   /** Carry 58 (ruling G13-R0 12): a public app's gate, at its pinned commit, can be read. */
   gateReachable(f: GitHubFacts, reviewed: readonly ReviewedTool[]): Promise<boolean>;
   proofRepos(f: GitHubFacts, p: RepoProfile, auth: Auth, store: StateStore, runId: string, actions: readonly string[]): Promise<ProofRepos>;
+  /** Stage 8, read only (ruling G14-R0 1): the helper repos that don't exist yet (names). */
+  helperRepos(f: GitHubFacts, p: RepoProfile): Promise<string[]>;
   needs(p: RepoProfile, caps: Capabilities, bundle: CodeBundle, ai: ReturnType<typeof makeProvider>, writers: number, knownValues: string[]): Promise<NeedsPlan>;
   /** `ai` is the run's metered provider (sec I2); `onUsage` saves the meter after each call. */
   discover(needs: NeedsPlan['needs'], p: RepoProfile, f: GitHubFacts, reviewed: ReviewedTool[], ai: ReturnType<typeof makeProvider>, onUsage: () => void): Promise<Map<string, readonly Candidate[]>>;
@@ -243,8 +250,8 @@ export interface RunDeps {
   /** The platform actions (default platformActions over the reviewed list). */
   platformActions?: (reviewed: ReviewedTool[], f: GitHubFacts) => Promise<PlatformActions>;
   runId?: () => string;
-  /** G14: armProofCleanup(store, cleanupAfterProof); returns the disarm. Absent (G13): the store stays unarmed, so no helper repo is created. */
-  arm?: (store: StateStore) => () => void;
+  /** G14: armProofCleanup(store, cleanupAfterProof, meters); returns the disarm (default defaultArm). The proof arms before its first GitHub write. */
+  arm?: (store: StateStore, cleanup: (ctx: InterruptContext) => Promise<unknown>, meters: () => ProofMeters | undefined) => () => void;
   /** sec M4: whether the memory folder is one (default isMemoryFolder). */
   isMemory?: (dir: string) => boolean;
   /** sec I1: the pinned secret scanner (default ensurePinnedBinary with the pins). */
@@ -348,8 +355,14 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     // G13-R1 (sec M4): key-env makes its key pair only in memory; a host without a memory folder is refused before anything costs money
     const keyEnvApplies = signingMode(p, facts.caps) === 'key-env' && publishedImageServices(p, facts.caps).length > 0;
     if (keyEnvApplies && !(deps.isMemory ?? isMemoryFolder)(MEMORY_DIR)) { err(NO_MEMORY_FOLDER); return 2; }
-    // G13-R1 (spec M5): until G14 builds the proof, the run stops here: no AI money spent, no secret asked for
-    if (deps.proof === undefined) { err(PROOF_NOT_BUILT); return 2; }
+    // 8, read only (ruling G14-R0 1): helper repos this token can't create are named before anything costs money. The writing check
+    // (checkProofRepos: create, Actions access, default branch) runs inside the proof, where a throw is cleaned up
+    const missing = await st.helperRepos(facts, p).catch(() => null);
+    if (missing !== null && missing.length > 0 && !(auth.kind === 'app' && auth.canCreateRepos)) {
+      err(['Create these private repos, then run pipegen again:', ...createCommands(p.owner, missing).map((c) => `  ${c}`)].join('\n'));
+      err('pipegen stopped before anything was spent: the helper repositories above must exist first. exit code 2.');
+      return 2;
+    }
     const extra = notProvableNotes(p);
     const floor = floorNeeds(p, facts.caps);
     const activity = await st.activity(facts, p);
@@ -374,15 +387,8 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     const runStore = store;
     const onUsage = (): void => { runStore.saveMeters({ aiUsedUsd: meter.usedUsd }); };
 
-    // G14 registers the Ctrl-C cleanup here (armProofCleanup): without it the store gives no create permit, so no helper repo is made
-    if (deps.arm !== undefined) disarm = deps.arm(store);
     // carry 58: a public app whose gate can't load stops before the proof (and before any repo is made)
     if (!p.private && !(await st.gateReachable(facts, reviewed))) { err(GATE_UNREACHABLE); return 2; }
-    // 8. the helper repos
-    const repos = await st.proofRepos(facts, p, auth, store, runId, proofActions(reviewed));
-    // sec M3: the central Actions access level before the change, saved at once
-    if (repos.actionsAccess !== undefined) store.recordActionsAccess(repos.actionsAccess.previous);
-    if (!repos.ready) { err('pipegen stopped: the helper repositories above must exist first (see the commands). exit code 2.'); return 2; }
 
     // 9-10
     const needsPlan = await st.needs(p, facts.caps, bundle, ai, facts.writers.length, knownValues);
@@ -448,9 +454,32 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     let built = await st.build(inputs(draft));
     if (!judgedClean(built)) return 2;
 
-    // 16-17. the proof (G14) through the seam; delivery only from `cleaned` with a passed proof (Plan E carry (a)1)
-    const proofAssemble = proofAssembler(built.assembled.draft, (d, mode) => assemble(d, { gate: gateOf(reviewed), reviewed, platform: plat, mode, layout: d.profile.private ? 'central' : 'local', plan: { ...plan, needs: d.needs } }));
-    const proof = await (deps.proof ?? defaultProof)({ draft, assembled: built.assembled.draft, files: built.files, assemble: proofAssemble, store, auth, gh: facts.gh, repos, vault, ai: { meter }, io });
+    // 16-17. the proof (G14, run-proof.ts); delivery only from `cleaned` with a passed proof (Plan E carry (a)1)
+    const assembleIn = (d: PipelineDraft, mode: 'none') => assemble(d, { gate: gateOf(reviewed), reviewed, platform: plat, mode, layout: d.profile.private ? 'central' : 'local', plan: { ...plan, needs: d.needs } });
+    const proofAssemble = proofAssembler(built.assembled.draft, assembleIn);
+    const proofBuild = built.proof;
+    const pre = built;
+    const named = (consent as { terms?: { secretScanner?: { name: 'gitleaks' | 'betterleaks' } } }).terms?.secretScanner?.name ?? 'betterleaks';
+    const proof = await (deps.proof ?? defaultProof)({
+      draft, assembled: built.assembled.draft, files: built.files, assemble: proofAssemble,
+      // the security review's carry: the proof assembles the draft it is given (the fix loop's), never only the pre-proof one
+      assembleFor: async (d) => proofAssembler(d === draft ? pre.assembled.draft : proofBuild === undefined ? d : (await proofBuild.rebuild(d)).assembled, assembleIn),
+      ...(proofBuild === undefined ? {} : { build: proofBuild }),
+      store, auth, gh: facts.gh, vault, ai: { meter }, io, debate: debated,
+      withWinners: (w) => ({ ...draft, steps: draftFromDebate(base, debated, w).draft.steps }),
+      reviewed, platform: plat, dir, bundle,
+      scanner: () => (deps.secretScanner ?? pinnedScanner)(named),
+      arm: (cleanup, meters) => { disarm = (deps.arm ?? defaultArm)(runStore, cleanup, meters); },
+      variantMinutes: Math.max(1, Math.ceil(est.setupMinutes / 2)),
+      checkRepos: async () => {
+        const r = await st.proofRepos(facts, p, auth, runStore, runId, proofActions(reviewed));
+        // sec M3: the central Actions access level before the change, saved at once
+        if (r.actionsAccess !== undefined) runStore.recordActionsAccess(r.actionsAccess.previous);
+        return r;
+      },
+    });
+    for (const n of proof.notes ?? []) void n;
+    const repos: Pick<ProofRepos, 'created' | 'createdIds' | 'actionsAccess'> = proof.repos ?? { created: [] };
     if (!proof.ok) { err(safeText(proof.stopped ?? 'pipegen stopped: the proof did not pass, so nothing was delivered. exit code 2.', 1200)); return 2; }
     const saved = store.load();
     if (saved === null || saved.stage !== 'cleaned' || saved.proofOk !== true) { err('pipegen stopped: the proof did not end cleaned up with a passed verdict, so nothing was delivered. exit code 2.'); return 2; }
@@ -463,6 +492,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
       built = await st.build(inputs(draft));
       if (!judgedClean(built)) return 2;
     }
+    const provenBuild = built;
 
     // 18. two-step delivery (carries 14, 15): deliverCentral (the central files of the last judged build), the re-pin, the central file list
     // once, assemble and judge again
@@ -482,7 +512,11 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
       centralFileList = await st.readCentralFileList(facts, p);
       built = await st.build(inputs(draft, centralFileList));
       if (!judgedClean(built)) return 2;
+      // G14 (controller addendum): the central file list may change a public app's central CODEOWNERS only, never what the app gets
+      if (!sameFiles(appFilesOf(built.files), appFilesOf(provenBuild.files))) { err(PUBLIC_FILES_CHANGED); return 2; }
     }
+    // carries 23, 31: no planted file, no proof harness and no compat copy is ever delivered
+    if (built.files.some((f) => isPlantedPath(f.path) || f.path === HARNESS_PATH || f.path.startsWith(COMPAT_PREFIX))) { err(PROOF_FILE_IN_DELIVERY); return 2; }
     // ruling G13-R0 3: the preview estimate from the assembled jobs; asked again when it is higher than what was agreed
     const est2 = estimate(p, built.minutes.jobs, 2, activity, provider, { needKeys: needKeyCount(built.assembled.draft.needs) });
     if (est2.monthlyMinutes > est.monthlyMinutes) {
@@ -606,6 +640,13 @@ export async function scanCounted(dir: string, consent: ConsentToken, knownValue
 /** The AI provider keys set in the environment (makeProvider reads these names), for the state store's token check. */
 export const aiKeysOf = (env: NodeJS.ProcessEnv): string[] =>
   ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY'].map((n) => env[n]).filter((v): v is string => typeof v === 'string' && v !== '');
+
+const appFilesOf = (files: readonly CreatedFile[]): CreatedFile[] => files.filter((f) => f.repo === 'app');
+/** The same files (path, repo, content) in any order. */
+const sameFiles = (a: readonly CreatedFile[], b: readonly CreatedFile[]): boolean => {
+  const k = (fs: readonly CreatedFile[]) => fs.map((f) => JSON.stringify([f.repo, f.path, f.content])).sort();
+  return isDeepStrictEqual(k(a), k(b));
+};
 
 /** sec I5: only the scratch repo (pipegen-proof-<repo>) is the state's scratch repo; the central repo checkProofRepos also creates is not. */
 export const onCreatedFor = (store: Pick<StateStore, 'scratchCreated'>, repo: string) => (name: string, id: number): void => {
@@ -879,6 +920,11 @@ function realStages(io: CliIO, deps: RunDeps): RunStages {
       if (sha === undefined) return false;
       try { await f.gh.request('GET /repos/{owner}/{repo}/commits/{ref}', { owner, repo, ref: sha }); return true; } catch { return false; }
     },
+    async helperRepos(f, p) {
+      const out: string[] = [];
+      for (const name of [CENTRAL_REPO, `pipegen-proof-${p.repo}`]) if ((await readRepo(f.gh, { owner: p.owner, repo: name }, f.clock)) === null) out.push(name);
+      return out;
+    },
     proofRepos: (f, p, auth, store, runId, actions) => checkProofRepos(f.gh, p, { auth, actions, runId, clock: f.clock, onCreated: onCreatedFor(store, p.repo), onAccessChanged: (previous) => { store.recordActionsAccess(previous); }, createPermit: () => store.createPermit() }, io),
     needs: (p, caps, bundle, ai, writers, knownValues) => planNeeds(p, caps, bundle, ai, writers, { knownValues }),
     async discover(needs, p, f, reviewed, ai, onUsage) {
@@ -914,12 +960,13 @@ function realStages(io: CliIO, deps: RunDeps): RunStages {
     async build(i) {
       const facts = await readBuildFacts(i);
       // spec I7: the environment plan runs inside buildFiles, before the doc, so its notes reach doc.notes and the preview
-      const files = await buildFiles(i, facts, async (requireApproval, inserted) => {
+      const envPlan: EnvPlanFn = async (requireApproval, inserted) => {
         const notes: string[] = [];
         const envs = await environmentPlan(i.facts.gh, i.draft.profile, i.facts.caps, requireApproval, { texts: facts.texts, inserted, clock: i.facts.clock, notes });
         return { envs, notes };
-      });
-      return { ...files, ...(await judgeBuilt(i, files, facts)) };
+      };
+      const files = await buildFiles(i, facts, envPlan);
+      return { ...files, ...(await judgeBuilt(i, files, facts)), proof: proofBuildFor(i, facts, envPlan) };
     },
     async trusted(f, p, io2) {
       const notes: string[] = [];
@@ -960,6 +1007,38 @@ export async function judgeBuilt(i: BuildInput, files: Pick<Built, 'assembled' |
     allowWorkflowInsert: files.verify.inserts.map((x) => x.path), closure: loadReviewedClosure(i.reviewed), vault: i.vault,
   });
   return { report, guardProblems: g.refused.map((r) => `${r.path}: ${r.reason}`) };
+}
+
+/**
+ * G14 (carries 25, 26; D-I3, D-m1): the fix loop's build of a draft with the facts this build read: buildFiles again, the referee through
+ * makeFixReferee (seven arguments, judging AssembledFiles.draft), and the guard on the same batch (a Dockerfile with its .dockerignore);
+ * either one refusing is an issue. Never isolatedTestJob.
+ */
+export function proofBuildFor(i: BuildInput, facts: BuildFacts, envPlan: EnvPlanFn = NO_ENV_PLAN, deps: { linters?: () => ReturnType<typeof ensureLinters>; guard?: typeof guardCreatedFiles } = {}): ProofBuild {
+  const cache = new WeakMap<PipelineDraft, ReturnType<typeof buildFiles>>();
+  const rebuild = (d: PipelineDraft): ReturnType<typeof buildFiles> => {
+    let b = cache.get(d);
+    if (b === undefined) { b = buildFiles({ ...i, draft: d }, facts, envPlan); cache.set(d, b); }
+    return b;
+  };
+  const referee = makeFixReferee({
+    assemble: async (d) => { const b = await rebuild(d); return { files: b.files, draft: b.assembled.draft }; },
+    platform: i.platform, reviewed: i.reviewed, linters: (deps.linters ?? ensureLinters)(), ghToken: i.auth.token ?? null,
+    deps: { vault: i.vault, createdInputs: createdInputsFor(i, facts) },
+  });
+  const ctx = { root: i.dir, baseTree: facts.baseTree, installRecord: guardRecord(i.prev), repo: 'app' as const, closure: loadReviewedClosure(i.reviewed), vault: i.vault };
+  const guard = deps.guard ?? guardCreatedFiles;
+  return {
+    rebuild: async (d) => { const b = await rebuild(d); return { files: b.files, assembled: b.assembled.draft }; },
+    async referee(d) {
+      const report = await referee(d);
+      const b = await rebuild(d);
+      const g = await guard(b.files.filter((x) => x.repo === 'app'), { ...ctx, profile: b.assembled.draft.profile, allowWorkflowInsert: b.verify.inserts.map((x) => x.path) });
+      const issues = [...report.issues, ...g.refused.map((r) => ({ file: r.path, check: 'template' as const, message: `the guard refused it: ${r.reason}`, repo: 'app' as const }))];
+      return { ...report, ok: report.ok && g.refused.length === 0, issues };
+    },
+    guard: (files) => makeFixGuard({ ...ctx, profile: i.draft.profile })(files),
+  };
 }
 
 /** Ruling G13-R0 13: the credits from the audit's coverage map (local files only: no child process, no AI). */
