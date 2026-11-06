@@ -1257,10 +1257,12 @@ describe('G10 fix round 2 (review-G10-r1, ruling G10-R3)', () => {
     const again = appFiles(pin2, { withPkg: false }).filter((f) => f.edited === undefined && f.inserted === undefined).map((f) => (f.path === 'PIPEGEN.md' ? { ...f, content: '# pipegen v2\n' } : f));
     await deliver(w.g.octokit(), p, planDelivery(input(p, pin2, { files: [...centralFiles(), ...again], locks: locks({ codeowners: undefined }) })), v2, deps(w));
     const body2 = w.g.repo('o/r').pulls[0]?.body as string;
-    expect(body2).toContain('Already there and identical to what pipegen writes');
-    expect(body2).toContain('`.github/workflows/r--merge.yml` (central repo)');
+    // earlier adopted files this run does not write are carried over, and not called identical to what pipegen writes
+    expect(body2).toContain('Adopted by an earlier run and still in the repository');
+    expect(body2.split('\n').find((l) => l.startsWith('Adopted by an earlier run')) ?? '').toContain('`.github/workflows/r--merge.yml` (central repo)');
     expect(body2).toMatch(/This run rewrites a file that an earlier run adopted .*`PIPEGEN.md`/);
-    expect(body2.split('\n').find((l) => l.startsWith('Already there')) ?? '').not.toContain('`PIPEGEN.md`');
+    expect(body2.split('\n').find((l) => l.startsWith('Adopted by an earlier run')) ?? '').not.toContain('`PIPEGEN.md`');
+    expect(body2).not.toContain('identical to what pipegen writes');
   });
 
   it('fix 2: a pre-existing pipegen-signing that pipegen narrowed goes into the leftovers with its previous settings (N3)', async () => {

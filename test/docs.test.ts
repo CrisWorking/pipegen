@@ -1,6 +1,8 @@
 // v0.2 Plan G, G9 (plan Task 6): PIPEGEN.md. The builder is pure (draft, reviewed list); the referee builds it again and requires the same bytes.
 // Fixtures are invented and come in two shapes: A, a private organisation repo with two services; B, a public repo with one static site.
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { parse as parseJs } from 'acorn';
+import { transformSync } from 'esbuild';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -10,14 +12,14 @@ import { SecretVault } from '../src/create/secrets.js';
 import { cleanForDoc } from '../src/debate/clean.js';
 import { keyOffers } from '../src/debate/builder.js';
 import { prBody } from '../src/deliver/deliver.js';
-import { docRecomputeProblem, GATE_REASONS, HISTORY_REWRITE_NOTE, pipegenDoc, pipegenDocWith, SECTION_TITLES, WARN_MODE_TEXT, ZAP_JSON_VERIFIED, ZAP_TOOL } from '../src/deliver/docs.js';
+import { docRecomputeProblem, GATE_REASONS, HISTORY_REWRITE_NOTE, pipegenDoc, pipegenDocWith, PipegenDocError, SECTION_TITLES, WARN_MODE_TEXT, ZAP_JSON_VERIFIED, ZAP_TOOL } from '../src/deliver/docs.js';
 import { pipegenDocProblems } from '../src/engine/created-judges/pipegen-doc.js';
 import { referee } from '../src/engine/referee.js';
 import { BOOTSTRAP_PROOFS_NOTE } from '../src/engine/reviewed.js';
 import { floorNeeds, MINIMUM_CATEGORIES, WORKFLOW_LINT_TOOL } from '../src/engine/needs.js';
 import { assembleJobs, HOOKS_CI_NOTES, NOT_RENDERED_V02, POUTINE_NOT_RUN, PYPI_PUBLISH_NOTE, WORKFLOW_LINT_SUGGESTION } from '../src/layers/jobs.js';
 import { HUSKY_NO_CI_NOTE, precommitFiles, SETUP_COMMANDS } from '../src/layers/precommit.js';
-import { GATE_CHECK_NAME, type CreatedFile, type ExistingWorkflow, type Need, type NotProven, type PipelineDoc, type PipelineDraft, type ProjectType, type ReviewedTool, type Service } from '../src/types.js';
+import { GATE_CHECK_NAME, type CreatedFile, type ExistingWorkflow, type Need, type NotProven, type PipelineDoc, type PipelineDraft, type ProjectType, type ReviewedTool, type Service, type StepSpec } from '../src/types.js';
 import { CAPS as ALL_CAPS, need, profile, REVIEWED, svc } from './helpers/debate-fixtures.js';
 import { CAPS, LINTERS, node, p, planned, profileOf } from './helpers/assemble.js';
 import { platform, entry, reviewedList, specFor } from './helpers/render.js';
@@ -40,6 +42,12 @@ const mergeNeeds = (prof: PipelineDraft['profile'], caps: PipelineDraft['capabil
   const all = [...minimumOf(prof, caps), ...extra];
   return all.filter((n, i) => all.findIndex((m) => m.id === n.id && m.service === n.service && m.layer === n.layer) === i);
 };
+/** One step per merge, push and pre-commit need, the first reviewed tool of its category (the gate's job list is built from the steps). */
+const stepsFor = (needs: readonly Need[]): StepSpec[] => needs.flatMap((n, i) => {
+  if (n.category === 'gate' || n.layer === 'deploy' || needs.findIndex((m) => m.id === n.id && m.service === n.service) !== i) return [];   // one step per need and service, as the debate gives them
+  const t = REVIEWED.find((r) => r.categories.includes(n.category));
+  return t === undefined ? [] : [specFor(t, { needId: n.id, ...(n.service === undefined ? {} : { service: n.service }) })];
+});
 const type = (types: ProjectType['types'], extra: Partial<ProjectType> = {}): ProjectType => ({ types, evidence: [], unsure: false, ...extra });
 
 /** Shape A: a private organisation repo, two node services, a deploy layer and the checks of the catalogue. */
@@ -55,7 +63,8 @@ function shapeA(over: Partial<PipelineDraft> = {}, doc: Partial<PipelineDoc> = {
   ];
   const needs = mergeNeeds(prof, ALL_CAPS, extra);
   return {
-    profile: prof, capabilities: ALL_CAPS, needs, steps: [], created: [], notProven: [], testDecisions: [], layersSkipped: [], scoreboard: [], requireDeployApproval: false, skipped: [], suggestions: [],
+    // the running app scan is not run by ZAP here (ZAP is judged as not proven while its report is unverified: the sec C1 test puts ZAP back)
+    profile: prof, capabilities: ALL_CAPS, needs, steps: stepsFor(needs).map((st) => (st.needId === 'dast' ? { ...st, tool: { ...st.tool, id: 'dast-scanner' } } : st)), created: [], notProven: [], testDecisions: [], layersSkipped: [], scoreboard: [], requireDeployApproval: false, skipped: [], suggestions: [],
     signing: { mode: 'key-env', images: [{ service: 'shop-api', repo: 'ghcr.io/acme/shop-shop-api' }], cosignPubSha256: 'a'.repeat(64) },
     codeOwners: { owners: ['@alice', '@bob'], writers: 3 },
     doc: { ...EMPTY_DOC, ...doc }, ...over,
@@ -68,7 +77,7 @@ function shapeB(over: Partial<PipelineDraft> = {}, doc: Partial<PipelineDoc> = {
   const caps = { ...ALL_CAPS, environments: false, envRequiredReviewers: false, deploymentBranchPolicies: false, attestations: false, branchProtection: true, keylessSigningAllowed: true };
   const needs = mergeNeeds(prof, caps, []);
   return {
-    profile: prof, capabilities: caps, needs, steps: [], created: [], notProven: [], testDecisions: [], layersSkipped: [], scoreboard: [], requireDeployApproval: false, skipped: [], suggestions: [],
+    profile: prof, capabilities: caps, needs, steps: stepsFor(needs), created: [], notProven: [], testDecisions: [], layersSkipped: [], scoreboard: [], requireDeployApproval: false, skipped: [], suggestions: [],
     doc: { ...EMPTY_DOC, ...doc }, ...over,
   };
 }
@@ -84,6 +93,40 @@ const headingAt = (text: string, title: string): string => {
   const next = lines.findIndex((l, i) => i > at && /^## /.test(l));
   return lines.slice(at, next < 0 ? undefined : next).join('\n');
 };
+/**
+ * The string literals of a gate source file, and the leading text of every reason it raises (block, warn, put, errors.push, rangeReason, NOT_RUN_FORK):
+ * read from the syntax tree, so a comment can never stand in for code.
+ */
+function gateStrings(file: string): { literals: string[]; reasons: string[] } {
+  const js = transformSync(readFileSync(new URL(`../gate/src/${file}`, import.meta.url), 'utf8'), { loader: 'ts', target: 'esnext', format: 'esm' }).code;
+  const literals: string[] = [];
+  const reasons: string[] = [];
+  type N = { type: string; [k: string]: unknown };
+  const lead = (n: N | undefined): string | null => {
+    if (n === undefined) return null;
+    if (n.type === 'Literal' && typeof n.value === 'string') return n.value;
+    if (n.type === 'TemplateLiteral') return ((n.quasis as { value: { cooked: string } }[])[0] as { value: { cooked: string } }).value.cooked;
+    if (n.type === 'ArrowFunctionExpression') return lead(n.body as N);
+    return null;
+  };
+  const walk = (n: unknown): void => {
+    if (n === null || typeof n !== 'object') return;
+    if (Array.isArray(n)) { n.forEach(walk); return; }
+    const node = n as N;
+    if (typeof node.type !== 'string') return;
+    if (node.type === 'Literal' && typeof node.value === 'string') literals.push(node.value);
+    if (node.type === 'TemplateElement') literals.push((node.value as { cooked: string }).cooked);
+    if (node.type === 'CallExpression') {
+      const c = node.callee as N;
+      const name = c.type === 'Identifier' ? (c.name as string) : c.type === 'MemberExpression' && (c.object as N).name === 'errors' && (c.property as N).name === 'push' ? 'errors.push' : '';
+      if (['block', 'warn', 'put', 'errors.push'].includes(name)) for (const a of node.arguments as N[]) { const l = lead(a); if (l !== null) reasons.push(l); }
+    }
+    if (node.type === 'VariableDeclarator' && ['rangeReason', 'NOT_RUN_FORK'].includes(((node.id as N).name as string) ?? '')) { const l = lead(node.init as N); if (l !== null) reasons.push(l); }
+    for (const k of Object.keys(node)) walk(node[k]);
+  };
+  walk(parseJs(js, { ecmaVersion: 'latest', sourceType: 'module' }));
+  return { literals, reasons: reasons.filter((r) => r.length >= 8 && !['block', 'warn', 'count'].includes(r)) };
+}
 const count = (text: string, part: string): number => text.split(part).length - 1;
 
 describe('doc: the 18 sections', () => {
@@ -120,23 +163,37 @@ describe('doc: the 18 sections', () => {
         expect(row).toContain(r.todo);
       }
     }
-    // the first column is the gate's own leading text: each one is found in the gate's source (decide.ts, integrity.ts), so a user can copy a line of the summary
+    // the first column is the gate's own leading text: each one is found in a string of the gate's CODE (decide.ts, settings.ts, integrity.ts; comments do not count),
+    // so a user can copy a line of the summary and find its row
     const ids = GATE_REASONS.map((r) => r.id);
-    const decide = readFileSync(new URL('../gate/src/decide.ts', import.meta.url), 'utf8').replace(/\\'/g, "'");
-    const gate = readFileSync(new URL('../gate/src/integrity.ts', import.meta.url), 'utf8');
+    const decide = gateStrings('decide.ts');
+    const settings = gateStrings('settings.ts');
+    const integrity = gateStrings('integrity.ts');
+    const code = [...decide.literals, ...settings.literals, ...integrity.literals];
     for (const r of GATE_REASONS) {
       if (r.id === 'warn-mode' || r.id === 'warn-ended') {
         // the heading is built from the mode: `(${r.mode} mode)`, mode being 'warn' or 'block'
-        expect(decide, r.id).toContain('(${r.mode} mode)');
-        expect(decide, r.id).toMatch(/export type GateMode = 'warn' \| 'block'/);
+        expect(decide.literals.some((l) => l.includes(' mode)')), r.id).toBe(true);
+        expect(readFileSync(new URL('../gate/src/decide.ts', import.meta.url), 'utf8')).toMatch(/export type GateMode = 'warn' \| 'block'/);
         expect(r.message).toBe(r.id === 'warn-mode' ? '(warn mode)' : '(block mode)');
         continue;
       }
-      expect(decide.includes(r.message) || gate.includes(r.message), `${r.id}: "${r.message}" is not in the gate's source`).toBe(true);
+      expect(code.some((l) => l.includes(r.message)), `${r.id}: "${r.message}" is not in a string of the gate's code`).toBe(true);
+    }
+    // the other way: every reason the gate's code raises (block, warn, the finding reasons, the settings errors, the commit-range line, the fork line) has a row
+    const raised = [...decide.reasons, ...settings.reasons];
+    expect(raised.length).toBeGreaterThan(20);
+    expect(raised.some((l) => l.startsWith('secret added in this PR\'s history')), 'the commit-range line is read').toBe(true);
+    expect(raised.some((l) => l.startsWith('not run on a fork PR')), 'the fork line is read').toBe(true);
+    expect(raised.some((l) => l.startsWith('the policy input is refused')), 'the settings errors are read').toBe(true);
+    for (const extra of ['not proven: never blocks', 'a non-blocking check: never blocks', 'warn-first: a warning until a reviewed pull request makes the check blocking']) expect(decide.literals.some((l) => l.includes(extra)), extra).toBe(true);
+    for (const reason of [...raised, 'not proven: never blocks', 'a non-blocking check: never blocks']) {
+      if (reason.startsWith('${')) continue;
+      expect(GATE_REASONS.some((r) => reason.includes(r.message) || r.message.includes(reason)), `the gate reason "${reason.slice(0, 70)}" has no row`).toBe(true);
     }
     // the plan's reasons are all there (Plan C summary), and every integrity rule id the gate can raise
     for (const want of ['new-finding', 'secret-in-range', 'protected-path', 'suppression', 'incomplete-list', 'tool-error', 'fork-not-run', 'not-proven', 'skipped', 'tampered', 'no-base', 'malicious', 'warn-mode', 'warn-ended', 'image-no-base', 'failed-check', 'missing-check', 'no-coverage', 'settings-policy']) expect(ids, want).toContain(want);
-    const ruleIds = [...new Set([...gate.matchAll(/push\('(integrity:[a-z-]+)'/g)].map((m) => m[1] as string))];
+    const ruleIds = [...new Set(integrity.literals.filter((l) => /^integrity:[a-z-]+$/.test(l)))];
     expect(ruleIds.length).toBeGreaterThanOrEqual(5);
     const table = headingAt(docOf(shapeA()), 'Fix a blocked pull request');
     for (const id of ruleIds) expect(table, id).toContain(id);
@@ -225,7 +282,12 @@ describe('doc: the 18 sections', () => {
     // every hostile string of the shared fixture, as a service name, a suggestion, a path and a note
     for (const [k, v] of Object.entries(hostileNames)) {
       const base = shapeA();
-      const d2 = shapeA({ profile: { ...base.profile, services: base.profile.services.map((s, i) => (i === 0 ? { ...s, name: v } : s)) }, needs: base.needs.map((n) => (n.service === 'shop-api' ? { ...n, service: v } : n)), suggestions: [{ name: v, repo: v, why: v }], created: [{ path: v, content: 'x', part: 'docker', reason: v, repo: 'app' }] }, { notes: [v], lockNotes: [v], transcript: [v] });
+      const others = { suggestions: [{ name: v, repo: v, why: v }], created: [{ path: v, content: 'x', part: 'docker' as const, reason: v, repo: 'app' as const }] };
+      const docs = { notes: [v], lockNotes: [v], transcript: [v] };
+      const withName = shapeA({ profile: { ...base.profile, services: base.profile.services.map((s, i) => (i === 0 ? { ...s, name: v } : s)) }, needs: base.needs.map((n) => (n.service === 'shop-api' ? { ...n, service: v } : n)), ...others }, docs);
+      let d2 = withName;
+      // a service name the gate could not turn into an artifact name is refused by the builder (the reader never lets one through); the other fields are still tried
+      try { docOf(withName); } catch (e) { expect(e, k).toBeInstanceOf(PipegenDocError); d2 = shapeA(others, docs); }
       expect(problems(d2), k).toEqual([]);
     }
   });
@@ -274,7 +336,7 @@ describe('doc: the 18 sections', () => {
 
   it('doc: warn mode text references finish, not a fixed date', () => {
     for (const [label, make] of SHAPES) {
-      const d = make({ warnFirst: { sast: { since: '2026-11-05' }, deps: { since: '2026-11-05' } }, gateSettings: { blockFromRecorded: '2026-11-12' } });
+      const d = make({ warnFirst: { coverage: { since: '2026-11-05' }, 'type-check': { since: '2026-11-05' } }, gateSettings: { blockFromRecorded: '2026-11-12' } });
       const text = docOf(d);
       const sec = headingAt(text, 'Warn mode');
       expect(sec, label).toContain('Warn mode lasts until 7 days after you merge (the exact date is set by `npx pipegen finish`).');
@@ -282,7 +344,7 @@ describe('doc: the 18 sections', () => {
       expect(text, label).not.toMatch(/\b20\d\d-\d\d-\d\d\b/);
       expect(text).not.toContain('2026-11-12');
       expect(sec).toMatch(/about 14 days/);
-      expect(sec).toContain('- Code scan');
+      expect(sec).toContain('- Test coverage');
     }
   });
 
@@ -297,7 +359,7 @@ describe('doc: the 18 sections', () => {
     const rich = shapeA({
       suggestions: [{ name: 'trufflehog', repo: 'trufflesecurity/trufflehog', why: 'It also checks the commit history for keys.' }],
       notProven: [np('pipeline', 'The scan needs a login that pipegen was not given.', ['APP_LOGIN_TOKEN'], 'dast')],
-      skipped: [{ part: 'slack', reason: 'No Slack here.' }], scoreboard: ['The builder won the sast check, 2 to 1.'], warnFirst: { sast: { since: '2026-11-05' } },
+      skipped: [{ part: 'slack', reason: 'No Slack here.' }], scoreboard: ['The builder won the sast check, 2 to 1.'], warnFirst: { coverage: { since: '2026-11-05' } },
       testDecisions: [{ service: 'shop-api', choice: 'keep', reasons: ['This service already has tests, so pipegen keeps them.'] }],
     }, { transcript: ['Builder: use semgrep for sast.'], setupCommand: 'lefthook install', lockNotes: ['Only one person can write to "shop", so pull requests need no approval.'], deployGaps: [{ path: '.github/workflows/release.yml', triggers: ['workflow_dispatch'], why: 'It starts by hand.' }], credits: [{ text: 'The tests run on every pull request into main and every push to main.', kind: 'push-default' }], notes: ['A note from the build.'] });
     expect(docOf(rich)).toMatchSnapshot('shape A');
@@ -765,13 +827,14 @@ describe('doc: carries (lines present when they apply, absent when they do not)'
     expect(layers).toMatch(/- semgrep\/semgrep: .*dist/);
     expect(docOf({ ...x.draft, doc: { ...EMPTY_DOC } })).not.toContain('Reduced coverage');
     expect(layers).toMatch(/- Code scan, service "web", tool semgrep\/semgrep\. Looks for insecure code patterns in your source\. Blocks a pull request\./);
-    expect(layers).toMatch(/### Pre-commit layer[\s\S]*Blocks the commit\./);
+    expect(layers).toMatch(/### Pre-commit layer[\s\S]*Not set up: pipegen wrote no hook file \(see Hooks setup\)\./);
+    expect(layers).not.toMatch(/Blocks the commit/);
     expect(layers).toMatch(/### Push layer[\s\S]*Fails the run\./);
-    expect(layers).toMatch(/- Dead code, service "web", tool knip|Dead code, service "web", tool webpro-nl\/knip\. Finds code and packages that nothing uses\. Warns only\./);
+    expect(layers).toMatch(/- Dead code, service "web", tool knip|Dead code, service "web", tool webpro-nl\/knip\. Finds code and packages that nothing uses\. Warns only\.|Dead code, service "web", tool webpro-nl\/knip\. Finds code and packages that nothing uses\. Runs for information; the gate does not use it\./);
     // a gate need names the gate action; warn-first checks say so
     expect(layers).toMatch(/The gate, tool the pipegen gate action/);
-    const wf = docOf({ ...x.draft, warnFirst: { sast: { since: '2026-11-05' } }, doc: { ...EMPTY_DOC } });
-    expect(headingAt(wf, 'The four layers')).toContain('Starts in warn mode, then blocks.');
+    const wf = docOf({ ...x.draft, warnFirst: { coverage: { since: '2026-11-05' } }, doc: { ...EMPTY_DOC } });
+    expect(headingAt(wf, 'The four layers')).toMatch(/Test coverage, service "web".*Starts in warn mode: /);
   });
 
   it('doc: hooks setup, first-use trust, --no-verify, the E404 case and fail closed (carries 11-16)', () => {
@@ -838,7 +901,7 @@ describe('doc: carries (lines present when they apply, absent when they do not)'
 describe('doc: fix round 1 (ruling G9-R1)', () => {
   const zapDraft = (over: Partial<PipelineDraft> = {}, doc: Partial<PipelineDoc> = {}): PipelineDraft => {
     const base = shapeA(over, doc);
-    return { ...base, steps: [...base.steps, specFor(entry('zap-baseline'), { needId: 'dast', service: 'shop-api' })] };
+    return { ...base, steps: base.steps.map((st) => (st.needId === 'dast' ? specFor(entry('zap-baseline'), { needId: 'dast', service: 'shop-api' }) : st)) };
   };
   const layersLine = (text: string, label: string): string => headingAt(text, 'The four layers').split('\n').find((l) => l.startsWith(`- ${label}`)) as string;
 
@@ -854,7 +917,8 @@ describe('doc: fix round 1 (ruling G9-R1)', () => {
     expect(line).toContain('Warns only: ZAP results are not verified yet');
     expect(line).not.toMatch(/Blocks a pull request/);
     const np1 = headingAt(t1, 'Not proven yet');
-    expect(np1).toContain('Running app scan, service "shop-api", tool zap-baseline: ZAP results are not verified yet');
+    expect(np1).toContain('Running app scan, service "shop-api", tool zaproxy/zaproxy: ZAP results are not verified yet');
+    expect(line).toContain('tool zaproxy/zaproxy');   // the same name in every line
     expect(np1).not.toContain('Every check pipegen set up is proven.');
     // the same need with another tool keeps its mode, and the plain draft says everything is proven
     expect(layersLine(docOf(shapeA()), 'Running app scan')).toMatch(/Blocks a pull request/);
@@ -1053,5 +1117,182 @@ describe('doc: fix round 1 (ruling G9-R1)', () => {
     expect(msgs(await run(f, stale1))).toMatch(/not the file pipegen builds from the draft/);
     const stale2 = { ...d, doc: { ...(d.doc as PipelineDoc), uncoveredMinimum: [] } };
     expect(msgs(await run(f, stale2))).toMatch(/not the file pipegen builds from the draft/);
+  });
+
+  // ---------- round 2 (ruling G9-R2) ----------
+  const needOf = (id: string, layer: Need['layer'], service?: string, blocking = id !== 'format-lint'): Need => ({ id, layer, category: id, ...(service === undefined ? {} : { service }), why: 't', blocking, floor: false });
+  const BIOME = entry('biome');
+  const BIOME_V = BIOME.step.cli?.install.version as string;
+  /** The pre-commit needs and the hooks-ci check of a repository, over the G6 fixtures (service `app`, with Biome in its lockfile unless told). */
+  const hookRepo = (precommit: 'pre-commit' | 'husky' | 'lefthook' | null, over: { biome?: boolean; other?: boolean } = {}): PipelineDraft => {
+    const d0 = draftOf();
+    const services = prof.services.map((sv, i) => (i !== 0 ? sv : { ...sv, quality: { ...sv.quality, versions: over.biome === false ? {} : { '@biomejs/biome': BIOME_V }, fromRange: [] } }));
+    return draftOf({
+      profile: { ...prof, precommit, services, ...(over.other === true ? { otherHookManagers: ['simple-git-hooks' as const] } : {}) },
+      needs: [...d0.needs, needOf('hooks', 'pre-commit'), needOf('secrets', 'pre-commit'), needOf('format-lint', 'pre-commit', 'app'), needOf('hooks-ci', 'merge')],
+      steps: [...d0.steps, specFor(BIOME, { needId: 'format-lint', service: 'app' }), specFor(entry('lefthook'), { needId: 'hooks-ci' })],
+    });
+  };
+  const withHooks = async (d: PipelineDraft, reviewed: readonly ReviewedTool[], files: Record<string, string>): Promise<{ text: string; layers: string }> => {
+    const dir = mkdtempSync(join(tmpdir(), 'pipegen-docs-'));
+    try {
+      for (const [f, t] of Object.entries(files)) { mkdirSync(join(dir, dirname(f)), { recursive: true }); writeFileSync(join(dir, f), t); }
+      const r = await precommitFiles(d, reviewed, dir);
+      const full: PipelineDraft = { ...d, created: [...d.created, ...r.files], doc: { ...EMPTY_DOC, setupCommand: r.setupCommand, notes: r.notes } };
+      const text = pipegenDoc(full, reviewed).content;
+      return { text, layers: headingAt(text, 'The four layers') };
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  };
+  const lineOf = (layers: string, start: string): string => layers.split('\n').find((l) => l.startsWith(`- ${start}`)) as string;
+
+  it('N1: pre-commit lines come from what was written: nothing written, no gitleaks, no Biome', async () => {
+    // simple-git-hooks: pipegen adds no hooks of its own, so nothing is set up and hooks in CI has no config to run
+    const none = await withHooks(hookRepo(null, { other: true }), reviewedList(), {});
+    for (const l of ['Local hooks', 'Secret scan', 'Format and lint']) {
+      const pre = none.layers.slice(none.layers.indexOf('### Pre-commit layer'), none.layers.indexOf('### Push layer'));
+      expect(pre, l).toContain(l);
+    }
+    const pre = none.layers.slice(none.layers.indexOf('### Pre-commit layer'), none.layers.indexOf('### Push layer'));
+    expect(pre).not.toMatch(/Blocks the commit/);
+    expect(pre.match(/Not set up: pipegen wrote no hook file/g)?.length).toBe(3);
+    expect(lineOf(none.layers, 'Hooks in CI')).toContain('Not set up: there is no hook config for it to run.');
+    expect(lineOf(none.layers, 'Hooks in CI')).not.toMatch(/Blocks a pull request/);
+    expect(headingAt(none.text, 'Hooks setup')).toContain('pipegen wrote no hook file');
+    // the repository's own lefthook config: hooks in CI has something to run, pipegen's pre-commit lines are set up
+    const mine = await withHooks(hookRepo('lefthook'), reviewedList(), { 'lefthook.yml': 'commit-msg:\n  commands:\n    lint:\n      run: npx --no -- commitlint --edit {1}\n' });
+    const preMine = mine.layers.slice(mine.layers.indexOf('### Pre-commit layer'), mine.layers.indexOf('### Push layer'));
+    expect(lineOf(preMine, 'Secret scan')).toContain('Blocks the commit.');
+    expect(lineOf(preMine, 'Local hooks')).toContain('Blocks the commit.');
+    expect(lineOf(preMine, 'Format and lint')).toContain('Warns only.');
+    expect(lineOf(mine.layers, 'Hooks in CI')).toMatch(/Blocks a pull request|Fails the run|Warns only/);
+    expect(lineOf(mine.layers, 'Hooks in CI')).not.toContain('Not set up');
+    // a reviewed list without gitleaks: the file is written (Biome), the secrets hook is not
+    const noGitleaks = reviewedList().filter((t) => t.id !== 'gitleaks');
+    const g = await withHooks(hookRepo('lefthook'), noGitleaks, { 'lefthook.yml': 'commit-msg:\n  commands:\n    lint:\n      run: npx --no -- commitlint --edit {1}\n' });
+    const preG = g.layers.slice(g.layers.indexOf('### Pre-commit layer'), g.layers.indexOf('### Push layer'));
+    expect(lineOf(preG, 'Secret scan')).toContain('Not set up: the reviewed list has no gitleaks entry here, so no secrets hook was written.');
+    expect(lineOf(preG, 'Secret scan')).not.toMatch(/Blocks the commit/);
+    expect(lineOf(preG, 'Format and lint')).toContain('Warns only.');
+    // Biome left out (not in the lockfile): the secrets hook is written, the format and lint hook is not
+    const nb = await withHooks(hookRepo('lefthook', { biome: false }), reviewedList(), { 'lefthook.yml': 'commit-msg:\n  commands:\n    lint:\n      run: npx --no -- commitlint --edit {1}\n' });
+    const preN = nb.layers.slice(nb.layers.indexOf('### Pre-commit layer'), nb.layers.indexOf('### Push layer'));
+    expect(lineOf(preN, 'Secret scan')).toContain('Blocks the commit.');
+    expect(lineOf(preN, 'Format and lint')).toContain('Not set up: the format and lint hook was left out');
+    expect(lineOf(preN, 'Format and lint')).not.toMatch(/Warns only|Blocks/);
+    // a written file that does not hold the hook (a draft that says one thing and a file another) is not read as set up
+    const base = hookRepo('lefthook');
+    const fake: CreatedFile = { path: 'lefthook.yml', content: 'pre-commit:\n  commands: {}\n', part: 'precommit', reason: 't', repo: 'app', edited: { original: '' } };
+    const lie = headingAt(pipegenDoc({ ...base, created: [fake], doc: { ...EMPTY_DOC } }, reviewedList()).content, 'The four layers');
+    expect(lineOf(lie, 'Secret scan')).toContain('Not set up: the hook file does not hold the secrets hook.');
+  });
+
+  it('N2: the minimum and the mode follow the gate\'s job list at the merge layer', () => {
+    const base = shapeA();
+    // sast removed from the merge layer only (the push layer keeps one): not covered
+    const noMergeSast = shapeA({ needs: [...base.needs.filter((n) => !(n.id === 'sast' && n.layer === 'merge')), need('sast', 'push', 'shop-api')] });
+    expect(headingAt(docOf(noMergeSast), 'Not proven yet')).toContain('- Code scan, service "shop-api": not covered. This setup has no job for it.');
+    // a non-blocking workflow-lint is not in the gate's list: not covered, and its line says it runs for information
+    const soft = shapeA({ needs: base.needs.map((n) => (n.id === 'workflow-lint' ? { ...n, blocking: false } : n)) });
+    expect(headingAt(docOf(soft), 'Not proven yet')).toContain('- Workflow lint: not covered. This setup has no job for it.');
+    expect(lineOfDoc(docOf(soft), 'Workflow lint')).toContain('Runs for information; the gate does not use it.');
+    expect(headingAt(docOf(base), 'Not proven yet')).not.toContain('Minimum checks with no job');
+  });
+  const lineOfDoc = (text: string, label: string): string => lineOf(headingAt(text, 'The four layers'), label);
+
+  it('N3: every inserted deploy file is listed under Not proven yet, and "proven" is never printed beside one', () => {
+    const base = shapeB();
+    const inserted: CreatedFile = { path: '.github/workflows/deploy.yml', content: 'x', part: 'deploy-verify', reason: 'verify', repo: 'app', inserted: { original: 'o', jobs: ['pipegen-verify'], needs: [] } };
+    const two: CreatedFile = { ...inserted, path: '.github/workflows/site.yml' };
+    const d = shapeB({ created: [inserted, two], notProven: [] });
+    const sec = headingAt(docOf(d), 'Not proven yet');
+    expect(sec).toContain('Part deploy-verify: pipegen edited ".github/workflows/deploy.yml" (it added the verify job and `needs` entries). Check the edit by hand before you rely on it.');
+    expect(sec).toContain('".github/workflows/site.yml"');
+    expect(sec).not.toContain('Every check pipegen set up is proven.');
+    expect(headingAt(docOf(base), 'Not proven yet')).toContain('Every check pipegen set up is proven.');
+  });
+
+  it('N5: warn-first is worded as the gate does it (job status warns, findings still block a new critical or high finding)', () => {
+    const d = shapeA({ warnFirst: { coverage: { since: '2026-11-05' }, 'image-scan': { since: '2026-11-05' } } });
+    const layers = headingAt(docOf(d), 'The four layers');
+    expect(lineOf(layers, 'Image scan')).toContain('Starts in warn mode: old and medium findings warn, but a new critical or high finding still blocks, and so does a failed job.');
+    const cov = lineOf(layers, 'Test coverage');
+    expect(cov).toMatch(/Starts in warn mode: (?:a failure warns until a reviewed pull request makes the check blocking|old and medium findings warn, but a new critical or high finding still blocks, and so does a failed job)\./);
+    expect(layers).not.toContain('Starts in warn mode, then blocks.');
+    const row = GATE_REASONS.find((r) => r.id === 'warn-first') as (typeof GATE_REASONS)[number];
+    expect(row.means).toContain('judged by its job status');
+    expect((GATE_REASONS.find((r) => r.id === 'warn-first-finding') as (typeof GATE_REASONS)[number]).means).toContain('still blocks');
+    expect((GATE_REASONS.find((r) => r.id === 'no-base') as (typeof GATE_REASONS)[number]).means).toMatch(/new critical or high finding therefore blocks/);
+    expect((GATE_REASONS.find((r) => r.id === 'no-base') as (typeof GATE_REASONS)[number]).means).not.toMatch(/installs pipegen warns instead\. /);
+  });
+
+  it('N6: a strictness label that does not fit the checks is refused, not printed', async () => {
+    const mismatch = shapeA({ warnFirst: { coverage: { since: '2026-11-05' } } }, { estimates: { monthlyMinutes: 1, includedMinutes: null, strictness: 'Strict' } });
+    expect(() => pipegenDoc(mismatch, REVIEWED)).toThrow(PipegenDocError);
+    expect(() => pipegenDoc(mismatch, REVIEWED)).toThrow(/Strict has no warn period/);
+    expect(docRecomputeProblem(pipegenDoc(shapeA(), REVIEWED), mismatch, REVIEWED)).toMatch(/Strict has no warn period/);
+    // the labels that fit are printed
+    expect(docOf(shapeA({ warnFirst: { coverage: { since: '2026-11-05' } } }, { estimates: { monthlyMinutes: 1, includedMinutes: null, strictness: 'Standard' } }))).toContain('This setup uses Standard.');
+    expect(docOf(shapeA({}, { estimates: { monthlyMinutes: 1, includedMinutes: null, strictness: 'Strict' } }))).toContain('This setup uses Strict.');
+  });
+
+  it('N2/N6: a draft the gate could not list is refused by the builder, not printed', () => {
+    const base = shapeA();
+    const first = base.steps.find((st) => st.needId === 'sast') as StepSpec;
+    const twice = shapeA({ steps: [...base.steps, { ...first, tool: { ...first.tool, id: 'another-sast' } }] });
+    expect(() => pipegenDoc(twice, REVIEWED)).toThrow(PipegenDocError);
+    expect(() => pipegenDoc(twice, REVIEWED)).toThrow(/the gate's job list can not be built/);
+    expect(docRecomputeProblem(pipegenDoc(base, REVIEWED), twice, REVIEWED)).toMatch(/could not be built again from the draft: the gate's job list can not be built/);
+  });
+
+  it('N7: prBody checks every path it prints, the AI-written ones too', () => {
+    const evil = 'a`![x](https://evil.example/p.png) @octocat <!-- `';
+    const plan = { aiWritten: [evil, 'src/ok.ts'] } as unknown as Parameters<typeof prBody>[0];
+    const body = prBody(plan, [], 0, [], [], [{ repo: 'app', path: evil }, { repo: 'app', path: 'docs/old.md' }]);
+    expect(body).not.toMatch(/evil|octocat|<!--/);
+    expect(body).toContain('Written by the AI (read them closely): `src/ok.ts`');
+    expect(body).toContain('Adopted by an earlier run and still in the repository');
+    expect(body).toContain('`docs/old.md`');
+    // the carried files are not called identical to what pipegen writes
+    expect(body).not.toContain('identical to what pipegen writes');
+    expect(prBody(plan, [], 0, [{ repo: 'app', path: 'docs/new.md' }])).toContain('Already there and identical to what pipegen writes');
+  });
+
+  it('N8: when nothing can require the gate, merge lines do not say they block', () => {
+    const base = shapeA();
+    const free = shapeA({ capabilities: { ...ALL_CAPS, branchProtection: false } });
+    const layers = headingAt(docOf(free), 'The four layers');
+    expect(layers).toContain('Runs on each pull request, but nothing requires it to pass.');
+    const merge = layers.slice(layers.indexOf('### Merge layer'), layers.indexOf('### Deploy layer'));
+    expect(merge).not.toMatch(/Blocks a pull request/);
+    // locks skipped, or G13 says the lock plan has no rule
+    expect(headingAt(docOf(shapeA({ skipped: [{ part: 'locks', reason: 'by hand' }] })), 'The four layers')).not.toMatch(/Blocks a pull request/);
+    expect(headingAt(docOf(shapeA({}, { gateRequired: false })), 'The four layers')).not.toMatch(/Blocks a pull request/);
+    expect(headingAt(docOf(base), 'The four layers')).toMatch(/Blocks a pull request/);
+    // a doc can only take the claim away: true does not put it back
+    expect(headingAt(docOf(shapeA({ capabilities: { ...ALL_CAPS, branchProtection: false } }, { gateRequired: true })), 'The four layers')).not.toMatch(/Blocks a pull request/);
+  });
+
+  it('N9, N10: a check the gate does not list runs for information, and a demoted one warns because its tool writes no results file', () => {
+    const base = shapeA();
+    const layers = headingAt(docOf(base), 'The four layers');
+    expect(lineOf(layers, 'Copy-paste check')).toContain('Runs for information; the gate does not use it.');
+    // a blocking findings check whose tool writes no SARIF: demoted
+    const demoted = shapeA({ steps: base.steps.map((st) => (st.needId === 'licences' ? { ...st, output: { ...st.output, format: 'none' as const } } : st)) });
+    const dl = lineOf(headingAt(docOf(demoted), 'The four layers'), 'Licence check');
+    expect(dl).toContain('Warns only: its tool writes no results file the gate can read.');
+    expect(dl).not.toMatch(/Blocks a pull request/);
+    expect(lineOf(layers, 'Licence check')).toMatch(/Blocks a pull request/);
+  });
+
+  it('smaller fixes: an unnamed service, and the same ZAP name in every line', () => {
+    const base = shapeA();
+    const unnamed = shapeA({ profile: { ...base.profile, services: base.profile.services.map((sv, i) => (i === 1 ? { ...sv, name: '@@@' } : sv)) } });
+    const t = docOf(unnamed);
+    expect(t).toContain('Service (unnamed) (node)');
+    expect(t).not.toContain('(no reason given)');
+    const z = zapDraft();
+    const text = docOf(z);
+    const name = (layersLine(text, 'Running app scan').match(/tool ([^.]*)\./) as RegExpMatchArray)[1];
+    expect(headingAt(text, 'Not proven yet')).toContain(`tool ${name}: ZAP results`);
   });
 });

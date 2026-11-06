@@ -13,9 +13,11 @@
 //   - the user's typed values (the vault): every variable string is scrubbed with the ACTIVE vault before any cut (F4-R14), and the judge checks the
 //     whole text on its cleaned forms. Run the builder inside withActiveVault (pipegenDocWith does; the referee already does).
 // No need keys, item ids, objection ids or dispute keys are ever printed, and neither is the creator's own AI note ("The AI explained ...").
-import { NEED_ID_CATEGORY } from '../engine/need-ids.js';
+import { NEED_ID_CATEGORY, SCHEDULED_CATEGORIES } from '../engine/need-ids.js';
+import { FINDINGS_CATEGORIES, gateJobList, jobIdFor, PIPEGEN_JOB_CATEGORIES, readableFormat, type JobListEntry } from '../engine/gate-job-list.js';
+import { hookCommands, SECRETS_HOOK_ID, type HookCommand } from '../engine/created-builders.js';
 import { PUSH_CREDIT_WARNING } from '../audit/coverage/equivalents.js';
-import { cleanForDoc, CLEAN_DOC_MAX } from '../debate/clean.js';
+import { cleanForDoc, CLEAN_DOC_MAX, CLEAN_DOC_PLACEHOLDER } from '../debate/clean.js';
 import { centralProjectName } from '../engine/central-path.js';
 import { CALLER_WORKFLOW, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PUSH_WORKFLOW } from '../engine/job-rules.js';
 import { pipegenDocProblems } from '../engine/created-judges/pipegen-doc.js';
@@ -23,7 +25,7 @@ import { BOOTSTRAP_PROOFS_NOTE } from '../engine/reviewed.js';
 import { floorNeeds, MINIMUM_CATEGORIES } from '../engine/needs.js';
 import { describeTuning } from '../engine/tuning.js';
 import { HUSKY_NO_CI_NOTE, SETUP_COMMANDS } from '../layers/precommit.js';
-import { FLOOR_NEEDS, GATE_CHECK_NAME, type CreatedFile, type PipelineDraft, type ReviewedTool, type Service, type StepSpec } from '../types.js';
+import { FLOOR_NEEDS, GATE_CHECK_NAME, type CreatedFile, type Need, type PipelineDraft, type ReviewedTool, type Service, type StepSpec } from '../types.js';
 import { scrubActive, withActiveVault } from '../util/known-values.js';
 import type { KnownValueCheck } from '../types.js';
 
@@ -77,7 +79,8 @@ export const WARN_MODE_TEXT = 'Warn mode lasts until 7 days after you merge (the
  */
 export const GATE_REASONS: readonly { id: string; message: string; means: string; todo: string }[] = Object.freeze([
   { id: 'new-finding', message: 'a new critical, high or secret finding blocks in any mode', means: 'A check found a serious problem or a secret that the base branch did not have.', todo: 'Fix it in the pull request. A false alarm is for a code owner to judge; adding a suppression comment is flagged itself. Treat a secret as leaked and rotate it: a secret that was ever pushed stays in the history.' },
-  { id: 'secret-in-range', message: 'the pull request\'s commits are not proven free of secrets', means: 'A scan of the commits of this pull request found a secret, or could not run. A commit that added a secret still counts after a later commit took it out. Any finding in the commit range blocks.', todo: 'Rotate the secret. Then rewrite the branch so the commits no longer hold it, and push again. If the scan could not run, run the job again.' },
+  { id: 'secret-in-range', message: 'secret added in this PR\'s history', means: 'A scan of the commits of this pull request found a secret. A commit that added a secret still counts after a later commit took it out. Any finding in the commit range blocks.', todo: 'Rotate the secret now. Then rewrite the branch so the commits no longer hold it, and push again.' },
+  { id: 'range-unproven', message: 'the pull request\'s commits are not proven free of secrets', means: 'The scan of the commits of this pull request could not run or gave no result, so nothing is proven. It blocks on a pull request.', todo: 'Run the job again.' },
   { id: 'dependency-review', message: 'a new vulnerability in dependency review', means: 'A package added by the pull request has a known vulnerability that the base did not have.', todo: 'Pick another package or version.' },
   { id: 'malicious', message: 'a malicious package advisory (MAL-): blocks even when old', means: 'A dependency matches a malicious-package advisory. It blocks even when it is old.', todo: 'Remove the package and rotate anything it could have read.' },
   { id: 'licence', message: 'an unknown licence: needs a human, never blocks', means: 'A package has a licence the check does not know. It only warns.', todo: 'Have a person check the licence.' },
@@ -93,14 +96,22 @@ export const GATE_REASONS: readonly { id: string; message: string; means: string
   { id: 'fork-not-run', message: 'not run on a fork PR (no secrets)', means: 'GitHub gives no secrets to a pull request from a fork, so a check that needs one did not run. If the check is required, the pull request is blocked.', todo: 'A maintainer can push the branch into this repository and open the pull request from there.' },
   { id: 'not-proven', message: 'not-proven check', means: 'pipegen could not prove the check on your repository yet (see Not proven yet). It warns and does not block.', todo: 'Set the secret names listed under Not proven yet. The nightly run then opens an issue and `npx pipegen update` applies the change.' },
   { id: 'non-blocking', message: 'non-blocking check', means: 'A check that never blocks. The summary notes its result.', todo: 'Read the note; nothing is required.' },
-  { id: 'warn-first', message: 'warn-first check', means: 'A check in its own warn period: a failure is a warning until a reviewed pull request makes it blocking.', todo: 'Fix the warnings before the period ends (see Warn mode).' },
+  { id: 'warn-first', message: 'warn-first check', means: 'A check judged by its job status, in its own warn period: a failed job is a warning until a reviewed pull request makes the check blocking.', todo: 'Fix the failure before the period ends (see Warn mode).' },
+  { id: 'warn-first-finding', message: 'warn-first: a warning until a reviewed pull request makes the check blocking', means: 'A finding of a check that reads findings, in its own warn period, is a warning. A new critical, high or secret finding still blocks, and so does a failed job of such a check (an image scan or a Dockerfile lint, for example).', todo: 'Fix the findings before the period ends (see Warn mode).' },
+  { id: 'not-proven-finding', message: 'not proven: never blocks', means: 'A finding of a check that is not proven yet is a warning and never blocks.', todo: 'Make the check proven (see Not proven yet).' },
+  { id: 'non-blocking-finding', message: 'a non-blocking check: never blocks', means: 'A finding of a check that is not meant to block is shown and never blocks.', todo: 'Read it; nothing is required.' },
   { id: 'failed-check', message: 'required check', means: 'A required check failed, so the pull request is blocked.', todo: 'Open the job\'s log, fix the failure and push again.' },
   { id: 'missing-check', message: 'is not in the job list (missing)', means: 'The gate expects a check that did not run, so the pull request can not merge.', todo: 'Run the workflow again. With the org required workflow, re-run the `pipegen required` run after a code owner approves.' },
   { id: 'empty-list', message: 'the job list is empty', means: 'No check ran, so nothing is proven and the gate blocks.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
   { id: 'tampered', message: 'result tampered or missing', means: 'The result file of a check is missing, or its checksum differs from the one its job reported. The gate does not trust it and blocks.', todo: 'Run the checks again. If it keeps happening, someone changed the pipeline: run `npx pipegen verify`.' },
   { id: 'no-coverage', message: 'no coverage for', means: 'A check ran but could not look (for example a scan that reported nothing because it had nothing to read). A required one blocks, because nothing was proven.', todo: 'Fix what the check could not read, then run the checks again.' },
-  { id: 'no-base', message: 'no base:', means: 'The base scan did not run on the base commit of this event, so every finding compared with it counts as new. On the pull request that installs pipegen it warns instead.', todo: 'Run the checks again. On a new install, merge the setup pull request and the next pull request has a base.' },
+  { id: 'no-base', message: 'no base:', means: 'The base scan could not be used for this event, so every finding compared with it counts as new. A new critical or high finding therefore blocks, and so does a new secret. Only a scanner that could not run on the base commit of the pull request that installs pipegen warns instead (the next row).', todo: 'Run the checks again. On a new install, merge the setup pull request and the next pull request has a base.' },
   { id: 'image-no-base', message: 'no base: the scanner couldn\'t run on the base commit (installing pipegen)', means: 'Image findings have no earlier scan to compare with yet: on the pull request that installs pipegen they warn, and on every other pull request they block.', todo: 'Fix the finding in the image or its base image.' },
+  { id: 'settings-input-refused', message: 'input is refused', means: 'One of the gate\'s own inputs (the job list, the policy, the service roots, the protected paths, a date) is not one the gate accepts. The gate blocks, because it can not trust its own settings.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
+  { id: 'settings-input-missing', message: 'input is missing', means: 'One of the gate\'s own inputs (the job list, the GitHub token, the service roots) is missing. The gate blocks.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
+  { id: 'settings-jobs', message: 'the jobs input (toJSON(needs)) is', means: 'The results of the jobs the gate reads are missing, too large or not an object. The gate blocks.', todo: 'Run the workflow again. If it keeps happening, run `npx pipegen verify`.' },
+  { id: 'settings-mode-name', message: 'the mode input is not gate', means: 'The gate was started in a mode other than gate. The gate blocks.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
+  { id: 'settings-mode', message: 'does not take the input', means: 'The gate was given an input it does not know, or the wrong mode. The gate blocks.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
   { id: 'settings-policy', message: 'the policy is refused', means: 'The gate\'s own settings are wrong, so it uses the default policy and blocks.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
   { id: 'settings-floor', message: 'not-proven can\'t include floor need', means: 'A check every repository needs is listed as not proven, which the gate does not allow.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
   { id: 'settings-skip', message: 'can never be skipped', means: 'A check that can never be skipped is listed as skipped.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
@@ -201,7 +212,10 @@ function fit(raw: unknown, max: number = CAP): string {
   return cleanForDoc(scrubbed, max);
 }
 /** Repo text (a service name, a suggestion name, a path): cleanForDoc after the vault scrub, in quotation marks so no neighbour joins it (F-9). */
-const q = (raw: unknown, max = 120): string => `"${cleanForDoc(scrubActive(isStr(raw) ? raw : ''), max).replace(/"/g, ' ').replace(/ {2,}/g, ' ').trim()}"`;
+const q = (raw: unknown, max = 120): string => {
+  const c = cleanForDoc(scrubActive(isStr(raw) ? raw : ''), max).replace(/"/g, ' ').replace(/ {2,}/g, ' ').trim();
+  return c === '' || c === CLEAN_DOC_PLACEHOLDER ? '(unnamed)' : `"${c}"`;
+};
 
 class Doc {
   readonly lines: string[] = [];
@@ -253,7 +267,7 @@ const DEFAULT_DOC = { transcript: [], deployGaps: [], lockNotes: [], estimates: 
 /** `bad`: how many entries of each list could not be read and were left out; the doc says so where the list is printed. */
 type DocData = {
   transcript: string[]; deployGaps: { path: string; triggers: string[]; why: string }[]; lockNotes: string[]; est: { monthlyMinutes: number; includedMinutes: number | null; prWaitMinutes?: number; strictness?: string } | null;
-  setupCommand: string; testNotes: string[]; uncoveredMinimum: { category: string; why: string; service?: string }[]; notes: string[]; credits: { text: string; kind: string }[];
+  gateRequired: boolean | undefined; setupCommand: string; testNotes: string[]; uncoveredMinimum: { category: string; why: string; service?: string }[]; notes: string[]; credits: { text: string; kind: string }[];
   bad: Record<'transcript' | 'deployGaps' | 'lockNotes' | 'testNotes' | 'uncoveredMinimum' | 'notes' | 'credits', number>;
 };
 const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -288,6 +302,7 @@ function dataOf(draft: PipelineDraft): DocData {
     deployGaps: gaps.map((g) => ({ path: g.path as string, triggers: strs(g.triggers), why: isStr(g.why) ? g.why : '' })),
     lockNotes: texts('lockNotes'),
     est: whole(est.monthlyMinutes) ? { monthlyMinutes: est.monthlyMinutes, includedMinutes: whole(est.includedMinutes) ? est.includedMinutes : null, ...(whole(est.prWaitMinutes) ? { prWaitMinutes: est.prWaitMinutes } : {}), ...(isStr(est.strictness) && STRICTNESS.has(est.strictness) ? { strictness: est.strictness } : {}) } : null,
+    gateRequired: typeof o.gateRequired === 'boolean' ? o.gateRequired : undefined,
     setupCommand: isStr(o.setupCommand) ? o.setupCommand : '',
     testNotes: texts('testNotes'),
     uncoveredMinimum: unc.map((u) => ({ category: u.category as string, why: isStr(u.why) ? u.why : '', ...(isStr(u.service) ? { service: u.service } : {}) })),
@@ -388,6 +403,33 @@ function tableSection(d: Doc): void {
   for (const r of GATE_REASONS) d.row([r.message, r.means, r.todo]);
 }
 
+/** The builder refuses a draft whose facts contradict each other (a label that does not fit the checks): G13 fixes the input. */
+export class PipegenDocError extends Error {}
+
+/** What the builder works out itself, once, from the draft: the gate's job list, whether anything can require the gate, and what the hook file really holds. */
+interface Facts {
+  list: JobListEntry[];
+  /** Whether the merge lock can require the gate to pass (branch rules available, locks not skipped, and the doc's own word when G13 gives one). */
+  gateRequired: boolean;
+  /** The hook files pipegen wrote (part precommit) and the hooks it put in them. */
+  hookFiles: CreatedFile[];
+  hooks: HookCommand[];
+  /** A hook config exists for hooks-ci to run: the repository's own manager, or the file pipegen wrote. */
+  hookConfig: boolean;
+}
+function factsOf(draft: PipelineDraft, reviewed: readonly ReviewedTool[], data: DocData): Facts {
+  let list: JobListEntry[];
+  try { list = gateJobList(draft); } catch (e) { throw new PipegenDocError(`the gate's job list can not be built from the draft, so PIPEGEN.md can not say what blocks (${e instanceof Error ? e.message.slice(0, 200) : 'an error'})`); }
+  if (data.est?.strictness === 'Strict' && draft.warnFirst !== undefined && Object.keys(draft.warnFirst).length > 0) {
+    throw new PipegenDocError('the strictness label is Strict, but some checks start in warn mode (Strict has no warn period), so PIPEGEN.md would say two things that do not fit');
+  }
+  const hookFiles = draft.created.filter((f) => f.part === 'precommit');
+  let hooks: HookCommand[] = [];
+  try { hooks = hookCommands(draft, reviewed); } catch { hooks = []; }
+  const gateRequired = draft.capabilities.branchProtection === true && !draft.skipped.some((x) => x.part === 'locks') && data.gateRequired !== false;
+  return { list, gateRequired, hookFiles, hooks, hookConfig: hookFiles.length > 0 || draft.profile.precommit !== null };
+}
+
 /**
  * The gate's own rule (gate/src/decide.ts, level): a check that is not a floor need is judged as not proven, a warning that never blocks, when its need is
  * in notProven, or when it runs ZAP while ZAP's report is unverified. Null: the check keeps its mode.
@@ -399,10 +441,59 @@ function warnOnlyWhy(draft: PipelineDraft, n: { id: string; category: string; se
   if (!ZAP_JSON_VERIFIED && stepsOf(draft, n.id, n.service).some((s) => s.tool.id === ZAP_TOOL)) return 'ZAP results are not verified yet, so the gate does not let this check block';
   return null;
 }
+const NOT_REQUIRED = 'Runs on each pull request, but nothing requires it to pass.';
+const FOR_INFO = 'Runs for information; the gate does not use it.';
 
-function layersSection(d: Doc, draft: PipelineDraft, data: DocData): void {
+/** The mode line of one check, from facts the builder derived (the gate's job list, the hook file, the lock), never from the need's flags alone. */
+function modeOf(draft: PipelineDraft, reviewed: readonly ReviewedTool[], f: Facts, n: Need): string {
+  const cat = categoryOf(n.id, n.category);
+  const layer = n.layer;
+  const specs = stepsOf(draft, n.id, n.service);
+  // hooks: what was written is what is set up
+  if (layer === 'pre-commit') {
+    if (f.hookFiles.length === 0) return 'Not set up: pipegen wrote no hook file (see Hooks setup).';
+    if (n.id === 'secrets') {
+      const h = f.hooks.find((x) => x.id === SECRETS_HOOK_ID);
+      if (h === undefined) return reviewed.some((t) => t.id === 'gitleaks' && t.categories.includes('secrets')) ? 'Not set up: the secrets hook was not written (see the notes below).' : 'Not set up: the reviewed list has no gitleaks entry here, so no secrets hook was written.';
+      if (!f.hookFiles.some((x) => x.content.includes(h.run))) return 'Not set up: the hook file does not hold the secrets hook.';
+    } else if (n.id === 'format-lint') {
+      const mine = f.hooks.filter((x) => x.id !== SECRETS_HOOK_ID);
+      if (mine.length === 0) return 'Not set up: the format and lint hook was left out (it needs the repository\'s own Biome at the reviewed version in its lockfile; see the notes below).';
+      if (!mine.some((h) => f.hookFiles.some((x) => x.content.includes(h.run)))) return 'Not set up: the hook file does not hold the format and lint hook.';
+    }
+    return n.blocking ? 'Blocks the commit.' : 'Warns only.';
+  }
+  if (cat === 'hooks-ci' && !f.hookConfig) return 'Not set up: there is no hook config for it to run.';
+  if (layer !== 'merge') {
+    const only = warnOnlyWhy(draft, n);
+    return only !== null ? `Warns only: ${only}.` : !n.blocking ? 'Warns only.' : 'Fails the run.';
+  }
+  // the merge layer: the gate's own list decides
+  if (PIPEGEN_JOB_CATEGORIES.has(cat)) return f.gateRequired ? 'Blocks a pull request.' : NOT_REQUIRED;
+  let key: string;
+  try { key = jobIdFor(n.id, n.service); } catch { return FOR_INFO; }
+  const e = f.list.find((x) => x.job === key && x.range !== true);
+  if (e === undefined) {
+    const demoted = n.blocking && FINDINGS_CATEGORIES.has(cat) && specs.length > 0 && !specs.every((s) => readableFormat(cat, s.output.format));
+    return demoted ? 'Warns only: its tool writes no results file the gate can read.' : FOR_INFO;
+  }
+  const floor = FLOOR_NEEDS.includes(e.needId) || FLOOR_NEEDS.includes(e.category);
+  const zapUnverified = e.tool === ZAP_TOOL && !ZAP_JSON_VERIFIED;
+  if (!floor && draft.notProven.some((x) => x.needId === e.needId)) return 'Warns only: it is not proven yet (see Not proven yet).';
+  if (!floor && zapUnverified) return 'Warns only: ZAP results are not verified yet, so the gate does not let this check block.';
+  if (!floor && !e.blocking) return 'Warns only.';
+  if (!f.gateRequired) return NOT_REQUIRED;
+  if (e.warnFirst !== undefined) {
+    return e.format === 'none'
+      ? 'Starts in warn mode: a failure warns until a reviewed pull request makes the check blocking.'
+      : 'Starts in warn mode: old and medium findings warn, but a new critical or high finding still blocks, and so does a failed job.';
+  }
+  return 'Blocks a pull request.';
+}
+
+function layersSection(d: Doc, draft: PipelineDraft, data: DocData, reviewed: readonly ReviewedTool[], facts: Facts): void {
   d.h(2, SECTION_TITLES[3] as string);
-  d.p('Each check has a tool, a reason and a mode: it either blocks a pull request or only warns.');
+  d.p('Each check has a tool, a reason and a mode. The mode is worked out from what pipegen wrote and from the gate\'s own rules, not only from what the plan asked for.');
   for (const layer of LAYERS) {
     const needs = draft.needs.filter((n) => n.layer === layer);
     d.h(3, `${layer === 'pre-commit' ? 'Pre-commit' : layer === 'push' ? 'Push' : layer === 'merge' ? 'Merge' : 'Deploy'} layer`);
@@ -412,10 +503,7 @@ function layersSection(d: Doc, draft: PipelineDraft, data: DocData): void {
       const cat = categoryOf(n.id, n.category);
       const [label, why] = Object.hasOwn(CATEGORY_TEXT, cat) ? (CATEGORY_TEXT[cat] as readonly [string, string]) : ['A check pipegen added', 'See the tool name.'];
       const tools = [...new Set(stepsOf(draft, n.id, n.service).map((s) => fit(s.tool.name, 80)))];
-      const warnFirst = draft.warnFirst !== undefined && Object.hasOwn(draft.warnFirst, n.id);
-      const blocks = layer === 'pre-commit' ? 'Blocks the commit.' : layer === 'merge' ? 'Blocks a pull request.' : 'Fails the run.';
-      const only = warnOnlyWhy(draft, n);
-      const mode = only !== null ? `Warns only: ${only}.` : !n.blocking ? 'Warns only.' : warnFirst ? 'Starts in warn mode, then blocks.' : blocks;
+      const mode = modeOf(draft, reviewed, facts, n);
       const tool = cat === 'gate' ? 'tool the pipegen gate action' : tools.length === 0 ? 'no tool listed (see the notes below)' : `tool ${tools.join(', ')}`;
       d.li(`${label}${n.service === undefined ? '' : `, service ${q(n.service)}`}, ${tool}. ${why} ${mode}`);
     }
@@ -564,23 +652,30 @@ function deploysSection(d: Doc, draft: PipelineDraft, data: DocData): void {
   d.li('Each edit pipegen made to a deploy workflow is listed under Not proven yet until you have checked it.');
 }
 
-/** A minimum check the plan owes (floorNeeds, merge layer, MINIMUM_CATEGORIES) that is missing from the draft's needs: not covered, whatever doc.uncoveredMinimum says. */
-function missingMinimum(draft: PipelineDraft): { category: string; service?: string }[] | 'unknown' {
+/**
+ * A minimum check the plan owes (floorNeeds, merge layer, MINIMUM_CATEGORIES) that the gate would not wait for: it has no entry in the gate's job list
+ * (gateJobList, merge layer), or, for the gate itself, no merge-layer need. Not covered, whatever doc.uncoveredMinimum says.
+ */
+function missingMinimum(draft: PipelineDraft, f: Facts): { category: string; service?: string }[] | 'unknown' {
   try {
-    const have = new Set(draft.needs.map((n) => `${n.id}\u0000${n.service ?? ''}`));
     return floorNeeds(draft.profile, draft.capabilities)
-      .filter((n) => n.layer === 'merge' && (MINIMUM_CATEGORIES as readonly string[]).includes(categoryOf(n.id, n.category)) && !have.has(`${n.id}\u0000${n.service ?? ''}`))
+      .filter((n) => n.layer === 'merge' && (MINIMUM_CATEGORIES as readonly string[]).includes(categoryOf(n.id, n.category)))
+      .filter((n) => (categoryOf(n.id, n.category) === 'gate'
+        ? !draft.needs.some((x) => x.layer === 'merge' && x.id === n.id)
+        : !f.list.some((e) => e.job === jobIdFor(n.id, n.service))))
       .map((n) => ({ category: categoryOf(n.id, n.category), ...(n.service === undefined ? {} : { service: n.service }) }));
   } catch { return 'unknown'; }
 }
 
-function notProvenSection(d: Doc, draft: PipelineDraft, data: DocData, reviewed: readonly ReviewedTool[]): void {
+function notProvenSection(d: Doc, draft: PipelineDraft, data: DocData, reviewed: readonly ReviewedTool[], facts: Facts): void {
   const p = draft.profile;
   d.h(2, SECTION_TITLES[10] as string);
-  const zap = draft.needs.filter((n) => n.layer === 'merge' && !FLOOR_NEEDS.includes(n.id) && !FLOOR_NEEDS.includes(categoryOf(n.id, n.category)) && !ZAP_JSON_VERIFIED
-    && stepsOf(draft, n.id, n.service).some((s) => s.tool.id === ZAP_TOOL) && !draft.notProven.some((x) => x.needId === n.id));
+  // ZAP while its report is unverified: the gate's own list says which checks run it
+  const zap = facts.list.filter((e) => e.tool === ZAP_TOOL && !ZAP_JSON_VERIFIED && !FLOOR_NEEDS.includes(e.needId) && !FLOOR_NEEDS.includes(e.category) && !draft.notProven.some((x) => x.needId === e.needId));
+  // every file pipegen edited is not proven by design: derived here, so a "proven" line can never stand next to one
+  const edits = draft.created.filter((f) => f.inserted !== undefined);
   const proofless = draft.steps.some((s) => reviewed.some((t) => t.id === s.tool.id && t.proofs === 0));
-  const warnOnly = draft.notProven.length > 0 || zap.length > 0 || proofless;
+  const warnOnly = draft.notProven.length > 0 || zap.length > 0 || edits.length > 0 || proofless;
   if (!warnOnly) d.p('Every check pipegen set up is proven.');
   for (const n of draft.notProven) {
     const cat = n.needId === undefined ? '' : categoryOf(n.needId, n.needId);
@@ -589,17 +684,20 @@ function notProvenSection(d: Doc, draft: PipelineDraft, data: DocData, reviewed:
     const secrets = names.length === 0 ? '' : ` Secret names to set: ${names.map((x) => (SECRET_NAME_RE.test(x) ? `\`${x}\`` : fit(x, 60))).join(', ')}.`;
     d.li(`Part ${fit(n.part, 40)}${label === '' ? '' : `, ${label}`}: ${fit(n.reason)}${secrets}`);
   }
-  for (const n of zap) {
-    const label = Object.hasOwn(CATEGORY_TEXT, categoryOf(n.id, n.category)) ? (CATEGORY_TEXT[categoryOf(n.id, n.category)] as readonly [string, string])[0] : 'A check pipegen added';
-    d.li(`${label}${n.service === undefined ? '' : `, service ${q(n.service)}`}, tool ${ZAP_TOOL}: ZAP results are not verified yet, so the gate judges this check as not proven. It only warns and never blocks a pull request.`);
+  for (const e of zap) {
+    const need = draft.needs.find((n) => n.layer === 'merge' && n.id === e.needId && jobIdFor(n.id, n.service) === e.job);
+    const spec = draft.steps.find((st) => st.needId === e.needId && st.service === need?.service && st.tool.id === ZAP_TOOL);
+    const label = Object.hasOwn(CATEGORY_TEXT, e.category) ? (CATEGORY_TEXT[e.category] as readonly [string, string])[0] : 'A check pipegen added';
+    d.li(`${label}${need?.service === undefined ? '' : `, service ${q(need.service)}`}, tool ${fit(spec?.tool.name ?? ZAP_TOOL, 80)}: ZAP results are not verified yet, so the gate judges this check as not proven. It only warns and never blocks a pull request.`);
   }
+  for (const f of edits) d.li(`Part deploy-verify: pipegen edited ${q(f.path, 160)} (it added the verify job and \`needs\` entries). Check the edit by hand before you rely on it.`);
   const link = secretsLink(p.owner, p.repo);
   d.p(`Set a missing secret in the repository settings: Settings, Secrets and variables, Actions${link === null ? '' : ` (${link})`}. When the key exists, the nightly run opens an issue with the exact patch: run \`npx pipegen update\` and it applies the change as a pull request. CI never edits workflow files itself.`);
   const where = p.private ? `\`.github/workflows/${centralProjectName(p.repo)}--merge.yml\` in the pipelines repository` : `\`${LOCAL_MERGE_WORKFLOW}\``;
   d.p(`The not-proven list is one line in ${where}, marked \`pipegen:not-proven\`. It never holds a check that every repository needs.`);
   if (proofless) d.p(BOOTSTRAP_PROOFS_NOTE);
   // the minimum checks without a job: the ones the plan reported, and any the builder finds missing itself (a doc that leaves one out is still complete)
-  const miss = missingMinimum(draft);
+  const miss = missingMinimum(draft, facts);
   const derived = miss === 'unknown' ? [] : miss.filter((m) => !data.uncoveredMinimum.some((u) => u.category === m.category && u.service === m.service));
   if (data.uncoveredMinimum.length > 0 || derived.length > 0 || miss === 'unknown' || data.bad.uncoveredMinimum > 0) {
     d.h(3, 'Minimum checks with no job (not covered)');
@@ -714,20 +812,21 @@ const DOC_REASON = 'Explains in plain English what pipegen set up, what it does 
  */
 export function pipegenDoc(draft: PipelineDraft, reviewed: readonly ReviewedTool[]): CreatedFile {
   const data = dataOf(draft);
+  const facts = factsOf(draft, reviewed, data);
   const d = new Doc();
   d.h(1, 'What pipegen set up in this repository');
   d.p('pipegen wrote this file in plain English. If you edit it, pipegen keeps your edits and never replaces the file.');
   planSection(d, draft, data);
   setupSection(d, draft, data);
   tableSection(d);
-  layersSection(d, draft, data);
+  layersSection(d, draft, data, reviewed, facts);
   suggestionsSection(d, draft);
   filesSection(d, draft, data);
   testsSection(d, draft);
   skippedSection(d, draft);
   signingSection(d, draft);
   deploysSection(d, draft, data);
-  notProvenSection(d, draft, data, reviewed);
+  notProvenSection(d, draft, data, reviewed, facts);
   integritySection(d, draft);
   warnSection(d, draft);
   retentionSection(d);
@@ -752,7 +851,7 @@ export function docRecomputeProblem(file: CreatedFile, draft: PipelineDraft, rev
   const shape = docShapeProblem(draft.doc);
   if (shape !== null) return `${shape}, so the referee can not build PIPEGEN.md again to compare it`;
   let again: CreatedFile;
-  try { again = pipegenDoc(draft, reviewed); } catch { return 'PIPEGEN.md could not be built again from the draft'; }
+  try { again = pipegenDoc(draft, reviewed); } catch (e) { return e instanceof PipegenDocError ? `PIPEGEN.md could not be built again from the draft: ${e.message}` : 'PIPEGEN.md could not be built again from the draft'; }
   if (file.content !== again.content) return 'PIPEGEN.md is not the file pipegen builds from the draft (the referee builds it again and requires the same bytes)';
   if (file.reason !== again.reason || file.part !== again.part) return 'PIPEGEN.md does not carry the part and reason pipegen gives it';
   return null;

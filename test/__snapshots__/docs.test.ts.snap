@@ -51,7 +51,8 @@ The required check is \`pipegen / gate\`. When it fails, or only warns, its summ
 | Message | What it means | What to do |
 | --- | --- | --- |
 | a new critical, high or secret finding blocks in any mode | A check found a serious problem or a secret that the base branch did not have. | Fix it in the pull request. A false alarm is for a code owner to judge; adding a suppression comment is flagged itself. Treat a secret as leaked and rotate it: a secret that was ever pushed stays in the history. |
-| the pull request's commits are not proven free of secrets | A scan of the commits of this pull request found a secret, or could not run. A commit that added a secret still counts after a later commit took it out. Any finding in the commit range blocks. | Rotate the secret. Then rewrite the branch so the commits no longer hold it, and push again. If the scan could not run, run the job again. |
+| secret added in this PR's history | A scan of the commits of this pull request found a secret. A commit that added a secret still counts after a later commit took it out. Any finding in the commit range blocks. | Rotate the secret now. Then rewrite the branch so the commits no longer hold it, and push again. |
+| the pull request's commits are not proven free of secrets | The scan of the commits of this pull request could not run or gave no result, so nothing is proven. It blocks on a pull request. | Run the job again. |
 | a new vulnerability in dependency review | A package added by the pull request has a known vulnerability that the base did not have. | Pick another package or version. |
 | a malicious package advisory (MAL-): blocks even when old | A dependency matches a malicious-package advisory. It blocks even when it is old. | Remove the package and rotate anything it could have read. |
 | an unknown licence: needs a human, never blocks | A package has a licence the check does not know. It only warns. | Have a person check the licence. |
@@ -67,14 +68,22 @@ The required check is \`pipegen / gate\`. When it fails, or only warns, its summ
 | not run on a fork PR (no secrets) | GitHub gives no secrets to a pull request from a fork, so a check that needs one did not run. If the check is required, the pull request is blocked. | A maintainer can push the branch into this repository and open the pull request from there. |
 | not-proven check | pipegen could not prove the check on your repository yet (see Not proven yet). It warns and does not block. | Set the secret names listed under Not proven yet. The nightly run then opens an issue and \`npx pipegen update\` applies the change. |
 | non-blocking check | A check that never blocks. The summary notes its result. | Read the note; nothing is required. |
-| warn-first check | A check in its own warn period: a failure is a warning until a reviewed pull request makes it blocking. | Fix the warnings before the period ends (see Warn mode). |
+| warn-first check | A check judged by its job status, in its own warn period: a failed job is a warning until a reviewed pull request makes the check blocking. | Fix the failure before the period ends (see Warn mode). |
+| warn-first: a warning until a reviewed pull request makes the check blocking | A finding of a check that reads findings, in its own warn period, is a warning. A new critical, high or secret finding still blocks, and so does a failed job of such a check (an image scan or a Dockerfile lint, for example). | Fix the findings before the period ends (see Warn mode). |
+| not proven: never blocks | A finding of a check that is not proven yet is a warning and never blocks. | Make the check proven (see Not proven yet). |
+| a non-blocking check: never blocks | A finding of a check that is not meant to block is shown and never blocks. | Read it; nothing is required. |
 | required check | A required check failed, so the pull request is blocked. | Open the job's log, fix the failure and push again. |
 | is not in the job list (missing) | The gate expects a check that did not run, so the pull request can not merge. | Run the workflow again. With the org required workflow, re-run the \`pipegen required\` run after a code owner approves. |
 | the job list is empty | No check ran, so nothing is proven and the gate blocks. | Run \`npx pipegen verify\`, then \`npx pipegen update\`. |
 | result tampered or missing | The result file of a check is missing, or its checksum differs from the one its job reported. The gate does not trust it and blocks. | Run the checks again. If it keeps happening, someone changed the pipeline: run \`npx pipegen verify\`. |
 | no coverage for | A check ran but could not look (for example a scan that reported nothing because it had nothing to read). A required one blocks, because nothing was proven. | Fix what the check could not read, then run the checks again. |
-| no base: | The base scan did not run on the base commit of this event, so every finding compared with it counts as new. On the pull request that installs pipegen it warns instead. | Run the checks again. On a new install, merge the setup pull request and the next pull request has a base. |
+| no base: | The base scan could not be used for this event, so every finding compared with it counts as new. A new critical or high finding therefore blocks, and so does a new secret. Only a scanner that could not run on the base commit of the pull request that installs pipegen warns instead (the next row). | Run the checks again. On a new install, merge the setup pull request and the next pull request has a base. |
 | no base: the scanner couldn't run on the base commit (installing pipegen) | Image findings have no earlier scan to compare with yet: on the pull request that installs pipegen they warn, and on every other pull request they block. | Fix the finding in the image or its base image. |
+| input is refused | One of the gate's own inputs (the job list, the policy, the service roots, the protected paths, a date) is not one the gate accepts. The gate blocks, because it can not trust its own settings. | Run \`npx pipegen verify\`, then \`npx pipegen update\`. |
+| input is missing | One of the gate's own inputs (the job list, the GitHub token, the service roots) is missing. The gate blocks. | Run \`npx pipegen verify\`, then \`npx pipegen update\`. |
+| the jobs input (toJSON(needs)) is | The results of the jobs the gate reads are missing, too large or not an object. The gate blocks. | Run the workflow again. If it keeps happening, run \`npx pipegen verify\`. |
+| the mode input is not gate | The gate was started in a mode other than gate. The gate blocks. | Run \`npx pipegen verify\`, then \`npx pipegen update\`. |
+| does not take the input | The gate was given an input it does not know, or the wrong mode. The gate blocks. | Run \`npx pipegen verify\`, then \`npx pipegen update\`. |
 | the policy is refused | The gate's own settings are wrong, so it uses the default policy and blocks. | Run \`npx pipegen verify\`, then \`npx pipegen update\`. |
 | not-proven can't include floor need | A check every repository needs is listed as not proven, which the gate does not allow. | Run \`npx pipegen verify\`, then \`npx pipegen update\`. |
 | can never be skipped | A check that can never be skipped is listed as skipped. | Run \`npx pipegen verify\`, then \`npx pipegen update\`. |
@@ -85,41 +94,41 @@ The required check is \`pipegen / gate\`. When it fails, or only warns, its summ
 
 ## The four layers
 
-Each check has a tool, a reason and a mode: it either blocks a pull request or only warns.
+Each check has a tool, a reason and a mode. The mode is worked out from what pipegen wrote and from the gate's own rules, not only from what the plan asked for.
 
 ### Pre-commit layer
 
 Runs on your machine before each commit.
 
-- Secret scan, no tool listed (see the notes below). Looks for passwords, keys and tokens in the code and in the commits of a pull request. Blocks the commit.
-- Format and lint, service "shop-api", no tool listed (see the notes below). Checks formatting and common mistakes on the files you commit. Warns only.
+- Secret scan, tool betterleaks/betterleaks. Looks for passwords, keys and tokens in the code and in the commits of a pull request. Not set up: pipegen wrote no hook file (see Hooks setup).
+- Format and lint, service "shop-api", tool biomejs/biome. Checks formatting and common mistakes on the files you commit. Not set up: pipegen wrote no hook file (see Hooks setup).
 
 ### Push layer
 
 Runs on a push to a branch that has no open pull request.
 
-- Secret scan, no tool listed (see the notes below). Looks for passwords, keys and tokens in the code and in the commits of a pull request. Fails the run.
+- Secret scan, tool betterleaks/betterleaks. Looks for passwords, keys and tokens in the code and in the commits of a pull request. Fails the run.
 
 ### Merge layer
 
 Runs on every pull request and decides whether it can merge. The gate (the check \`pipegen / gate\`) reads every result.
 
-- Secret scan, no tool listed (see the notes below). Looks for passwords, keys and tokens in the code and in the commits of a pull request. Blocks a pull request.
-- Code scan, service "shop-api", no tool listed (see the notes below). Looks for insecure code patterns in your source. Starts in warn mode, then blocks.
-- Code scan, service "jobs-runner", no tool listed (see the notes below). Looks for insecure code patterns in your source. Starts in warn mode, then blocks.
-- Dependency scan, service "shop-api", no tool listed (see the notes below). Looks for known vulnerabilities in the packages you depend on. Blocks a pull request.
-- Dependency scan, service "jobs-runner", no tool listed (see the notes below). Looks for known vulnerabilities in the packages you depend on. Blocks a pull request.
+- Secret scan, tool betterleaks/betterleaks. Looks for passwords, keys and tokens in the code and in the commits of a pull request. Blocks a pull request.
+- Code scan, service "shop-api", tool semgrep/semgrep. Looks for insecure code patterns in your source. Blocks a pull request.
+- Code scan, service "jobs-runner", tool semgrep/semgrep. Looks for insecure code patterns in your source. Blocks a pull request.
+- Dependency scan, service "shop-api", tool google/osv-scanner. Looks for known vulnerabilities in the packages you depend on. Blocks a pull request.
+- Dependency scan, service "jobs-runner", tool google/osv-scanner. Looks for known vulnerabilities in the packages you depend on. Blocks a pull request.
 - The gate, tool the pipegen gate action. Reads every result and decides whether the pull request can merge. Blocks a pull request.
-- Workflow lint, no tool listed (see the notes below). Checks GitHub workflow files for unsafe patterns. Blocks a pull request.
-- Workflow pin check, no tool listed (see the notes below). Checks that the actions in workflows are pinned to a commit. Blocks a pull request.
+- Workflow lint, tool rhysd/actionlint. Checks GitHub workflow files for unsafe patterns. Blocks a pull request.
+- Workflow pin check, tool suzuki-shunsuke/pinact. Checks that the actions in workflows are pinned to a commit. Blocks a pull request.
 - Unit tests, service "shop-api", no tool listed (see the notes below). Runs your tests so a change that breaks them is caught. Blocks a pull request.
-- Type check, service "shop-api", no tool listed (see the notes below). Runs the type checker. Blocks a pull request.
-- Test coverage, service "shop-api", no tool listed (see the notes below). Checks how much of the code the tests run. Blocks a pull request.
-- Copy-paste check, no tool listed (see the notes below). Finds code copied from other places in the repository. Warns only.
-- Image build, service "shop-api", no tool listed (see the notes below). Builds the container image of the pull request without publishing it. Blocks a pull request.
-- Image scan, service "shop-api", no tool listed (see the notes below). Scans the built image for known vulnerabilities. Blocks a pull request.
-- Running app scan, service "shop-api", no tool listed (see the notes below). Starts the app and probes it the way an attacker would. Warns only: it is not proven yet (see Not proven yet).
-- Licence check, no tool listed (see the notes below). Checks the licences of your dependencies. Blocks a pull request.
+- Type check, service "shop-api", tool python/mypy. Runs the type checker. Blocks a pull request.
+- Test coverage, service "shop-api", tool vitest-dev/vitest. Checks how much of the code the tests run. Starts in warn mode: a failure warns until a reviewed pull request makes the check blocking.
+- Copy-paste check, tool kucherenko/jscpd. Finds code copied from other places in the repository. Runs for information; the gate does not use it.
+- Image build, service "shop-api", tool docker/build-push-action. Builds the container image of the pull request without publishing it. Blocks a pull request.
+- Image scan, service "shop-api", tool aquasecurity/trivy. Scans the built image for known vulnerabilities. Blocks a pull request.
+- Running app scan, service "shop-api", tool zaproxy/zaproxy. Starts the app and probes it the way an attacker would. Warns only: it is not proven yet (see Not proven yet).
+- Licence check, tool aquasecurity/trivy. Checks the licences of your dependencies. Blocks a pull request.
 
 ### Deploy layer
 
@@ -219,7 +228,7 @@ There are two timers. The first (7 days after you merge) is for the whole gate: 
 
 These checks start in warn mode:
 
-- Code scan
+- Test coverage
 
 ## Deploying old commits and retention
 
@@ -325,7 +334,8 @@ The required check is \`pipegen / gate\`. When it fails, or only warns, its summ
 | Message | What it means | What to do |
 | --- | --- | --- |
 | a new critical, high or secret finding blocks in any mode | A check found a serious problem or a secret that the base branch did not have. | Fix it in the pull request. A false alarm is for a code owner to judge; adding a suppression comment is flagged itself. Treat a secret as leaked and rotate it: a secret that was ever pushed stays in the history. |
-| the pull request's commits are not proven free of secrets | A scan of the commits of this pull request found a secret, or could not run. A commit that added a secret still counts after a later commit took it out. Any finding in the commit range blocks. | Rotate the secret. Then rewrite the branch so the commits no longer hold it, and push again. If the scan could not run, run the job again. |
+| secret added in this PR's history | A scan of the commits of this pull request found a secret. A commit that added a secret still counts after a later commit took it out. Any finding in the commit range blocks. | Rotate the secret now. Then rewrite the branch so the commits no longer hold it, and push again. |
+| the pull request's commits are not proven free of secrets | The scan of the commits of this pull request could not run or gave no result, so nothing is proven. It blocks on a pull request. | Run the job again. |
 | a new vulnerability in dependency review | A package added by the pull request has a known vulnerability that the base did not have. | Pick another package or version. |
 | a malicious package advisory (MAL-): blocks even when old | A dependency matches a malicious-package advisory. It blocks even when it is old. | Remove the package and rotate anything it could have read. |
 | an unknown licence: needs a human, never blocks | A package has a licence the check does not know. It only warns. | Have a person check the licence. |
@@ -341,14 +351,22 @@ The required check is \`pipegen / gate\`. When it fails, or only warns, its summ
 | not run on a fork PR (no secrets) | GitHub gives no secrets to a pull request from a fork, so a check that needs one did not run. If the check is required, the pull request is blocked. | A maintainer can push the branch into this repository and open the pull request from there. |
 | not-proven check | pipegen could not prove the check on your repository yet (see Not proven yet). It warns and does not block. | Set the secret names listed under Not proven yet. The nightly run then opens an issue and \`npx pipegen update\` applies the change. |
 | non-blocking check | A check that never blocks. The summary notes its result. | Read the note; nothing is required. |
-| warn-first check | A check in its own warn period: a failure is a warning until a reviewed pull request makes it blocking. | Fix the warnings before the period ends (see Warn mode). |
+| warn-first check | A check judged by its job status, in its own warn period: a failed job is a warning until a reviewed pull request makes the check blocking. | Fix the failure before the period ends (see Warn mode). |
+| warn-first: a warning until a reviewed pull request makes the check blocking | A finding of a check that reads findings, in its own warn period, is a warning. A new critical, high or secret finding still blocks, and so does a failed job of such a check (an image scan or a Dockerfile lint, for example). | Fix the findings before the period ends (see Warn mode). |
+| not proven: never blocks | A finding of a check that is not proven yet is a warning and never blocks. | Make the check proven (see Not proven yet). |
+| a non-blocking check: never blocks | A finding of a check that is not meant to block is shown and never blocks. | Read it; nothing is required. |
 | required check | A required check failed, so the pull request is blocked. | Open the job's log, fix the failure and push again. |
 | is not in the job list (missing) | The gate expects a check that did not run, so the pull request can not merge. | Run the workflow again. With the org required workflow, re-run the \`pipegen required\` run after a code owner approves. |
 | the job list is empty | No check ran, so nothing is proven and the gate blocks. | Run \`npx pipegen verify\`, then \`npx pipegen update\`. |
 | result tampered or missing | The result file of a check is missing, or its checksum differs from the one its job reported. The gate does not trust it and blocks. | Run the checks again. If it keeps happening, someone changed the pipeline: run \`npx pipegen verify\`. |
 | no coverage for | A check ran but could not look (for example a scan that reported nothing because it had nothing to read). A required one blocks, because nothing was proven. | Fix what the check could not read, then run the checks again. |
-| no base: | The base scan did not run on the base commit of this event, so every finding compared with it counts as new. On the pull request that installs pipegen it warns instead. | Run the checks again. On a new install, merge the setup pull request and the next pull request has a base. |
+| no base: | The base scan could not be used for this event, so every finding compared with it counts as new. A new critical or high finding therefore blocks, and so does a new secret. Only a scanner that could not run on the base commit of the pull request that installs pipegen warns instead (the next row). | Run the checks again. On a new install, merge the setup pull request and the next pull request has a base. |
 | no base: the scanner couldn't run on the base commit (installing pipegen) | Image findings have no earlier scan to compare with yet: on the pull request that installs pipegen they warn, and on every other pull request they block. | Fix the finding in the image or its base image. |
+| input is refused | One of the gate's own inputs (the job list, the policy, the service roots, the protected paths, a date) is not one the gate accepts. The gate blocks, because it can not trust its own settings. | Run \`npx pipegen verify\`, then \`npx pipegen update\`. |
+| input is missing | One of the gate's own inputs (the job list, the GitHub token, the service roots) is missing. The gate blocks. | Run \`npx pipegen verify\`, then \`npx pipegen update\`. |
+| the jobs input (toJSON(needs)) is | The results of the jobs the gate reads are missing, too large or not an object. The gate blocks. | Run the workflow again. If it keeps happening, run \`npx pipegen verify\`. |
+| the mode input is not gate | The gate was started in a mode other than gate. The gate blocks. | Run \`npx pipegen verify\`, then \`npx pipegen update\`. |
+| does not take the input | The gate was given an input it does not know, or the wrong mode. The gate blocks. | Run \`npx pipegen verify\`, then \`npx pipegen update\`. |
 | the policy is refused | The gate's own settings are wrong, so it uses the default policy and blocks. | Run \`npx pipegen verify\`, then \`npx pipegen update\`. |
 | not-proven can't include floor need | A check every repository needs is listed as not proven, which the gate does not allow. | Run \`npx pipegen verify\`, then \`npx pipegen update\`. |
 | can never be skipped | A check that can never be skipped is listed as skipped. | Run \`npx pipegen verify\`, then \`npx pipegen update\`. |
@@ -359,7 +377,7 @@ The required check is \`pipegen / gate\`. When it fails, or only warns, its summ
 
 ## The four layers
 
-Each check has a tool, a reason and a mode: it either blocks a pull request or only warns.
+Each check has a tool, a reason and a mode. The mode is worked out from what pipegen wrote and from the gate's own rules, not only from what the plan asked for.
 
 ### Pre-commit layer
 
@@ -377,12 +395,12 @@ No check of this layer is set up here.
 
 Runs on every pull request and decides whether it can merge. The gate (the check \`pipegen / gate\`) reads every result.
 
-- Secret scan, no tool listed (see the notes below). Looks for passwords, keys and tokens in the code and in the commits of a pull request. Blocks a pull request.
-- Code scan, service "docs-site", no tool listed (see the notes below). Looks for insecure code patterns in your source. Blocks a pull request.
-- Dependency scan, service "docs-site", no tool listed (see the notes below). Looks for known vulnerabilities in the packages you depend on. Blocks a pull request.
+- Secret scan, tool betterleaks/betterleaks. Looks for passwords, keys and tokens in the code and in the commits of a pull request. Blocks a pull request.
+- Code scan, service "docs-site", tool semgrep/semgrep. Looks for insecure code patterns in your source. Blocks a pull request.
+- Dependency scan, service "docs-site", tool google/osv-scanner. Looks for known vulnerabilities in the packages you depend on. Blocks a pull request.
 - The gate, tool the pipegen gate action. Reads every result and decides whether the pull request can merge. Blocks a pull request.
-- Workflow lint, no tool listed (see the notes below). Checks GitHub workflow files for unsafe patterns. Blocks a pull request.
-- Workflow pin check, no tool listed (see the notes below). Checks that the actions in workflows are pinned to a commit. Blocks a pull request.
+- Workflow lint, tool rhysd/actionlint. Checks GitHub workflow files for unsafe patterns. Blocks a pull request.
+- Workflow pin check, tool suzuki-shunsuke/pinact. Checks that the actions in workflows are pinned to a commit. Blocks a pull request.
 
 ### Deploy layer
 

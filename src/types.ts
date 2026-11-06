@@ -242,6 +242,8 @@ export interface PipelineDoc {
   lockNotes: string[];
   estimates: { monthlyMinutes: number; includedMinutes: number | null; prWaitMinutes?: number; strictness?: 'Starter' | 'Standard' | 'Strict' };
   setupCommand: string;
+  /** G13 may say the merge lock does not require the gate (the lock plan has neither ruleset nor classic rule); false only ever takes the claim "blocks" away. */
+  gateRequired?: boolean;
   testNotes: string[];
   uncoveredMinimum: { category: string; why: string; service?: string }[];
   notes: string[];
