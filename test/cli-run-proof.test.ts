@@ -997,6 +997,21 @@ describe('G14-R2: a decline is proven again without the declined files (ruling G
     expect(w.evals.every((e) => !lacks(e.d, 'api/Dockerfile'))).toBe(true);
   });
 
+  it('run: a decline in a proof that already failed gets no extra proof (it is not a pass either way)', async () => {
+    const w = await proofWorld({ aiFile: true, aiPath: { path: 'api/Dockerfile', part: 'docker' }, confirm: false, results: [failOn('sast')] });
+    // the loop: a proof, the declined confirmation, then it ends failed
+    w.ops.fixLoop = async (d, deps) => {
+      const run = await deps.prove(d, 'pr');
+      expect(await deps.confirm?.(d.created.filter((f) => f.aiEdited === true))).toBe(false);
+      return { result: run.result, draft: d } as never;
+    };
+    const r = await w.run();
+    expect(r.ok).toBe(false);
+    expect(w.evals).toHaveLength(1);
+    expect(w.evals.every((e) => !lacks(e.d, 'api/Dockerfile'))).toBe(true);
+    expect(r.draft && lacks(r.draft, 'api/Dockerfile')).toBe(true);
+  });
+
   it('run: the question\'s "No" says what happens; a floor stop names each floor part once', () => {
     expect(CONFIRM_QUESTION).toContain('pipegen proves the pipeline again without them; if that fails, nothing is delivered');
     const d = { profile: { services: [] }, needs: [{ id: 'unit-tests', category: 'unit-tests', floor: true }], skipped: [], steps: [], notProven: [], created: [
@@ -1005,6 +1020,16 @@ describe('G14-R2: a decline is proven again without the declined files (ruling G
     ] } as unknown as PipelineDraft;
     const out = dropDeclined({ draft: d, result: { ok: true, parts: [], findings: [], minutesUsed: 0, runUrls: [] } } as never, new Set(['a.test.js', 'b.test.js', 'Dockerfile']));
     expect(out.stopped).toMatch(/and the tests part must be proven$/);
+  });
+
+  it('dropDeclined: a floor need read in two services is named once', async () => {
+    const w = await proofWorld();
+    const d0 = w.input.draft;
+    const files = ['api/Dockerfile', 'web/Dockerfile'].map((path) => ({ repo: 'app', path, content: 'x', part: 'docker', reason: 'r', aiEdited: true }) as CreatedFile);
+    const draft = { ...d0, needs: d0.needs.map((n) => (n.id === 'sast' ? { ...n, floor: true } : n)), created: files } as PipelineDraft;
+    const parts = [{ part: 'pipeline', needId: 'sast', status: 'proven', detail: 'ok' }, { part: 'pipeline', needId: 'sast', status: 'proven', detail: 'ok' }];
+    const out = dropDeclined({ draft, result: { ok: true, parts, findings: [], minutesUsed: 0, runUrls: [] } } as never, new Set(files.map((f) => f.path)));
+    expect(out.stopped).toMatch(/and the sast part must be proven$/);
   });
 });
 
@@ -1052,10 +1077,10 @@ describe('G14-R2: the AI-fixed draft is kept for an interrupt; the central repo 
     s.update((n) => { n.centralCreated = true; n.cleanupDone = true; });
     s.begin('20261106-000000-abcdef', app, { cap: 1, aiCap: 1 });
     expect(s.state?.centralCreated).toBe(true);
-    // another app: not carried
-    const s2 = await StateStore.open(p, { home: mkdtempSync(join(tmpdir(), 'pg-cc-')), env: {} });
-    s2.begin(RUN_ID, app, { cap: 1, aiCap: 1 });
-    expect(s2.state?.centralCreated).toBeUndefined();
+    // a run of another app in the same store: not carried
+    s.update((n) => { n.cleanupDone = true; });
+    s.begin('20261106-000001-abcdef', { ...app, repo: 'other' }, { cap: 1, aiCap: 1 });
+    expect(s.state?.centralCreated).toBeUndefined();
   });
 });
 
