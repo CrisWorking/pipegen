@@ -1013,7 +1013,7 @@ describe('G14-R2: the matcher of GitHub\'s filters is the audit\'s (sec m2)', ()
   const at = { branch: 'proof/r1/main', defaultBranch: 'main' };
   it('proofWorkflowsOf: `?`, `+` and `[…]` follow GitHub; a tags-only push runs on no branch push', () => {
     const wf = proofWorkflowsOf([
-      f('.github/workflows/q.yml', '{push: {branches: ["mai?"]}}'), f('.github/workflows/p.yml', '{push: {branches: ["ma+in"]}}'),
+      f('.github/workflows/q.yml', '{push: {branches: ["mx?ain"]}}'), f('.github/workflows/p.yml', '{push: {branches: ["ma+in"]}}'),
       f('.github/workflows/b.yml', '{push: {branches: ["[m]ain"]}}'), f('.github/workflows/t.yml', '{push: {tags: ["v*"]}}'),
       f('.github/workflows/x.yml', '{push: {branches: ["mai?x"]}}'),
     ], at);

@@ -383,6 +383,8 @@ export class StateStore {
       stage: 'consented', branches: [], prs: [], secretNames: [], minutesUsed: 0, cap: init.cap, aiCostUsd: 0, aiCap: init.aiCap,
       ...(keepId ? { scratchRepoId: old.scratchRepoId } : {}),
       ...(old !== null && old.actionsAccessPrevious !== undefined && old.app.owner.toLowerCase() === app.owner.toLowerCase() && old.app.repo.toLowerCase() === app.repo.toLowerCase() ? { actionsAccessPrevious: old.actionsAccessPrevious } : {}),
+      // G14-R2 (spec minor): pipegen made the central repo in an earlier run of this app (kept like the Actions access level)
+      ...(old !== null && old.centralCreated === true && old.app.owner.toLowerCase() === app.owner.toLowerCase() && old.app.repo.toLowerCase() === app.repo.toLowerCase() ? { centralCreated: true } : {}),
       ...(init.draft === undefined ? {} : { draft: init.draft }),
       ...(init.agreed === undefined ? {} : { agreed: structuredClone(init.agreed) }),
       leftovers: [], notes: [], updatedAt: '',

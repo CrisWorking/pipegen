@@ -16,6 +16,7 @@
 // Never here: a clack spinner (it adds signal handlers; E-b1), a second assembler or meter (ProofInput's), isolatedTestJob, a flag that
 // answers the mid-run confirmation.
 import type { Octokit } from '@octokit/rest';
+import { branchFilter, compileGlob } from '../audit/coverage/triggers.js';
 import { parseDocument } from 'yaml';
 import type { CodeBundle } from '../ai/redact.js';
 import type { SecretScanner } from '../ai/secret-scan-config.js';
@@ -53,7 +54,10 @@ export const PROOF_WAIT_MS = 45 * 60_000;
 export const REPOS_NOT_READY = 'pipegen stopped: the helper repositories above must exist first (see the commands). exit code 2.';
 /** Plan l. 504: the mid-run screen, before AI-written code runs with the user's keys. */
 export const CONFIRM_TITLE = 'pipegen\'s AI wrote or changed these files to make the proof pass. They ran with placeholder keys only so far:';
-export const CONFIRM_QUESTION = 'Run them with your real test keys now? (No: pipegen drops these AI changes from what runs with your keys; the parts that need your keys end not proven.)';
+export const CONFIRM_QUESTION = 'Run them with your real test keys now? (No: pipegen leaves these AI changes out, and pipegen proves the pipeline again without them; if that fails, nothing is delivered.)';
+/** Ruling G14-R2 1: the extra proof of a declined draft failed, or could not run. */
+export const REPROOF_FAILED = 'pipegen proved the pipeline again without the AI-written files you declined, and it did not pass';
+export const NO_MINUTES_FOR_REPROOF = 'not enough Actions minutes are left to prove the pipeline again without the AI-written files you declined, so nothing was delivered';
 /** A private app's proof pushes its central workflows once per proof (snapshot.ts: one central draft per session). */
 export const CENTRAL_CHANGED = 'pipegen stopped the proof: a change would need pipegen\'s central workflows pushed again, which one proof can\'t do. Nothing was delivered. Run `npx pipegen run` again. exit code 2.';
 
@@ -170,25 +174,28 @@ export function proofWorkflowsOf(files: readonly { path: string; content: string
     const text = typeof f.content === 'string' ? f.content : Buffer.from(f.content).toString('utf8');
     const on: unknown = parseDocument(text).toJS()?.on;
     const events: Record<string, unknown> = typeof on === 'string' ? { [on]: null } : Array.isArray(on) ? Object.fromEntries(on.map((e) => [String(e), null])) : typeof on === 'object' && on !== null ? on as Record<string, unknown> : {};
-    if (Object.hasOwn(events, 'push') && runsOn(events.push, at.branch, changed)) push.push(f.path);
-    if (Object.hasOwn(events, 'pull_request') && runsOn(events.pull_request, at.defaultBranch, changed)) pullRequest.push(f.path);
-    if (Object.hasOwn(events, 'push') && runsOn(events.push, at.defaultBranch, changed)) merge.push(f.path);
+    if (Object.hasOwn(events, 'push') && runsOn(events.push, at.branch, changed, 'push')) push.push(f.path);
+    if (Object.hasOwn(events, 'pull_request') && runsOn(events.pull_request, at.defaultBranch, changed, 'pull_request')) pullRequest.push(f.path);
+    if (Object.hasOwn(events, 'push') && runsOn(events.push, at.defaultBranch, changed, 'push')) merge.push(f.path);
   }
   return { push, pullRequest, merge };
 }
 
-/** One event's filters against a branch and the changed paths (GitHub's rules: a filter it can't read means no run, fail closed). */
-function runsOn(cfg: unknown, branch: string, changed: readonly string[]): boolean {
+/**
+ * One event's filters against a branch and the changed paths, with the audit's GitHub matcher (triggers.ts: `*`, `**`, `?`, `+`, `[…]`,
+ * `!`; sec m2). A push filtered by tags only runs on no branch push. A filter it can't read means no run (fail closed).
+ */
+function runsOn(cfg: unknown, branch: string, changed: readonly string[], event: 'push' | 'pull_request'): boolean {
   if (cfg === null || cfg === undefined) return true;
   if (typeof cfg !== 'object' || Array.isArray(cfg)) return false;
   const c = cfg as Record<string, unknown>;
-  const list = (k: string): string[] | null | undefined => (c[k] === undefined ? undefined : Array.isArray(c[k]) ? (c[k] as unknown[]).map(String) : typeof c[k] === 'string' ? [c[k] as string] : null);
-  const br = list('branches'), brIgnore = list('branches-ignore'), paths = list('paths'), pathsIgnore = list('paths-ignore');
-  if (br === null || brIgnore === null || paths === null || pathsIgnore === null) return false;
-  if (br !== undefined && !filterMatches(br, branch)) return false;
-  if (brIgnore !== undefined && brIgnore.some((x) => globMatch(x, branch))) return false;
+  const list = (k: string): string[] | null | undefined => (c[k] === undefined || c[k] === null ? undefined : Array.isArray(c[k]) ? (c[k] as unknown[]).map(String) : typeof c[k] === 'string' ? [c[k] as string] : null);
+  const br = list('branches'), brIgnore = list('branches-ignore'), paths = list('paths'), pathsIgnore = list('paths-ignore'), tags = list('tags'), tagsIgnore = list('tags-ignore');
+  if (br === null || brIgnore === null || paths === null || pathsIgnore === null || tags === null || tagsIgnore === null) return false;
+  if (event === 'push' && br === undefined && brIgnore === undefined && (tags !== undefined || tagsIgnore !== undefined)) return false;
+  if (!branchFilter({ ...(br === undefined ? {} : { branches: br }), ...(brIgnore === undefined ? {} : { 'branches-ignore': brIgnore }) })(branch)) return false;
   if (paths !== undefined && !changed.some((x) => filterMatches(paths, x))) return false;
-  if (pathsIgnore !== undefined && changed.every((x) => pathsIgnore.some((g) => globMatch(g, x)))) return false;
+  if (pathsIgnore !== undefined && changed.every((x) => pathsIgnore.some((g) => compileGlob(g)(x)))) return false;
   return true;
 }
 /** A filter list with `!` negations: the last pattern that matches decides. */
@@ -196,20 +203,9 @@ function filterMatches(patterns: readonly string[], value: string): boolean {
   let hit = false;
   for (const raw of patterns) {
     const neg = raw.startsWith('!');
-    if (globMatch(neg ? raw.slice(1) : raw, value)) hit = !neg;
+    if (compileGlob(neg ? raw.slice(1) : raw)(value)) hit = !neg;
   }
   return hit;
-}
-/** GitHub's filter pattern: `**` any characters, `*` any but `/`, `?` one character; the rest literal. */
-function globMatch(pattern: string, value: string): boolean {
-  let re = '';
-  for (let k = 0; k < pattern.length; k++) {
-    const ch = pattern[k] as string;
-    if (ch === '*' && pattern[k + 1] === '*') { re += '.*'; k++; } else if (ch === '*') re += '[^/]*';
-    else if (ch === '?') re += '.';
-    else re += ch.replace(/[.+^${}()|[\]\\]/g, '\\$&');
-  }
-  return new RegExp(`^${re}$`).test(value);
 }
 
 /** One proof's files of a draft: the central draft (private apps) and the app branch's files (assembled at signing none, the created app files, the harness, the compat copies). */
@@ -399,6 +395,10 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
         const f = await filesAt(d, centralSha);
         if (fileKey(f.central) !== centralKey) throw new ProofStopError(CENTRAL_CHANGED);
         latest = d;
+        // spec minor (G14-R2 4): the draft this proof runs is saved at once (no verdict: not proven), so an interrupt keeps the AI-fixed one
+        if (store.state?.stage === 'proving' && d !== store.state.draft) {
+          try { store.update((n) => { n.draft = structuredClone(d); }); } catch { /* the earlier draft stays; a resume proves it again */ }
+        }
         let { main, planted: pl, placements } = cur;
         if (calls > 0 || fileKey(f.app) !== fileKey(cur.files.app)) {
           const r = await freshRound(d, f);
@@ -453,7 +453,22 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
         log: say,
       };
       const out = await o.fixLoop(cur.d, fix);
-      return declined.size === 0 ? out : dropDeclined(out, declined);
+      if (declined.size === 0) return out;
+      // ruling G14-R2 1: a decline is proven again. The loop didn't pass: no pass anyway (the declined files dropped, fail closed)
+      if (!out.result.ok || out.stopped !== undefined || out.cap !== undefined) return dropDeclined(out, declined);
+      // no minutes left for one more proof: the fallback (sec M1's marking) and a plain stop
+      if (m.cap - m.used < Math.max(1, i.variantMinutes)) {
+        const d0 = dropDeclined(out, declined);
+        return { ...d0, result: { ...d0.result, ok: false }, stopped: NO_MINUTES_FOR_REPROOF };
+      }
+      // ONE more full proof of the draft without the declined files: the same keys, a fresh round off the base, fresh placements
+      const draft = withoutDeclined(out.draft, declined);
+      const run = await proveDraft(draft, 'full');
+      if (!run.result.ok) {
+        const why = run.result.parts.filter((x) => x.status === 'failed').map((x) => `${x.part}${x.needId === undefined ? '' : ` (${x.needId})`}: ${x.detail}`).join('; ');
+        return { ...out, draft, result: { ...run.result, ok: false }, stopped: `${REPROOF_FAILED}${why === '' ? '' : ` (${why})`}` };
+      }
+      return { ...out, draft, result: run.result };
     };
 
     let res: { outcome: FixOutcome; cleanup: CleanupResult };
@@ -505,10 +520,22 @@ export function dropDeclined(out: FixOutcome, declined: ReadonlySet<string>): Fi
   ].filter((n) => !out.draft.notProven.some((o) => o.part === n.part && o.reason === n.reason && o.needId === (n as { needId?: string }).needId));
   const notProven = [...out.draft.notProven, ...add];
   const draft: PipelineDraft = { ...out.draft, created: out.draft.created.filter((f) => !gone.includes(f)), notProven } as PipelineDraft;
+  // sec m1: each floor part once, and only the floor ones
+  const floorIds = [...new Set([
+    ...parts.filter((x) => FLOOR_PARTS.has(x) || (x === 'tests' && testsFloor)),
+    ...hit.filter((x) => out.draft.needs.some((n) => n.id === x.needId && n.floor === true)).map((x) => x.needId as string),
+  ])];
   const result = { ...out.result, parts: out.result.parts.map((x) => (hit.includes(x) ? { ...x, status: 'not-proven' as const, detail: DECLINED_REASON } : x)) };
   return floorHit
-    ? { ...out, draft, result: { ...result, ok: false }, stopped: `${out.stopped === undefined ? '' : `${out.stopped}; `}${DECLINED_REASON}, and the ${[...parts, ...hit.map((x) => x.needId as string)].join(', ')} part must be proven` }
+    ? { ...out, draft, result: { ...result, ok: false }, stopped: `${out.stopped === undefined ? '' : `${out.stopped}; `}${DECLINED_REASON}, and the ${floorIds.join(', ')} part must be proven` }
     : { ...out, draft, result };
+}
+/** Ruling G14-R2 1: the draft without the declined AI-written app files, each declined part noted (the extra proof decides the rest). */
+export function withoutDeclined(d: PipelineDraft, declined: ReadonlySet<string>): PipelineDraft {
+  const gone = d.created.filter((f) => f.repo === 'app' && declined.has(f.path));
+  const parts = [...new Set(gone.map((f) => f.part))];
+  const add = parts.filter((part) => !d.notProven.some((n) => n.part === part && n.reason === DECLINED_REASON)).map((part) => ({ part, missingSecrets: [], reason: DECLINED_REASON }));
+  return { ...d, created: d.created.filter((f) => !gone.includes(f)), notProven: [...d.notProven, ...add] } as PipelineDraft;
 }
 const owns = (servicePath: string, path: string): boolean => {
   const sp = servicePath.replace(/^(?:\.\/)+/, '').replace(/\/+$/, '');
