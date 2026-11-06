@@ -8,7 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { HOOK_REPORT, HOOK_SECRETS_EXIT, HOOK_TMP_PREFIX, hookSecrets, hookSecretsArgv } from '../src/cli/hook.js';
 import { run } from '../src/cli/main.js';
 import type { CliIO } from '../src/cli/io.js';
@@ -240,6 +240,35 @@ describe('G6: pipegen hook secrets', () => {
     expect(await hookSecrets(io(), repo({}), {})).toBe(0);
     expect(existsSync(old)).toBe(false);
     expect(existsSync(fresh)).toBe(true);
+  });
+
+  it('the secrets hook command: a hangup, quit, interrupt or stop mid-scan removes the private folder (M7, N4)', async () => {
+    for (const [sig, code] of [['SIGHUP', 129], ['SIGQUIT', 131], ['SIGINT', 130], ['SIGTERM', 143]] as const) {
+      const before = process.listeners(sig).length;
+      const exits: (number | undefined)[] = [];
+      const exit = vi.spyOn(process, 'exit').mockImplementation(((c?: number) => { exits.push(c); }) as never);
+      let tmp = '';
+      try {
+        const res = await hookSecrets(io(), repo({ 'a.txt': 'x\n' }), {
+          gitleaks: G,
+          exec: async (_f, _a, opts) => {
+            tmp = dirname(dirname(opts.cwd));
+            expect(existsSync(tmp), sig).toBe(true);
+            const added = process.listeners(sig).slice(before);
+            expect(added.length, sig).toBe(1);
+            (added[0] as (s: NodeJS.Signals) => void)(sig);
+            return 0;
+          },
+        });
+        expect(res, sig).toBe(2);
+      } finally {
+        exit.mockRestore();
+      }
+      expect(exits, sig).toEqual([code]);
+      expect(tmp.startsWith(join(tmpdir(), HOOK_TMP_PREFIX)), tmp).toBe(true);
+      expect(existsSync(tmp), sig).toBe(false);
+      expect(process.listeners(sig).length, sig).toBe(before);
+    }
   });
 
   it('the secrets hook command: a scanner error, a pinned binary that does not check out, or no git repo blocks the commit (fail closed)', async () => {

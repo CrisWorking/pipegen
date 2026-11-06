@@ -17,7 +17,7 @@
 // GITLEAKS_CONFIG), inline allow comments ignored, the secret redacted, a SARIF report into the private folder. The gate's own reader
 // (parseSarifText, readStage, applyStage) maps the findings back to the index paths and turns every staged file whose canary was not
 // reported exactly once into a not-scanned finding. Any finding blocks the commit (exit 1); a scan that can't run blocks it too (exit 2).
-// The private folder is removed at the end, on SIGINT and SIGTERM, and this user's stale ones are swept at the start (G6-R2 M7). No shell.
+// The private folder is removed at the end, on SIGHUP, SIGINT, SIGQUIT and SIGTERM, and this user's stale ones are swept at the start (G6-R2 M7). No shell.
 import { spawn } from 'node:child_process';
 import { chmodSync, lstatSync, readdirSync, rmSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
@@ -188,15 +188,18 @@ function findingLine(f: { file?: string; displayPath?: string; line?: number; ru
   return `  ${where}${f.line === undefined ? '' : `:${f.line}`} (${safeText(f.ruleId.replace(/^secret:/, ''), 80)})`;
 }
 
+/** G6-R2 M7, G6-R3 N4: the signals that end a commit (a closed terminal is SIGHUP), and the shell's 128 + number exit codes for them. */
+const CLEANUP_SIGNALS = ['SIGHUP', 'SIGINT', 'SIGQUIT', 'SIGTERM'] as const;
+const SIGNAL_NUMBERS: Partial<Record<NodeJS.Signals, number>> = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGTERM: 15 };
+
 /** Runs the staged secret scan for the repository holding `dir`. 0: clean; 1: a secret was found; 2: the scan could not run or was not complete. */
 export async function hookSecrets(io: CliIO, dir: string, deps: HookSecretsDeps = {}): Promise<number> {
   let tmp: string | null = null;
   const onSignal = (sig: NodeJS.Signals): void => {
     if (tmp !== null) removeTree(tmp);
-    process.exit(sig === 'SIGINT' ? 130 : 143);
+    process.exit(128 + (SIGNAL_NUMBERS[sig] ?? 15));
   };
-  process.once('SIGINT', onSignal);
-  process.once('SIGTERM', onSignal);
+  for (const sig of CLEANUP_SIGNALS) process.once(sig, onSignal);
   try {
     const env: NodeJS.ProcessEnv = { ...io.env, GIT_NO_REPLACE_OBJECTS: '1' };
     for (const k of Object.keys(env)) if (k.startsWith('GITLEAKS_')) delete env[k];
@@ -250,8 +253,7 @@ export async function hookSecrets(io: CliIO, dir: string, deps: HookSecretsDeps 
     io.err(`pipegen's secret scan could not run: ${safeText(why, 400)} The commit is blocked until it can.`);
     return 2;
   } finally {
-    process.removeListener('SIGINT', onSignal);
-    process.removeListener('SIGTERM', onSignal);
+    for (const sig of CLEANUP_SIGNALS) process.removeListener(sig, onSignal);
     if (tmp !== null) removeTree(tmp);
   }
 }

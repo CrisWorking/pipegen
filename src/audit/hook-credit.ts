@@ -1,71 +1,70 @@
-// Coverage mapper (G6, ruling G6-R2 spec I2 / sec M2): whether the user's own hook file already runs a secret scanner that keeps a key out
-// of the COMMIT, so pipegen's pre-commit layer adds no second one (Plan J G-J1: a check the repo already has is not added again).
+// Coverage mapper (G6, rulings G6-R2 spec I2 / sec M2, G6-R-sec2, G6-R3 H1): whether the user's own hook file already runs a secret scan
+// that keeps a key out of the COMMIT, so pipegen's pre-commit layer adds no second one (Plan J G-J1: a check the repo already has is not
+// added again), and whether the audit may say the pre-commit secrets row is covered.
 //
-// It reads the hook file with Plan J's hook reading (the tool signatures of data/tool-signatures.yml, scanShell, flagsAllow and
-// commandReason, as readHooks does) and credits only a scanner that runs at the pre-commit stage and can fail: a Found of category
-// `secrets` with no reason (no soft flag, no `|| true`, no condition, no file filter, no other stage, a known hook repo). Sync and pure on
-// the file text, so the builder and the referee's judge decide the same. Repository scripts are not followed (`npm run x`): a scanner
-// behind one is not credited, so pipegen adds its own hook (a harmless duplicate, never a missing scan).
-//   - husky: the script, read as `sh -e` reads it;
-//   - pre-commit: each hook of `.pre-commit-config.yaml` at the commit stage (its `stages`, else `default_stages`), without a file filter; a
-//     remote hook only as its repo defines it (no `language` or `entry` override, G6-R-sec2), a local one by its entry;
-//   - lefthook: never (pipegen appends to lefthook only when the file has no `pre-commit` key at all, so there is nothing at that stage).
+// The rule is the module's own: a harmless duplicate, never a missing scan. Only ONE form is credited, the canonical remote gitleaks hook
+// as gitleaks publishes it (https://github.com/gitleaks/gitleaks/blob/master/.pre-commit-hooks.yaml: `gitleaks git --pre-commit --redact
+// --staged --verbose`, language golang, pass_filenames false):
+//   - the official repo (or its old zricethezav URL, which redirects to it), at a pinned rev (a full commit sha or a v8+ release tag);
+//   - id `gitleaks`, with no `entry`, `language` or `args` of the user's (pre-commit runs shlex.split(entry) + args with no shell, so a
+//     `#`, a newline or `--exit-code=0` there is a real word, review H1 a), `pass_filenames` not true (gitleaks then reads a one-file
+//     commit's file name as its repo path, H1 b), no file filter and no key pipegen doesn't read;
+//   - at the commit stage: its `stages`, else (absent or empty, N2) `default_stages`, else every stage; and installed at pre-commit.
+// Never credited: a local pre-commit hook (any entry, H1 a/c), husky (git may run it without -e, N1) and lefthook: pipegen adds its own
+// hook there. trufflehog has no hook signature in data/tool-signatures.yml, so it is never credited either. Sync and pure on the text,
+// so the builder and the referee's judge decide the same.
 import { regexSafe } from '../read/limits.js';
 import { asObj } from '../read/manifest.js';
 import { isObj, parseYaml } from '../engine/yaml-parse.js';
 import { MAX_HOOKS } from './coverage/bounds.js';
-import { commandReason, flagsAllow, foundOf } from './coverage/settings.js';
-import { DEFAULT_SHELL, scanShell, type ShellMode } from './coverage/shell.js';
-import { compile, hookRepo, hookRepoKey, loadToolSignatures } from './coverage/signatures.js';
-import type { Compiled, Found } from './coverage/types.js';
 
-let compiled: Compiled | undefined;
-const sigs = (): Compiled => (compiled ??= compile(loadToolSignatures()));
-const HUSKY_SHELL: ShellMode = { errexit: true, pipefail: false };
-/** pre-commit languages that don't run the entry as a command (hooks.ts NOT_A_COMMAND_LANGUAGES). */
-const NOT_A_COMMAND: ReadonlySet<string> = new Set(['fail', 'pygrep', 'script', 'unsupported_script', 'docker_image']);
-const FILTER_KEYS = ['files', 'exclude', 'types', 'types_or', 'exclude_types'] as const;
-const strs = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
-const credits = (fs: readonly Found[]): boolean => fs.some((f) => f.reason === null && f.categories.includes('secrets'));
-const atCommit = (stages: readonly string[]): boolean => stages.length === 0 || stages.some((s) => s === 'pre-commit' || s === 'commit');
-const budget = () => ({ visits: 0, bytes: 0, truncated: false });
+type Obj = Record<string, unknown>;
+const GITLEAKS_REPOS: ReadonlySet<string> = new Set(['https://github.com/gitleaks/gitleaks', 'https://github.com/zricethezav/gitleaks']);
+/** A full commit sha, or a gitleaks v8+ release tag (v8 is the first whose hook reads only the staged changes). */
+const PINNED_REV = /^(?:[0-9a-f]{40}|v(?:[89]|[1-9]\d)\.\d{1,4}\.\d{1,4})$/;
+/** The hook keys that don't change what the canonical hook runs or which files it sees. */
+const COSMETIC_KEYS: ReadonlySet<string> = new Set(['id', 'name', 'alias', 'description', 'stages', 'verbose', 'log_file', 'require_serial', 'always_run', 'fail_fast', 'pass_filenames']);
+const TOP_FILTER_KEYS = ['files', 'exclude'] as const;
+const AT_COMMIT = (s: unknown) => s === 'pre-commit' || s === 'commit';
+const ALL_STAGES = ['pre-commit'];
+const normRepo = (repo: string) => repo.trim().toLowerCase().replace(/\/+$/, '').replace(/\.git$/, '');
+const isSet = (o: Obj, key: string) => o[key] !== undefined && o[key] !== null;
 
-/** Whether the hook file `original` of `manager` already runs a secret scanner at the commit stage that can fail. */
+/** The stages a hook runs at, as pre-commit reads them; null when they are not a list of names. */
+function stagesOf(doc: Obj, hook: Obj): readonly unknown[] | null {
+  if (isSet(hook, 'stages')) {
+    if (!Array.isArray(hook.stages)) return null;
+    if (hook.stages.length > 0) return hook.stages;
+  } else if ('stages' in hook) return null;
+  if (!('default_stages' in doc)) return ALL_STAGES;
+  return Array.isArray(doc.default_stages) ? doc.default_stages : null;
+}
+
+/**
+ * Whether hook `hook` of repo entry `repo` in pre-commit config `doc` is the canonical gitleaks hook at the commit stage. Shared by the
+ * pre-commit layer (existingSecretsHook) and the audit's hook reading (coverage/hooks.ts), so both credit exactly the same form.
+ */
+export function canonicalSecretsHook(doc: Obj, repo: Obj, hook: Obj): boolean {
+  if (TOP_FILTER_KEYS.some((k) => isSet(doc, k))) return false;
+  if (isSet(doc, 'default_install_hook_types') && !(Array.isArray(doc.default_install_hook_types) && doc.default_install_hook_types.includes('pre-commit'))) return false;
+  if (typeof repo.repo !== 'string' || !GITLEAKS_REPOS.has(normRepo(repo.repo))) return false;
+  if (typeof repo.rev !== 'string' || !PINNED_REV.test(repo.rev.trim())) return false;
+  if (hook.id !== 'gitleaks' || Object.keys(hook).some((k) => !COSMETIC_KEYS.has(k))) return false;
+  if ('pass_filenames' in hook && hook.pass_filenames !== false) return false;
+  const stages = stagesOf(doc, hook);
+  return stages !== null && stages.some(AT_COMMIT);
+}
+
+/** Whether the hook file `original` of `manager` already runs the canonical secret scan at the commit stage. */
 export function existingSecretsHook(manager: 'pre-commit' | 'husky' | 'lefthook', original: string): boolean {
-  if (typeof original !== 'string' || original === '' || !regexSafe(original.slice(0, 1_000_000))) return false;
+  if (manager !== 'pre-commit' || typeof original !== 'string' || original === '' || !regexSafe(original.slice(0, 1_000_000))) return false;
   try {
-    if (manager === 'husky') return credits(scanShell(original, '.', sigs(), budget(), HUSKY_SHELL));
-    if (manager === 'lefthook') return false;
     const r = parseYaml(original, 'strict');
     if ('problems' in r || !isObj(r.parsed.js)) return false;
     const doc = r.parsed.js;
-    if (FILTER_KEYS.some((k) => doc[k] !== undefined && doc[k] !== null)) return false;
-    const defaults = strs(doc.default_stages);
-    const s = sigs();
     for (const rawRepo of (Array.isArray(doc.repos) ? doc.repos : []).slice(0, MAX_HOOKS)) {
       const repo = asObj(rawRepo);
-      const url = typeof repo.repo === 'string' ? repo.repo : '';
-      if (url === 'meta') continue;
-      const local = url === 'local';
-      for (const raw of (Array.isArray(repo.hooks) ? repo.hooks : []).slice(0, MAX_HOOKS)) {
-        const hook = asObj(raw);
-        if (!atCommit('stages' in hook ? strs(hook.stages) : defaults)) continue;
-        if (FILTER_KEYS.some((k) => hook[k] !== undefined && hook[k] !== null)) continue;
-        const args = strs(hook.args);
-        if (local) {
-          // a local hook runs its entry as a command, unless its language reads it as something else
-          const entry = typeof hook.entry === 'string' ? hook.entry : undefined;
-          if (entry === undefined || typeof hook.language !== 'string' || NOT_A_COMMAND.has(hook.language)) continue;
-          if (credits(scanShell([entry, ...args].join(' '), '.', s, budget(), DEFAULT_SHELL))) return true;
-          continue;
-        }
-        // G6-R-sec2: a remote hook is credited from its signature only as the hook repo defines it: a `language` or `entry` of the
-        // user's own overrides what it runs (`language: fail` prints the entry, `entry: "true"` runs nothing), so it gets no credit
-        if ('language' in hook || 'entry' in hook || !s.hookRepos.has(hookRepo(url))) continue;
-        const id = typeof hook.id === 'string' ? hook.id : '';
-        const tools = s.hooks.get(hookRepoKey(url, id));
-        if (tools?.some((t) => flagsAllow(t, args) && commandReason(t, args) === null && credits([foundOf(t, '.', null)]))) return true;
-      }
+      for (const raw of (Array.isArray(repo.hooks) ? repo.hooks : []).slice(0, MAX_HOOKS)) if (canonicalSecretsHook(doc, repo, asObj(raw))) return true;
     }
     return false;
   } catch {

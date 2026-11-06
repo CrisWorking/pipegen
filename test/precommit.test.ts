@@ -11,6 +11,7 @@ import { parse } from 'yaml';
 import { guardCreatedFiles, gitBlobSha, type BaseTree } from '../src/create/guard.js';
 import { HOOK_FILES, hookCommands, hookFile, hookFileMode, huskyAppendProblem, SECRETS_HOOK_ID, secretsHookRun } from '../src/engine/created-builders.js';
 import { createdFileProblems, CREATED_RULES } from '../src/engine/created-files.js';
+import { existingSecretsHook } from '../src/audit/hook-credit.js';
 import { precommitFiles, SETUP_COMMANDS } from '../src/layers/precommit.js';
 import { emptyServiceQuality } from '../src/read/quality.js';
 import type { CreatedFile, Need, PipelineDraft, ReviewedTool, Service } from '../src/types.js';
@@ -103,7 +104,11 @@ describe('G6: the pre-commit layer (plan Task 3, B4)', () => {
     for (const original of ['. "$(dirname -- "$0")/_/husky.sh"\nnpm test\n', 'source ./env.sh\nnpm test\n', 'eval "exit 0"\n', 'npm test\nreturn 0\n', 'npm test && . ./x.sh\n', 'if true; then . ./x.sh; fi\n', '{ . ./x.sh; }\n',
       // G6-R2 I1: a trap or errexit turned off; M1: quoted and escaped forms, command/builtin, a command word from a variable, an npx of its own
       "trap 'exit 0' EXIT\nnpm test\n", 'trap cleanup EXIT\nnpm test\n', 'set +e\nnpm test\n', 'set -u +e\n', 'set +o errexit\n', '"exit" 0\n', "'exit' 0\n", 'e"x"it 0\n', 'ex\\it 0\n', '"." ./x\n', '\\. ./x\n',
-      'command . ./x\n', 'builtin source ./x\n', '${x}it 0\n', '$CMD\n', 'npx() { :; }\n', 'function npx { :; }\n', "alias npx='true'\n", 'echo "source of truth"\n', "echo 'eval me'\n"]) {
+      'command . ./x\n', 'builtin source ./x\n', '${x}it 0\n', '$CMD\n', 'npx() { :; }\n', 'function npx { :; }\n', "alias npx='true'\n", 'echo "source of truth"\n', "echo 'eval me'\n",
+      // G6-R3 N3: no-exec mode, a dangling `||` that would swallow pipegen's first line, a hashed npx
+      'set -n\n', 'set -o noexec\n', 'set -euxn\n', 'set -nu\n', 'npm test && set -n\n', 'set -o  noexec\nnpm test\n', 'set -eo noexec\n',
+      'npm test ||\n', 'npm test || # later\n', 'npm test ||   \n', 'npm test ||\t# x\n',
+      'hash -p /bin/true npx\n', 'hash npx\n', 'hash -r npx\n']) {
       expect(huskyAppendProblem(original), JSON.stringify(original)).not.toBeNull();
       const res = await precommitFiles(hookDraft('husky'), reviewedList(), repo({ [HOOK_FILES.husky]: original }));
       expect(res.files, JSON.stringify(original)).toEqual([]);
@@ -111,7 +116,7 @@ describe('G6: the pre-commit layer (plan Task 3, B4)', () => {
       expect(res.notes.join('\n'), JSON.stringify(original)).toMatch(/can not add its hooks to \.husky\/pre-commit safely/);
     }
     // a dot or the word inside a string, a comment, or as an argument is no command
-    for (const original of ['npx biome check .\n', '# . ./x.sh\nnpm test\n', 'ls ./src\n', 'x=$(date)\nnpm test "$x"\n', 'set -e\nnpm test\n']) {
+    for (const original of ['npx biome check .\n', '# . ./x.sh\nnpm test\n', 'ls ./src\n', 'x=$(date)\nnpm test "$x"\n', 'set -e\nnpm test\n', 'set -eu\nnpm test\n', 'npm test || npm run fix\n', 'echo set -n\n', '# set -n\nnpm test\n', 'hash -r\nnpm test\n', 'npm run lint -- --no-cache\n']) {
       expect(huskyAppendProblem(original), JSON.stringify(original)).toBeNull();
     }
   });
@@ -235,45 +240,100 @@ describe('G6: carries (G1-R2 m5, m6; secrets hook; Plan J G-J1)', () => {
   });
 
   it('precommit: an existing secrets hook gets no second one, with a note', async () => {
-    // credited: a scanner that runs at the commit stage and can fail (Plan J's hook reading and tool signatures)
+    // G6-R3 (H1): credited only as the canonical remote gitleaks hook: the official repo, a pinned rev, id gitleaks, no
+    // entry, language or args of the user's, pass_filenames not true, at the commit stage (stages, else default_stages)
     const withGitleaks = `${PRE_COMMIT}  - repo: https://github.com/gitleaks/gitleaks\n    rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e\n    hooks:\n      - id: gitleaks\n`;
-    const huskyScan = 'gitleaks git --pre-commit --redact --staged\n';
-    for (const [manager, original] of [['pre-commit', withGitleaks], ['husky', huskyScan]] as const) {
-      const draft = hookDraft(manager);
-      const r = await precommitFiles(draft, reviewedList(), repo({ [HOOK_FILES[manager]]: original }));
+    const hookWith = (extra: string) => withGitleaks.replace('      - id: gitleaks\n', `      - id: gitleaks\n${extra}`);
+    const credited = [
+      withGitleaks,
+      withGitleaks.replace('83d9cd684c87d95d656c1458ef04895a7f1cbd8e', 'v8.30.1'),
+      withGitleaks.replace('https://github.com/gitleaks/gitleaks', 'https://github.com/gitleaks/gitleaks.git'),
+      withGitleaks.replace('https://github.com/gitleaks/gitleaks', 'https://github.com/zricethezav/gitleaks'),
+      hookWith('        name: scan for keys\n        verbose: true\n        pass_filenames: false\n'),
+      hookWith('        stages: [pre-commit, pre-push]\n'),
+      hookWith('        stages: [commit]\n'),
+      hookWith('        stages: []\n'),
+      `default_stages: [pre-commit]\n${hookWith('        stages: []\n')}`,
+    ];
+    for (const original of credited) {
+      expect(existingSecretsHook('pre-commit', original), original).toBe(true);
+      const draft = hookDraft('pre-commit');
+      const r = await precommitFiles(draft, reviewedList(), repo({ [HOOK_FILES['pre-commit']]: original }));
       const f = r.files[0] as CreatedFile;
-      expect(f.content, manager).not.toContain('hook secrets');
-      expect(f.content, manager).toContain(BIOME_RUN);
-      expect(r.notes.join('\n'), manager).toMatch(/already scans for secrets/);
-      expect(judge(f, draft), manager).toEqual([]);
+      expect(f.content, original).not.toContain('hook secrets');
+      expect(f.content, original).toContain(BIOME_RUN);
+      expect(r.notes.join('\n'), original).toMatch(/already scans for secrets/);
+      expect(judge(f, draft), original).toEqual([]);
     }
-    // not credited (G6-R2 spec I2 / sec M2): another stage, a scanner that can't fail, a soft run, a file filter, a mention in a comment or an echo
+    const local = (body: string) => `${PRE_COMMIT}  - repo: local\n    hooks:\n      - id: gitleaks\n        name: gitleaks\n        language: system\n${body}`;
     const notCredited: [PipelineDraft['profile']['precommit'], string][] = [
       ['lefthook', 'pre-push:\n  commands:\n    scan:\n      run: trufflehog git file://. --since-commit HEAD --fail\n'],
-      ['pre-commit', withGitleaks.replace('      - id: gitleaks\n', '      - id: gitleaks\n        stages: [manual]\n')],
+      ['pre-commit', hookWith('        stages: [manual]\n')],
       // G6-R-sec2: the remote hook's language or entry overridden, so it never runs the scan the signature expects
-      ['pre-commit', withGitleaks.replace('      - id: gitleaks\n', '      - id: gitleaks\n        language: fail\n')],
-      ['pre-commit', withGitleaks.replace('      - id: gitleaks\n', '      - id: gitleaks\n        language: system\n')],
-      ['pre-commit', withGitleaks.replace('      - id: gitleaks\n', '      - id: gitleaks\n        entry: "true"\n')],
-      ['pre-commit', withGitleaks.replace('      - id: gitleaks\n', '      - id: gitleaks\n        entry: gitleaks git --pre-commit --staged\n')],
-      ['pre-commit', `default_stages: [pre-push]\n${withGitleaks}`.replace('default_stages: [pre-push]', 'default_stages: [pre-commit, pre-push]').replace('      - id: gitleaks\n', '      - id: gitleaks\n        stages: [pre-push]\n')],
-      ['pre-commit', withGitleaks.replace('      - id: gitleaks\n', '      - id: gitleaks\n        exclude: ^docs/\n')],
+      ['pre-commit', hookWith('        language: fail\n')],
+      ['pre-commit', hookWith('        language: system\n')],
+      ['pre-commit', hookWith('        entry: "true"\n')],
+      ['pre-commit', hookWith('        entry: gitleaks git --pre-commit --staged\n')],
+      ['pre-commit', `default_stages: [pre-commit, pre-push]\n${hookWith('        stages: [pre-push]\n')}`],
+      ['pre-commit', hookWith('        exclude: ^docs/\n')],
       ['pre-commit', `exclude: ^\\.gitleaks\\.toml$\n${withGitleaks}`],
+      // review H1 a: any args of the user's (pre-commit runs shlex.split(entry) + args, no shell: `#` is no comment)
+      ['pre-commit', hookWith('        args: ["#", "--exit-code=0"]\n')],
+      ['pre-commit', hookWith('        args: [--exit-code=0]\n')],
+      ['pre-commit', hookWith('        args: [--verbose]\n')],
+      // review H1 b: pass_filenames true makes gitleaks read a one-file commit's file name as its repo path
+      ['pre-commit', hookWith('        pass_filenames: true\n')],
+      // not the canonical hook: another id, no pinned rev, a fork, a key pipegen doesn't read
+      ['pre-commit', withGitleaks.replace('id: gitleaks', 'id: gitleaks-docker')],
+      ['pre-commit', withGitleaks.replace('id: gitleaks', 'id: gitleaks-system')],
+      ['pre-commit', withGitleaks.replace('    rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e\n', '')],
+      ['pre-commit', withGitleaks.replace('83d9cd684c87d95d656c1458ef04895a7f1cbd8e', 'master')],
+      ['pre-commit', withGitleaks.replace('83d9cd684c87d95d656c1458ef04895a7f1cbd8e', 'v7.6.1')],
+      ['pre-commit', withGitleaks.replace('github.com/gitleaks/gitleaks', 'github.com/someone/gitleaks')],
+      ['pre-commit', hookWith('        additional_dependencies: [x]\n')],
+      ['pre-commit', hookWith('        stages: pre-commit\n')],
+      ['pre-commit', `default_install_hook_types: [pre-push]\n${withGitleaks}`],
+      // review H1 a/b/c: a local hook is never credited, whatever its entry
+      ['pre-commit', local('        entry: "gitleaks protect\\nexit 0"\n        pass_filenames: false\n')],
+      ['pre-commit', local('        entry: true && gitleaks git --pre-commit --staged\n        pass_filenames: false\n')],
+      ['pre-commit', local('        entry: echo && gitleaks git --pre-commit --staged\n        pass_filenames: false\n')],
+      ['pre-commit', local('        entry: "true\\ngitleaks git --pre-commit --redact --staged"\n        pass_filenames: false\n')],
+      ['pre-commit', local('        entry: "gitleaks git --pre-commit --redact --staged\\n--exit-code=0"\n        pass_filenames: false\n')],
+      ['pre-commit', local('        entry: gitleaks git --pre-commit --redact --staged # --exit-code=0\n        pass_filenames: false\n')],
+      ['pre-commit', local('        entry: |\n          gitleaks git --pre-commit --redact --staged\n          --exit-code 0\n        pass_filenames: false\n')],
+      ['pre-commit', local('        entry: gitleaks git --pre-commit --redact --staged --verbose\n')],
+      ['pre-commit', local('        entry: gitleaks protect\n        pass_filenames: false\n')],
+      ['pre-commit', local('        entry: gitleaks git\n        pass_filenames: false\n')],
+      ['pre-commit', local('        entry: gitleaks detect\n        pass_filenames: false\n')],
+      ['pre-commit', local('        entry: gitleaks git --pre-commit\n        pass_filenames: false\n')],
+      ['pre-commit', local('        entry: gitleaks git --pre-commit --redact --staged\n        pass_filenames: false\n')],
+      // husky and lefthook are never credited (N1: git may run .husky/pre-commit without -e)
+      ['husky', 'gitleaks git --pre-commit --redact --staged\n'],
+      ['husky', '#!/bin/sh\ngitleaks protect --staged\nnpx lint-staged\n'],
+      ['husky', 'npx gitleaks detect\n'], ['husky', 'gitleaks protect\n'], ['husky', 'gitleaks git --pre-commit\n'],
+      ['husky', 'trufflehog git file://. --since-commit HEAD --fail\n'],
       ['husky', 'gitleaks version\nnpm test\n'], ['husky', 'detect-secrets scan > .secrets.baseline\n'], ['husky', 'gitleaks git --staged || true\n'],
       ['husky', 'npm test # gitleaks runs in CI\n'], ['husky', 'echo "TODO: add gitleaks"\n'], ['husky', '# TODO: gitleaks\nnpm test\n'],
     ];
     for (const [manager, original] of notCredited) {
-      const r = await precommitFiles(hookDraft(manager), reviewedList(), repo({ [HOOK_FILES[manager ?? 'lefthook']]: original }));
-      const text = r.files.map((f) => f.content).join('') + r.notes.join('\n');
-      expect(text, original).toContain(SCAN_HOOK_RUN);
+      const m = manager ?? 'lefthook';
+      expect(existingSecretsHook(m, original), original).toBe(false);
+      // run through the builder: the secrets line stays (or the file is refused with its own note), never "already scans"
+      const r = await precommitFiles(hookDraft(manager), reviewedList(), repo({ [HOOK_FILES[m]]: original }));
       expect(r.notes.join('\n'), original).not.toMatch(/already scans/);
+      if (r.files.length > 0) expect(r.files.map((f) => f.content).join(''), original).toContain(SCAN_HOOK_RUN);
+      else expect(r.notes.length, original).toBeGreaterThan(0);
     }
+    // only the pre-commit framework reads that config: the same text as a husky or lefthook file is no scan
+    for (const m of ['husky', 'lefthook'] as const) expect(existingSecretsHook(m, withGitleaks), m).toBe(false);
+    // N2: an empty `stages` falls back to default_stages, as pre-commit reads it (an empty default_stages runs nowhere)
+    for (const ds of ['[pre-push]', '[]']) expect(existingSecretsHook('pre-commit', `default_stages: ${ds}\n${hookWith('        stages: []\n')}`), ds).toBe(false);
     // only a secrets hook to add and the repo has one: no file at all, and the one true reason (spec I3)
-    const d = hookDraft('husky');
+    const d = hookDraft('pre-commit');
     const onlyScanHook = { ...d, needs: d.needs.filter((n) => n.id !== 'format-lint') };
-    const r = await precommitFiles(onlyScanHook, reviewedList(), repo({ [HOOK_FILES.husky]: huskyScan }));
+    const r = await precommitFiles(onlyScanHook, reviewedList(), repo({ [HOOK_FILES['pre-commit']]: withGitleaks }));
     expect(r.files).toEqual([]);
-    expect(r.notes).toEqual(['Your .husky/pre-commit already scans for secrets at commit, so pipegen adds no secrets hook of its own there.']);
+    expect(r.notes).toEqual(['Your .pre-commit-config.yaml already scans for secrets at commit, so pipegen adds no secrets hook of its own there.']);
     // no gitleaks entry in the reviewed list: a note says the local secrets hook is not added
     const noGitleaks = await precommitFiles(hookDraft('husky'), reviewedList().filter((t) => t.id !== 'gitleaks'), repo({ [HOOK_FILES.husky]: HUSKY }));
     expect(noGitleaks.notes.join('\n')).toMatch(/no gitleaks entry/);

@@ -90,6 +90,8 @@ const REASON_WHY: Readonly<Record<Reason, (subject: string, when: string) => str
   runner: (s) => `${s} runs, but not on a GitHub-hosted runner it supports, outside a container, so it may not block anything.`,
   // ruling P33 (the run's own why names the never-list reason)
   'never-listed': (s) => `${s} runs, but this action is on pipegen's never-use list; pin a reviewed alternative.`,
+  // G6-R3 (H1): the audit credits a secret scan before each commit as the pre-commit layer does (hook-credit.ts)
+  'hook-form': (s) => `${s} runs in your hooks, but pipegen counts a secret scan before each commit only as the official gitleaks pre-commit hook (its repo at a pinned rev, id gitleaks, no entry, language, args or file filter of your own), so it can't tell this one keeps a key out of every commit.`,
 };
 /** Reasons whose run carries pipegen's own why from the signature (partialWhy, actionRef, unavailableWhy, requireInputs). */
 const OWN_WHY: ReadonlySet<Reason> = new Set<Reason>(['never', 'ref', 'unavailable', 'needs-inputs', 'config', 'some-jobs', 'runner', 'never-listed']);

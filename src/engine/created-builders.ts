@@ -406,6 +406,11 @@ export function huskyAppendProblem(original: string): string | null {
   // G6-R2 M1: a command word built at run time, and an npx of the script's own (a function or an alias would run instead of pipegen's lines)
   if (new RegExp(`${at}\\$`, 'm').test(plain)) return 'it runs a command whose name is a variable, so pipegen can not tell what it runs';
   if (/\bnpx\s*\(\s*\)|\bfunction\s+npx\b|\balias\b[^\n;]*\bnpx=/.test(plain)) return 'it defines its own npx (a function or an alias), which would run instead of pipegen\'s hooks';
+  // G6-R3 N3: no-exec mode reads the rest without running it; a hashed npx can point at another program; a dangling `||` at the end
+  // joins pipegen's first line to the original's last command, so the scan would run only when that command fails
+  if (new RegExp(`${at}set\\b[^\\n;&|]*?[ \\t](?:-[A-Za-z]*n|-[A-Za-z]*o[ \\t]+noexec\\b)`, 'm').test(plain)) return 'it turns on no-exec mode (set -n), so appended lines would not run';
+  if (new RegExp(`${at}hash\\b[^\\n;&|]*\\bnpx\\b`, 'm').test(plain)) return 'it hashes npx to a path of its own, which would run instead of pipegen\'s hooks';
+  if (/\|\|\s*$/.test(code)) return 'it ends with a dangling ||, which would make pipegen\'s first hook line run only when the last command fails';
   if (code.includes('<<')) return 'it has a here-document or here-string';
   const n = (re: RegExp): number => (code.match(re) ?? []).length;
   const word = (w: string): RegExp => new RegExp(`(?:^|[\\s;&|(){}])${w}(?=$|[\\s;&|(){}])`, 'g');
