@@ -294,6 +294,9 @@ const POLICIES = {
     config: { flag: '--config', content: 'check-for-app-update: false\n', fileName: 'syft.yaml' },
   },
   cosign: { method: GH, needsSlot: "is run by Plan G's sign job, which adds its own reviewed flags", package: 'cosign-linux-amd64', exe: 'cosign', dialect: 'long', sub: ['sign'], flags: { yes: 'bool' }, required: { yes: 'true' } },
+  // G15a (B3 d, P-5): the pinned gh release, run only by the attest verify step (signing.ts renderVerifySteps), which adds its own reviewed
+  // flags; never by renderStep. The template is the subcommand alone
+  gh: { method: GH, needsSlot: 'is run by the attest verify step of the job pipegen-verify, which adds its own reviewed flags', package: 'gh_2.103.3_linux_amd64.tar.gz', exe: 'gh', dialect: 'long', sub: ['attestation', 'verify'], flags: {} },
   actionlint: { method: GH, package: 'actionlint_1.7.12_linux_amd64.tar.gz',
     exe: 'actionlint', dialect: 'goflags', sub: [], flags: { 'no-color': 'bool', shellcheck: { values: [''] }, pyflakes: { values: [''] } },
     required: { shellcheck: '', pyflakes: '' },
@@ -410,7 +413,7 @@ const POLICIES = {
  * it (mypy, schemathesis, pinact). An entry is listed only with a reason it can not load repo code. Everything with a
  * pinned config passed by flag reads that one (the loop test in test/job-order.test.ts checks this); semgrep and nuclei
  * have no config file but a verified rules archive. NOT listed, on purpose: lefthook, vitest-coverage, c8 (run repo code),
- * prettier, knip (load repo config), pinact (reads .pinact.yaml, no pinned config), gosec, cosign, registry (not rendered
+ * prettier, knip (load repo config), pinact (reads .pinact.yaml, no pinned config), gosec, cosign, gh, registry (not rendered
  * as a step), and every pip tool and schemathesis.
  */
 const READS_ONLY: readonly string[] = [

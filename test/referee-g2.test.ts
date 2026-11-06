@@ -48,14 +48,10 @@ const PEM = [['-----BEGIN', 'PUBLIC KEY-----'].join(' '), 'MFkwEwYHKoZIzj0CAQYIK
 const PUB_SHA = createHash('sha256').update(PEM, 'utf8').digest('hex');
 const IMG = { service: 'app', repo: 'ghcr.io/o/r-app' } as const;
 const COSIGN = entry(COSIGN_ID);
-/** A fixture for the reviewed pinned gh release entry (the real one lands in G15's re-pin batch, ruling B3 d). */
+/** The reviewed pinned gh release entry (G15a, ruling B3 d), or a copy of it with its candidate changed (for the refusals). */
 const ghEntry = (over: Partial<Candidate> = {}): ReviewedTool => {
-  const candidate: Candidate = { id: GH_ID, name: 'cli/cli', kind: 'cli', repo: 'cli/cli', version: 'v2.80.0', pin: { checksum: 'c'.repeat(64) }, source: 'reviewed', reviewed: true, categories: ['attestation'], ...over };
-  return {
-    id: candidate.id, categories: ['attestation'], languages: ['any'], candidate: candidate as ReviewedTool['candidate'],
-    step: { cli: { install: { method: 'github-release', package: 'gh_2.80.0_linux_amd64.tar.gz', version: candidate.version }, command: ['gh', 'attestation', 'verify'] }, output: { path: '', format: 'none' } },
-    fixedInputs: {}, choices: {}, configFiles: [], reviewedBy: 'fixture', reviewedAt: '2026-11-05', proofs: 0,
-  };
+  const real = entry(GH_ID);
+  return { ...real, candidate: { ...real.candidate, ...over } as ReviewedTool['candidate'] };
 };
 /** A draft of only these steps (its other checks are not the point here). */
 const bare = (over: Partial<PipelineDraft> = {}): PipelineDraft => draftOf({ needs: [], steps: [], ...over });
@@ -191,14 +187,15 @@ describe('G2: signing and verification steps (B3 b, d)', () => {
     const at = signingDraft(ATTEST);
     const gh = ghEntry();
     const ghSteps = renderVerifySteps(gh, at, IMG);
-    expect(ghSteps[0]?.env?.PIPEGEN_DL_URL).toBe('https://github.com/cli/cli/releases/download/v2.80.0/gh_2.80.0_linux_amd64.tar.gz');
-    expect(ghSteps[0]?.env?.PIPEGEN_DL_SHA256).toBe('c'.repeat(64));
+    expect(ghSteps[0]?.env?.PIPEGEN_DL_URL).toBe('https://github.com/cli/cli/releases/download/v2.103.3/gh_2.103.3_linux_amd64.tar.gz');
+    expect(ghSteps[0]?.env?.PIPEGEN_DL_SHA256).toBe('4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d');
     const ghRun = lastRun(ghSteps).run as string;
     // (G3 ruling: the sign workflow is the project's own central file, <project>--sign.yml, since its content is the draft's plan)
     expect(attestSignerWorkflow('o/pipelines', 'r')).toBe('o/pipelines/.github/workflows/r--sign.yml');
     // G2-R-sec 2: bound like keyless: the source is the app's default branch, the signer is the central sign workflow AT the central commit
     // pipegen pinned (a reusable workflow called at a commit signs with that commit), on a GitHub-hosted runner
-    expect(ghRun).toContain(`"$RUNNER_TEMP/pipegen-bin/pipegen-gh-verify/gh" attestation verify "oci://$ref" --repo 'o/r' --source-ref 'refs/heads/main' --signer-workflow 'o/pipelines/.github/workflows/r--sign.yml' --signer-digest '${'a'.repeat(40)}' --deny-self-hosted-runners`);
+    // G15a: and the deployed commit itself (--source-digest, the push's GITHUB_SHA, checked as 40 hex first)
+    expect(ghRun).toContain(`"$RUNNER_TEMP/pipegen-bin/pipegen-gh-verify/gh" attestation verify "oci://$ref" --repo 'o/r' --source-ref 'refs/heads/main' --source-digest "$GITHUB_SHA" --signer-workflow 'o/pipelines/.github/workflows/r--sign.yml' --signer-digest '${'a'.repeat(40)}' --deny-self-hosted-runners`);
     for (const defaultBranch of ['-x', 'a..b', "ma'in", 'ma in', '']) {
       expect(() => renderVerifySteps(gh, { ...at, profile: { ...at.profile, defaultBranch } }, IMG), defaultBranch).toThrow(RenderError);
     }
@@ -239,10 +236,15 @@ describe('G2: signing and verification steps (B3 b, d)', () => {
     const leaked = { ...digestDownload() };
     const pubOnOther: RenderedStep = { id: 'pipegen-verify-0000000000000000', name: 'x', run: 'echo "$PIPEGEN_COSIGN_PUB"', shell: 'bash', env: { PIPEGEN_COSIGN_PUB: '${{ vars.PIPEGEN_COSIGN_PUB }}' } };
     expect((await runWith([rawFile({ 'pipegen-verify': job([leaked, pubOnOther], { permissions: VERIFY_PERMS, environment: 'pipegen-signing' }) }, { on: { workflow_call: null } }, '.github/workflows/deploy-verify.yml')], keDraft)).ok).toBe(false);
-    // attest: with the gh entry the step is pipegen's; without it (the real list until G15) nothing renders it, so it is refused
+    // attest: with the real gh entry the step is pipegen's own verify step (recognised by content, in pipegen-verify); without the entry
+    // nothing renders it, so it is refused. G15a: the attest verify job is still refused as a whole, for one reason only: gh reads GitHub's
+    // Sigstore trust root from a host no reviewed network set holds (not confirmed offline for the pinned gh; the live checklist), so
+    // behind the network lock it could only fail
     const atFile = vf({ 'pipegen-verify': verifyJob(ghSteps) });
-    expect(show(await runWith([atFile], at, [...reviewedList(), gh]))).toBe('');
-    const noGh = await runWith([atFile], at);
+    const withGh = await runWith([atFile], at, reviewedList());
+    expect(withGh.issues.map((i) => i.message).filter((m) => !/trust root/.test(m)), show(withGh)).toEqual([]);
+    expect(has(withGh, 'template', /attest[\s\S]*trust root/), show(withGh)).toBe(true);
+    const noGh = await runWith([atFile], at, reviewedList().filter((t) => t.id !== GH_ID));
     expect(noGh.ok).toBe(false);
     expect(noGh.notes.some((n) => /gh/.test(n)), noGh.notes.join('\n')).toBe(true);
   });

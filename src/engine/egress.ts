@@ -97,6 +97,16 @@ export const SHARED_CDN_SETS: ReadonlySet<EgressSet> = new Set<EgressSet>(['gith
  */
 export const KEYLESS_VERIFY_SETS: readonly EgressSet[] = Object.freeze([SIGSTORE_SET]);
 
+/**
+ * G15a (open question 3): the sets the attest verify job adds for `gh attestation verify`, or null while they are not sourced. gh reads the
+ * trusted root of GitHub's own Sigstore instance through TUF from its own host (the installed gh 2.87.3 holds tuf-repo.github.com and
+ * tuf-repo-cdn.sigstore.dev), but the pinned gh v2.103.3 could not be read offline, and every host in a set cites the pinned upstream. So
+ * the attest verify job is refused (fails closed) until a reviewed set lists them: the live checklist confirms the hosts on v2.103.3.
+ */
+export const ATTEST_VERIFY_SETS: readonly EgressSet[] | null = null;
+/** Why an attest verify job is refused while ATTEST_VERIFY_SETS is null (plain words, shown by assemble and the referee). */
+export const ATTEST_VERIFY_REFUSAL = 'gh reads the trust root of GitHub\'s own signing service from a host that is in no reviewed network set yet, so behind the network lock the verify job could only fail; pipegen refuses the attest deploy check instead of writing a job that never passes';
+
 /** The Docker network range a job's services and containers use (the reviewed `allowed-ips` choice). */
 const DOCKER_RANGE = '172.16.0.0/12';
 

@@ -41,7 +41,7 @@ export function signedImageOwner(p: RepoProfile, caps: Capabilities, service: un
   return why === undefined ? { ok: true, service: svc } : { ok: false, reportOnly: true, why };
 }
 
-/** The reviewed entries the steps come from. GH_ID is the reviewed pinned gh release entry (it lands in G15's re-pin batch, ruling B3 d). */
+/** The reviewed entries the steps come from. GH_ID is the reviewed pinned gh release entry (ruling B3 d). */
 export const COSIGN_ID = 'cosign';
 export const GH_ID = 'gh';
 const COSIGN_REPO = 'sigstore/cosign';
@@ -179,7 +179,9 @@ export function renderVerifySteps(tool: ReviewedTool, draft: PipelineDraft, imag
     const signer = attestSignerWorkflow(central, draft.profile.repo);
     // controller ruling G2-R-sec 2: bound like keyless. The source is the app's default branch; the signer is the central sign workflow at
     // the commit pipegen pinned (a reusable workflow called at a commit signs with that commit, so --signer-digest binds its ref; gh's
-    // --signer-workflow takes no ref); never a self-hosted runner. Flags checked against gh 2.87.3's help; the pinned entry's version: live checklist.
+    // --signer-workflow takes no ref, and is a prefix regex, safe only with --signer-digest); never a self-hosted runner. G15a: and the
+    // deployed commit itself (--source-digest, the same commit source as key-env and keyless, G7-R1 sec M1: the verify job runs only for a
+    // push deploy, so it is GITHUB_SHA, checked as 40 hex first). Flags: the pinned entry's version (reviewed-tools.yml gh comment).
     const centralSha = draft.centralPin?.sha;
     if (typeof centralSha !== 'string' || !COMMIT_RE.test(centralSha)) throw new RenderError('Attest mode binds the signer to the central commit pipegen pinned, and the draft has no 40-character central commit.');
     const branch = draft.profile.defaultBranch;
@@ -191,7 +193,8 @@ export function renderVerifySteps(tool: ReviewedTool, draft: PipelineDraft, imag
       ...refLines(repo, artifact),
       // a fresh config folder: the runner's own gh login or config is never read
       'ghcfg="$(mktemp -d "$RUNNER_TEMP/pipegen-gh.XXXXXX")"',
-      `GH_TOKEN="$PIPEGEN_GH_TOKEN" GH_CONFIG_DIR="$ghcfg" GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 "${install.bin}" attestation verify "oci://$ref" --repo ${q(app)} --source-ref ${q(`refs/heads/${branch}`)} --signer-workflow ${q(signer)} --signer-digest ${q(centralSha)} --deny-self-hosted-runners`,
+      COMMIT_LINE,
+      `GH_TOKEN="$PIPEGEN_GH_TOKEN" GH_CONFIG_DIR="$ghcfg" GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 "${install.bin}" attestation verify "oci://$ref" --repo ${q(app)} --source-ref ${q(`refs/heads/${branch}`)} --source-digest "$GITHUB_SHA" --signer-workflow ${q(signer)} --signer-digest ${q(centralSha)} --deny-self-hosted-runners`,
     ], { PIPEGEN_GH_TOKEN: VERIFY_STEP_ENV.PIPEGEN_GH_TOKEN as string })];
   }
   reviewedRelease(tool, COSIGN_ID, COSIGN_REPO, 'cosign');
@@ -259,7 +262,7 @@ export function expectedSigningSteps(draft: PipelineDraft, reviewed: readonly Re
       if (s !== null) out.sign.push(s);
     }
     const tool = plan.mode === 'attest' ? gh : cosign;
-    const v = attempt('verify', () => { if (tool === undefined) throw new RenderError(`the reviewed list has no ${plan.mode === 'attest' ? 'gh (the pinned gh release lands in the re-pin batch, G15)' : 'cosign'} entry`); return renderVerifySteps(tool, draft, image); });
+    const v = attempt('verify', () => { if (tool === undefined) throw new RenderError(`the reviewed list has no ${plan.mode === 'attest' ? 'gh (the pinned gh release)' : 'cosign'} entry`); return renderVerifySteps(tool, draft, image); });
     if (v !== null) out.verify.push(v);
   }
   return out;

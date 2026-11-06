@@ -816,6 +816,46 @@ tools:
     reviewedAt: "2026-10-28"
     proofs: 0
 
+  # Verifies the build attestation of an image in attest mode (ruling B3 d, P-5; v0.2 Plan G G15a): the reviewed gh release, installed by its
+  #   sha256 and run by its absolute path in the job pipegen-verify only (src/engine/signing.ts renderVerifySteps), never the runner's gh.
+  # Source: release v2.103.3 of cli/cli: gh_2.103.3_linux_amd64.tar.gz sha256 from the release checksums file (gh_2.103.3_checksums.txt,
+  #   asset digest sha256:f756e7859d90dbb5e85aae5194206c37da220bec9bac23d3d659078a8e766fdc); the digest GitHub records for the asset agrees.
+  #   Released 2026-10-26T19:20:08Z (published_at): the newest non-prerelease at least 7 days old on 2026-11-06. Read by the controller on
+  #   2026-11-06 (G15-R0 5; the time of day was not recorded, so pinnedOn is that day's start: the stricter cooldown reading).
+  #   linux arm64 (not rendered): gh_2.103.3_linux_arm64.tar.gz sha256 ee32df2323c8847f5fac6cb6b4b69ca75828e9329a8f22f677021f7b3306ce63.
+  # Flags (G2-R1 carry; G7 progress line "bind the commit with --source-digest"): `gh attestation verify` at v2.103.3 has --source-digest,
+  #   --source-ref, --signer-digest, --cert-identity, --deny-self-hosted-runners and --signer-workflow (pkg/cmd/attestation/verify/verify.go:259-268,
+  #   read by the controller at the tag; not re-read offline here). --signer-workflow is a ^-anchored prefix regex with unescaped dots: pipegen
+  #   uses it only together with --signer-digest. The live checklist runs each flag on this version.
+  # The release's build-provenance attestation is not checked yet (G15-R0 4): the controller checks it live with an independent gh before the
+  #   tag, then records verifiedWith here and adds cli/cli to MUST_VERIFY (src/engine/reviewed.ts) in the same change.
+  - id: gh
+    categories: ["deploy-verify"]
+    languages: ["any"]
+    releasedAt: "2026-10-26T19:20:08Z"
+    pinnedOn: "2026-11-06T00:00:00Z"
+    candidate:
+      id: gh
+      name: "cli/cli"
+      kind: cli
+      repo: cli/cli
+      version: "v2.103.3"
+      pin: { checksum: "4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d" }
+      source: reviewed
+      reviewed: true
+      categories: ["deploy-verify"]
+    step:
+      cli:
+        install: { method: github-release, package: "gh_2.103.3_linux_amd64.tar.gz", version: "v2.103.3" }
+        command: ["gh", "attestation", "verify"]
+      output: { path: "", format: none }
+    fixedInputs: {}
+    choices: {}
+    configFiles: []
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-11-06"
+    proofs: 0
+
   # Lints GitHub workflow files. Same release as data/pinned-binaries.yml (ruling S25). No shellcheck or pyflakes from the runner's PATH.
   # Source: release v1.7.12 of rhysd/actionlint: actionlint_1.7.12_linux_amd64.tar.gz sha256 from the release checksums file. Released 2026-03-30T17:49:21Z.
   # The pinned config ignores only the cache-mode job key, which actionlint 1.7.12 rejects (DECISIONS #79; checked with the real 1.7.12 binary).

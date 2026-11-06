@@ -1949,6 +1949,8 @@ function validDate(text) {
 // src/engine/egress-sets.ts
 var REVIEWED_EGRESS_LABELS = Object.freeze(["github-core", "npm", "pypi", "dockerhub", "ghcr"]);
 var E3_EGRESS_SETS = Object.freeze(["github-releases", "trivy-db", "osv"]);
+var SIGSTORE_SET = "sigstore";
+var G15_EGRESS_SETS = Object.freeze([SIGSTORE_SET]);
 var EGRESS_DOMAIN_SETS = Object.freeze({
   "github-core": Object.freeze([
     "github.com",
@@ -1968,7 +1970,8 @@ var EGRESS_DOMAIN_SETS = Object.freeze({
   ghcr: Object.freeze(["ghcr.io", "pkg-containers.githubusercontent.com"]),
   "github-releases": Object.freeze(["release-assets.githubusercontent.com"]),
   "trivy-db": Object.freeze(["mirror.gcr.io"]),
-  osv: Object.freeze(["api.osv.dev"])
+  osv: Object.freeze(["api.osv.dev"]),
+  [SIGSTORE_SET]: Object.freeze(["rekor.sigstore.dev", "tuf-repo-cdn.sigstore.dev"])
 });
 
 // src/engine/tool-flags.ts
@@ -2091,6 +2094,9 @@ var POLICIES = {
     config: { flag: "--config", content: "check-for-app-update: false\n", fileName: "syft.yaml" }
   },
   cosign: { method: GH, needsSlot: "is run by Plan G's sign job, which adds its own reviewed flags", package: "cosign-linux-amd64", exe: "cosign", dialect: "long", sub: ["sign"], flags: { yes: "bool" }, required: { yes: "true" } },
+  // G15a (B3 d, P-5): the pinned gh release, run only by the attest verify step (signing.ts renderVerifySteps), which adds its own reviewed
+  // flags; never by renderStep. The template is the subcommand alone
+  gh: { method: GH, needsSlot: "is run by the attest verify step of the job pipegen-verify, which adds its own reviewed flags", package: "gh_2.103.3_linux_amd64.tar.gz", exe: "gh", dialect: "long", sub: ["attestation", "verify"], flags: {} },
   actionlint: {
     method: GH,
     package: "actionlint_1.7.12_linux_amd64.tar.gz",
@@ -9589,6 +9595,13 @@ var GATE_VIEW = [
     "id": "cosign",
     "categories": [
       "signing"
+    ],
+    "configFiles": []
+  },
+  {
+    "id": "gh",
+    "categories": [
+      "deploy-verify"
     ],
     "configFiles": []
   },

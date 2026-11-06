@@ -1844,7 +1844,11 @@ describe('data/reviewed-tools.yml', () => {
       if (t.candidate.repo === 'crisworking/pipegen') continue; // pipegen's own repository is exempt (C6): its code is reviewed in this repository
       const at = Date.parse(t.releasedAt);
       expect(Number.isFinite(at), t.id).toBe(true);
-      expect(pinnedOn - at, t.id).toBeGreaterThanOrEqual(COOLDOWN_DAYS * DAY);
+      // G15a: an entry pinned after the list (gh) counts from its own pin day, never earlier than the list's
+      const own = (t as { pinnedOn?: string }).pinnedOn;
+      const pin = own === undefined ? pinnedOn : Date.parse(own);
+      expect(pin, t.id).toBeGreaterThanOrEqual(pinnedOn);
+      expect(pin - at, t.id).toBeGreaterThanOrEqual(COOLDOWN_DAYS * DAY);
     }
     // the loader refuses an entry released less than the cooldown before pinnedOn
     const young = cliEntry();

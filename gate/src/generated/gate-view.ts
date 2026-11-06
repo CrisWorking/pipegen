@@ -221,6 +221,13 @@ export const GATE_VIEW: readonly GateToolView[] = [
     "configFiles": []
   },
   {
+    "id": "gh",
+    "categories": [
+      "deploy-verify"
+    ],
+    "configFiles": []
+  },
+  {
     "id": "actionlint",
     "categories": [
       "workflow-lint"

@@ -64,7 +64,7 @@ import { FIND_RUN_STEP_ID, renderDigestStep, renderHeadCheckStep, renderPublishD
 import { strongReason } from './deploy-gating.js';
 import { ARCHIVE_TOOL_IDS, imageBuildTag, renderImageArchiveScan, renderImageBuild } from './image-handoff.js';
 import { dastStartOf, renderDastRun, renderDastScrub } from './dast-handoff.js';
-import { KEYLESS_VERIFY_SETS, SHARED_CDN_SETS } from './egress.js';
+import { ATTEST_VERIFY_REFUSAL, ATTEST_VERIFY_SETS, KEYLESS_VERIFY_SETS, SHARED_CDN_SETS } from './egress.js';
 import { EGRESS_DOMAIN_SETS, SIGSTORE_SET } from './egress-sets.js';
 import { allowedDomainsProblem, ARGV_POLICIES, BULLFROG_USES, CACHE_LOCKS, GATE_OPTIONAL_UPLOADS, PLAIN_REL_RE, PLATFORM_USES, RANGE_TOOL, RENDERER_INPUTS, rendererInputProblems, SCRUB_SECRET, uploadIfNoFiles } from './tool-flags.js';
 
@@ -1138,7 +1138,8 @@ function judgeJob(fc: FileCtx, id: string, j: unknown): void {
  * and its commit is still that branch's head), and for each image pipegen publishes here its digest step (the gated run's digest artifact by
  * run id, DIGEST_RE-checked) and, whenever the repository's own signing mode signs (re-derived from the repository and its capabilities,
  * never the draft's recorded plan, carry G5→G7 1), that image's signature check after the digest. A verify job assembled in mode none for a
- * signing repository, or in attest mode before the reviewed gh entry exists (G15), has no signature check and is refused.
+ * signing repository has no signature check and is refused; G15a: an attest one is refused while gh's network hosts are in no reviewed set,
+ * and a keyless one must reach Sigstore's hosts through its egress step.
  */
 function judgeVerifyJob(fc: FileCtx, where: string, j: Obj, judged: readonly Judged[]): void {
   // `template`: a verify job that is not the form pipegen writes (each part below is what makes it a proof)
@@ -1164,6 +1165,8 @@ function judgeVerifyJob(fc: FileCtx, where: string, j: Obj, judged: readonly Jud
     const k = plan === undefined || plan === null || !Array.isArray(plan.images) ? -1 : plan.images.findIndex((i) => { try { return slug(String(i?.service)) === s; } catch { return false; } });
     const verify = k < 0 ? -1 : at(`${VERIFY_SOURCE}:${k}`);
     if (verify < 0 || verify < digest) bad(`must check the signature of the image of ${show(service)} after its digest step: this repository signs in mode ${mode}, so a deploy of an image pipegen did not sign (or one verified in mode none) is never let through.`);
+    // G15a (open question 3): an attest verify job is refused while gh's own Sigstore hosts are in no reviewed set (it could only fail)
+    if (mode === 'attest' && ATTEST_VERIFY_SETS === null) bad(`checks an attest-mode image, which pipegen does not verify yet: ${ATTEST_VERIFY_REFUSAL}.`);
     // G15a (carry A2): keyless verification reads Sigstore's trusted root and log, so the job's egress step must reach them (else it fails
     // closed at run time and every deploy stops)
     if (mode === 'keyless') {

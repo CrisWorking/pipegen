@@ -243,6 +243,11 @@ const entrySchema = z.strictObject({
   languages: z.array(z.enum(LANGUAGES)).min(1),
   /** Server-recorded date of the pinned release (cooldown, ruling S26); file metadata, not returned. */
   releasedAt: z.string().regex(ISO_RE),
+  /**
+   * G15a: when this entry was pinned, for an entry added after the list's own pinnedOn (never before it, never in the future). Its cooldown,
+   * reviewedAt and verifiedOn count from it; every other entry keeps the list's. File metadata, not returned.
+   */
+  pinnedOn: z.string().regex(ISO_RE).optional(),
   candidate: candidateSchema,
   step: stepSchema,
   fixedInputs: fixedSchema,
@@ -282,16 +287,25 @@ const fileSchema = z.strictObject({
   // a pinnedOn in the future would let a release younger than the cooldown through
   if (!(pinnedOn <= Date.now())) ctx.addIssue({ code: 'custom', path: ['pinnedOn'], message: 'pinnedOn is in the future: the cooldown is measured from it' });
   f.tools.forEach((t, i) => {
-    if (t.reviewedAt !== PENDING && DATE_RE.test(t.reviewedAt) && t.reviewedAt < pinnedDay) {
-      ctx.addIssue({ code: 'custom', path: ['tools', i, 'reviewedAt'], message: `reviewedAt is before pinnedOn (${pinnedDay}): the review must cover the pins as they are` });
+    // G15a: an entry pinned after the list carries its own pin day, never earlier than the list's and never in the future
+    let at = pinnedOn;
+    let day = pinnedDay;
+    if (t.pinnedOn !== undefined) {
+      at = Date.parse(t.pinnedOn);
+      day = t.pinnedOn.slice(0, 10);
+      if (!(at >= pinnedOn)) ctx.addIssue({ code: 'custom', path: ['tools', i, 'pinnedOn'], message: `the entry's pinnedOn is before the list's (${f.pinnedOn}): an entry is never pinned earlier than the list` });
+      if (!(at <= Date.now())) ctx.addIssue({ code: 'custom', path: ['tools', i, 'pinnedOn'], message: 'the entry\'s pinnedOn is in the future: the cooldown is measured from it' });
+    }
+    if (t.reviewedAt !== PENDING && DATE_RE.test(t.reviewedAt) && t.reviewedAt < day) {
+      ctx.addIssue({ code: 'custom', path: ['tools', i, 'reviewedAt'], message: `reviewedAt is before pinnedOn (${day}): the review must cover the pins as they are` });
     }
     // pipegen's own repository is exempt (C6): its code is reviewed in this repository; the exact repo, nothing else
-    if (!(t.candidate.kind === 'action' && t.candidate.repo === PIPEGEN_OWN_REPO) && !(pinnedOn - Date.parse(t.releasedAt) >= COOLDOWN_DAYS * DAY_MS)) {
+    if (!(t.candidate.kind === 'action' && t.candidate.repo === PIPEGEN_OWN_REPO) && !(at - Date.parse(t.releasedAt) >= COOLDOWN_DAYS * DAY_MS)) {
       ctx.addIssue({ code: 'custom', path: ['tools', i, 'releasedAt'], message: `the release must be at least ${COOLDOWN_DAYS} days older than pinnedOn (cooldown, ruling S26)` });
     }
     // PS24: the signature check must cover the pins as they are
-    if (t.verifiedWith !== undefined && t.verifiedWith.verifiedOn < pinnedDay) {
-      ctx.addIssue({ code: 'custom', path: ['tools', i, 'verifiedWith', 'verifiedOn'], message: `verifiedOn is before pinnedOn (${pinnedDay}): the signature check must cover the pins as they are` });
+    if (t.verifiedWith !== undefined && t.verifiedWith.verifiedOn < day) {
+      ctx.addIssue({ code: 'custom', path: ['tools', i, 'verifiedWith', 'verifiedOn'], message: `verifiedOn is before pinnedOn (${day}): the signature check must cover the pins as they are` });
     }
   });
 });
@@ -1294,7 +1308,7 @@ export function loadReviewed(
 }
 
 function toReviewedTool(e: Entry): ReviewedTool {
-  const { releasedAt: _releasedAt, ...tool } = e;
+  const { releasedAt: _releasedAt, pinnedOn: _pinnedOn, ...tool } = e;
   return tool as ReviewedTool;
 }
 

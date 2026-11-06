@@ -219,7 +219,8 @@ describe('referee: the renderer and the referee agree', () => {
     expect(r.demoted).toEqual([]);
     // the entries the renderer refuses are the documented ones (6c report), nothing else
     // (registry is a job service and skipped above with the platform entries)
-    expect(refused.sort()).toEqual(['cosign', 'gosec', 'pypi-publish', 'schemathesis', 'scorecard-action', 'bandit', 'coverage-py', 'creosote', 'mypy', 'vulture'].sort());
+    // (G15a: gh, like cosign, is run only by its own verify step in pipegen-verify, signing.ts)
+    expect(refused.sort()).toEqual(['cosign', 'gh', 'gosec', 'pypi-publish', 'schemathesis', 'scorecard-action', 'bandit', 'coverage-py', 'creosote', 'mypy', 'vulture'].sort());
     // (G4-R1: the two DAST tools are judged in their two-job form in test/jobs-dast.test.ts, not here)
     expect(specs.length).toBeGreaterThan(28);
   });

@@ -51,7 +51,7 @@ import { RenderError } from '../engine/render-error.js';
 import { renderFindRunStep, stepsToYaml } from '../engine/render-step.js';
 import { FIND_RUN_STEP_ID, renderDigestStep, renderHeadCheckStep } from '../engine/deploy-steps.js';
 import { slug } from '../engine/artifact-names.js';
-import { egressSetsForTool, KEYLESS_VERIFY_SETS } from '../engine/egress.js';
+import { ATTEST_VERIFY_REFUSAL, ATTEST_VERIFY_SETS, egressSetsForTool, KEYLESS_VERIFY_SETS } from '../engine/egress.js';
 import type { EgressSet } from '../engine/egress-sets.js';
 import { publishedImageServices } from '../engine/needs.js';
 import { COSIGN_ID, GH_ID, renderVerifySteps, type SignedImage } from '../engine/signing.js';
@@ -481,7 +481,8 @@ export function verifyJob(draft: PipelineDraft, deps: { gate: ReviewedTool; revi
  * The verify job's steps after find-run (G7), and the egress sets they need besides github-core: the head check; for the published image
  * (publishedImageServices: one per repository in v0.2) the digest step; and when the draft records a signing plan, that image's signature
  * check (signing.ts, from the reviewed cosign entry, or gh for attest). A published image the plan does not sign, a signing plan without
- * the image, a signing step that can not be rendered (attest until G15) and more than one published image are refused (fail closed).
+ * the image, a signing step that can not be rendered, an attest verify job while gh's network hosts are not a reviewed set (G15a) and more than
+ * one published image are refused (fail closed).
  */
 export function verifyTail(draft: PipelineDraft, reviewed: readonly ReviewedTool[]): { steps: RenderedStep[]; sets: EgressSet[] } {
   const steps: RenderedStep[] = [guard(() => renderHeadCheckStep(draft.profile.defaultBranch))];
@@ -499,10 +500,15 @@ export function verifyTail(draft: PipelineDraft, reviewed: readonly ReviewedTool
     const image = planned.find((i) => sameSlug(i?.service, service));
     if (image === undefined) fail(`The image of ${show(service)} is published, but the signing plan does not sign it, so a deploy of it could not be verified.`);
     const tool = reviewed.find((t) => t.id === (plan.mode === 'attest' ? GH_ID : COSIGN_ID));
-    if (tool === undefined) fail(plan.mode === 'attest' ? 'Attest-mode deploys are verified with the reviewed pinned gh release, which is not on the reviewed list yet (it lands with the re-pin batch, G15), so this deploy can not be verified.' : 'The reviewed list has no cosign entry, so no deploy can be verified.');
+    if (tool === undefined) fail(plan.mode === 'attest' ? 'Attest-mode deploys are verified with the reviewed pinned gh release, which is not on the reviewed list, so this deploy can not be verified.' : 'The reviewed list has no cosign entry, so no deploy can be verified.');
     steps.push(...guard(() => renderVerifySteps(tool as ReviewedTool, draft, image as SignedImage)));
     for (const x of egressSetsForTool(tool as ReviewedTool)) sets.add(x);
     sets.add('ghcr');
+    // G15a (open question 3): gh's own Sigstore hosts are not sourced for the pinned gh yet, so an attest verify job is refused (fail closed)
+    if (plan.mode === 'attest') {
+      if (ATTEST_VERIFY_SETS === null) fail(`Attest-mode deploys can not be verified yet: ${ATTEST_VERIFY_REFUSAL}.`);
+      for (const x of ATTEST_VERIFY_SETS ?? []) sets.add(x);
+    }
     // G15a (carries A2, A3): keyless verification reads Sigstore's trusted root and log; only this job gets that set (mode-scoped)
     if (plan.mode === 'keyless') for (const x of KEYLESS_VERIFY_SETS) sets.add(x);
   }

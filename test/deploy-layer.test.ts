@@ -298,9 +298,9 @@ describe('G7 verify job: what pipegen-verify proves before a deploy', () => {
   });
 
   it('verify job: attest mode uses gh attestation verify --signer-workflow', () => {
-    // the reviewed pinned gh release lands with the re-pin batch (G15); a gh entry of the same form shows the rendered command
-    const cosign = REVIEWED.find((t) => t.id === 'cosign') as ReviewedTool;
-    const gh: ReviewedTool = { ...cosign, id: 'gh', candidate: { ...cosign.candidate, id: 'gh', name: 'cli/cli', repo: 'cli/cli' }, step: { ...cosign.step, cli: { ...(cosign.step.cli as NonNullable<ReviewedTool['step']['cli']>), command: ['gh', 'attestation', 'verify'] } } };
+    // G15a: the reviewed pinned gh release is on the list
+    const gh = REVIEWED.find((t) => t.id === 'gh') as ReviewedTool;
+    expect(gh).toBeDefined();
     const prof = profileOf([SERVER], { private: true });
     const draft = planned(prof, { over: { centralPin: PIN, signing: { mode: 'attest', images: [IMG] } } }).draft;
     const run = String(renderVerifySteps(gh, draft, IMG)[1]?.run);
@@ -308,12 +308,10 @@ describe('G7 verify job: what pipegen-verify proves before a deploy', () => {
     expect(run).toContain("--signer-workflow 'o/pipelines/.github/workflows/r--sign.yml'");
     expect(run).toContain(`--signer-digest '${PIN.sha}'`);
     expect(run).toContain("--repo 'o/r'");
-    // until the reviewed gh entry exists, an attest deploy of an image can not be verified: assembling its verify job is refused
-    expect(REVIEWED.some((t) => t.id === 'gh')).toBe(false);
-    expect(() => verifyTail(draft, REVIEWED)).toThrow(/reviewed pinned gh release.*G15/);
-    // with the gh entry of that form the job is assembled, with the attest permissions (G7-R1 sec M7), and the command above is its last step
-    const tail = verifyTail(draft, [...REVIEWED, gh]);
-    expect(String(tail.steps.at(-1)?.run)).toBe(run);
+    // the attest verify job stays refused, with a plain reason: gh reads GitHub's Sigstore trust root from a host no reviewed network set
+    // holds yet (the live checklist confirms it for the pinned gh), so behind the network lock the job could only fail
+    expect(() => verifyTail(draft, REVIEWED)).toThrow(/trust root/);
+    expect(() => verifyTail(draft, REVIEWED)).not.toThrow(/\bG\d+\b/);
     expect(verifyPermissions(draft)).toEqual({ contents: 'read', actions: 'read', packages: 'read', attestations: 'read' });
   });
 
