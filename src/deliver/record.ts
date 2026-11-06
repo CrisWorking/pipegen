@@ -70,6 +70,13 @@ const API = z.strictObject({
 /** The deepest nesting a record may have (fix round 1, m2): deeper is refused with a plain reason before the schema runs. */
 export const MAX_RECORD_DEPTH = 32;
 /** A repo-relative path or glob pattern: no absolute path, no backslash, no `..` segment (fix round 1, m3). */
+/**
+ * G13-R2 1: the protected paths in the record. CODEOWNERS and the gate anchor a name to the root with a leading `/` (`/trivy.yaml`: the root
+ * only; `trivy.yaml`: any depth). The record holds repo-relative paths only (REL), so a root-anchored entry is kept as `./name` (still the root
+ * only, also for the gate's matcher) and read back as `/name`. The one pair of conversions, used by deliver (write) and finish/verify (read).
+ */
+export const protectedPathsForRecord = (paths: readonly string[]): string[] => paths.map((p) => (p.startsWith('/') ? `./${p.replace(/^\/+/, '')}` : p));
+export const protectedPathsOfRecord = (paths: readonly string[]): string[] => paths.map((p) => (p.startsWith('./') ? `/${p.replace(/^(?:\.\/)+/, '')}` : p));
 const REL = z.string().max(400).refine((p) => p !== '' && !p.startsWith('/') && !p.includes('\\') && !p.split('/').includes('..'), 'not a repo-relative path');
 const ENV_SETTINGS = z.strictObject({
   wait_timer: z.number().int().min(0).max(43_200), prevent_self_review: z.boolean(),

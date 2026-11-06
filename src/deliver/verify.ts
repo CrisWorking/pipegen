@@ -29,7 +29,7 @@ import { GATE_CHECK_INTEGRATION_ID, GATE_CHECK_NAME, PROTECTED_PATHS_BASE, type 
 import { safeText } from '../util/safe-text.js';
 import { readEnv, SETUP_BRANCH } from './deliver.js';
 import { compareStatus, DeliverError, readBlobText, readHead, readRepo, readTree, statusOf, type RepoRef, type TreeEntry } from './git-data.js';
-import { centralOf, readLocalRecord, readRecord, RecordError, recordMarkerOf, recordPath, type LocalRecordDeps } from './record.js';
+import { centralOf, protectedPathsOfRecord, readLocalRecord, readRecord, RecordError, recordMarkerOf, recordPath, type LocalRecordDeps } from './record.js';
 import { classicPutForm, holdsWanted, isObj, SettingsApi } from './settings-api.js';
 
 export interface VerifyDrift { what: string; expected: string; actual: string | null }
@@ -39,7 +39,7 @@ export interface VerifyDeps { clock?: RateClock; local?: LocalRecordDeps }
 const show = (s: string, n = 140): string => safeText(s, n);
 const MAX_TEXT = 512 * 1024;
 /** Which recorded paths are protected: the record's own list for the app (the built-in one if it holds none), the central list for central. */
-const protectedListOf = (r: InstallRecord, repo: 'app' | 'central'): readonly string[] => (repo === 'app' ? (r.protectedPaths.length > 0 ? r.protectedPaths : PROTECTED_PATHS_BASE) : CENTRAL_PROTECTED_PATHS);
+const protectedListOf = (r: InstallRecord, repo: 'app' | 'central'): readonly string[] => (repo === 'app' ? (r.protectedPaths.length > 0 ? protectedPathsOfRecord(r.protectedPaths) : PROTECTED_PATHS_BASE) : CENTRAL_PROTECTED_PATHS);
 
 /** `pipegen verify` for the app (read-only; see the header). */
 export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): Promise<VerifyResult> {
@@ -412,7 +412,7 @@ async function findSetupPr(api: SettingsApi, app: RepoRef): Promise<number | und
 function teamOnly(text: string, r: InstallRecord, path: string): string[] {
   const lines = text.split(/\r?\n/);
   const end = lines.findIndex((l) => l.trim() === CODEOWNERS_END);
-  const isProt = protectedMatcher([...new Set([...r.protectedPaths, ...PROTECTED_PATHS_BASE])]);
+  const isProt = protectedMatcher([...new Set([...protectedPathsOfRecord(r.protectedPaths), ...PROTECTED_PATHS_BASE])]);
   const out: string[] = [];
   for (const raw of lines.slice(end < 0 ? 0 : end + 1)) {
     const line = raw.trim();

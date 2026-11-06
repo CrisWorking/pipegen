@@ -470,6 +470,12 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
       centralFileList = await st.readCentralFileList(facts, p);
       built = await st.build(inputs(draft, centralFileList));
       if (!judgedClean(built)) return 2;
+    } else if (built.files.some((f) => f.repo === 'central')) {
+      // G13-R2: a public app's batch holds the record repo's CODEOWNERS (the central lock): judged against the central file list, and
+      // delivered with it (deliver refuses central files without one)
+      centralFileList = await st.readCentralFileList(facts, p);
+      built = await st.build(inputs(draft, centralFileList));
+      if (!judgedClean(built)) return 2;
     }
     // ruling G13-R0 3: the preview estimate from the assembled jobs; asked again when it is higher than what was agreed
     const est2 = estimate(p, built.minutes.jobs, 2, activity, provider, { needKeys: needKeyCount(built.assembled.draft.needs) });

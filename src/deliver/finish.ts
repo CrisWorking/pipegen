@@ -58,7 +58,7 @@ import { generateCosignKeys } from '../layers/deploy.js';
 import type { CosignExec, CosignResolver } from './cosign-keys.js';
 import { ensureSigningEnvironment, plannedOfLocks, readEnv, SETUP_BRANCH } from './deliver.js';
 import { DeliverError, isoAt, readBlobText, readHead, readRepo, readTree, statusOf, type RepoRef, type TreeEntry } from './git-data.js';
-import { centralOf, centralUpdateBranch, localFinishPendingPath, readFinishPending, readLocalRecord, RecordError, writeFinishPending, writeRecord, type FinishPending, type LocalRecordDeps } from './record.js';
+import { centralOf, centralUpdateBranch, localFinishPendingPath, protectedPathsOfRecord, readFinishPending, readLocalRecord, RecordError, writeFinishPending, writeRecord, type FinishPending, type LocalRecordDeps } from './record.js';
 import { classicPutForm, holdsWanted, isObj, PLANNED_ROUTES, refusedAsUnavailable, SettingsApi } from './settings-api.js';
 import { trustedPrevious } from './trust.js';
 
@@ -926,7 +926,7 @@ export async function finish(gh: Octokit, app: RepoRef, opts: FinishOpts, deps: 
     };
     // the inputs from the record (a typed record carries none: re-derived from the CODEOWNERS block on the default branch)
     const owners = typed ? ownersOf(appCo.block) : rec.planned.owners.app;
-    const protectedPaths = rec.protectedPaths.length > 0 ? rec.protectedPaths : [...PROTECTED_PATHS_BASE];
+    const protectedPaths = rec.protectedPaths.length > 0 ? protectedPathsOfRecord(rec.protectedPaths) : [...PROTECTED_PATHS_BASE];
     const coEdit = rec.edits.find((e) => e.repo === 'app' && e.kind === 'codeowners' && e.path === appCo.path) as { inserted: string } | undefined;
     const inserted = coEdit !== undefined && appCo.text.split(coEdit.inserted).length === 2 ? coEdit.inserted : appCo.block;
     const fresh = planLocks({

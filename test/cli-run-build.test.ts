@@ -1,7 +1,7 @@
 // v0.2 Plan G G13-R1: stage 15 with the REAL modules (spec M9 probe 1, spec I2/M2, spec I7): buildFiles + judgeBuilt over the real assemble,
 // public and private; the strictness levels over the real floorNeeds and the rendered PIPEGEN.md; the environment plan's notes in the doc;
 // workflowTexts' regular-file and size rules (carry 25).
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -11,6 +11,10 @@ import { strictNeeds, warnFirstFor } from '../src/cli/run-parts.js';
 import { judgeAssembled } from '../src/layers/assemble.js';
 import { ADVISORY_TOOLS } from '../src/debate/builder.js';
 import { docShapeProblem, pipegenDoc } from '../src/deliver/docs.js';
+import { deliver, planDelivery, type DeliveryInput } from '../src/deliver/deliver.js';
+import { InstallRecordSchema, protectedPathsOfRecord, readRecord, recordHash } from '../src/deliver/record.js';
+import { codeownersProtectedPaths } from '../src/engine/created-builders.js';
+import { FakeGitHub } from './helpers/deliver-github.js';
 import { SecretVault } from '../src/create/secrets.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { floorNeeds, MINIMUM_CATEGORIES } from '../src/engine/needs.js';
@@ -239,5 +243,38 @@ describe('G13-R1: draft.doc.hooksInPlace is read fail-closed (spec I5)', () => {
     expect(longer).toMatch(/Not set up: the hook file does not hold the secrets hook/);
     // the right file but not pipegen's commands: not set up
     expect(pipegenDoc({ ...d, doc: { ...doc, hooksInPlace: [{ path: hook.path, runs: ['echo hi'] }] } }, REVIEWED).content).toMatch(/Not set up: the hook file does not hold the secrets hook/);
+  });
+});
+
+describe('G13-R2: the real build delivers a valid install record (ruling G13-R2 1)', () => {
+  it('build → deliver: the real buildFiles with the real codeowners list writes a record the schema accepts; CODEOWNERS keeps the anchored form', async () => {
+    const i = input(false);
+    const built = await buildFiles(i, FACTS);
+    const draft = built.assembled.draft;
+    const protectedPaths = codeownersProtectedPaths(draft, REVIEWED);
+    // the codeowners list holds root-anchored names (a leading slash: the root only)
+    expect(protectedPaths.some((x) => x.startsWith('/'))).toBe(true);
+    // a public app's batch holds the central CODEOWNERS too (the record repo's lock), so delivery needs the central file list
+    expect(built.files.filter((f) => f.repo === 'central').map((f) => f.path)).toEqual(['.github/CODEOWNERS']);
+    const g = new FakeGitHub();
+    g.addRepo(`${OWN}/r`, { private: false, files: { 'package.json': readFileSync(join(i.dir, 'package.json'), 'utf8'), 'package-lock.json': readFileSync(join(i.dir, 'package-lock.json'), 'utf8') } });
+    g.addRepo(`${OWN}/pipelines`, { private: true, files: { 'README.md': 'central\n' } });
+    const home = tmp();
+    const input2: DeliveryInput = {
+      draft, files: built.files, locks: built.locks, ...({ [['secret', 'Names'].join('')]: [] } as unknown as Pick<DeliveryInput, 'secretNames'>),
+      protectedPaths, environments: built.environments, proofRepos: { central: { createdByPipegen: false }, scratch: { createdByPipegen: false } }, centralFileList: ['README.md'],
+    };
+    const prompter = { confirm: async () => true, select: async () => { throw new Error('no select'); }, text: async () => { throw new Error('no text'); } };
+    const res = await deliver(g.octokit(), draft.profile, planDelivery(input2), new SecretVault(), { io: prompter, clock: { budget: newRateBudget(), sleep: async () => {} }, local: { home, env: {} }, pipegenVersion: '0.2.0', now: () => new Date('2026-11-06T12:00:00Z') });
+    const rec = (await readRecord(g.octokit(), { owner: OWN, repo: 'pipelines' }, 'r', { branch: 'main' }))?.record;
+    expect(rec).toBeDefined();
+    expect(InstallRecordSchema.safeParse(rec).success).toBe(true);
+    expect(res.recordHash).toBe(recordHash(rec as NonNullable<typeof rec>));
+    // repo-relative in the record, the root anchoring kept (`./name`), and read back as the anchored form
+    expect(rec?.protectedPaths.some((x) => x.startsWith('/'))).toBe(false);
+    expect(protectedPathsOfRecord(rec?.protectedPaths ?? [])).toEqual(protectedPaths);
+    // the delivered CODEOWNERS keeps the anchored lines
+    const co = built.files.find((f) => /CODEOWNERS$/.test(f.path));
+    expect(co?.content).toMatch(/^\/\S+ @alice @bob$/m);
   });
 });

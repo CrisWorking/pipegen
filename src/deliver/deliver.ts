@@ -50,7 +50,7 @@ import { safeText } from '../util/safe-text.js';
 import {
   commitFiles, compareStatus, DeliverError, ghRead, ghWrite, isoAt, openOrUpdatePr, readHead, readRepo, readTree, refusedMove, setBranch, statusOf, type RepoRef, type TreeEntry,
 } from './git-data.js';
-import { addLocalLeftovers, centralPrBase, centralUpdateBranch, localRecordPath, ownWholeFile, RecordError, writeRecord, type Leftover, type LocalRecordDeps } from './record.js';
+import { addLocalLeftovers, centralPrBase, centralUpdateBranch, localRecordPath, ownWholeFile, protectedPathsForRecord, RecordError, writeRecord, type Leftover, type LocalRecordDeps } from './record.js';
 import { trustedPrevious } from './trust.js';
 
 export { DeliverError };
@@ -608,7 +608,7 @@ function buildRecord(x: RecordCtx): InstallRecord {
     ...(prev?.orgRuleset === undefined ? {} : { orgRuleset: prev.orgRuleset }),
     ...(prev?.repoSettings === undefined ? {} : { repoSettings: prev.repoSettings }),
     central, ...(scratch === undefined ? {} : { scratch: { ...scratch } }),
-    planned: plannedOf(d), protectedPaths: [...d.protectedPaths],
+    planned: plannedOf(d), protectedPaths: protectedPathsForRecord(d.protectedPaths),
     ...(cosign === undefined ? {} : { cosignPubSha256: cosign }), ...(pub === undefined ? {} : { cosignPub: pub }), ...(prev?.blockFrom === undefined ? {} : { blockFrom: prev.blockFrom }),
   };
 }

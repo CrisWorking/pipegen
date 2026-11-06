@@ -1279,3 +1279,19 @@ describe('G13-R1: what the user is told', () => {
     expect(i.asked.find((q) => /Open the setup pull request/.test(q))).toContain('only on an environment your deploy jobs use');
   });
 });
+
+describe('G13-R2: a public app\'s central CODEOWNERS', () => {
+  it('run: a public app whose batch holds central files reads the central file list once, judges with it and delivers it', async () => {
+    const w = world({ facts: facts({}, { private: false }), built: (i) => builtOf(i, { files: [FILE('PIPEGEN.md'), FILE('.github/CODEOWNERS', 'central')] }) });
+    expect(await run(w)).toBe(0);
+    expect(w.calls).not.toContain('deliverCentral');
+    expect(w.calls.filter((c) => c === 'readCentralFileList')).toHaveLength(1);
+    const listed = ['.github/workflows/r--merge.yml', 'installs/r.json'];
+    expect(w.builds.at(-1)?.centralFiles).toEqual(listed);
+    expect((w.got.deliver?.[0] as { centralFileList?: string[] }).centralFileList).toEqual(listed);
+    // a public app with no central file reads no list
+    const w2 = world({ facts: facts({}, { private: false }) });
+    expect(await run(w2)).toBe(0);
+    expect(w2.calls).not.toContain('readCentralFileList');
+  });
+});
