@@ -112,6 +112,10 @@ function afterStripProblem(e: TextEdit, stripped: string, current: string): stri
   if (e.kind === 'codeowners') return stripped.includes(CODEOWNERS_BEGIN) || stripped.includes(CODEOWNERS_END) ? "a pipegen CODEOWNERS marker is still in the file besides pipegen's recorded block" : null;
   if (e.kind === 'hooks') {
     if (stripped.includes(HOOKS_MARKER)) return `a ${HOOKS_MARKER} marker is still in the file besides pipegen's recorded block`;
+    // V2-R1b m3: an owner line before the cut that continues onto the next would join the owner's line after it into one command
+    const at = current.indexOf(e.inserted);
+    const last = current.slice(0, at < 0 ? 0 : at).split('\n').filter((l) => l.trim() !== '').at(-1) ?? '';
+    if (e.path === HOOK_FILES.husky && /\\\s*$/.test(last)) return "the owner's line before pipegen's block continues onto the next, so the cut would join two of the owner's lines";
     const f = hookFormOf(e.path, e.inserted, false);
     if (f === null) return 'the hooks block is not pipegen\'s';
     return hookDataProblem(f.manager, stripped, current, f.commands) === null ? null : 'the file does not read as the rest plus exactly pipegen\'s hooks (an owner line may sit under pipegen\'s block)';
@@ -492,10 +496,21 @@ export function revertPair(json: { edit: JsonEdit; current: CurrentFile | null }
  */
 export function revertEdits(edits: readonly InstallEdit[], read: (e: InstallEdit) => CurrentFile | null, blob: BlobReader, ctx: RevertContext = {}): { edit: InstallEdit; result: RevertResult }[] {
   const pairs = new Map<InstallEdit, RevertResult>();
+  // V2-R1b m1: a lock related to more than one package.json (either side naming the other) goes manual with all of them, whatever the order
+  const jsons = edits.filter((x): x is JsonEdit => x.kind === 'package-json');
+  const relates = (j: JsonEdit, l: LockEdit): boolean => l.repo === j.repo && (l.path === j.lock || l.json === j.path);
+  for (const l of edits) {
+    if (l.kind !== 'package-lock') continue;
+    const owners = jsons.filter((j) => relates(j, l));
+    if (owners.length < 2) continue;
+    const m = manual(`${show(l.path)} is related to more than one package.json edit in the record (${owners.map((j) => show(j.path)).join(', ')}), so none of them goes back; review them by hand.`);
+    pairs.set(l, m);
+    for (const j of owners) pairs.set(j, m);
+  }
   for (const e of edits) {
-    if (e.kind !== 'package-json') continue;
+    if (e.kind !== 'package-json' || pairs.has(e)) continue;
     // V2-R1 sec M1: a lock is this package.json's when either names the other; revertPair refuses a pair that isn't mutual, so neither goes alone
-    const related = edits.filter((x): x is LockEdit => x.kind === 'package-lock' && x.repo === e.repo && (x.path === e.lock || x.json === e.path));
+    const related = edits.filter((x): x is LockEdit => x.kind === 'package-lock' && relates(e, x));
     if (related.length > 1) {
       const m = manual(`${show(e.path)} has more than one lock file edit in the record, so none of them goes back; review them by hand.`);
       pairs.set(e, m);

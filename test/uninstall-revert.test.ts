@@ -448,4 +448,29 @@ describe('V2: the revert engine', () => {
     const good = textEdit('codeowners', 'CODEOWNERS', original, codeownersFile(original, block), { ownerEdited: true });
     expect(revertEdit(good, cur(codeownersFile(original, block)), blob)).toMatchObject({ kind: 'manual', remove: good.inserted });
   });
+
+  it('V2-R1b m1: a lock related to more than one package.json goes manual with all of them, in any order', () => {
+    const pj = '{\n  "name": "c"\n}\n';
+    const pjNew = buildPackageJson(pj, { add: { c8: '12.0.0' }, setTest: false }) as string;
+    const lock = '{ "m": 1 }\n';
+    const lockNew = '{ "m": 2 }\n';
+    for (const t of [pj, pjNew, lock, lockNew]) put(t);
+    const pj1: Extract<InstallEdit, { kind: 'package-json' }> = { repo: 'app', path: 'package.json', kind: 'package-json', add: { c8: '12.0.0' }, setTest: false, lock: 'package-lock.json', originalSha: gitBlobSha(pj), writtenShas: [gitBlobSha(pjNew)] };
+    const lk: Extract<InstallEdit, { kind: 'package-lock' }> = { repo: 'app', path: 'package-lock.json', kind: 'package-lock', json: 'package.json', originalSha: gitBlobSha(lock), writtenShas: [gitBlobSha(lockNew)] };
+    const pj2: Extract<InstallEdit, { kind: 'package-json' }> = { ...pj1, path: 'web/package.json' };
+    const read = (e: InstallEdit): { text: string; sha: string } => (e.kind === 'package-lock' ? cur(lockNew) : cur(pjNew));
+    for (const order of [[pj1, lk, pj2], [pj2, lk, pj1], [lk, pj2, pj1]]) {
+      expect(revertEdits(order, read, blob, CTX).map((x) => x.result.kind), order.map((e) => e.path).join(',')).toEqual(['manual', 'manual', 'manual']);
+    }
+  });
+
+  it('V2-R1b m3: a husky strip after an owner line that continues onto the next is manual', () => {
+    const husky = '#!/usr/bin/env sh\nfoo \\\n';
+    const hb = hookBlock('husky', [{ id: 'biome', run: 'npx biome check' }]);
+    const he = textEdit('hooks', '.husky/pre-commit', husky, `${husky}${hb}`);
+    expect(revertEdit(he, cur(`${husky}${hb}bar\n`), blob)).toMatchObject({ kind: 'manual', remove: hb });
+    expect(revertEdit(he, cur(`${husky}\n${hb}bar\n`), blob)).toMatchObject({ kind: 'manual', remove: hb });   // a blank line between: still the same command
+    const plain = textEdit('hooks', '.husky/pre-commit', '#!/usr/bin/env sh\nfoo\n', `#!/usr/bin/env sh\nfoo\n${hb}`);
+    expect(textOf(revertEdit(plain, cur(`#!/usr/bin/env sh\nfoo\n${hb}bar\n`), blob))).toBe('#!/usr/bin/env sh\nfoo\nbar\n');
+  });
 });
