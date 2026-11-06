@@ -162,7 +162,8 @@ describe('mapCoverage (brief)', () => {
 describe('mapCoverage (rulings)', () => {
   it('coverage: pre-commit framework and lefthook hook configs are read (S4)', async () => {
     const dir = makeTempDir();
-    writeIn(dir, '.pre-commit-config.yaml', 'repos:\n  - repo: https://github.com/gitleaks/gitleaks\n    rev: v8.0.0\n    hooks:\n      - id: gitleaks\n  - repo: local\n    hooks:\n      - id: fmt\n        entry: ruff format\n        stages: [manual]\n');
+    // G6-R4: v8.0.0's hook ran no scan, so the fixture uses a tag whose hook does
+    writeIn(dir, '.pre-commit-config.yaml', 'repos:\n  - repo: https://github.com/gitleaks/gitleaks\n    rev: v8.30.1\n    hooks:\n      - id: gitleaks\n  - repo: local\n    hooks:\n      - id: fmt\n        entry: ruff format\n        stages: [manual]\n');
     const rows = await coverage(dir, pyApp);
     expect(row(rows, 'pre-commit', 'secrets')).toMatchObject({ status: 'covered', by: 'gitleaks', where: '.pre-commit-config.yaml' });
     expect(row(rows, 'pre-commit', 'hooks')).toMatchObject({ status: 'covered', by: 'pre-commit' });
@@ -181,12 +182,16 @@ describe('mapCoverage (rulings)', () => {
       writeIn(dir, '.pre-commit-config.yaml', config);
       return row(await coverage(dir, pyApp), 'pre-commit', 'secrets');
     };
-    for (const config of [canonical, withHook('        stages: []\n'), `default_stages: [pre-commit]\n${canonical}`, withHook('        pass_filenames: false\n')]) {
+    for (const config of [canonical, canonical.replace('v8.30.1', 'v8.1.1'), withHook('        stages: []\n'), `default_stages: [pre-commit]\n${canonical}`, withHook('        pass_filenames: false\n')]) {
       expect((await status(config)).status, config).toBe('covered');
     }
     for (const config of [
       withHook('        args: ["#", "--exit-code=0"]\n'), withHook('        args: [--verbose]\n'), withHook('        pass_filenames: true\n'),
-      `default_stages: [pre-push]\n${withHook('        stages: []\n')}`, canonical.replace('v8.30.1', 'master'), canonical.replace('v8.30.1', '83d9cd684c87d95d656c1458ef04895a7f1cbd8e'), canonical.replace('id: gitleaks', 'id: gitleaks-system'),
+      `default_stages: [pre-push]\n${withHook('        stages: []\n')}`, canonical.replace('v8.30.1', 'master'), ...['v8.0.0', 'v8.1.0', 'v9.0.0', 'v9.2.1', 'v10.2.3'].map((t) => canonical.replace('v8.30.1', t)),
+      // G6-R4 minor 1: pre-commit's PyYAML merges `<<`, the audit's YAML 1.2 reader keeps it as a literal key: no credit with one
+      `<<: {exclude: '.*'}\n${canonical}`, `<<: {default_stages: [manual]}\n${canonical}`,
+      canonical.replace('    rev: v8.30.1\n', '    rev: v8.30.1\n    <<: {x: 1}\n'), withHook('        <<: {files: ^docs/}\n'),
+      canonical.replace('v8.30.1', '83d9cd684c87d95d656c1458ef04895a7f1cbd8e'), canonical.replace('id: gitleaks', 'id: gitleaks-system'),
       local('        entry: "gitleaks git --pre-commit --redact --staged\\n--exit-code=0"\n        pass_filenames: false\n'),
       local('        entry: gitleaks git --pre-commit --redact --staged # --exit-code=0\n        pass_filenames: false\n'),
       local('        entry: gitleaks git --pre-commit --redact --staged --verbose\n'),

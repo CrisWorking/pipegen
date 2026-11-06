@@ -22,6 +22,9 @@ import { HOOK_FILES, hookCommands, hookFile, SECRETS_HOOK_ID, type HookManager }
 import { readTextLimitedWithReason } from '../read/limits.js';
 import type { CreatedFile, InstallEdit, PipelineDraft, ReviewedTool } from '../types.js';
 
+/** G6-R4 HOLE 2: the note next to the canonical gitleaks hook (pipegen's own secrets hook is added all the same). */
+const ALSO_SCANS_NOTE = 'Your hooks already run gitleaks; pipegen adds its own secrets hook too, because it also checks files the usual hook skips.';
+
 /** The one command that turns each manager's hooks on in a clone (shown to the user in PIPEGEN.md). Fixed text. */
 export const SETUP_COMMANDS: Readonly<Record<HookManager, string>> = Object.freeze({ 'pre-commit': 'pre-commit install', husky: 'npm install', lefthook: 'lefthook install' });
 
@@ -98,8 +101,8 @@ export async function precommitFiles(draft: PipelineDraft, reviewed: readonly Re
   // what the builder will leave out, said plainly (G6-R2 spec I3: one true reason each)
   let wanted: string[] = [];
   try { wanted = hookCommands(draft, reviewed).map((c) => c.id); } catch { /* hookFile gives the note */ }
-  const credited = wanted.includes(SECRETS_HOOK_ID) && existingSecretsHook(manager, original);
-  if (credited) notes.push(`Your ${path} already scans for secrets at commit, so pipegen adds no secrets hook of its own there.`);
+  // G6-R4 HOLE 2: pipegen's own secrets hook is always added; the canonical gitleaks hook only gets a note saying why both run
+  if (wanted.includes(SECRETS_HOOK_ID) && existingSecretsHook(manager, original)) notes.push(ALSO_SCANS_NOTE);
   const asksSecrets = draft.needs.some((n) => n.layer === 'pre-commit' && n.id === 'secrets');
   if (asksSecrets && !reviewed.some((t) => t.id === 'gitleaks' && t.categories.includes('secrets'))) notes.push("pipegen's reviewed list has no gitleaks entry here, so it adds no local secrets hook; the CI secret scan still runs on every push.");
   const biome = reviewed.find((t) => t.id === 'biome')?.step.cli?.install;
@@ -109,11 +112,7 @@ export async function precommitFiles(draft: PipelineDraft, reviewed: readonly Re
   }
 
   const built = hookFile(manager, original, draft, reviewed);
-  if ('note' in built) {
-    // nothing left to add only because the repo already scans: that is the reason, not "no reviewed hook command"
-    const onlyCredited = credited && wanted.every((id) => id === SECRETS_HOOK_ID);
-    return onlyCredited ? none() : none(built.note);
-  }
+  if ('note' in built) return none(built.note);
   if (manager === 'husky') notes.push('husky hooks are shell scripts, so CI does not re-run them (no hooks-ci command); the CI secret scan still runs on every push.');
   const file: CreatedFile = { path, content: built.content, part: 'precommit', reason: REASON, repo: 'app', edited: { original } };
   const edit: InstallEdit = { repo: 'app', path, kind: 'hooks', inserted: built.inserted, originalSha: original === '' ? null : gitBlobSha(original), writtenShas: [gitBlobSha(built.content)] };

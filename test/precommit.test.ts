@@ -54,6 +54,7 @@ const BIOME_RUN = `npx --no --package=@biomejs/biome@${BIOME_VERSION} -- biome c
 const PRE_COMMIT = 'repos:\n  - repo: https://github.com/pre-commit/pre-commit-hooks\n    rev: 2c9f875913ee60ca25ce70243dc24d5b6415598c   # v6.0.0\n    hooks:\n      - id: trailing-whitespace\n';
 const LEFTHOOK = 'commit-msg:\n  commands:\n    lint:\n      run: npx --no -- commitlint --edit {1}\n';
 const HUSKY = 'npm test\n';
+const ALSO_NOTE = 'Your hooks already run gitleaks; pipegen adds its own secrets hook too, because it also checks files the usual hook skips.';
 
 describe('G6: the pre-commit layer (plan Task 3, B4)', () => {
   it('precommit: existing config gets hooks appended, existing untouched, edit recorded', async () => {
@@ -108,7 +109,7 @@ describe('G6: the pre-commit layer (plan Task 3, B4)', () => {
       // G6-R3 N3: no-exec mode, a dangling `||` that would swallow pipegen's first line, a hashed npx
       'set -n\n', 'set -o noexec\n', 'set -euxn\n', 'set -nu\n', 'npm test && set -n\n', 'set -o  noexec\nnpm test\n', 'set -eo noexec\n',
       'npm test ||\n', 'npm test || # later\n', 'npm test ||   \n', 'npm test ||\t# x\n',
-      'hash -p /bin/true npx\n', 'hash npx\n', 'hash -r npx\n']) {
+      'hash -p /bin/true npx\n', 'hash -p /bin/true $H\n', 'hash -rp /x npx\n', 'set -e -n -- x\n', 'set -o noexec -- x\n']) {
       expect(huskyAppendProblem(original), JSON.stringify(original)).not.toBeNull();
       const res = await precommitFiles(hookDraft('husky'), reviewedList(), repo({ [HOOK_FILES.husky]: original }));
       expect(res.files, JSON.stringify(original)).toEqual([]);
@@ -116,7 +117,9 @@ describe('G6: the pre-commit layer (plan Task 3, B4)', () => {
       expect(res.notes.join('\n'), JSON.stringify(original)).toMatch(/can not add its hooks to \.husky\/pre-commit safely/);
     }
     // a dot or the word inside a string, a comment, or as an argument is no command
-    for (const original of ['npx biome check .\n', '# . ./x.sh\nnpm test\n', 'ls ./src\n', 'x=$(date)\nnpm test "$x"\n', 'set -e\nnpm test\n', 'set -eu\nnpm test\n', 'npm test || npm run fix\n', 'echo set -n\n', '# set -n\nnpm test\n', 'hash -r\nnpm test\n', 'npm run lint -- --no-cache\n']) {
+    for (const original of ['npx biome check .\n', '# . ./x.sh\nnpm test\n', 'ls ./src\n', 'x=$(date)\nnpm test "$x"\n', 'set -e\nnpm test\n', 'set -eu\nnpm test\n', 'npm test || npm run fix\n', 'echo set -n\n', '# set -n\nnpm test\n', 'hash -r\nnpm test\n', 'npm run lint -- --no-cache\n',
+      // G6-R4 minor 3: after `--` (or the first plain word) set takes arguments, not options; hash counts only with -p
+      'set -- --no-stash -n\n', 'set -e -- -n\n', 'set -e foo -n\n', 'set -e bar -n\n', 'hash npx 2>/dev/null && npx lint-staged\n', 'hash npx\n', 'hash -r npx\n']) {
       expect(huskyAppendProblem(original), JSON.stringify(original)).toBeNull();
     }
   });
@@ -239,14 +242,14 @@ describe('G6: carries (G1-R2 m5, m6; secrets hook; Plan J G-J1)', () => {
     expect(BIOME_RUN).toMatch(/--staged .*--vcs-enabled=true --vcs-client-kind=git$/);
   });
 
-  it('precommit: an existing secrets hook gets no second one, with a note', async () => {
-    // G6-R3 (H1): credited only as the canonical remote gitleaks hook: the official repo, a pinned rev, id gitleaks, no
-    // entry, language or args of the user's, pass_filenames not true, at the commit stage (stages, else default_stages)
+  it('precommit: pipegen always adds its own secrets hook, even next to the canonical gitleaks hook (G6-R4 HOLE 2)', async () => {
+    // the canonical remote gitleaks hook (the audit's only credit: the official repo, a v8.1.1+ v8 tag, id gitleaks, no entry,
+    // language or args of the user's, pass_filenames not true, at the commit stage) still skips files pipegen's hook scans
     const withGitleaks = `${PRE_COMMIT}  - repo: https://github.com/gitleaks/gitleaks\n    rev: v8.30.1\n    hooks:\n      - id: gitleaks\n`;
     const hookWith = (extra: string) => withGitleaks.replace('      - id: gitleaks\n', `      - id: gitleaks\n${extra}`);
     const credited = [
       withGitleaks,
-      withGitleaks.replace('v8.30.1', 'v10.0.0'),
+      withGitleaks.replace('v8.30.1', 'v8.1.1'),
       withGitleaks.replace('https://github.com/gitleaks/gitleaks', 'https://github.com/gitleaks/gitleaks.git'),
       withGitleaks.replace('https://github.com/gitleaks/gitleaks', 'https://github.com/zricethezav/gitleaks'),
       hookWith('        name: scan for keys\n        verbose: true\n        pass_filenames: false\n'),
@@ -260,9 +263,11 @@ describe('G6: carries (G1-R2 m5, m6; secrets hook; Plan J G-J1)', () => {
       const draft = hookDraft('pre-commit');
       const r = await precommitFiles(draft, reviewedList(), repo({ [HOOK_FILES['pre-commit']]: original }));
       const f = r.files[0] as CreatedFile;
-      expect(f.content, original).not.toContain('hook secrets');
+      // HOLE 2: never dropped (the canonical hook skips links, NUL bytes, -diff/binary attributes, gitleaks:allow, a repo .gitleaks.toml)
+      expect(f.content, original).toContain(SCAN_HOOK_RUN);
       expect(f.content, original).toContain(BIOME_RUN);
-      expect(r.notes.join('\n'), original).toMatch(/already scans for secrets/);
+      expect(r.notes, original).toContain(ALSO_NOTE);
+      expect(r.notes.join('\n'), original).not.toMatch(/already scans/);
       expect(judge(f, draft), original).toEqual([]);
     }
     const local = (body: string) => `${PRE_COMMIT}  - repo: local\n    hooks:\n      - id: gitleaks\n        name: gitleaks\n        language: system\n${body}`;
@@ -290,6 +295,9 @@ describe('G6: carries (G1-R2 m5, m6; secrets hook; Plan J G-J1)', () => {
       ['pre-commit', withGitleaks.replace('v8.30.1', 'master')],
       ['pre-commit', withGitleaks.replace('v8.30.1', 'v7.6.1')],
       ['pre-commit', withGitleaks.replace('v8.30.1', 'v8.30')],
+      // G6-R4 HOLE 1: v8.0.0 to v8.1.0 publish `entry: gitleaks` (usage, exit 0); v9+ is a hook nobody reviewed yet
+      ['pre-commit', withGitleaks.replace('v8.30.1', 'v8.0.0')], ['pre-commit', withGitleaks.replace('v8.30.1', 'v8.1.0')],
+      ['pre-commit', withGitleaks.replace('v8.30.1', 'v9.0.0')], ['pre-commit', withGitleaks.replace('v8.30.1', 'v9.2.1')], ['pre-commit', withGitleaks.replace('v8.30.1', 'v10.0.0')],
       // G6-R-sec3: a bare commit sha may be a fork-network commit reachable through the upstream URL, never released: no credit
       ['pre-commit', withGitleaks.replace('v8.30.1', '83d9cd684c87d95d656c1458ef04895a7f1cbd8e')],
       ['pre-commit', withGitleaks.replace('v8.30.1', '83d9cd684c87d95d656c1458ef04895a7f1cbd8e  # v8.30.1')],
@@ -322,9 +330,9 @@ describe('G6: carries (G1-R2 m5, m6; secrets hook; Plan J G-J1)', () => {
     for (const [manager, original] of notCredited) {
       const m = manager ?? 'lefthook';
       expect(existingSecretsHook(m, original), original).toBe(false);
-      // run through the builder: the secrets line stays (or the file is refused with its own note), never "already scans"
+      // run through the builder: the secrets line stays (or the file is refused with its own note), and no "already run" note
       const r = await precommitFiles(hookDraft(manager), reviewedList(), repo({ [HOOK_FILES[m]]: original }));
-      expect(r.notes.join('\n'), original).not.toMatch(/already scans/);
+      expect(r.notes.join('\n'), original).not.toMatch(/already (?:scans|run)/);
       if (r.files.length > 0) expect(r.files.map((f) => f.content).join(''), original).toContain(SCAN_HOOK_RUN);
       else expect(r.notes.length, original).toBeGreaterThan(0);
     }
@@ -332,12 +340,17 @@ describe('G6: carries (G1-R2 m5, m6; secrets hook; Plan J G-J1)', () => {
     for (const m of ['husky', 'lefthook'] as const) expect(existingSecretsHook(m, withGitleaks), m).toBe(false);
     // N2: an empty `stages` falls back to default_stages, as pre-commit reads it (an empty default_stages runs nowhere)
     for (const ds of ['[pre-push]', '[]']) expect(existingSecretsHook('pre-commit', `default_stages: ${ds}\n${hookWith('        stages: []\n')}`), ds).toBe(false);
-    // only a secrets hook to add and the repo has one: no file at all, and the one true reason (spec I3)
+    // only a secrets hook to add and the repo has the canonical one: pipegen's hook is still written, with the one note
     const d = hookDraft('pre-commit');
     const onlyScanHook = { ...d, needs: d.needs.filter((n) => n.id !== 'format-lint') };
     const r = await precommitFiles(onlyScanHook, reviewedList(), repo({ [HOOK_FILES['pre-commit']]: withGitleaks }));
-    expect(r.files).toEqual([]);
-    expect(r.notes).toEqual(['Your .pre-commit-config.yaml already scans for secrets at commit, so pipegen adds no secrets hook of its own there.']);
+    expect(r.files.length).toBe(1);
+    expect((r.files[0] as CreatedFile).content).toContain(SCAN_HOOK_RUN);
+    expect(judge(r.files[0] as CreatedFile, onlyScanHook)).toEqual([]);
+    expect(r.notes).toEqual([ALSO_NOTE]);
+    // the builder decides alone on the text: hookFile keeps the secrets command whatever the original holds
+    const built = hookFile('pre-commit', withGitleaks, hookDraft('pre-commit'), reviewedList());
+    expect('content' in built && built.content.includes(SCAN_HOOK_RUN)).toBe(true);
     // no gitleaks entry in the reviewed list: a note says the local secrets hook is not added
     const noGitleaks = await precommitFiles(hookDraft('husky'), reviewedList().filter((t) => t.id !== 'gitleaks'), repo({ [HOOK_FILES.husky]: HUSKY }));
     expect(noGitleaks.notes.join('\n')).toMatch(/no gitleaks entry/);

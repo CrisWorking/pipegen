@@ -1,18 +1,17 @@
-// Coverage mapper (G6, rulings G6-R2 spec I2 / sec M2, G6-R-sec2, G6-R3 H1): whether the user's own hook file already runs a secret scan
-// that keeps a key out of the COMMIT, so pipegen's pre-commit layer adds no second one (Plan J G-J1: a check the repo already has is not
-// added again), and whether the audit may say the pre-commit secrets row is covered.
+// Coverage mapper (G6, rulings G6-R2 spec I2 / sec M2, G6-R-sec2, G6-R3 H1, G6-R4): whether the user's own hook file already runs the
+// canonical secret scan before each commit, so the audit may say the pre-commit secrets row is covered. G6-R4 HOLE 2: the pre-commit
+// layer never drops its own secrets hook for it (the canonical hook skips links, NUL bytes, -diff/binary attributes, gitleaks:allow and a
+// repo .gitleaks.toml, which pipegen's hook scans); it only says so in a note.
 //
 // The rule is the module's own: a harmless duplicate, never a missing scan. Only ONE form is credited, the canonical remote gitleaks hook
 // as gitleaks publishes it (https://github.com/gitleaks/gitleaks/blob/master/.pre-commit-hooks.yaml: `gitleaks git --pre-commit --redact
 // --staged --verbose`, language golang, pass_filenames false):
-//   - the official repo (or its old zricethezav URL, which redirects to it), at a v8+ release tag (never a bare commit sha, G6-R-sec3);
+//   - the official repo (or its old zricethezav URL, which redirects to it), at a v8 release tag from v8.1.1 (never a bare commit sha, G6-R-sec3; never v9+, G6-R4);
 //   - id `gitleaks`, with no `entry`, `language` or `args` of the user's (pre-commit runs shlex.split(entry) + args with no shell, so a
 //     `#`, a newline or `--exit-code=0` there is a real word, review H1 a), `pass_filenames` not true (gitleaks then reads a one-file
 //     commit's file name as its repo path, H1 b), no file filter and no key pipegen doesn't read;
 //   - at the commit stage: its `stages`, else (absent or empty, N2) `default_stages`, else every stage; and installed at pre-commit.
-// Never credited: a local pre-commit hook (any entry, H1 a/c), husky (git may run it without -e, N1) and lefthook: pipegen adds its own
-// hook there. trufflehog has no hook signature in data/tool-signatures.yml, so it is never credited either. Sync and pure on the text,
-// so the builder and the referee's judge decide the same.
+// Never credited: a local pre-commit hook (any entry, H1 a/c), husky (git may run it without -e, N1) and lefthook. trufflehog has no hook signature in data/tool-signatures.yml, so it is never credited either. Sync and pure on the text.
 import { regexSafe } from '../read/limits.js';
 import { asObj } from '../read/manifest.js';
 import { isObj, parseYaml } from '../engine/yaml-parse.js';
@@ -21,12 +20,15 @@ import { MAX_HOOKS } from './coverage/bounds.js';
 type Obj = Record<string, unknown>;
 const GITLEAKS_REPOS: ReadonlySet<string> = new Set(['https://github.com/gitleaks/gitleaks', 'https://github.com/zricethezav/gitleaks']);
 /**
- * A gitleaks v8+ release tag (v8 is the first whose hook reads only the staged changes). G6-R-sec3: never a bare commit sha: GitHub
- * serves a commit of any fork in the network through the upstream URL, so a sha may be one never released (a hook that does nothing).
+ * A gitleaks release tag from v8.1.1 up to (not including) v9 (G6-R4 HOLE 1): v8.0.0 to v8.1.0 publish `entry: gitleaks` with no
+ * subcommand, which prints usage and exits 0; v8.1.1 is the first whose hook runs `protect --staged`. A v9 or later hook has not been
+ * reviewed, so it gets no credit until it is. Never a bare commit sha (G6-R-sec3): GitHub serves a commit of any fork in the network
+ * through the upstream URL, so a sha may be one never released (a hook that does nothing).
  */
-const PINNED_REV = /^v(?:[89]|[1-9]\d)\.\d{1,4}\.\d{1,4}$/;
+const PINNED_REV = /^v8\.(?:1\.[1-9]\d{0,3}|(?:[2-9]|[1-9]\d{1,3})\.\d{1,4})$/;
 /** The hook keys that don't change what the canonical hook runs or which files it sees. */
 const COSMETIC_KEYS: ReadonlySet<string> = new Set(['id', 'name', 'alias', 'description', 'stages', 'verbose', 'log_file', 'require_serial', 'always_run', 'fail_fast', 'pass_filenames']);
+const MERGE_KEY = '<<';
 const TOP_FILTER_KEYS = ['files', 'exclude'] as const;
 const AT_COMMIT = (s: unknown) => s === 'pre-commit' || s === 'commit';
 const ALL_STAGES = ['pre-commit'];
@@ -48,6 +50,8 @@ function stagesOf(doc: Obj, hook: Obj): readonly unknown[] | null {
  * pre-commit layer (existingSecretsHook) and the audit's hook reading (coverage/hooks.ts), so both credit exactly the same form.
  */
 export function canonicalSecretsHook(doc: Obj, repo: Obj, hook: Obj): boolean {
+  // G6-R4 minor 1: pre-commit's PyYAML merges a `<<` key, which a YAML 1.2 reader keeps as a plain key: what it merges is unknown
+  if ([doc, repo, hook].some((o) => MERGE_KEY in o)) return false;
   if (TOP_FILTER_KEYS.some((k) => isSet(doc, k))) return false;
   if (isSet(doc, 'default_install_hook_types') && !(Array.isArray(doc.default_install_hook_types) && doc.default_install_hook_types.includes('pre-commit'))) return false;
   if (typeof repo.repo !== 'string' || !GITLEAKS_REPOS.has(normRepo(repo.repo))) return false;

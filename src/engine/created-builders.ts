@@ -4,7 +4,6 @@
 import { LOGIN_RE, MAX_LINE, PIPEGEN_BLOCK_BEGIN, PIPEGEN_BLOCK_END } from '../../gate/src/integrity.js';
 import type { PipelineDraft, ReviewedTool } from '../types.js';
 import { packageVersion } from '../util/package-data.js';
-import { existingSecretsHook } from '../audit/hook-credit.js';
 import { effectiveProtectedPaths } from './protected-paths.js';
 import { isObj, parseYaml } from './yaml-parse.js';
 
@@ -299,8 +298,7 @@ export function hookFile(manager: HookManager, original: string, draft: Pipeline
   if (typeof original !== 'string') return { note: 'the original text of the hook file is missing' };
   let commands: HookCommand[];
   try { commands = hookCommands(draft, reviewed); } catch (e) { return { note: e instanceof Error ? e.message : 'the hook commands can not be built' }; }
-  // G6 (Plan J G-J1): a hook file that already runs a secret scanner gets no second one
-  if (existingSecretsHook(manager, original)) commands = commands.filter((c) => c.id !== SECRETS_HOOK_ID);
+  // G6-R4 HOLE 2: pipegen's own secrets hook is never dropped for one the repo already has (a duplicate is harmless)
   if (commands.length === 0) return { note: 'pipegen has no reviewed hook command for this repository (a format and lint check of the root npm service with a tool whose hook form is reviewed), so it adds no hook' };
   if (original.includes(HOOKS_MARKER)) return { note: `the ${HOOK_FILES[manager]} file already holds pipegen's hooks, so pipegen adds them no second time` };
   const by = (why: string): { note: string } => ({ note: `pipegen can not add its hooks to ${HOOK_FILES[manager]} safely (${why}); add them by hand:\n${hookBlock(manager, commands)}` });
@@ -377,6 +375,27 @@ const sortKeys = (v: unknown): unknown => (Array.isArray(v) ? v.map(sortKeys) : 
  * whole, so this refuses what makes it unclear: `exit` or `exec` anywhere outside a comment, any here-document or here-string (`<<`), a quote
  * left open, and an `if`/`case`/loop or a brace or parenthesis left open at the end. A refused script gets no append and a note.
  */
+/**
+ * G6-R3 N3, G6-R4 minor 3: whether a `set` at a command position turns on no-exec mode. Only its option words count: those before `--`,
+ * `-` or the first plain word (after which set takes positional arguments, so `set -- --no-stash -n` is no option). An option word
+ * counts when it is `-` and letters including n, or an `o` cluster followed by `noexec`.
+ */
+function setsNoexec(plain: string, at: string): boolean {
+  for (const m of plain.matchAll(new RegExp(`${at}set\\b([^\\n;&|]*)`, 'gm'))) {
+    const words = (m[1] ?? '').split(/[ \t]+/).filter((w) => w !== '');
+    for (let i = 0; i < words.length; i++) {
+      const w = words[i] as string;
+      if (w === '--' || w === '-' || !/^[-+][A-Za-z]+$/.test(w)) break;
+      if (w.startsWith('-') && w.includes('n')) return true;
+      if (w.endsWith('o')) {
+        if (w.startsWith('-') && words[i + 1] === 'noexec') return true;
+        i++; // the option name `-o`/`+o` takes
+      }
+    }
+  }
+  return false;
+}
+
 export function huskyAppendProblem(original: string): string | null {
   // the code outside comments and quoted strings (quoted text kept as an empty pair, so a word inside a string is not a keyword)
   // and (G6-R2 M1) `plain`: the code with the quote characters and backslashes taken out but what they hold kept, so `"exit"`, `e"x"it`,
@@ -408,8 +427,9 @@ export function huskyAppendProblem(original: string): string | null {
   if (/\bnpx\s*\(\s*\)|\bfunction\s+npx\b|\balias\b[^\n;]*\bnpx=/.test(plain)) return 'it defines its own npx (a function or an alias), which would run instead of pipegen\'s hooks';
   // G6-R3 N3: no-exec mode reads the rest without running it; a hashed npx can point at another program; a dangling `||` at the end
   // joins pipegen's first line to the original's last command, so the scan would run only when that command fails
-  if (new RegExp(`${at}set\\b[^\\n;&|]*?[ \\t](?:-[A-Za-z]*n|-[A-Za-z]*o[ \\t]+noexec\\b)`, 'm').test(plain)) return 'it turns on no-exec mode (set -n), so appended lines would not run';
-  if (new RegExp(`${at}hash\\b[^\\n;&|]*\\bnpx\\b`, 'm').test(plain)) return 'it hashes npx to a path of its own, which would run instead of pipegen\'s hooks';
+  if (setsNoexec(plain, at)) return 'it turns on no-exec mode (set -n), so appended lines would not run';
+  // G6-R4 minor 3: only `hash -p` gives a command a path of the script's own; a plain `hash npx` just looks it up
+  if (new RegExp(`${at}hash\\b[^\\n;&|]*?[ \\t]-[A-Za-z]*p`, 'm').test(plain)) return 'it gives a command a path of its own with hash -p, which could run instead of pipegen\'s hooks';
   if (/\|\|\s*$/.test(code)) return 'it ends with a dangling ||, which would make pipegen\'s first hook line run only when the last command fails';
   if (code.includes('<<')) return 'it has a here-document or here-string';
   const n = (re: RegExp): number => (code.match(re) ?? []).length;
