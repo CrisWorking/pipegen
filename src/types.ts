@@ -260,6 +260,8 @@ export interface PipelineDoc {
   uncoveredMinimum: { category: string; why: string; service?: string }[];
   notes: string[];
   credits?: { text: string; kind: 'push-default' | 'hooks-ci' | 'signing' | 'deploy-gate' }[];
+  /** G13-R1 spec I5: the hook file that already held pipegen's block (PrecommitResult.inPlace): set up, not written again; `runs` are pipegen's hook commands in it. */
+  hooksInPlace?: { path: string; runs: string[] }[];
 }
 /**
  * The signing of a draft (G2): `mode` from signingMode (Plan A; `none` is no plan); `images` the repositories pipegen publishes and signs,

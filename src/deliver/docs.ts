@@ -268,6 +268,7 @@ const DEFAULT_DOC = { transcript: [], deployGaps: [], lockNotes: [], estimates: 
 type DocData = {
   transcript: string[]; deployGaps: { path: string; triggers: string[]; why: string }[]; lockNotes: string[]; est: { monthlyMinutes: number; includedMinutes: number | null; prWaitMinutes?: number; strictness?: string } | null;
   gateRequired: boolean | undefined; setupCommand: string; testNotes: string[]; uncoveredMinimum: { category: string; why: string; service?: string }[]; notes: string[]; credits: { text: string; kind: string }[];
+  hooksInPlace: { path: string; runs: string[] }[];
   bad: Record<'transcript' | 'deployGaps' | 'lockNotes' | 'testNotes' | 'uncoveredMinimum' | 'notes' | 'credits', number>;
 };
 const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -283,6 +284,7 @@ export function docShapeProblem(doc: unknown): string | null {
   if (!isObj(doc.estimates)) return 'the draft\'s doc data has no estimates';
   if (doc.credits !== undefined && !Array.isArray(doc.credits)) return 'the draft\'s doc credits are not a list';
   if (doc.gateRequired !== undefined && typeof doc.gateRequired !== 'boolean') return 'the draft\'s doc gateRequired is not true or false';
+  if (doc.hooksInPlace !== undefined && (!Array.isArray(doc.hooksInPlace) || !doc.hooksInPlace.every((h) => isObj(h) && isStr(h.path) && Array.isArray(h.runs) && h.runs.every(isStr)))) return 'the draft\'s doc hooksInPlace is not a list of hook files';
   return null;
 }
 /** draft.doc read defensively: whatever shape a caller hands over, the builder reads only strings and whole numbers, and counts what it could not read. */
@@ -309,6 +311,8 @@ function dataOf(draft: PipelineDraft): DocData {
     uncoveredMinimum: unc.map((u) => ({ category: u.category as string, why: isStr(u.why) ? u.why : '', ...(isStr(u.service) ? { service: u.service } : {}) })),
     notes: texts('notes'),
     credits: cred.map((c) => ({ text: c.text as string, kind: isStr(c.kind) ? c.kind : '' })),
+    // spec I5: only a hook file name pipegen writes to, with pipegen's own hook commands (a bad entry counts as no file: fail closed)
+    hooksInPlace: (Array.isArray(o.hooksInPlace) ? o.hooksInPlace : []).filter(isObj).filter((h) => isStr(h.path) && (Object.values(HOOK_FILES) as string[]).includes(h.path)).map((h) => ({ path: h.path as string, runs: strs(h.runs) })),
     bad,
   };
 }
@@ -430,9 +434,12 @@ function factsOf(draft: PipelineDraft, reviewed: readonly ReviewedTool[], data: 
   if (data.est?.strictness === 'Strict' && draft.warnFirst !== undefined && Object.keys(draft.warnFirst).length > 0) {
     throw new PipegenDocError('the strictness label is Strict, but some checks start in warn mode (Strict has no warn period), so PIPEGEN.md would say two things that do not fit');
   }
-  const hookFiles = draft.created.filter((f) => f.part === 'precommit');
   let hooks: HookCommand[] = [];
   try { hooks = hookCommands(draft, reviewed); } catch { hooks = []; }
+  // spec I5 (G9-R3 carry 7): a hook file that already held pipegen's block counts as set up, holding only the hook commands it was seen with
+  const own = new Set(hooks.map((h) => h.run));
+  const inPlace = data.hooksInPlace.map((h): CreatedFile => ({ repo: 'app', path: h.path, part: 'precommit', reason: 'already in place', content: h.runs.filter((r) => own.has(r)).join('\n') }));
+  const hookFiles = [...draft.created.filter((f) => f.part === 'precommit'), ...inPlace];
   const gateRequired = draft.capabilities.branchProtection === true && !draft.skipped.some((x) => x.part === 'locks') && data.gateRequired !== false;
   // the setup command is the written file's manager's, or empty when no file was written: anything else is a doc that says one thing and a file another
   const manager = (Object.keys(HOOK_FILES) as (keyof typeof HOOK_FILES)[]).find((m) => hookFiles.some((f) => f.path === HOOK_FILES[m])) ?? null;

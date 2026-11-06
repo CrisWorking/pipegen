@@ -18,7 +18,7 @@ import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { gitBlobSha } from '../create/guard.js';
 import { existingSecretsHook } from '../audit/hook-credit.js';
-import { HOOK_FILES, hookCommands, hookFile, SECRETS_HOOK_ID, type HookManager } from '../engine/created-builders.js';
+import { HOOK_FILES, HOOKS_MARKER, hookCommands, hookFile, SECRETS_HOOK_ID, type HookManager } from '../engine/created-builders.js';
 import { readTextLimitedWithReason } from '../read/limits.js';
 import type { CreatedFile, InstallEdit, PipelineDraft, ReviewedTool } from '../types.js';
 
@@ -37,6 +37,11 @@ export interface PrecommitResult {
   setupCommand: string;
   /** Plain-English notes for PIPEGEN.md (pipegen's own text; no repo text). */
   notes: string[];
+  /**
+   * G13-R1 spec I5 (G9-R3 carry 7): the hook file that already holds pipegen's block (a second run): not written again, but set up. `runs`
+   * are pipegen's own hook commands (hookCommands) the file holds, never other repo text. `setupCommand` is then the manager's.
+   */
+  inPlace?: { path: string; runs: string[] }[];
 }
 
 /** The note of a husky repository (PIPEGEN.md prints it only when GJ's hooks-ci note for husky is not there: one line per hook manager, G9-R0 3). */
@@ -114,7 +119,15 @@ export async function precommitFiles(draft: PipelineDraft, reviewed: readonly Re
   }
 
   const built = hookFile(manager, original, draft, reviewed);
-  if ('note' in built) return none(built.note);
+  if ('note' in built) {
+    // spec I5: pipegen's block is already there (an earlier run wrote it): the hooks are set up, nothing is written
+    if (original.includes(HOOKS_MARKER)) {
+      let runs: string[] = [];
+      try { runs = hookCommands(draft, reviewed).map((c) => c.run).filter((r) => original.includes(r)); } catch { runs = []; }
+      return { files: [], edits: [], setupCommand: SETUP_COMMANDS[manager], notes: [...notes, built.note], inPlace: [{ path, runs }] };
+    }
+    return none(built.note);
+  }
   if (manager === 'husky') notes.push(HUSKY_NO_CI_NOTE);
   const file: CreatedFile = { path, content: built.content, part: 'precommit', reason: REASON, repo: 'app', edited: { original } };
   const edit: InstallEdit = { repo: 'app', path, kind: 'hooks', inserted: built.inserted, originalSha: original === '' ? null : gitBlobSha(original), writtenShas: [gitBlobSha(built.content)] };

@@ -184,7 +184,7 @@ export interface DocInputs {
   transcript: readonly string[];
   verify: Pick<VerifyPlan, 'gaps' | 'notes' | 'preview'>;
   locks: Pick<LockPlan, 'notes'> & { gateRequired: boolean };
-  precommit: Pick<PrecommitResult, 'setupCommand' | 'notes'>;
+  precommit: Pick<PrecommitResult, 'setupCommand' | 'notes' | 'inPlace'>;
   jobs: { notes: readonly string[]; uncoveredMinimum: AssembledJobs['uncoveredMinimum'] };
   assembledNotes: readonly string[];
   testNotes: readonly string[];
@@ -208,6 +208,7 @@ export function docFor(i: DocInputs): PipelineDoc {
     uncoveredMinimum: i.jobs.uncoveredMinimum.map((u) => ({ category: u.category, why: u.why, ...(u.service === undefined ? {} : { service: u.service }) })),
     notes: [...new Set(notes)],
     credits: i.credits.map((c) => ({ text: c.text, kind: c.kind })),
+    ...(i.precommit.inPlace === undefined || i.precommit.inPlace.length === 0 ? {} : { hooksInPlace: i.precommit.inPlace.map((h) => ({ path: h.path, runs: [...h.runs] })) }),
   };
 }
 

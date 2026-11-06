@@ -10,6 +10,7 @@ import { buildFiles, judgeBuilt, readRegular, runCreators, workflowTexts, type B
 import { strictNeeds, warnFirstFor } from '../src/cli/run-parts.js';
 import { judgeAssembled } from '../src/layers/assemble.js';
 import { ADVISORY_TOOLS } from '../src/debate/builder.js';
+import { docShapeProblem, pipegenDoc } from '../src/deliver/docs.js';
 import { SecretVault } from '../src/create/secrets.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { floorNeeds, MINIMUM_CATEGORIES } from '../src/engine/needs.js';
@@ -25,6 +26,7 @@ const TODAY = '2026-11-06';
 const OWN = 'CrisWorking';
 const EST = { monthlyMinutes: 120, includedMinutes: 3000, setupMinutes: 10, setupMinutesCap: 20, aiTokens: [], aiCostUsd: 'local', aiCostCapUsd: null, durationMinutes: { low: 1, high: 2 }, basis: [], pricedFor: null } as unknown as Estimates;
 const TK_KEY = ['to', 'ken'].join('');
+const DOC0 = { transcript: [], deployGaps: [], lockNotes: [], testNotes: [], uncoveredMinimum: [], notes: [], setupCommand: '', estimates: {} };
 
 function folder(): string {
   const dir = tmp();
@@ -185,5 +187,44 @@ describe('G13-R1: package.json reads (sec M6)', () => {
       compose: () => ({ file: null, notes: [] }) as never,
     });
     expect(seen).toBe('');
+  });
+});
+
+describe('G13-R1: a second run over hooks pipegen already wrote (spec I5, G9-R3 carry 7)', () => {
+  it('build: the hook file already holds pipegen\'s block: the doc says the hooks block the commit and gives the setup command', async () => {
+    const i = input(false);
+    const first = await buildFiles(i, FACTS);
+    const hook = first.files.find((f) => f.part === 'precommit');
+    expect(hook).toBeDefined();
+    expect(first.doc.content).toMatch(/Blocks the commit/);
+    // the first run's file, now in the folder
+    writeFileSync(join(i.dir, (hook as { path: string }).path), (hook as { content: string }).content);
+    const again = await buildFiles(i, FACTS);
+    expect(again.files.some((f) => f.part === 'precommit')).toBe(false);
+    expect(again.precommit.inPlace?.map((x) => x.path)).toEqual([(hook as { path: string }).path]);
+    expect(again.precommit.setupCommand).toBe(first.precommit.setupCommand);
+    expect(again.assembled.draft.doc?.hooksInPlace?.[0]?.path).toBe((hook as { path: string }).path);
+    expect(again.doc.content).toMatch(/Blocks the commit/);
+    expect(again.doc.content).not.toMatch(/Not set up: pipegen wrote no hook file/);
+    expect(again.doc.content).toContain(first.precommit.setupCommand);
+  });
+});
+
+describe('G13-R1: draft.doc.hooksInPlace is read fail-closed (spec I5)', () => {
+  it('docs: the shape check refuses a bad list; another path or another command does not count as a set-up hook', async () => {
+    expect(docShapeProblem({ ...DOC0, hooksInPlace: 'lefthook.yml' })).toMatch(/hooksInPlace/);
+    expect(docShapeProblem({ ...DOC0, hooksInPlace: [{ path: 'lefthook.yml', runs: [1] }] })).toMatch(/hooksInPlace/);
+    expect(docShapeProblem({ ...DOC0, hooksInPlace: [{ path: 'lefthook.yml', runs: ['x'] }] })).toBeNull();
+    const i = input(false);
+    const first = await buildFiles(i, FACTS);
+    const hook = first.files.find((f) => f.part === 'precommit') as { path: string; content: string };
+    writeFileSync(join(i.dir, hook.path), hook.content);
+    const again = await buildFiles(i, FACTS);
+    const d = again.assembled.draft;
+    const doc = d.doc as NonNullable<PipelineDraft['doc']>;
+    // a path pipegen never writes to: no hook file, so the setup command no longer fits and the builder refuses
+    expect(() => pipegenDoc({ ...d, doc: { ...doc, hooksInPlace: [{ path: 'evil.yml', runs: doc.hooksInPlace?.[0]?.runs ?? [] }] } }, REVIEWED)).toThrow(/setup command/);
+    // the right file but not pipegen's commands: not set up
+    expect(pipegenDoc({ ...d, doc: { ...doc, hooksInPlace: [{ path: hook.path, runs: ['echo hi'] }] } }, REVIEWED).content).toMatch(/Not set up: the hook file does not hold the secrets hook/);
   });
 });
