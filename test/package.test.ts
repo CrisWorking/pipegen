@@ -44,11 +44,19 @@ function codeOf(text: string): string {
  * runs to the next one), and the build test proves from esbuild's metafile that those modules import nothing outside the bundle.
  */
 const TEXT_TEMPLATE_PACKAGES = ['sucrase'];
+/**
+ * G13: `pipegen run` makes the AI prompts reachable; the starter-test prompt (src/ai/prompts/tests.ts) tells the AI to write
+ * `named imports from "vitest"` in its prompt text, and the CI step renderer (src/engine/render-cli.ts) writes small node scripts
+ * (`const fs = require("fs")`) into the workflows it renders; the starter-test rules (src/create/test-rules.ts) and the proof's planted
+ * items (src/debate/planted.ts) hold the test and app code they check or write as text. Those modules are left out of the text scan the same way; the metafile check below
+ * proves every input of the bundle (these included) imports only Node built-ins.
+ */
+const TEXT_TEMPLATE_FILES = ['src/ai/prompts/', 'src/engine/render-cli.ts', 'src/create/test-rules.ts', 'src/debate/planted.ts'];
 function withoutTemplatePackages(raw: string): string {
   let skipping = false;
   return raw.split('\n').filter((line) => {
     // any esbuild module path line ends the window (fix round 1, review J2 minor 1: also gate/src/… and other folders)
-    if (/^\/\/ \S+\.(?:[cm]?[jt]sx?|json)$/.test(line)) skipping = TEXT_TEMPLATE_PACKAGES.some((p) => line.startsWith(`// node_modules/${p}/`));
+    if (/^\/\/ \S+\.(?:[cm]?[jt]sx?|json)$/.test(line)) skipping = TEXT_TEMPLATE_PACKAGES.some((p) => line.startsWith(`// node_modules/${p}/`)) || TEXT_TEMPLATE_FILES.some((p) => line.startsWith(`// ${p}`));
     return !skipping;
   }).join('\n');
 }
@@ -142,6 +150,18 @@ describe('build', () => {
     ].map((m) => m[1]);
     for (const s of specs) expect(s.startsWith('node:'), `non-builtin import: ${s}`).toBe(true);
     for (const name of shimRequires(out)) expect(isBuiltin(name), `non-builtin require: ${name}`).toBe(true);
+  });
+
+  it('package: dist/cli/main.js bundles libsodium and execa; THIRD_PARTY_NOTICES is current', () => {
+    // G13 (carry 22): run, finish, verify, update and cleanup make src/deliver/* and src/proof/* reachable from main.ts
+    execFileSync('npx', ['tsup'], { cwd: root, stdio: 'pipe' });
+    const meta = JSON.parse(readFileSync(resolve(root, '.build/meta.json'), 'utf8')) as { inputs: Record<string, unknown> };
+    const inputs = Object.keys(meta.inputs);
+    for (const p of ['node_modules/libsodium-wrappers/', 'node_modules/libsodium/', 'node_modules/execa/', 'src/deliver/deliver.ts', 'src/proof/state.ts', 'src/cli/run.ts']) {
+      expect(inputs.some((f) => f.startsWith(p)), p).toBe(true);
+    }
+    const notices = readFileSync(resolve(root, 'THIRD_PARTY_NOTICES'), 'utf8');
+    for (const name of ['libsodium-wrappers@', 'libsodium@', 'execa@']) expect(notices).toMatch(new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'm'));
   });
 
   it('build: dist/cli/junit-thread.js is built and readJunitBytes from the bundle parses a report', async () => {
