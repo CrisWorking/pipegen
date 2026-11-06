@@ -9,6 +9,7 @@ import { CODEOWNERS_BEGIN, CODEOWNERS_END, CENTRAL_PROTECTED_PATHS, codeownersBl
 import { createdFileProblems, type CreatedEnv } from '../src/engine/created-files.js';
 import { codeownersJudge, codeownersLaterOverrides, codeownersProbes, codeownersSemanticProblems } from '../src/engine/created-judges/codeowners.js';
 import { effectiveProtectedPaths } from '../src/engine/protected-paths.js';
+import { pipegenDoc } from '../src/deliver/docs.js';
 import { referee, type Linters } from '../src/engine/referee.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
 import type { CreatedFile, PipelineDraft, RepoProfile, ReviewedTool } from '../src/types.js';
@@ -981,7 +982,9 @@ describe('referee: the three judges run on real files', () => {
   const LINTERS: Linters = { actionlint: async () => '/x', zizmor: async () => '/x' };
   const run = (files: CreatedFile[], inputs: CreatedEnv['inputs'] = {}, d: PipelineDraft = draft) => referee(files, d, platform(), reviewed, LINTERS, 'tok', { runLinters: async () => [], createdInputs: inputs });
   it('good files pass', async () => {
-    const r = await run([good(), depFile(okFile('')), docFile(DOC_OK)], docInputs());
+    // G9 (B7): the PIPEGEN.md is the one pipegenDoc builds from the draft's doc data (the referee builds it again)
+    const withDoc: PipelineDraft = { ...draft, doc: { transcript: [], deployGaps: [], lockNotes: [], estimates: { monthlyMinutes: 0, includedMinutes: null }, setupCommand: '', testNotes: [], uncoveredMinimum: [], notes: [] } };
+    const r = await run([good(), depFile(okFile('')), pipegenDoc(withDoc, reviewed)], docInputs(), withDoc);
     expect(r.issues).toEqual([]);
     expect(r.ok).toBe(true);
   });

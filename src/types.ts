@@ -216,6 +216,36 @@ export interface PipelineDraft {
    * or verify step is pipegen's. Plan G fills it (G3/G7).
    */
   signing?: SigningPlan;
+  /**
+   * v0.2 Plan G G9 (ruling B7): what PIPEGEN.md shows that is not on the draft itself, as plain data, so the referee can build the file again from
+   * the draft and require the same bytes (src/deliver/docs.ts pipegenDoc). Absent = the referee refuses a PIPEGEN.md. Plan G (G13) fills it.
+   */
+  doc?: PipelineDoc;
+}
+/**
+ * The inputs of PIPEGEN.md that live outside the draft (B7, S22). Doc-final strings only: code-built or Plan F's doc-final text. The builder still
+ * checks every string against the PIPEGEN.md judge and cleans (cleanForDoc) what does not pass, so a bad string is cleaned, never trusted.
+ * - `transcript`: the debate's short transcript lines (Plan F, doc-final).
+ * - `deployGaps`: DeployGap[] of the deploy layer (src/layers/deploy.ts): the workflow, its triggers, why it is not protected.
+ * - `lockNotes`: LockPlan.notes, in order.
+ * - `estimates`: monthly Actions minutes (Estimates.monthlyMinutes, includedMinutes) and, when known, the wait of a pull request in minutes.
+ * - `setupCommand`: PrecommitResult.setupCommand ('' when no hook file is written).
+ * - `testNotes`: the notes of the test and Docker creators and of the tests decision. The creator's own AI note ("The AI explained ...") is dropped.
+ * - `uncoveredMinimum`: AssembledJobs.uncoveredMinimum (minimum checks left without a job), shown as not covered.
+ * - `notes`: every other build note, printed by one generic path: AssembledJobs.notes, AssembledFiles.notes, PrecommitResult.notes, VerifyPlan.notes and
+ *   VerifyPlan.preview. A note added later needs no change in the builder.
+ * - `credits`: the checks the repository already had that count for a pipegen check (the audit's credits); the kind says which.
+ */
+export interface PipelineDoc {
+  transcript: string[];
+  deployGaps: { path: string; triggers: string[]; why: string }[];
+  lockNotes: string[];
+  estimates: { monthlyMinutes: number; includedMinutes: number | null; prWaitMinutes?: number };
+  setupCommand: string;
+  testNotes: string[];
+  uncoveredMinimum: { category: string; why: string; service?: string }[];
+  notes: string[];
+  credits?: { text: string; kind: 'push-default' | 'hooks-ci' | 'signing' | 'deploy-gate' }[];
 }
 /**
  * The signing of a draft (G2): `mode` from signingMode (Plan A; `none` is no plan); `images` the repositories pipegen publishes and signs,

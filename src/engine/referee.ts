@@ -42,6 +42,7 @@ import { PLATFORM_ACTION_IDS, type PlatformActions } from './pin.js';
 import { APP_RUNNING_CATEGORIES, renderRangeScan, TRIVY_LAUNCH_RE } from './render-cli.js';
 import { EXPR, own, show } from './render-error.js';
 import { isObj, parseYaml, uniq, type Obj, type Parsed } from './yaml-parse.js';
+import { docRecomputeProblem } from '../deliver/docs.js';
 import { createdFileProblems, duplicatePathProblems, type CreatedInputs, type CreatedRule } from './created-files.js';
 import {
   ACTION_PATH_RE, CALLER_WORKFLOW, checkExpressions, createdPathProblem, checkJobOrder, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, gateResultUploadProblems, IF_VALUES,
@@ -2285,6 +2286,11 @@ async function judgeFiles(allFiles: CreatedFile[], draft: PipelineDraft, platfor
           : 'pipegen writes no file of this kind (no rule claims this path), so it is not written.', undefined, f.repo);
       }
       for (const m of v.problems) add(f.path, 'template', `pipegen refuses this file: ${m.replace(/\.$/, '')}.`, undefined, f.repo);
+      // G9 (B7): PIPEGEN.md is built by a pure function of the draft; the file must be exactly what it builds again (the line judge above is the net)
+      if (v.claimed && f.repo === 'app' && f.path === 'PIPEGEN.md') {
+        const again = docRecomputeProblem(f, draft, reviewed);
+        if (again !== null) add(f.path, 'template', `pipegen refuses this file: ${again}.`, undefined, f.repo);
+      }
       continue;
     }
     if (f.edited !== undefined) add(f.path, 'template', 'Only a file of a registered kind can carry the edited marker; an edit to a workflow uses the inserted mark.', undefined, f.repo);

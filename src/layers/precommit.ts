@@ -39,6 +39,8 @@ export interface PrecommitResult {
   notes: string[];
 }
 
+/** The note of a husky repository (PIPEGEN.md prints it only when GJ's hooks-ci note for husky is not there: one line per hook manager, G9-R0 3). */
+export const HUSKY_NO_CI_NOTE = 'husky hooks are shell scripts, so CI does not re-run them (no hooks-ci command); the CI secret scan still runs on every push.';
 const REASON = "pipegen's reviewed pre-commit hooks: a secret scan of the staged changes, and format and lint where the repository asks for it";
 const ADVISORY = (scripts: readonly string[]): string => `The per-repo lefthook hooks (${scripts.join(', ')}) stay advisory: they run the repository's own scripts, so pipegen does not add them as local hooks (item 63); add them yourself if you want them.`;
 const HOOK_SCRIPT_RE = /^[a-z][a-z:-]{0,30}$/;
@@ -113,7 +115,7 @@ export async function precommitFiles(draft: PipelineDraft, reviewed: readonly Re
 
   const built = hookFile(manager, original, draft, reviewed);
   if ('note' in built) return none(built.note);
-  if (manager === 'husky') notes.push('husky hooks are shell scripts, so CI does not re-run them (no hooks-ci command); the CI secret scan still runs on every push.');
+  if (manager === 'husky') notes.push(HUSKY_NO_CI_NOTE);
   const file: CreatedFile = { path, content: built.content, part: 'precommit', reason: REASON, repo: 'app', edited: { original } };
   const edit: InstallEdit = { repo: 'app', path, kind: 'hooks', inserted: built.inserted, originalSha: original === '' ? null : gitBlobSha(original), writtenShas: [gitBlobSha(built.content)] };
   return { files: [file], edits: [edit], setupCommand: SETUP_COMMANDS[manager], notes };

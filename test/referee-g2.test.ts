@@ -9,6 +9,7 @@ import { aiChoiceNames, CODE_FILLED_CHOICES } from '../src/create/coverage.js';
 import { builderOffers } from '../src/debate/builder.js';
 import { jobIdFor } from '../src/engine/gate-job-list.js';
 import { CALLER_WORKFLOW, checkExpressions, checkJobOrder, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, PUSH_WORKFLOW, createdPathProblem, imageBuildJobId, jobOutputsProblems, NO_SCANS, SIGN_STEP_ENV, VERIFY_STEP_ENV, IMAGE_ARCHIVE_STEP_ID, IMAGE_SHA_OUTPUT, jobOutputsFor, NARROWING_CHOICES, type RenderedStep } from '../src/engine/job-rules.js';
+import { pipegenDoc } from '../src/deliver/docs.js';
 import { referee, type Linters } from '../src/engine/referee.js';
 import { imageArchiveArtifact, imageBuildTag, renderImageArchiveScan, renderImageBuild } from '../src/engine/image-handoff.js';
 import { attestSignerWorkflow, COSIGN_ID, GH_ID, imageDigestArtifact, keylessIdentity, pubKeySha256, renderSignSteps, renderVerifySteps } from '../src/engine/signing.js';
@@ -501,9 +502,11 @@ describe('G2: created paths and the vault (S14, CF-1, D-m4)', () => {
   });
 
   it('referee: containsKnownValue derived from deps.vault when absent', async () => {
-    const d = bare();
-    const DOC = '# Pipeline\n\nThis repo uses pipegen.\n';
-    const doc: CreatedFile = { path: 'PIPEGEN.md', content: DOC, part: 'docs', reason: 't', repo: 'app' };
+    // G9 (B7): PIPEGEN.md is the file pipegenDoc builds from the draft's doc data; the referee builds it again
+    const d: PipelineDraft = { ...bare(), doc: { transcript: [], deployGaps: [], lockNotes: [], estimates: { monthlyMinutes: 0, includedMinutes: null }, setupCommand: '', testNotes: [], uncoveredMinimum: [], notes: [] } };
+    const built = pipegenDoc(d, reviewedList());
+    const DOC = built.content;
+    const doc: CreatedFile = built;
     const inputs = { pipegenDoc: { baseSha: null, recordSha: null } };
     // no vault and no check: refused (a missing input never reads as "nothing there")
     const none = await runWith([doc], d, reviewedList(), { createdInputs: inputs });

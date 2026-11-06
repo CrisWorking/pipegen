@@ -1,0 +1,483 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`doc: the 18 sections > doc: snapshot > shape A 1`] = `
+"# What pipegen set up in this repository
+
+pipegen wrote this file in plain English. If you edit it, pipegen keeps your edits and never replaces the file.
+
+## What your GitHub plan allows
+
+This section comes first so that no limit is hidden.
+
+- This repository is private. Your GitHub plan: team.
+- Branch rules: available, so the check \`pipegen / gate\` can be required before a pull request merges.
+- Environments: available. The environment \`pipegen-signing\` holds the signing key and limits the verify step to the default branch.
+- Required reviewers on an environment: available.
+- Deployment branch policies: available, so only the default branch can use the signing environment.
+- Build attestations: available.
+- Code scanning results: available.
+- Keyless signing: allowed (a public repository: its signing log is public).
+- Anyone who can add a workflow can add a job that reports under the name of the gate. The guard is CODEOWNERS plus a required code-owner review of the pipeline files. On a private repository with a free plan GitHub can not enforce that review, so this is a limit that stays.
+- Where GitHub can not enforce this (a private repository on a free plan, or a repository with one writer), the deploy check trusts the people who can edit the workflow files.
+- Pull requests from forks: on a public repository, a first-time contributor's workflow run waits for a maintainer to approve it. On a private repository, workflows on fork pull requests are off by default. A check that needs a secret shows as not run on a fork pull request.
+- The network block on CI jobs lets only the allowed hosts through. A site that sits behind the same CDN as an allowed host stays reachable, so the block limits traffic and is not a wall.
+
+### Locks on merging
+
+- Only one person can write to "shop", so pull requests need no approval.
+
+## What pipegen set up
+
+- pipegen v0.2 is for repositories owned by CrisWorking. A public repository uses the gate in the normal way.
+- This repository is private, so its checks run from central workflows in the pipelines repository of the same owner, pinned to one commit. The caller file in this repository is \`.github/workflows/pipegen.yml\`.
+- pipegen does not change what or how you deploy. It adds a verify job and \`needs\` entries to your existing deploy jobs, and nothing else in them.
+- pipegen offers three strictness levels, Starter, Standard (the default) and Strict. They decide which checks block a pull request and which only warn. The Standard level is used unless you chose another.
+- Estimated monthly Actions minutes: about 120, counted from the activity of the last 30 days. Your plan includes 3000 minutes a month for private repositories.
+
+### Services pipegen found
+
+- Service "shop-api" (node), type: server, container.
+- Service "jobs-runner" (node), type: cli.
+
+### Checks your repository already has
+
+- The tests run on every pull request into main and every push to main.
+- Pushes to branches without a pull request aren't checked.
+
+## Fix a blocked pull request
+
+The required check is \`pipegen / gate\`. When it fails, or only warns, its summary on the run gives a message. Find it in the first column.
+
+| Message | What it means | What to do |
+| --- | --- | --- |
+| A new critical or high finding | A check found a serious problem that the base branch did not have. | Fix it in the pull request. A false alarm is for a code owner to judge; adding a suppression comment is flagged itself. |
+| A new secret | A scan found a password, key or token in the files of this pull request. | Remove it, and treat it as leaked: rotate it. A secret that was ever pushed stays in the history. |
+| A secret in a commit of this pull request | A commit of the pull request added a secret, even if a later commit took it out. Any finding in the commit range blocks. | Rotate the secret. Then rewrite the branch so the commits no longer hold it, and push again. |
+| integrity:protected-path (this file is part of the pipeline) | The pull request changes a workflow, a tool config or an ignore file, and no code owner approved this exact commit. | Ask a code owner to approve the latest commit. After a new push the approval has to be given again. |
+| integrity:suppression (lines suppress a check) | Added lines turn a check off for that code (a suppression comment). | Remove the suppression, or ask a code owner to approve this exact commit. |
+| An approval on an older commit | A code owner approved an earlier commit of the pull request. An approval counts only for the commit it was given on. | Ask the code owner to approve the latest commit. |
+| integrity:incomplete-list (the list of changed files is incomplete) | The pull request is too large to check (3,000 or more files), or GitHub did not give the whole file list, so the gate can not see every change. | Split the pull request into smaller ones, or run the checks again if the branch moved. |
+| integrity:no-patch (the gate can not read this file's changes) | GitHub gave no readable change for that file, so the gate can not check it for suppressions. | Make the change smaller or split the file change into its own pull request. A code owner can approve the exact commit. |
+| integrity:case-extension | A new file has a scanned language's extension in another letter case, so the scanners would skip it while a runtime may still load it. | Rename the file to the lower-case extension. |
+| A tool error | A check could not finish (it crashed, ran out of time or its result could not be read). A required check that errors blocks. | Read the check's log, fix the cause and run the checks again. |
+| Not run on a fork pull request | GitHub gives no secrets to a pull request from a fork, so a check that needs one did not run. If the check is required, the pull request is blocked. | A maintainer can push the branch into this repository and open the pull request from there. |
+| A check marked not proven | pipegen could not prove the check on your repository yet (see Not proven yet). It warns and does not block. | Set the secret names listed under Not proven yet. The nightly run then opens an issue and \`npx pipegen update\` applies the change. |
+| A check marked skipped | You skipped that part with --skip, so it has no job and gives no protection. | Run pipegen again without the skip if you want the part. |
+| A check's result does not match | The result file of a check is missing, or its checksum differs from the one its job reported. The gate does not trust it and blocks. | Run the checks again. If it keeps happening, someone changed the pipeline: run \`npx pipegen verify\`. |
+| No base to compare with | The base scan did not run on the base commit of this event, so every finding counts as new. On the pull request that installs pipegen it warns instead. | Run the checks again. On a new install, merge the setup pull request and the next pull request has a base. |
+| A known malicious package | A dependency matches a malicious-package advisory (MAL-). It blocks even when it is old. | Remove the package and rotate anything it could have read. |
+| A new dependency problem or an unknown licence | A package added by the pull request has a new advisory, or a licence the check does not know. A new advisory blocks; an unknown licence warns because it needs a human. | Pick another package, or have a person check the licence. |
+| No coverage | A check ran but could not look (for example a scan that reported nothing because it had nothing to read). A required one blocks, because nothing was proven. | Fix what the check could not read, then run the checks again. |
+| A warning in warn mode | The check is still in warn mode, so old findings and medium ones warn. A new critical, high or secret finding still blocks. | Fix the warnings before warn mode ends (see Warn mode). |
+| Warn mode ended | The warn period is over, so what used to warn now blocks. | Fix the finding. Nothing else changed. |
+| A gate settings problem | The gate's own settings are wrong (for example a required check listed as not proven). The gate blocks, because it can not trust itself. | Run \`npx pipegen verify\`, then \`npx pipegen update\`. |
+| An image finding with no base | Image findings have no base to compare with yet: on the pull request that installs pipegen they warn, and on every other pull request they block. | Fix the finding in the image or its base image. |
+| The required check \`pipegen / gate\` never reported | GitHub waits for a check that did not run, so the pull request can not merge. | Run the workflow again. With the org required workflow, re-run the \`pipegen required\` run after a code owner approves. |
+
+## The four layers
+
+Each check has a tool, a reason and a mode: it either blocks a pull request or only warns.
+
+### Pre-commit layer
+
+Runs on your machine before each commit.
+
+- Secret scan, no tool listed (see the notes below). Looks for passwords, keys and tokens in the code and in the commits of a pull request. Blocks the commit.
+- Format and lint, service "shop-api", no tool listed (see the notes below). Checks formatting and common mistakes on the files you commit. Warns only.
+
+### Push layer
+
+Runs on a push to a branch that has no open pull request.
+
+- Secret scan, no tool listed (see the notes below). Looks for passwords, keys and tokens in the code and in the commits of a pull request. Fails the run.
+
+### Merge layer
+
+Runs on every pull request and decides whether it can merge. The gate (the check \`pipegen / gate\`) reads every result.
+
+- Secret scan, no tool listed (see the notes below). Looks for passwords, keys and tokens in the code and in the commits of a pull request. Blocks a pull request.
+- Code scan, service "shop-api", no tool listed (see the notes below). Looks for insecure code patterns in your source. Starts in warn mode, then blocks.
+- Dependency scan, service "shop-api", no tool listed (see the notes below). Looks for known vulnerabilities in the packages you depend on. Blocks a pull request.
+- Unit tests, service "shop-api", no tool listed (see the notes below). Runs your tests so a change that breaks them is caught. Blocks a pull request.
+- Type check, service "shop-api", no tool listed (see the notes below). Runs the type checker. Blocks a pull request.
+- Test coverage, service "shop-api", no tool listed (see the notes below). Checks how much of the code the tests run. Blocks a pull request.
+- Copy-paste check, no tool listed (see the notes below). Finds code copied from other places in the repository. Warns only.
+- Image build, service "shop-api", no tool listed (see the notes below). Builds the container image of the pull request without publishing it. Blocks a pull request.
+- Image scan, service "shop-api", no tool listed (see the notes below). Scans the built image for known vulnerabilities. Blocks a pull request.
+- Running app scan, service "shop-api", no tool listed (see the notes below). Starts the app and probes it the way an attacker would. Blocks a pull request.
+- Licence check, no tool listed (see the notes below). Checks the licences of your dependencies. Blocks a pull request.
+- The gate, tool the pipegen gate action. Reads every result and decides whether the pull request can merge. Blocks a pull request.
+
+### Deploy layer
+
+Runs on a push to the default branch: it builds, signs and checks the images that are deployed.
+
+- Publishing, service "shop-api", no tool listed (see the notes below). Publishes a package with a short-lived token instead of a stored one. Fails the run.
+- Image signing, service "shop-api", no tool listed (see the notes below). Signs the published image so a deploy can check where it came from. Fails the run.
+
+### Limits of these checks
+
+- The type-check follows your own tsconfig.json. The repo's tsconfig decides what tsc checks and how strictly, and a pull request can edit it (\`exclude\`, \`skipLibCheck\`, \`extends\`, a \`ts-nocheck\` comment). pipegen refuses only the plain no-op layouts: no file selected, \`noCheck\`, and a missing or linked tsconfig.json. It is not a protected path.
+- The raw result of the running app scan travels unscrubbed between the job that runs the app and the job that reads the result. It holds only what an app without secrets answered. A hostile app can always answer a scanner cleanly.
+- The running app scan has no base twin, so its findings warn on the pull request that installs pipegen and are new after it.
+- Image findings have no base yet: there is no base twin, so image findings warn on the pull request that installs pipegen and block on every other.
+- The scanned image is not the published image. The scan covers the build of the pull request head; the publish job builds again at the merge commit, so a moving base image tag can make them differ.
+- The licence scan reads lockfiles only.
+- The code scan runs Semgrep with a pinned copy of the semgrep-rules repository. Those rules have their own licence (the Semgrep Rules License v1.0). It lets you use them to check your own code, but not to sell them or offer them as a service. Read it before you use the rules anywhere else.
+- Publishing uses a trusted publisher, so no token is stored. Set it up once: on npmjs.com open the package settings and add a trusted publisher for GitHub Actions with this repository and the publish workflow file name; on PyPI open the project, then Publishing, and add a trusted publisher with the same details. The publish job needs npm 11.5.1 or newer and Node 22.14.0 or newer, and it is the only job that gets the \`id-token\` permission.
+- The copy-paste check warns only, at first: it reports new copy-paste in changed code, and old copies are not counted. A repository can make it blocking. The mode of a check is part of the pipeline files, which are protected paths, so that change goes through a pull request that a code owner approves.
+- Each service installs with \`npm ci\`, which needs a \`package-lock.json\` in that service's folder. A lock file at the workspace root is not enough: the check then fails closed, it does not pass.
+- Project scripts that pipegen runs get no declared secrets yet. A test that needs a secret can get it only through the coverage check.
+- npm only: pnpm, yarn and bun are not supported yet. A Vue, Svelte or Astro TypeScript repository stops at assembly with a plain reason, because pipegen has no reviewed type checker for it.
+- The nightly job has a \`concurrency\` group, so runs never overlap. An issue it opened and any bot closed (even a stale bot running as the github-actions bot) is reopened by design. Only a person can dismiss it.
+- After rewriting main's history (a force-push), the gate may stay in block mode until 10 green pushes to main have followed.
+
+### Notes from the build
+
+- A note from the build.
+
+## Suggestions (not running)
+
+A suggestion is a tool that pipegen does not run for you. It may be a tool pipegen has not reviewed, or a reviewed tool that had nothing to run on in this repository (its reason says which). Suggestions are mention-only: they never run. A tool can join the reviewed list only through a reviewed pull request to pipegen.
+
+- "trufflehog" (repository trufflesecurity/trufflehog): It also checks the commit history for keys.
+
+## Files pipegen created and why
+
+- \`PIPEGEN.md\`: this file.
+- \`.github/workflows/pipegen.yml\`: the workflow that starts the pipeline.
+- In the pipelines repository: the central workflows \`shop--push.yml\`, \`shop--merge.yml\`, \`shop--nightly.yml\` and the shared signing workflow, with the install record.
+- Dependabot, in \`.github/dependabot.yml\` when pipegen adds an entry: it keeps the pinned actions up to date, each update at least 7 days old. The entry ignores the central repository, because Dependabot can not read it, so Dependabot does not bump the central commit. pipegen keeps that pin fresh: \`npx pipegen update\` opens the pull request and the nightly run warns when the pin is old. There are two opt-ins, not on by default: an organisation grant through the API, or a git registry entry with a read-only token you make yourself. A repository that uses Renovate keeps it and gets no Dependabot file (set \`minimumReleaseAge\` to 7 days in Renovate).
+- Files that were already in your repository, identical to what pipegen writes, are listed in the setup pull request. pipegen never rewrites them, and uninstall asks before it deletes one.
+
+## Your tests
+
+Starter tests describe what your code does today. They are a coverage floor, not proof: they can lock in today's bugs, so review them. App code runs with full power (process, network and files), so the CI job that runs it has no secrets, a read-only token and no network except the registry.
+
+If a coverage waiver is needed, the owners in pipegen's CODEOWNERS block can approve it, also for a file whose own CODEOWNERS rule names no user.
+
+- Service "shop-api": pipegen keeps your tests. This service already has tests, so pipegen keeps them.
+
+## Skipped parts
+
+- Part slack: skipped with --skip. No Slack here. What is missing: There are no Slack messages about findings.
+
+## Signing
+
+Images are signed with a cosign key. \`npx pipegen finish\` makes the key pair and stores it as environment secrets of \`pipegen-signing\`, which only the default branch can use. The public key is the environment variable \`PIPEGEN_COSIGN_PUB\` of \`pipegen-signing\`. The verify job checks the sha256 of that variable against the value in the install record before it uses it, so a changed variable is a finding. Signing uses \`--tlog-upload=false\`.
+
+\`npx pipegen finish --rotate-key\` makes a new key pair. Images signed with the old key no longer verify. The verify literal changes through a pull request, and verify fails closed until that pull request is merged. A key rotation resets the gate's marker and baseline, and \`npx pipegen verify\` says so.
+
+Signing covers images only. A service that builds no image has report-only signing: pipegen signs nothing for it, and the notes in The four layers name each one.
+
+## Deploys
+
+Deploy with the verified image digest (the verify job output \`digest\`). A signature only protects a deploy that uses that digest, so deploy by digest, not by tag.
+
+### Unprotected deploys
+
+- ".github/workflows/release.yml" (triggers: workflow_dispatch): It starts by hand.
+- A deploy workflow with any other trigger than a push to the default branch gets no verify job, so it is an unprotected gap. A deploy started by \`workflow_run\` is a gap too, and so is a deploy from a branch other than the default branch (the verify job passes only for the default branch).
+- Each edit pipegen made to a deploy workflow is listed under Not proven yet until you have checked it.
+
+## Not proven yet
+
+- Part pipeline, Running app scan: The scan needs a login that pipegen was not given. Secret names to set: \`APP_LOGIN_TOKEN\`.
+
+Set a missing secret in the repository settings: Settings, Secrets and variables, Actions ([the secrets page of this repository](https://github.com/acme/shop/settings/secrets/actions)). When the key exists, the nightly run opens an issue with the exact patch: run \`npx pipegen update\` and it applies the change as a pull request. CI never edits workflow files itself.
+
+The not-proven list is one line in \`.github/workflows/shop--merge.yml\` in the pipelines repository, marked \`pipegen:not-proven\`. It never holds a check that every repository needs.
+
+## Pipeline integrity
+
+- The gate protects the files that define the pipeline: workflows, tool configs, ignore files and the hook files. A pull request that changes one is blocked unless a code owner approved the exact head commit.
+- Code owners in pipegen's CODEOWNERS block: "alice", "bob". 3 people can write to this repository.
+- A one-person repository: pull requests need no approval, so whoever merges can also change the pipeline that judges them, and pipegen can not prevent that. Run \`npx pipegen verify\` to see whether the pipeline still matches what pipegen set up.
+- Code-owner review is the guard against a job that fakes the gate's name. Where GitHub can not enforce it, the limit is stated in the first section.
+- A patch issue the nightly run opens is only a prompt: \`npx pipegen update\` works out the change itself from its built-in reviewed pins.
+
+## Warn mode
+
+Warn mode lasts until 7 days after you merge (the exact date is set by \`npx pipegen finish\`).
+
+In warn mode old findings and medium ones warn, and a new critical, high or secret finding still blocks. A new blocking check starts in warn mode for about 14 days, then the nightly run opens an issue to switch it to blocking.
+
+These checks start in warn mode:
+
+- Code scan
+
+## Deploying old commits and retention
+
+Runs past the retention period can not be verified, so re-run the pipeline first before you deploy an old commit. GitHub Actions keeps runs and artifacts 90 days by default. On private repositories you can raise it to 400 days (Settings, Actions, General).
+
+## The debate
+
+pipegen chose its tools in a short debate between AI models. The code, not the AI, checks every choice against pipegen's reviewed list.
+
+### Scoreboard
+
+- The builder won the sast check, 2 to 1.
+
+### Transcript
+
+- Builder: use semgrep for sast.
+
+## Hooks setup
+
+After you clone the repository, run \`lefthook install\` once, so the hooks are active on your machine.
+
+The secrets hook runs pipegen from npm, at the exact version that wrote the hook, and pipegen runs its pinned secret scanner on the staged changes. The command is:
+
+\`\`\`sh
+npx --yes --prefix=/ --registry=https://registry.npmjs.org pipegen@VERSION hook secrets
+\`\`\`
+
+VERSION is the exact pipegen version that wrote the hook. The first commit trusts npm's metadata for that exact version. It is not pinned by a lockfile hash.
+
+- The hook needs \`node\` and \`npx\` and a connection to the npm registry, in every language repository. If one is missing the hook fails and blocks the commit (it fails closed).
+- \`git commit --no-verify\` is the way out when npm is unreachable or the version is not published. CI still scans.
+- If the pipegen version that wrote the hook is not on npm (a build that was never published), every commit fails with npm's own \`E404\` text. That means npm has no such version. Use \`git commit --no-verify\` until a published version is in the hook.
+- In CI the hooks run with \`--all-files\`, so nothing is staged and the secrets hook passes at once. The secret scan job of CI is the cover.
+- The local hook is a convenience a repo's own scripts can turn off; CI is the gate.
+
+## Run again, finish, verify, update and uninstall
+
+- Run the pipegen setup again at any time. It updates the same pull request \`pipegen/setup\` and opens central changes through a central pull request, so there are no duplicates.
+- A re-run with \`--yes\`, or in CI, needs the local record file. Without it pipegen shows what the install record claims and you type \`owner/repo\` to confirm.
+- \`npx pipegen finish\` runs after you merge the setup pull request. It turns on the merge locks and the settings pipegen planned. None of them is turned on before the merge, or the setup pull request could not merge.
+- \`npx pipegen finish --print\` changes nothing: it prints the exact commands, so you can run them yourself.
+- \`npx pipegen finish --rotate-key\` makes a new signing key pair (key mode only). Old images do not verify with the new key, and the verify literal changes through a pull request.
+- \`npx pipegen verify\` compares the pipeline in the repository with the install record. It also warns about a CODEOWNERS rule after pipegen's block that names only teams: the gate can not read a team's members, so name users there.
+- \`npx pipegen update\` makes only gate pin swaps and the central re-pin. It never touches \`PIPEGEN.md\`. A file you edited is never overwritten; it goes to a conflict list.
+- Uninstall removes only what the install record shows pipegen made. It asks before it deletes a file that was already in your repository.
+
+## Words used
+
+- Gate: The check \`pipegen / gate\`. It reads every result and decides whether a pull request can merge.
+- Finding: One problem a check reports, such as a vulnerable package or a leaked key.
+- Baseline: The findings that were already there before a pull request, so only new ones count against it.
+- Warn mode: A period in which most findings warn and do not block.
+- Protected path: A file that defines the pipeline. Changing it needs a code-owner approval.
+- Code owner: A person named in CODEOWNERS whose review is required for the files they own.
+- Ruleset: GitHub's rules for a branch, such as a required check or a required review.
+- Not proven: A check pipegen could not prove on your repository yet. It warns and does not block.
+- Verify-first: A job that runs before a deploy and checks the commit passed the gate and the image is the signed one.
+- Signing: A signature on an image that shows which workflow made it.
+- Digest: The checksum that names one exact image. A digest never changes; a tag can move.
+- Suggestion: A tool pipegen mentions but does not run.
+"
+`;
+
+exports[`doc: the 18 sections > doc: snapshot > shape B 1`] = `
+"# What pipegen set up in this repository
+
+pipegen wrote this file in plain English. If you edit it, pipegen keeps your edits and never replaces the file.
+
+## What your GitHub plan allows
+
+This section comes first so that no limit is hidden.
+
+- This repository is public. Your GitHub plan: free.
+- Branch rules: available, so the check \`pipegen / gate\` can be required before a pull request merges.
+- Environments: not available on this plan, so there is no \`pipegen-signing\` environment: the verify job runs without one, and the default-branch limit can not be enforced there.
+- Required reviewers on an environment: not available, so a deploy does not wait for a person.
+- Deployment branch policies: not confirmed, so pipegen does not store a signing key in key mode.
+- Build attestations: not available on this plan.
+- Code scanning results: available.
+- Keyless signing: allowed (a public repository: its signing log is public).
+- Anyone who can add a workflow can add a job that reports under the name of the gate. The guard is CODEOWNERS plus a required code-owner review of the pipeline files. On a private repository with a free plan GitHub can not enforce that review, so this is a limit that stays.
+- Where GitHub can not enforce this (a private repository on a free plan, or a repository with one writer), the deploy check trusts the people who can edit the workflow files.
+- Pull requests from forks: on a public repository, a first-time contributor's workflow run waits for a maintainer to approve it. On a private repository, workflows on fork pull requests are off by default. A check that needs a secret shows as not run on a fork pull request.
+- The network block on CI jobs lets only the allowed hosts through. A site that sits behind the same CDN as an allowed host stays reachable, so the block limits traffic and is not a wall.
+- On a public repository anyone can submit a review on a pull request, and that starts a run on the review event. It does not cancel the pull request's own run.
+
+## What pipegen set up
+
+- pipegen v0.2 is for repositories owned by CrisWorking. A public repository uses the gate in the normal way.
+- This repository is public, so its checks are written inline in this repository: \`.github/workflows/pipegen.yml\`, \`.github/workflows/pipegen-merge.yml\`, \`.github/workflows/pipegen-push.yml\` and \`.github/workflows/pipegen-nightly.yml\`. Its install record is kept in a private pipelines repository.
+- pipegen does not change what or how you deploy. It adds a verify job and \`needs\` entries to your existing deploy jobs, and nothing else in them.
+- pipegen offers three strictness levels, Starter, Standard (the default) and Strict. They decide which checks block a pull request and which only warn. The Standard level is used unless you chose another.
+- Estimated monthly Actions minutes: about 120, counted from the activity of the last 30 days. Actions minutes on a public repository are free.
+
+### Services pipegen found
+
+- Service "docs-site" (node), type: static-site (set by you).
+
+## Fix a blocked pull request
+
+The required check is \`pipegen / gate\`. When it fails, or only warns, its summary on the run gives a message. Find it in the first column.
+
+| Message | What it means | What to do |
+| --- | --- | --- |
+| A new critical or high finding | A check found a serious problem that the base branch did not have. | Fix it in the pull request. A false alarm is for a code owner to judge; adding a suppression comment is flagged itself. |
+| A new secret | A scan found a password, key or token in the files of this pull request. | Remove it, and treat it as leaked: rotate it. A secret that was ever pushed stays in the history. |
+| A secret in a commit of this pull request | A commit of the pull request added a secret, even if a later commit took it out. Any finding in the commit range blocks. | Rotate the secret. Then rewrite the branch so the commits no longer hold it, and push again. |
+| integrity:protected-path (this file is part of the pipeline) | The pull request changes a workflow, a tool config or an ignore file, and no code owner approved this exact commit. | Ask a code owner to approve the latest commit. After a new push the approval has to be given again. |
+| integrity:suppression (lines suppress a check) | Added lines turn a check off for that code (a suppression comment). | Remove the suppression, or ask a code owner to approve this exact commit. |
+| An approval on an older commit | A code owner approved an earlier commit of the pull request. An approval counts only for the commit it was given on. | Ask the code owner to approve the latest commit. |
+| integrity:incomplete-list (the list of changed files is incomplete) | The pull request is too large to check (3,000 or more files), or GitHub did not give the whole file list, so the gate can not see every change. | Split the pull request into smaller ones, or run the checks again if the branch moved. |
+| integrity:no-patch (the gate can not read this file's changes) | GitHub gave no readable change for that file, so the gate can not check it for suppressions. | Make the change smaller or split the file change into its own pull request. A code owner can approve the exact commit. |
+| integrity:case-extension | A new file has a scanned language's extension in another letter case, so the scanners would skip it while a runtime may still load it. | Rename the file to the lower-case extension. |
+| A tool error | A check could not finish (it crashed, ran out of time or its result could not be read). A required check that errors blocks. | Read the check's log, fix the cause and run the checks again. |
+| Not run on a fork pull request | GitHub gives no secrets to a pull request from a fork, so a check that needs one did not run. If the check is required, the pull request is blocked. | A maintainer can push the branch into this repository and open the pull request from there. |
+| A check marked not proven | pipegen could not prove the check on your repository yet (see Not proven yet). It warns and does not block. | Set the secret names listed under Not proven yet. The nightly run then opens an issue and \`npx pipegen update\` applies the change. |
+| A check marked skipped | You skipped that part with --skip, so it has no job and gives no protection. | Run pipegen again without the skip if you want the part. |
+| A check's result does not match | The result file of a check is missing, or its checksum differs from the one its job reported. The gate does not trust it and blocks. | Run the checks again. If it keeps happening, someone changed the pipeline: run \`npx pipegen verify\`. |
+| No base to compare with | The base scan did not run on the base commit of this event, so every finding counts as new. On the pull request that installs pipegen it warns instead. | Run the checks again. On a new install, merge the setup pull request and the next pull request has a base. |
+| A known malicious package | A dependency matches a malicious-package advisory (MAL-). It blocks even when it is old. | Remove the package and rotate anything it could have read. |
+| A new dependency problem or an unknown licence | A package added by the pull request has a new advisory, or a licence the check does not know. A new advisory blocks; an unknown licence warns because it needs a human. | Pick another package, or have a person check the licence. |
+| No coverage | A check ran but could not look (for example a scan that reported nothing because it had nothing to read). A required one blocks, because nothing was proven. | Fix what the check could not read, then run the checks again. |
+| A warning in warn mode | The check is still in warn mode, so old findings and medium ones warn. A new critical, high or secret finding still blocks. | Fix the warnings before warn mode ends (see Warn mode). |
+| Warn mode ended | The warn period is over, so what used to warn now blocks. | Fix the finding. Nothing else changed. |
+| A gate settings problem | The gate's own settings are wrong (for example a required check listed as not proven). The gate blocks, because it can not trust itself. | Run \`npx pipegen verify\`, then \`npx pipegen update\`. |
+| An image finding with no base | Image findings have no base to compare with yet: on the pull request that installs pipegen they warn, and on every other pull request they block. | Fix the finding in the image or its base image. |
+| The required check \`pipegen / gate\` never reported | GitHub waits for a check that did not run, so the pull request can not merge. | Run the workflow again. With the org required workflow, re-run the \`pipegen required\` run after a code owner approves. |
+
+## The four layers
+
+Each check has a tool, a reason and a mode: it either blocks a pull request or only warns.
+
+### Pre-commit layer
+
+Runs on your machine before each commit.
+
+No check of this layer is set up here.
+
+### Push layer
+
+Runs on a push to a branch that has no open pull request.
+
+No check of this layer is set up here.
+
+### Merge layer
+
+Runs on every pull request and decides whether it can merge. The gate (the check \`pipegen / gate\`) reads every result.
+
+- Secret scan, no tool listed (see the notes below). Looks for passwords, keys and tokens in the code and in the commits of a pull request. Blocks a pull request.
+- Code scan, service "docs-site", no tool listed (see the notes below). Looks for insecure code patterns in your source. Blocks a pull request.
+- Dependency scan, service "docs-site", no tool listed (see the notes below). Looks for known vulnerabilities in the packages you depend on. Blocks a pull request.
+- The gate, tool the pipegen gate action. Reads every result and decides whether the pull request can merge. Blocks a pull request.
+
+### Deploy layer
+
+Runs on a push to the default branch: it builds, signs and checks the images that are deployed.
+
+No check of this layer is set up here.
+
+### Limits of these checks
+
+- The code scan runs Semgrep with a pinned copy of the semgrep-rules repository. Those rules have their own licence (the Semgrep Rules License v1.0). It lets you use them to check your own code, but not to sell them or offer them as a service. Read it before you use the rules anywhere else.
+- Each service installs with \`npm ci\`, which needs a \`package-lock.json\` in that service's folder. A lock file at the workspace root is not enough: the check then fails closed, it does not pass.
+- npm only: pnpm, yarn and bun are not supported yet. A Vue, Svelte or Astro TypeScript repository stops at assembly with a plain reason, because pipegen has no reviewed type checker for it.
+- The nightly job has a \`concurrency\` group, so runs never overlap. An issue it opened and any bot closed (even a stale bot running as the github-actions bot) is reopened by design. Only a person can dismiss it.
+- After rewriting main's history (a force-push), the gate may stay in block mode until 10 green pushes to main have followed.
+
+### Notes from the build
+
+There are no notes.
+
+## Suggestions (not running)
+
+A suggestion is a tool that pipegen does not run for you. It may be a tool pipegen has not reviewed, or a reviewed tool that had nothing to run on in this repository (its reason says which). Suggestions are mention-only: they never run. A tool can join the reviewed list only through a reviewed pull request to pipegen.
+
+There are no suggestions.
+
+## Files pipegen created and why
+
+- \`PIPEGEN.md\`: this file.
+- \`.github/workflows/pipegen.yml\`: the workflow that starts the pipeline. Its jobs sit beside it in \`.github/workflows/pipegen-merge.yml\`, \`.github/workflows/pipegen-push.yml\` and \`.github/workflows/pipegen-nightly.yml\`.
+- Dependabot, in \`.github/dependabot.yml\` when pipegen adds an entry: it keeps the pinned actions up to date, each update at least 7 days old. The entry ignores the central repository, because Dependabot can not read it, so Dependabot does not bump the central commit. pipegen keeps that pin fresh: \`npx pipegen update\` opens the pull request and the nightly run warns when the pin is old. There are two opt-ins, not on by default: an organisation grant through the API, or a git registry entry with a read-only token you make yourself. A repository that uses Renovate keeps it and gets no Dependabot file (set \`minimumReleaseAge\` to 7 days in Renovate).
+- Files that were already in your repository, identical to what pipegen writes, are listed in the setup pull request. pipegen never rewrites them, and uninstall asks before it deletes one.
+
+## Your tests
+
+Starter tests describe what your code does today. They are a coverage floor, not proof: they can lock in today's bugs, so review them. App code runs with full power (process, network and files), so the CI job that runs it has no secrets, a read-only token and no network except the registry.
+
+No test decision was recorded.
+
+## Skipped parts
+
+Nothing was skipped.
+
+## Signing
+
+pipegen signs nothing in this setup.
+
+- No service builds an image that pipegen publishes, or the signing mode is not available here.
+
+Signing covers images only. A service that builds no image has report-only signing: pipegen signs nothing for it, and the notes in The four layers name each one.
+
+## Deploys
+
+Deploy with the verified image digest (the verify job output \`digest\`). A signature only protects a deploy that uses that digest, so deploy by digest, not by tag.
+
+### Unprotected deploys
+
+pipegen listed no unprotected deploy workflow.
+
+- A deploy workflow with any other trigger than a push to the default branch gets no verify job, so it is an unprotected gap. A deploy started by \`workflow_run\` is a gap too, and so is a deploy from a branch other than the default branch (the verify job passes only for the default branch).
+- Each edit pipegen made to a deploy workflow is listed under Not proven yet until you have checked it.
+
+## Not proven yet
+
+Every check pipegen set up is proven.
+
+Set a missing secret in the repository settings: Settings, Secrets and variables, Actions ([the secrets page of this repository](https://github.com/pat/garden/settings/secrets/actions)). When the key exists, the nightly run opens an issue with the exact patch: run \`npx pipegen update\` and it applies the change as a pull request. CI never edits workflow files itself.
+
+The not-proven list is one line in \`.github/workflows/pipegen-merge.yml\`, marked \`pipegen:not-proven\`. It never holds a check that every repository needs.
+
+## Pipeline integrity
+
+- The gate protects the files that define the pipeline: workflows, tool configs, ignore files and the hook files. A pull request that changes one is blocked unless a code owner approved the exact head commit.
+- pipegen wrote no CODEOWNERS block, so there is no code-owner review of the pipeline files (see the locks notes in the first section).
+- A one-person repository: pull requests need no approval, so whoever merges can also change the pipeline that judges them, and pipegen can not prevent that. Run \`npx pipegen verify\` to see whether the pipeline still matches what pipegen set up.
+- Code-owner review is the guard against a job that fakes the gate's name. Where GitHub can not enforce it, the limit is stated in the first section.
+- A patch issue the nightly run opens is only a prompt: \`npx pipegen update\` works out the change itself from its built-in reviewed pins.
+
+## Warn mode
+
+Warn mode lasts until 7 days after you merge (the exact date is set by \`npx pipegen finish\`).
+
+In warn mode old findings and medium ones warn, and a new critical, high or secret finding still blocks. A new blocking check starts in warn mode for about 14 days, then the nightly run opens an issue to switch it to blocking.
+
+## Deploying old commits and retention
+
+Runs past the retention period can not be verified, so re-run the pipeline first before you deploy an old commit. GitHub Actions keeps runs and artifacts 90 days by default. On private repositories you can raise it to 400 days (Settings, Actions, General).
+
+## The debate
+
+pipegen chose its tools in a short debate between AI models. The code, not the AI, checks every choice against pipegen's reviewed list.
+
+No debate was recorded.
+
+## Hooks setup
+
+pipegen wrote no hook file, so there is no setup command. The notes in The four layers say why.
+
+## Run again, finish, verify, update and uninstall
+
+- Run the pipegen setup again at any time. It updates the same pull request \`pipegen/setup\` and opens central changes through a central pull request, so there are no duplicates.
+- A re-run with \`--yes\`, or in CI, needs the local record file. Without it pipegen shows what the install record claims and you type \`owner/repo\` to confirm.
+- \`npx pipegen finish\` runs after you merge the setup pull request. It turns on the merge locks and the settings pipegen planned. None of them is turned on before the merge, or the setup pull request could not merge.
+- \`npx pipegen finish --print\` changes nothing: it prints the exact commands, so you can run them yourself.
+- \`npx pipegen finish --rotate-key\` makes a new signing key pair (key mode only). Old images do not verify with the new key, and the verify literal changes through a pull request.
+- \`npx pipegen verify\` compares the pipeline in the repository with the install record. It also warns about a CODEOWNERS rule after pipegen's block that names only teams: the gate can not read a team's members, so name users there.
+- \`npx pipegen update\` makes only gate pin swaps and the central re-pin. It never touches \`PIPEGEN.md\`. A file you edited is never overwritten; it goes to a conflict list.
+- Uninstall removes only what the install record shows pipegen made. It asks before it deletes a file that was already in your repository.
+
+## Words used
+
+- Gate: The check \`pipegen / gate\`. It reads every result and decides whether a pull request can merge.
+- Finding: One problem a check reports, such as a vulnerable package or a leaked key.
+- Baseline: The findings that were already there before a pull request, so only new ones count against it.
+- Warn mode: A period in which most findings warn and do not block.
+- Protected path: A file that defines the pipeline. Changing it needs a code-owner approval.
+- Code owner: A person named in CODEOWNERS whose review is required for the files they own.
+- Ruleset: GitHub's rules for a branch, such as a required check or a required review.
+- Not proven: A check pipegen could not prove on your repository yet. It warns and does not block.
+- Verify-first: A job that runs before a deploy and checks the commit passed the gate and the image is the signed one.
+- Signing: A signature on an image that shows which workflow made it.
+- Digest: The checksum that names one exact image. A digest never changes; a tag can move.
+- Suggestion: A tool pipegen mentions but does not run.
+"
+`;
