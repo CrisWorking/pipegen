@@ -196,7 +196,8 @@ export interface RunStages {
   scan(dir: string, consent: ConsentToken, knownValues: string[]): Promise<CodeBundle>;
   activity(f: GitHubFacts, p: RepoProfile): Promise<Activity>;
   consent(f: GitHubFacts, p: RepoProfile, ai: ReturnType<typeof makeProvider>, est: Estimates, bundle: CodeBundle, auth: Auth, extra: string[]): Promise<ConsentToken | null>;
-  state(p: RepoProfile): Promise<StateStore>;
+  /** G13-R2 4 (sec m3): `guard` is the run's known-value check (the vault and the key vault, read live) and its tokens: never written. */
+  state(p: RepoProfile, guard: { vault: KnownValueCheck; tokens: readonly string[] }): Promise<StateStore>;
   /** Carry 58 (ruling G13-R0 12): a public app's gate, at its pinned commit, can be read. */
   gateReachable(f: GitHubFacts, reviewed: readonly ReviewedTool[]): Promise<boolean>;
   proofRepos(f: GitHubFacts, p: RepoProfile, auth: Auth, store: StateStore, runId: string, actions: readonly string[]): Promise<ProofRepos>;
@@ -355,7 +356,10 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     // the secret scan of the counted files only; a finding stops the run before anything is sent to an AI
     const bundle = await st.scan(dir, consent, knownValues);
     if (bundle.found.names.length > 0 || bundle.found.values.length > 0) { err(SECRET_FOUND); return 2; }
-    store = await st.state(p);
+    // sec m3: the vaults exist from here (empty), so the state store checks every write against what is typed later
+    vault = new SecretVault();
+    keyVault = new SecretVault();
+    store = await st.state(p, { vault: knownChecks(vault, keyVault), tokens: [auth.token] });
     const runId = (deps.runId ?? (() => newRunId(now())))();
     // S20: one pipegen per app repo on this machine
     store.acquireLease(runId);
@@ -403,8 +407,6 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     if (p.private) draft.centralPin = { repo: `${p.owner}/${CENTRAL_REPO}`, sha: UNPINNED };
     // carry 10: the signing plan from the probed mode, only for services that build an image. key-env (carries 16, 28, 60): a record that
     // already names a public key (a finish --rotate-key) keeps it and makes no pair; otherwise one pair, in memory, before the verify literal
-    vault = new SecretVault();
-    keyVault = new SecretVault();
     let pair: SigningKey | undefined;
     let pubSha: string | undefined;
     if (keyEnvApplies) {
@@ -834,7 +836,7 @@ function realStages(io: CliIO, deps: RunDeps): RunStages {
       return askConsent(io.prompt, screen, (s) => { io.err(s); });
     },
     scan: (dir, consent, knownValues) => scanCounted(dir, consent, knownValues, deps.secretScanner ?? pinnedScanner),
-    state: (p) => StateStore.open(p, deps.state ?? {}),
+    state: (p, guard) => StateStore.open(p, { ...deps.state, vault: guard.vault, tokens: guard.tokens }),
     async gateReachable(f, reviewed) {
       // ruling G13-R0 12: the gate action's pinned commit, read through the API; any failure is "unreachable"
       const g = gateOf(reviewed);

@@ -1295,3 +1295,25 @@ describe('G13-R2: a public app\'s central CODEOWNERS', () => {
     expect(w2.calls).not.toContain('readCentralFileList');
   });
 });
+
+describe('G13-R2: the state file never holds a known value (ruling G13-R2 4)', () => {
+  it('run: the state store gets the run\'s known-value check (the vault and the key vault, live) and the GitHub token', async () => {
+    const w = world();
+    let guard: { vault: { containsKnownValue(t: string): boolean }; tokens: readonly string[] } | undefined;
+    const seen: boolean[] = [];
+    w.stages.state = async (p, g) => { guard = g; w.calls.push('state'); return StateStore.open(p, { home: w.home, env: {}, ...g }); };
+    const secrets = w.stages[SEC_STAGE] as RunStages['secrets'];
+    w.stages[SEC_STAGE] = async (...a) => { seen.push(guard?.vault.containsKnownValue('x typed-value-1234567890 y') ?? false); return secrets(...a); };
+    expect(await run(w)).toBe(0);
+    expect(guard?.tokens).toEqual([TK]);
+    // the value typed after the store was opened is known to it (a live check, not a copy)
+    expect(seen).toEqual([true]);
+    // and a real store with that guard refuses to write it
+    const d = tmp('pg-state-guard-');
+    const v = new SecretVault();
+    const store = await StateStore.open({ owner: OWN, repo: 'r' }, { home: d, env: {}, vault: v, tokens: [TK] });
+    store.begin('20261106-100000-abc123', { owner: OWN, repo: 'r', private: true, ownerType: 'User', defaultBranch: 'main' }, { cap: 1, aiCap: 1 });
+    v.set('API_TK', 'typed-value-1234567890');
+    expect(() => store.recordVerdict({ ok: false, stopped: 'typed-value-1234567890' })).toThrow();
+  });
+});
