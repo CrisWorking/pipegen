@@ -1,6 +1,7 @@
 // Coverage mapper (see ../coverage.ts for the rules): git hooks (pre-commit, husky, lefthook) and CI `pre-commit run`.
 import { parse as parseToml } from 'smol-toml';
 import { regexSafe } from '../../read/limits.js';
+import { canonicalSecretsHook } from '../hook-credit.js';
 import { asObj } from '../../read/manifest.js';
 import { MAX_FLAG_WORDS, MAX_HITS, MAX_HOOKS } from './bounds.js';
 import { HOOK_FILE } from './decide.js';
@@ -24,6 +25,18 @@ export interface Hooks {
    * and creditEquivalents never credits them.
    */
   unrecognised: string[];
+}
+/**
+ * G6-R3 (H1, the audit side): a secret scan counts before each commit only from the canonical remote gitleaks hook (hook-credit.ts,
+ * the pre-commit layer's own rule): any other hook's secrets run, and every husky or lefthook one, gets reason `hook-form` (partial).
+ */
+function strictSecrets(fs: readonly Found[], canonical: boolean): Found[] {
+  if (canonical) return [...fs];
+  return fs.flatMap((f) => {
+    if (f.reason !== null || !f.categories.includes('secrets')) return [f];
+    const rest = f.categories.filter((c) => c !== 'secrets');
+    return [...(rest.length > 0 ? [{ ...f, categories: rest }] : []), { ...f, categories: ['secrets'], reason: 'hook-form' as const }];
+  });
 }
 /** What hookConfigRuns read: the tools the config runs and the hooks it couldn't place. */
 interface HookConfig { found: Found[]; unrecognised: string[] }
@@ -189,7 +202,7 @@ async function hookConfigRuns(ctx: Ctx, config: Obj): Promise<HookConfig> {
         const stages = 'stages' in hook ? strs(hook.stages) : defaultStages;
         if (stages.length > 0 && !stages.some((st) => st === 'pre-commit' || st === 'commit')) hookFound = hookFound.map((f) => ({ ...f, reason: 'stage' }));
         // each hook's scripts are followed here, not at the end, so a hook whose script runs no known tool is seen (B4)
-        const resolved = (await resolveScripts(ctx, hookFound)).filter((f) => f.composeSentinel !== true); // P59 (4): no job env here
+        const resolved = strictSecrets((await resolveScripts(ctx, hookFound)).filter((f) => f.composeSentinel !== true), canonicalSecretsHook(r.ok, repo, hook)); // P59 (4): no job env here
         const lookalike = !local && !known; // a repo pipegen doesn't list: it can't see what the hook runs
         if (lookalike || !resolved.some((f) => f.categories.some((c) => !c.startsWith(UNKNOWN_PREFIX)))) {
           if (unrecognised.length < MAX_UNRECOGNISED) unrecognised.push(id !== '' && PLAIN_HOOK_ID.test(id) ? id : '(a hook without a readable id)');
@@ -207,7 +220,7 @@ export async function readHooks(ctx: Ctx): Promise<Hooks> {
   if (manager === null) return none;
   const scan = async (text: string, base: string | null, mode: ShellMode) => {
     const g = gateOf([text], [], undefined, ctx.sigs.softEnv, ctx.sigs.configFiles);
-    return gated(await resolveScripts(ctx, scanShell(text, base, ctx.sigs, ctx.budget, mode)), g).filter((f) => f.composeSentinel !== true || g.compose);
+    return strictSecrets(gated(await resolveScripts(ctx, scanShell(text, base, ctx.sigs, ctx.budget, mode)), g).filter((f) => f.composeSentinel !== true || g.compose), false);
   };
   if (manager === 'husky') {
     const where = '.husky/pre-commit';

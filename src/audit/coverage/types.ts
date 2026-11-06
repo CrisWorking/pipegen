@@ -40,7 +40,9 @@ export type Reason = 'continue' | 'suppressed' | 'function' | 'soft' | 'inputs' 
   // fix round 1: a config file or env var that can turn the check off (P8); an egress step on a runner it can't guard
   | 'config' | 'runner'
   // Plan P final review I1 (ruling P33): an action on pipegen's own never-list, which never makes a row covered
-  | 'never-listed';
+  | 'never-listed'
+  // G6-R3 (H1): a secret scan in a hook that is not the canonical remote gitleaks pre-commit hook (hook-credit.ts)
+  | 'hook-form';
 
 export type Manager = NonNullable<RepoProfile['precommit']>;
 export type CiLayer = Exclude<Layer, 'pre-commit'>;

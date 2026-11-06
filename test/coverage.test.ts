@@ -146,12 +146,13 @@ describe('mapCoverage (brief)', () => {
     expect(row(rows, 'pre-commit', 'secrets').status).toBe('missing'); // hooks are read, not guessed
   });
 
-  it('coverage: husky hook running gitleaks → pre-commit covered', async () => {
+  it('coverage: husky hook running gitleaks → pre-commit secrets partial (G6-R3: only the canonical pre-commit hook covers it)', async () => {
     const dir = makeTempDir();
     writeIn(dir, '.husky/pre-commit', '#!/bin/sh\n# gitleaks used to run here: nogitleaksx\ngitleaks protect --staged --redact\nnpx lint-staged\n');
     const rows = await coverage(dir);
-    expect(row(rows, 'pre-commit', 'secrets')).toMatchObject({ status: 'covered', by: 'gitleaks', where: '.husky/pre-commit' });
-    expect(row(rows, 'pre-commit', 'secrets').why).toMatch(/husky pre-commit hook/);
+    // git may run .husky/pre-commit without -e, so the last line's exit status wins (review N1)
+    expect(row(rows, 'pre-commit', 'secrets')).toMatchObject({ status: 'partial', by: 'gitleaks', where: '.husky/pre-commit' });
+    expect(row(rows, 'pre-commit', 'secrets').why).toMatch(/official gitleaks pre-commit hook/);
     expect(row(rows, 'pre-commit', 'hooks')).toMatchObject({ status: 'covered', by: 'husky' });
     expect(row(rows, 'pre-commit', 'format-lint', 'app')).toMatchObject({ status: 'covered', by: 'lint-staged' });
     expect(row(rows, 'push', 'secrets').status).toBe('missing'); // a hook is not CI
@@ -161,14 +162,47 @@ describe('mapCoverage (brief)', () => {
 describe('mapCoverage (rulings)', () => {
   it('coverage: pre-commit framework and lefthook hook configs are read (S4)', async () => {
     const dir = makeTempDir();
-    writeIn(dir, '.pre-commit-config.yaml', 'repos:\n  - repo: https://github.com/gitleaks/gitleaks\n    rev: v8.0.0\n    hooks:\n      - id: gitleaks\n  - repo: local\n    hooks:\n      - id: fmt\n        entry: ruff format\n        stages: [manual]\n');
+    // G6-R4: v8.0.0's hook ran no scan, so the fixture uses a tag whose hook does
+    writeIn(dir, '.pre-commit-config.yaml', 'repos:\n  - repo: https://github.com/gitleaks/gitleaks\n    rev: v8.30.1\n    hooks:\n      - id: gitleaks\n  - repo: local\n    hooks:\n      - id: fmt\n        entry: ruff format\n        stages: [manual]\n');
     const rows = await coverage(dir, pyApp);
     expect(row(rows, 'pre-commit', 'secrets')).toMatchObject({ status: 'covered', by: 'gitleaks', where: '.pre-commit-config.yaml' });
     expect(row(rows, 'pre-commit', 'hooks')).toMatchObject({ status: 'covered', by: 'pre-commit' });
     expect(row(rows, 'pre-commit', 'format-lint', 'app').status).toBe('partial'); // manual stage only: set up, but not run before a commit (fix round 1, I2)
     const dir2 = makeTempDir();
     writeIn(dir2, 'lefthook.yml', 'pre-commit:\n  commands:\n    leaks:\n      run: trufflehog git file://. --since-commit HEAD --fail\n');
-    expect(row(await coverage(dir2), 'pre-commit', 'secrets')).toMatchObject({ status: 'covered', by: 'trufflehog', where: 'lefthook.yml' });
+    expect(row(await coverage(dir2), 'pre-commit', 'secrets')).toMatchObject({ status: 'partial', by: 'trufflehog', where: 'lefthook.yml' });
+  });
+
+  it('coverage: a secret scan before each commit is covered only by the canonical remote gitleaks hook (G6-R3, the audit side of H1)', async () => {
+    const canonical = 'repos:\n  - repo: https://github.com/gitleaks/gitleaks\n    rev: v8.30.1\n    hooks:\n      - id: gitleaks\n';
+    const withHook = (extra: string) => `${canonical}${extra}`;
+    const local = (body: string) => `repos:\n  - repo: local\n    hooks:\n      - id: gitleaks\n        name: gitleaks\n        language: system\n${body}`;
+    const status = async (config: string) => {
+      const dir = makeTempDir();
+      writeIn(dir, '.pre-commit-config.yaml', config);
+      return row(await coverage(dir, pyApp), 'pre-commit', 'secrets');
+    };
+    for (const config of [canonical, canonical.replace('v8.30.1', 'v8.1.1'), withHook('        stages: []\n'), `default_stages: [pre-commit]\n${canonical}`, withHook('        pass_filenames: false\n')]) {
+      expect((await status(config)).status, config).toBe('covered');
+    }
+    for (const config of [
+      withHook('        args: ["#", "--exit-code=0"]\n'), withHook('        args: [--verbose]\n'), withHook('        pass_filenames: true\n'),
+      `default_stages: [pre-push]\n${withHook('        stages: []\n')}`, canonical.replace('v8.30.1', 'master'), ...['v8.0.0', 'v8.1.0', 'v9.0.0', 'v9.2.1', 'v10.2.3'].map((t) => canonical.replace('v8.30.1', t)),
+      // G6-R4 minor 1: pre-commit's PyYAML merges `<<`, the audit's YAML 1.2 reader keeps it as a literal key: no credit with one
+      `<<: {exclude: '.*'}\n${canonical}`, `<<: {default_stages: [manual]}\n${canonical}`,
+      canonical.replace('    rev: v8.30.1\n', '    rev: v8.30.1\n    <<: {x: 1}\n'), withHook('        <<: {files: ^docs/}\n'),
+      canonical.replace('v8.30.1', '83d9cd684c87d95d656c1458ef04895a7f1cbd8e'), canonical.replace('id: gitleaks', 'id: gitleaks-system'),
+      local('        entry: "gitleaks git --pre-commit --redact --staged\\n--exit-code=0"\n        pass_filenames: false\n'),
+      local('        entry: gitleaks git --pre-commit --redact --staged # --exit-code=0\n        pass_filenames: false\n'),
+      local('        entry: gitleaks git --pre-commit --redact --staged --verbose\n'),
+      local('        entry: gitleaks protect\n        pass_filenames: false\n'),
+    ]) {
+      const r = await status(config);
+      expect(r.status, config).not.toBe('covered');
+    }
+    const r = await status(local('        entry: gitleaks git --pre-commit --redact --staged\n        pass_filenames: false\n'));
+    expect(r).toMatchObject({ status: 'partial', by: 'gitleaks' });
+    expect(r.why).toMatch(/official gitleaks pre-commit hook/);
   });
 
   it('coverage: S4 hooks, hooks-ci, gate and deploy-verify rows', async () => {
@@ -698,7 +732,8 @@ describe('mapCoverage (fix round 2)', () => {
   it('coverage: round 2 hooks: husky runs with sh -e, lefthook with sh -c (no -e)', async () => {
     const husky = makeTempDir();
     writeIn(husky, '.husky/pre-commit', 'gitleaks protect --staged\necho done\n');
-    expect(row(await coverage(husky), 'pre-commit', 'secrets').status).toBe('covered');
+    // G6-R3 (N1): git may run .husky/pre-commit without -e, so a husky secret scan is never counted as covered
+    expect(row(await coverage(husky), 'pre-commit', 'secrets').status).toBe('partial');
     const lefthook = makeTempDir();
     writeIn(lefthook, 'lefthook.yml', 'pre-commit:\n  commands:\n    leaks:\n      run: gitleaks protect --staged; echo done\n');
     expect(row(await coverage(lefthook), 'pre-commit', 'secrets').status).toBe('partial');
@@ -1114,7 +1149,7 @@ describe('mapCoverage (Task 5, item 2: Python runners)', () => {
 });
 
 const RUFF_REPO = 'https://github.com/astral-sh/ruff-pre-commit';
-const hookConfig = (hooks: string, repo = RUFF_REPO) => `repos:\n  - repo: ${repo}\n    rev: v0.16.0\n    hooks:\n${hooks}`;
+const hookConfig = (hooks: string, repo = RUFF_REPO, rev = 'v0.16.0') => `repos:\n  - repo: ${repo}\n    rev: ${rev}\n    hooks:\n${hooks}`;
 const FLASK_PRECOMMIT = 'uv run --locked --no-default-groups --group pre-commit pre-commit run --show-diff-on-failure --color=always --all-files';
 
 describe('mapCoverage (P55 batch B: docker compose and Dockerfile RUN)', () => {
@@ -1418,7 +1453,7 @@ describe('mapCoverage (Task 5, item 3: pre-commit hook contents)', () => {
 
   it('pre-commit hooks (adversarial): a secret-scan hook run in CI is not a CI secret scan (it scans staged changes); soft hook args → partial', async () => {
     const dir = makeTempDir();
-    writeIn(dir, '.pre-commit-config.yaml', hookConfig('      - id: gitleaks\n', 'https://github.com/gitleaks/gitleaks'));
+    writeIn(dir, '.pre-commit-config.yaml', hookConfig('      - id: gitleaks\n', 'https://github.com/gitleaks/gitleaks', 'v8.30.1'));
     ci(dir, run('pre-commit run --all-files'));
     const rows = await coverage(dir, pyApp);
     expect(row(rows, 'pre-commit', 'secrets')).toMatchObject({ status: 'covered', by: 'gitleaks' });
@@ -1524,7 +1559,9 @@ describe('mapCoverage (Task 5 fix round 1)', () => {
       ['local language: pygrep', local('        entry: gitleaks\n        language: pygrep\n'), 'missing', 'missing', 'missing'],
       ['local language: system', local('        entry: ruff check\n        language: system\n'), 'covered', 'missing', 'covered'],
       ['meta with an entry', 'repos:\n  - repo: meta\n    hooks:\n      - id: identity\n        entry: ruff check\n', 'missing', 'missing', 'missing'],
-      ['old gitleaks URL', hookConfig('      - id: gitleaks\n', 'https://github.com/zricethezav/gitleaks'), 'missing', 'covered', 'missing'],
+      // G6-R3: a gitleaks hook counts at a pinned gitleaks rev (a v8+ tag or a commit sha)
+      ['old gitleaks URL, a branch rev', hookConfig('      - id: gitleaks\n', 'https://github.com/zricethezav/gitleaks', 'main'), 'missing', 'partial', 'missing'],
+      ['old gitleaks URL', hookConfig('      - id: gitleaks\n', 'https://github.com/zricethezav/gitleaks', 'v8.30.1'), 'missing', 'covered', 'missing'],
       ['old ruff URL', hookConfig('      - id: ruff\n', RUFF_OLD), 'covered', 'missing', 'covered'],
       ['psf/black', hookConfig('      - id: black\n', 'https://github.com/psf/black'), 'covered', 'missing', 'missing'],
       ['ruff-check (control)', hookConfig('      - id: ruff-check\n'), 'covered', 'missing', 'covered'],
