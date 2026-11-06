@@ -558,6 +558,21 @@ describe('uninstall: load and trust the install record, fix round 1 (V1-R1)', ()
     }
   });
 
+  it('record: a record only on the central update branch, with no local file or another hash in it → stop says merge or delete that branch, asks nothing (sec M-r1, probe R-M6b)', async () => {
+    for (const interactive of [true, false]) {
+      for (const localFile of ['none', 'other'] as const) {
+        const w = world();
+        putRecord(w, recordFileText(sampleRecord(w.appId)), 'pipegen/update-r');
+        if (localFile === 'other') await writeLocalRecord(APP, { recordHash: 'a'.repeat(64), updatedAt: 'x' }, local(w));
+        const e = await stops(loadUninstallRecord(gh(w), APP, { local: local(w), ...(interactive ? { io: io(w, 'o/r'), interactive: true } : {}) }),
+          /only on the central branch pipegen\/update-r.*Merge that change \(or delete the branch\), then run `npx pipegen uninstall` again/s);
+        expect(e.message, `${interactive}/${localFile}`).not.toMatch(/type the repo name|not confirmed by typing|move that file away|didn't confirm/);
+        expect(w.asked).toEqual([]);
+        expect(writes(w)).toEqual([]);
+      }
+    }
+  });
+
   it('record: the app is held to GitHub\'s canonical name, owner type and central id (sec M7, probe P6)', async () => {
     // P6: a transferred repo, served through GitHub's redirect for the old name
     const w = world();

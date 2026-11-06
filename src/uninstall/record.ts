@@ -259,6 +259,11 @@ async function load(gh: Octokit, app: RepoRef, deps: UninstallDeps): Promise<Loa
   const trusted = await trustedPrevious(gh, app, central, c.defaultBranch, updateExists ? update : null, deps.local ?? {}, clock, notes, confirm);
   if (trusted.record === null) {
     if (!trusted.exists) throw new UninstallError(none);
+    // sec M-r1 (V1-R2): nothing on the default branch, so the record is only on the central update branch. trustedPrevious offers only the
+    // default branch's record for typing, so no run at a terminal can confirm it, and its note ("you didn't confirm it") would be false.
+    if (first === null) {
+      throw new UninstallError(`pipegen found no install record for ${name} on the default branch of ${centralName}: it is only on the central branch ${show(update, 120)}, which pipegen can't confirm. Merge that change (or delete the branch), then run \`npx pipegen uninstall\` again. Nothing was changed.`);
+    }
     const file = localRecordPath(app, deps.local ?? {});
     const wayOn = trusted.why === 'mismatch'
       ? `This machine's local record file ${show(file, 300)} holds another record's hash. If you set pipegen up from another machine, move that file away and run \`npx pipegen uninstall\` again at a terminal: pipegen then shows what the record claims and asks you to type the repo name.`
