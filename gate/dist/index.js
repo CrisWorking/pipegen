@@ -1895,6 +1895,8 @@ function resultArtifactName(needId, service, opts) {
 }
 var SECRETS_RANGE_ID = "secrets-range";
 var SECRETS_RANGE_ARTIFACT = resultArtifactName(SECRETS_RANGE_ID);
+var SECRETS_HISTORY_ID = "secrets-history";
+var SECRETS_HISTORY_ARTIFACT = resultArtifactName(SECRETS_HISTORY_ID);
 var SECRETS_RANGE_TOOL = "betterleaks";
 var RANGE_FACTS_FILE = "range.json";
 var RANGE_CANARY_FILES = ["pipegen-range-canary-1.txt", "pipegen-range-canary-2.txt"];
@@ -2655,6 +2657,8 @@ var RANGE_BEFORE_REF = `\${{ github.event_name == 'pull_request' && github.event
 var RANGE_EVENT_REF = "${{ github.event_name }}";
 var RANGE_STEP_ENV = Object.freeze({ PIPEGEN_RANGE_BASE: BASE_CHECKOUT_REF, PIPEGEN_RANGE_HEAD: RANGE_HEAD_REF, PIPEGEN_RANGE_BEFORE: RANGE_BEFORE_REF, PIPEGEN_RANGE_EVENT: RANGE_EVENT_REF });
 var rangeScanStepId = `checker-run-${sha16(SECRETS_RANGE_ARTIFACT)}`;
+var HISTORY_STEP_ENV = Object.freeze({ PIPEGEN_HISTORY_HEAD: "${{ github.sha }}" });
+var historyScanStepId = `checker-run-${sha16(SECRETS_HISTORY_ARTIFACT)}`;
 var RENDERER_INPUTS = Object.freeze({
   // the base commit, for the base-scan job only (the job rule is in job-rules.ts); no other ref is ever set
   "actions/checkout": { ref: { describe: "the event-switched base commit (BASE_CHECKOUT_REF) and nothing else", check: (v) => v === BASE_CHECKOUT_REF } },
@@ -6010,14 +6014,16 @@ var RangeFactsError = class extends Error {
 };
 var SKIP_REASONS = ["no-range", "no-merge-base"];
 var isRangeSkipped = (r) => Object.hasOwn(r, "skipped");
+var isHistory = (r) => Object.hasOwn(r, "history");
 var SHA_RE3 = /^[0-9a-f]{40}$/;
 var ZERO = "0".repeat(40);
 var MAX_FACTS_BYTES = 64 * 1024;
 var MAX_COMMITS = 1e7;
 var KEYS = ["base", "before", "canaries", "commits", "forced", "head", "pipegenRange"];
+var HISTORY_KEYS = ["canaries", "commits", "head", "history", "pipegenRange"];
 var CANARY_RULE_ID2 = `secret:${CANARY_RULE}`;
 var isObj2 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
-function parseRangeFacts(text) {
+function parseRangeFacts(text, kind = "range") {
   const bad = (why2) => {
     throw new RangeFactsError(`the commit-range facts ${why2}`);
   };
@@ -6030,6 +6036,12 @@ function parseRangeFacts(text) {
   }
   if (!isObj2(d)) return bad("are not in the form the range scan step writes");
   if (d.pipegenRange !== 1) bad("are of a version this gate does not read");
+  if (kind === "history") {
+    if (Object.keys(d).sort().join() !== HISTORY_KEYS.join() || d.history !== true) return bad("are not the full-history form the history scan step writes");
+    if (typeof d.head !== "string" || !SHA_RE3.test(d.head) || d.head === ZERO) bad("have a head that is not a commit sha");
+    return { history: true, head: d.head, commits: commitsOf(d.commits, bad), canaries: canariesOf(d.canaries, bad) };
+  }
+  if (kind !== "range") bad("are of a kind this gate does not read");
   if (Object.keys(d).sort().join() === "pipegenRange,skipped") {
     if (!SKIP_REASONS.includes(d.skipped)) bad("say the scan was skipped for a reason this gate does not know");
     return { skipped: d.skipped };
@@ -6038,8 +6050,13 @@ function parseRangeFacts(text) {
   for (const k of ["base", "head"]) if (typeof d[k] !== "string" || !SHA_RE3.test(d[k]) || d[k] === ZERO) bad(`have a ${k} that is not a commit sha`);
   if (d.before !== null && (typeof d.before !== "string" || !SHA_RE3.test(d.before) || d.before === ZERO)) bad("have a before that is not a commit sha");
   if (typeof d.forced !== "boolean") bad("do not say whether the push rewrote the branch");
-  if (typeof d.commits !== "number" || !Number.isSafeInteger(d.commits) || d.commits < 0 || d.commits > MAX_COMMITS) bad("have a commit count that is not a whole number");
-  const list = d.canaries;
+  return { base: d.base, head: d.head, before: d.before, forced: d.forced, commits: commitsOf(d.commits, bad), canaries: canariesOf(d.canaries, bad) };
+}
+function commitsOf(v, bad) {
+  if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0 || v > MAX_COMMITS) bad("have a commit count that is not a whole number");
+  return v;
+}
+function canariesOf(list, bad) {
   if (!Array.isArray(list) || list.length !== RANGE_CANARY_FILES.length) return bad(`do not name ${RANGE_CANARY_FILES.length} canary commits`);
   const canaries = list.map((c, i) => {
     if (!isObj2(c) || Object.keys(c).sort().join() !== "commit,path") return bad("have a canary that is not { commit, path }");
@@ -6049,9 +6066,9 @@ function parseRangeFacts(text) {
     return { commit: c.commit, path };
   });
   if (new Set(canaries.map((c) => c.commit)).size !== canaries.length) bad("name one canary commit twice");
-  return { base: d.base, head: d.head, before: d.before, forced: d.forced, commits: d.commits, canaries };
+  return canaries;
 }
-function readRangeFacts(path) {
+function readRangeFacts(path, kind = "range") {
   let st;
   try {
     st = lstatSync3(path);
@@ -6071,7 +6088,7 @@ function readRangeFacts(path) {
       if (n === 0) break;
       got += n;
     }
-    return parseRangeFacts(buf.subarray(0, got).toString("utf8"));
+    return parseRangeFacts(buf.subarray(0, got).toString("utf8"), kind);
   } catch (e) {
     if (e instanceof RangeFactsError) throw e;
     throw new RangeFactsError("the commit-range facts could not be read");
@@ -6098,6 +6115,9 @@ function applyRange(findings, facts) {
   if ((seen[tip] ?? 0) === 0) throw new RangeFactsError(`the scanner did not report the canary of the stream's last commit (${facts.canaries[tip].commit.slice(0, 12)}), so it has not read the commit range to its end`);
   const wrong = facts.canaries.filter((_, i) => seen[i] !== 1);
   if (wrong.length > 0) throw new RangeFactsError(`the scanner did not report the canary of commit ${wrong.map((c) => c.commit.slice(0, 12)).join(" and ")} exactly once, so it is not proven to have read the commit range once`);
+  if (isHistory(facts)) {
+    return { findings: kept, notes: [`the whole history up to ${facts.head.slice(0, 12)} (${facts.commits} commit(s), merges included, every ref of the checkout) was scanned to its end; both canary commits were read`] };
+  }
   const dropped = facts.before === null ? "" : `, and the commits the push replaced (the head before it, ${facts.before.slice(0, 12)})`;
   return {
     findings: kept,
@@ -6642,10 +6662,10 @@ function scrubFile(opts) {
     return fail1("the key could not be masked in the logs, so the scrub did not run");
   }
   let range;
-  if (opts.artifact === SECRETS_RANGE_ARTIFACT) {
+  if (opts.artifact === SECRETS_RANGE_ARTIFACT || opts.artifact === SECRETS_HISTORY_ARTIFACT) {
     if (opts.stage !== void 0) return fail1("the commit-range scan has no stage folder");
     try {
-      range = readRangeFacts(join3(dirname2(opts.raw), RANGE_FACTS_FILE));
+      range = readRangeFacts(join3(dirname2(opts.raw), RANGE_FACTS_FILE), opts.artifact === SECRETS_HISTORY_ARTIFACT ? "history" : "range");
     } catch (e) {
       return fail1(e instanceof RangeFactsError ? e.message : "the commit-range facts could not be read");
     }
