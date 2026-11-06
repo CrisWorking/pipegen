@@ -276,7 +276,7 @@ describe('uninstall: load and trust the install record (V1)', () => {
     const r = sampleRecord(w.appId, {
       variables: [{ name: 'PIPEGEN_X', scope: 'repo', created: false, previous: 'old' }],
       environments: [{ name: 'pipegen-signing', created: false, previous: { wait_timer: 0, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: null, branch_policies: [] }, changed: ['can_admins_bypass'], branchPolicyIds: [3] }],
-      orgRuleset: undefined, scratch: { repoId: 77, createdByPipegen: true }, repoSettings: { secretScanning: { previous: false } },
+      orgRuleset: undefined, scratch: { repoId: 77, createdByPipegen: true }, repoSettings: { vulnerabilityAlerts: { previous: false } },
     });
     putRecord(w, recordFileText(r));
     setupPr(w, 5, withRecordMarker('pipegen sets up CI', recordHash(r)));
