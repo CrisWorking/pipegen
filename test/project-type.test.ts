@@ -6,6 +6,7 @@ import { floorNeeds, isRunnable, MINIMUM_CATEGORIES, skippedChecks } from '../sr
 import { applyTypeOverrides } from '../src/read/project-type.js';
 import { readProject } from '../src/read/project.js';
 import { wouldCreateOf } from '../src/audit/model.js';
+import { workflowBuildRefs } from '../src/read/container-file.js';
 import { readWorkflows } from '../src/read/workflows.js';
 import type { Capabilities, ProjectType, RepoProfile, Service, ServiceType } from '../src/types.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
@@ -776,6 +777,16 @@ describe('GJ-R2 (review GJ-r1 N1, N2, N4): every container file that builds a fo
     expect(web.containerHint).toBeUndefined();
     expect(web.dockerfile).toBeUndefined();
   });
+  it('scoping: a service nested in the static site\'s folder keeps its container file to itself', async () => {
+    const p = await read(ws({
+      'package.json': JSON.stringify({ name: 'mono', private: true, workspaces: ['apps/*', 'apps/web/admin'] }),
+      'apps/web/admin/package.json': pkg({ name: 'admin', scripts: { start: 'node index.js' }, dependencies: { express: '4.0.0' } }), 'apps/web/admin/index.js': "require('express')().listen(3001);\n", 'apps/web/admin/Dockerfile.prod': 'FROM node:24\nEXPOSE 3001\n',
+    }));
+    const web = p.services.find((s) => s.name === 'web') as Service;
+    expect(p.services.find((s) => s.name === 'admin')?.dockerfile).toBe('apps/web/admin/Dockerfile.prod');
+    expect(web.containerHint).toBeUndefined();
+    expect(web.projectType?.types).toEqual(['static-site']);
+  });
   it('N2: service finding uses the same rule (a folder or workspace package with Dockerfile.prod is a service)', async () => {
     const folders = await read({
       'api/package.json': pkg({ name: 'api', scripts: { start: 'node index.js' }, dependencies: { express: '4.0.0' } }), 'api/index.js': "require('express')().listen(3000);\n", 'api/Dockerfile': 'FROM node:24\nEXPOSE 3000\n',
@@ -799,4 +810,21 @@ describe('GJ-R2 (review GJ-r1 N1, N2, N4): every container file that builds a fo
     const plain = await notesOf(site({ ...two, Dockerfile: NGINX }));
     expect(plain.p.services[0]?.dockerfile).toBe('Dockerfile');
   });
+
+describe('GJ-R-sec1: workflowBuildRefs reads hostile workflow text within the regex budget', () => {
+  it('long runs of spaces, slashes or unclosed quotes finish fast; real references are still found', () => {
+    const hostile = [
+      `file:${' '.repeat(100_000)}x`, `context: ${'/'.repeat(100_000)}`, `      -f ${'/'.repeat(100_000)}a`, `docker build ${' '.repeat(100_000)}-f`,
+      `${'\n'.repeat(50_000)}file:${' \n'.repeat(50_000)}`, `-f "${'a'.repeat(100_000)}`, `context: ${'./'.repeat(50_000)}`,
+    ];
+    const t0 = performance.now();
+    for (const h of hostile) workflowBuildRefs([h]);
+    expect(performance.now() - t0).toBeLessThan(1500);
+    // values past the per-line budget are dropped, never parsed
+    expect(workflowBuildRefs([`context: ${'/'.repeat(100_000)}`]).size).toBe(0);
+    // the real forms still count
+    expect([...workflowBuildRefs(['      - run: docker build -f apps/web/Dockerfile.prod -t x apps/web/ && docker push x', '          context: ./svc//', '          file: "ops/web.Dockerfile"'])].sort())
+      .toEqual(['apps/web', 'apps/web/Dockerfile.prod', 'ops/web.Dockerfile', 'svc']);
+  });
+});
 });

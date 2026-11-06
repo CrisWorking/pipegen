@@ -6,6 +6,7 @@
 // case; a name that is clearly not built (a backup, a template, a sample, docs, a .dockerignore) is not one. Used by service finding, the
 // service's own Dockerfile (the folder's own file), the COPY pass, and the container hint (a file deeper in the folder, a workflow that builds
 // it, a container file elsewhere that copies it): a hint makes a static decision unsure (a server), never the static skip.
+import { regexLines, regexSafe } from './limits.js';
 import { baseOf, dirOf, PLAIN_PATH_RE } from './manifest.js';
 
 /** A path as the hint shows it: a plain repo path, else a fixed word (no repo text reaches the evidence, S14). */
@@ -40,7 +41,14 @@ export function chooseContainerFile(candidates: readonly string[], built: Readon
 }
 
 /** A repo-relative path as a workflow writes it: no leading `./`, no trailing `/`; `.` for the root. */
-const norm = (p: string): string => { const x = p.replace(/^["']|["']$/g, '').replace(/^(?:\.\/)+/, '').replace(/\/+$/, ''); return x === '' ? '.' : x; };
+// GJ-R-sec1: no regex runs over an unbounded string (trailing slashes trimmed by a loop; the value is a capture of one bounded line)
+function norm(p: string): string {
+  let x = p.replace(/^["']|["']$/g, '').replace(/^(?:\.\/)+/, '');
+  let end = x.length;
+  while (end > 0 && x.charCodeAt(end - 1) === 47) end--;
+  x = x.slice(0, end);
+  return x === '' ? '.' : x;
+}
 const FLAG_WITH_VALUE = new Set(['-t', '--tag', '--build-arg', '--platform', '--target', '--label', '--secret', '--cache-from', '--cache-to', '--output', '-o', '--network', '--progress']);
 
 /**
@@ -49,19 +57,24 @@ const FLAG_WITH_VALUE = new Set(['-t', '--tag', '--build-arg', '--platform', '--
  */
 export function workflowBuildRefs(texts: readonly string[]): Set<string> {
   const out = new Set<string>();
+  const add = (v: string | undefined): void => { if (v !== undefined && regexSafe(v)) out.add(norm(v)); };
+  // GJ-R-sec1: line by line over regexLines (each line bounded, like the other parsers), `[ \t]*` at the anchor
   for (const t of texts) {
-    for (const m of t.matchAll(/(?:^|\s)(?:-f|--file)(?:\s+|=)("[^"\n]+"|'[^'\n]+'|[^\s"';&|]+)/g)) out.add(norm(m[1] as string));
-    for (const m of t.matchAll(/^\s*(?:-\s+)?(?:file|context):\s*("[^"\n]+"|'[^'\n]+'|[^\s"'#]+)/gm)) out.add(norm(m[1] as string));
-    for (const m of t.matchAll(/\b(?:docker(?:\s+buildx)?|podman)\s+build\b([^\n&|;]*)/g)) {
-      const words = (m[1] as string).trim().split(/\s+/).filter((w) => w !== '');
-      let ctx: string | undefined;
-      for (let i = 0; i < words.length; i++) {
-        const w = words[i] as string;
-        if (w === '-f' || w === '--file' || FLAG_WITH_VALUE.has(w)) { i++; continue; }
-        if (w.startsWith('-')) continue;
-        ctx = w;
+    for (const line of regexLines(t)) {
+      for (const m of line.matchAll(/(?:^|[ \t])(?:-f|--file)(?:[ \t]+|=)("[^"]+"|'[^']+'|[^\s"';&|]+)/g)) add(m[1]);
+      const key = /^[ \t]*(?:-[ \t]+)?(?:file|context):[ \t]*("[^"]+"|'[^']+'|[^\s"'#]+)/.exec(line);
+      if (key !== null) add(key[1]);
+      for (const m of line.matchAll(/\b(?:docker(?:[ \t]+buildx)?|podman)[ \t]+build\b([^&|;]*)/g)) {
+        const words = (m[1] as string).trim().split(/[ \t]+/).filter((w) => w !== '');
+        let ctx: string | undefined;
+        for (let i = 0; i < words.length; i++) {
+          const w = words[i] as string;
+          if (w === '-f' || w === '--file' || FLAG_WITH_VALUE.has(w)) { i++; continue; }
+          if (w.startsWith('-')) continue;
+          ctx = w;
+        }
+        add(ctx);
       }
-      if (ctx !== undefined) out.add(norm(ctx));
     }
   }
   return out;
