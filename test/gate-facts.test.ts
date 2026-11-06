@@ -419,8 +419,9 @@ describe('licence coverage: lockfile types trivy can not read are "not covered (
   it('the facts carry it for the licences check, and the summary shows it on that check (its state is never only "no findings")', async () => {
     const w = world();
     const lic = ent({ needId: 'licences', tool: 'trivy-licence' });
-    const clean = scrubbed('trivy-licence', 'test/fixtures/sarif/clean/trivy-licence.sarif');
-    w.arts.push({ id: 300, name: lic.artifact as string, runId: RUN, zip: zipOf('trivy-licence.sarif', clean) }, { id: 301, name: lic.baseArtifact as string, runId: RUN, zip: zipOf('trivy-licence.sarif', clean) });
+    // (G15a G11-2: the licence scan's raw result is the pinned trivy's JSON, here a clean run; the scrubbed file keeps its name)
+    const clean = scrubbed('trivy-licence', 'test/fixtures/trivy-licence-json/empty.json');
+    w.arts.push({ id: 300, name: lic.artifact as string, runId: RUN, zip: zipOf('trivy-licence.json', clean) }, { id: 301, name: lic.baseArtifact as string, runId: RUN, zip: zipOf('trivy-licence.json', clean) });
     w.list.push(lic);
     w.needs[lic.job] = { result: 'success', outputs: { [`${lic.artifact}-sha256`]: sha256(clean), [`${lic.artifact}-status`]: 'ok' } };
     Object.assign(out(w, 'base-scan'), { [`${lic.baseArtifact}-sha256`]: sha256(clean), [`${lic.baseArtifact}-status`]: 'ok' });

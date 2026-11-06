@@ -33,9 +33,10 @@ function plantedWorkspace(): string {
   return ws;
 }
 
+// (G15a G11-2: the licence scan's raw result is the pinned trivy's JSON with every package listed; the scrubbed result is SARIF)
 const PLANTED: [string, string][] = [
   ['betterleaks.sarif', 'betterleaks'], ['gitleaks.sarif', 'gitleaks'], ['semgrep.sarif', 'semgrep'], ['osv-scanner.sarif', 'osv-scanner'], ['trivy-config.sarif', 'trivy-config'],
-  ['trivy-image.sarif', 'trivy-image'], ['trivy-licence.sarif', 'trivy-licence'], ['hadolint.sarif', 'hadolint'], ['kube-linter.sarif', 'kube-linter'], ['nuclei.sarif', 'nuclei'],
+  ['trivy-image.sarif', 'trivy-image'], ['../trivy-licence-json/composer.json', 'trivy-licence'], ['hadolint.sarif', 'hadolint'], ['kube-linter.sarif', 'kube-linter'], ['nuclei.sarif', 'nuclei'],
   ['ruff.sarif', 'ruff'], ['gosec.sarif', 'gosec'], ['bandit.sarif', 'bandit'],
 ];
 const run = (raw: Buffer | string, tool: string, over: Obj = {}) => scrubBytes(typeof raw === 'string' ? Buffer.from(raw) : raw, { tool, format: 'sarif', fpKey: KEY, eventText: PUSH_EVENT, workspace: WS, ...over } as Parameters<typeof scrubBytes>[1]);
@@ -474,7 +475,7 @@ describe('scrub: input checks', () => {
 
 describe('gate/src: no new dependency', () => {
   it('fingerprint.ts, scrub.ts and stage.ts import only node:crypto, node:fs, node:path and files of gate/src, src/types.ts, src/util/safe-text.ts, src/ai/redact-core.ts and src/ai/scan-staging.ts', () => {
-    const allowed = new Set(['node:crypto', 'node:fs', 'node:path', './fingerprint.js', './parse-common.js', './sarif.js', './zap.js', './stage.js', './range.js', './generated/secrets-path-rules.js', '../../src/types.js', '../../src/util/safe-text.js', '../../src/ai/redact-core.js', '../../src/ai/scan-staging.js']);
+    const allowed = new Set(['node:crypto', 'node:fs', 'node:path', './fingerprint.js', './parse-common.js', './sarif.js', './zap.js', './trivy-licence.js', './stage.js', './range.js', './generated/secrets-path-rules.js', '../../src/types.js', '../../src/util/safe-text.js', '../../src/ai/redact-core.js', '../../src/ai/scan-staging.js']);
     for (const f of ['fingerprint.ts', 'scrub.ts', 'stage.ts']) {
       const text = readFileSync(join(import.meta.dirname, '..', 'gate', 'src', f), 'utf8');
       const specs = [...text.matchAll(/^(?:import|export)\s[^;]*?from\s+'([^']+)'/gms)].map((m) => m[1]);

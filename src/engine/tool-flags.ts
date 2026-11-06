@@ -243,6 +243,14 @@ const ESLINT_FILES = "files: ['**/*.{js,mjs,cjs,jsx,vue,svelte,astro}']";
 const ESLINT_TS_FILES = "files: ['**/*.{js,mjs,cjs,jsx,ts,mts,cts,tsx,vue,svelte,astro}']";
 
 /**
+ * G11-2 (no licence data counts as Unknown): Trivy's SARIF lists only the licences it found, so the licence scan writes Trivy's own JSON
+ * with every package listed (`--format json --list-all-pkgs`, trivy v0.76.0 docs/guide/references/configuration/cli/trivy_filesystem.md),
+ * and the gate's scrub reads that file for this tool id only (gate/src/trivy-licence.ts), writing the usual scrubbed SARIF. The loader
+ * requires exactly these flags on the licence scan and refuses `--format json` on any other trivy scan (reviewed.ts trivyProblems).
+ */
+export const TRIVY_LICENCE_RESULT = Object.freeze({ tool: 'trivy-licence', file: 'trivy-licence.json', format: 'json', listAll: '--list-all-pkgs' } as const);
+
+/**
  * Ruling P19: every reviewed cli entry's argv, by entry id (a cli entry without one fails to load). Flags were read
  * from each pinned version's own `--help` (or its source in the downloaded package) on pin day. A flag that turns
  * failing off (`--exit-zero`, `-no-fail`, `--no-fail`, `--write`, `--fix`, `--failure-threshold none`, …) is never

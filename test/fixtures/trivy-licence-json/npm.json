@@ -1,0 +1,72 @@
+{
+  "SchemaVersion": 2,
+  "Trivy": {
+    "Version": "0.76.0"
+  },
+  "ReportID": "01a1b236-5bb7-7dd1-9d1a-462ad82a8675",
+  "CreatedAt": "2026-11-06T18:54:29.303906627Z",
+  "ArtifactName": ".",
+  "ArtifactType": "filesystem",
+  "Results": [
+    {
+      "Target": "package-lock.json",
+      "Class": "lang-pkgs",
+      "Type": "npm",
+      "Packages": [
+        {
+          "ID": "left-pad@1.3.0",
+          "Name": "left-pad",
+          "Identifier": {
+            "PURL": "pkg:npm/left-pad@1.3.0",
+            "UID": "3cdaf281bf660ca9"
+          },
+          "Version": "1.3.0",
+          "Licenses": [
+            "WTFPL"
+          ],
+          "Relationship": "direct",
+          "Locations": [
+            {
+              "StartLine": 8,
+              "EndLine": 8
+            }
+          ],
+          "AnalyzedBy": "npm"
+        },
+        {
+          "ID": "nolic@1.0.0",
+          "Name": "nolic",
+          "Identifier": {
+            "PURL": "pkg:npm/nolic@1.0.0",
+            "UID": "acf9ab3fdfd838b"
+          },
+          "Version": "1.0.0",
+          "Relationship": "direct",
+          "Locations": [
+            {
+              "StartLine": 9,
+              "EndLine": 9
+            }
+          ],
+          "AnalyzedBy": "npm"
+        }
+      ]
+    },
+    {
+      "Target": "package-lock.json",
+      "Class": "license",
+      "Licenses": [
+        {
+          "Severity": "CRITICAL",
+          "Category": "forbidden",
+          "PkgName": "left-pad",
+          "FilePath": "package-lock.json",
+          "Name": "WTFPL",
+          "Text": "",
+          "Confidence": 1,
+          "Link": ""
+        }
+      ]
+    }
+  ]
+}

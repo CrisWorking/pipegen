@@ -399,7 +399,7 @@ export const GATE_VIEW: readonly GateToolView[] = [
       ".trivyignore.yaml",
       "trivy-secret.yaml"
     ],
-    "outputFile": "trivy-licence.sarif"
+    "outputFile": "trivy-licence.json"
   },
   {
     "id": "dependency-review-action",

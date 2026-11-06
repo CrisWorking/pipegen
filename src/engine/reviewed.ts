@@ -47,6 +47,7 @@ import { expectedPins, loadNpmClosure, NpmClosureError } from './npm-closure.js'
 import { lastValue, parseArgv, type ParsedArgv } from './argv.js';
 import {
   ACTION_POLICIES, ARGV_POLICIES, DOCKER_ACTION_USES, BETTERLEAKS_FORBIDDEN_FLAGS, type InputSpec, BETTERLEAKS_FORBIDDEN_SUBCOMMANDS, BETTERLEAKS_SUBCOMMANDS, SECRETS_SCAN_CONFIG, type ArgvPolicy, type CommandPolicy, type FlagSpec,
+  TRIVY_LICENCE_RESULT,
 } from './tool-flags.js';
 import { BETTERLEAKS_GRAMMAR, NUCLEI_GRAMMAR, TRIVY_GRAMMAR, type FlagGrammar } from './tool-grammar.js';
 import { levenshtein, neverImage, neverListed } from './never-list.js';
@@ -696,6 +697,8 @@ function choiceProblems(tool: string, e: Entry, known: (name: string) => boolean
  */
 export const TRIVY_ALLOWED_FLAGS: ReadonlySet<string> = new Set([
   'disable-telemetry', 'skip-version-check', 'skip-check-update', 'format', 'output', 'exit-code', 'severity', 'scanners', 'ignore-unfixed',
+  // G11-2: the licence scan lists every package, so the gate sees the ones with no licence data (only with --format json; trivyProblems)
+  'list-all-pkgs',
 ]);
 /** The `--exit-code` of trivy, betterleaks and gitleaks: a finding is reported with 10, a code their errors never use (an error or a betterleaks partial scan exits 1). Keep equal to their `findingsExit` in tool-flags.ts. */
 const FINDINGS_EXIT_FLAG = '10';
@@ -813,8 +816,20 @@ function trivyProblems(e: Entry): Problem[] {
   // UNKNOWN, so any --severity filter hides some (G11: HIGH,CRITICAL hid every Unknown licence); the gate judges the severities itself
   const scanners = [...p.flags, ...pa.flags].filter((f) => f.name === 'scanners').flatMap((f) => f.value.split(','));
   if (scanners.includes('license') && severities.length > 0) bad('trivy\'s licence scan must report every severity (no --severity in the command, the fixed args or a choice): a filter hides the Unknown licences a person must look at (ruling S9)', 'step', 'cli', 'command');
+  // G11-2: the licence scan writes Trivy's JSON with every package listed (the gate's scrub reads it for this tool id: gate/src/trivy-licence.ts);
+  // every other trivy scan writes SARIF. The format, the package list and the file are fixed, never a choice
+  const formats = [...p.flags, ...pa.flags].filter((f) => f.name === 'format').map((f) => f.value);
+  const listAll = TRIVY_LICENCE_RESULT.listAll.slice(2);
+  if (scanners.includes('license')) {
+    if (lastValue(p, 'format') !== TRIVY_LICENCE_RESULT.format || lastValue(pa, 'format') !== TRIVY_LICENCE_RESULT.format || formats.some((v) => v !== TRIVY_LICENCE_RESULT.format)
+      || lastValue(p, listAll) !== 'true' || !args.includes(TRIVY_LICENCE_RESULT.listAll) || e.step.output.format !== 'sarif') {
+      bad(`trivy's licence scan runs with --format json ${TRIVY_LICENCE_RESULT.listAll}, in the command and fixedInputs.args, and its output format is sarif (the gate reads every package from Trivy's JSON and writes the scrubbed SARIF; a package with no licence data is an Unknown)`, 'step', 'cli', 'command');
+    }
+  } else if (formats.includes('json') || [...p.flags, ...pa.flags].some((f) => f.name === listAll)) {
+    bad(`only trivy's licence scan writes json (${TRIVY_LICENCE_RESULT.listAll} too): the gate reads every other trivy scan as SARIF`, 'step', 'cli', 'command');
+  }
   out.push(...choiceProblems('trivy', e, (k) => (g.value.has(k) || g.bool.has(k)) && TRIVY_ALLOWED_FLAGS.has(k),
-    (k) => (TRIVY_FORBIDDEN.has(k) || k === 'exit-code' || (TRIVY_REQUIRED_FLAGS as readonly string[]).includes(`--${k}`) ? `the AI may not choose trivy's --${k}` : null)));
+    (k) => (TRIVY_FORBIDDEN.has(k) || k === 'exit-code' || k === 'format' || k === 'output' || k === listAll || (TRIVY_REQUIRED_FLAGS as readonly string[]).includes(`--${k}`) ? `the AI may not choose trivy's --${k}` : null)));
   return out;
 }
 

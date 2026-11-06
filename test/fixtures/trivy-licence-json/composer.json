@@ -1,0 +1,144 @@
+{
+  "SchemaVersion": 2,
+  "Trivy": {
+    "Version": "0.76.0"
+  },
+  "ReportID": "01a1b234-f7d0-7ca4-904e-8d3137f3d193",
+  "CreatedAt": "2026-11-06T18:52:58.192829764Z",
+  "ArtifactName": ".",
+  "ArtifactType": "filesystem",
+  "Results": [
+    {
+      "Target": "php/composer.lock",
+      "Class": "lang-pkgs",
+      "Type": "composer",
+      "Packages": [
+        {
+          "ID": "acme/emptylicence@0.1.0",
+          "Name": "acme/emptylicence",
+          "Identifier": {
+            "PURL": "pkg:composer/acme/emptylicence@0.1.0",
+            "UID": "e1f4d2dd42e2c34c"
+          },
+          "Version": "0.1.0",
+          "Locations": [
+            {
+              "StartLine": 9,
+              "EndLine": 9
+            }
+          ],
+          "AnalyzedBy": "composer"
+        },
+        {
+          "ID": "acme/gpl@1.0.0",
+          "Name": "acme/gpl",
+          "Identifier": {
+            "PURL": "pkg:composer/acme/gpl@1.0.0",
+            "UID": "9cf22a0b4d30e182"
+          },
+          "Version": "1.0.0",
+          "Licenses": [
+            "GPL-3.0-only"
+          ],
+          "Locations": [
+            {
+              "StartLine": 5,
+              "EndLine": 5
+            }
+          ],
+          "AnalyzedBy": "composer"
+        },
+        {
+          "ID": "acme/mit@2.0.0",
+          "Name": "acme/mit",
+          "Identifier": {
+            "PURL": "pkg:composer/acme/mit@2.0.0",
+            "UID": "225474b37d7917b1"
+          },
+          "Version": "2.0.0",
+          "Licenses": [
+            "MIT"
+          ],
+          "Locations": [
+            {
+              "StartLine": 6,
+              "EndLine": 6
+            }
+          ],
+          "AnalyzedBy": "composer"
+        },
+        {
+          "ID": "acme/nolicence@3.1.0",
+          "Name": "acme/nolicence",
+          "Identifier": {
+            "PURL": "pkg:composer/acme/nolicence@3.1.0",
+            "UID": "4912cc0149959e8"
+          },
+          "Version": "3.1.0",
+          "Locations": [
+            {
+              "StartLine": 8,
+              "EndLine": 8
+            }
+          ],
+          "AnalyzedBy": "composer"
+        },
+        {
+          "ID": "acme/weird@1.0.0",
+          "Name": "acme/weird",
+          "Identifier": {
+            "PURL": "pkg:composer/acme/weird@1.0.0",
+            "UID": "6b95a9bccbf1ffc5"
+          },
+          "Version": "1.0.0",
+          "Licenses": [
+            "SomeWeirdLicense-1.0"
+          ],
+          "Locations": [
+            {
+              "StartLine": 7,
+              "EndLine": 7
+            }
+          ],
+          "AnalyzedBy": "composer"
+        }
+      ]
+    },
+    {
+      "Target": "php/composer.lock",
+      "Class": "license",
+      "Licenses": [
+        {
+          "Severity": "HIGH",
+          "Category": "restricted",
+          "PkgName": "acme/gpl",
+          "FilePath": "php/composer.lock",
+          "Name": "GPL-3.0-only",
+          "Text": "",
+          "Confidence": 1,
+          "Link": ""
+        },
+        {
+          "Severity": "LOW",
+          "Category": "notice",
+          "PkgName": "acme/mit",
+          "FilePath": "php/composer.lock",
+          "Name": "MIT",
+          "Text": "",
+          "Confidence": 1,
+          "Link": ""
+        },
+        {
+          "Severity": "UNKNOWN",
+          "Category": "unknown",
+          "PkgName": "acme/weird",
+          "FilePath": "php/composer.lock",
+          "Name": "SomeWeirdLicense-1.0",
+          "Text": "",
+          "Confidence": 1,
+          "Link": ""
+        }
+      ]
+    }
+  ]
+}

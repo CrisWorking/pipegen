@@ -33,6 +33,7 @@ import { MAX_ADVISORY_IDS, SARIF_TOOLS, parseSarifText } from './sarif.js';
 import { applyStage, readStage, StageError, STAGED_NAME_RE, type Stage, type StagedFindings } from './stage.js';
 import { applyRange, isRangeSkipped, RANGE_FACTS_FILE, SKIP_NOTES, SKIP_REASONS, RangeFactsError, readRangeFacts, SECRETS_RANGE_ARTIFACT, SECRETS_RANGE_TOOL, type RangeRun } from './range.js';
 import { ZAP_TOOL, parseZapJsonText } from './zap.js';
+import { parseTrivyLicenceJsonText, TRIVY_LICENCE_TOOL } from './trivy-licence.js';
 
 export type ScrubFormat = 'sarif' | 'zap-json';
 export interface ScrubOptions {
@@ -214,7 +215,11 @@ export function scrubBytes(raw: Uint8Array, opts: ScrubOptions): ScrubOutcome {
           return toolError(e instanceof StageError ? e.message : 'the stage folder could not be read', key);
         }
       }
-      parsed = opts.range !== undefined
+      // G11-2: the licence scan's raw result is Trivy's JSON with every package listed (the scrubbed result is SARIF, as for every tool);
+      // a SARIF file there is a tool error (the reader refuses it), so the packages with no licence data are never missed in silence
+      parsed = opts.tool === TRIVY_LICENCE_TOOL
+        ? parseTrivyLicenceJsonText(raw, opts.tool, { limits: { maxBytes } })
+        : opts.range !== undefined
         ? parseSarifText(raw, opts.tool, { commits: true, limits: { maxBytes } })   // C9: git mode writes repository paths; no workspace
         : stage === undefined
           ? parseSarifText(raw, opts.tool, { workspace: opts.workspace, limits: { maxBytes } })

@@ -41,7 +41,7 @@ describe('CF1: trivy never loads a repo trivy-secret.yaml', () => {
       expect(t?.fixedInputs.config?.passAs, id).toEqual({ flag: '--config' });
       expect(t?.rootConfigFiles, id).toContain('trivy-secret.yaml');
       expect(t?.reviewedBy, id).toBe('Claude delegated DECISIONS 105');
-      expect(t?.reviewedAt, id).toBe('2026-10-30');
+      expect(t?.reviewedAt, id).toBe(id === 'trivy-licence' ? '2026-11-06' : '2026-10-30');   // G15a G11-2: the licence scan's JSON form
     }
   });
 

@@ -7,13 +7,14 @@
 // - a raw domain, a part of a set, an unsorted or repeated list, a list without github-core: a problem.
 // Written first.
 import { describe, expect, it } from 'vitest';
-import { E3_EGRESS_SETS, EGRESS_DOMAIN_SETS, REVIEWED_EGRESS_LABELS, renderEgressStep } from '../src/engine/egress.js';
+import { E3_EGRESS_SETS, G15_EGRESS_SETS, EGRESS_DOMAIN_SETS, REVIEWED_EGRESS_LABELS, renderEgressStep } from '../src/engine/egress.js';
 import { renderStep } from '../src/engine/render-step.js';
 import { loadReviewed } from '../src/engine/reviewed.js';
 import { ACTION_POLICIES, allowedDomainsProblem, egressDomains } from '../src/engine/tool-flags.js';
 import { ctxFor, entry, platform, service, specFor } from './helpers/render.js';
 
-const LABELS = ['github-core', 'npm', 'pypi', 'dockerhub', 'ghcr', 'github-releases', 'trivy-db', 'osv'];
+// (G15a: the Sigstore set of the keyless verify job is the ninth)
+const LABELS = ['github-core', 'npm', 'pypi', 'dockerhub', 'ghcr', 'github-releases', 'trivy-db', 'osv', 'sigstore'];
 const union = (...sets: (keyof typeof EGRESS_DOMAIN_SETS)[]): string => [...new Set(sets.flatMap((s) => EGRESS_DOMAIN_SETS[s]))].sort().join('\n');
 
 describe('E9: the bullfrog allowed-domains policy', () => {
@@ -47,7 +48,7 @@ describe('E9: the bullfrog allowed-domains policy', () => {
     expect([...ACTION_POLICIES['bullfrogsec/bullfrog']!['allowed-domains']!.values].sort()).toEqual([...LABELS].sort());
     const t = loadReviewed().find((e) => e.id === 'bullfrog')!;
     expect([...t.choices['allowed-domains']!].sort()).toEqual([...LABELS].sort());
-    expect([...REVIEWED_EGRESS_LABELS, ...E3_EGRESS_SETS].sort()).toEqual([...LABELS].sort());
+    expect([...REVIEWED_EGRESS_LABELS, ...E3_EGRESS_SETS, ...G15_EGRESS_SETS].sort()).toEqual([...LABELS].sort());
     expect(Object.keys(EGRESS_DOMAIN_SETS).sort()).toEqual([...LABELS].sort());
   });
 

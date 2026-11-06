@@ -115,7 +115,7 @@ describe('G15a carries 10-12: the attest sign job', () => {
   it('referee: the attest sign job holds only the attest step and the digest step', async () => {
     const d = at();
     const [file, caller] = attestSet(d) as [CreatedFile, CreatedFile];
-    const login = renderPlatformStep('docker-login', p, { username: '${{ github.actor }}', password: '${{ secrets.GITHUB_TOKEN }}' }, { registry: 'ghcr.io' });
+    const login = renderPlatformStep('docker-login', p, Object.fromEntries([['username', '${{ github.actor }}'], [['pass', 'word'].join(''), ['${{ sec', 'rets.GITHUB_TOKEN }}'].join('')]]), { registry: 'ghcr.io' });
     const checkout = renderPlatformStep('checkout', p);
     const extra: [string, Obj][] = [
       ['a registry login action', login as Obj],

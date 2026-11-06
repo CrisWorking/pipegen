@@ -241,10 +241,10 @@ var require_utils = __commonJS({
       REGEX_SPECIAL_CHARS_GLOBAL
     } = require_constants();
     exports.isObject = (val) => val !== null && typeof val === "object" && !Array.isArray(val);
-    exports.hasRegexChars = (str2) => REGEX_SPECIAL_CHARS.test(str2);
-    exports.isRegexChar = (str2) => str2.length === 1 && exports.hasRegexChars(str2);
-    exports.escapeRegex = (str2) => str2.replace(REGEX_SPECIAL_CHARS_GLOBAL, "\\$1");
-    exports.toPosixSlashes = (str2) => str2.replace(REGEX_BACKSLASH, "/");
+    exports.hasRegexChars = (str3) => REGEX_SPECIAL_CHARS.test(str3);
+    exports.isRegexChar = (str3) => str3.length === 1 && exports.hasRegexChars(str3);
+    exports.escapeRegex = (str3) => str3.replace(REGEX_SPECIAL_CHARS_GLOBAL, "\\$1");
+    exports.toPosixSlashes = (str3) => str3.replace(REGEX_BACKSLASH, "/");
     exports.isWindows = () => {
       if (typeof navigator !== "undefined" && navigator.platform) {
         const platform = navigator.platform.toLowerCase();
@@ -255,8 +255,8 @@ var require_utils = __commonJS({
       }
       return false;
     };
-    exports.removeBackslashes = (str2) => {
-      return str2.replace(REGEX_REMOVE_BACKSLASH, (match) => {
+    exports.removeBackslashes = (str3) => {
+      return str3.replace(REGEX_REMOVE_BACKSLASH, (match) => {
         return match === "\\" ? "" : match;
       });
     };
@@ -346,7 +346,7 @@ var require_scan = __commonJS({
       const slashes = [];
       const tokens2 = [];
       const parts = [];
-      let str2 = input;
+      let str3 = input;
       let index = -1;
       let start = 0;
       let lastIndex = 0;
@@ -365,10 +365,10 @@ var require_scan = __commonJS({
       let code3;
       let token = { value: "", depth: 0, isGlob: false };
       const eos = () => index >= length;
-      const peek = () => str2.charCodeAt(index + 1);
+      const peek = () => str3.charCodeAt(index + 1);
       const advance = () => {
         prev = code3;
-        return str2.charCodeAt(++index);
+        return str3.charCodeAt(++index);
       };
       while (index < length) {
         code3 = advance();
@@ -545,24 +545,24 @@ var require_scan = __commonJS({
         isExtglob = false;
         isGlob = false;
       }
-      let base = str2;
+      let base = str3;
       let prefix = "";
       let glob = "";
       if (start > 0) {
-        prefix = str2.slice(0, start);
-        str2 = str2.slice(start);
+        prefix = str3.slice(0, start);
+        str3 = str3.slice(start);
         lastIndex -= start;
       }
       if (base && isGlob === true && lastIndex > 0) {
-        base = str2.slice(0, lastIndex);
-        glob = str2.slice(lastIndex);
+        base = str3.slice(0, lastIndex);
+        glob = str3.slice(lastIndex);
       } else if (isGlob === true) {
         base = "";
-        glob = str2;
+        glob = str3;
       } else {
-        base = str2;
+        base = str3;
       }
-      if (base && base !== "" && base !== "/" && base !== str2) {
+      if (base && base !== "" && base !== "/" && base !== str3) {
         if (isPathSeparator(base.charCodeAt(base.length - 1))) {
           base = base.slice(0, -1);
         }
@@ -1609,8 +1609,8 @@ var require_parse = __commonJS({
         if (opts2.noglobstar === true) return star;
         return `(${capture}(?:(?!${START_ANCHOR}${opts2.dot ? DOTS_SLASH : DOT_LITERAL}).)*?)`;
       };
-      const create = (str2) => {
-        switch (str2) {
+      const create = (str3) => {
+        switch (str3) {
           case "*":
             return `${nodot}${ONE_CHAR}${star}`;
           case ".*":
@@ -1628,7 +1628,7 @@ var require_parse = __commonJS({
           case "**/.*":
             return `(?:${nodot}${globstar(opts)}${SLASH_LITERAL})?${DOT_LITERAL}${ONE_CHAR}${star}`;
           default: {
-            const match = /^(.*?)\.(\w+)$/.exec(str2);
+            const match = /^(.*?)\.(\w+)$/.exec(str3);
             if (!match) return;
             const source2 = create(match[1]);
             if (!source2) return;
@@ -1659,9 +1659,9 @@ var require_picomatch = __commonJS({
     var picomatch2 = (glob, options, returnState = false) => {
       if (Array.isArray(glob)) {
         const fns = glob.map((input) => picomatch2(input, options, returnState));
-        const arrayMatcher = (str2) => {
+        const arrayMatcher = (str3) => {
           for (const isMatch of fns) {
-            const state2 = isMatch(str2);
+            const state2 = isMatch(str3);
             if (state2) return state2;
           }
           return false;
@@ -1737,7 +1737,7 @@ var require_picomatch = __commonJS({
       const regex = glob instanceof RegExp ? glob : picomatch2.makeRe(glob, options);
       return regex.test(utils.basename(input, { windows: posix }));
     };
-    picomatch2.isMatch = (str2, patterns, options) => picomatch2(patterns, options)(str2);
+    picomatch2.isMatch = (str3, patterns, options) => picomatch2(patterns, options)(str3);
     picomatch2.parse = (pattern, options) => {
       if (Array.isArray(pattern)) return pattern.map((p) => picomatch2.parse(p, options));
       return parse3(pattern, { ...options, fastpaths: false });
@@ -2006,6 +2006,7 @@ var TEST_COMMANDS = Object.freeze({
 });
 var ESLINT_FILES = "files: ['**/*.{js,mjs,cjs,jsx,vue,svelte,astro}']";
 var ESLINT_TS_FILES = "files: ['**/*.{js,mjs,cjs,jsx,ts,mts,cts,tsx,vue,svelte,astro}']";
+var TRIVY_LICENCE_RESULT = Object.freeze({ tool: "trivy-licence", file: "trivy-licence.json", format: "json", listAll: "--list-all-pkgs" });
 var POLICIES = {
   "trivy-config": { ...DEDICATED("trivy", TRIVY_ASSET, TRIVY_CONFIG), findingsExit: FOUND_10 },
   "trivy-image": { ...DEDICATED("trivy", TRIVY_ASSET, TRIVY_CONFIG), slots: { "": "image-digest" }, findingsExit: FOUND_10 },
@@ -2534,30 +2535,30 @@ var literalInput = (modes, problem, describe) => ({
 });
 var ID_LIST_MAX = 50;
 function idListProblem(text) {
-  const list = parseJson(text);
-  if (!Array.isArray(list) || list.length > ID_LIST_MAX) return `a JSON list of at most ${ID_LIST_MAX} need ids`;
-  return list.every((x) => typeof x === "string" && NEED_ID_TEXT_RE.test(x)) ? null : "a JSON list of need ids (lower case letters, digits and dashes)";
+  const list2 = parseJson(text);
+  if (!Array.isArray(list2) || list2.length > ID_LIST_MAX) return `a JSON list of at most ${ID_LIST_MAX} need ids`;
+  return list2.every((x) => typeof x === "string" && NEED_ID_TEXT_RE.test(x)) ? null : "a JSON list of need ids (lower case letters, digits and dashes)";
 }
 function policyProblem2(text) {
   return policyProblem(parseJson(text));
 }
 var GLOB_RE = /^(?![-/])(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/*?-]{1,200}$/;
 function pathListProblem(text) {
-  const list = parseJson(text);
-  if (!Array.isArray(list) || list.length > 100) return "a JSON list of at most 100 path globs";
-  return list.every((x) => typeof x === "string" && GLOB_RE.test(x)) ? null : "a JSON list of plain relative path globs (no .., no leading /)";
+  const list2 = parseJson(text);
+  if (!Array.isArray(list2) || list2.length > 100) return "a JSON list of at most 100 path globs";
+  return list2.every((x) => typeof x === "string" && GLOB_RE.test(x)) ? null : "a JSON list of plain relative path globs (no .., no leading /)";
 }
 var SERVICE_ROOT_RE = /^(?:\.|(?![-/])(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/-]{1,200})$/;
 function serviceRootsProblem(text) {
-  const list = parseJson(text);
-  if (!Array.isArray(list) || list.length > 100) return "a JSON list of at most 100 service folders";
-  return list.every((x) => typeof x === "string" && SERVICE_ROOT_RE.test(x) && !x.includes("//")) ? null : "a JSON list of plain relative folders (or .), no glob, no .., no leading /";
+  const list2 = parseJson(text);
+  if (!Array.isArray(list2) || list2.length > 100) return "a JSON list of at most 100 service folders";
+  return list2.every((x) => typeof x === "string" && SERVICE_ROOT_RE.test(x) && !x.includes("//")) ? null : "a JSON list of plain relative folders (or .), no glob, no .., no leading /";
 }
 function licenceLockfilesProblem(text) {
-  const list = parseJson(text);
+  const list2 = parseJson(text);
   const shape = 'a JSON list of at most 100 { "service", "lockfiles": [{ "kind", "read" }] } entries';
-  if (!Array.isArray(list) || list.length > 100) return shape;
-  for (const e of list) {
+  if (!Array.isArray(list2) || list2.length > 100) return shape;
+  for (const e of list2) {
     if (!isPlainObject(e) || Object.keys(e).sort().join() !== "lockfiles,service") return shape;
     if (typeof e.service !== "string" || e.service.length > 40 || !SERVICE_SLUG_RE.test(e.service)) return `${shape}, each service a service slug`;
     if (!Array.isArray(e.lockfiles) || e.lockfiles.length > 4) return `${shape}, at most 4 lockfiles each`;
@@ -2569,11 +2570,11 @@ function licenceLockfilesProblem(text) {
   return null;
 }
 function warnFirstListProblem(text) {
-  const list = parseJson(text);
+  const list2 = parseJson(text);
   const shape = 'a JSON list of at most 50 { "needId", "since": "YYYY-MM-DD" } entries, each need once';
-  if (!Array.isArray(list) || list.length > ID_LIST_MAX) return shape;
+  if (!Array.isArray(list2) || list2.length > ID_LIST_MAX) return shape;
   const seen = /* @__PURE__ */ new Set();
-  for (const e of list) {
+  for (const e of list2) {
     if (!isPlainObject(e) || Object.keys(e).sort().join() !== "needId,since" || typeof e.needId !== "string" || !NEED_ID_TEXT_RE.test(e.needId) || typeof e.since !== "string" || validDate(e.since) !== e.since || seen.has(e.needId)) return shape;
     seen.add(e.needId);
   }
@@ -2621,13 +2622,13 @@ function rangeEntryProblem(e) {
 }
 var JOB_LIST_REQUIRED = ["needId", "job", "category", "format", "blocking", "needsSecrets"];
 function jobListLiteralProblem(text) {
-  const list = parseJson(text);
-  if (!Array.isArray(list)) return "it is not a JSON list";
-  if (list.length > JOB_LIST_MAX) return `it has more than ${JOB_LIST_MAX} entries`;
+  const list2 = parseJson(text);
+  if (!Array.isArray(list2)) return "it is not a JSON list";
+  if (list2.length > JOB_LIST_MAX) return `it has more than ${JOB_LIST_MAX} entries`;
   const jobs = /* @__PURE__ */ new Set();
   const secretsJobs = /* @__PURE__ */ new Set();
   const ranges = [];
-  for (const [i, e] of list.entries()) {
+  for (const [i, e] of list2.entries()) {
     if (!isPlainObject(e)) return `entry ${i + 1} is not an object`;
     for (const k of Object.keys(e)) if (!JOB_LIST_KEYS.includes(k)) return `entry ${i + 1} has the key ${JSON.stringify(k.slice(0, 40))}, which a job list entry never has`;
     for (const k of JOB_LIST_REQUIRED) if (!Object.hasOwn(e, k)) return `entry ${i + 1} has no ${k}`;
@@ -3174,21 +3175,21 @@ function tagTables(s) {
           while (e < n && (isNameChar(code(s, e)) || code(s, e) === 58)) e++;
           if (e === k + 2 || e < n && code(s, e) !== 62 && code(s, e) !== 32 && code(s, e) !== 9) continue;
           const key = s.slice(k + 2, e).toLowerCase();
-          const list2 = closers.get(key);
-          if (list2 === void 0) closers.set(key, [k]);
-          else list2.push(k);
+          const list3 = closers.get(key);
+          if (list3 === void 0) closers.set(key, [k]);
+          else list3.push(k);
         }
       }
-      const list = closers.get(name.toLowerCase());
-      if (list === void 0) return -1;
+      const list2 = closers.get(name.toLowerCase());
+      if (list2 === void 0) return -1;
       let lo = 0;
-      let hi = list.length;
+      let hi = list2.length;
       while (lo < hi) {
         const mid = lo + hi >> 1;
-        if (list[mid] > from) hi = mid;
+        if (list2[mid] > from) hi = mid;
         else lo = mid + 1;
       }
-      return lo < list.length ? list[lo] : -1;
+      return lo < list2.length ? list2[lo] : -1;
     }
   };
 }
@@ -3953,10 +3954,10 @@ function optList(o, key, where) {
   return v;
 }
 function optStrList(o, key, where) {
-  const list = optList(o, key, where);
-  if (list === void 0) return void 0;
-  for (const item of list) if (typeof item !== "string") fail(`${where}: ${key} holds a value that is not a string`);
-  return list;
+  const list2 = optList(o, key, where);
+  if (list2 === void 0) return void 0;
+  for (const item of list2) if (typeof item !== "string") fail(`${where}: ${key} holds a value that is not a string`);
+  return list2;
 }
 function cutText(s, max = MAX_MESSAGE_CHARS) {
   if (s.length <= max) return s;
@@ -4162,8 +4163,8 @@ var MAX_ADVISORY_IDS = 64;
 var SAME = (a, b) => a.level === b.level && String(a.score) === String(b.score) && a.tags.join("\0") === b.tags.join("\0") && a.template === b.template && a.aliases.join("\0") === b.aliases.join("\0");
 function readAliases(lists, where) {
   const out = [];
-  for (const list of lists) {
-    for (const id of list ?? []) {
+  for (const list2 of lists) {
+    for (const id of list2 ?? []) {
       if (id.length > MAX_ID_CHARS) fail(`${where}: an advisory id is longer than ${MAX_ID_CHARS}`);
       if (!out.includes(id)) out.push(id);
       if (out.length > MAX_ADVISORY_IDS) fail(`${where}: more than ${MAX_ADVISORY_IDS} advisory ids and aliases`);
@@ -4187,7 +4188,7 @@ function readTags(o, where) {
   return tags;
 }
 function readRules(driver, where) {
-  const list = [];
+  const list2 = [];
   const byId = /* @__PURE__ */ new Map();
   const raw = optList(driver, "rules", where);
   for (const [i, r] of (raw ?? []).entries()) {
@@ -4203,12 +4204,12 @@ function readRules(driver, where) {
     const template = optStr(optObj(r, "fullDescription", at3) ?? {}, "text", `${at3} fullDescription`);
     const aliases = readAliases([optStrList(r, "deprecatedIds", at3), optStrList(props, "aliases", `${at3} properties`)], at3);
     const rule = { id, level, score, tags, ...tagFacts(tags), ...template === void 0 ? {} : { template }, aliases };
-    list.push(rule);
+    list2.push(rule);
     const same = byId.get(id);
     if (same === void 0) byId.set(id, rule);
     else if (!SAME(same, rule)) fail(`${at3}: two rules have the same id (${shown(id)}) and different severity data`);
   }
-  return { list, byId };
+  return { list: list2, byId };
 }
 function readInvocations(run, info, where) {
   let executionFailed = false;
@@ -5195,10 +5196,10 @@ function verifyCleanRunArtifact(bytes, meta, ctx) {
 }
 function candidatesOf(listing, artifactName, runId) {
   if (!isPlain2(listing)) return [];
-  const list = own(listing, "artifacts");
-  if (!Array.isArray(list)) return [];
+  const list2 = own(listing, "artifacts");
+  if (!Array.isArray(list2)) return [];
   const out = [];
-  for (const a of list) {
+  for (const a of list2) {
     if (!isPlain2(a) || own(a, "name") !== artifactName || !posInt(own(a, "id"))) continue;
     const wr = own(a, "workflow_run");
     if (!isPlain2(wr) || own(wr, "id") !== runId) continue;
@@ -6021,9 +6022,9 @@ function parseRangeFacts(text) {
   if (d.before !== null && (typeof d.before !== "string" || !SHA_RE3.test(d.before) || d.before === ZERO)) bad("have a before that is not a commit sha");
   if (typeof d.forced !== "boolean") bad("do not say whether the push rewrote the branch");
   if (typeof d.commits !== "number" || !Number.isSafeInteger(d.commits) || d.commits < 0 || d.commits > MAX_COMMITS) bad("have a commit count that is not a whole number");
-  const list = d.canaries;
-  if (!Array.isArray(list) || list.length !== RANGE_CANARY_FILES.length) return bad(`do not name ${RANGE_CANARY_FILES.length} canary commits`);
-  const canaries = list.map((c, i) => {
+  const list2 = d.canaries;
+  if (!Array.isArray(list2) || list2.length !== RANGE_CANARY_FILES.length) return bad(`do not name ${RANGE_CANARY_FILES.length} canary commits`);
+  const canaries = list2.map((c, i) => {
     if (!isObj2(c) || Object.keys(c).sort().join() !== "commit,path") return bad("have a canary that is not { commit, path }");
     if (typeof c.commit !== "string" || !SHA_RE3.test(c.commit)) return bad("have a canary commit that is not a commit sha");
     const path = RANGE_CANARY_FILES[i];
@@ -6093,6 +6094,121 @@ var SKIP_NOTES = Object.freeze({
   "no-range": "no commit range on this event (a push that made the branch, workflow_dispatch or schedule), so no commit range was scanned",
   "no-merge-base": "this push rewrote the history of the branch and its old head is not in the checkout, so its commit range was not scanned"
 });
+
+// gate/src/trivy-licence.ts
+var TRIVY_LICENCE_TOOL = TRIVY_LICENCE_RESULT.tool;
+var NO_LICENCE_RULE_SUFFIX = ":no-licence-data";
+var SEVERITY = Object.freeze(Object.assign(/* @__PURE__ */ Object.create(null), {
+  CRITICAL: "critical",
+  HIGH: "high",
+  MEDIUM: "medium",
+  LOW: "low",
+  UNKNOWN: "info"
+}));
+var PACKAGE_CLASSES = /* @__PURE__ */ new Set(["lang-pkgs", "os-pkgs"]);
+var LICENCE_CLASSES = /* @__PURE__ */ new Set(["license", "license-file"]);
+var MAX_RESULTS = 1e5;
+function str(o, key, where, required) {
+  const v = getOwn(o, key);
+  if (v === void 0 && !required) return "";
+  if (typeof v !== "string" || required && v === "") fail(`${where}: ${key} is not a non-empty string (${shown(v)})`);
+  if (v.length > MAX_ID_CHARS) fail(`${where}: ${key} is longer than ${MAX_ID_CHARS}`);
+  return v;
+}
+function list(o, key, where) {
+  const v = getOwn(o, key);
+  if (v === void 0 || v === null) return [];
+  if (!Array.isArray(v)) fail(`${where}: ${key} is not a list`);
+  return v;
+}
+function parseTrivyLicenceJson(json, toolId, opts = {}) {
+  return guarded((notes) => {
+    if (toolId !== TRIVY_LICENCE_TOOL) fail(`${JSON.stringify(safeText(toolId, 60))} is not a tool whose Trivy licence JSON the gate reads`);
+    if (!isObj(json)) fail("the result is not a Trivy JSON report (the top level is not an object)");
+    if (getOwn(json, "SchemaVersion") !== 2) fail(`the report's SchemaVersion is ${shown(getOwn(json, "SchemaVersion"))}, not 2 (the pinned trivy's)`);
+    if (getOwn(json, "ArtifactType") !== "filesystem") fail("the report is not of a filesystem scan (ArtifactType)");
+    const limits = limitsFrom(opts.limits);
+    const results = list(json, "Results", "the report");
+    if (results.length > MAX_RESULTS) fail(`the report has more than ${MAX_RESULTS} results`);
+    const findings = [];
+    let unknownSeverity = 0;
+    let unmapped = 0;
+    const push = (ruleId, severity, path, message) => {
+      if (findings.length >= limits.maxResults) fail(`the report has more than ${limits.maxResults} findings`);
+      const file = normaliseUri(path, { encoding: "raw" });
+      if (file === void 0) unmapped++;
+      findings.push({
+        tool: toolId,
+        ruleId: cutText(ruleId, MAX_ID_CHARS),
+        severity,
+        file,
+        line: 1,
+        message: cutText(message, MAX_MESSAGE_CHARS),
+        uriUnmapped: file === void 0,
+        secret: false,
+        ...file === void 0 ? { uriId: uriIdOf(path) } : {}
+      });
+    };
+    for (const [n, r] of results.entries()) {
+      const at3 = `result ${n}`;
+      if (!isObj(r)) fail(`${at3} is not an object`);
+      const target = str(r, "Target", at3, true);
+      const cls = str(r, "Class", at3, true);
+      if (PACKAGE_CLASSES.has(cls)) {
+        for (const [k, p] of list(r, "Packages", at3).entries()) {
+          const where = `${at3} package ${k}`;
+          if (!isObj(p)) fail(`${where} is not an object`);
+          const name = str(p, "Name", where, true);
+          const lics = list(p, "Licenses", where);
+          for (const l of lics) if (typeof l !== "string") fail(`${where}: Licenses holds a value that is not a string`);
+          if (lics.length > 0) continue;
+          push(
+            `${name}${NO_LICENCE_RULE_SUFFIX}`,
+            "info",
+            target,
+            `Artifact: ${target}
+PkgName: ${name}
+ No licence data: the package names no licence, so it counts as Unknown (a person checks it)`
+          );
+        }
+      } else if (LICENCE_CLASSES.has(cls)) {
+        for (const [k, l] of list(r, "Licenses", at3).entries()) {
+          const where = `${at3} licence ${k}`;
+          if (!isObj(l)) fail(`${where} is not an object`);
+          const name = str(l, "Name", where, true);
+          const pkg = str(l, "PkgName", where, false);
+          const path = str(l, "FilePath", where, false) || target;
+          const category = str(l, "Category", where, false);
+          const word = str(l, "Severity", where, false);
+          let severity = Object.hasOwn(SEVERITY, word) ? SEVERITY[word] : void 0;
+          if (severity === void 0) {
+            severity = "high";
+            unknownSeverity++;
+          }
+          push(
+            pkg === "" ? name : `${pkg}:${name}`,
+            severity,
+            path,
+            `Artifact: ${target}
+License ${name}
+PkgName: ${pkg}
+ Classification: ${category}
+ Path: ${path}`
+          );
+        }
+      } else {
+        fail(`${at3} is of class ${shown(cls)}, which the licence reader does not know`);
+      }
+    }
+    if (unknownSeverity > 0) notes.push(`${unknownSeverity} licence(s) had an unknown severity and are counted as high`);
+    if (unmapped > 0) notes.push(`${unmapped} finding(s) had a path that could not be mapped to a repository file`);
+    return findings;
+  });
+}
+function parseTrivyLicenceJsonText(input, toolId, opts = {}) {
+  const read = readJson(input, limitsFrom(opts.limits).maxBytes);
+  return read.toolError === void 0 ? parseTrivyLicenceJson(read.json, toolId, opts) : { findings: [], toolError: read.toolError, notes: [] };
+}
 
 // gate/src/scrub.ts
 var MAX_ERROR_CHARS = 300;
@@ -6235,7 +6351,7 @@ function scrubBytes(raw, opts) {
           return toolError(e instanceof StageError ? e.message : "the stage folder could not be read", key);
         }
       }
-      parsed = opts.range !== void 0 ? parseSarifText(raw, opts.tool, { commits: true, limits: { maxBytes } }) : stage === void 0 ? parseSarifText(raw, opts.tool, { workspace: opts.workspace, limits: { maxBytes } }) : parseSarifText(raw, opts.tool, { workspace: stage.files, exactNames: STAGED_NAME_RE, limits: { maxBytes } });
+      parsed = opts.tool === TRIVY_LICENCE_TOOL ? parseTrivyLicenceJsonText(raw, opts.tool, { limits: { maxBytes } }) : opts.range !== void 0 ? parseSarifText(raw, opts.tool, { commits: true, limits: { maxBytes } }) : stage === void 0 ? parseSarifText(raw, opts.tool, { workspace: opts.workspace, limits: { maxBytes } }) : parseSarifText(raw, opts.tool, { workspace: stage.files, exactNames: STAGED_NAME_RE, limits: { maxBytes } });
     } else if (opts.format === "zap-json") {
       if (opts.stage !== void 0 || opts.range !== void 0) return toolError("a stage folder or a commit range is only for the secrets tools", key);
       if (opts.tool !== ZAP_TOOL) return toolError(`${JSON.stringify(safeText(opts.tool, 60))} is not a tool whose ZAP report the gate reads`, key);
@@ -6291,7 +6407,7 @@ function scrubBytes(raw, opts) {
     return toolError("the scrub failed unexpectedly", key);
   }
 }
-var str = (o, k, where) => {
+var str2 = (o, k, where) => {
   const v = getOwn(o, k);
   if (typeof v !== "string") fail(`${where}: ${k} is not a string`);
   return v;
@@ -6340,7 +6456,7 @@ function readScrubbed(input, format, maxBytes = MAX_RAW_BYTES) {
       const run = runs[0];
       const props = getOwn(run, "properties");
       if (!isObj(props) || getOwn(props, "pipegenScrubbed") !== true) fail("the result was not written by the scrub");
-      const tool2 = str(props, "pipegenTool", "properties");
+      const tool2 = str2(props, "pipegenTool", "properties");
       const id = getOwn(props, "pipegenKeyId");
       if (id !== void 0 && (typeof id !== "string" || !/^[0-9a-f]{16}$/.test(id))) fail("the key id is not 16 hex characters");
       const results = getOwn(run, "results");
@@ -6352,10 +6468,10 @@ function readScrubbed(input, format, maxBytes = MAX_RAW_BYTES) {
         const fp2 = getOwn(r, "partialFingerprints");
         const msg = getOwn(r, "message");
         if (!isObj(p) || !isObj(fp2) || !isObj(msg)) fail(`${at3} is missing a part`);
-        const severity = str(p, "pipegenSeverity", at3);
-        const fpBy = str(p, "pipegenFpBy", at3);
+        const severity = str2(p, "pipegenSeverity", at3);
+        const fpBy = str2(p, "pipegenFpBy", at3);
         if (!SEVERITIES2.includes(severity) || !FP_BYS.includes(fpBy)) fail(`${at3}: an unknown severity or fingerprint form`);
-        const fingerprint = str(fp2, "pipegenFingerprint", at3);
+        const fingerprint = str2(fp2, "pipegenFingerprint", at3);
         if (!/^(?:secret:|secret-nokey:|quoted:|quoted-nokey:)?[0-9a-f]{64}$/.test(fingerprint)) fail(`${at3}: the fingerprint is not a hash`);
         let file;
         let line;
@@ -6365,7 +6481,7 @@ function readScrubbed(input, format, maxBytes = MAX_RAW_BYTES) {
           const phys = Array.isArray(locs) && isObj(locs[0]) ? getOwn(locs[0], "physicalLocation") : void 0;
           if (!isObj(phys)) fail(`${at3}: the location is not readable`);
           const art = getOwn(phys, "artifactLocation");
-          if (art !== void 0) file = isObj(art) ? str(art, "uri", at3) : fail(`${at3}: the artifact location is not an object`);
+          if (art !== void 0) file = isObj(art) ? str2(art, "uri", at3) : fail(`${at3}: the artifact location is not an object`);
           const region = getOwn(phys, "region");
           if (region !== void 0) {
             if (!isObj(region)) fail(`${at3}: the region is not an object`);
@@ -6375,18 +6491,18 @@ function readScrubbed(input, format, maxBytes = MAX_RAW_BYTES) {
         }
         return {
           tool: tool2,
-          ruleId: str(r, "ruleId", at3),
+          ruleId: str2(r, "ruleId", at3),
           severity,
           ...file === void 0 ? {} : { file },
           ...line === void 0 ? {} : { line },
           ...endLine === void 0 ? {} : { endLine },
-          message: str(msg, "text", at3),
+          message: str2(msg, "text", at3),
           fingerprint,
           secret: bool(p, "pipegenSecret", at3),
           fpBy,
           uriUnmapped: bool(p, "pipegenUnmapped", at3),
           pathWithheld: optBool(p, "pipegenPathWithheld", at3),
-          ...getOwn(p, "pipegenDisplayPath") === void 0 ? {} : { displayPath: str(p, "pipegenDisplayPath", at3) },
+          ...getOwn(p, "pipegenDisplayPath") === void 0 ? {} : { displayPath: str2(p, "pipegenDisplayPath", at3) },
           ...getOwn(p, "pipegenAdvisoryIds") === void 0 ? {} : { advisoryIds: advisoryIdsOf(getOwn(p, "pipegenAdvisoryIds"), at3) },
           ...getOwn(p, "pipegenCommit") === void 0 ? {} : { commit: commitOf(getOwn(p, "pipegenCommit"), at3) }
         };
@@ -6401,18 +6517,18 @@ function readScrubbed(input, format, maxBytes = MAX_RAW_BYTES) {
     const findings = alerts.map((a, i) => {
       const at3 = `alert ${i}`;
       if (!isObj(a)) fail(`${at3} is not an object`);
-      const severity = str(a, "severity", at3);
-      const fingerprint = str(a, "fingerprint", at3);
+      const severity = str2(a, "severity", at3);
+      const fingerprint = str2(a, "fingerprint", at3);
       if (!SEVERITIES2.includes(severity) || !/^[0-9a-f]{64}$/.test(fingerprint)) fail(`${at3}: an unknown severity or a fingerprint that is not a hash`);
       const method = getOwn(a, "method");
       const path = getOwn(a, "path");
       if (method !== void 0 && typeof method !== "string" || path !== void 0 && typeof path !== "string") fail(`${at3}: a method or path is not a string`);
       return {
         tool: ZAP_TOOL,
-        ruleId: str(a, "pluginid", at3),
+        ruleId: str2(a, "pluginid", at3),
         severity,
         ...path === void 0 ? {} : { file: path },
-        message: str(a, "name", at3),
+        message: str2(a, "name", at3),
         fingerprint,
         secret: false,
         fpBy: "hash",
@@ -6591,12 +6707,12 @@ function pickArtifact(listing, want) {
   const bad = (problem) => ({ ok: false, missing: false, problem });
   const max = want.maxBytes ?? MAX_RESULT_ZIP_BYTES;
   if (!isPlain3(listing)) return bad("the artifact list is not an object");
-  const list = own2(listing, "artifacts");
-  if (!Array.isArray(list)) return bad("the artifact list has no artifacts");
+  const list2 = own2(listing, "artifacts");
+  if (!Array.isArray(list2)) return bad("the artifact list has no artifacts");
   const total = own2(listing, "total_count");
-  if (total !== void 0 && (!natInt(total) || total > list.length)) return bad("the artifact list is cut (fewer entries than its total)");
-  if (!list.every(isPlain3)) return bad("an entry of the artifact list is not an object");
-  const named = list.filter((a2) => own2(a2, "name") === want.name);
+  if (total !== void 0 && (!natInt(total) || total > list2.length)) return bad("the artifact list is cut (fewer entries than its total)");
+  if (!list2.every(isPlain3)) return bad("an entry of the artifact list is not an object");
+  const named = list2.filter((a2) => own2(a2, "name") === want.name);
   if (named.length === 0) return { ok: false, missing: true, problem: `no artifact named ${want.name}` };
   if (named.length > 1) return bad(`${named.length} artifacts are named ${want.name}`);
   const a = named[0];
@@ -7103,10 +7219,10 @@ function parseNumber(ctx, startPtr, startChr, sign2, endChr) {
   }
   if (!(state & 1))
     TomlError.x("unfinished numeric value", ctx, startPtr);
-  let str2 = ctx.s.slice(startPtr, ctx.p);
+  let str3 = ctx.s.slice(startPtr, ctx.p);
   if (hasUnderscores)
-    str2 = str2.replaceAll("_", "");
-  return state > 1 ? parseFloat(str2) : parseInteger(ctx, str2, 10, startPtr);
+    str3 = str3.replaceAll("_", "");
+  return state > 1 ? parseFloat(str3) : parseInteger(ctx, str3, 10, startPtr);
 }
 function parseIntegerBaseN(ctx, startPtr, base, endChr) {
   let c, underscore = 1;
@@ -7122,15 +7238,15 @@ function parseIntegerBaseN(ctx, startPtr, base, endChr) {
   }
   if (underscore & 1)
     TomlError.x("unfinished numeric value", ctx);
-  let str2 = ctx.s.slice(startPtr + 2, ctx.p);
+  let str3 = ctx.s.slice(startPtr + 2, ctx.p);
   if (underscore)
-    str2 = str2.replaceAll("_", "");
-  return parseInteger(ctx, str2, base, startPtr);
+    str3 = str3.replaceAll("_", "");
+  return parseInteger(ctx, str3, base, startPtr);
 }
-function parseInteger(ctx, str2, base, startPtr) {
+function parseInteger(ctx, str3, base, startPtr) {
   if (ctx.bi !== true)
     int: {
-      let val = parseInt(str2, base);
+      let val = parseInt(str3, base);
       if (!Number.isSafeInteger(val)) {
         if (ctx.bi)
           break int;
@@ -7138,7 +7254,7 @@ function parseInteger(ctx, str2, base, startPtr) {
       }
       return val;
     }
-  return base === 10 ? BigInt(str2) : BigInt((base === 2 ? "0b" : base === 8 ? "0o" : "0x") + str2);
+  return base === 10 ? BigInt(str3) : BigInt((base === 2 ? "0b" : base === 8 ? "0o" : "0x") + str3);
 }
 function parseDate(ctx, c, endChr) {
   let startPtr = ctx.p++, unsafeSeparator;
@@ -7185,25 +7301,25 @@ function parseTime(ctx, c, endChr) {
   let t = ctx.s.slice(start, ctx.p);
   return readDate(ctx, t, 4, false, start);
 }
-function readDate(ctx, str2, type, unsafeDelim, errPtr, temporalSuffix) {
+function readDate(ctx, str3, type, unsafeDelim, errPtr, temporalSuffix) {
   if (ctx.ld) {
-    let date = new TomlDate(str2, type, unsafeDelim);
+    let date = new TomlDate(str3, type, unsafeDelim);
     if (!date.isValid())
       TomlError.x("invalid date", ctx, errPtr);
     return date;
   }
   try {
     if (temporalSuffix)
-      str2 += temporalSuffix;
+      str3 += temporalSuffix;
     switch (type) {
       case 1:
-        return Temporal.ZonedDateTime.from(str2);
+        return Temporal.ZonedDateTime.from(str3);
       case 2:
-        return Temporal.PlainDateTime.from(str2);
+        return Temporal.PlainDateTime.from(str3);
       case 3:
-        return Temporal.PlainDate.from(str2);
+        return Temporal.PlainDate.from(str3);
       case 4:
-        return Temporal.PlainTime.from(str2);
+        return Temporal.PlainTime.from(str3);
     }
   } catch (e) {
     TomlError.x(e instanceof Error ? e.message : "" + e, ctx, errPtr);
@@ -8287,11 +8403,11 @@ async function buildPrDiff(gh, repo2, baseSha, headSha) {
     return bad();
   }
   const status = isPlain4(a) ? own3(a, "status") : void 0;
-  const list = isPlain4(a) ? own3(a, "files") : void 0;
-  if (status !== "ahead" && status !== "identical" || !Array.isArray(list)) return bad();
-  let ok = list.length < COMPARE_FILE_CAP;
+  const list2 = isPlain4(a) ? own3(a, "files") : void 0;
+  if (status !== "ahead" && status !== "identical" || !Array.isArray(list2)) return bad();
+  let ok = list2.length < COMPARE_FILE_CAP;
   const files = [];
-  for (const e of list) {
+  for (const e of list2) {
     const f = readFile(e);
     if (f === void 0) ok = false;
     else files.push(f);
@@ -8479,19 +8595,19 @@ function readJobList(text, errors) {
     return [];
   }
   const raw = JSON.parse(text);
-  const list = raw.map((r) => {
+  const list2 = raw.map((r) => {
     const e = {};
     for (const k of JOB_LIST_KEYS) if (Object.hasOwn(r, k)) e[k] = k === "warnFirst" ? { since: r[k].since } : r[k];
     return e;
   });
-  for (const [i, e] of list.entries()) {
+  for (const [i, e] of list2.entries()) {
     const problem = entryProblem(e, i);
     if (problem !== null) {
       errors.push(`the job-list input is refused (${problem})`);
       return [];
     }
   }
-  return list;
+  return list2;
 }
 function resolveSettings(raw, ctx) {
   const errors = [];
@@ -8625,7 +8741,7 @@ function outputsOf(outputs, artifact) {
   }
   return o;
 }
-function mapJobs(needs, list) {
+function mapJobs(needs, list2) {
   const notes = [];
   const base = jobOf(needs, BASE_SCAN_JOB);
   let baseScan = null;
@@ -8633,7 +8749,7 @@ function mapJobs(needs, list) {
     const c = own4(base.outputs, BASE_SHA_OUTPUT);
     baseScan = { result: base.result, ...typeof c === "string" && SHA_RE5.test(c) ? { commit: c } : {} };
   }
-  const checks = list.map((entry) => {
+  const checks = list2.map((entry) => {
     const j = jobOf(needs, entry.job);
     if (j === void 0) return { entry, result: "missing", outputs: {} };
     if (j.result === "missing") notes.push(`the job ${shownName(entry.job)} has no result GitHub gives (success, failure, cancelled or skipped): it counts as missing`);
@@ -8643,7 +8759,7 @@ function mapJobs(needs, list) {
     return { entry, result: j.result, outputs, ...baseOutputs === void 0 ? {} : { baseOutputs } };
   });
   if (isPlain5(needs)) {
-    const listed = /* @__PURE__ */ new Set([...list.map((e) => e.job), BASE_SCAN_JOB]);
+    const listed = /* @__PURE__ */ new Set([...list2.map((e) => e.job), BASE_SCAN_JOB]);
     const extra = Object.keys(needs).filter((k) => !listed.has(k));
     if (extra.length > 0) notes.push(`${extra.length} job${extra.length === 1 ? "" : "s"} the gate waits for ${extra.length === 1 ? "is" : "are"} not in the job list and ${extra.length === 1 ? "was" : "were"} not read: ${extra.slice(0, 10).map(shownName).join(", ")}`);
   }
@@ -8683,10 +8799,10 @@ function at2(o, ...path) {
   return v;
 }
 var sha402 = (v) => typeof v === "string" && SHA_RE6.test(v) ? v : void 0;
-function licenceCoverage(list) {
-  if (list === void 0) return ["coverage per lockfile not known (the gate step has no licence-lockfiles input)"];
-  if (list.length === 0) return ["not covered (no lockfile)"];
-  return [...new Set(list.flatMap((e) => e.lockfiles.length === 0 ? [`${e.service}: not covered (no lockfile)`] : e.lockfiles.filter((l) => !l.read).map((l) => `${e.service}: ${l.kind}: not covered (lockfile type)`)))];
+function licenceCoverage(list2) {
+  if (list2 === void 0) return ["coverage per lockfile not known (the gate step has no licence-lockfiles input)"];
+  if (list2.length === 0) return ["not covered (no lockfile)"];
+  return [...new Set(list2.flatMap((e) => e.lockfiles.length === 0 ? [`${e.service}: not covered (no lockfile)`] : e.lockfiles.filter((l) => !l.read).map((l) => `${e.service}: ${l.kind}: not covered (lockfile type)`)))];
 }
 var ZERO_SHA2 = "0".repeat(40);
 async function rangeScanOf(tool2, result, outputs, fileOf) {
@@ -9127,8 +9243,8 @@ function githubAdapter(opts) {
       const path = `${repo(owner, name)}/actions/runs/${num(runId)}/artifacts?${new URLSearchParams({ name: artifactName, per_page: String(MAX_PER_PAGE) }).toString()}`;
       const a = await getJson(path);
       const total = typeof a === "object" && a !== null && Object.hasOwn(a, "total_count") ? a.total_count : void 0;
-      const list = typeof a === "object" && a !== null && Object.hasOwn(a, "artifacts") ? a.artifacts : void 0;
-      if (typeof total !== "number" || !Array.isArray(list) || total > list.length) throw new GitHubApiError(`GET ${path.replace(/\?.*$/, "")}: the artifact list is cut (fewer entries than its total_count) or malformed`);
+      const list2 = typeof a === "object" && a !== null && Object.hasOwn(a, "artifacts") ? a.artifacts : void 0;
+      if (typeof total !== "number" || !Array.isArray(list2) || total > list2.length) throw new GitHubApiError(`GET ${path.replace(/\?.*$/, "")}: the artifact list is cut (fewer entries than its total_count) or malformed`);
       return a;
     },
     downloadArtifact: async (owner, name, artifactId) => {
@@ -9215,13 +9331,13 @@ async function attemptVerdict(gh, repo2, runId, attempt, gateJobName) {
     for (let page2 = 1; page2 <= JOB_PAGE_CAP; page2++) {
       const answer = await gh.listAttemptJobs(repo2.owner, repo2.name, runId, attempt, page2, JOBS_PER_PAGE);
       const t = isPlain7(answer) ? own5(answer, "total_count") : void 0;
-      const list = isPlain7(answer) ? own5(answer, "jobs") : void 0;
-      if (typeof t !== "number" || !Number.isSafeInteger(t) || t < 0 || !Array.isArray(list)) return { kind: "error", detail: `${what} could not be read (the answer is not a job list)` };
+      const list2 = isPlain7(answer) ? own5(answer, "jobs") : void 0;
+      if (typeof t !== "number" || !Number.isSafeInteger(t) || t < 0 || !Array.isArray(list2)) return { kind: "error", detail: `${what} could not be read (the answer is not a job list)` };
       if (total !== -1 && t !== total) return { kind: "error", detail: `${what} changed while they were read` };
       total = t;
-      jobs.push(...list);
+      jobs.push(...list2);
       if (jobs.length >= total) break;
-      if (list.length === 0) return { kind: "error", detail: `${what} could not be read (the list is cut short)` };
+      if (list2.length === 0) return { kind: "error", detail: `${what} could not be read (the list is cut short)` };
     }
   } catch (e) {
     return { kind: "error", detail: why(`${what} could not be read`, e) };
@@ -9785,7 +9901,7 @@ var GATE_VIEW = [
       ".trivyignore.yaml",
       "trivy-secret.yaml"
     ],
-    "outputFile": "trivy-licence.sarif"
+    "outputFile": "trivy-licence.json"
   },
   {
     "id": "dependency-review-action",
@@ -10229,9 +10345,9 @@ async function upsertIssueDetailed(gh, repo2, key, title, body, opts = {}) {
   const closed = [];
   let complete = false;
   for (let page2 = 1; page2 <= ISSUE_PAGE_CAP; page2++) {
-    const list = await gh.listIssues(repo2.owner, repo2.name, page2, ISSUE_PER_PAGE);
-    if (!Array.isArray(list)) throw new Error("nightly: the issue list is not a list, so no issue is written");
-    for (const raw of list) {
+    const list2 = await gh.listIssues(repo2.owner, repo2.name, page2, ISSUE_PER_PAGE);
+    if (!Array.isArray(list2)) throw new Error("nightly: the issue list is not a list, so no issue is written");
+    for (const raw of list2) {
       const h = hitOf(raw, true);
       if (h === void 0) continue;
       if (h.state === "open") {
@@ -10241,7 +10357,7 @@ async function upsertIssueDetailed(gh, repo2, key, title, body, opts = {}) {
       if (closed.length < MAX_CLOSED_CHECKS) closed.push(h.number);
     }
     if (open !== void 0) break;
-    if (list.length < ISSUE_PER_PAGE) {
+    if (list2.length < ISSUE_PER_PAGE) {
       complete = true;
       break;
     }
@@ -10249,9 +10365,9 @@ async function upsertIssueDetailed(gh, repo2, key, title, body, opts = {}) {
   let adopted = false;
   if (open === void 0 && closed.length === 0) {
     if (!complete) throw new Error(`nightly: the issue list reaches its cap of ${ISSUE_PAGE_CAP} pages without ending, so no issue is created (it might be a duplicate)`);
-    const list = await gh.listIssues(repo2.owner, repo2.name, 1, ISSUE_PER_PAGE, false);
-    if (!Array.isArray(list)) throw new Error("nightly: the unlabelled issue list is not a list, so no issue is written");
-    for (const raw of list) {
+    const list2 = await gh.listIssues(repo2.owner, repo2.name, 1, ISSUE_PER_PAGE, false);
+    if (!Array.isArray(list2)) throw new Error("nightly: the unlabelled issue list is not a list, so no issue is written");
+    for (const raw of list2) {
       const h = hitOf(raw, false);
       if (h === void 0) continue;
       adopted = true;
@@ -10317,9 +10433,9 @@ async function setupMergedAt(gh, repo2, now) {
   let best;
   try {
     for (let page2 = 1; page2 <= PULL_PAGES; page2++) {
-      const list = await gh.listSetupPulls(repo2.owner, repo2.name, page2, 100);
-      if (!Array.isArray(list)) return { note: "the list of closed setup pull requests could not be read (not a list), so the setup merge is not proven" };
-      for (const pr of list) {
+      const list2 = await gh.listSetupPulls(repo2.owner, repo2.name, page2, 100);
+      if (!Array.isArray(list2)) return { note: "the list of closed setup pull requests could not be read (not a list), so the setup merge is not proven" };
+      for (const pr of list2) {
         if (!isPlain9(pr)) continue;
         const head = own6(pr, "head");
         const base = own6(pr, "base");
@@ -10335,7 +10451,7 @@ async function setupMergedAt(gh, repo2, now) {
         if (t === void 0 || t > clock || typeof mergeSha !== "string" || !SHA_RE10.test(mergeSha)) continue;
         if (best === void 0 || t > best.t) best = { t, at: merged, sha: mergeSha };
       }
-      if (list.length < 100) break;
+      if (list2.length < 100) break;
     }
   } catch {
     return { note: "the list of closed setup pull requests could not be read, so the setup merge is not proven" };
@@ -10370,9 +10486,9 @@ async function latestGateRelease(gh, current, now) {
   const found = [];
   try {
     for (let page2 = 1; page2 <= RELEASE_PAGES; page2++) {
-      const list = await gh.listReleases(PIPEGEN_OWNER, PIPEGEN_NAME, page2, 100);
-      if (!Array.isArray(list)) return { note: "no update check: the release list of pipegen could not be read (not a list)" };
-      for (const r of list) {
+      const list2 = await gh.listReleases(PIPEGEN_OWNER, PIPEGEN_NAME, page2, 100);
+      if (!Array.isArray(list2)) return { note: "no update check: the release list of pipegen could not be read (not a list)" };
+      for (const r of list2) {
         if (!isPlain9(r)) continue;
         const tag = own6(r, "tag_name");
         const m = typeof tag === "string" ? GATE_TAG_RE.exec(tag) : null;
@@ -10381,7 +10497,7 @@ async function latestGateRelease(gh, current, now) {
         const ver = semver(m[1]);
         if (ver !== void 0) found.push({ version: m[1], ver, publishedAt: published, tag, immutable: own6(r, "immutable") === true });
       }
-      if (list.length < 100) break;
+      if (list2.length < 100) break;
     }
   } catch {
     return { note: "no update check: the release list of pipegen could not be read (the repository is private until v0.4, so this is expected)" };
@@ -10531,9 +10647,9 @@ var SUPERSEDED_RE = /^> Superseded by #/;
 async function supersedeOlder(gh, repo2, version, newNumber) {
   const cur = semver(version);
   for (let page2 = 1; page2 <= ISSUE_PAGE_CAP; page2++) {
-    const list = await gh.listIssues(repo2.owner, repo2.name, page2, ISSUE_PER_PAGE);
-    if (!Array.isArray(list)) throw new Error("the issue list is not a list");
-    for (const raw of list) {
+    const list2 = await gh.listIssues(repo2.owner, repo2.name, page2, ISSUE_PER_PAGE);
+    if (!Array.isArray(list2)) throw new Error("the issue list is not a list");
+    for (const raw of list2) {
       if (!isPlain9(raw) || own6(raw, "pull_request") !== void 0 || own6(raw, "state") !== "open") continue;
       const number = own6(raw, "number");
       const user = own6(raw, "user");
@@ -10550,7 +10666,7 @@ async function supersedeOlder(gh, repo2, version, newNumber) {
       const next = [lines[0], `> Superseded by #${newNumber}: pipegen gate v${version} is out.`, ...rest].join("\n");
       if (next !== lines.join("\n")) await gh.updateIssue(repo2.owner, repo2.name, number, { title, body: next });
     }
-    if (list.length < ISSUE_PER_PAGE) return;
+    if (list2.length < ISSUE_PER_PAGE) return;
   }
 }
 async function runNightly(gh, ctx, deps = {}) {

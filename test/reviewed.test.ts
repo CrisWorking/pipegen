@@ -676,7 +676,8 @@ describe('loader rules (Plan P Task 5)', () => {
     rejects([trivyEntry({ command: ['trivy', 'plugin', 'install', 'x'], args: [] })], /trivy config\|image\|fs/);
     // shorthands read as pflag does: combined bools and glued values
     expect(load([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, '-fsarif', '-o=tool.sarif', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--exit-code', '10'] })])).toHaveLength(1);
-    expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--exit-code', '10'] })])).toHaveLength(1);
+    // (G15a G11-2: the licence scan writes Trivy's JSON with every package listed)
+    expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--format', 'json', '--list-all-pkgs', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--format', 'json', '--list-all-pkgs', '--exit-code', '10'] })])).toHaveLength(1);
     // S9 (Plan C final review fix round A): a licence scan with a severity filter does not load
     rejects([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--severity', 'HIGH,CRITICAL', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--exit-code', '10'] })], /licence scan must report every severity/);
     // the environment can set any flag: no TRIVY_* env at all
@@ -1039,9 +1040,11 @@ describe('loader rules (Plan P Task 5)', () => {
     // none of the forbidden ones is allowlisted
     for (const f of BETTERLEAKS_FORBIDDEN_FLAGS) expect(BETTERLEAKS_ALLOWED_FLAGS.has(f.replace(/^-+/, ''))).toBe(false);
     const tail = ['--format', 'sarif', '--output', 'tool.sarif', '--exit-code', '10', '.'];
-    for (const f of ['--help', '-h', '--version', '-v', '--quiet', '-q', '--debug', '--no-progress', '--skip-db-update', '--list-all-pkgs', '-qv']) {
+    for (const f of ['--help', '-h', '--version', '-v', '--quiet', '-q', '--debug', '--no-progress', '--skip-db-update', '-qv']) {
       rejects([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, f, ...tail] })], /allowlist, ruling P13/);
     }
+    // (G15a G11-2: --list-all-pkgs is allowlisted for the licence scan only)
+    rejects([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, '--list-all-pkgs', ...tail] })], /only trivy's licence scan/);
     for (const f of ['--help', '-h', '-hv', '--log-level=debug', '--max-target-megabytes=1', '--baseline-path=x', '--enable-rule=x', '-ir', '--no-color']) {
       rejects([betterleaksEntry({ command: blCmd(f, ...(f === '-ir' ? ['x'] : [])) })], /allowlist, ruling P13|never use --verbose/);
     }
@@ -1052,7 +1055,8 @@ describe('loader rules (Plan P Task 5)', () => {
     rejects([betterleaksEntry({ command: blCmd('--no-color'), args: [...BL_ARGS, '--no-color'] })], /allowlist, ruling P13/);
     rejects([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, '--no-such', ...tail], args: [...TRIVY_FLAGS, '--no-such'] })], /unknown flag --no-such/);
     // allowlisted flags load (the trivy-licence shape of fix round A, S9: no --severity; the image and betterleaks shapes)
-    expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--exit-code', '10'] })])).toHaveLength(1);
+    // (G15a G11-2: the licence scan writes Trivy's JSON with every package listed)
+    expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--format', 'json', '--list-all-pkgs', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--format', 'json', '--list-all-pkgs', '--exit-code', '10'] })])).toHaveLength(1);
     expect(load([betterleaksEntry({ command: blCmd('--no-banner', '--ignore-gitleaks-allow'), args: BL_ARGS })])).toHaveLength(1);
     expect(load([nucleiEntry({ command: nucleiCmd('-u', 'http://localhost:8080', '-ni', '-as') })])).toHaveLength(1);
   });
@@ -1662,7 +1666,7 @@ describe('data/reviewed-tools.yml', () => {
     'actions-setup-node': '2026-10-29', betterleaks: '2026-10-30', gitleaks: '2026-10-30', 'docker-login-action': '2026-10-29', nuclei: '2026-10-29',
     // C4 fix rounds 1 and 2 (review-C4): tools that honour .gitignore run without it, bandit gets an explicit empty --ini, and every config name
     // has a scope (nested or root, see rootConfigFiles in the data file); oxlint lints an explicit file list
-    semgrep: '2026-10-30', 'trivy-config': '2026-10-30', 'trivy-image': '2026-10-30', 'trivy-licence': '2026-10-30', eslint: '2026-10-30', 'eslint-typescript': '2026-10-30',
+    semgrep: '2026-10-30', 'trivy-config': '2026-10-30', 'trivy-image': '2026-10-30', 'trivy-licence': '2026-11-06', eslint: '2026-10-30', 'eslint-typescript': '2026-10-30',
     ruff: '2026-10-30', 'ruff-format': '2026-10-30', prettier: '2026-10-30', knip: '2026-10-30', 'osv-scanner': '2026-10-30', jscpd: '2026-10-30', bandit: '2026-10-30', 'oxlint-typeaware': '2026-10-30',
     lefthook: '2026-10-30', syft: '2026-10-30', zizmor: '2026-10-30', hadolint: '2026-10-30', 'kube-linter': '2026-10-30', poutine: '2026-10-30',
     // D9 (ruling B5): c8 runs the service's tests (fixed table, after --) with the code-filled --lines={lines}
@@ -1982,7 +1986,7 @@ describe('Task 6 review fix round 1 (P19-P27)', () => {
       expect(t?.fixedInputs.args, id).toEqual(expect.arrayContaining(['--exit-code', '10']));
       expect(ARGV_POLICIES[id]?.findingsExit, id).toEqual([10]);
       expect(t?.reviewedBy, id).toBe('Claude delegated DECISIONS 105');
-      expect(t?.reviewedAt, id).toBe('2026-10-30');   // re-reviewed for C1c (secrets) and for the config scopes (C4 fix round 2)
+      expect(t?.reviewedAt, id).toBe(id === 'trivy-licence' ? '2026-11-06' : '2026-10-30');   // re-reviewed for C1c (secrets) and for the config scopes (C4 fix round 2); G15a G11-2: the licence JSON
       // the old value (1), also only in the command or only in the fixed args, no longer loads
       refused(both(realEntry(id), swap('10', '1')), /--exit-code 10|--exit-code is a fixed arg: exactly 10|exit-code is one of "10"/);
     }

@@ -1298,10 +1298,10 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "trivy_0.76.0_Linux-64bit.tar.gz", version: "v0.76.0" }
-        command: ["trivy", "fs", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--format", "sarif", "--output", "trivy-licence.sarif", "--exit-code", "10", "."]
-      output: { path: "trivy-licence.sarif", format: sarif }
+        command: ["trivy", "fs", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--format", "json", "--list-all-pkgs", "--output", "trivy-licence.json", "--exit-code", "10", "."]
+      output: { path: "trivy-licence.json", format: sarif }
     fixedInputs:
-      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--format", "sarif", "--output", "trivy-licence.sarif", "--exit-code", "10"]
+      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--format", "json", "--list-all-pkgs", "--output", "trivy-licence.json", "--exit-code", "10"]
       config:
         content: "# pipegen's pinned trivy config: no cache kept between runs, and no repository trivy-secret.yaml (an empty path loads none)\ncache:\n  backend: memory\nsecret:\n  config: \"\"\n"
         passAs: { flag: "--config" }
@@ -1312,7 +1312,10 @@ tools:
     configFiles: []
     rootConfigFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml", "trivy-secret.yaml"]
     reviewedBy: Claude delegated DECISIONS 105
-    reviewedAt: "2026-10-30"
+    # G11-2 (2026-11-06): the scan writes Trivy's JSON with every package listed (--format json --list-all-pkgs), measured offline on the
+    #   pinned 0.76.0 (test/fixtures/trivy-licence-json): a package with no licence data appears only in the lang-pkgs result, with no
+    #   Licenses. The gate's scrub reads that file (gate/src/trivy-licence.ts) and writes the scrubbed SARIF, so output.format stays sarif.
+    reviewedAt: "2026-11-06"
     proofs: 0
     verifiedWith:
       method: cosign-bundle
