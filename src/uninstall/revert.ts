@@ -17,10 +17,11 @@
 import { isDeepStrictEqual } from 'node:util';
 import { Document, isAlias, isMap, isScalar, isSeq, parseDocument, visit, type Node as YamlNode, type Pair, type YAMLMap, type YAMLSeq } from 'yaml';
 import { gitBlobSha } from '../create/guard.js';
-import { editOf } from '../create/package-edit.js';
-import { CODEOWNERS_BEGIN, CODEOWNERS_END, dependabotEntryText, HOOK_FILES, HOOKS_MARKER, hookBlock, type HookCommand, type HookManager } from '../engine/created-builders.js';
+import { buildPackageJson } from '../create/package-edit.js';
+import { CODEOWNERS_BEGIN, CODEOWNERS_END, dependabotEntry, dependabotEntryText, HOOK_FILES, HOOKS_MARKER, hookBlock, hookDataProblem, type DependabotEntry, type HookCommand, type HookManager } from '../engine/created-builders.js';
 import { HEAD_CHECK_STEP_ID, renderHeadCheckStep } from '../engine/deploy-steps.js';
 import { stepsToYaml } from '../engine/render-step.js';
+import { parseYaml } from '../engine/yaml-parse.js';
 import { VERIFY_JOB_ID } from '../layers/assemble.js';
 import type { InstallEdit, PipelineDraft } from '../types.js';
 import { safeText } from '../util/safe-text.js';
@@ -72,7 +73,8 @@ export function revertEdit(e: InstallEdit, current: CurrentFile, blob: BlobReade
     if (e.lock !== undefined) return manual(`${show(e.path)} is reverted only together with its lock file (${show(e.lock)}), never alone.`);
     return revertPair({ edit: e, current }, null, blob).json;
   }
-  if (e.ownerEdited === true) return manual(OWNER_EDITED(e.path), e.kind === 'verify-job' ? undefined : e.inserted);
+  // V2-R1 sec M3: the text to remove is offered only when it is in pipegen's builder form (V4 still escapes it when it prints it)
+  if (e.ownerEdited === true) return manual(OWNER_EDITED(e.path), e.kind === 'verify-job' || textFormProblem(e) !== null ? undefined : e.inserted);
   if (gitBlobSha(current.text) !== current.sha) return manual(`${show(e.path)}: the text read is not the blob of its sha, so pipegen changes nothing there.`);
   return e.kind === 'verify-job' ? revertVerify(e, current, blob, ctx) : revertText(e, current, blob);
 }
@@ -96,8 +98,39 @@ function revertText(e: TextEdit, current: CurrentFile, blob: BlobReader): Revert
     if (original !== null && current.text === original + e.inserted) return { kind: 'restore', text: original };
   }
   const s = stripOnce(current.text, e.inserted);
-  if (typeof s === 'string') return { kind: 'strip', text: s };
-  return manual(`${where}: ${s.why}; take pipegen's text out by hand.`, e.inserted);
+  const left = typeof s === 'string' ? afterStripProblem(e, s, current.text) : s.why;
+  if (typeof s === 'string' && left === null) return { kind: 'strip', text: s };
+  return manual(`${where}: ${left ?? ''}; take pipegen's text out by hand.`, e.inserted);
+}
+
+/**
+ * Why the stripped text is not the owner's file without exactly pipegen's part, or null (V2-R1 sec I3, M2): no pipegen marker may be left,
+ * and for the YAML kinds the current file must read as the stripped one plus exactly pipegen's hooks or entry, so no owner line nested under
+ * pipegen's key or item is moved to another parent by the cut.
+ */
+function afterStripProblem(e: TextEdit, stripped: string, current: string): string | null {
+  if (e.kind === 'codeowners') return stripped.includes(CODEOWNERS_BEGIN) || stripped.includes(CODEOWNERS_END) ? "a pipegen CODEOWNERS marker is still in the file besides pipegen's recorded block" : null;
+  if (e.kind === 'hooks') {
+    if (stripped.includes(HOOKS_MARKER)) return `a ${HOOKS_MARKER} marker is still in the file besides pipegen's recorded block`;
+    const f = hookFormOf(e.path, e.inserted, false);
+    if (f === null) return 'the hooks block is not pipegen\'s';
+    return hookDataProblem(f.manager, stripped, current, f.commands) === null ? null : 'the file does not read as the rest plus exactly pipegen\'s hooks (an owner line may sit under pipegen\'s block)';
+  }
+  const f = dependabotFormOf(e.path, e.inserted, false);
+  if (f === null) return 'the Dependabot entry is not pipegen\'s';
+  const a = parseYaml(stripped, 'strict');
+  const b = parseYaml(current, 'strict');
+  if (!('parsed' in a) || !('parsed' in b)) return 'the file without pipegen\'s entry would not parse as one strict YAML document';
+  const before = a.parsed.js as Obj;
+  const after = b.parsed.js as Obj;
+  const { updates: u0, ...rest0 } = before;
+  const { updates: u1, ...rest1 } = after;
+  if (!isDeepStrictEqual(rest0, rest1)) return 'the rest of the file would change';
+  // the owner's entries, in their order, with pipegen's one entry at a single place among them (an owner entry may follow it as a sibling)
+  const owners: unknown[] | null = Object.hasOwn(before, 'updates') ? (Array.isArray(u0) ? u0 : null) : f.updatesLine ? [] : null;
+  const fits = owners !== null && Array.isArray(u1) && u1.length === owners.length + 1
+    && u1.some((_x, k) => isDeepStrictEqual(u1, [...owners.slice(0, k), f.entry, ...owners.slice(k)]));
+  return fits ? null : 'the updates do not read as the owner\'s plus exactly pipegen\'s entry (an owner line may sit under pipegen\'s entry)';
 }
 
 /** `text` without `ins`, when `ins` occurs exactly once and starts a line (or starts with its own newline and ends the text). */
@@ -139,8 +172,13 @@ const parseJson = (s: string | undefined): string | null => { if (s === undefine
 
 /** Why `ins` is not hookFile's insert for the hook file at `path` (the block hookBlock writes, after the prefixes hookFile adds), or null. */
 function hooksFormProblem(path: string, ins: string, isNew: boolean): string | null {
+  if (MANAGERS.find((m) => HOOK_FILES[m] === path) === undefined) return 'not a hook file pipegen edits';
+  return hookFormOf(path, ins, isNew) === null ? `not the ${HOOKS_MARKER} block pipegen writes` : null;
+}
+/** The manager and commands of hookFile's insert at `path`, or null when `ins` is not exactly that insert. */
+function hookFormOf(path: string, ins: string, isNew: boolean): { manager: HookManager; commands: HookCommand[] } | null {
   const manager = MANAGERS.find((m) => HOOK_FILES[m] === path);
-  if (manager === undefined) return 'not a hook file pipegen edits';
+  if (manager === undefined) return null;
   const prefixes = isNew ? [manager === 'husky' ? HUSKY_SHEBANG : manager === 'pre-commit' ? 'repos:\n' : ''] : ['', '\n'];
   for (const pre of prefixes) {
     if (!ins.startsWith(pre)) continue;
@@ -148,10 +186,10 @@ function hooksFormProblem(path: string, ins: string, isNew: boolean): string | n
     const indents = manager === 'pre-commit' ? (isNew ? [''] : ['', '  ']) : [''];
     for (const indent of indents) {
       const commands = hookCommandsOf(manager, body, indent);
-      if (commands !== null && commands.length > 0 && hookBlock(manager, commands, indent) === body) return null;
+      if (commands !== null && commands.length > 0 && hookBlock(manager, commands, indent) === body) return { manager, commands };
     }
   }
-  return `not the ${HOOKS_MARKER} block pipegen writes`;
+  return null;
 }
 
 /** The commands a hook block names, read loosely (the caller rebuilds the block from them and compares it byte for byte), or null. */
@@ -188,14 +226,23 @@ function hookCommandsOf(manager: HookManager, body: string, i: string): HookComm
 /** Why `ins` is not dependabotFile's insert (its one github-actions entry, after the prefixes dependabotFile adds), or null. */
 function dependabotFormProblem(path: string, ins: string, isNew: boolean): string | null {
   if (path !== '.github/dependabot.yml' && path !== '.github/dependabot.yaml') return 'not the Dependabot file';
+  return dependabotFormOf(path, ins, isNew) === null ? 'not the github-actions entry pipegen writes' : null;
+}
+/** The entry dependabotFile's insert holds and whether the insert carries the `updates:` line, or null when `ins` is not exactly that insert. */
+function dependabotFormOf(path: string, ins: string, isNew: boolean): { entry: DependabotEntry; updatesLine: boolean } | null {
+  if (path !== '.github/dependabot.yml' && path !== '.github/dependabot.yaml') return null;
   const prefixes = isNew ? ['version: 2\nupdates:\n'] : ['', '\n', 'updates:\n', '\nupdates:\n'];
   const ignored = /\n {6}- dependency-name: ("[^"\n]*")\n$/.exec(ins)?.[1];
   const repo = parseJson(ignored)?.replace(/\/\*$/, '');
-  const entries: string[] = [];
-  const draftOf = (d: unknown): PipelineDraft => d as PipelineDraft;
-  entries.push(dependabotEntryText(draftOf({ profile: { private: false } })));
-  if (repo !== undefined) { try { entries.push(dependabotEntryText(draftOf({ profile: { private: true }, centralPin: { repo } }))); } catch { /* no valid central repo: only the public form */ } }
-  return prefixes.some((p) => entries.some((x) => ins === p + x)) ? null : 'not the github-actions entry pipegen writes';
+  const drafts: PipelineDraft[] = [{ profile: { private: false } } as unknown as PipelineDraft];
+  if (repo !== undefined) drafts.push({ profile: { private: true }, centralPin: { repo } } as unknown as PipelineDraft);
+  for (const d of drafts) {
+    let text: string;
+    try { text = dependabotEntryText(d); } catch { continue; }   // no valid central repo: only the public form
+    const p = prefixes.find((x) => ins === x + text);
+    if (p !== undefined) return { entry: dependabotEntry(d), updatesLine: p.includes('updates:') };
+  }
+  return null;
 }
 
 // ---------- verify-job ----------
@@ -222,7 +269,8 @@ function revertVerify(e: VerifyEdit, current: CurrentFile, blob: BlobReader, ctx
   const s = stripVerify(e, current.text, blob, ctx, original);
   if (typeof s !== 'string') return manual(`${where}: ${s.why}. ${byHand(e)}`);
   // unchanged, and the strip reads exactly as the original: the original's own bytes come back
-  if (unchanged(e, current) && original !== null && isDeepStrictEqual(jsOf(s), jsOf(original))) return { kind: 'restore', text: original };
+  // V2-R1 sec I2: only after ONE write (originalSha is the first original: after a re-run the owner's bytes between the writes would go)
+  if (e.writtenShas.length === 1 && unchanged(e, current) && original !== null && isDeepStrictEqual(jsOf(s), jsOf(original))) return { kind: 'restore', text: original };
   return { kind: 'strip', text: s };
 }
 
@@ -402,7 +450,9 @@ function stripVerify(e: VerifyEdit, text: string, blob: BlobReader, ctx: RevertC
 
 /**
  * The package.json edit and its lock edit, reverted together or not at all (m6, V-S8): both restored from their original blobs only when
- * both are unchanged (each current sha the last pipegen wrote), the package.json reads as the recorded edit, and both originals can be read.
+ * both are unchanged, each written exactly once (V2-R1 sec I1: originalSha is the first original, so after a re-run the owner's changes between
+ * the writes would go), the package.json is byte for byte its original rebuilt with the recorded edit (buildPackageJson, the package judge's
+ * own check), and both originals can be read.
  * Anything else: both manual. `lock` is null only for a package.json whose record names no lock. `current: null` = the file is gone.
  */
 export function revertPair(json: { edit: JsonEdit; current: CurrentFile | null }, lock: { edit: LockEdit; current: CurrentFile | null } | null, blob: BlobReader): { json: RevertResult; lock: RevertResult | null } {
@@ -420,19 +470,16 @@ export function revertPair(json: { edit: JsonEdit; current: CurrentFile | null }
     if (c === null) return { why: `${show(e.path)} is no longer there` };
     if (gitBlobSha(c.text) !== c.sha) return { why: `the text read for ${show(e.path)} is not the blob of its sha` };
     if (!unchanged(e, c)) return { why: `${show(e.path)} changed since pipegen wrote it` };
+    if (e.writtenShas.length !== 1) return { why: `pipegen wrote ${show(e.path)} more than once, so its first original may lack the owner's changes between the writes` };
     const o = readBlob(blob, e.originalSha);
     return o === null ? { why: `pipegen can't read the original ${show(e.path)}` } : o;
   };
   const jo = restoreOf(pj, json.current);
   if (typeof jo !== 'string') return both(jo.why);
-  // the package.json reads as the recorded edit of its original (the same devDependencies added, the same test-script change)
-  let readsAsRecorded = false;
-  try {
-    const before: unknown = JSON.parse(jo);
-    const after: unknown = JSON.parse((json.current as CurrentFile).text);
-    if (isObj(before) && isObj(after)) { const d = editOf(before, after); readsAsRecorded = isDeepStrictEqual({ ...d.add }, { ...pj.add }) && d.setTest === pj.setTest; }
-  } catch { readsAsRecorded = false; }
-  if (!readsAsRecorded) return both(`${show(pj.path)} doesn't read as the original with pipegen's recorded change`);
+  // the package.json is exactly its original with the recorded edit applied (every other byte the original's)
+  let rebuilt: string | null = null;
+  try { rebuilt = buildPackageJson(jo, { add: { ...pj.add }, setTest: pj.setTest }); } catch { rebuilt = null; }
+  if (rebuilt === null || rebuilt !== (json.current as CurrentFile).text) return both(`${show(pj.path)} is not its original with exactly pipegen's recorded change`);
   if (lock === null) return { json: { kind: 'restore', text: jo }, lock: null };
   const lo = restoreOf(lock.edit, lock.current);
   if (typeof lo !== 'string') return both(lo.why);
@@ -447,7 +494,15 @@ export function revertEdits(edits: readonly InstallEdit[], read: (e: InstallEdit
   const pairs = new Map<InstallEdit, RevertResult>();
   for (const e of edits) {
     if (e.kind !== 'package-json') continue;
-    const lk = e.lock === undefined ? undefined : edits.find((x): x is LockEdit => x.kind === 'package-lock' && x.repo === e.repo && x.path === e.lock);
+    // V2-R1 sec M1: a lock is this package.json's when either names the other; revertPair refuses a pair that isn't mutual, so neither goes alone
+    const related = edits.filter((x): x is LockEdit => x.kind === 'package-lock' && x.repo === e.repo && (x.path === e.lock || x.json === e.path));
+    if (related.length > 1) {
+      const m = manual(`${show(e.path)} has more than one lock file edit in the record, so none of them goes back; review them by hand.`);
+      pairs.set(e, m);
+      for (const x of related) pairs.set(x, m);
+      continue;
+    }
+    const lk = related[0];
     const r = revertPair({ edit: e, current: read(e) }, lk === undefined ? null : { edit: lk, current: read(lk) }, blob);
     pairs.set(e, r.json);
     if (lk !== undefined && r.lock !== null) pairs.set(lk, r.lock);

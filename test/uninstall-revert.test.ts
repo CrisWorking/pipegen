@@ -1,6 +1,7 @@
 // v0.2 Plan V, Task V2: the revert engine (rulings V-S7, V-S8, V-N3, V-N11, V-B6; plan m6). Pure functions: texts and shas in, a result out.
 import { describe, expect, it } from 'vitest';
 import { gitBlobSha } from '../src/create/guard.js';
+import { buildPackageJson } from '../src/create/package-edit.js';
 import { codeownersBlock, codeownersFile, dependabotEntryText, hookBlock } from '../src/engine/created-builders.js';
 import { renderHeadCheckStep } from '../src/engine/deploy-steps.js';
 import { insertHeadChecks, insertVerify } from '../src/layers/deploy.js';
@@ -227,12 +228,13 @@ describe('V2: the revert engine', () => {
   });
 
   it('plan: package.json and package-lock.json reverted together or not at all; lock only when its sha is one pipegen wrote', () => {
-    const pj = '{\n  "name": "app",\n  "devDependencies": { "vitest": "^1.0.0" }\n}\n';
-    const pjNew = '{\n  "name": "app",\n  "devDependencies": { "vitest": "^1.0.0", "@biomejs/biome": "1.9.4" }\n}\n';
+    const pj = '{\n  "name": "app",\n  "devDependencies": {\n    "vitest": "5.0.5"\n  }\n}\n';
+    const pjNew = buildPackageJson(pj, { add: { c8: '12.0.0' }, setTest: false }) as string;
+    expect(pjNew).toContain('"c8": "12.0.0"');
     const lock = '{ "lockfileVersion": 3, "packages": {} }\n';
     const lockNew = '{ "lockfileVersion": 3, "packages": { "node_modules/@biomejs/biome": {} } }\n';
     for (const t of [pj, pjNew, lock, lockNew]) put(t);
-    const json: Extract<InstallEdit, { kind: 'package-json' }> = { repo: 'app', path: 'package.json', kind: 'package-json', add: { '@biomejs/biome': '1.9.4' }, setTest: false, lock: 'package-lock.json', originalSha: gitBlobSha(pj), writtenShas: [gitBlobSha(pjNew)] };
+    const json: Extract<InstallEdit, { kind: 'package-json' }> = { repo: 'app', path: 'package.json', kind: 'package-json', add: { c8: '12.0.0' }, setTest: false, lock: 'package-lock.json', originalSha: gitBlobSha(pj), writtenShas: [gitBlobSha(pjNew)] };
     const lk: Extract<InstallEdit, { kind: 'package-lock' }> = { repo: 'app', path: 'package-lock.json', kind: 'package-lock', json: 'package.json', originalSha: gitBlobSha(lock), writtenShas: [gitBlobSha(lockNew)] };
     // both unchanged: both restored
     expect(revertPair({ edit: json, current: cur(pjNew) }, { edit: lk, current: cur(lockNew) }, blob)).toEqual({ json: { kind: 'restore', text: pj }, lock: { kind: 'restore', text: lock } });
@@ -311,10 +313,10 @@ describe('V2: the revert engine', () => {
     expect(kind(revertEdit({ ...edit, ownerEdited: true }, cur(written), blob, CTX))).toBe('manual');
     const newFile = textEdit('codeowners', 'CODEOWNERS', null, block, { ownerEdited: true });
     expect(kind(revertEdit(newFile, cur(block), blob))).toBe('manual');
-    const pj = '{"name":"a"}\n';
-    const pjNew = '{"name":"a","devDependencies":{"x":"1.0.0"}}\n';
+    const pj = '{\n  "name": "a"\n}\n';
+    const pjNew = buildPackageJson(pj, { add: { c8: '12.0.0' }, setTest: false }) as string;
     put(pj); put(pjNew);
-    const json: Extract<InstallEdit, { kind: 'package-json' }> = { repo: 'app', path: 'package.json', kind: 'package-json', add: { x: '1.0.0' }, setTest: false, originalSha: gitBlobSha(pj), writtenShas: [gitBlobSha(pjNew)] };
+    const json: Extract<InstallEdit, { kind: 'package-json' }> = { repo: 'app', path: 'package.json', kind: 'package-json', add: { c8: '12.0.0' }, setTest: false, originalSha: gitBlobSha(pj), writtenShas: [gitBlobSha(pjNew)] };
     expect(revertEdit(json, cur(pjNew), blob).kind).toBe('restore');
     expect(revertEdit({ ...json, ownerEdited: true }, cur(pjNew), blob).kind).toBe('manual');
   });
@@ -340,5 +342,110 @@ describe('V2: the revert engine', () => {
     expect(kind(revertEdit({ ...e, writtenShas: [put(grown)] }, cur(grown), blob))).toBe('manual');
     // the current sha is an older one pipegen wrote: changed, manual
     expect(kind(revertEdit({ ...e, writtenShas: [gitBlobSha(block), gitBlobSha('x')] }, cur(block), blob))).toBe('manual');
+  });
+
+  // ---------- fix round 1 (V2-R1): the reviewers' probes ----------
+
+  it('V2-R1 1: the package pair is restored only after one write each and when the package.json is the original rebuilt with the recorded edit', () => {
+    const o1 = '{\n  "name": "app",\n  "version": "1.0.0",\n  "devDependencies": {\n    "typescript": "5.4.0"\n  }\n}\n';
+    const w1 = buildPackageJson(o1, { add: { c8: '12.0.0' }, setTest: false }) as string;
+    // P1: the owner uninstalled c8, bumped the version, added express; the re-run added c8 again on top
+    const owner = '{\n  "name": "app",\n  "version": "2.3.0",\n  "dependencies": {\n    "express": "5.0.0"\n  },\n  "devDependencies": {\n    "typescript": "5.6.0"\n  }\n}\n';
+    const w2 = buildPackageJson(owner, { add: { c8: '12.0.0' }, setTest: false }) as string;
+    const l1 = '{ "lockfileVersion": 3, "n": 1 }\n';
+    const lw1 = '{ "lockfileVersion": 3, "n": 2 }\n';
+    const lw2 = '{ "lockfileVersion": 3, "n": 3 }\n';
+    for (const t of [o1, w1, owner, w2, l1, lw1, lw2]) put(t);
+    const json: Extract<InstallEdit, { kind: 'package-json' }> = { repo: 'app', path: 'package.json', kind: 'package-json', add: { c8: '12.0.0' }, setTest: false, lock: 'package-lock.json', originalSha: gitBlobSha(o1), writtenShas: [gitBlobSha(w1), gitBlobSha(w2)] };
+    const lk: Extract<InstallEdit, { kind: 'package-lock' }> = { repo: 'app', path: 'package-lock.json', kind: 'package-lock', json: 'package.json', originalSha: gitBlobSha(l1), writtenShas: [gitBlobSha(lw1), gitBlobSha(lw2)] };
+    const r = revertPair({ edit: json, current: cur(w2) }, { edit: lk, current: cur(lw2) }, blob);
+    expect([r.json.kind, r.lock?.kind]).toEqual(['manual', 'manual']);
+    // one write each, but the record's original isn't the file the current one was built from (it differs outside devDependencies)
+    const older = '{\n  "name": "app",\n  "version": "0.9.0",\n  "devDependencies": {\n    "typescript": "5.4.0"\n  }\n}\n';
+    const one = { ...json, originalSha: put(older), writtenShas: [gitBlobSha(w1)] };
+    const r2 = revertPair({ edit: one, current: cur(w1) }, { edit: { ...lk, writtenShas: [gitBlobSha(lw1)] }, current: cur(lw1) }, blob);
+    expect([r2.json.kind, r2.lock?.kind]).toEqual(['manual', 'manual']);
+    // the honest single-write pair: restored
+    const r3 = revertPair({ edit: { ...json, writtenShas: [gitBlobSha(w1)] }, current: cur(w1) }, { edit: { ...lk, writtenShas: [gitBlobSha(lw1)] }, current: cur(lw1) }, blob);
+    expect(r3).toEqual({ json: { kind: 'restore', text: o1 }, lock: { kind: 'restore', text: l1 } });
+    // only the package.json was written twice: both manual
+    const r4 = revertPair({ edit: { ...json, writtenShas: [gitBlobSha(w2), gitBlobSha(w1)] }, current: cur(w1) }, { edit: { ...lk, writtenShas: [gitBlobSha(lw1)] }, current: cur(lw1) }, blob);
+    expect([r4.json.kind, r4.lock?.kind]).toEqual(['manual', 'manual']);
+  });
+
+  it('V2-R1 2: a verify-job file written twice is stripped, never restored to the first original', () => {
+    // P2: the owner took pipegen's part out by hand, added comments and moved keys; the re-run inserted again
+    const ownerWf = USER_WF.replace('jobs:\n', '# Production deploy. Owner: @alice\njobs:\n').replace('      - run: ./deploy.sh   # ship it\n', '      - run: ./deploy.sh   # deploys to prod; see RUNBOOK.md\n');
+    const first = verifyEdit(USER_WF, ['deploy']);
+    const second = insertVerify(ownerWf, ['deploy'], VERIFY);
+    put(second.text);
+    const e: VerifyEdit = { ...first.edit, writtenShas: [gitBlobSha(first.written), gitBlobSha(second.text)] };
+    const r = revertEdit(e, cur(second.text), blob, CTX);
+    expect(r).toEqual({ kind: 'strip', text: ownerWf });
+  });
+
+  it("V2-R1 3: a YAML hook or Dependabot strip that would re-parent the owner's lines is manual", () => {
+    const cmds = [{ id: 'biome', run: 'npx biome check' }];
+    // P3 lefthook: the owner's command under pipegen's pre-commit key would become a pre-push command
+    const lh = 'pre-push:\n  commands:\n    t:\n      run: npm test\n';
+    const lhb = hookBlock('lefthook', cmds);
+    const le = textEdit('hooks', 'lefthook.yml', lh, `${lh}${lhb}`);
+    expect(revertEdit(le, cur(`${lh}${lhb}    typecheck:\n      run: tsc\n`), blob)).toMatchObject({ kind: 'manual', remove: lhb });
+    // P5 pre-commit: the owner's local hook under pipegen's repo would become a hook of the remote repo
+    const pc = 'repos:\n  - repo: https://github.com/x/y\n    rev: v1\n    hooks:\n      - id: z\n';
+    const pcb = hookBlock('pre-commit', cmds, '  ');
+    const pe = textEdit('hooks', '.pre-commit-config.yaml', pc, `${pc}${pcb}`);
+    const mine = '      - id: mine\n        name: mine\n        entry: ./mine.sh\n        language: system\n';
+    expect(revertEdit(pe, cur(`${pc}${pcb}${mine}`), blob)).toMatchObject({ kind: 'manual', remove: pcb });
+    // P4a dependabot: pipegen added `updates:`; the owner's npm entry under it would dangle after the strip
+    const pub = dependabotEntryText({ profile: { private: false } } as unknown as PipelineDraft);
+    const v2 = 'version: 2\n';
+    const de = textEdit('dependabot', '.github/dependabot.yml', v2, `${v2}updates:\n${pub}`);
+    const npmEntry = '  - package-ecosystem: "npm"\n    directory: "/"\n    schedule:\n      interval: "daily"\n';
+    expect(revertEdit(de, cur(`${v2}updates:\n${pub}${npmEntry}`), blob)).toMatchObject({ kind: 'manual', remove: `updates:\n${pub}` });
+    expect(textOf(revertEdit(de, cur(`# top\n${v2}updates:\n${pub}`), blob))).toBe(`# top\n${v2}`);
+    // P4b: the owner's keys on pipegen's entry would move onto the owner's npm entry
+    const dep = `${v2}updates:\n${npmEntry}`;
+    const de2 = textEdit('dependabot', '.github/dependabot.yml', dep, `${dep}${pub}`);
+    expect(revertEdit(de2, cur(`${dep}${pub}    labels: ["deps"]\n    open-pull-requests-limit: 0\n`), blob)).toMatchObject({ kind: 'manual', remove: pub });
+    // the owner's own new entry after pipegen's is a sibling: the strip keeps it as one
+    expect(textOf(revertEdit(de2, cur(`${dep}${pub}${npmEntry.replace('"/"', '"/web"')}`), blob))).toBe(`${dep}${npmEntry.replace('"/"', '"/web"')}`);
+  });
+
+  it('V2-R1 4: revertEdits pairs a lock that names a package.json even when that package.json names no lock', () => {
+    const pj = '{\n  "name": "b"\n}\n';
+    const pjNew = buildPackageJson(pj, { add: { c8: '12.0.0' }, setTest: false }) as string;
+    const lock = '{ "l": 1 }\n';
+    const lockNew = '{ "l": 2 }\n';
+    for (const t of [pj, pjNew, lock, lockNew]) put(t);
+    const json: Extract<InstallEdit, { kind: 'package-json' }> = { repo: 'app', path: 'package.json', kind: 'package-json', add: { c8: '12.0.0' }, setTest: false, originalSha: gitBlobSha(pj), writtenShas: [gitBlobSha(pjNew)] };
+    const lk: Extract<InstallEdit, { kind: 'package-lock' }> = { repo: 'app', path: 'package-lock.json', kind: 'package-lock', json: 'package.json', originalSha: gitBlobSha(lock), writtenShas: [gitBlobSha(lockNew)] };
+    const r = revertEdits([json, lk], (e) => (e.path === 'package.json' ? cur(pjNew) : cur(lockNew)), blob, CTX);
+    expect(r.map((x) => [x.edit.path, x.result.kind])).toEqual([['package.json', 'manual'], ['package-lock.json', 'manual']]);
+  });
+
+  it("V2-R1 5: pipegen's markers left after a strip → manual", () => {
+    const original = '* @alice\n';
+    const block = codeownersBlock(['trivy.yaml'], ['@o']);
+    const written = codeownersFile(original, block);
+    const e = textEdit('codeowners', 'CODEOWNERS', original, written);
+    // the block once more without its separator (an owner copy) at the top: which one is pipegen's is unclear
+    expect(revertEdit(e, cur(`${block}${written}`), blob)).toMatchObject({ kind: 'manual', remove: e.inserted });
+    expect(revertEdit(e, cur(`# pipegen:begin\n${written}`), blob)).toMatchObject({ kind: 'manual', remove: e.inserted });
+    const husky = '#!/usr/bin/env sh\nnpm test\n';
+    const hb = hookBlock('husky', [{ id: 'biome', run: 'npx biome check' }]);
+    const he = textEdit('hooks', '.husky/pre-commit', husky, `${husky}${hb}`);
+    expect(revertEdit(he, cur(`# pipegen:hooks old\n${husky}${hb}`), blob)).toMatchObject({ kind: 'manual', remove: hb });
+  });
+
+  it('V2-R1 6: an ownerEdited edit offers its text to remove only when it is in builder form', () => {
+    const original = '* @alice\n';
+    const bad = textEdit('codeowners', 'CODEOWNERS', original, `${original}\x1b[2J\x1b[31m\n`, { ownerEdited: true });
+    const r = revertEdit(bad, cur(`${original}\x1b[2J\x1b[31m\n`), blob);
+    expect(r.kind).toBe('manual');
+    expect(r).not.toHaveProperty('remove');
+    const block = codeownersBlock(['trivy.yaml'], ['@o']);
+    const good = textEdit('codeowners', 'CODEOWNERS', original, codeownersFile(original, block), { ownerEdited: true });
+    expect(revertEdit(good, cur(codeownersFile(original, block)), blob)).toMatchObject({ kind: 'manual', remove: good.inserted });
   });
 });
