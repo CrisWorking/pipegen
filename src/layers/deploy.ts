@@ -323,6 +323,8 @@ function readsContents(job: unknown, top: unknown): boolean {
   if (p === undefined || p === 'read-all' || p === 'write-all') return true;
   return isObj(p) && (p.contents === 'read' || p.contents === 'write');
 }
+/** G7-R-sec1: every step's if: of a job runs only when the steps before it passed (the job-level rule, gatedIfAllowed, per step). */
+const stepsGated = (job: unknown): boolean => isObj(job) && (!Array.isArray(job.steps) || job.steps.every((st) => !isObj(st) || gatedIfAllowed(st.if)));
 /**
  * G7-R1 sec I2: why a job the deploy detector does not flag may still deploy (so it waits for the check), or null when it plainly can not:
  * it names no secret but the workflow token (and no `secrets:` of a call), its permissions (its own, else the workflow's) are set and only
@@ -377,6 +379,10 @@ export function planVerifyInserts(draft: PipelineDraft, texts: ReadonlyMap<strin
     const left = ids.filter((id) => !deployJobs.includes(id));
     const ungated = deployJobs.filter((id) => !gatedIfAllowed(isObj(jobs[id]) ? (jobs[id] as Obj).if : undefined));
     if (ungated.length > 0) { gap(`its job ${ungated.map(show).join(', ')} has an if: that could run it even when pipegen's check fails (always(), failure(), or a top-level ||); change it to success() && <your condition>`, triggers); continue; }
+    // G7-R-sec1: a later step whose if: can run when an earlier step failed (always(), failure(), cancelled(), a top-level ||) would still
+    // deploy after pipegen's head check failed, so such a job is not protected: the workflow is a gap
+    const stepIfs = deployJobs.filter((id) => !callsWorkflow(jobs[id]) && !stepsGated(jobs[id]));
+    if (stepIfs.length > 0) { gap(`a step of its job ${stepIfs.map(show).join(', ')} has an if: that could run it after pipegen's head check failed (always(), failure(), cancelled(), or a top-level ||); change it to success() && <your condition>`, triggers); continue; }
     const noContents = deployJobs.filter((id) => !callsWorkflow(jobs[id]) && !readsContents(jobs[id], js.permissions));
     if (noContents.length > 0) { gap(`its job ${noContents.map(show).join(', ')} sets permissions without contents: read, which pipegen's head check in that job needs to read the branch; add contents: read to that job's permissions`, triggers); continue; }
     let edit: ReturnType<typeof insertVerify>;

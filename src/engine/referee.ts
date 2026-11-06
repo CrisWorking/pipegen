@@ -2135,6 +2135,8 @@ function judgeEdited(fc: FileCtx, parsed: Parsed, mark: PipegenInserted): void {
       const first = isSeq(stepsNode) ? stepsNode.items[0] : undefined;
       if (hasAnchorOrAlias(first)) bad('injection', `The head check pipegen added to ${show(id)} uses a YAML anchor or alias.`);
       if (want === null || !isDeepStrictEqual(steps[0], want)) { bad('template', `The job ${show(id)} does not start with pipegen's head check exactly (the step pipegen writes for the default branch, first).`); continue; }
+      // G7-R-sec1: no later step may run once the head check failed (a status function or a top-level || in its if:)
+      steps.forEach((st, i) => { if (i > 0 && isObj(st) && !gatedIfAllowed(st.if)) bad('template', `Step ${i + 1} of the job ${show(id)} has an if: that could run it after pipegen's head check failed (always(), failure(), cancelled(), or a top-level ||), so the check would not stop that deploy.`); });
       steps.shift();
     }
   }

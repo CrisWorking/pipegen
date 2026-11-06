@@ -957,3 +957,28 @@ describe('G7-R1 spec: the byte-level edit, the key, the network note, the enviro
     expect('triggerNames' in deploy).toBe(false);
   });
 });
+
+describe('G7-R-sec1: a step-level if: can not run a deploy step after the head check failed', () => {
+  const withStepIf = (cond: string): string => DEPLOY_A.replace('      - run: ./scripts/ship.sh\n', `      - run: ./scripts/ship.sh\n        if: ${cond}\n`);
+  it('G7-R-sec1: a gated job with a step if: always() (or failure(), cancelled(), a top-level ||) → no insert, an honest gap', async () => {
+    for (const cond of ['always()', '${{ failure() }}', 'cancelled()', "success() || github.ref == 'refs/heads/main'", '${{ !cancelled() }}']) {
+      const w = world('keyless', [[A, withStepIf(cond)]]);
+      expect(w.v.inserts, cond).toEqual([]);
+      expect(w.v.gaps, cond).toEqual([{ path: A, triggers: ['push'], why: expect.stringMatching(/a step of its job "deploy" has an if: that could run it after pipegen's head check failed/) }]);
+    }
+    // the referee refuses the same file edited by hand (the insert forced)
+    const w = world('keyless', [[A, withStepIf('always()')]]);
+    const forced = insertVerify(withStepIf('always()'), ['deploy'], verifyOf(w));
+    const f: CreatedFile = { path: A, content: forced.text, part: 'deploy-verify', reason: 't', repo: 'app', inserted: forced.inserted };
+    const r = await judge(w, [f]);
+    expect(r.issues.some((i) => /Step \d+ of the job "deploy" has an if: that could run it after pipegen's head check failed/.test(i.message)), shown(r)).toBe(true);
+  });
+  it('G7-R-sec1: a step if: success() && <condition> is allowed', async () => {
+    for (const cond of ["${{ success() && github.ref == 'refs/heads/main' }}", "github.ref == 'refs/heads/main'"]) {
+      const w = world('keyless', [[A, withStepIf(cond)]]);
+      expect(w.v.gaps, cond).toEqual([]);
+      expect(w.v.inserts, cond).toHaveLength(1);
+      expect(shown(await judge(w)), cond).toBe('');
+    }
+  });
+});
