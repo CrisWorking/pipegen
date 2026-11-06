@@ -100,8 +100,8 @@ Each check has a tool, a reason and a mode. The mode is worked out from what pip
 
 Runs on your machine before each commit.
 
-- Secret scan, tool betterleaks/betterleaks. Looks for passwords, keys and tokens in the code and in the commits of a pull request. Not set up: pipegen wrote no hook file (see Hooks setup).
-- Format and lint, service "shop-api", tool biomejs/biome. Checks formatting and common mistakes on the files you commit. Not set up: pipegen wrote no hook file (see Hooks setup).
+- Secret scan, tool betterleaks/betterleaks. Looks for passwords, keys and tokens in the code and in the commits of a pull request. Blocks the commit.
+- Format and lint, service "shop-api", tool biomejs/biome. Checks formatting and common mistakes on the files you commit. Not set up: the format and lint hook was left out (it needs the repository's own Biome at the reviewed version in its lockfile; see the notes below).
 
 ### Push layer
 
@@ -170,6 +170,7 @@ A suggestion is a tool that pipegen does not run for you. It may be a tool pipeg
 - \`.github/workflows/pipegen.yml\`: the workflow that starts the pipeline.
 - In the pipelines repository: the central workflows \`shop--push.yml\`, \`shop--merge.yml\`, \`shop--nightly.yml\` and the shared signing workflow, with the install record.
 - Dependabot, in \`.github/dependabot.yml\` when pipegen adds an entry: it keeps the pinned actions up to date, each update at least 7 days old. The entry ignores the central repository, because Dependabot can not read it, so Dependabot does not bump the central commit. pipegen keeps that pin fresh: \`npx pipegen update\` opens the pull request and the nightly run warns when the pin is old. There are two opt-ins, not on by default: an organisation grant through the API, or a git registry entry with a read-only token you make yourself. A repository that uses Renovate keeps it and gets no Dependabot file (set \`minimumReleaseAge\` to 7 days in Renovate).
+- "lefthook.yml": t
 - Files that were already in your repository, identical to what pipegen writes, are listed in the setup pull request. pipegen never rewrites them, and uninstall asks before it deletes one.
 
 ## Your tests
@@ -248,7 +249,7 @@ pipegen chose its tools in a short debate between AI models. The code, not the A
 
 ## Hooks setup
 
-After you clone the repository, run \`lefthook install\` once, so the hooks are active on your machine.
+After you clone the repository, run \`lefthook install\` once, so the hooks pipegen wrote in \`lefthook.yml\` are active on your machine.
 
 The secrets hook runs pipegen from npm, at the exact version that wrote the hook, and pipegen runs its pinned secret scanner on the staged changes. The command is:
 

