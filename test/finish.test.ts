@@ -57,7 +57,7 @@ interface SeedOpts {
 }
 interface Seed {
   g: FinishGitHub; home: string; record: InstallRecord; pin: string; pr: number; locks: LockPlan; lines: string[]; probes: number[]; resolves: string[]; execs: string[];
-  deps: (over?: Partial<FinishDeps>) => FinishDeps; caps: { value: Capabilities }; plan: { value: Plan };
+  deps: (over?: Partial<FinishDeps>) => FinishDeps; caps: { value: Capabilities }; plan: { value: Plan }; shm: string;
 }
 
 /** A project delivered by pipegen (the setup PR, the record written as deliver writes it) and, unless `merge: false`, merged. */
