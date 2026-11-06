@@ -102,7 +102,7 @@ describe('G6: the pre-commit layer (plan Task 3, B4)', () => {
     // a husky original that sources, evals or returns gets no append, only a note (G1 r1 minor), like exit and exec
     for (const original of ['. "$(dirname -- "$0")/_/husky.sh"\nnpm test\n', 'source ./env.sh\nnpm test\n', 'eval "exit 0"\n', 'npm test\nreturn 0\n', 'npm test && . ./x.sh\n', 'if true; then . ./x.sh; fi\n', '{ . ./x.sh; }\n',
       // G6-R2 I1: a trap or errexit turned off; M1: quoted and escaped forms, command/builtin, a command word from a variable, an npx of its own
-      "trap 'exit 0' EXIT\nnpm test\n", 'set +e\nnpm test\n', 'set -u +e\n', 'set +o errexit\n', '"exit" 0\n', "'exit' 0\n", 'e"x"it 0\n', 'ex\\it 0\n', '"." ./x\n', '\\. ./x\n',
+      "trap 'exit 0' EXIT\nnpm test\n", 'trap cleanup EXIT\nnpm test\n', 'set +e\nnpm test\n', 'set -u +e\n', 'set +o errexit\n', '"exit" 0\n', "'exit' 0\n", 'e"x"it 0\n', 'ex\\it 0\n', '"." ./x\n', '\\. ./x\n',
       'command . ./x\n', 'builtin source ./x\n', '${x}it 0\n', '$CMD\n', 'npx() { :; }\n', 'function npx { :; }\n', "alias npx='true'\n", 'echo "source of truth"\n', "echo 'eval me'\n"]) {
       expect(huskyAppendProblem(original), JSON.stringify(original)).not.toBeNull();
       const res = await precommitFiles(hookDraft('husky'), reviewedList(), repo({ [HOOK_FILES.husky]: original }));
@@ -251,9 +251,14 @@ describe('G6: carries (G1-R2 m5, m6; secrets hook; Plan J G-J1)', () => {
     const notCredited: [PipelineDraft['profile']['precommit'], string][] = [
       ['lefthook', 'pre-push:\n  commands:\n    scan:\n      run: trufflehog git file://. --since-commit HEAD --fail\n'],
       ['pre-commit', withGitleaks.replace('      - id: gitleaks\n', '      - id: gitleaks\n        stages: [manual]\n')],
+      // G6-R-sec2: the remote hook's language or entry overridden, so it never runs the scan the signature expects
+      ['pre-commit', withGitleaks.replace('      - id: gitleaks\n', '      - id: gitleaks\n        language: fail\n')],
+      ['pre-commit', withGitleaks.replace('      - id: gitleaks\n', '      - id: gitleaks\n        language: system\n')],
+      ['pre-commit', withGitleaks.replace('      - id: gitleaks\n', '      - id: gitleaks\n        entry: "true"\n')],
+      ['pre-commit', withGitleaks.replace('      - id: gitleaks\n', '      - id: gitleaks\n        entry: gitleaks git --pre-commit --staged\n')],
       ['pre-commit', `default_stages: [pre-push]\n${withGitleaks}`.replace('default_stages: [pre-push]', 'default_stages: [pre-commit, pre-push]').replace('      - id: gitleaks\n', '      - id: gitleaks\n        stages: [pre-push]\n')],
       ['pre-commit', withGitleaks.replace('      - id: gitleaks\n', '      - id: gitleaks\n        exclude: ^docs/\n')],
-      ['pre-commit', `exclude: ^\\.gitleaks\\.toml$\n${PRE_COMMIT}`],
+      ['pre-commit', `exclude: ^\\.gitleaks\\.toml$\n${withGitleaks}`],
       ['husky', 'gitleaks version\nnpm test\n'], ['husky', 'detect-secrets scan > .secrets.baseline\n'], ['husky', 'gitleaks git --staged || true\n'],
       ['husky', 'npm test # gitleaks runs in CI\n'], ['husky', 'echo "TODO: add gitleaks"\n'], ['husky', '# TODO: gitleaks\nnpm test\n'],
     ];

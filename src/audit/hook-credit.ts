@@ -7,7 +7,8 @@
 // the file text, so the builder and the referee's judge decide the same. Repository scripts are not followed (`npm run x`): a scanner
 // behind one is not credited, so pipegen adds its own hook (a harmless duplicate, never a missing scan).
 //   - husky: the script, read as `sh -e` reads it;
-//   - pre-commit: each hook of `.pre-commit-config.yaml` at the commit stage (its `stages`, else `default_stages`), without a file filter;
+//   - pre-commit: each hook of `.pre-commit-config.yaml` at the commit stage (its `stages`, else `default_stages`), without a file filter; a
+//     remote hook only as its repo defines it (no `language` or `entry` override, G6-R-sec2), a local one by its entry;
 //   - lefthook: never (pipegen appends to lefthook only when the file has no `pre-commit` key at all, so there is nothing at that stage).
 import { regexSafe } from '../read/limits.js';
 import { asObj } from '../read/manifest.js';
@@ -51,15 +52,18 @@ export function existingSecretsHook(manager: 'pre-commit' | 'husky' | 'lefthook'
         if (!atCommit('stages' in hook ? strs(hook.stages) : defaults)) continue;
         if (FILTER_KEYS.some((k) => hook[k] !== undefined && hook[k] !== null)) continue;
         const args = strs(hook.args);
-        const entry = typeof hook.entry === 'string' ? hook.entry : undefined;
-        if (entry !== undefined) {
-          if (!local && !s.hookRepos.has(hookRepo(url))) continue;
-          if (typeof hook.language === 'string' && NOT_A_COMMAND.has(hook.language)) continue;
+        if (local) {
+          // a local hook runs its entry as a command, unless its language reads it as something else
+          const entry = typeof hook.entry === 'string' ? hook.entry : undefined;
+          if (entry === undefined || typeof hook.language !== 'string' || NOT_A_COMMAND.has(hook.language)) continue;
           if (credits(scanShell([entry, ...args].join(' '), '.', s, budget(), DEFAULT_SHELL))) return true;
           continue;
         }
+        // G6-R-sec2: a remote hook is credited from its signature only as the hook repo defines it: a `language` or `entry` of the
+        // user's own overrides what it runs (`language: fail` prints the entry, `entry: "true"` runs nothing), so it gets no credit
+        if ('language' in hook || 'entry' in hook || !s.hookRepos.has(hookRepo(url))) continue;
         const id = typeof hook.id === 'string' ? hook.id : '';
-        const tools = local ? undefined : s.hooks.get(hookRepoKey(url, id));
+        const tools = s.hooks.get(hookRepoKey(url, id));
         if (tools?.some((t) => flagsAllow(t, args) && commandReason(t, args) === null && credits([foundOf(t, '.', null)]))) return true;
       }
     }
