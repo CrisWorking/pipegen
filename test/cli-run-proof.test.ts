@@ -13,7 +13,7 @@ vi.mock('../src/util/exit-hooks.js', async (orig) => {
 vi.mock(import('../src/debate/decide.js'), async (orig) => { const m = await orig(); return { ...m, optionRunOf: vi.fn(m.optionRunOf) }; });
 import { optionRunOf as watchedOptionRunOf } from '../src/debate/decide.js';
 
-import { DECLINED_REASON, dropDeclined, guardedKeys, midRunConfirm, nextCandidateFrom, proofWorkflowsOf, REPOS_NOT_READY, CENTRAL_CHANGED, PRIVATE_REASON } from '../src/cli/run-proof.js';
+import { CONFIRM_QUESTION, DECLINED_REASON, dropDeclined, guardedKeys, midRunConfirm, nextCandidateFrom, proofWorkflowsOf, REPOS_NOT_READY, CENTRAL_CHANGED, PRIVATE_REASON } from '../src/cli/run-proof.js';
 import { proofAssembler } from '../src/cli/run-parts.js';
 import { assemble } from '../src/layers/assemble.js';
 import { node, p as PLAT, planned, profileOf } from './helpers/assemble.js';
@@ -937,6 +937,125 @@ describe('G14-R1: a declined AI file and the parts that read it (spec M6, sec M1
     const o2 = dropDeclined(await outcome(other, { floorSast: true }), new Set(['docs/x.md']));
     expect(o2.result.ok).toBe(true);
     expect(o2.result.parts.find((x) => x.needId === 'sast')?.status).toBe('proven');
+  });
+});
+
+describe('G14-R2: a decline is proven again without the declined files (ruling G14-R2 1-2)', () => {
+  const ROOT = svc({ name: 'app', path: '.', language: 'node', packageManager: 'npm', scripts: ['test', 'start'] });
+  const lacks = (d: PipelineDraft, path: string): boolean => !d.created.some((f) => f.path === path);
+
+  it('run: a declined root Dockerfile (one service) → one more full proof without it, fresh round → delivered without it', async () => {
+    const w = await proofWorld({ services: [ROOT], aiFile: true, aiPath: { path: 'Dockerfile', part: 'docker' }, confirm: false });
+    const r = await w.run();
+    expect(w.tl.some((x) => x.startsWith('keys.real'))).toBe(false);
+    // the extra proof: the last evaluation is of the draft without the file, on a fresh round, merged (full)
+    const lastEval = w.evals.at(-1);
+    expect(lastEval && lacks(lastEval.d, 'Dockerfile')).toBe(true);
+    expect(w.evals.slice(0, -1).some((e) => !lacks(e.d, 'Dockerfile'))).toBe(true);
+    const rounds = w.pushed.filter((x) => x.variant === 'main' && x.round !== undefined);
+    expect(rounds.length).toBeGreaterThan(0);
+    expect(w.variants.at(-2)).toMatchObject({ variant: 'main', merge: true });
+    expect(r.ok).toBe(true);
+    expect(r.draft && lacks(r.draft, 'Dockerfile')).toBe(true);
+    expect(w.store.state?.proofOk).toBe(true);
+    expect(w.store.state?.draft && lacks(w.store.state.draft, 'Dockerfile')).toBe(true);
+    // the decline is a note on its part, not a blanket "not proven" of every job of the service
+    expect(r.draft?.notProven.some((n) => n.part === 'docker' && n.reason === DECLINED_REASON)).toBe(true);
+    expect(r.draft?.notProven.some((n) => n.needId === 'sast')).toBe(false);
+  });
+
+  it('run: a decline in a two-service repo → the extra proof covers both services (the whole draft, full) before anything is delivered', async () => {
+    const w = await proofWorld({ aiFile: true, aiPath: { path: 'api/Dockerfile', part: 'docker' }, confirm: false });
+    const r = await w.run();
+    const lastEval = w.evals.at(-1);
+    expect(lastEval && lacks(lastEval.d, 'api/Dockerfile')).toBe(true);
+    expect(new Set(lastEval?.d.steps.filter((x) => x.needId === 'sast').map((x) => x.service))).toEqual(new Set(['api', 'web']));
+    expect(w.variants.at(-2)).toMatchObject({ variant: 'main', merge: true });
+    expect(r.ok).toBe(true);
+  });
+
+  it('run: the extra proof fails → nothing delivered, a plain message, the saved verdict not proven', async () => {
+    const w = await proofWorld({ aiFile: true, aiPath: { path: 'api/Dockerfile', part: 'docker' }, confirm: false });
+    const evaluate = w.ops.evaluate as NonNullable<typeof w.ops.evaluate>;
+    w.ops.evaluate = async (d, runs, ctx) => {
+      const ev = await evaluate(d, runs, ctx);
+      return lacks(d, 'api/Dockerfile') ? { ...ev, result: failOn('sast', 'the build needs the Dockerfile') } : ev;
+    };
+    const r = await w.run();
+    expect(r.ok).toBe(false);
+    expect(r.stopped).toContain('proved the pipeline again without the AI-written files you declined, and it did not pass');
+    expect(w.store.state?.proofOk).toBe(false);
+  });
+
+  it('run: no minutes left for the extra proof → no delivery, a plain message (the declined files\' readers not proven)', async () => {
+    const w = await proofWorld({ aiFile: true, aiPath: { path: 'api/Dockerfile', part: 'docker' }, confirm: false, input: { variantMinutes: 1000 } });
+    const n = w.evals.length;
+    const r = await w.run();
+    expect(r.ok).toBe(false);
+    expect(r.stopped).toContain('not enough Actions minutes are left to prove the pipeline again without the AI-written files you declined');
+    expect(w.evals.length).toBeGreaterThan(n);
+    expect(w.evals.every((e) => !lacks(e.d, 'api/Dockerfile'))).toBe(true);
+  });
+
+  it('run: the question\'s "No" says what happens; a floor stop names each floor part once', () => {
+    expect(CONFIRM_QUESTION).toContain('pipegen proves the pipeline again without them; if that fails, nothing is delivered');
+    const d = { profile: { services: [] }, needs: [{ id: 'unit-tests', category: 'unit-tests', floor: true }], skipped: [], steps: [], notProven: [], created: [
+      { repo: 'app', path: 'a.test.js', content: 'x', part: 'tests', reason: 'r', aiEdited: true }, { repo: 'app', path: 'b.test.js', content: 'x', part: 'tests', reason: 'r', aiEdited: true },
+      { repo: 'app', path: 'Dockerfile', content: 'x', part: 'docker', reason: 'r', aiEdited: true },
+    ] } as unknown as PipelineDraft;
+    const out = dropDeclined({ draft: d, result: { ok: true, parts: [], findings: [], minutesUsed: 0, runUrls: [] } } as never, new Set(['a.test.js', 'b.test.js', 'Dockerfile']));
+    expect(out.stopped).toMatch(/and the tests part must be proven$/);
+  });
+});
+
+describe('G14-R2: the matcher of GitHub\'s filters is the audit\'s (sec m2)', () => {
+  const f = (path: string, on: string) => ({ path, content: `on: ${on}\njobs: {}\n` });
+  const at = { branch: 'proof/r1/main', defaultBranch: 'main' };
+  it('proofWorkflowsOf: `?`, `+` and `[…]` follow GitHub; a tags-only push runs on no branch push', () => {
+    const wf = proofWorkflowsOf([
+      f('.github/workflows/q.yml', '{push: {branches: ["mai?"]}}'), f('.github/workflows/p.yml', '{push: {branches: ["ma+in"]}}'),
+      f('.github/workflows/b.yml', '{push: {branches: ["[m]ain"]}}'), f('.github/workflows/t.yml', '{push: {tags: ["v*"]}}'),
+      f('.github/workflows/x.yml', '{push: {branches: ["mai?x"]}}'),
+    ], at);
+    expect(wf.merge).toEqual(['.github/workflows/q.yml', '.github/workflows/p.yml', '.github/workflows/b.yml']);
+    expect(wf.push).toEqual([]);
+    expect(proofWorkflowsOf([f('.github/workflows/p.yml', '{push: {branches: ["ma+in"]}}')], { branch: 'proof/r1/main', defaultBranch: 'maaain' }).merge).toEqual(['.github/workflows/p.yml']);
+    // tags with branches: the branch filter decides the branch pushes
+    expect(proofWorkflowsOf([f('.github/workflows/tb.yml', '{push: {tags: ["v*"], branches: [main]}}')], at).merge).toEqual(['.github/workflows/tb.yml']);
+  });
+});
+
+describe('G14-R2: the AI-fixed draft is kept for an interrupt; the central repo carried into a fresh run (spec minors)', () => {
+  it('run: every draft a proof runs is saved at once (not proven), so an interrupt mid-proof keeps the AI-fixed one', async () => {
+    const w = await proofWorld({ results: [failOn('sast'), PASS] });
+    const fixedFile: CreatedFile = { repo: 'app', path: 'api/test_fix.py', content: 'x\n', part: 'tests', reason: 'r', aiEdited: true };
+    let savedThen: PipelineDraft | undefined;
+    let fixed: PipelineDraft | undefined;
+    w.ops.fixLoop = async (d, deps) => {
+      await deps.prove(d, 'pr');
+      fixed = { ...d, created: [...d.created, fixedFile] };
+      const run = await deps.prove(fixed, 'pr');
+      savedThen = w.store.load()?.draft;
+      return { result: run.result, draft: fixed } as never;
+    };
+    await w.run();
+    expect(savedThen).toEqual(fixed);
+    expect(w.store.load()?.proofOk === true ? 'verdict' : 'none').toBe('verdict');
+  });
+
+  it('state: begin carries centralCreated of the same app into a fresh run', async () => {
+    const p = profile({ owner: OWN, repo: 'r', private: false });
+    const home = mkdtempSync(join(tmpdir(), 'pg-cc-'));
+    const s = await StateStore.open(p, { home, env: {} });
+    const app = { owner: OWN, repo: 'r', private: false, ownerType: 'User' as const, defaultBranch: 'main' };
+    s.begin(RUN_ID, app, { cap: 1, aiCap: 1 });
+    s.update((n) => { n.centralCreated = true; n.cleanupDone = true; });
+    s.begin('20261106-000000-abcdef', app, { cap: 1, aiCap: 1 });
+    expect(s.state?.centralCreated).toBe(true);
+    // another app: not carried
+    const s2 = await StateStore.open(p, { home: mkdtempSync(join(tmpdir(), 'pg-cc-')), env: {} });
+    s2.begin(RUN_ID, app, { cap: 1, aiCap: 1 });
+    expect(s2.state?.centralCreated).toBeUndefined();
   });
 });
 

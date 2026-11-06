@@ -17,7 +17,7 @@ import { StateStore } from '../../src/proof/state.js';
 import { proofTarget } from '../../src/proof/target.js';
 import { makeRunProof, type ProofInput, type ProofOps, type ProofReturn } from '../../src/cli/run-proof.js';
 import type { CliIO, Prompter } from '../../src/cli/io.js';
-import type { CreatedFile, PipelineDraft, ProofResult, RepoProfile } from '../../src/types.js';
+import type { CreatedFile, PipelineDraft, ProofResult, RepoProfile, Service } from '../../src/types.js';
 import { CAPS, candidatesFor, choicesFor, need, profile, scripted, svc } from './debate-fixtures.js';
 
 export const RUN_ID = '20261106-100000-abc123';
@@ -63,6 +63,10 @@ export interface WorldOpts {
   stage?: 'created';
   /** The real central layout (C1): the app caller is the same for every draft; the steps' tools live only in the central workflow. */
   centralOnly?: boolean;
+  /** The app's services (default: api and web). */
+  services?: Service[];
+  /** The AI-written file of `aiFile` (default: api/test_app.py, part tests). */
+  aiPath?: { path: string; part: CreatedFile['part'] };
 }
 export interface World {
   tl: string[]; store: StateStore; input: ProofInput; ops: Partial<ProofOps>; asked: string[]; vault: SecretVault; meter: AiSpendMeter;
@@ -81,14 +85,15 @@ export async function proofWorld(o: WorldOpts = {}): Promise<World> {
   const tl: string[] = [];
   const home = mkdtempSync(join(tmpdir(), 'pg-proof-'));
   homes.push(home);
-  const p: RepoProfile = profile({ owner: OWN, repo: 'r', private: o.private === true, services: [APP, WEB], generatedDirs: [] });
-  const choices = choicesFor(NEEDS2, p, {}, {}, undefined, candidatesFor(NEEDS2, p));
+  const p: RepoProfile = profile({ owner: OWN, repo: 'r', private: o.private === true, services: o.services ?? [APP, WEB], generatedDirs: [] });
+  const NEEDS = o.services === undefined ? NEEDS2 : [need('secrets', 'push', undefined), ...o.services.map((x) => need('sast', 'merge', x.name)), need('gate', 'merge', undefined)];
+  const choices = choicesFor(NEEDS, p, {}, {}, undefined, candidatesFor(NEEDS, p));
   let draft: PipelineDraft = {
-    profile: p, capabilities: CAPS, needs: [...NEEDS2], steps: choices.map((c) => c.chosen), created: [], notProven: [], testDecisions: [], layersSkipped: [], scoreboard: [],
+    profile: p, capabilities: CAPS, needs: [...NEEDS], steps: choices.map((c) => c.chosen), created: [], notProven: [], testDecisions: [], layersSkipped: [], scoreboard: [],
     requireDeployApproval: false, skipped: [], suggestions: [],
     ...(o.private === true ? { centralPin: { repo: `${OWN}/pipelines`, sha: '0'.repeat(40) } } : {}),
   } as unknown as PipelineDraft;
-  if (o.aiFile === true) draft = { ...draft, created: [{ repo: 'app', path: 'api/test_app.py', content: 'def test_a():\n    assert 1\n', part: 'tests', reason: 'r', aiEdited: true }] };
+  if (o.aiFile === true) draft = { ...draft, created: [{ repo: 'app', path: o.aiPath?.path ?? 'api/test_app.py', content: 'def test_a():\n    assert 1\n', part: o.aiPath?.part ?? 'tests', reason: 'r', aiEdited: true }] };
   if (o.draft !== undefined) draft = o.draft(draft);
   const store = await StateStore.open(p, { home, env: {} });
   store.begin(RUN_ID, { owner: OWN, repo: 'r', private: p.private, ownerType: 'User', defaultBranch: 'main' }, { cap: 100, aiCap: 5 });
@@ -198,7 +203,7 @@ export async function proofWorld(o: WorldOpts = {}): Promise<World> {
       guard: async (files) => { tl.push('guard'); return { ok: files, refused: [], notes: [] }; },
     },
     store, [A_FIELD]: { kind: 'fine-grained', [TK_FIELD]: MADE_UP, canCreateRepos: false, canDeleteRepos: o.canDelete === true } as never, gh: {} as Octokit, vault, ai: { meter }, io,
-    debate: { choices, needs: [...NEEDS2], candidates: candidatesFor(NEEDS2, p), disputes: o.disputes ?? [], suggestions: [], transcript: [], requireDeployApproval: false, byCode: [], uncovered: [] } as unknown as DebateResult,
+    debate: { choices, needs: [...NEEDS], candidates: candidatesFor(NEEDS, p), disputes: o.disputes ?? [], suggestions: [], transcript: [], requireDeployApproval: false, byCode: [], uncovered: [] } as unknown as DebateResult,
     reviewed: (await import('./debate-fixtures.js')).REVIEWED, platform: {} as never, dir: '/repo',
     scanner: async () => ({ name: 'betterleaks', path: '/bin/betterleaks', version: '1.0.0' }),
     arm: (c, m) => { tl.push('arm'); armed.push({ cleanup: c, meters: m }); disarm = armProofCleanup(input.store, c, { meters: m }); },
