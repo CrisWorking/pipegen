@@ -695,9 +695,15 @@ async function checkPin(gh: Octokit, d: DeliveryPlan, c: RepoRef, defaultBranch:
 }
 
 /** The setup pull request's body (the record's marker line is added by writeRecord). */
-function prBody(d: DeliveryPlan, commits: readonly { part: Part; files: CreatedFile[] }[], left: number): string {
+export function prBody(d: DeliveryPlan, commits: readonly { part: Part; files: CreatedFile[] }[], left: number, adopted: readonly CreatedFile[] = [], rewritten: readonly CreatedFile[] = []): string {
   const lines = ['pipegen sets up the security checks of this repository. One commit per part:', ''];
   for (const c of commits) lines.push(`- ${PART_TITLE[c.part]} (${c.part}): ${c.files.length} file${c.files.length === 1 ? '' : 's'}`);
+  // G10-R4 P3 (G9-R0 1): the files that were already there, byte-identical to what pipegen writes, are named; pipegen never rewrites them
+  if (adopted.length > 0) {
+    lines.push('', `Already there and identical to what pipegen writes, so pipegen left ${adopted.length === 1 ? 'it' : 'them'} as ${adopted.length === 1 ? 'it is' : 'they are'} (recorded as adopted: pipegen never rewrites ${adopted.length === 1 ? 'it' : 'them'}, and uninstall asks before it deletes ${adopted.length === 1 ? 'it' : 'them'}): ${adopted.map((f) => `\`${show(f.path)}\`${f.repo === 'central' ? ' (central repo)' : ''}`).join(', ')}`);
+  }
+  // a file an earlier run adopted that this run rewrites (its text changed): said plainly
+  if (rewritten.length > 0) lines.push('', `This run rewrites ${rewritten.length === 1 ? 'a file' : 'files'} that an earlier run adopted (${rewritten.length === 1 ? 'it was' : 'they were'} in your repository before pipegen): ${rewritten.map((f) => `\`${show(f.path)}\``).join(', ')}`);
   if (d.aiWritten.length > 0) lines.push('', `Written by the AI (read them closely): ${d.aiWritten.map((x) => `\`${show(x)}\``).join(', ')}`);
   if (left > 0) lines.push('', `${left} change${left === 1 ? '' : 's'} that run code (scripts or dependencies) ${left === 1 ? 'was' : 'were'} left out, as you chose.`);
   lines.push('', 'After you merge it, run `npx pipegen finish`: it turns on the merge locks and the settings pipegen planned (none of them comes before the merge, or this pull request could not merge).');
@@ -829,7 +835,10 @@ export async function deliver(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vaul
       tree = r.tree;
     }
     if (await setBranch(gh, app, SETUP_BRANCH, parent, true, clock) === 'created') stored.push({ kind: 'branch', name: SETUP_BRANCH, repo: `${p.owner}/${p.repo}` });
-    const pr = await openOrUpdatePr(gh, app, { head: SETUP_BRANCH, base: appRepo.defaultBranch, title: 'pipegen: set up the security pipeline', body: prBody(d, commits, left) }, clock);
+    // N2/G9: the adopted files named in the body; an adopted file of the record that this run rewrites is said so
+    const adoptedHere = [...adopted];
+    const rewrittenAdopted = commits.flatMap((c) => c.files).filter((f) => prev?.files.find((r) => r.repo === f.repo && r.path === f.path)?.adopted === true);
+    const pr = await openOrUpdatePr(gh, app, { head: SETUP_BRANCH, base: appRepo.defaultBranch, title: 'pipegen: set up the security pipeline', body: prBody(d, commits, left, adoptedHere, rewrittenAdopted) }, clock);
     if (pr.opened) stored.push({ kind: 'pull-request', name: `#${pr.number}`, repo: `${p.owner}/${p.repo}` });
     done.push(`${pr.opened ? 'opened' : 'updated'} the setup pull request ${pr.url}`);
 
