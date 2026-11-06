@@ -746,6 +746,15 @@ describe('uninstall plan: GitHub objects (V4)', () => {
     expect(u3.unfinished).toBe(false);
     expect(u3.deleteBranches).toEqual([]);
     expect(u3.closePrs).toEqual([]);
+    // merged, though no workflow of pipegen's is on the default branch now and the record has no mergedAt: still not unfinished
+    const w4 = world({ 'README.md': 'my app\n' });
+    w4.app.pulls.push({ number: 3, head: 'pipegen/setup', base: 'main', title: 's', body: '', state: 'closed', html_url: 'x' });
+    const g4 = gh(w4);
+    const merged4 = { request: async (route: string, params: Record<string, unknown>) => {
+      const out = await (g4 as unknown as { request: (r: string, p: unknown) => Promise<{ data: unknown }> }).request(route, params);
+      return route.endsWith('/pulls/{pull_number}') ? { ...out, data: { ...(out.data as object), merged_at: '2026-11-05T13:00:00Z' } } : out;
+    } } as unknown as Octokit;
+    expect((await planUninstall(merged4, loadedOf(w4, sampleRecord(w4, { mergedAt: undefined }), { setupPr: 3 }), term().p, { interactive: true, local: local(w4) })).unfinished).toBe(false);
   });
 
   it('plan: leftovers file entries asked and identity-checked, never deleted blind', async () => {
@@ -1049,6 +1058,9 @@ describe('uninstall plan: reads, terminal and preview (V4)', () => {
     w2.app.pulls.push({ number: 3, head: 'pipegen/setup', base: 'main', title: 's', body: '', state: 'closed', html_url: 'x' });
     expect((await plan(w2, sampleRecord(w2), term(), { setupPr: 3 })).unfinished).toBe(false);
     expect((await plan(w2, sampleRecord(w2, { mergedAt: undefined }), term(), { setupPr: 3 })).unfinished).toBe(true);
+    // only pipegen's workflows count: its Dockerfile on the default branch doesn't make the install finished
+    const wd = world({ 'README.md': 'my app\n', Dockerfile: FILES.Dockerfile as string });
+    expect((await plan(wd, sampleRecord(wd, { mergedAt: undefined }), term())).unfinished).toBe(true);
     // an adopted workflow is not pipegen's own: it doesn't count as live
     const w3 = world({ 'README.md': 'my app\n', '.github/workflows/pipegen.yml': 'name: pipegen\n' });
     const ad = sampleRecord(w3, { mergedAt: undefined });
@@ -1081,7 +1093,9 @@ describe('uninstall plan: reads, terminal and preview (V4)', () => {
     const w = world();
     w.app.stored.set('PIPEGEN_X', AT);
     env(w, 'production', { wait_timer: 30 });
+    setVar(w, 'repo', 'PIPEGEN_BLOCK_FROM', '2026-11-05T00:00:00Z');
     const rec = sampleRecord(w, {
+      variables: [{ name: 'PIPEGEN_BLOCK_FROM', scope: 'repo', created: false, previous: 'old-value-before-pipegen' }], blockFrom: '2026-11-05T00:00:00Z',
       [SEC]: [{ name: 'PIPEGEN_X', scope: 'repo', created: true, unconfirmed: true }],
       environments: [{ name: 'production', created: false, githubCreatedAt: AT, previous: envSettings({ wait_timer: 0 }), changed: ['wait_timer'], branchPolicyIds: [] }],
       repoSettings: { [SS]: { previous: false } },
@@ -1095,6 +1109,8 @@ describe('uninstall plan: reads, terminal and preview (V4)', () => {
     expect(u.deleteSecrets[0]?.typed).toBeUndefined();
     expect(u.restoreEnvironments).toMatchObject([{ name: 'production', needsName: true, confirmedByName: false }]);
     expect(u.restoreEnvironments[0]?.typed).toBeUndefined();
+    expect(u.restoreVariables).toMatchObject([{ name: 'PIPEGEN_BLOCK_FROM', needsName: true, confirmedByName: false }]);
+    expect(u.restoreVariables[0]?.typed).toBeUndefined();
     const p = previewUninstall(u);
     expect(p).toMatch(/Next run \(after you merge the uninstall PR\)[^]*PIPEGEN_X[^]*you type its name then/);
     expect(p).toMatch(/production[^]*wait_timer: 30 → 0/);
@@ -1103,7 +1119,12 @@ describe('uninstall plan: reads, terminal and preview (V4)', () => {
     const tb = term({ confirm: () => true });
     const b = await planB(w, rec, tb);
     expect(b.phase).toBe('B');
-    expect(tb.typed).toHaveLength(2);
+    expect(tb.typed).toHaveLength(3);
+    expect(b.restoreVariables[0]?.typed).toBeDefined();
+    // run 2 asks no file question: pipegen's files still on the branch are left (kept in run 1, or the PR not merged)
+    expect(tb.confirms.filter((q) => !q.startsWith('Turn off'))).toEqual([]);
+    expect([...b.removeFiles, ...b.keepAsk]).toEqual([]);
+    expect(b.skipped.find((x) => x.what === 'Dockerfile')?.why).toMatch(/still on the default branch/);
     expect(b.deleteSecrets[0]?.typed).toBeDefined();
     expect(b.restoreEnvironments[0]?.typed).toBeDefined();
     expect(b.settings[0]?.turnOff).toBe(true);
