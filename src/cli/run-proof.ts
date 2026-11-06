@@ -62,7 +62,7 @@ export interface ProofBuild {
   /** buildFiles of `d` with the run's facts: the delivered files and AssembledFiles.draft. */
   rebuild(d: PipelineDraft): Promise<{ files: CreatedFile[]; assembled: PipelineDraft }>;
   /** makeFixReferee (seven arguments, AssembledFiles.draft) AND the guard on the same batch (D-m1): either one refusing is an issue. */
-  referee(d: PipelineDraft): Promise<RefereeReport>;
+  referee: (d: PipelineDraft) => Promise<RefereeReport>;
   /** makeFixGuard: the guard on a part's files (the vault, the reviewed closure, the install record, the delivery base tree). */
   guard(files: CreatedFile[]): Promise<GuardResult>;
 }

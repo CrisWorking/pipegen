@@ -1106,7 +1106,7 @@ export function proofBuildFor(i: BuildInput, facts: BuildFacts, envPlan: EnvPlan
     if (b === undefined) { b = buildFiles({ ...i, draft: d }, facts, envPlan); cache.set(d, b); }
     return b;
   };
-  const referee = makeFixReferee({
+  const judge = makeFixReferee({
     assemble: async (d) => { const b = await rebuild(d); return { files: b.files, draft: b.assembled.draft }; },
     platform: i.platform, reviewed: i.reviewed, linters: (deps.linters ?? ensureLinters)(), ghToken: i.auth.token ?? null,
     deps: { vault: i.vault, createdInputs: createdInputsFor(i, facts), ...(deps.runLinters === undefined ? {} : { runLinters: deps.runLinters }) },
@@ -1115,8 +1115,8 @@ export function proofBuildFor(i: BuildInput, facts: BuildFacts, envPlan: EnvPlan
   const guard = deps.guard ?? guardCreatedFiles;
   return {
     rebuild: async (d) => { const b = await rebuild(d); return { files: b.files, assembled: b.assembled.draft }; },
-    async referee(d) {
-      const report = await referee(d);
+    referee: async (d) => {
+      const report = await judge(d);
       const b = await rebuild(d);
       const g = await guard(b.files.filter((x) => x.repo === 'app'), { ...ctx, profile: b.assembled.draft.profile, allowWorkflowInsert: b.verify.inserts.map((x) => x.path) });
       const issues = [...report.issues, ...g.refused.map((r) => ({ file: r.path, check: 'template' as const, message: `the guard refused it: ${r.reason}`, repo: 'app' as const }))];

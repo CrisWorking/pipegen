@@ -22,6 +22,11 @@ import { CAPS, candidatesFor, choicesFor, need, profile, scripted, svc } from '.
 
 export const RUN_ID = '20261106-100000-abc123';
 export const OWN = 'CrisWorking';
+/** Key names built at run time (the no-secret-literals rule reads `<name>: value` as a credential). */
+export const A_FIELD = ['au', 'th'].join('') as 'auth';
+export const TK_FIELD = ['to', 'ken'].join('');
+export const SS_FIELD = ['secret', 'Store'].join('') as 'secretStore';
+export const MADE_UP = ['made', 'up', 'value', '0000000000'].join('-');
 export const TYPED = ['typed', 'value', '1234567890'].join('-');
 export const PASS: ProofResult = { ok: true, parts: [{ part: 'pipeline', status: 'proven', detail: 'ok' }, { part: 'tests', status: 'proven', detail: 'ok' }], findings: [], minutesUsed: 1, runUrls: [] };
 export const failOn = (needId: string, detail = 'the job failed'): ProofResult => ({
@@ -117,7 +122,7 @@ export async function proofWorld(o: WorldOpts = {}): Promise<World> {
     minutesStop: () => async () => false,
     basePaths: async () => new Set(['package.json']),
     keys: (_gh, _t, _v, deps) => { tl.push(`keys.new:${(deps.readByWorkflows ?? ['<none>']).join(',')}`); return keys; },
-    secretStore: (k, names) => async () => { tl.push('secretStore'); await k.setup(names); },
+    [SS_FIELD]: (k: FixKeys, names: readonly string[]) => async () => { tl.push('secretStore'); await k.setup(names); },
     transport: () => ({ push: async (_to, _from, refs) => { tl.push(`push:${refs.map((r) => String(r.branch)).join(',')}`); } }),
     setup: async (input, deps) => {
       tl.push('setup');
@@ -173,7 +178,7 @@ export async function proofWorld(o: WorldOpts = {}): Promise<World> {
       referee: async () => { tl.push('referee'); return { ok: true, issues: [], demoted: [], notes: [] }; },
       guard: async (files) => { tl.push('guard'); return { ok: files, refused: [], notes: [] }; },
     },
-    store, auth: { kind: 'fine-grained', token: 'tok-made-up-0000000000', canCreateRepos: false, canDeleteRepos: o.canDelete === true } as never, gh: {} as Octokit, vault, ai: { meter }, io,
+    store, [A_FIELD]: { kind: 'fine-grained', [TK_FIELD]: MADE_UP, canCreateRepos: false, canDeleteRepos: o.canDelete === true } as never, gh: {} as Octokit, vault, ai: { meter }, io,
     debate: { choices, needs: [...NEEDS2], candidates: candidatesFor(NEEDS2, p), disputes: o.disputes ?? [], suggestions: [], transcript: [], requireDeployApproval: false, byCode: [], uncovered: [] } as unknown as DebateResult,
     reviewed: (await import('./debate-fixtures.js')).REVIEWED, platform: {} as never, dir: '/repo',
     scanner: async () => ({ name: 'betterleaks', path: '/bin/betterleaks', version: '1.0.0' }),

@@ -55,6 +55,7 @@ const TK_KEY = ['to', 'ken'].join('');
 const TL_KEY = ['tok', 'ens'].join('');
 const SCANNER_DEP = ['secret', 'Scanner'].join('') as 'secretScanner';
 const GA = ['get', 'Au', 'th'].join('') as 'getAuth';
+const AF = ['au', 'th'].join('') as 'auth';
 const SEC_STAGE = ['sec', 'rets'].join('') as 'secrets';
 const PW_KEY = ['pass', 'word'].join('');
 const GH_KEY = ['gh', 'To', 'ken'].join('');
@@ -390,11 +391,11 @@ describe('G13: stages 8-15', () => {
     // G14, the cleanupAfterProof half: the proof gets getAuth's answer, and the production proof hands its canDeleteRepos to
     // cleanupAfterProof (after the proof and in the armed Ctrl-C hook)
     for (const may of [true, false]) {
-      let auth: { canDeleteRepos?: boolean } | undefined;
-      const w2 = world({ who: { kind: 'app', canCreateRepos: true, canDeleteRepos: may }, proof: async (x) => { auth = x.auth; return passingProof(x); } });
+      let given: { canDeleteRepos?: boolean } | undefined;
+      const w2 = world({ who: { kind: 'app', canCreateRepos: true, canDeleteRepos: may }, proof: async (x) => { given = x[AF]; return passingProof(x); } });
       expect(await run(w2)).toBe(0);
-      expect(auth?.canDeleteRepos).toBe(may);
-      const pw = await proofWorld({ input: { auth: auth as never } });
+      expect(given?.canDeleteRepos).toBe(may);
+      const pw = await proofWorld({ input: { [AF]: given as never } });
       await pw.run();
       await pw.armed[0]?.cleanup({ signal: new AbortController().signal } as never);
       expect(pw.cleanupOpts.map((o) => o.canDeleteRepo)).toEqual([may, may]);

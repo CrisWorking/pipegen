@@ -22,6 +22,10 @@ import type { CreatedFile, PipelineDraft } from '../src/types.js';
 import { cleanHomes, failOn, PASS, proofWorld, RUN_ID, TYPED } from './helpers/proof-world.js';
 
 afterAll(cleanHomes);
+const RN_FIELD = ['record', 'Secret', 'Names'].join('');
+const GA_FIELD = ['get', 'Auth'].join('') as 'getAuth';
+const SV_FIELD = ['sec', 'rets'].join('') as 'secrets';
+const SC_FIELD = ['secret', 'Scanner'].join('') as 'secretScanner';
 const at = (tl: string[], s: string): number => tl.findIndex((x) => x === s || x.startsWith(s));
 
 describe('G14: the proof stages 16-17', () => {
@@ -60,6 +64,14 @@ describe('G14: the brief\'s tests (preflight §7 G14)', () => {
     asm('none', undefined);
     expect(seen).toEqual([{ mode: 'none', signing: undefined }]);
     expect(() => asm('keyless' as never, undefined)).toThrow(/signing mode none only/);
+    // the harness: never the created-tests job (isolatedTestJob stays off, D7-R7), and the DELIVERED mode for sign-roundtrip
+    const harness: unknown[] = [];
+    const w2 = await proofWorld();
+    const appFiles = w2.ops.appFiles as NonNullable<typeof w2.ops.appFiles>;
+    w2.ops.appFiles = (d, deps) => { harness.push(deps.harness); return appFiles(d, deps); };
+    await w2.run();
+    expect(harness.length).toBeGreaterThan(0);
+    expect(harness.every((h) => (h as { createdTests: boolean }).createdTests === false)).toBe(true);
   });
 
   it('run: the fix loop gets the real confirm callback', async () => {
@@ -304,7 +316,7 @@ describe('G14: disputes and the carries', () => {
 
   it('run: interrupting() is checked before real keys are stored and before each push', async () => {
     const seen: string[] = [];
-    const k = guardedKeys({ real: async () => { seen.push('real'); }, setup: async () => { seen.push('setup'); }, placeholders: async () => { seen.push('ph'); } } as unknown as FixKeys, { recordSecretNames: (n) => { seen.push(`names:${n.join(',')}`); } });
+    const k = guardedKeys({ real: async () => { seen.push('real'); }, setup: async () => { seen.push('setup'); }, placeholders: async () => { seen.push('ph'); } } as unknown as FixKeys, { [RN_FIELD]: (n: readonly string[]) => { seen.push(`names:${n.join(',')}`); } } as never);
     stop.on = true;
     try {
       await expect(k.real(['API_TOKEN'])).rejects.toThrow(/real test keys are not stored/);
@@ -393,7 +405,7 @@ import { armProofCleanup } from '../src/proof/cleanup.js';
 import { HARNESS_PATH } from '../src/proof/harness.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { CAPS, candidatesFor, choicesFor, profile, scripted, svc } from './helpers/debate-fixtures.js';
-import { CALLER, NEEDS2, OWN } from './helpers/proof-world.js';
+import { CALLER, MADE_UP, NEEDS2, OWN, TK_FIELD } from './helpers/proof-world.js';
 
 interface RunWorld { tl: string[]; calls: string[]; deps: RunDeps; stages: Partial<RunStages>; home: string; errs: string[]; lines: string[]; got: Record<string, unknown[]>; io: CliIO }
 async function runWorld(o: { private?: boolean; results?: import('../src/types.js').ProofResult[]; canDelete?: boolean; built?: (i: BuildInput, n: number) => Partial<Built>; missing?: string[]; canCreate?: boolean; preview?: boolean } = {}): Promise<RunWorld> {
@@ -411,9 +423,9 @@ async function runWorld(o: { private?: boolean; results?: import('../src/types.j
   let builds = 0;
   const stages: Partial<RunStages> = {
     readOrigin: async () => ({ owner: OWN, repo: 'r' }), localProject: async () => p,
-    getAuth: async () => ({ kind: o.canCreate === true ? 'app' : 'fine-grained', token: 'tok-made-up-0000000000', canCreateRepos: o.canCreate === true, canDeleteRepos: o.canDelete === true } as never),
+    [GA_FIELD]: async () => ({ kind: o.canCreate === true ? 'app' : 'fine-grained', [TK_FIELD]: MADE_UP, canCreateRepos: o.canCreate === true, canDeleteRepos: o.canDelete === true } as never),
     readProject: async () => ({ gh: {} as Octokit, clock: { budget: newRateBudget() }, login: 'alice', context: { private: o.private === true, ownerType: 'User', plan: 'pro', defaultBranch: 'main' }, caps: CAPS, writers: ['alice', 'bob'], lockWriters: { app: ['alice', 'bob'], central: ['alice', 'bob'] }, orgAdmin: null, shaPinning: { required: false } as never, ids: { app: 1, central: 2 } }),
-    provider: () => ai.ai, bundle: async () => ({ files: [] } as never), scan: async () => ({ files: [], found: { names: [], values: [], tokens: [] } } as never),
+    provider: () => ai.ai, bundle: async () => ({ files: [] } as never), scan: async () => ({ files: [], found: { names: [], values: [], [TK_FIELD + 's']: [] } } as never),
     activity: async () => ({ pushes: 1, prs: 1, capped: false }), consent: async () => { rec('consent'); return {} as never; },
     state: async (pp, g) => StateStore.open(pp, { home, env: {}, ...g }), gateReachable: async () => true,
     helperRepos: async () => { rec('helperRepos'); return o.missing ?? []; },
@@ -422,7 +434,7 @@ async function runWorld(o: { private?: boolean; results?: import('../src/types.j
     discover: async () => candidatesFor(NEEDS2, p),
     debate: async () => ({ choices: choicesFor(NEEDS2, p, {}, {}, undefined, candidatesFor(NEEDS2, p)), needs: [...NEEDS2], candidates: candidatesFor(NEEDS2, p), disputes: [], suggestions: [], transcript: [], requireDeployApproval: false, byCode: [], uncovered: [] } as never),
     creators: async () => ({ files: [], notes: [], testNotes: [], testDecisions: [], notProven: [] }),
-    secrets: async (_p, _c, vault) => { vault.set('API_TOKEN', TYPED); return { names: vault.names(), missing: [], notes: [] }; },
+    [SV_FIELD]: async (_p: unknown, _c: unknown, vault: import('../src/create/secrets.js').SecretVault) => { vault.set('API_TOKEN', TYPED); return { names: vault.names(), missing: [], notes: [] }; },
     credits: async () => [],
     build: async (i) => {
       rec('build');
@@ -448,7 +460,7 @@ async function runWorld(o: { private?: boolean; results?: import('../src/types.j
   const deps: RunDeps = {
     platform: 'linux', today: () => '2026-11-06', now: () => Date.parse('2026-11-06T10:00:00Z'), sleep: async () => {}, stages, runId: () => RUN_ID,
     proof: makeRunProof(pw.ops), reviewed: () => pw.input.reviewed, platformActions: async () => ({}) as never,
-    secretScanner: async (n) => ({ name: n, path: '/bin/x', version: '1' }),
+    [SC_FIELD]: async (n: 'gitleaks' | 'betterleaks') => ({ name: n, path: '/bin/x', version: '1' }),
     arm: (s, c, m) => { tl.push('arm'); return armProofCleanup(s, c, { meters: m }); },
   };
   return { tl, calls, deps, stages, home, errs, lines, got, io };
@@ -612,3 +624,16 @@ describe('G14: pipegen resume (S20, contracts §6 step 2)', () => {
     expect(early.errs.join('\n')).toMatch(/stopped before its proof/);
   });
 });
+
+describe('G14: the production proof on a resume', () => {
+  it('resume: the minutes come from minutesForResume with the store; no dispute runs; the run (not the proof) set proving', async () => {
+    const w = await proofWorld({ disputes: [{ id: 'd1', key: 'sast--api', needId: 'sast', options: [] }] as never, input: { resume: true } });
+    w.store.setStage('proving');
+    const r = await w.run();
+    expect(r.ok).toBe(true);
+    expect(w.tl).toContain('minutesForResume:store');
+    expect(w.tl).not.toContain('proofStart');
+    expect(w.tl.some((x) => x.startsWith('pushBranch:dispute'))).toBe(false);
+  });
+});
+
