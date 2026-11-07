@@ -42,7 +42,7 @@ import { MinutesMeter, minutesStop, proofStart } from '../proof/minutes.js';
 import { checkProofRepos, type ProofRepoOptions, type ProofRepos } from '../proof/repos.js';
 import { proveVariant, rerunFailedJobs, resetBase, type ProofWorkflows, type RunOutcome, type VariantProof, type WaitOptions } from '../proof/run.js';
 import { gitTransport, plantedSecretPlacements, pushProofBranch, pushProofSetup, type BaseSnapshot, type PlantedPlacement, type ProofBranch, type ProofFile, type ProofSession, type ProofSetup, type ProofSetupDeps, type ProofSetupInput, type ProofTransport, type SecretStoreStep, type Variant } from '../proof/snapshot.js';
-import { prRecorder, proofTransport, type StateStore } from '../proof/state.js';
+import { prRecorder, proofTransport, type RunState, type StateStore } from '../proof/state.js';
 import { ProofStopError, proofTarget, type ProofTarget } from '../proof/target.js';
 import type { Auth, CreatedFile, PipelineDraft, RepoProfile, ReviewedTool, StepSpec } from '../types.js';
 import { interrupting, type InterruptContext } from '../util/exit-hooks.js';
@@ -397,7 +397,10 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
         latest = d;
         // spec minor (G14-R2 4): the draft this proof runs is saved at once (no verdict: not proven), so an interrupt keeps the AI-fixed one
         if (store.state?.stage === 'proving' && d !== store.state.draft) {
-          try { store.update((n) => { n.draft = structuredClone(d); }); } catch { /* the earlier draft stays; a resume proves it again */ }
+          // m5: through replace, so the draft gets the state format's check before it is written (a draft that fails it is not saved)
+          try {
+            store.replace({ ...structuredClone(store.state), draft: structuredClone(d) } as RunState);
+          } catch { /* the earlier draft stays; a resume proves it again */ }
         }
         let { main, planted: pl, placements } = cur;
         if (calls > 0 || fileKey(f.app) !== fileKey(cur.files.app)) {
@@ -454,21 +457,31 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
       };
       const out = await o.fixLoop(cur.d, fix);
       if (declined.size === 0) return out;
-      // ruling G14-R2 1: a decline is proven again. The loop didn't pass: no pass anyway (the declined files dropped, fail closed)
-      if (!out.result.ok || out.stopped !== undefined || out.cap !== undefined) return dropDeclined(out, declined);
-      // no minutes left for one more proof: the fallback (sec M1's marking) and a plain stop
-      if (m.cap - m.used < Math.max(1, i.variantMinutes)) {
+      // G14-R2b NOTE: the declined AI changes undone: pipegen's own version of a file comes back (the builder's, e.g. its Dockerfile); a
+      // file only the AI wrote is left out. This is the draft saved on every path below (m1: never sec M1's per-job marks)
+      const kept = withoutDeclined(out.draft, declined, startDraft);
+      // ruling G14-R2 1: a decline is proven again. The loop didn't pass: no pass anyway (the result and the stop from dropDeclined)
+      if (!out.result.ok || out.stopped !== undefined || out.cap !== undefined) return { ...dropDeclined(out, declined), draft: kept };
+      // m2: one more proof needs the minutes of two variants (main merged and planted); else the fallback and a plain stop. A proof that
+      // then passes wins over the cap (the spend is done and the draft is proven)
+      if (m.cap - m.used < 2 * Math.max(1, i.variantMinutes)) {
         const d0 = dropDeclined(out, declined);
-        return { ...d0, result: { ...d0.result, ok: false }, stopped: NO_MINUTES_FOR_REPROOF };
+        return { ...d0, draft: kept, result: { ...d0.result, ok: false }, stopped: NO_MINUTES_FOR_REPROOF };
       }
-      // ONE more full proof of the draft without the declined files: the same keys, a fresh round off the base, fresh placements
-      const draft = withoutDeclined(out.draft, declined);
-      const run = await proveDraft(draft, 'full');
+      // m3: the referee and the guard judge the draft first, like every draft the fix loop proves
+      const judged = await build.referee(kept);
+      const guarded = await build.guard((await build.rebuild(kept)).files.filter((f) => f.repo === 'app'));
+      if (!judged.ok || guarded.refused.length > 0) {
+        const why = [...judged.issues.map((x) => `${x.file}: ${x.message}`), ...guarded.refused.map((x) => `${x.path}: ${x.reason}`)].join('; ');
+        return { ...out, draft: kept, result: { ...out.result, ok: false }, stopped: `${REPROOF_FAILED} (pipegen's checks refused it: ${why})` };
+      }
+      // ONE more full proof of that draft: the same keys, a fresh round off the base, fresh placements
+      const run = await proveDraft(kept, 'full');
       if (!run.result.ok) {
         const why = run.result.parts.filter((x) => x.status === 'failed').map((x) => `${x.part}${x.needId === undefined ? '' : ` (${x.needId})`}: ${x.detail}`).join('; ');
-        return { ...out, draft, result: { ...run.result, ok: false }, stopped: `${REPROOF_FAILED}${why === '' ? '' : ` (${why})`}` };
+        return { ...out, draft: kept, result: { ...run.result, ok: false }, stopped: `${REPROOF_FAILED}${why === '' ? '' : ` (${why})`}` };
       }
-      return { ...out, draft, result: run.result };
+      return { ...out, draft: kept, result: run.result };
     };
 
     let res: { outcome: FixOutcome; cleanup: CleanupResult };
@@ -530,12 +543,19 @@ export function dropDeclined(out: FixOutcome, declined: ReadonlySet<string>): Fi
     ? { ...out, draft, result: { ...result, ok: false }, stopped: `${out.stopped === undefined ? '' : `${out.stopped}; `}${DECLINED_REASON}, and the ${floorIds.join(', ')} part must be proven` }
     : { ...out, draft, result };
 }
-/** Ruling G14-R2 1: the draft without the declined AI-written app files, each declined part noted (the extra proof decides the rest). */
-export function withoutDeclined(d: PipelineDraft, declined: ReadonlySet<string>): PipelineDraft {
-  const gone = d.created.filter((f) => f.repo === 'app' && declined.has(f.path));
+/**
+ * Ruling G14-R2 1 and G14-R2b NOTE: the draft with the declined AI changes undone. A declined file pipegen's own builder had a version of
+ * (in `own`, not AI-written) goes back to that version; a file that exists only because of the AI is left out, and its part is noted
+ * (the extra proof decides the rest).
+ */
+export function withoutDeclined(d: PipelineDraft, declined: ReadonlySet<string>, own?: PipelineDraft): PipelineDraft {
+  const ownOf = (path: string): CreatedFile | undefined => own?.created.find((f) => f.repo === 'app' && f.path === path && f.aiEdited !== true);
+  const hit = d.created.filter((f) => f.repo === 'app' && declined.has(f.path));
+  const gone = hit.filter((f) => ownOf(f.path) === undefined);
   const parts = [...new Set(gone.map((f) => f.part))];
   const add = parts.filter((part) => !d.notProven.some((n) => n.part === part && n.reason === DECLINED_REASON)).map((part) => ({ part, missingSecrets: [], reason: DECLINED_REASON }));
-  return { ...d, created: d.created.filter((f) => !gone.includes(f)), notProven: [...d.notProven, ...add] } as PipelineDraft;
+  const created = d.created.filter((f) => !gone.includes(f)).map((f) => (hit.includes(f) ? structuredClone(ownOf(f.path) as CreatedFile) : f));
+  return { ...d, created, notProven: [...d.notProven, ...add] } as PipelineDraft;
 }
 const owns = (servicePath: string, path: string): boolean => {
   const sp = servicePath.replace(/^(?:\.\/)+/, '').replace(/\/+$/, '');

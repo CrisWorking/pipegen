@@ -1110,7 +1110,7 @@ describe('G14-R2b: a decline reverts to pipegen\'s own files; the stop paths, th
     let after: PipelineDraft | undefined;
     w.ops.fixLoop = async (d, deps) => {
       await deps.prove(d, 'pr');
-      const odd = { ...d, created: [{ ...OWN_DF, part: 'not-a-part' }] } as unknown as PipelineDraft;
+      const odd = { ...d, created: [{ ...OWN_DF, repo: 'elsewhere' }] } as unknown as PipelineDraft;
       const run = await deps.prove(odd, 'pr');
       after = w.store.load()?.draft;
       return { result: run.result, draft: d } as never;
