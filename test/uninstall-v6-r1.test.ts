@@ -173,14 +173,14 @@ describe('V6-R1 hook-1: token mode and pipegen\'s own central branches', () => {
     b.w.g.commitOn('o/pipelines', BR, { '.github/workflows/shop--merge.yml': 'on: workflow_call # teammate\n' }, 'teammate');
     const rb = await run(b.w, b.rec, term(), { deleteRepos: true, canDeleteRepos: false });
     expect(rb.lines.join('\n')).not.toMatch(central);
-    expect(rb.manual.some((m) => /pipelines/.test(m.what) && /pipegen\/uninstall-shop/.test(m.why))).toBe(true);
+    expect([...rb.manual, ...rb.failed].some((m) => /pipelines/.test(m.what) && /pipegen\/uninstall-shop/.test(m.why))).toBe(true);
     // pipegen's update branch, whose head pipegen never recorded: no command, the branch named
     const c = await setup();
     c.w.central.refs.set('heads/pipegen/update-shop', c.w.g.head('o/pipelines'));
     c.w.g.commitOn('o/pipelines', 'pipegen/update-shop', { '.github/workflows/shop--push.yml': 'on: workflow_call # wip\n' }, 'wip');
     const rc = await run(c.w, c.rec, term(), { deleteRepos: true, canDeleteRepos: false });
     expect(rc.lines.join('\n')).not.toMatch(central);
-    expect(rc.manual.some((m) => /pipelines/.test(m.what) && /pipegen\/update-shop/.test(m.why))).toBe(true);
+    expect([...rc.manual, ...rc.failed].some((m) => /pipelines/.test(m.what) && /pipegen\/update-shop/.test(m.why))).toBe(true);
     expect(c.w.deleted).toEqual([]);
   });
 });
@@ -283,16 +283,14 @@ describe('V6-R1: the central branches (sec M1, M2)', () => {
       const rec = sampleRecord(w, { central: { repoId: w.central.id, createdByPipegen: true } });
       await run(w, rec, term(), { deleteRepos: true, canDeleteRepos: true });
       mergePr(w, w.central, BR);
-      w.central.refs.set('heads/pipegen/update-shop', w.g.head('o/pipelines'));
-      w.g.commitOn('o/pipelines', 'pipegen/update-shop', { '.github/workflows/shop--push.yml': 'on: workflow_call # teammate wip\n' }, 'teammate wip');
       return { w, rec };
     };
-    // the user doesn't type pipelines: the repo and both branches stay
+    // (V6-R2 sec M3: an own branch at a head pipegen never recorded is refused before the question: test/uninstall-v6-r2.test.ts)
+    // the user doesn't type pipelines: the repo and its branch stay
     const a = await setup();
     const ta = term({ type: (_q, exp) => (exp === 'pipelines' ? 'no' : exp) });
     await run(a.w, a.rec, ta, { deleteRepos: true, canDeleteRepos: true });
     expect(a.w.deleted).toEqual([]);
-    expect(a.w.central.refs.has('heads/pipegen/update-shop')).toBe(true);
     expect(a.w.central.refs.has(`heads/${BR}`)).toBe(true);
     expect(a.w.g.routes()).not.toContain('DELETE /repos/{owner}/{repo}/git/refs/{ref}');
     // deleteCentralRepo refuses (an issue): the branches stay
@@ -300,16 +298,16 @@ describe('V6-R1: the central branches (sec M1, M2)', () => {
     b.w.lists.set('central:issues', [{ number: 9 }]);
     await run(b.w, b.rec, term(), { deleteRepos: true, canDeleteRepos: true });
     expect(b.w.deleted).toEqual([]);
-    expect(b.w.central.refs.has('heads/pipegen/update-shop')).toBe(true);
+    expect(b.w.central.refs.has(`heads/${BR}`)).toBe(true);
     // typed: the repo goes, and the question named the branches that go with it
     const c = await setup();
     const tc = term();
     await run(c.w, c.rec, tc, { deleteRepos: true, canDeleteRepos: true });
     expect(c.w.deleted).toEqual(['o/pipelines']);
-    expect(tc.typed.some((q) => /Type pipelines to go on/.test(q) && /pipegen\/update-shop/.test(q) && /pipegen\/uninstall-shop/.test(q))).toBe(true);
-    // a commit lands on pipegen's update branch while pipegen asks: not deleted
+    expect(tc.typed.some((q) => /Type pipelines to go on/.test(q) && /pipegen\/uninstall-shop/.test(q))).toBe(true);
+    // a commit lands on pipegen's branch while pipegen asks: not deleted
     const m = await setup();
-    const tm = term({ type: (_q, exp) => { if (exp === 'pipelines') m.w.g.commitOn('o/pipelines', 'pipegen/update-shop', { 'later.txt': 'x\n' }, 'later'); return exp; } });
+    const tm = term({ type: (_q, exp) => { if (exp === 'pipelines') m.w.g.commitOn('o/pipelines', BR, { 'later.txt': 'x\n' }, 'later'); return exp; } });
     await run(m.w, m.rec, tm, { deleteRepos: true, canDeleteRepos: true });
     expect(m.w.deleted).toEqual([]);
     // another branch still keeps it

@@ -214,7 +214,9 @@ async function fromRun2Blob(
   const branch = `pipegen/uninstall-${centralProjectName(app.repo)}`;
   const prs = await ghRead(gh, 'GET /repos/{owner}/{repo}/pulls', central, { head: `${central.owner}:${branch}`, state: 'closed', per_page: 100 }, clock);
   const merged = (Array.isArray(prs) ? prs.filter(isObj) : [])
-    .filter((p) => headIs(p, branch, c.id) && isObj(p.base) && p.base.ref === c.defaultBranch && typeof p.merged_at === 'string' && p.merged_at !== '')
+    // V6-R2 sec M1: this uninstall's PR only: its head the one pipegen set the branch to (the progress file); an earlier cycle's doesn't count
+    .filter((p) => headIs(p, branch, c.id) && isObj(p.base) && p.base.ref === c.defaultBranch && typeof p.merged_at === 'string' && p.merged_at !== ''
+      && st.centralUninstallHead !== undefined && isObj(p.head) && p.head.sha === st.centralUninstallHead)
     .map((p) => p.number).filter((n): n is number => typeof n === 'number' && Number.isSafeInteger(n) && n > 0).sort((x, y) => y - x);
   if (merged.length === 0) return null;
   const centralName = show(`${central.owner}/${central.repo}`);

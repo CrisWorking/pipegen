@@ -56,7 +56,7 @@ export interface Report {
 export interface CentralNow {
   ref: RepoRef; defaultBranch: string; head: string; tree: string; entries: Map<string, TreeEntry>;
   /** This project's central uninstall PR (the newest on its exact branch from the recorded central repo), as GitHub shows it now. */
-  pr: { number: number; url: string; merged: boolean; open: boolean } | null;
+  pr: { number: number; url: string; merged: boolean; open: boolean; headSha: string | null } | null;
 }
 
 /** The head of `branch` of `ref` now, or null (no such branch). */
@@ -102,7 +102,7 @@ export async function centralNow(api: PhaseApi, app: RepoRef, centralRepoId: num
     if (!isObj(p) || !posId(p.number) || !isObj(p.head) || p.head.ref !== branch || !isObj(p.head.repo) || p.head.repo.id !== centralRepoId) continue;
     if (pr !== null && pr.number > p.number) continue;
     const merged = typeof p.merged_at === 'string' && p.merged_at !== '' && isObj(p.base) && p.base.ref === def;
-    pr = { number: p.number, url: typeof p.html_url === 'string' ? p.html_url : '', merged, open: p.state === 'open' };
+    pr = { number: p.number, url: typeof p.html_url === 'string' ? p.html_url : '', merged, open: p.state === 'open', headSha: typeof p.head.sha === 'string' && SHA_RE.test(p.head.sha) ? p.head.sha : null };
   }
   return { ref, defaultBranch: def, head, tree, entries, pr };
 }
@@ -196,8 +196,10 @@ export async function runCentral(o: {
   }
   const orgRule = await orgRuleNow(api, rec, { ...app, ownerType: o.ownerType }, plan.trust);
   const lp = await lastProjectNow(api, app, now, o.centralRepoId);
-  if (now.pr?.merged === true && !now.entries.has(rp)) {
+  // V6-R2 sec M1: this cycle's PR only (its head the one pipegen set), and this project's files and locks must be gone from central now
+  if (now.pr?.merged === true && !now.entries.has(rp) && now.pr.headSha !== null && now.pr.headSha === o.branch.head) {
     report.done(`central pull request #${now.pr.number} in ${full}: merged; this project's install record is gone from ${full}`);
+    await stillThere();
     if (!lp.last) await joinedSince();
     return { merged: true, last: lp.last, lastWhy: lp.why, orgRule };
   }
@@ -320,6 +322,32 @@ export async function runCentral(o: {
   const pr = await api.openUninstallPr('central', { base: now.defaultBranch, title: `pipegen: uninstall ${show(rec.name, 100)}`, body: text });
   report.done(`central pull request #${pr.number} in ${full}: ${pr.opened ? 'opened' : 'updated'}`);
   return { merged: false, pr: { number: pr.number, url: pr.url }, last: lp.last, lastWhy: lp.why, orgRule };
+
+  /**
+   * V6-R2 sec M1: after the merge, what of this project is still on central's default branch (the plan's exact files) and, when last, the
+   * central locks the plan holds: each is a failed leftover (the local files stay), with its step. A read that fails is one too.
+   */
+  async function stillThere(): Promise<void> {
+    if (now === null) return;
+    const own = centralFilesOf(app.repo);
+    for (const p of plan.centralFiles) {
+      if (p === rp || !own.includes(p) || !now.entries.has(p)) continue;
+      report.fail(`central ${show(p)}`, `it is still on the default branch of ${full} after the central pull request merged`, `Remove ${p} from ${full} by hand if it is this project's${p === centralWorkflowFile(app.repo, 'required') ? ' (once the org rule that requires it is gone)' : ''}, then run \`pipegen uninstall\` again.`);
+    }
+    const locks = plan.centralLocks;
+    if (!lp.last || locks === undefined) return;
+    if (posId(locks.rulesetId)) {
+      let there = true;
+      try { await api.read('GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', { ...now.ref, ruleset_id: locks.rulesetId }); } catch (e) {
+        if (isRateStop(e) || e instanceof GitHubAccessError || statusOf(e) === 401) throw e;
+        there = statusOf(e) !== 404;
+      }
+      if (there) report.fail(`central ruleset (id ${locks.rulesetId}) of ${full}`, 'it is still there (or pipegen can\'t tell it is gone) after the central pull request merged', `Delete it by hand (gh api -X DELETE repos/${full}/rulesets/${locks.rulesetId}) if it is pipegen's, then run \`pipegen uninstall\` again.`);
+    }
+    if (locks.codeowners?.created === true && now.entries.has(locks.codeowners.path)) {
+      report.fail(`central ${show(locks.codeowners.path)}`, 'the CODEOWNERS pipegen created is still on the default branch after the central pull request merged', `Remove it from ${full} by hand if it holds only pipegen's block, then run \`pipegen uninstall\` again.`);
+    }
+  }
 
   /**
    * V6-R1 sec M5: after the merge, another project is there, and the locks the record holds are gone (the central ruleset reads 404, or

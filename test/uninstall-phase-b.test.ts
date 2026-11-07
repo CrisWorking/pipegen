@@ -3,7 +3,7 @@
 // settings the user chose, then the central pull request (this project's exact files, the record last), the repo deletes (--delete-repos,
 // App mode only) and the local files, only when nothing is left over. GitHub is a fake; prompts are fakes; no network.
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join, posix, relative, sep } from 'node:path';
+import { dirname, join, relative, sep } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { localFinishPendingPath, localRecordPath, recordPath } from '../src/deliver/record.js';
 import type { InstallRecord } from '../src/types.js';
@@ -14,6 +14,7 @@ import { UninstallRefusal } from '../src/uninstall/target.js';
 import { ProgressFile, uninstallProgressPath } from '../src/uninstall/progress.js';
 import type { LoadedRecord } from '../src/uninstall/record.js';
 import type { Env } from './helpers/deliver-github.js';
+import { entryImportProblems } from './helpers/import-scan.js';
 import {
   AT, blob, cleanHomes, deps, gh, loadedOf, local, mergePr, RECORD_TEXT, sampleRecord, SEC, SHA, term, world, writes, type Term, type World,
 } from './helpers/uninstall-world.js';
@@ -350,7 +351,7 @@ describe('uninstall phase B: the phase-bound api and the source rules (V5-R1 car
     const n = w.g.calls.length;
     const fake = {} as GuardedRepo;
     for (const call of [
-      () => api.confirm({ kind: 'central-ruleset', id: 5 }), () => api.removeCentralRepo(rec), () => api.scratchCleanup(fake, { op: 'delete-run', runId: 1 }),
+      () => api.confirm({ kind: 'central-ruleset', id: 5 }), () => api.removeCentralRepo(rec, {}), () => api.scratchCleanup(fake, { op: 'delete-run', runId: 1 }),
       () => api.scratchSecretDelete(fake, 'X'), () => api.scratchRepoDelete(fake, 1), () => api.proofLeftovers({} as never, {} as never),
     ]) await expect(call()).rejects.toBeInstanceOf(UninstallRefusal);
     expect(w.g.calls.length).toBe(n);
@@ -403,7 +404,7 @@ describe('uninstall phase B: the phase-bound api and the source rules (V5-R1 car
     };
     for (const [name, code] of Object.entries(r2)) {
       expect(entryImportProblems('src/uninstall/zz-form.ts', code).length, `${name} uninstall`).toBeGreaterThan(0);
-      expect(entryImportProblems('src/cli/zz-form.ts', code.replaceAll("'./t", "'../uninstall/t").replaceAll('`./t', '`../uninstall/t')).length, `${name} cli`).toBeGreaterThan(0);
+      expect(entryImportProblems('src/cli/uninstall.ts', code.replaceAll("'./t", "'../uninstall/t").replaceAll('`./t', '`../uninstall/t')).length, `${name} cli`).toBeGreaterThan(0);
     }
     // F8: an allowed file hands a guarded binding on
     expect(entryImportProblems('src/uninstall/apply.ts', "import { deleteCentralRepo } from './target.js';\nexport { deleteCentralRepo as dcr };").length, 'F8').toBeGreaterThan(0);
@@ -421,51 +422,5 @@ function srcFiles(dir: string): string[] {
     if (e.isDirectory()) out.push(...srcFiles(join(dir, e.name)));
     else if (e.name.endsWith('.ts')) out.push(join(dir, e.name));
   }
-  return out;
-}
-/** The uninstall modules whose entry points are guarded (paths from the repo root). */
-const GUARDED = ['src/uninstall/target.ts', 'src/uninstall/plan.ts', 'src/uninstall/apply.ts'];
-/** E's scratch secret delete, its name spelled at run time (test/no-secret-literals.test.ts). */
-const SCRATCH_SD = ['deleteScratch', 'Secret'].join('');
-/** Value names, and the only files that may import them. */
-const ENTRY_ALLOWED: Readonly<Record<string, (file: string) => boolean>> = {
-  UninstallApi: (f) => f === 'src/uninstall/plan.ts',
-  planUninstall: (f) => f === 'src/uninstall/apply.ts', confirmPlan: (f) => f === 'src/uninstall/apply.ts',
-  takeApi: (f) => f === 'src/uninstall/apply.ts', deleteCentralRepo: (f) => f === 'src/uninstall/apply.ts',
-  // E's scratch writers: E's own modules, E's cleanup command, and uninstall's phase-bound api
-  cleanupWrite: (f) => f.startsWith('src/proof/') || f === 'src/cli/cleanup.ts' || f === 'src/uninstall/apply.ts',
-  [SCRATCH_SD]: (f) => f.startsWith('src/proof/') || f === 'src/cli/cleanup.ts' || f === 'src/uninstall/apply.ts',
-  deleteScratchRepo: (f) => f.startsWith('src/proof/') || f === 'src/cli/cleanup.ts' || f === 'src/uninstall/apply.ts',
-  cleanupLeftovers: (f) => f.startsWith('src/proof/') || f === 'src/cli/cleanup.ts' || f === 'src/uninstall/apply.ts',
-};
-/** `spec` as imported from `file`, as a path from the repo root (.ts), or null for a package. */
-function resolveSpec(file: string, spec: string): string | null {
-  if (!spec.startsWith('.')) return null;
-  return posix.normalize(posix.join(posix.dirname(file), spec)).replace(/\.js$/, '.ts');
-}
-/** What the allow-list finds wrong in one file of src/ (`file` from the repo root). */
-function entryImportProblems(file: string, src: string): string[] {
-  const out: string[] = [];
-  const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`])\/\/.*$/gm, '$1');
-  const guarded = (spec: string): boolean => { const r = resolveSpec(file, spec); return r !== null && GUARDED.includes(r) && r !== file; };
-  // static imports and re-exports, one clause each (over several lines too)
-  for (const m of code.matchAll(/\b(import|export)\s+(type\s+)?([^;'"]*?)\s*from\s*['"]([^'"]+)['"]/g)) {
-    const [, kw, typeOnly, clause = '', spec = ''] = m;
-    if (typeOnly !== undefined) continue;
-    const braces = /\{([^}]*)\}/.exec(clause);
-    const rest = clause.replace(/\{[^}]*\}/, '').replace(/,/g, ' ').trim();
-    if (guarded(spec) && (rest !== '' || kw === 'export')) { out.push(`${kw === 'export' ? 're-export' : 'default or namespace import'} of ${spec} in ${file}`); continue; }
-    const names = (braces?.[1] ?? '').split(',').map((x) => x.trim()).filter((x) => x !== '' && !x.startsWith('type ')).map((x) => x.split(/\s+as\s+/)[0]?.trim() ?? '');
-    for (const n of names) {
-      const ok = ENTRY_ALLOWED[n];
-      if (ok !== undefined && !ok(file)) out.push(`${n} imported in ${file}`);
-    }
-  }
-  // dynamic imports and require: only a plain string, never one of the guarded modules
-  for (const m of code.matchAll(/\b(import|require)\s*\(\s*(['"])([^'"]+)\2\s*\)/g)) if (guarded(m[3] ?? '')) out.push(`a dynamic ${m[1]} of ${m[3]} in ${file}`);
-  const noStrings = code.replace(/'(?:[^'\\\n]|\\.)*'/g, "''").replace(/"(?:[^"\\\n]|\\.)*"/g, "''").replace(/`(?:[^`\\]|\\.)*`/g, "''");
-  if (/\b(?:import|require)\s*\(\s*(?!''\s*\))/.test(noStrings)) out.push(`a dynamic import or require of something that is not a plain string in ${file}`);
-  // import x = require(...)
-  if (/\bimport\s+\w+\s*=\s*require\b/.test(code)) out.push(`an import = require in ${file}`);
   return out;
 }

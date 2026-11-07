@@ -3,6 +3,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Octokit } from '@octokit/rest';
+import { moduleRefs } from './helpers/import-scan.js';
 import { describe, expect, it } from 'vitest';
 import { gitBlobSha } from '../src/create/guard.js';
 import { centralWorkflowFile } from '../src/engine/central-path.js';
@@ -271,16 +272,15 @@ const PROOF_OK = ['cleanupWrite', 'deleteScratchSecret', 'deleteScratchRepo', 'p
 const WRITERS = /\b(?:ghWrite|commitFiles|setBranch|openOrUpdatePr|writeRecord|writeLocalRecord|SettingsApi|guardedWrite|createHelperRepo|makeRepoPrivate|scratchSecretSink|storeEnvSecret|storeCosignKey|ensureSigningEnvironment|writeFinishPending|addLocalLeftovers|ensureActionsAccess|setScratchDefaultBranch|cleanupAfterProof|storeRepoSecret|storeSecrets|storeSecretsVia|deliverCentral)\b/;
 function importProblems(src: string): string[] {
   const out: string[] = [];
-  for (const m of src.matchAll(/\b(import|export)\s+(type\s+)?([^;'"]*?)\s+from\s+['"]([^'"]+)['"]/g)) {
-    const [, , typeOnly, clause = '', spec = ''] = m;
-    if (typeOnly !== undefined || spec.startsWith('node:') || spec === '@octokit/rest' || spec === 'yaml' || spec === 'zod') continue;
+  // V6-R2 sec M2: read from the parsed code (test/helpers/import-scan.ts), so a comment or string trick can't hide an import
+  for (const r of moduleRefs(src).refs) {
+    if (r.spec === null || r.kind === 'dynamic' || r.kind === 'require') { out.push(`a dynamic import or require of ${r.spec ?? 'something that is not a plain string'}`); continue; }
+    const spec = r.spec;
+    if (spec.startsWith('node:') || spec === '@octokit/rest' || spec === 'yaml' || spec === 'zod') continue;
     const mod = spec.replace(/^(?:\.\.?\/)+/, '').replace(/\.js$/, '');
     if (mod === 'target' && spec.startsWith('./')) continue;   // the guarded module itself
-    const braces = /\{([^}]*)\}/.exec(clause);
-    const rest = clause.replace(/\{[^}]*\}/, '').replace(/,/g, ' ').trim();
-    if (rest !== '') { out.push(`a default or namespace import from ${spec}`); continue; }
-    const names = (braces?.[1] ?? '').split(',').map((x) => x.trim()).filter((x) => x !== '' && !x.startsWith('type ')).map((x) => x.split(/\s+as\s+/)[0]?.trim() ?? '');
-    for (const n of names) {
+    if (r.namespace || r.default) { out.push(`a default or namespace import from ${spec}`); continue; }
+    for (const n of r.names.map((x) => x.imported)) {
       const ok = mod === 'deliver/git-data' ? GIT_DATA_READS.includes(n)
         : mod.startsWith('proof/') ? PROOF_OK.includes(n)
           : mod === 'create/secrets' ? false
@@ -746,7 +746,7 @@ describe('V3 target: deleteCentralRepo', () => {
       const r = await run(w, opts);
       expect(r.out.deleted, JSON.stringify({ w, opts })).toBe(false);
       expect(r.deletes).toEqual([]);
-      expect(r.out.command).toBe('gh repo delete acme/pipelines');
+      expect(r.out.command).toBeUndefined();   // V6-R2 sec I1: a refusal never advises the delete
       if (why !== undefined) expect(r.out.why).toMatch(why);
       return r;
     };
@@ -779,7 +779,10 @@ describe('V3 target: deleteCentralRepo', () => {
     await notDeleted(world(), { rec: recOf({ central: { createdByPipegen: true } }) });
     await notDeleted(world(), { rec: recOf({ central: undefined }) });
     // the typed name, from the terminal only (V1's askTypedName stops a run without one: nothing is deleted)
-    await notDeleted(world(), { typedAs: 'pipeline' });
+    const declined = await run(world(), { typedAs: 'pipeline' });
+    expect(declined.out.deleted).toBe(false);
+    expect(declined.deletes).toEqual([]);
+    expect(declined.out.command).toBe('gh repo delete acme/pipelines');   // V6-R2: every check passed, the user declined: theirs to run
     const stop = fakeGh(centralHandler(world(), { deleted: false }), { raw: true });
     await expect(deleteCentralRepo(stop.gh, { owner: OWNER, repo: 'pipelines' }, recOf(), { askName: async () => { throw new Error('no terminal'); }, clock: clock() })).rejects.toThrow('no terminal');
     expect(stop.calls.some((c) => c.route === 'DELETE /repos/{owner}/{repo}')).toBe(false);
@@ -945,7 +948,7 @@ describe('V3 fix round 1', () => {
       const r = await go(w as never);
       expect(r.deleted, JSON.stringify(w)).toBe(false);
       expect(r.out.why, JSON.stringify(w)).toMatch(why);
-      expect(r.out.command).toBe('gh repo delete acme/pipelines');
+      expect(r.out.command).toBeUndefined();   // V6-R2 sec I1: a refusal never advises the delete
     }
   });
 
@@ -1232,7 +1235,7 @@ describe('V3 fix round 2', () => {
       const r = await go({ repo });
       expect(r.deleted, JSON.stringify(repo)).toBe(false);
       expect(r.out.why).toMatch(/Discussions/);
-      expect(r.out.command).toBe('gh repo delete acme/pipelines');
+      expect(r.out.command).toBeUndefined();   // V6-R2 sec I1: a refusal never advises the delete
       expect(r.asked).toEqual([]);
     }
   });
