@@ -2030,31 +2030,31 @@ tools:
   # it (loader and scripts/cooldown.ts exempt exactly `crisworking/pipegen`, nothing else). Every input is the renderer's (RENDERER_INPUTS);
   # the entry fixes none and offers no choice (ACTION_POLICIES row: none).
   # Reach (ruling S6, DECISIONS #83): the repository stays private until v0.4, so in v0.2 only CrisWorking-owned repositories can use it.
-  # Self-pin (C6 scheme; re-pinned 2026-11-07, Plan G task G15b): pinned to 53da79e (the last commit that changes gate/dist or
-  #   gate/action.yml, bundle sha256 6e88ddb9d0556f9c299c96ea20d07f6f24b4f622b55b585bef2aba2d8b20a4b8), which is the commit of the
-  #   annotated tag gate-v0.2.3. The version is bundle content (GATE_VERSION in the gate view), so it changes before the tag, never in the
-  #   re-pin commit. Previous pins: 76b6c25, tag gate-v0.2.2 (Plan E E9); 99a0abe, tag gate-v0.2.1 (Plan D D9); a174da8, tag gate-v0.2.0
-  #   (Plan C). scripts/cooldown.ts requires the tag gate-v<version> to resolve to the pin; release-check requires the pin's gate/dist and
-  #   action.yml to equal HEAD's and the pin to be on the default branch. Never rewrite history at or before the pin; merge with merge
-  #   commits only.
-  # Source: commit 53da79eda2da5f00ffd81aec32ae3b9a917097c9 of CrisWorking/pipegen (committed 2026-11-07T05:59:05Z), tag gate-v0.2.3.
+  # Self-pin (C6 scheme; re-pinned 2026-11-07, Plan G task G15b, fix round G15b-R1): pinned to 468dd79 (the last commit that changes
+  #   gate/dist or gate/action.yml, bundle sha256 9ab707b220eba3a6b7c5ff4c0752367528ff08eef15e972f6a1b35be78b7a0ed), which is the commit
+  #   of the annotated tag gate-v0.2.3. The version is bundle content (GATE_VERSION in the gate view), so it changes before the tag, never
+  #   in the re-pin commit. Previous pins: 53da79e (the first local gate-v0.2.3, moved in G15b-R1 before any push); 76b6c25, tag
+  #   gate-v0.2.2 (Plan E E9); 99a0abe, tag gate-v0.2.1 (Plan D D9); a174da8, tag gate-v0.2.0 (Plan C). scripts/cooldown.ts requires the
+  #   tag gate-v<version> to resolve to the pin; release-check requires the pin's gate/dist and action.yml to equal HEAD's and the pin to
+  #   be on the default branch. Never rewrite history at or before the pin; merge with merge commits only.
+  # Source: commit 468dd79af999342fbd525d4dd6fbe57f7e47e375 of CrisWorking/pipegen (committed 2026-11-07T06:32:07Z), tag gate-v0.2.3.
   - id: pipegen-gate
     categories: ["gate"]
     languages: ["any"]
-    releasedAt: "2026-11-07T05:59:05Z"
+    releasedAt: "2026-11-07T06:32:07Z"
     candidate:
       id: pipegen-gate
       name: "pipegen-gate"
       kind: action
       repo: crisworking/pipegen
       version: "0.2.3"
-      pin: { sha: "53da79eda2da5f00ffd81aec32ae3b9a917097c9" }
+      pin: { sha: "468dd79af999342fbd525d4dd6fbe57f7e47e375" }
       source: reviewed
       reviewed: true
       categories: ["gate"]
     step:
       action:
-        uses: crisworking/pipegen/gate@53da79eda2da5f00ffd81aec32ae3b9a917097c9
+        uses: crisworking/pipegen/gate@468dd79af999342fbd525d4dd6fbe57f7e47e375
         with: {}
       output: { path: "", format: none }
     fixedInputs:

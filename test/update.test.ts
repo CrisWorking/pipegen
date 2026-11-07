@@ -21,7 +21,7 @@ import { FakeGitHub } from './helpers/deliver-github.js';
 
 // ---------- fixtures ----------
 
-const NEW = '53da79eda2da5f00ffd81aec32ae3b9a917097c9';   // gate-v0.2.3 (G15b)
+const NEW = '468dd79af999342fbd525d4dd6fbe57f7e47e375';   // gate-v0.2.3 (G15b-R1)
 const NEW_V = '0.2.3';
 const OLD = '76b6c25'.padEnd(40, '1');
 const OLD_V = '0.2.2';

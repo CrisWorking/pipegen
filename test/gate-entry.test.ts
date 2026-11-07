@@ -65,6 +65,7 @@ describe('C6: the pipegen-gate reviewed entry', () => {
     expect(pin).toMatch(/^[0-9a-f]{40}$/);
     expect(pin).not.toBe('99a0abec03b3410fbf769ac9bce6516f760e0b57');
     expect(pin).not.toBe('76b6c257d94d649993c4709a39bf4a3f7399f0c8');
+    expect(pin).not.toBe('53da79eda2da5f00ffd81aec32ae3b9a917097c9');   // G15b-R1: the first local gate-v0.2.3, moved before any push
     expect(t.step.action?.uses).toBe(`${PIPEGEN_GATE_USES}@${pin}`);
     if (!git('cat-file', '-e', `${pin}:gate/dist/index.js`)) return; // not fetched (a depth-1 checkout)
     expect(git('diff', '--quiet', pin, '--', 'gate/dist'), `git diff ${pin} -- gate/dist is empty`).toBe(true);
