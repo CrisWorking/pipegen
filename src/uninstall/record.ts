@@ -307,7 +307,7 @@ async function load(gh: Octokit, app: RepoRef, deps: UninstallDeps): Promise<Loa
   else if (marker === 'differs') warnings.push(`The record marker in the setup pull request #${pr.number} doesn't match the install record (someone edited one of them), so ${ask}`);
 
   // V-N4: what a typed trust doesn't grant
-  if (typed) warnings.push(`The install record was trusted by typing the repo name, so pipegen uses only the names you confirmed, and it will ask you to type each name, one by one, before it deletes or restores anything on GitHub. It doesn't undo its edits, restore earlier settings, remove the merge locks or the org rule, or delete repos: those are manual steps it lists.`);
+  if (typed) warnings.push(`The install record was trusted by typing the repo name, so pipegen uses only the names you confirmed, and it will ask you to type each name, one by one, before it deletes or restores anything on GitHub. It deletes the app's rulesets only after each name is typed. It doesn't undo its edits, restore earlier settings or the branch protection, remove the org rule or the central locks, or delete repos: those are manual steps it lists.`);
 
   return {
     app: uapp, record, trust: typed ? 'typed' : 'full', typedNames: typed || marker !== 'match', blobSha: found.blobSha, centralHead: found.commit, centralRepoId: c.id,

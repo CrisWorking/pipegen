@@ -131,6 +131,8 @@ const fmt = (v: unknown): string => safeText(canon(v), 160);
 const SHA_RE = /^[0-9a-f]{40}$/;
 /** The largest file uninstall reads to revert (a package-lock can be large); a larger one is manual. */
 const MAX_BLOB = 8 * 1024 * 1024;
+/** The most pages of open central pull requests read (100 each); more → not provably the last project. */
+const MAX_PR_PAGES = 10;
 /** The most workflows of the app read for pipegen's leftovers (V-N11); more → one manual step. */
 const MAX_SCANNED = 200;
 const NOT_TYPED = 'kept: its name was not typed';
@@ -155,13 +157,14 @@ const WORKFLOW_RE = /^\.github\/workflows\/[^/]+\.ya?ml$/;
 /** The classic protection keys a diff compares (classicPutForm's output). */
 const CLASSIC_DIFF_KEYS = ['required_status_checks', 'enforce_admins', 'required_pull_request_reviews', 'restrictions', 'allow_force_pushes', 'allow_deletions', 'required_linear_history', 'required_conversation_resolution', 'block_creations', 'lock_branch', 'allow_fork_syncing'];
 
+const CENTRAL_MANUAL = 'the central repo\'s ruleset, CODEOWNERS block and Actions access';
 /** V-N4: what a typed trust doesn't grant (TYPED_DROPPED field → the manual step). */
 const TYPED_MANUAL: readonly { fields: readonly string[]; what: string; step: string }[] = [
   { fields: ['edits'], what: 'pipegen\'s changes inside your files', step: 'Review by hand the pipegen-verify job and the head checks in your deploy workflows, pipegen\'s hook block, its CODEOWNERS block, its Dependabot entry and the test changes in package.json and its lock file.' },
   { fields: ['variables.previous', 'environments.previous'], what: 'settings pipegen changed on existing variables and environments', step: 'Check your repo variables and environments (Settings → Environments) and put back what you want.' },
   { fields: ['classicProtection'], what: 'the branch protection pipegen set (if it set one)', step: 'Check Settings → Branches and put the protection back as you want it.' },
   { fields: ['orgRuleset'], what: 'the organisation required-workflow rule (if pipegen made one)', step: 'Check the organisation\'s rulesets and delete pipegen\'s required-workflow rule for this repo if it is there.' },
-  { fields: ['central'], what: 'the central repo\'s ruleset, CODEOWNERS block and Actions access', step: 'Check the ruleset, CODEOWNERS and Actions access settings of your pipelines repo by hand.' },
+  { fields: ['central'], what: CENTRAL_MANUAL, step: 'Check the ruleset, CODEOWNERS and Actions access settings of your pipelines repo by hand.' },
   { fields: ['scratch'], what: 'the scratch repo (if pipegen made one)', step: 'Check for a pipegen-proof-<repo> repo and delete it by hand if you don\'t need it.' },
   { fields: ['repoSettings'], what: 'repo security settings pipegen turned on', step: 'Check Settings → Code security (secret scanning, push protection, Dependabot alerts) and Settings → Actions (the sha pin).' },
 ];
@@ -442,8 +445,17 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
   const updateBranch = centralUpdateBranch(appRef.repo);
   const mine = new Set([updateBranch, uninstallBranch(targetApp, 'central')]);
   const ownHead = (p: Record<string, unknown>, branches: ReadonlySet<string>): boolean => isObj(p.head) && typeof p.head.ref === 'string' && branches.has(p.head.ref) && isObj(p.head.repo) && p.head.repo.id === loaded.centralRepoId;
-  const openCentral = await live('GET /repos/{owner}/{repo}/pulls', { ...central, state: 'open', per_page: 100 });
-  const centralPrs = !('data' in openCentral) || !Array.isArray(openCentral.data) ? null : openCentral.data;
+  // every open central PR, page by page (M-r1-3): a page that can't be read, or more pages than pipegen reads → null (not the last project)
+  const centralPrs = await (async (): Promise<unknown[] | null> => {
+    const all: unknown[] = [];
+    for (let page = 1; page <= MAX_PR_PAGES; page += 1) {
+      const l = await live('GET /repos/{owner}/{repo}/pulls', { ...central, state: 'open', per_page: 100, page });
+      if (!('data' in l) || !Array.isArray(l.data)) return null;
+      all.push(...l.data);
+      if (l.data.length < 100) return all;
+    }
+    return null;
+  })();
   const otherPrs = centralPrs === null ? null : centralPrs.filter((p) => !(isObj(p) && ownHead(p, mine)));
   u.lastProject = otherRecords.length === 0 && otherFiles.length === 0 && otherPrs !== null && otherPrs.length === 0;
   if (u.lastProject && !typedTrust && rec.central !== undefined) u.centralLocks = rec.central;
@@ -617,7 +629,17 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
   }
   // V4-R1: unfinished (nothing to wait for) only when none of pipegen's own workflows is on the default branch, and (full trust) the
   // record has no mergedAt; a setup PR closed unmerged with the workflows live (copied over by hand) still takes two runs
-  const workflowsLive = rec.files.some((f) => f.repo === 'app' && APP_WORKFLOWS.includes(f.path) && f.adopted !== true && plainFile(entries.get(f.path)));
+  let workflowsLive = rec.files.some((f) => f.repo === 'app' && APP_WORKFLOWS.includes(f.path) && f.adopted !== true && plainFile(entries.get(f.path)));
+  // M-r1-4: pipegen's verify job or head check still in a workflow it edited runs too (pipegen.yml may have been removed by hand);
+  // a blob that can't be read counts as live (two runs, the safe side)
+  for (const e of rec.edits) {
+    if (workflowsLive) break;
+    if (e.repo !== 'app' || e.kind !== 'verify-job') continue;
+    const t = entries.get(e.path);
+    if (!plainFile(t)) continue;
+    const text = await readBlob(t.sha);
+    if (text === null || text.includes(VERIFY_JOB_ID) || text.includes(HEAD_CHECK_STEP_ID)) workflowsLive = true;
+  }
   u.unfinished = !workflowsLive && (typedTrust || rec.mergedAt === undefined) && setupMerged !== true;
   if (setupMerged === false && setupClosed && workflowsLive) {
     u.warnings.push(`The setup pull request #${loaded.setupPr} was closed without merging, but pipegen's workflows are on ${show(loaded.app.defaultBranch, 100)}: pipegen uninstalls them through the uninstall pull request, in two runs.`);
@@ -710,7 +732,7 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
       if (text === null) still = null;
       else if (e.kind === 'codeowners' || e.kind === 'hooks' || e.kind === 'dependabot') still = e.inserted === '' ? null : text.includes(e.inserted);
       else if (e.kind === 'verify-job') still = text.includes(VERIFY_JOB_ID) || text.includes(HEAD_CHECK_STEP_ID);
-      if (still === false) { markDone(`${p}: pipegen's part taken out`); continue; }
+      if (still === false) { markDone(`${p}: pipegen's exact text is no longer in it`); continue; }
       manual(e.path, still === true ? 'pipegen\'s change is still in it (the first run didn\'t take it out, or the uninstall pull request is not merged yet)' : 'pipegen can\'t tell whether its change is still in it', 'Take pipegen\'s change out by hand, or merge the uninstall pull request and run `pipegen uninstall` again.');
     }
   }
@@ -721,7 +743,7 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
     for (const r of rec.rulesets) {
       const what = `ruleset ${show(r.name, 100)} (id ${r.id})`;
       const l = await live('GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', { ...appRef, ruleset_id: r.id });
-      if ('missing' in l) { if (l.manual) manual(what, l.missing); else markDone(`${what}: deleted`); continue; }
+      if ('missing' in l) { if (l.manual) manual(what, l.missing); else markDone(`${what}: ${GONE}`); continue; }
       const v = isPipegens({ kind: 'ruleset', entry: r }, l.data, targetApp);
       if (v.is === 'no') skip(what, v.why);
       else manual(what, 'it is still there: the first run didn\'t delete it', step);
@@ -903,7 +925,9 @@ export function previewUninstall(u: UninstallPlan): string {
   later.push(u.centralLocks !== undefined
     ? `  - this is the last project in ${CENTRAL_REPO}: its central ruleset, CODEOWNERS and Actions access go too, as recorded`
     : u.lastProject
-      ? `  - this is the last project in ${CENTRAL_REPO}, but the install record doesn't vouch for its central ruleset, CODEOWNERS and Actions access: pipegen doesn't touch them (see the manual steps)`
+      ? u.manual.some((m) => m.what === CENTRAL_MANUAL)
+        ? `  - this is the last project in ${CENTRAL_REPO}, but the install record doesn't vouch for its central ruleset, CODEOWNERS and Actions access: pipegen doesn't touch them (see the manual steps)`
+        : `  - this is the last project in ${CENTRAL_REPO}; the install record lists no central ruleset, CODEOWNERS or Actions access of pipegen's, so pipegen doesn't touch them`
       : `  - other projects use ${CENTRAL_REPO}: its central ruleset, CODEOWNERS and Actions access stay`);
   list(!inA ? 'This run:' : u.unfinished ? 'Next part (right after this one), pipegen will:' : 'Next run (after you merge the uninstall PR), pipegen will:', later);
   list('Not done (kept):', u.skipped.map((s) => `  - ${show(s.what, 200)}: ${show(s.why, 400)}`));
