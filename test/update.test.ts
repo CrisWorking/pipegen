@@ -21,10 +21,10 @@ import { FakeGitHub } from './helpers/deliver-github.js';
 
 // ---------- fixtures ----------
 
-const NEW = '76b6c257d94d649993c4709a39bf4a3f7399f0c8';
-const NEW_V = '0.2.2';
-const OLD = '99a0abe0'.padEnd(40, '1');
-const OLD_V = '0.2.1';
+const NEW = '53da79eda2da5f00ffd81aec32ae3b9a917097c9';   // gate-v0.2.3 (G15b)
+const NEW_V = '0.2.3';
+const OLD = '76b6c25'.padEnd(40, '1');
+const OLD_V = '0.2.2';
 const OTHER = 'b'.repeat(40);
 /** The reviewed list this CLI bundles, as far as update reads it: the pipegen-gate entry. */
 const REVIEWED = [{ id: 'pipegen-gate', candidate: { id: 'pipegen-gate', name: 'pipegen-gate', kind: 'action', repo: 'crisworking/pipegen', version: NEW_V, pin: { sha: NEW }, source: 'reviewed', reviewed: true, categories: ['gate'] } }] as unknown as ReviewedTool[];

@@ -57,12 +57,14 @@ describe('C6: the pipegen-gate reviewed entry', () => {
     }
   });
   it('gate-entry: new pin; git diff <pin> -- gate/dist empty', () => {
-    // E9: re-pinned off gate-v0.2.1 (99a0abe) to the commit of the annotated tag gate-v<version>; the checked-out bundle is the pinned one
+    // G15b: re-pinned off gate-v0.2.2 (76b6c25; E9 had moved it off gate-v0.2.1, 99a0abe) to the commit of the annotated tag
+    // gate-v<version>; the checked-out bundle is the pinned one
     const t = real();
     const pin = t.candidate.pin.sha as string;
     const git = (...args: string[]): boolean => { try { execFileSync('git', args, { cwd: ROOT, stdio: 'ignore' }); return true; } catch { return false; } };
     expect(pin).toMatch(/^[0-9a-f]{40}$/);
     expect(pin).not.toBe('99a0abec03b3410fbf769ac9bce6516f760e0b57');
+    expect(pin).not.toBe('76b6c257d94d649993c4709a39bf4a3f7399f0c8');
     expect(t.step.action?.uses).toBe(`${PIPEGEN_GATE_USES}@${pin}`);
     if (!git('cat-file', '-e', `${pin}:gate/dist/index.js`)) return; // not fetched (a depth-1 checkout)
     expect(git('diff', '--quiet', pin, '--', 'gate/dist'), `git diff ${pin} -- gate/dist is empty`).toBe(true);
