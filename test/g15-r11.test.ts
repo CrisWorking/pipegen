@@ -54,7 +54,7 @@ describe('G15a-R11 r5-1: the publish digest step proves the digest is the image 
     expect(step.env).toMatchObject(PUBLISH_DIGEST_ENV);
     const run = String(step.run);
     expect(run).toContain(`docker image inspect --format '{{json .RepoDigests}}' -- "$image_id"`);
-    expect(run).toContain(`want='ghcr.io/o/r-app'"@$digest"`);
+    expect(run).toContain("repo='ghcr.io/o/r-app'\nwant=\"$repo@$digest\"");
     // the check comes before anything is written for the upload
     expect(run.indexOf('RepoDigests')).toBeGreaterThan(-1);
     expect(run.indexOf('RepoDigests')).toBeLessThan(run.indexOf('mkdir'));

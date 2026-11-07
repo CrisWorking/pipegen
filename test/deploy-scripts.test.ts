@@ -313,7 +313,7 @@ describe.skipIf(!READY)('G7-R1 spec I2, G15a-R11 r5-1: the publish digest step r
     for (const [store, id, rd] of [
       ['classic', IMAGE_ID, digests(`${IMAGE_REPO}@${DIGEST}`)],
       ['containerd', DIGEST, digests(`${IMAGE_REPO}@${DIGEST}`)],
-      ['classic, an older push too', IMAGE_ID, digests(`${IMAGE_REPO}@sha256:${'d'.repeat(64)}`, `${IMAGE_REPO}@${DIGEST}`)],
+      ['classic, an entry of another repository too', IMAGE_ID, digests(`ghcr.io/o/r-web@sha256:${'d'.repeat(64)}`, `${IMAGE_REPO}@${DIGEST}`)],
     ] as const) {
       const r = await run(step, { PIPEGEN_IMAGE_ID: id, PIPEGEN_TEST_REPO_DIGESTS: rd });
       expect(r.code, `${store}: ${r.err}`).toBe(0);
@@ -329,6 +329,11 @@ describe.skipIf(!READY)('G7-R1 spec I2, G15a-R11 r5-1: the publish digest step r
       ['the swapped digest (another writer\'s manifest)', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: digests(`${IMAGE_REPO}@sha256:${'f'.repeat(64)}`) }],
       ['the digest under another repository', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: digests(`ghcr.io/o/r-other@${DIGEST}`) }],
       ['a prefix of the repository', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: digests(`ghcr.io/o/r-app-x@${DIGEST}`) }],
+      // round 12 (security r6 Nit 2): exactly one entry for the repository; two are refused, whichever the build reported
+      ['two entries for the repository, the reported digest second', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: digests(`${IMAGE_REPO}@sha256:${'f'.repeat(64)}`, `${IMAGE_REPO}@${DIGEST}`) }],
+      ['two entries for the repository, the reported digest first', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: digests(`${IMAGE_REPO}@${DIGEST}`, `${IMAGE_REPO}@sha256:${'f'.repeat(64)}`) }],
+      ['the reported entry twice', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: digests(`${IMAGE_REPO}@${DIGEST}`, `${IMAGE_REPO}@${DIGEST}`) }],
+      ['a non-string entry beside it', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: JSON.stringify([`${IMAGE_REPO}@${DIGEST}`, 1]) }],
       ['no RepoDigests (never pushed by this daemon)', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: '[]' }],
       ['RepoDigests null', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: 'null' }],
       ['RepoDigests not JSON', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: `${IMAGE_REPO}@${DIGEST}` }],

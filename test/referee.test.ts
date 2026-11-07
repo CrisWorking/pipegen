@@ -153,7 +153,7 @@ describe('referee: the renderer and the referee agree', () => {
           ? renderStep(spec, t, p, ctxN).steps
           // (G15a-R11 r5-2: the build-push entry renders here as the PR-time build only, in image-build--app13 below. image-publish is bound to the
           // one published service (v0.2), and this draft's fourteen root services with a Dockerfile would all be published, so pipegen's real
-          // image-publish (releaseJobs) is held to the referee in g15-r10, g15-r11, assemble and deploy-layer instead)
+          // image-publish (releaseJobs) is held to the referee in g15-r8 to g15-r11, assemble, deploy-layer, g15-attest-verify and g15-sigstore instead)
           : t.id === 'docker-build-push-action'
           ? [...prelude(), ...renderStep(spec, t, p, { ...ctxN, targets: { image: 'ghcr.io/o/app:pr-1' } }).steps]
           : toolJob(spec, ctxN);
@@ -221,7 +221,8 @@ describe('referee: the renderer and the referee agree', () => {
     jobs.gate = job([...harden, download(), renderGateStep(GATE, d), ...renderGateUploads(platform())], { name: GATE_CHECK_NAME.split(' / ')[1], if: 'always()', needs: entries.map((e) => e.job), permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } });
     const r = await run([wf(jobs, { on: { push: defaultPushTrigger('main'), pull_request: null } })], d, { list: [...reviewedList(), GATE, WATCHER] });
     // (G15a round 3: the weekly scorecard job belongs to the nightly file only; round 4: the full-history upload job and the nightly DAST upload job (test/g15-dast-nightly.test.ts) are written only there too; both are judged end to end in test/g15-scorecard.test.ts and test/g15-history-nightly.test.ts)
-    // (G15a-R11 r5-2: image-publish is held to the referee with releaseJobs' own job in g15-r10, g15-r11, assemble and deploy-layer)
+    // (G15a-R11 r5-2: image-publish is held to the referee with releaseJobs' own job in g15-r8 to g15-r11, assemble, deploy-layer, g15-attest-verify
+    // and g15-sigstore)
     for (const id of Object.keys(JOB_STEP_POLICY).filter((x) => x !== 'pipegen-verify' && x !== 'scorecard' && x !== 'code-scanning-history' && x !== 'workflow-lint-online' && x !== 'code-scanning-dast' && x !== 'image-publish')) expect(Object.keys(jobs), id).toContain(id);
     expect(show(r)).toBe('');
     expect(r.ok).toBe(true);

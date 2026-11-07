@@ -17,14 +17,14 @@ import {
 } from '../src/engine/job-rules.js';
 import { protectedMatcher } from '../src/engine/protected-match.js';
 import { referee, type RefereeReport } from '../src/engine/referee.js';
-import { BUILD_PUSH_STEP_ID, DIGEST_STEP_ID, FIND_RUN_STEP_ID, imageDigestArtifact, PUBLISH_TAG, renderHeadCheckStep, renderPublishDigestStep } from '../src/engine/deploy-steps.js';
-import { insertVerify } from '../src/layers/deploy.js';
-import { renderFindRunStep, renderJobPrelude, renderPlatformStep, stepsToYaml } from '../src/engine/render-step.js';
+import { DIGEST_STEP_ID, FIND_RUN_STEP_ID, renderHeadCheckStep } from '../src/engine/deploy-steps.js';
+import { insertVerify, releaseJobs } from '../src/layers/deploy.js';
+import { renderFindRunStep, stepsToYaml } from '../src/engine/render-step.js';
 import {
   assemble, callerPermissions, callerSecrets, judgeAssembled, MERGE_CALLER_JOB, NIGHTLY_CRON, NOT_PROVEN_MARK, verifyJob, VERIFY_GRACE_MINUTES, VERIFY_MARGIN_MINUTES,
   type AssembledFiles, type AssembleOpts,
 } from '../src/layers/assemble.js';
-import { AssembleError, assembleJobs, egressStepFor, type Job } from '../src/layers/jobs.js';
+import { AssembleError, assembleJobs, type Job } from '../src/layers/jobs.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
 import { GATE_CHECK_NAME, PROTECTED_PATHS_BASE, type Capabilities, type CreatedFile, type PipelineDraft, type ReviewedTool, type SigningPlan } from '../src/types.js';
 import { APP_KEY, CAPS, LINTERS, MISSING, node, p, planned, profileOf, SEC, shown, type Obj } from './helpers/assemble.js';
@@ -62,16 +62,10 @@ const C = (layer: 'merge' | 'push' | 'nightly', project = 'r'): string => centra
 const JD = { platform: p, reviewed: REVIEWED, linters: LINTERS, [['gh', 'Tok' + 'en'].join('')]: null, refereeDeps: { runLinters: async () => [] } } as unknown as Omit<Parameters<typeof judgeAssembled>[1], 'extra' | 'referee'>;
 const judge = (a: AssembledFiles, extra: CreatedFile[] = []): Promise<RefereeReport> => judgeAssembled(a, { ...JD, extra });
 
-/** The deploy layer's image-publish job (G7 builds the real one): egress, checkout, the reviewed build-push with push, then (G15a-R10 r4-2,
- * r4-3) the plan's tag and the digest hand-off as its last two steps. */
+/** The deploy layer's image-publish job, from releaseJobs itself (G15a round 12, security r6 Nit 1: a hand-built copy would not catch
+ * renderer drift): the job releaseJobs renders for the key-env draft below (one published root service, app, with a Dockerfile). */
 function imagePublish(): Job {
-  const artifact = imageDigestArtifact('app');
-  return {
-    'runs-on': 'ubuntu-24.04', 'timeout-minutes': 30, permissions: { contents: 'read', packages: 'write' }, 'cache-mode': 'none',
-    steps: [egressStepFor(['dockerhub', 'ghcr'], { [['user', 'Sec' + 'ret'].join('')]: false, dockerNetworks: true, job: 'image-publish' } as unknown as Parameters<typeof egressStepFor>[1]), ...renderJobPrelude({}, p).steps,
-      { id: BUILD_PUSH_STEP_ID, ...renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: `ghcr.io/o/r-app:${PUBLISH_TAG}` }, { push: 'true' }) },
-      renderPublishDigestStep('app', 'ghcr.io/o/r-app'), { ...renderPlatformStep('upload-artifact', p, { name: artifact, path: `\${{ runner.temp }}/pipegen-out/${artifact}` }), name: 'Upload the image digest of app' }],
-  };
+  return releaseJobs(keyEnv().draft, { platform: p })['image-publish'] as Job;
 }
 /** A key-env private draft (environments with the proven branch policy) whose app has a Dockerfile; the needs of the plain profile. */
 function keyEnv(): Planned {

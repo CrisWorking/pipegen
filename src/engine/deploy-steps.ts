@@ -143,7 +143,7 @@ export function renderDigestStep(service: string): RenderedStep {
  * Why the proof: on the docker driver with the classic image store, buildx pushes through the daemon and then asks the REGISTRY what the tag
  * names to fill `digest`; anyone who can write to the package could move the tag in between, and pipegen would sign their image. So the step
  * asks the daemon for its own record of the image the build made (by the build's `imageid`, never by the tag): its RepoDigests must hold
- * exactly `<imageRepo>@<digest>`. The daemon computes that entry from the manifest it pushed. Classic store: imageid is the config digest and
+ * exactly one entry for `<imageRepo>`, and it is `<imageRepo>@<digest>` (round 12). The daemon computes that entry from the manifest it pushed. Classic store: imageid is the config digest and
  * RepoDigests gets the pushed manifest; containerd store: imageid is the manifest (or index) digest itself, also in RepoDigests. Checked live
  * on both stores (G15a round 11); which store GitHub's hosted runners use is a G16 live item.
  */
@@ -156,9 +156,11 @@ export function renderPublishDigestStep(service: string, imageRepo: string): Ren
     'if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then pg_fail "the image build gave no sha256:<64 hex> digest"; fi',
     'if ! [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then pg_fail "the image build gave no sha256:<64 hex> image id"; fi',
     'for t in docker jq; do command -v "$t" > /dev/null || pg_fail "this runner has no $t, which pipegen\'s publish digest check needs"; done',
-    `want=${q(imageRepo)}"@$digest"`,
+    `repo=${q(imageRepo)}`,
+    'want="$repo@$digest"',
     `repo_digests="$(docker image inspect --format '{{json .RepoDigests}}' -- "$image_id")" || pg_fail "the Docker daemon has no record of the image this job built, so the digest of what it pushed can not be proven"`,
-    'if ! printf \'%s\' "$repo_digests" | jq -e --arg want "$want" \'type == "array" and any(.[]; . == $want)\' > /dev/null; then pg_fail "the digest the build reported is not the image this job built and pushed (the Docker daemon\'s record of that image does not hold $want): the tag may have been moved by another writer after the push, so nothing is handed on to be signed"; fi',
+    // round 12 (security r6 Nit 2): exactly one entry for the repository, and it is $want (one push of one build on a fresh runner)
+    'if ! printf \'%s\' "$repo_digests" | jq -e --arg repo "$repo" --arg want "$want" \'type == "array" and ([.[] | select(type != "string" or startswith($repo + "@"))] == [$want])\' > /dev/null; then pg_fail "the digest the build reported is not the image this job built and pushed (the Docker daemon\'s record of that image does not hold exactly one entry for $repo, $want): the tag may have been moved by another writer after the push, so nothing is handed on to be signed"; fi',
     `dir="$RUNNER_TEMP/pipegen-out/${artifact}"`,
     'mkdir -p "$RUNNER_TEMP/pipegen-out"',
     'mkdir "$dir"',
