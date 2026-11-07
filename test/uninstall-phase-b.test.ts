@@ -7,7 +7,10 @@ import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { localFinishPendingPath, localRecordPath, recordPath } from '../src/deliver/record.js';
 import type { InstallRecord } from '../src/types.js';
-import { uninstallStep, type StepDeps, type StepResult } from '../src/uninstall/apply.js';
+import type { GuardedRepo } from '../src/proof/target.js';
+import { confirmPlan, takeApi, uninstallStep, type StepDeps, type StepResult } from '../src/uninstall/apply.js';
+import { planUninstall } from '../src/uninstall/plan.js';
+import { UninstallRefusal } from '../src/uninstall/target.js';
 import { ProgressFile, uninstallProgressPath } from '../src/uninstall/progress.js';
 import type { LoadedRecord } from '../src/uninstall/record.js';
 import type { Env } from './helpers/deliver-github.js';
@@ -77,6 +80,18 @@ describe('uninstall phase B: secrets, variables, environments, settings (V6)', (
     expect(w.app.envs.get('pipegen-deploy')?.stored.has('PIPEGEN_DEPLOY_KEY')).toBe(false);
     expect(r.skipped.some((s) => /environment pipegen-deploy/.test(s.what) && /TEAM_KEY/.test(s.why))).toBe(true);
     expect(text(r)).toMatch(/TEAM_KEY/);
+    expect(w.out.join('\n')).not.toMatch(/delete the environment pipegen-deploy/);   // the plan keeps it (V-S5), not only the writer
+    expect(w.out.join('\n')).toMatch(/delete the environment pipegen-signing/);
+    // a team secret added after the preview: target.ts reads the environment again right before the DELETE, and keeps it
+    const w2 = world();
+    await afterRun1(w2);
+    w2.app.envs.set('pipegen-signing', env());
+    const t2 = term();
+    const go = t2.p.confirm;
+    t2.p.confirm = async (m, d) => { if (m.startsWith('Go ahead')) w2.app.envs.get('pipegen-signing')?.stored.set('TEAM_LATE', AT); return go(m, d); };
+    await run(w2, sampleRecord(w2, { environments: [{ name: 'pipegen-signing', created: true, changed: [], branchPolicyIds: [], githubCreatedAt: AT }] }), t2);
+    expect(w2.app.envs.has('pipegen-signing')).toBe(true);
+    expect(writes(w2).filter((x) => x.startsWith('DELETE /repos/{owner}/{repo}/environments/{environment_name} '))).toEqual([]);
     // the progress file: run 2 begun, the run-1 PR and the record's blob kept (a resume neither stops on I1 nor skips merged_at)
     const p = JSON.parse(readFileSync(uninstallProgressPath({ owner: 'o', repo: 'shop' }, local(w)), 'utf8')) as Record<string, unknown>;
     expect(p).toMatchObject({ phase: 'B', prNumber: 1, anchors: { recordBlobSha: blob(RECORD_TEXT) } });
@@ -147,6 +162,18 @@ describe('uninstall phase B: secrets, variables, environments, settings (V6)', (
     expect(w2.scratch!.stored.has('MY_KEY')).toBe(true);
     expect(w2.runs.has(32)).toBe(true);
     expect(r2.skipped.some((x) => /pipegen-proof-shop/.test(x.what) && /marker/.test(x.why))).toBe(true);
+    expect(w2.out.join('\n')).not.toMatch(/empty the scratch repo/);
+    // the marker taken off after the preview: read again right before the first write, nothing sent
+    const w3 = world();
+    await afterRun1(w3);
+    w3.scratch!.stored.set('MY_KEY', AT);
+    const t3 = term();
+    const go3 = t3.p.confirm;
+    t3.p.confirm = async (m, d) => { if (m.startsWith('Go ahead')) w3.meta.set('pipegen-proof-shop', { description: 'mine now' }); return go3(m, d); };
+    await run(w3, sampleRecord(w3, { scratch: { repoId: w3.scratch!.id, createdByPipegen: true } }), t3);
+    expect(w3.out.join('\n')).toMatch(/empty the scratch repo o\/pipegen-proof-shop/);
+    expect(writes(w3).filter((x) => x.endsWith('pipegen-proof-shop'))).toEqual([]);
+    expect(w3.scratch!.stored.has('MY_KEY')).toBe(true);
 
     // the source scan: E's scratch writers are called only from apply.ts (the phase-bound api), never from another file
     const dir = join(import.meta.dirname, '..', 'src', 'uninstall');
@@ -154,6 +181,35 @@ describe('uninstall phase B: secrets, variables, environments, settings (V6)', (
       const code = readFileSync(join(dir, f), 'utf8').replace(/\/\/.*$/gm, '');
       expect(code, f).not.toMatch(/\b(?:cleanupWrite|deleteScratchSecret|deleteScratchRepo|cleanupLeftovers|guardedWrite)\s*\(/);
     }
+  });
+});
+
+describe('uninstall phase B: the re-check and a live workflow', () => {
+  it('phase B: the install record changed since the preview → stop, nothing sent', async () => {
+    const w = world();
+    await afterRun1(w);
+    w.app.stored.set('PIPEGEN_FP_KEY', AT);
+    const t = term();
+    const go = t.p.confirm;
+    t.p.confirm = async (m, d) => { if (m.startsWith('Go ahead')) w.g.commitOn('o/pipelines', 'main', { [recordPath('shop')]: '{"pipegen":"edited"}\n' }); return go(m, d); };
+    const before = writes(w).length;
+    const e = await run(w, sampleRecord(w, { [SEC]: [{ name: 'PIPEGEN_FP_KEY', scope: 'repo', created: true, githubCreatedAt: AT }] }), t).then(() => null, (x: unknown) => x);
+    expect((e as Error | null)?.message).toMatch(/install record .* changed since the preview/);
+    expect(writes(w).length).toBe(before);
+    expect(w.app.stored.has('PIPEGEN_FP_KEY')).toBe(true);
+  });
+
+  it('phase B: pipegen\'s workflow still on the default branch → nothing the gate needs is removed', async () => {
+    const w = world({ app: { 'README.md': 'my app\n', '.github/workflows/pipegen.yml': 'name: pipegen\n' } });
+    await afterRun1(w);
+    w.app.stored.set('PIPEGEN_FP_KEY', AT);
+    const r = await run(w, sampleRecord(w, { [SEC]: [{ name: 'PIPEGEN_FP_KEY', scope: 'repo', created: true, githubCreatedAt: AT }] }));
+    expect(w.out.join('\n')).toMatch(/aren't on the default branch/);
+    expect(w.app.stored.has('PIPEGEN_FP_KEY')).toBe(true);
+    expect(r.skipped.some((s) => /PIPEGEN_FP_KEY/.test(s.what) && /still on the app's default branch/.test(s.why))).toBe(true);
+    // central keeps this project's workflows and its record: no central PR
+    expect(w.central.pulls).toEqual([]);
+    expect(r.status).not.toBe('b-done');
   });
 });
 
@@ -246,6 +302,29 @@ describe('uninstall phase B: the record and the local files (V-N5)', () => {
 });
 
 describe('uninstall phase B: the phase-bound api and the source rules (V5-R1 carries)', () => {
+  it('apply: the phase-B routes (a typed name at apply time, the repo deletes, the scratch writes) are refused by a phase-A api; B asks only for the central ruleset', async () => {
+    const w = world();
+    const rec = sampleRecord(w, { central: { repoId: w.central.id, createdByPipegen: true } });
+    const t = term();
+    const opts = { interactive: true, local: local(w), state: local(w) };
+    const a = await planUninstall(gh(w), loadedOf(w, rec), t.p, { ...opts, phase: 'A' });
+    expect(await confirmPlan(a, t.p, { interactive: true, out: () => {} })).toBe(true);
+    const api = takeApi(a, 'A').api;
+    const n = w.g.calls.length;
+    const fake = {} as GuardedRepo;
+    for (const call of [
+      () => api.confirm({ kind: 'central-ruleset', id: 5 }), () => api.removeCentralRepo(rec), () => api.scratchCleanup(fake, { op: 'delete-run', runId: 1 }),
+      () => api.scratchSecretDelete(fake, 'X'), () => api.scratchRepoDelete(fake, 1), () => api.proofLeftovers({} as never, {} as never),
+    ]) await expect(call()).rejects.toBeInstanceOf(UninstallRefusal);
+    expect(w.g.calls.length).toBe(n);
+    const b = await planUninstall(gh(w), loadedOf(w, rec), t.p, { ...opts, phase: 'B' });
+    expect(await confirmPlan(b, t.p, { interactive: true, out: () => {} })).toBe(true);
+    const bApi = takeApi(b, 'B').api;
+    const asked = t.typed.length;
+    await expect(bApi.confirm({ kind: 'secret', entry: { name: 'PIPEGEN_X', scope: 'repo', created: true, githubCreatedAt: AT } })).rejects.toBeInstanceOf(UninstallRefusal);
+    expect(t.typed.length).toBe(asked);
+  });
+
   it('apply: new UninstallApi only in plan.ts; planUninstall, confirmPlan, takeApi and deleteCentralRepo are called only in apply.ts', () => {
     const dir = join(import.meta.dirname, '..', 'src', 'uninstall');
     const strip = (s: string): string => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '').replace(/'(?:[^'\\\n]|\\.)*'/g, "''").replace(/`(?:[^`\\]|\\.)*`/g, '``');

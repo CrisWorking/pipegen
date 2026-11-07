@@ -56,8 +56,10 @@ describe('uninstall central: the last project (V-B4, V-N9)', () => {
     expect(r1.status).toBe('b-waiting');
     expect(w.out.join('\n')).toMatch(/other projects/);
     mergePr(w, w.central, prBranch(w));
+    const n = w.g.calls.length;
     const r2 = await run(w, rec, t, { deleteRepos: true, canDeleteRepos: true });
     expect(w.g.repos.has('o/pipelines')).toBe(true);
+    expect(w.g.calls.slice(n).filter((c) => !c.route.startsWith('GET ') && c.params.repo === 'pipelines')).toEqual([]);
     expect(w.deleted).not.toContain('o/pipelines');
     expect(t.typed.some((q) => /Type pipelines to go on/.test(q))).toBe(false);
     expect([...r2.skipped, ...r2.manual].some((s) => /pipelines/.test(s.what) && /other project/.test(s.why))).toBe(true);
@@ -106,6 +108,8 @@ describe('uninstall central: the last project (V-B4, V-N9)', () => {
     expect(hist.findIndex((m) => /CODEOWNERS/.test(m))).toBeGreaterThan(0);
     expect(w.deleted).toEqual([]);   // central is not deleted before its PR merged
     expect(r1.lines.join('\n')).toMatch(/merge .*then run `pipegen uninstall --delete-repos` again/i);
+    expect(w.central.pulls.find((p) => p.head === prBranch(w))?.state).toBe('open');
+    expect(w.central.refs.has(`heads/${prBranch(w)}`)).toBe(true);
     // merged: the repo goes, after the typed name and the typed numbers of pipegen's central pull requests
     mergePr(w, w.central, prBranch(w));
     const before = w.g.calls.length;
@@ -126,6 +130,27 @@ describe('uninstall central: the last project (V-B4, V-N9)', () => {
     expect(w.central.rulesets.has(55)).toBe(true);
     expect(writes(w).filter((x) => x.startsWith('DELETE /repos/{owner}/{repo}/rulesets'))).toEqual([]);
     expect(r.skipped.some((s) => /central ruleset/.test(s.what) && /not the one pipegen created/.test(s.why))).toBe(true);
+    // the name is pipegen's but GitHub says it was created at another time: not the one pipegen created either
+    const w2 = world();
+    const locks2 = centralLocks(w2);
+    w2.central.rulesets.set(55, liveCentralRs({ created_at: '2026-01-01T00:00:00Z' }));
+    await afterRun1(w2);
+    await run(w2, sampleRecord(w2, { central: locks2.central, edits: locks2.edits }));
+    expect(w2.central.rulesets.has(55)).toBe(true);
+  });
+
+  it('central: the last project, a central CODEOWNERS that was there before pipegen: only pipegen\'s block taken out (V2)', async () => {
+    const w = world();
+    const team = '* @o/team\n';
+    w.g.commitOn('o/pipelines', 'main', { '.github/CODEOWNERS': team + OWNERS_INS });
+    await afterRun1(w);
+    const rec = sampleRecord(w, {
+      central: { repoId: w.central.id, createdByPipegen: true, codeowners: { path: '.github/CODEOWNERS', created: false } },
+      edits: [{ repo: 'central', path: '.github/CODEOWNERS', kind: 'codeowners', inserted: OWNERS_INS, originalSha: blob(team), writtenShas: [blob(team + OWNERS_INS)] }],
+    });
+    w.g.commitOn('o/pipelines', 'main', {});
+    await run(w, rec);
+    expect(filesAtPr(w).get('.github/CODEOWNERS')).toBe(team);
   });
 
   it('central: another project\'s workflow file or record present → not the last project, even with records deleted', async () => {
@@ -139,6 +164,8 @@ describe('uninstall central: the last project (V-B4, V-N9)', () => {
       await afterRun1(w);
       await run(w, sampleRecord(w, { central: locks.central, edits: locks.edits }));
       expect(w.central.rulesets.has(55), JSON.stringify(other)).toBe(true);
+      // run 2's own last-project rule (not only target.ts's): the ruleset is not even read
+      expect(w.g.calls.some((c) => c.route === 'GET /repos/{owner}/{repo}/rulesets/{ruleset_id}' && c.params.repo === 'pipelines'), JSON.stringify(other)).toBe(false);
       expect(w.settings.access).toBe('user');
     }
     // an open central pull request of another project (its update branch)
@@ -149,13 +176,15 @@ describe('uninstall central: the last project (V-B4, V-N9)', () => {
     await afterRun1(w);
     await run(w, sampleRecord(w, { central: locks.central, edits: locks.edits }));
     expect(w.central.rulesets.has(55)).toBe(true);
+    expect(w.g.calls.some((c) => c.route === 'GET /repos/{owner}/{repo}/rulesets/{ruleset_id}' && c.params.repo === 'pipelines')).toBe(false);
   });
 
   it('central: exact file list from the record, never a glob (repo a vs a--b)', async () => {
     const w = world({ appRepo: 'a', central: { [recordPath('a')]: RECORD_TEXT, '.github/workflows/a--merge.yml': MERGE_WF, [recordPath('a--b')]: '{}\n', '.github/workflows/a--b--merge.yml': MERGE_WF, '.github/workflows/a--b--push.yml': MERGE_WF } });
     await afterRun1(w);
-    const rec = sampleRecord(w);
-    await run(w, rec);
+    // an edited record claims a--b's file too (at its real sha): still never removed
+    const rec = sampleRecord(w, { files: [...sampleRecord(w).files, { repo: 'central', path: '.github/workflows/a--b--merge.yml', part: 'pipeline', shas: [blob(MERGE_WF)] }] });
+    await run(w, rec, term({ yes: () => true }));
     const files = filesAtPr(w);
     expect(files.has('.github/workflows/a--merge.yml')).toBe(false);
     expect(files.has(recordPath('a'))).toBe(false);
