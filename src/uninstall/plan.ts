@@ -78,7 +78,10 @@ export interface UninstallPlan {
   done: string[];
   /** The app as GitHub reports it now (LoadedRecord.app). */
   app: { owner: string; repo: string; repoId: number; defaultBranch: string };
-  /** The write API of this run: V5/V6 send every write through it, so the typed-name tokens below are honoured (they are bound to it). */
+  /**
+   * The write API of this plan; the typed-name tokens below are bound to it. Never used directly: apply.ts's takeApi takes it off the
+   * confirmed plan and hands the phase runner a PhaseApi bound to the plan's phase (V5-R1 I2); V5/V6 send every write through that.
+   */
   api: UninstallApi;
   trust: LoadedRecord['trust'];
   typedNames: boolean;

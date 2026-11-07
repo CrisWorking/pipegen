@@ -501,10 +501,17 @@ export class UninstallApi {
     }
   }
 
+  /** V5-R1 sec M3: this.gh for the git-data writes, refusing a write (a rate-limit retry too) once a stop has begun. */
+  get #stopping(): Octokit {
+    const gh = this.gh;
+    return { request: (route: string, params?: Record<string, unknown>) => { if (!route.startsWith('GET ') && interrupting()) refuse('a stop has begun; uninstall sends nothing more.'); return gh.request(route, params); } } as unknown as Octokit;
+  }
+
   async #send(route: string, params: Record<string, unknown>): Promise<{ status: number; data: unknown }> {
     if (!route.startsWith('GET ') && interrupting()) refuse('a stop has begun; uninstall sends nothing more.');
     try {
-      const res = await withRateLimit(() => this.gh.request(route, params), this.clock);
+      // V5-R1 sec M3: a write is not sent again after a rate-limit wait once a stop has begun
+      const res = await withRateLimit(() => { if (!route.startsWith('GET ') && interrupting()) refuse('a stop has begun; uninstall sends nothing more.'); return this.gh.request(route, params); }, this.clock);
       return { status: res.status, data: res.data };
     } catch (e) {
       if (isRateStop(e)) throw e;
@@ -990,9 +997,9 @@ export class UninstallApi {
       const written = codeownersEdit !== undefined && Array.isArray(codeownersEdit.writtenShas) ? codeownersEdit.writtenShas : [];
       if (!isObj(e) || e.type !== 'blob' || typeof e.sha !== 'string' || !written.includes(e.sha)) refuse(`${show(ownersGone, 100)} on ${show(`${r.owner}/${r.repo}`)} is not a version pipegen wrote (changed since, or GitHub's file list could not be read), so uninstall doesn't remove it.`);
     }
-    const t = (await ghWrite(this.gh, 'POST /repos/{owner}/{repo}/git/trees', r, { base_tree: c.baseTree, tree }, this.clock) as Body | null)?.sha;
+    const t = (await ghWrite(this.#stopping, 'POST /repos/{owner}/{repo}/git/trees', r, { base_tree: c.baseTree, tree }, this.clock) as Body | null)?.sha;
     if (typeof t !== 'string' || !SHA_RE.test(t)) throw new UninstallRefusal('GitHub\'s answer to the new file tree could not be read.');
-    const commit = (await ghWrite(this.gh, 'POST /repos/{owner}/{repo}/git/commits', r, { message: c.message, tree: t, parents: [c.parent] }, this.clock) as Body | null)?.sha;
+    const commit = (await ghWrite(this.#stopping, 'POST /repos/{owner}/{repo}/git/commits', r, { message: c.message, tree: t, parents: [c.parent] }, this.clock) as Body | null)?.sha;
     if (typeof commit !== 'string' || !SHA_RE.test(commit)) throw new UninstallRefusal('GitHub\'s answer to the new commit could not be read.');
     return { commit, tree: t };
   }
@@ -1001,14 +1008,14 @@ export class UninstallApi {
   async setUninstallBranch(where: Where, sha: string): Promise<'created' | 'moved'> {
     if (interrupting()) refuse('a stop has begun; uninstall sends nothing more.');
     await this.#verify(where);
-    return setBranch(this.gh, this.repoOf(where), uninstallBranch(this.app, where), sha, true, this.clock);
+    return setBranch(this.#stopping, this.repoOf(where), uninstallBranch(this.app, where), sha, true, this.clock);
   }
 
   /** Opens the uninstall PR of `where` from its branch, or updates the open one. */
   async openUninstallPr(where: Where, pr: { base: string; title: string; body: string }): Promise<{ number: number; url: string; opened: boolean }> {
     if (interrupting()) refuse('a stop has begun; uninstall sends nothing more.');
     await this.#verify(where);
-    return openOrUpdatePr(this.gh, this.repoOf(where), { head: uninstallBranch(this.app, where), base: checkBranch(pr.base), title: pr.title, body: pr.body }, this.clock);
+    return openOrUpdatePr(this.#stopping, this.repoOf(where), { head: uninstallBranch(this.app, where), base: checkBranch(pr.base), title: pr.title, body: pr.body }, this.clock);
   }
 
   /** The repo delete; only deleteCentralRepo calls it, after its checks. */
