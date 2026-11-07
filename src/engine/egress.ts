@@ -19,8 +19,8 @@ import type { RenderedStep } from './job-rules.js';
 import { loadReviewed } from './reviewed.js';
 import { egressDomains } from './tool-flags.js';
 
-export { E3_EGRESS_SETS, EGRESS_DOMAIN_SETS, REVIEWED_EGRESS_LABELS, type EgressSet } from './egress-sets.js';
-import { EGRESS_DOMAIN_SETS, type EgressSet } from './egress-sets.js';
+export { E3_EGRESS_SETS, EGRESS_DOMAIN_SETS, G15_EGRESS_SETS, GITHUB_ATTEST_SET, REVIEWED_EGRESS_LABELS, SIGSTORE_SET, type EgressSet } from './egress-sets.js';
+import { EGRESS_DOMAIN_SETS, GITHUB_ATTEST_SET, SIGSTORE_SET, type EgressSet } from './egress-sets.js';
 
 /**
  * Sets a tool needs at run time beyond its install (ruling E3-R1), by reviewed id. Reviewed data: a new entry that talks to
@@ -85,8 +85,24 @@ export function egressSetsForTool(tool: ReviewedTool): EgressSet[] {
   return [...out].sort();
 }
 
-/** E3-R3 (E-b5): the egress sets whose hosts serve anyone's content (release assets, the OSV API, the Trivy DB mirror): never in a job with a user secret. */
-export const SHARED_CDN_SETS: ReadonlySet<EgressSet> = new Set<EgressSet>(['github-releases', 'osv', 'trivy-db']);
+/**
+ * E3-R3 (E-b5): the egress sets whose hosts serve anyone's content (release assets, the OSV API, the Trivy DB mirror): never in a job with a
+ * user secret. G15a: the Sigstore set too (anyone can write an entry to the public transparency log, so it could carry a secret out).
+ */
+export const SHARED_CDN_SETS: ReadonlySet<EgressSet> = new Set<EgressSet>(['github-releases', 'osv', 'trivy-db', SIGSTORE_SET, GITHUB_ATTEST_SET]);
+
+/**
+ * G15a (carries A2, A3; open question 1, mode-scoped): the sets the keyless verify job adds to cosign's own (cosign verify reads Sigstore's
+ * trusted root and log). Not in cosign's RUNTIME_SETS: those feed the proof harness and the key-env sign job, which need no Sigstore host.
+ */
+export const KEYLESS_VERIFY_SETS: readonly EgressSet[] = Object.freeze([SIGSTORE_SET]);
+
+/**
+ * G15a (ruling G15a-R0b item 2): the sets the attest verify job reaches beyond its install and ghcr: gh's own hosts (the github-attest set,
+ * each host cited in egress-sets.ts from the pinned gh v2.103.3 source and one live reading). gh runs with --no-public-good there, so the
+ * public-good TUF is never fetched.
+ */
+export const ATTEST_VERIFY_SETS: readonly EgressSet[] = Object.freeze([GITHUB_ATTEST_SET]);
 
 /** The Docker network range a job's services and containers use (the reviewed `allowed-ips` choice). */
 const DOCKER_RANGE = '172.16.0.0/12';

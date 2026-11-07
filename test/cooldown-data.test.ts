@@ -203,12 +203,12 @@ describe('cooldown: the real data', () => {
   it('walks every entry and finds pins of every kind; the count is fixed, so a change to it is deliberate', () => {
     const kinds = new Set(ALL.map((a) => a.type));
     expect([...kinds].sort()).toEqual(['action', 'asset', 'docker', 'npm', 'pypi', 'rules', 'templates']);
-    // 14 actions, 3 images, 20 release assets, 8 npm tools + 6 npm plugins, 6 pip tools + 2 pip plugins,
+    // 14 actions, 4 images (G15a round 6: zap-af-active, the same pinned image as zap-baseline), 21 release assets (G15a: gh), 8 npm tools + 6 npm plugins, 6 pip tools + 2 pip plugins,
     // 20 pinned-binary platforms, the nuclei templates archive and the semgrep rules archive
     const count = (t: Artifact['type']) => ALL.filter((a) => a.type === t).length;
     expect({ action: count('action'), docker: count('docker'), asset: count('asset'), npm: count('npm'), pypi: count('pypi'), templates: count('templates'), rules: count('rules') })
-      .toEqual({ action: 14, docker: 3, asset: 40, npm: 16, pypi: 8, templates: 1, rules: 1 });
-    expect(ALL).toHaveLength(83);
+      .toEqual({ action: 14, docker: 4, asset: 41, npm: 16, pypi: 8, templates: 1, rules: 1 });
+    expect(ALL).toHaveLength(85);
     // each plugin is its own artifact (biome's binary, oxlint's three, bandit's two)
     expect(ALL.filter((a) => a.owner === 'oxlint-typeaware').map((a) => (a.type === 'npm' ? a.name : '')).sort()).toEqual(['@oxlint-tsgolint/linux-x64', '@oxlint/binding-linux-x64-gnu', 'oxlint', 'oxlint-tsgolint']);
   });

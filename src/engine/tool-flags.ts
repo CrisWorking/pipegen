@@ -5,7 +5,7 @@
 
 import { createHash } from 'node:crypto';
 import { NEED_CATEGORIES, RESULT_ARTIFACT_PREFIX, type PackageManager } from '../types.js';
-import { BASELINE_ARTIFACT, CLEAN_RUN_ARTIFACT, GATE_RESULT_ARTIFACT, SECRETS_RANGE_ARTIFACT, SECRETS_RANGE_TOOL } from './artifact-names.js';
+import { BASELINE_ARTIFACT, CLEAN_RUN_ARTIFACT, GATE_RESULT_ARTIFACT, SECRETS_HISTORY_ARTIFACT, SECRETS_RANGE_ARTIFACT, SECRETS_RANGE_TOOL } from './artifact-names.js';
 import type { SlotKind } from './slots.js';
 import { isLockfileKind, TRIVY_LICENCE_LOCKFILES } from './licence-lockfiles.js';
 // the gate's policy rule (C2): a leaf that imports only types.ts, so the engine and the gate check a policy with one function
@@ -13,6 +13,8 @@ import { policyProblem as gatePolicyProblem } from '../../gate/src/policy-defaul
 import { validDate } from '../../gate/src/date.js';
 // E9 (ruling B5): the reviewed egress host sets, a leaf with no imports
 import { EGRESS_DOMAIN_SETS } from './egress-sets.js';
+// G15a round 6: the reviewed AF plan of the nightly ZAP active scan, a leaf with no imports (its text is the policy's pinned config)
+import { ZAP_ACTIVE_PLAN, ZAP_ACTIVE_PLAN_FILE, ZAP_ACTIVE_TARGET_ENV } from './zap-active.js';
 
 /**
  * betterleaks flags pipegen never passes (catalogue §3 PC2: no egress, no config from the scanned repo). Taken from
@@ -92,7 +94,7 @@ export interface ArgvPolicy extends CommandPolicy {
    * tools pick the parser by name or extension (biome wants biome.json, the ESLint flat config must be .mjs, ruff .toml,
    * viper tools read the extension). One plain file name, never a path.
    */
-  readonly config?: { readonly flag: string; readonly content: string; readonly fileName: string };
+  readonly config?: { readonly flag: string; readonly content: string; readonly fileName: string; readonly atMount?: true };
   /**
    * Docker entries only (6b, ruling S26): where the renderer mounts a folder in the container. `source: 'repo'` is the
    * service folder (with `workdir` also `-w <at>`); `source: 'work'` is a fresh folder under runner temp that holds the
@@ -111,7 +113,7 @@ export interface ArgvPolicy extends CommandPolicy {
    */
   readonly asImageUser?: true;
   /**
-   * Why this entry is never rendered as a step by renderStep, in plain words (cosign: Plan G's sign job; gosec: Go is not
+   * Why this entry is never rendered as a step by renderStep, in plain words (cosign: pipegen's own sign job; gosec: Go is not
    * supported in v0.2): a RenderError now, instead of a step that fails at run time. (Named `needsSlot` in 6b, when the
    * target slots did not exist yet; they do now, see `slots`.)
    */
@@ -122,6 +124,16 @@ export interface ArgvPolicy extends CommandPolicy {
    * that is already in the command has its value replaced; otherwise `flag value` is appended.
    */
   readonly slots?: Readonly<Record<string, SlotKind>>;
+  /**
+   * G15a round 6: run-time slots passed into a docker DAST container as an environment variable (`-e NAME="$PIPEGEN_ARG_n"`), never as
+   * argv: the ZAP AF plan reads its target with the AF's own `${NAME}` substitution. Only a `local-url`, only for a docker DAST step.
+   */
+  readonly envSlots?: Readonly<Record<string, 'local-url'>>;
+  /**
+   * G15a round 6: the entry runs only in pipegen's own nightly lane (the ZAP AF active scan, dast-handoff.ts zapActiveSpec): never offered
+   * for a need (reviewed.ts reviewedFor), and the renderer refuses it unless the render context is that lane's (RenderContext.nightly).
+   */
+  readonly nightlyOnly?: true;
   /** For a `repo-path` slot: where the path comes from, a service's Dockerfile or the Kubernetes folder (context target, else `.` when the repo has Kubernetes files). */
   readonly repoPathFrom?: 'dockerfile' | 'k8s-dir';
   /**
@@ -157,6 +169,11 @@ export interface ArgvPolicy extends CommandPolicy {
    */
   readonly staged?: { readonly ignoreFiles: readonly string[] };
   readonly env?: readonly string[];
+  /**
+   * G15a round 5 (b2, P-4): the name the job's own read token (`${{ github.token }}`, JOB_TOKEN_REF) is passed to the tool under, in the
+   * step's env and through the env -i allowlist. Only ZIZMOR_ONLINE_POLICY has it; no policy of ARGV_POLICIES does (a test holds that).
+   */
+  readonly tokenEnv?: 'GH_TOKEN';
   readonly then?: readonly CommandPolicy[];
   readonly dedicated?: true;
   /**
@@ -243,6 +260,14 @@ const ESLINT_FILES = "files: ['**/*.{js,mjs,cjs,jsx,vue,svelte,astro}']";
 const ESLINT_TS_FILES = "files: ['**/*.{js,mjs,cjs,jsx,ts,mts,cts,tsx,vue,svelte,astro}']";
 
 /**
+ * G11-2 (no licence data counts as Unknown): Trivy's SARIF lists only the licences it found, so the licence scan writes Trivy's own JSON
+ * with every package listed (`--format json --list-all-pkgs`, trivy v0.76.0 docs/guide/references/configuration/cli/trivy_filesystem.md),
+ * and the gate's scrub reads that file for this tool id only (gate/src/trivy-licence.ts), writing the usual scrubbed SARIF. The loader
+ * requires exactly these flags on the licence scan and refuses `--format json` on any other trivy scan (reviewed.ts trivyProblems).
+ */
+export const TRIVY_LICENCE_RESULT = Object.freeze({ tool: 'trivy-licence', file: 'trivy-licence.json', format: 'json', listAll: '--list-all-pkgs' } as const);
+
+/**
  * Ruling P19: every reviewed cli entry's argv, by entry id (a cli entry without one fails to load). Flags were read
  * from each pinned version's own `--help` (or its source in the downloaded package) on pin day. A flag that turns
  * failing off (`--exit-zero`, `-no-fail`, `--no-fail`, `--write`, `--fix`, `--failure-threshold none`, …) is never
@@ -263,6 +288,16 @@ const POLICIES = {
     method: 'docker', package: 'zaproxy/zap-stable', exe: 'zap-baseline.py', dialect: 'goflags', sub: [], flags: { J: 'output', z: { values: ['-silent'] } },
     findingsExit: [1, 2],   // 1: a FAIL alert, 2: a WARN alert (0 is a clean run)
     required: { J: null, z: '-silent' }, mount: { at: '/zap/wrk', source: 'work' }, config: { flag: '-c', content: "# pipegen's pinned ZAP baseline rules: the defaults, nothing ignored\n", fileName: 'zap-baseline.conf' },
+  },
+  // G15a round 6 (P-4): the nightly ZAP Automation Framework active scan, the same pinned image. `zap.sh -cmd -silent` (no UI; no add-on
+  // update, no call home) runs the reviewed plan (zap-active.ts) by its absolute path in the work folder (zap.sh reads a relative -autorun
+  // path from /zap); the target comes in the container env (the plan's ${PIPEGEN_ZAP_TARGET}), never as a word. The AF exits 0 with
+  // alerts and 1 on a plan error, so only exit 0 with a report is a scan (no findings exit). Nightly only: never offered for a need.
+  'zap-af-active': {
+    envSlots: { [ZAP_ACTIVE_TARGET_ENV]: 'local-url' }, network: 'host', asImageUser: true, nightlyOnly: true,
+    method: 'docker', package: 'zaproxy/zap-stable', exe: 'zap.sh', dialect: 'goflags', sub: [], flags: { cmd: 'bool', silent: 'bool' },
+    findingsExit: [],
+    required: { cmd: 'true', silent: 'true' }, mount: { at: '/zap/wrk', source: 'work' }, config: { flag: '-autorun', content: ZAP_ACTIVE_PLAN, fileName: ZAP_ACTIVE_PLAN_FILE, atMount: true },
   },
   // Semgrep CE 1.181.0: rules only from the verified archive (semgrepProblems), no metrics, no version check, and no file-size skip
   // (--max-target-bytes=0: by default semgrep silently skips every file over 1 MB, so padding a file would hide it from SAST; DECISIONS #108)
@@ -293,7 +328,10 @@ const POLICIES = {
     exe: 'syft', dialect: 'long', sub: ['scan'], flags: { output: { values: ['spdx-json=sbom.spdx.json'] } }, required: { output: 'spdx-json=sbom.spdx.json' },
     config: { flag: '--config', content: 'check-for-app-update: false\n', fileName: 'syft.yaml' },
   },
-  cosign: { method: GH, needsSlot: "is run by Plan G's sign job, which adds its own reviewed flags", package: 'cosign-linux-amd64', exe: 'cosign', dialect: 'long', sub: ['sign'], flags: { yes: 'bool' }, required: { yes: 'true' } },
+  cosign: { method: GH, needsSlot: "is run only by pipegen's own sign job, which adds its own reviewed flags", package: 'cosign-linux-amd64', exe: 'cosign', dialect: 'long', sub: ['sign'], flags: { yes: 'bool' }, required: { yes: 'true' } },
+  // G15a (B3 d, P-5): the pinned gh release, run only by the attest verify step (signing.ts renderVerifySteps), which adds its own reviewed
+  // flags; never by renderStep. The template is the subcommand alone
+  gh: { method: GH, needsSlot: "is run only by pipegen's own attest verify step (job pipegen-verify), which adds its own reviewed flags", package: 'gh_2.103.3_linux_amd64.tar.gz', exe: 'gh', dialect: 'long', sub: ['attestation', 'verify'], flags: {} },
   actionlint: { method: GH, package: 'actionlint_1.7.12_linux_amd64.tar.gz',
     exe: 'actionlint', dialect: 'goflags', sub: [], flags: { 'no-color': 'bool', shellcheck: { values: [''] }, pyflakes: { values: [''] } },
     required: { shellcheck: '', pyflakes: '' },
@@ -410,13 +448,13 @@ const POLICIES = {
  * it (mypy, schemathesis, pinact). An entry is listed only with a reason it can not load repo code. Everything with a
  * pinned config passed by flag reads that one (the loop test in test/job-order.test.ts checks this); semgrep and nuclei
  * have no config file but a verified rules archive. NOT listed, on purpose: lefthook, vitest-coverage, c8 (run repo code),
- * prettier, knip (load repo config), pinact (reads .pinact.yaml, no pinned config), gosec, cosign, registry (not rendered
+ * prettier, knip (load repo config), pinact (reads .pinact.yaml, no pinned config), gosec, cosign, gh, registry (not rendered
  * as a step), and every pip tool and schemathesis.
  */
 const READS_ONLY: readonly string[] = [
   // pinned config passed by flag
   'trivy-config', 'trivy-image', 'trivy-licence', 'betterleaks', 'gitleaks', 'osv-scanner', 'syft', 'actionlint', 'zizmor',
-  'biome', 'eslint', 'eslint-typescript', 'oxlint-typeaware', 'jscpd', 'hadolint', 'kube-linter', 'poutine', 'ruff', 'ruff-format', 'zap-baseline',
+  'biome', 'eslint', 'eslint-typescript', 'oxlint-typeaware', 'jscpd', 'hadolint', 'kube-linter', 'poutine', 'ruff', 'ruff-format', 'zap-baseline', 'zap-af-active',
   // no config file, but verified rules/templates only, no repo plugin mechanism on the allowlist
   'semgrep', 'nuclei',
 ];
@@ -424,6 +462,7 @@ const READS_ONLY: readonly string[] = [
 export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze(Object.fromEntries(
   Object.entries(POLICIES as Record<string, ArgvPolicy>).map(([id, pol]) => [id, READS_ONLY.includes(id) ? { ...pol, readsOnly: true as const } : pol]),
 ));
+
 
 /**
  * Whether the run step of a reviewed entry is a repo-code step (the order rule applies to it). This IS the renderer's rule,
@@ -451,6 +490,13 @@ export const SCRUB_STEP_ID_RE = /^scrub-[0-9a-f]{16}$/;
 export const STAGE_STEP_ID_RE = /^stage-[0-9a-f]{16}$/;
 /** The first 16 hex digits of the SHA-256 of a text: the short, stable part of the ids that tie a result's steps together (scan, scrub). */
 export const sha16 = (text: string): string => createHash('sha256').update(text).digest('hex').slice(0, 16);
+/**
+ * G15a (carry C10): the attest sign job's digest step (signing.ts renderAttestDigestStep) of one image: its id, and the one expression the
+ * attest step's subject-digest may hold, that step's `digest` output. Spelled here because this module is a leaf (the input table below).
+ */
+export const ATTEST_DIGEST_STEP_ID_RE = /^pipegen-attest-digest-[0-9a-f]{16}$/;
+export const attestDigestStepId = (repo: string): string => `pipegen-attest-digest-${sha16(`attest-digest:${repo}`)}`;
+export const attestDigestRef = (repo: string): string => `\${{ steps.${attestDigestStepId(repo)}.outputs.digest }}`;
 /** The id of the scrub step of a result artifact: `scrub-<sha16(artifact)>`. The job outputs and the scrub cross-checks name a scrub by this id. */
 export const scrubStepId = (artifact: string): string => `scrub-${sha16(artifact)}`;
 /** The id of the stage step of a result artifact (C1c): `stage-<sha16(artifact)>`. */
@@ -549,7 +595,8 @@ export const ACTION_POLICIES: Readonly<Record<string, Readonly<Record<string, In
     'no-cache': { values: ['true'], as: 'fixed', required: true }, push: { values: ['false', 'true'], as: 'choice' },
   },
   'github/codeql-action/upload-sarif': {},
-  'actions/attest': {},
+  // G15a (carry C10): the attestation is stored next to the image in the registry (the attest job logs in to ghcr.io in its digest step)
+  'actions/attest': { 'push-to-registry': { values: ['true'], as: 'fixed', required: true } },
   // pipegen's own gate action: no inputs of its own to fix or choose; every one is the renderer's (RENDERER_INPUTS below)
   [PIPEGEN_GATE_USES]: {},
   'bullfrogsec/bullfrog': {
@@ -894,6 +941,38 @@ export const RANGE_EVENT_REF = '${{ github.event_name }}';
 export const RANGE_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_RANGE_BASE: BASE_CHECKOUT_REF, PIPEGEN_RANGE_HEAD: RANGE_HEAD_REF, PIPEGEN_RANGE_BEFORE: RANGE_BEFORE_REF, PIPEGEN_RANGE_EVENT: RANGE_EVENT_REF });
 /** C9: the id of the commit-range scan step (a checker step: the hash of the range artifact). */
 export const rangeScanStepId = `checker-run-${sha16(SECRETS_RANGE_ARTIFACT)}`;
+/**
+ * G15a round 4 (b1, P-4): the env of the nightly full-history scan step that holds an expression: exactly the commit the run checked out
+ * (the scan starts from it; every other ref of the full checkout is read too), on that step only.
+ */
+export const HISTORY_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_HISTORY_HEAD: '${{ github.sha }}' });
+/** G15a round 4 (b1): the id of the full-history scan step (a checker step: the hash of the history artifact). */
+export const historyScanStepId = `checker-run-${sha16(SECRETS_HISTORY_ARTIFACT)}`;
+
+/** G15a round 5 (b2): the job's own token, read-only in a job whose permissions are `contents: read`. */
+export const JOB_TOKEN_REF = '${{ github.token }}';
+/** G15a round 5 (b2): the only GitHub host the online zizmor run talks to (its `--gh-hostname`, required by ZIZMOR_ONLINE_POLICY). */
+export const ZIZMOR_ONLINE_HOST = 'github.com';
+/**
+ * G15a round 5 (b2, P-4): zizmor online, run nightly only (job-rules.ts ZIZMOR_ONLINE_JOB). The second argv policy of the reviewed zizmor entry:
+ * the offline policy (ARGV_POLICIES.zizmor) without `--offline`, so zizmor's online audits run (impostor-commit, ref-confusion,
+ * known-vulnerable-actions, stale-action-refs and the others that read GitHub). Flags read from the pinned zizmor 1.31.1's own `--help`
+ * (Network Options: `-o, --offline` [env: ZIZMOR_OFFLINE]; `--gh-token` [env: GH_TOKEN or GITHUB_TOKEN or ZIZMOR_GITHUB_TOKEN]; `--gh-hostname`
+ * [env: GH_HOST, default github.com]). The token goes in by env (GH_TOKEN), never as a word of the command. In place of `--offline` the
+ * command names the host itself (`--gh-hostname github.com`, required): the token can only ever be sent to github.com's API, whatever the
+ * environment (GH_HOST is not passed through env -i either). The online reads (strings of the pinned binary, crates/zizmor/src/github.rs: `https://` + `api.` + the host,
+ * and `.git/git-upload-pack` for the ref listing) go to api.github.com and github.com, both in github-core (the live checklist verifies).
+ * The entry's output stays `none`: a job-status check (exit 0 clean, 10-14 findings, anything else a failure), so no output format is read.
+ */
+export const ZIZMOR_ONLINE_POLICY: ArgvPolicy = Object.freeze((({ flags: _flags, required: _required, ...rest }: ArgvPolicy): ArgvPolicy => ({
+  ...rest, flags: { 'gh-hostname': { values: [ZIZMOR_ONLINE_HOST] } }, required: { 'gh-hostname': ZIZMOR_ONLINE_HOST }, tokenEnv: 'GH_TOKEN',
+}))(ARGV_POLICIES.zizmor as ArgvPolicy));
+/** G15a round 5 (b2): the one expression of the online zizmor run step's env: the job's own read token, as GH_TOKEN. */
+export const ZIZMOR_ONLINE_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ GH_TOKEN: JOB_TOKEN_REF });
+/** G15a round 5 (b2): the need-like id of the online run (its own artifact `pipegen-out-workflow-lint-online` and step ids, apart from the PR run). */
+export const ZIZMOR_ONLINE_ID = 'workflow-lint-online';
+/** G15a round 5 (b2): the id of the online zizmor run step (renderCliTool's `tool-run-<sha16(artifact)>`). */
+export const zizmorOnlineStepId = `tool-run-${sha16(`${RESULT_ARTIFACT_PREFIX}${ZIZMOR_ONLINE_ID}`)}`;
 
 /**
  * Ruling S15: the inputs the renderer sets on a platform action, by the same `owner/repo[/path]` key as ACTION_POLICIES,
@@ -901,7 +980,7 @@ export const rangeScanStepId = `checker-run-${sha16(SECRETS_RANGE_ARTIFACT)}`;
  * accepts only these beyond the reviewed template. No name here is also a template input.
  * - upload/download-artifact: the result's name (resultArtifactName) and its place under runner.temp (ruling S7);
  * - upload-sarif: the scrubbed SARIF file and the code-scanning category;
- * - attest: the image and its digest; build-push: the Dockerfile (Service.dockerfile) and the one image tag;
+ * - attest: the image and the digest step's output (G15a: never a literal); build-push: the Dockerfile (Service.dockerfile) and the one image tag;
  * - docker login: the actor and the workflow token, nothing else.
  */
 export const RENDERER_INPUTS: Readonly<Record<string, Readonly<Record<string, RendererInput>>>> = Object.freeze({
@@ -921,9 +1000,16 @@ export const RENDERER_INPUTS: Readonly<Record<string, Readonly<Record<string, Re
   },
   'actions/download-artifact': { name: ARTIFACT_NAME, path: OWN_FOLDER_PATH },
   'github/codeql-action/upload-sarif': { sarif_file: RUNNER_TEMP_PATH, category: rx(/^pipegen-[a-z0-9][a-z0-9-]{0,100}$/, 'a category starting pipegen-') },
+  // G15a round 3 (PF-3): the Scorecard docker step reads the job's own token (contents and actions read), never a secret
+  'docker://ghcr.io/ossf/scorecard-action': { repo_token: { describe: "the job's own token (${{ github.token }})", check: (v) => v === '${{ github.token }}' } },
+  // G15a (carry C10): the digest is the run-time output of pipegen's digest step of the same image (the hand-off file image-publish uploaded,
+  // checked as sha256:<64 hex>), never a literal and never another step's output
   'actions/attest': {
     'subject-name': rx(/^(?:ghcr\.io|docker\.io)\/[a-z0-9][a-z0-9._/-]{0,200}$/, 'an image name on ghcr.io or docker.io, with no tag'),
-    'subject-digest': rx(/^sha256:[0-9a-f]{64}$/, 'a sha256 digest'),
+    'subject-digest': rx(/^\$\{\{ steps\.pipegen-attest-digest-[0-9a-f]{16}\.outputs\.digest \}\}$/, 'the digest output of pipegen\'s attest digest step (${{ steps.pipegen-attest-digest-<16 hex>.outputs.digest }}), never a literal', {
+      check: (all) => typeof all['subject-name'] === 'string' && all['subject-digest'] === attestDigestRef(all['subject-name']),
+      describe: 'only as the digest step output of the image subject-name names',
+    }),
   },
   'docker/build-push-action': {
     file: rx(PLAIN_REL_RE, 'a repo-relative file path'),
@@ -1005,8 +1091,20 @@ export function rendererInputProblems(usesPath: string, inputs: Readonly<Record<
 /**
  * Actions whose action.yml runs a docker image (`runs.using: docker`), by `uses` path (ruling S13). Their reviewed entry
  * must record the image in `wrappedImage` (the loader checks it), and a render runs them only when that image is pinned
- * by digest. scorecard-action's is by tag today, so it stays refused.
+ * by digest. scorecard-action's action.yml runs it by tag, so as an action it stays refused; it runs as a docker step instead
+ * (DOCKER_STEP_IMAGES).
  */
 export const DOCKER_ACTION_USES: ReadonlySet<string> = new Set(['ossf/scorecard-action']);
+/**
+ * G15a round 3 (PF-3): the container actions pipegen runs as a `docker://<image>@<digest>` step, by `uses` path → the image (no tag, no
+ * digest). The digest is the one the reviewed entry recorded (wrappedImage.digest), and wrappedImage.ref must be this image at a tag: the
+ * step skips action.yml (which runs the image by tag), so no action.yml default applies and every input is written (the entry's fixed
+ * inputs and DOCKER_STEP_INPUTS). The referee accepts a docker:// step only in this form.
+ */
+export const DOCKER_STEP_IMAGES: Readonly<Record<string, string>> = Object.freeze({ 'ossf/scorecard-action': 'ghcr.io/ossf/scorecard-action' });
+/** The inputs a docker step gets besides its entry's fixed inputs (action.yml's defaults, written out): Scorecard reads the job's own token. */
+export const DOCKER_STEP_INPUTS: Readonly<Record<string, Readonly<Record<string, string>>>> = Object.freeze({
+  'ossf/scorecard-action': Object.freeze({ repo_token: '${{ github.token }}' }),
+});
 /** Actions that build an image from a Dockerfile at run time (a composite that generates one): what runs can not be pinned, so they are refused. */
 export const IMAGE_BUILT_ACTION_USES: ReadonlySet<string> = new Set(['pypa/gh-action-pypi-publish']);

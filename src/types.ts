@@ -133,7 +133,9 @@ export interface Candidate {
 }
 /** A candidate that comes from the reviewed list. The only kind a step may carry (B1): a discovery or memory Candidate does not fit. */
 export type ReviewedCandidate = Candidate & { source: 'reviewed'; reviewed: true };
-export type OutputFormat = 'sarif' | 'junit' | 'zap-json' | 'none';   // zap-json is converted by pipegen's parser
+// zap-json is converted by pipegen's parser; json (G15a-R7 spec 7) is Trivy's licence JSON, which the scrub reads for trivy-licence only and
+// writes as SARIF (gate-job-list.ts resultFormat): the entry declares what the tool writes, the scrubbed result is SARIF
+export type OutputFormat = 'sarif' | 'junit' | 'zap-json' | 'json' | 'none';
 export interface InstallSpec { method: 'npm' | 'pip' | 'github-release' | 'docker'; package: string; version: string; checksum?: string; digest?: string }
 /**
  * Per-repo tuning picks (Plan B 6d, DECISIONS #84 and #108): tuning option id → the values chosen, each from the enum the

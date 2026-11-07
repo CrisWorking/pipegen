@@ -267,7 +267,7 @@ export function regionSpan(workspace: string, f: ParsedFinding, cache?: RegionCa
 // ---------- fingerprints ----------
 
 type Profile = 'file' | 'image' | 'web' | 'zap';
-const PROFILES: Readonly<Record<string, Profile>> = Object.freeze(Object.assign(Object.create(null) as Record<string, Profile>, { 'trivy-image': 'image', nuclei: 'web', 'zap-baseline': 'zap' }));
+const PROFILES: Readonly<Record<string, Profile>> = Object.freeze(Object.assign(Object.create(null) as Record<string, Profile>, { 'trivy-image': 'image', nuclei: 'web', 'zap-baseline': 'zap', 'zap-af-active': 'zap' }));
 const profileOf = (tool: string): Profile => (Object.hasOwn(PROFILES, tool) ? PROFILES[tool] : 'file');
 
 /** The path part of an identity: the mapped file, `unmapped:<hash of the raw uri>`, or empty (no uri, or an image or a web target, which is not a repository file). */

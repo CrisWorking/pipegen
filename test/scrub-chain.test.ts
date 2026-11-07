@@ -385,7 +385,7 @@ describe('referee: the scrub chain', () => {
 const lastRun = (r: RenderResult): RenderedStep => r.steps.filter((s) => s.run !== undefined).at(-1) as RenderedStep;
 /** A stand-in secrets tool's body: it writes its (empty) report at the path its --report-path names (C1c: outside the stage folder). */
 const REPORT_AT_PATH = `prev=""\nfor a in "$@"; do if [ "$prev" = --report-path ]; then echo '{"runs":[]}' > "$a"; fi; prev="$a"; done\n`;
-const RAW_FORMATS = ['sarif', 'zap-json'];
+const RAW_FORMATS = ['sarif', 'zap-json', 'json'];   // (G15a-R7 spec 7: json is the licence scan's raw Trivy JSON, scrubbed to SARIF)
 
 describe('render-cli: the raw result folder (ruling B1 part 1)', () => {
   it('render-cli: a sarif/zap-json tool\'s result goes to pipegen-raw/<artifact>; nothing of it reaches pipegen-out', () => {

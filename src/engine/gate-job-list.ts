@@ -13,10 +13,16 @@ export const FINDINGS_CATEGORIES: ReadonlySet<string> = new Set(['secrets', 'sas
 /** Needs pipegen's own jobs implement (Plan G), not a tool step: they never need one, and the gate does not wait for them as checks. */
 export const PIPEGEN_JOB_CATEGORIES: ReadonlySet<string> = new Set(['gate', 'signing', 'attestation', 'deploy-verify']);
 
+/**
+ * G15a-R7 spec 7: the format of the result a tool's raw output becomes after the scrub, the one the gate and the scrub's `format` input name:
+ * Trivy's licence JSON (`json`, trivy-licence only: reviewed.ts) is scrubbed into SARIF; every other format is its own.
+ */
+export const resultFormat = (format: OutputFormat): Exclude<OutputFormat, 'json'> => (format === 'json' ? 'sarif' : format);
 /** Whether a tool's output format is one the gate reads for a need of this category (B7): SARIF, and ZAP's JSON for DAST. */
-export const readableFormat = (category: string, format: OutputFormat): boolean => format === 'sarif' || (category === 'dast' && format === 'zap-json');
+// (G15a-R8 spec 5: both read a tool's raw output format through resultFormat themselves, so a caller can not forget the mapping)
+export const readableFormat = (category: string, format: OutputFormat): boolean => resultFormat(format) === 'sarif' || (category === 'dast' && format === 'zap-json');
 /** Formats that are findings files (they go through the scrub and are compared with the base); `none` and `junit` are judged by job status (ruling B2). */
-export const isResultFormat = (format: OutputFormat): boolean => format === 'sarif' || format === 'zap-json';
+export const isResultFormat = (format: OutputFormat): boolean => resultFormat(format) === 'sarif' || format === 'zap-json';
 
 /**
  * One entry of the gate's job list. `service` is the service's slug, `job` the id of the job that runs the check (its
@@ -65,7 +71,7 @@ export interface GateJobListOptions {
  * when two tools of one need and service would write one result (one artifact name per need and service).
  */
 export function gateJobList(draft: PipelineDraft, opts: GateJobListOptions = {}): JobListEntry[] {
-  const formatOf = opts.formatOf ?? ((s: StepSpec): OutputFormat | undefined => s.output.format);
+  const formatOf = opts.formatOf ?? ((s: StepSpec): OutputFormat | undefined => resultFormat(s.output.format));
   const out: JobListEntry[] = [];
   // warn-first (#96, S12; final review fix round A, ruling 3): on every entry of a need in draft.warnFirst, never on a floor need (#13)
   const warnFirst = draft.warnFirst ?? {};

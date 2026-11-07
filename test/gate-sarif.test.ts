@@ -1,6 +1,7 @@
 // Plan C Task C1a: hostile-safe SARIF parsing (gate/src/sarif.ts). The input is hostile: a PR author controls the code that
 // was scanned, and a broken or compromised tool can write anything. A parser that reads "clean" when the scan covered
 // less is a false pass, the worst bug this product can have (preflight-scan B8, S7, S8, S10).
+import { resultFormat } from '../src/engine/gate-job-list.js';
 import { resolve } from 'node:path';
 import { build } from 'esbuild';
 import { describe, expect, it } from 'vitest';
@@ -437,10 +438,10 @@ describe('uri: normalisation (S10, uri part)', () => {
 });
 
 describe('sarif: the tool table', () => {
-  it('sarif: every reviewed entry that writes SARIF is in the table, except scorecard-action (reported only, never gated); every table entry is a reviewed entry', () => {
-    const sarifIds = loadReviewed().filter((t) => t.step.output.format === 'sarif').map((t) => t.id).filter((id) => id !== 'scorecard-action').sort();
+  it('sarif: every reviewed entry that writes SARIF is in the table (scorecard-action for its scrub only: reported, never gated); every table entry is a reviewed entry', () => {
+    const sarifIds = loadReviewed().filter((t) => resultFormat(t.step.output.format) === 'sarif').map((t) => t.id).sort();
     expect(Object.keys(SARIF_TOOLS).sort()).toEqual(sarifIds);
-    expect(sarifIds).toEqual(['bandit', 'betterleaks', 'gitleaks', 'gosec', 'hadolint', 'kube-linter', 'nuclei', 'osv-scanner', 'ruff', 'semgrep', 'trivy-config', 'trivy-image', 'trivy-licence']);
+    expect(sarifIds).toEqual(['bandit', 'betterleaks', 'gitleaks', 'gosec', 'hadolint', 'kube-linter', 'nuclei', 'osv-scanner', 'ruff', 'scorecard-action', 'semgrep', 'trivy-config', 'trivy-image', 'trivy-licence']);
   });
 
   it('sarif: the table is plain data with a driver name for each tool and a null prototype (no inherited ids)', () => {

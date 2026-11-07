@@ -57,12 +57,15 @@ describe('C6: the pipegen-gate reviewed entry', () => {
     }
   });
   it('gate-entry: new pin; git diff <pin> -- gate/dist empty', () => {
-    // E9: re-pinned off gate-v0.2.1 (99a0abe) to the commit of the annotated tag gate-v<version>; the checked-out bundle is the pinned one
+    // G15b: re-pinned off gate-v0.2.2 (76b6c25; E9 had moved it off gate-v0.2.1, 99a0abe) to the commit of the annotated tag
+    // gate-v<version>; the checked-out bundle is the pinned one
     const t = real();
     const pin = t.candidate.pin.sha as string;
     const git = (...args: string[]): boolean => { try { execFileSync('git', args, { cwd: ROOT, stdio: 'ignore' }); return true; } catch { return false; } };
     expect(pin).toMatch(/^[0-9a-f]{40}$/);
     expect(pin).not.toBe('99a0abec03b3410fbf769ac9bce6516f760e0b57');
+    expect(pin).not.toBe('76b6c257d94d649993c4709a39bf4a3f7399f0c8');
+    expect(pin).not.toBe('53da79eda2da5f00ffd81aec32ae3b9a917097c9');   // G15b-R1: the first local gate-v0.2.3, moved before any push
     expect(t.step.action?.uses).toBe(`${PIPEGEN_GATE_USES}@${pin}`);
     if (!git('cat-file', '-e', `${pin}:gate/dist/index.js`)) return; // not fetched (a depth-1 checkout)
     expect(git('diff', '--quiet', pin, '--', 'gate/dist'), `git diff ${pin} -- gate/dist is empty`).toBe(true);
@@ -89,7 +92,7 @@ describe('C6: the pipegen-gate reviewed entry', () => {
   it('the renderer accepts the real entry exactly as it accepts the fixture (same uses path, no inputs)', () => {
     const a = renderScrub('pipegen-out-sast--app', '${{ runner.temp }}/pipegen-raw/pipegen-out-sast--app/semgrep.sarif', 'semgrep', 'sarif', real());
     const b = renderScrub('pipegen-out-sast--app', '${{ runner.temp }}/pipegen-raw/pipegen-out-sast--app/semgrep.sarif', 'semgrep', 'sarif', gateEntry());
-    // the uses comment names each entry's own tag (the fixture stays at gate-v0.2.0; the real entry is gate-v0.2.2 since E9)
+    // the uses comment names each entry's own tag (the fixture stays at gate-v0.2.0; the real entry is gate-v0.2.3 since G15b)
     expect({ ...a, uses: a.uses?.split('@')[0], usesComment: '' }).toEqual({ ...b, uses: b.uses?.split('@')[0], usesComment: '' });
     expect(a.usesComment).toBe(`gate-v${real().candidate.version}`);
     expect(b.usesComment).toBe(`gate-v${gateEntry().candidate.version}`);
@@ -132,7 +135,7 @@ describe('C6 fix round 1: the cooldown skips the AGE rule for pipegen\'s own rep
     expect(PIPEGEN_GATE_USES.startsWith(`${PIPEGEN_OWN_REPO}/`)).toBe(true);
   });
   it('the entry\'s version is a bare semver (the tag is gate-v<version>)', () => {
-    expect(real().candidate.version).toBe('0.2.2');   // gate-v0.2.2 (E9; gate-v0.2.1 was D9); the version is bundle content (GATE_VERSION), so it changes before the tag
+    expect(real().candidate.version).toBe('0.2.3');   // gate-v0.2.3 (G15b; gate-v0.2.2 was E9, gate-v0.2.1 D9); the version is bundle content (GATE_VERSION), so it changes before the tag
   });
   it('tag == pin passes with no age check and no release lookup (pre-merge mode: no default-branch check)', async () => {
     const r = await run(onlyGate(), tagRoute());

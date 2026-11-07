@@ -18,13 +18,13 @@ import {
 import { protectedMatcher } from '../src/engine/protected-match.js';
 import { referee, type RefereeReport } from '../src/engine/referee.js';
 import { DIGEST_STEP_ID, FIND_RUN_STEP_ID, renderHeadCheckStep } from '../src/engine/deploy-steps.js';
-import { insertVerify } from '../src/layers/deploy.js';
-import { renderFindRunStep, renderJobPrelude, renderPlatformStep, stepsToYaml } from '../src/engine/render-step.js';
+import { insertVerify, releaseJobs } from '../src/layers/deploy.js';
+import { renderFindRunStep, stepsToYaml } from '../src/engine/render-step.js';
 import {
   assemble, callerPermissions, callerSecrets, judgeAssembled, MERGE_CALLER_JOB, NIGHTLY_CRON, NOT_PROVEN_MARK, verifyJob, VERIFY_GRACE_MINUTES, VERIFY_MARGIN_MINUTES,
   type AssembledFiles, type AssembleOpts,
 } from '../src/layers/assemble.js';
-import { AssembleError, assembleJobs, egressStepFor, type Job } from '../src/layers/jobs.js';
+import { AssembleError, assembleJobs, type Job } from '../src/layers/jobs.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
 import { GATE_CHECK_NAME, PROTECTED_PATHS_BASE, type Capabilities, type CreatedFile, type PipelineDraft, type ReviewedTool, type SigningPlan } from '../src/types.js';
 import { APP_KEY, CAPS, LINTERS, MISSING, node, p, planned, profileOf, SEC, shown, type Obj } from './helpers/assemble.js';
@@ -62,13 +62,10 @@ const C = (layer: 'merge' | 'push' | 'nightly', project = 'r'): string => centra
 const JD = { platform: p, reviewed: REVIEWED, linters: LINTERS, [['gh', 'Tok' + 'en'].join('')]: null, refereeDeps: { runLinters: async () => [] } } as unknown as Omit<Parameters<typeof judgeAssembled>[1], 'extra' | 'referee'>;
 const judge = (a: AssembledFiles, extra: CreatedFile[] = []): Promise<RefereeReport> => judgeAssembled(a, { ...JD, extra });
 
-/** The deploy layer's image-publish job (G7 builds the real one): egress, checkout, the reviewed build-push with push. */
+/** The deploy layer's image-publish job, from releaseJobs itself (G15a round 12, security r6 Nit 1: a hand-built copy would not catch
+ * renderer drift): the job releaseJobs renders for the key-env draft below (one published root service, app, with a Dockerfile). */
 function imagePublish(): Job {
-  return {
-    'runs-on': 'ubuntu-24.04', 'timeout-minutes': 30, permissions: { contents: 'read', packages: 'write' }, 'cache-mode': 'none',
-    steps: [egressStepFor(['dockerhub', 'ghcr'], { [['user', 'Sec' + 'ret'].join('')]: false, dockerNetworks: true, job: 'image-publish' } as unknown as Parameters<typeof egressStepFor>[1]), ...renderJobPrelude({}, p).steps,
-      renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: 'ghcr.io/o/r-app:latest' }, { push: 'true' })],
-  };
+  return releaseJobs(keyEnv().draft, { platform: p })['image-publish'] as Job;
 }
 /** A key-env private draft (environments with the proven branch policy) whose app has a Dockerfile; the needs of the plain profile. */
 function keyEnv(): Planned {
@@ -155,7 +152,9 @@ describe('G5: the delivered files and their callers', () => {
       const def = x.draft.profile.defaultBranch;
       expect(js(fileAt(a, 'app', CALLER_WORKFLOW)).on).toEqual({ push: { branches: [def] }, pull_request: null, pull_request_review: { types: ['submitted', 'dismissed'] } });
       expect(js(fileAt(a, 'app', PUSH_WORKFLOW)).on).toEqual({ push: { 'branches-ignore': [def] } });
-      expect(js(fileAt(a, 'app', NIGHTLY_WORKFLOW)).on).toEqual({ schedule: [{ cron: NIGHTLY_CRON }] });
+      // G15a round 3 (PF-3): the weekly Scorecard entry only when the plan has its job (Scorecard needs code scanning: public here)
+      const weekly = a.draft.needs.some((n) => n.id === 'scorecard') ? [{ cron: '23 4 * * 1' }] : [];
+      expect(js(fileAt(a, 'app', NIGHTLY_WORKFLOW)).on).toEqual({ schedule: [{ cron: NIGHTLY_CRON }, ...weekly] });
       expect(NIGHTLY_CRON).toBe('17 3 * * *');
       for (const f of workflows(a)) {
         const on = js(f).on as Obj;
@@ -306,7 +305,7 @@ describe('G5: the delivered files and their callers', () => {
     expect(workflows(a).map((f) => f.path).sort()).toEqual([CALLER_WORKFLOW, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PUSH_WORKFLOW].sort());
     // the push and nightly jobs are inline in their own files (a local push or nightly callee would be the file itself)
     for (const path of [PUSH_WORKFLOW, NIGHTLY_WORKFLOW]) for (const [id, j] of Object.entries(jobsOfFile(fileAt(a, 'app', path)))) expect(j.uses, `${path} ${id}`).toBeUndefined();
-    expect(Object.keys(jobsOfFile(fileAt(a, 'app', NIGHTLY_WORKFLOW)))).toEqual(['nightly']);
+    expect(Object.keys(jobsOfFile(fileAt(a, 'app', NIGHTLY_WORKFLOW)))).toEqual(['nightly', 'scorecard', 'code-scanning', 'secrets-history', 'code-scanning-history', 'workflow-lint-online']);   // G15a round 3: weekly Scorecard; round 4: the full-history secrets scan; round 5: zizmor online
     // no uses anywhere names the central repo
     expect(a.files.map((f) => f.content).join('\n')).not.toMatch(/\/pipelines\//);
     // a public draft with a central pin is refused (its find-run would look for a central workflow that is not there)

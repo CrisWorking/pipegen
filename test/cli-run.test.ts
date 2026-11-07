@@ -348,7 +348,9 @@ describe('G13: estimate and consent', () => {
   });
 
   it('run: consent estimate counts the assembled jobs', async () => {
-    const many = { 'pre-commit': [], push: [], merge: Array.from({ length: 60 }, () => 'sast'), deploy: [], nightly: [] };
+    // 200 merge jobs: well over the consent estimate, which since G15a also counts the nightly extras (history scan, ZAP, Scorecard);
+    // 60 jobs (600 min) fell under it (950 min) after the merge of G13 with G15a, so the re-ask was never reached
+    const many = { 'pre-commit': [], push: [], merge: Array.from({ length: 200 }, () => 'sast'), deploy: [], nightly: [] };
     // more minutes than agreed: asked again; a no delivers nothing
     const w = world({ built: (i) => builtOf(i, { minutes: { jobs: many, prWait: 9 } }) });
     const i = io({ again: false });

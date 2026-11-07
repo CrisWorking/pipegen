@@ -541,7 +541,7 @@ describe('doc: carries (lines present when they apply, absent when they do not)'
     expect(a).toMatch(/`concurrency` group, so runs never overlap/);
     expect(a).toMatch(/closed \(even a stale bot running as the github-actions bot\) is reopened by design|any bot closed \(even a stale bot running as the github-actions bot\) is reopened by design/);
     // key-env: the signing lines (the keyless line is absent)
-    expect(a).not.toMatch(/Keyless signing runs without a network block/);
+    expect(a).not.toMatch(/keyless signing job runs without a network block/);
     // Dependabot central (33)
     expect(a).toMatch(/Dependabot does not bump the central commit/);
     expect(a).toMatch(/uses Renovate keeps it and gets no Dependabot file/);
@@ -558,7 +558,7 @@ describe('doc: carries (lines present when they apply, absent when they do not)'
     expect(b).toMatch(/It does not cancel the pull request's own run/);
     expect(a).not.toMatch(/anyone can submit a review/);
     // keyless signing without a network block (21)
-    expect(docOf(shapeB({ signing: { mode: 'keyless', images: [] } }))).toMatch(/Keyless signing runs without a network block for now/);
+    expect(docOf(shapeB({ signing: { mode: 'keyless', images: [] } }))).toMatch(/The keyless signing job runs without a network block: it needs a per-run token host/);
     // S28 (42)
     for (const t of [a, b]) expect(t).toMatch(/pipegen v0\.2 is for repositories owned by CrisWorking\. A public repository uses the gate in the normal way/);
     expect(a).toMatch(/This repository is private, so its checks run from central workflows/);
@@ -916,22 +916,19 @@ describe('doc: fix round 1 (ruling G9-R1)', () => {
   };
   const layersLine = (text: string, label: string): string => headingAt(text, 'The four layers').split('\n').find((l) => l.startsWith(`- ${label}`)) as string;
 
-  it('sec C1: a check the gate only warns about is not printed as blocking (not proven need, ZAP while unverified)', () => {
+  it('sec C1: a check the gate only warns about is not printed as blocking (not proven need); ZAP is verified, so a ZAP check blocks', () => {
     // the ZAP constants are copies of the gate's
     const zap = readFileSync(new URL('../gate/src/zap.ts', import.meta.url), 'utf8');
     expect(/export const ZAP_TOOL = '([^']+)'/.exec(zap)?.[1]).toBe(ZAP_TOOL);
     expect(/export const ZAP_JSON_VERIFIED = (true|false)/.exec(zap)?.[1]).toBe(String(ZAP_JSON_VERIFIED));
-    expect(ZAP_JSON_VERIFIED).toBe(false);
-    // scenario 1: DAST run by ZAP
+    expect(ZAP_JSON_VERIFIED).toBe(true);
+    // scenario 1: DAST run by ZAP (G15a round 5: verified on real reports of the pinned image), the same mode as with another tool
     const t1 = docOf(zapDraft());
     const line = layersLine(t1, 'Running app scan');
-    expect(line).toContain('Warns only: ZAP results are not verified yet');
-    expect(line).not.toMatch(/Blocks a pull request/);
-    const np1 = headingAt(t1, 'Not proven yet');
-    expect(np1).toContain('Running app scan, service "shop-api", tool zaproxy/zaproxy: ZAP results are not verified yet');
-    expect(line).toContain('tool zaproxy/zaproxy');   // the same name in every line
-    expect(np1).not.toContain('Every check pipegen set up is proven.');
-    // the same need with another tool keeps its mode, and the plain draft says everything is proven
+    expect(line).toMatch(/Blocks a pull request/);
+    expect(line).not.toContain('not verified');
+    expect(line).toContain('tool zaproxy/zaproxy');
+    expect(headingAt(t1, 'Not proven yet')).not.toContain('ZAP results');
     expect(layersLine(docOf(shapeA()), 'Running app scan')).toMatch(/Blocks a pull request/);
     expect(headingAt(docOf(shapeA()), 'Not proven yet')).toContain('Every check pipegen set up is proven.');
     // scenario 2: a need in notProven (not a floor need)
@@ -1294,7 +1291,7 @@ describe('doc: fix round 1 (ruling G9-R1)', () => {
     expect(lineOf(layers, 'Licence check')).toMatch(/Blocks a pull request/);
   });
 
-  it('smaller fixes: an unnamed service, and the same ZAP name in every line', () => {
+  it('smaller fixes: an unnamed service, and the ZAP name in the layers line (no not-proven line now that ZAP is verified)', () => {
     const base = shapeA();
     const unnamed = shapeA({ profile: { ...base.profile, services: base.profile.services.map((sv, i) => (i === 1 ? { ...sv, name: '@@@' } : sv)) } });
     const t = docOf(unnamed);
@@ -1303,7 +1300,8 @@ describe('doc: fix round 1 (ruling G9-R1)', () => {
     const z = zapDraft();
     const text = docOf(z);
     const name = (layersLine(text, 'Running app scan').match(/tool ([^.]*)\./) as RegExpMatchArray)[1];
-    expect(headingAt(text, 'Not proven yet')).toContain(`tool ${name}: ZAP results`);
+    expect(name).toBe('zaproxy/zaproxy');
+    expect(headingAt(text, 'Not proven yet')).not.toContain('ZAP results');
   });
 
   // ---------- round 3 (ruling G9-R3) ----------

@@ -2,7 +2,7 @@
 // service, its unit tests, the base scan and the gate, over two services. `workflow` writes the gate job's steps as plain YAML, so an
 // edited gate step (or an edited env) can hold what the emitter itself refuses; the referee must refuse it too.
 import { Document } from 'yaml';
-import { gateJobList, type JobListEntry } from '../../src/engine/gate-job-list.js';
+import { gateJobList, resultFormat, type JobListEntry } from '../../src/engine/gate-job-list.js';
 import { jobOutputsFor, NO_SCANS, type ScanFact } from '../../src/engine/job-rules.js';
 import { NEED_ID_CATEGORY } from '../../src/engine/need-ids.js';
 import { referee, type Linters, type RefereeReport } from '../../src/engine/referee.js';
@@ -75,7 +75,7 @@ export const editSteps = (jobs: Record<string, Job>, id: string, edit: (s: Rende
 export function jobsOf(d: PipelineDraft, o: JobsOptions = {}): Record<string, Job> {
   const out: Record<string, Job> = {};
   const ctx: RenderContext = { profile: d.profile };
-  const findings = d.steps.filter((s) => s.output.format === 'sarif');   // the other specs' jobs are the caller's
+  const findings = d.steps.filter((s) => resultFormat(s.output.format) === 'sarif');   // the other specs' jobs are the caller's
   const blocks = findings.map((s) => renderFindingsBlock(s, entry(s.tool.id), p, ctx, GATE));
   const baseBlocks = findings.map((s) => renderFindingsBlock(s, entry(s.tool.id), p, { ...ctx, base: true }, GATE));
   findings.forEach((s, i) => {

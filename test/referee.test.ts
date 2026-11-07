@@ -7,7 +7,8 @@ import { defaultPushTrigger, DEPLOY_PUSH_IF, NO_SCANS } from '../src/engine/job-
 import { describe, expect, it } from 'vitest';
 import { JOB_PERMISSIONS, JOB_STEP_POLICY, pipegenLines, referee, type Linters, type RefereeDeps, type RefereeIssue, type RefereeReport } from '../src/engine/referee.js';
 import { gateJobList, jobIdFor } from '../src/engine/gate-job-list.js';
-import { jobOutputsFor } from '../src/engine/job-rules.js';
+import { attestDigestRef, jobOutputsFor } from '../src/engine/job-rules.js';
+import { renderAttestDigestStep } from '../src/engine/signing.js';
 import { dedupeJobSteps, RenderError, renderFindRunStep, renderGateStep, renderJobPrelude, renderNightlyStep, renderPlatformStep, renderProjectScript, renderScrub, renderStep, renderUpload, scrubbedPath, stepsToYaml, type RenderContext, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
 import { resultArtifactName } from '../src/engine/artifact-names.js';
 import { NEED_ID_CATEGORY, NEED_IDS } from '../src/engine/need-ids.js';
@@ -30,6 +31,11 @@ const sha = (c: string): string => c.repeat(40);
 const ref = (n: string): string => ['${{', `secrets.${n}`, '}}'].join(' ');
 /** The OIDC permission and the login inputs, spelled at run time for the same reason. */
 const OIDC = ['id', 'token'].join('-');
+/** G15a: the attest sign steps of the image ghcr.io/o/app: pipegen's digest step, then actions/attest with that step's output (never a literal). */
+const attestSteps = (pl: ReturnType<typeof platform>, repo = 'ghcr.io/o/app'): RenderedStep[] => [
+  renderAttestDigestStep({ service: 'app', repo }),
+  renderPlatformStep('attest', pl, { 'subject-name': repo, 'subject-digest': attestDigestRef(repo) }),
+];
 const loginInputs = (): Record<string, string> => Object.fromEntries([['username', '${{ github.actor }}'], [['pass', 'word'].join(''), ref('GITHUB_TOKEN')]]);
 /** A spec field or job key named `secrets`, set at run time. */
 const SEC_FIELD = ['sec', 'rets'].join('');
@@ -145,8 +151,11 @@ describe('referee: the renderer and the referee agree', () => {
         steps = t.id === 'bullfrog'
           // G4-R1: the egress step is every job's first step (the referee's backstop), so its own check's job is just that step
           ? renderStep(spec, t, p, ctxN).steps
+          // (G15a-R11 r5-2: the build-push entry renders here as the PR-time build only, in image-build--app13 below. image-publish is bound to the
+          // one published service (v0.2), and this draft's fourteen root services with a Dockerfile would all be published, so pipegen's real
+          // image-publish (releaseJobs) is held to the referee in g15-r8 to g15-r11, assemble, deploy-layer, g15-attest-verify and g15-sigstore instead)
           : t.id === 'docker-build-push-action'
-          ? [...prelude(), renderPlatformStep('setup-buildx', p), renderPlatformStep('docker-login', p, loginInputs(), { registry: 'ghcr.io' }), ...renderStep(spec, t, p, { ...ctxN, targets: { image: 'ghcr.io/o/app:pr-1' } }).steps]
+          ? [...prelude(), ...renderStep(spec, t, p, { ...ctxN, targets: { image: 'ghcr.io/o/app:pr-1' } }).steps]
           : toolJob(spec, ctxN);
       } catch (e) {
         if (!(e instanceof RenderError)) throw e;
@@ -158,10 +167,7 @@ describe('referee: the renderer and the referee agree', () => {
       if (t.id === 'docker-build-push-action') jobs[jobIdFor(spec.needId, spec.service)] = job([...prelude(), ...renderStep(spec, t, p, { ...ctxN, targets: { image: 'ghcr.io/o/app:pr-1' } }).steps]);
       // a listed check runs in the job named for it (ruling 3 of C0b fix round 1), with the outputs the gate reads
       const outputs = jobOutputsFor(steps);
-      jobs[t.id === 'docker-build-push-action' ? 'image-publish' : jobIdFor(spec.needId, spec.service)] = job(steps, {
-        // (G2-R1 I3: image-publish is a deploy job: a default-branch push only, after the gate)
-        ...(t.id === 'docker-build-push-action' ? { permissions: { contents: 'read', packages: 'write' }, if: DEPLOY_PUSH_IF, needs: ['gate'] } : {}), ...(Object.keys(outputs).length > 0 ? { outputs } : {}),
-      });
+      if (t.id !== 'docker-build-push-action') jobs[jobIdFor(spec.needId, spec.service)] = job(steps, { ...(Object.keys(outputs).length > 0 ? { outputs } : {}) });
     }
     // the helper-rendered platform actions, as Plan G uses them
     const sarif = '${{ runner.temp }}/pipegen-out/pipegen-out-sast--app/semgrep.sarif';
@@ -175,14 +181,15 @@ describe('referee: the renderer and the referee agree', () => {
     const watchAct: RenderedStep = { name: 'watch', uses: WATCHER.step.action?.uses as string, with: { mode: 'watcher' } };
     const [checkout] = prelude();
     const co = checkout as RenderedStep;
-    jobs['code-scanning'] = job([download(), renderPlatformStep('upload-sarif', p, { sarif_file: sarif, category: 'pipegen-sast' })], { permissions: { contents: 'read', 'security-events': 'write', actions: 'read' } });
+    // (G15a-R7 sec 1: the upload needs the job whose scrub wrote the file)
+    jobs['code-scanning'] = job([download(), renderPlatformStep('upload-sarif', p, { sarif_file: sarif, category: 'pipegen-sast' })], { permissions: { contents: 'read', 'security-events': 'write', actions: 'read' }, needs: ['sast--app'] });
     jobs['baseline-check'] = job([download(), gateAct('baseline-check')], { permissions: { contents: 'read', actions: 'read' } });
+    // (G15a: the attest sign job holds only the digest downloads, pipegen's digest step and actions/attest with that step's output)
     jobs.sign = job([
-      co, download(),
-      renderPlatformStep('docker-login', p, loginInputs(), { registry: 'ghcr.io' }),
-      renderPlatformStep('attest', p, { 'subject-name': 'ghcr.io/o/app', 'subject-digest': `sha256:${'a'.repeat(64)}` }),
+      download(),
+      ...attestSteps(p),
     // (v0.2 Plan G G2-R-sec2: a sign job that writes to the registry is a deploy job of the default-push pipegen.yml)
-    ], { permissions: { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' }, environment: 'pipegen-signing', if: DEPLOY_PUSH_IF, needs: ['gate'] });
+    ], { permissions: { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' }, environment: 'pipegen-signing', if: DEPLOY_PUSH_IF, needs: ['gate', 'image-publish'] });
     // (G7: pipegen-verify's shape is the deploy layer's whole verify job, the find-run step, the head check, the digest and the signature check
     // of the draft's mode; this draft's attest mode can not be verified until G15, so test/deploy-layer.test.ts holds that job to the referee)
     jobs.watch = job([co, watchAct], { permissions: { contents: 'read', issues: 'write', actions: 'read' } });
@@ -213,13 +220,17 @@ describe('referee: the renderer and the referee agree', () => {
     const entries = gateJobList(d);
     jobs.gate = job([...harden, download(), renderGateStep(GATE, d), ...renderGateUploads(platform())], { name: GATE_CHECK_NAME.split(' / ')[1], if: 'always()', needs: entries.map((e) => e.job), permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } });
     const r = await run([wf(jobs, { on: { push: defaultPushTrigger('main'), pull_request: null } })], d, { list: [...reviewedList(), GATE, WATCHER] });
-    for (const id of Object.keys(JOB_STEP_POLICY).filter((x) => x !== 'pipegen-verify')) expect(Object.keys(jobs), id).toContain(id);
+    // (G15a round 3: the weekly scorecard job belongs to the nightly file only; round 4: the full-history upload job and the nightly DAST upload job (test/g15-dast-nightly.test.ts) are written only there too; both are judged end to end in test/g15-scorecard.test.ts and test/g15-history-nightly.test.ts)
+    // (G15a-R11 r5-2: image-publish is held to the referee with releaseJobs' own job in g15-r8 to g15-r11, assemble, deploy-layer, g15-attest-verify
+    // and g15-sigstore)
+    for (const id of Object.keys(JOB_STEP_POLICY).filter((x) => x !== 'pipegen-verify' && x !== 'scorecard' && x !== 'code-scanning-history' && x !== 'workflow-lint-online' && x !== 'code-scanning-dast' && x !== 'image-publish')) expect(Object.keys(jobs), id).toContain(id);
     expect(show(r)).toBe('');
     expect(r.ok).toBe(true);
     expect(r.demoted).toEqual([]);
     // the entries the renderer refuses are the documented ones (6c report), nothing else
     // (registry is a job service and skipped above with the platform entries)
-    expect(refused.sort()).toEqual(['cosign', 'gosec', 'pypi-publish', 'schemathesis', 'scorecard-action', 'bandit', 'coverage-py', 'creosote', 'mypy', 'vulture'].sort());
+    // (G15a: gh, like cosign, is run only by its own verify step in pipegen-verify, signing.ts)
+    expect(refused.sort()).toEqual(['cosign', 'gh', 'gosec', 'pypi-publish', 'schemathesis', 'scorecard-action', 'bandit', 'coverage-py', 'creosote', 'mypy', 'vulture'].sort());
     // (G4-R1: the two DAST tools are judged in their two-job form in test/jobs-dast.test.ts, not here)
     expect(specs.length).toBeGreaterThan(28);
   });
@@ -339,10 +350,11 @@ describe('referee: only reviewed tools, and only as their template', () => {
     const login = renderPlatformStep('docker-login', p, loginInputs(), { registry: 'ghcr.io' });
     // (G2-R-sec2: no packages: write here, which would make it a registry write outside a deploy job; the login's whenWith is the subject)
     const perms = { permissions: { contents: 'read' } };
-    // (v0.2 Plan G G2-R1 I3: image-publish writes to the registry only from a deploy job on a default-branch push, so the login is judged in the sign job, the other row that holds it)
-    expect(show(await run([wf({ sign: job([login], perms) })], draftOf([])))).toBe('');
+    // (v0.2 Plan G G2-R1 I3: image-publish writes to the registry only from a deploy job on a default-branch push; with contents: read only it
+    // writes nothing, so the login is judged there. G15a: the sign row no longer holds a login action)
+    expect(show(await run([wf({ 'image-publish': job([login], perms) })], draftOf([])))).toBe('');
     const elsewhere = { ...login, with: { ...login.with, registry: 'evil.example' } };
-    expect(checks(await run([rawWf({ sign: job([elsewhere], perms) })], draftOf([])))).toContain('injection');
+    expect(checks(await run([rawWf({ 'image-publish': job([elsewhere], perms) })], draftOf([])))).toContain('injection');
     const up = renderUpload('pipegen-out-secrets', '${{ runner.temp }}/pipegen-out/pipegen-out-secrets/gitleaks.sarif', p);
     const outside = { ...up, with: { ...up.with, path: '/etc' } };
     expect(has(await run([wf({ a: job([outside]) })], draftOf([])), 'template')).toBe(true);
@@ -460,13 +472,13 @@ describe('referee: permissions by exact job id', () => {
     expect(has(await withPerms('pipegen-verify', p), 'permissions')).toBe(false);   // no environments on this plan
   });
   it('the table is keyed by exact job id and every job may read contents', () => {
-    expect(Object.keys(JOB_PERMISSIONS).sort()).toEqual(['base-scan', 'baseline-check', 'code-scanning', 'gate', 'image-publish', 'merged-red', 'nightly', 'notify', 'pipegen-verify', 'pr-check', 'sign', 'watch'].sort());
+    expect(Object.keys(JOB_PERMISSIONS).sort()).toEqual(['base-scan', 'baseline-check', 'code-scanning', 'code-scanning-dast', 'code-scanning-history', 'gate', 'image-publish', 'merged-red', 'nightly', 'notify', 'pipegen-verify', 'pr-check', 'scorecard', 'sign', 'watch'].sort());
+    expect(JOB_PERMISSIONS.scorecard).toEqual({ actions: 'read' });
     expect(JOB_PERMISSIONS['code-scanning']).toEqual({ 'security-events': 'write', actions: 'read' });
   });
   it('a reusable-workflow caller may have the union of the called file\'s jobs (when that file is in files)', async () => {
     // (G3: the sign job asks for the OIDC token and attestations write only with the step that uses them, here actions/attest)
-    const attest = renderPlatformStep('attest', platform(), { 'subject-name': 'ghcr.io/o/app', 'subject-digest': `sha256:${'a'.repeat(64)}` });
-    const called = wf({ sign: job([attest], { permissions: { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' } }) }, { on: { workflow_call: null } }, '.github/workflows/sign.yml');
+    const called = wf({ sign: job(attestSteps(platform()), { permissions: { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' } }) }, { on: { workflow_call: null } }, '.github/workflows/sign.yml');
     const caller = (perms: unknown): CreatedFile => wf({ release: { uses: './.github/workflows/sign.yml', permissions: perms } });
     const union = { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' };
     const attestDraft = draftOf([g.spec], { profile: { ...draftOf([g.spec]).profile, private: true }, signing: { mode: 'attest', images: [{ service: 'app', repo: 'ghcr.io/o/app' }] } });
@@ -1006,9 +1018,8 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
   it('A22: environment pipegen-signing only on sign and pipegen-verify', async () => {
     expect(has(await run([wf({ t: job(scriptSteps(), { environment: 'pipegen-signing' }) })], dScripts()), 'permissions')).toBe(true);
     // (G3: the OIDC token and attestations write only with actions/attest in the job)
-    const attest = renderPlatformStep('attest', platform(), { 'subject-name': 'ghcr.io/o/app', 'subject-digest': `sha256:${'a'.repeat(64)}` });
     const attestDraft = draftOf([], { profile: { ...draftOf([]).profile, private: true }, signing: { mode: 'attest', images: [{ service: 'app', repo: 'ghcr.io/o/app' }] } });
-    expect(permsBesidesRegistry(await run([wf({ sign: job([attest], { permissions: SIGNP, environment: 'pipegen-signing' }) })], attestDraft))).toBe(false);   // (G2-R-sec2: the registry-write rule aside; G3-R2: attest mode)
+    expect(permsBesidesRegistry(await run([wf({ sign: job(attestSteps(platform()), { permissions: SIGNP, environment: 'pipegen-signing' }) })], attestDraft))).toBe(false);   // (G2-R-sec2: the registry-write rule aside; G3-R2: attest mode)
   });
   it('A8: a secret value hidden by a YAML escape is found in the parsed scalars', async () => {
     const esc = fake.awsKey().replace(/^A/, '\\x41');

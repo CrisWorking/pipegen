@@ -49,7 +49,7 @@ var require_constants = __commonJS({
     var NO_DOT_SLASH = `(?!${DOT_LITERAL}{0,1}${END_ANCHOR})`;
     var NO_DOTS_SLASH = `(?!${DOTS_SLASH})`;
     var QMARK_NO_DOT = `[^.${SLASH_LITERAL}]`;
-    var STAR = `${QMARK}*?`;
+    var STAR2 = `${QMARK}*?`;
     var SEP = "/";
     var POSIX_CHARS = {
       DOT_LITERAL,
@@ -65,7 +65,7 @@ var require_constants = __commonJS({
       NO_DOT_SLASH,
       NO_DOTS_SLASH,
       QMARK_NO_DOT,
-      STAR,
+      STAR: STAR2,
       START_ANCHOR,
       SEP
     };
@@ -912,7 +912,7 @@ var require_parse = __commonJS({
         NO_DOTS_SLASH,
         QMARK,
         QMARK_NO_DOT,
-        STAR,
+        STAR: STAR2,
         START_ANCHOR
       } = PLATFORM_CHARS;
       const globstar = (opts2) => {
@@ -920,7 +920,7 @@ var require_parse = __commonJS({
       };
       const nodot = opts.dot ? "" : NO_DOT;
       const qmarkNoDot = opts.dot ? QMARK : QMARK_NO_DOT;
-      let star = opts.bash === true ? globstar(opts) : STAR;
+      let star = opts.bash === true ? globstar(opts) : STAR2;
       if (opts.capture) {
         star = `(${star})`;
       }
@@ -1594,14 +1594,14 @@ var require_parse = __commonJS({
         NO_DOT,
         NO_DOTS,
         NO_DOTS_SLASH,
-        STAR,
+        STAR: STAR2,
         START_ANCHOR
       } = constants6.globChars(opts.windows);
       const nodot = opts.dot ? NO_DOTS : NO_DOT;
       const slashDot = opts.dot ? NO_DOTS_SLASH : NO_DOT;
       const capture = opts.capture ? "" : "?:";
       const state = { negated: false, prefix: "" };
-      let star = opts.bash === true ? ".*?" : STAR;
+      let star = opts.bash === true ? ".*?" : STAR2;
       if (opts.capture) {
         star = `(${star})`;
       }
@@ -1895,6 +1895,8 @@ function resultArtifactName(needId, service, opts) {
 }
 var SECRETS_RANGE_ID = "secrets-range";
 var SECRETS_RANGE_ARTIFACT = resultArtifactName(SECRETS_RANGE_ID);
+var SECRETS_HISTORY_ID = "secrets-history";
+var SECRETS_HISTORY_ARTIFACT = resultArtifactName(SECRETS_HISTORY_ID);
 var SECRETS_RANGE_TOOL = "betterleaks";
 var RANGE_FACTS_FILE = "range.json";
 var RANGE_CANARY_FILES = ["pipegen-range-canary-1.txt", "pipegen-range-canary-2.txt"];
@@ -1949,6 +1951,9 @@ function validDate(text) {
 // src/engine/egress-sets.ts
 var REVIEWED_EGRESS_LABELS = Object.freeze(["github-core", "npm", "pypi", "dockerhub", "ghcr"]);
 var E3_EGRESS_SETS = Object.freeze(["github-releases", "trivy-db", "osv"]);
+var SIGSTORE_SET = "sigstore";
+var GITHUB_ATTEST_SET = "github-attest";
+var G15_EGRESS_SETS = Object.freeze([SIGSTORE_SET, GITHUB_ATTEST_SET]);
 var EGRESS_DOMAIN_SETS = Object.freeze({
   "github-core": Object.freeze([
     "github.com",
@@ -1968,8 +1973,67 @@ var EGRESS_DOMAIN_SETS = Object.freeze({
   ghcr: Object.freeze(["ghcr.io", "pkg-containers.githubusercontent.com"]),
   "github-releases": Object.freeze(["release-assets.githubusercontent.com"]),
   "trivy-db": Object.freeze(["mirror.gcr.io"]),
-  osv: Object.freeze(["api.osv.dev"])
+  osv: Object.freeze(["api.osv.dev"]),
+  [SIGSTORE_SET]: Object.freeze(["rekor.sigstore.dev", "tuf-repo-cdn.sigstore.dev"]),
+  [GITHUB_ATTEST_SET]: Object.freeze(["tmaproduction.blob.core.windows.net", "tuf-repo.github.com"])
 });
+
+// src/engine/zap-active.ts
+var ZAP_ACTIVE_TARGET_ENV = "PIPEGEN_ZAP_TARGET";
+var ZAP_ACTIVE_WORK = "/zap/wrk";
+var ZAP_ACTIVE_PLAN_FILE = "zap-active.yaml";
+var ZAP_ACTIVE_REPORT = "zap-active.json";
+var ZAP_ACTIVE_COMMAND = Object.freeze(["zap.sh", "-autorun", `${ZAP_ACTIVE_WORK}/${ZAP_ACTIVE_PLAN_FILE}`, "-cmd", "-silent"]);
+var ZAP_ACTIVE_POLICY = Object.freeze({ defaultStrength: "medium", defaultThreshold: "medium", maxRuleDurationInMins: 5, maxScanDurationInMins: 30 });
+var ZAP_ACTIVE_SPIDER_MINUTES = 5;
+var ZAP_ACTIVE_PASSIVE_MINUTES = 5;
+var ZAP_ACTIVE_START_MINUTES = 5;
+var ZAP_ACTIVE_CEILING_MINUTES = ZAP_ACTIVE_SPIDER_MINUTES + ZAP_ACTIVE_PASSIVE_MINUTES + ZAP_ACTIVE_POLICY.maxScanDurationInMins + ZAP_ACTIVE_START_MINUTES;
+var T = `\${${ZAP_ACTIVE_TARGET_ENV}}`;
+var ORIGIN = `\\Q${T}\\E(?:/.*)?`;
+var ZAP_ACTIVE_PLAN = [
+  "env:",
+  "  contexts:",
+  "    - name: pipegen",
+  "      urls:",
+  `        - "${T}"`,
+  "      includePaths:",
+  `        - '${ORIGIN}'`,
+  "      excludePaths:",
+  `        - '(?!${ORIGIN}$).*'`,
+  "  parameters:",
+  "    failOnError: true",
+  "    failOnWarning: false",
+  "    progressToStdout: true",
+  "jobs:",
+  "  - type: passiveScan-config",
+  "    parameters:",
+  "      maxAlertsPerRule: 10",
+  "      enableTags: false",
+  "  - type: spider",
+  "    parameters:",
+  "      context: pipegen",
+  `      url: "${T}"`,
+  `      maxDuration: ${ZAP_ACTIVE_SPIDER_MINUTES}`,
+  "  - type: passiveScan-wait",
+  "    parameters:",
+  `      maxDuration: ${ZAP_ACTIVE_PASSIVE_MINUTES}`,
+  "  - type: activeScan",
+  "    parameters:",
+  "      context: pipegen",
+  `      maxRuleDurationInMins: ${ZAP_ACTIVE_POLICY.maxRuleDurationInMins}`,
+  `      maxScanDurationInMins: ${ZAP_ACTIVE_POLICY.maxScanDurationInMins}`,
+  "    policyDefinition:",
+  `      defaultStrength: ${ZAP_ACTIVE_POLICY.defaultStrength}`,
+  `      defaultThreshold: ${ZAP_ACTIVE_POLICY.defaultThreshold}`,
+  "  - type: report",
+  "    parameters:",
+  "      template: traditional-json",
+  `      reportDir: ${ZAP_ACTIVE_WORK}`,
+  `      reportFile: ${ZAP_ACTIVE_REPORT}`,
+  "      reportTitle: pipegen ZAP active scan",
+  ""
+].join("\n");
 
 // src/engine/tool-flags.ts
 var OXLINT_EXTENSIONS = ["js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx", "vue", "astro", "svelte"];
@@ -2003,6 +2067,7 @@ var TEST_COMMANDS = Object.freeze({
 });
 var ESLINT_FILES = "files: ['**/*.{js,mjs,cjs,jsx,vue,svelte,astro}']";
 var ESLINT_TS_FILES = "files: ['**/*.{js,mjs,cjs,jsx,ts,mts,cts,tsx,vue,svelte,astro}']";
+var TRIVY_LICENCE_RESULT = Object.freeze({ tool: "trivy-licence", file: "trivy-licence.json", format: "json", listAll: "--list-all-pkgs" });
 var POLICIES = {
   "trivy-config": { ...DEDICATED("trivy", TRIVY_ASSET, TRIVY_CONFIG), findingsExit: FOUND_10 },
   "trivy-image": { ...DEDICATED("trivy", TRIVY_ASSET, TRIVY_CONFIG), slots: { "": "image-digest" }, findingsExit: FOUND_10 },
@@ -2032,6 +2097,26 @@ var POLICIES = {
     required: { J: null, z: "-silent" },
     mount: { at: "/zap/wrk", source: "work" },
     config: { flag: "-c", content: "# pipegen's pinned ZAP baseline rules: the defaults, nothing ignored\n", fileName: "zap-baseline.conf" }
+  },
+  // G15a round 6 (P-4): the nightly ZAP Automation Framework active scan, the same pinned image. `zap.sh -cmd -silent` (no UI; no add-on
+  // update, no call home) runs the reviewed plan (zap-active.ts) by its absolute path in the work folder (zap.sh reads a relative -autorun
+  // path from /zap); the target comes in the container env (the plan's ${PIPEGEN_ZAP_TARGET}), never as a word. The AF exits 0 with
+  // alerts and 1 on a plan error, so only exit 0 with a report is a scan (no findings exit). Nightly only: never offered for a need.
+  "zap-af-active": {
+    envSlots: { [ZAP_ACTIVE_TARGET_ENV]: "local-url" },
+    network: "host",
+    asImageUser: true,
+    nightlyOnly: true,
+    method: "docker",
+    package: "zaproxy/zap-stable",
+    exe: "zap.sh",
+    dialect: "goflags",
+    sub: [],
+    flags: { cmd: "bool", silent: "bool" },
+    findingsExit: [],
+    required: { cmd: "true", silent: "true" },
+    mount: { at: "/zap/wrk", source: "work" },
+    config: { flag: "-autorun", content: ZAP_ACTIVE_PLAN, fileName: ZAP_ACTIVE_PLAN_FILE, atMount: true }
   },
   // Semgrep CE 1.181.0: rules only from the verified archive (semgrepProblems), no metrics, no version check, and no file-size skip
   // (--max-target-bytes=0: by default semgrep silently skips every file over 1 MB, so padding a file would hide it from SAST; DECISIONS #108)
@@ -2090,7 +2175,10 @@ var POLICIES = {
     required: { output: "spdx-json=sbom.spdx.json" },
     config: { flag: "--config", content: "check-for-app-update: false\n", fileName: "syft.yaml" }
   },
-  cosign: { method: GH, needsSlot: "is run by Plan G's sign job, which adds its own reviewed flags", package: "cosign-linux-amd64", exe: "cosign", dialect: "long", sub: ["sign"], flags: { yes: "bool" }, required: { yes: "true" } },
+  cosign: { method: GH, needsSlot: "is run only by pipegen's own sign job, which adds its own reviewed flags", package: "cosign-linux-amd64", exe: "cosign", dialect: "long", sub: ["sign"], flags: { yes: "bool" }, required: { yes: "true" } },
+  // G15a (B3 d, P-5): the pinned gh release, run only by the attest verify step (signing.ts renderVerifySteps), which adds its own reviewed
+  // flags; never by renderStep. The template is the subcommand alone
+  gh: { method: GH, needsSlot: "is run only by pipegen's own attest verify step (job pipegen-verify), which adds its own reviewed flags", package: "gh_2.103.3_linux_amd64.tar.gz", exe: "gh", dialect: "long", sub: ["attestation", "verify"], flags: {} },
   actionlint: {
     method: GH,
     package: "actionlint_1.7.12_linux_amd64.tar.gz",
@@ -2362,6 +2450,7 @@ var READS_ONLY = [
   "ruff",
   "ruff-format",
   "zap-baseline",
+  "zap-af-active",
   // no config file, but verified rules/templates only, no repo plugin mechanism on the allowlist
   "semgrep",
   "nuclei"
@@ -2370,6 +2459,8 @@ var ARGV_POLICIES = Object.freeze(Object.fromEntries(
   Object.entries(POLICIES).map(([id, pol]) => [id, READS_ONLY.includes(id) ? { ...pol, readsOnly: true } : pol])
 ));
 var sha16 = (text) => createHash("sha256").update(text).digest("hex").slice(0, 16);
+var attestDigestStepId = (repo2) => `pipegen-attest-digest-${sha16(`attest-digest:${repo2}`)}`;
+var attestDigestRef = (repo2) => `\${{ steps.${attestDigestStepId(repo2)}.outputs.digest }}`;
 var stagePath = (artifact) => `\${{ runner.temp }}/pipegen-stage/${artifact}`;
 var isStagedTool = (tool2) => tool2 !== void 0 && Object.hasOwn(ARGV_POLICIES, tool2) && ARGV_POLICIES[tool2]?.staged !== void 0;
 var PIPEGEN_GATE_USES = "crisworking/pipegen/gate";
@@ -2430,7 +2521,8 @@ var ACTION_POLICIES = Object.freeze({
     push: { values: ["false", "true"], as: "choice" }
   },
   "github/codeql-action/upload-sarif": {},
-  "actions/attest": {},
+  // G15a (carry C10): the attestation is stored next to the image in the registry (the attest job logs in to ghcr.io in its digest step)
+  "actions/attest": { "push-to-registry": { values: ["true"], as: "fixed", required: true } },
   // pipegen's own gate action: no inputs of its own to fix or choose; every one is the renderer's (RENDERER_INPUTS below)
   [PIPEGEN_GATE_USES]: {},
   "bullfrogsec/bullfrog": {
@@ -2643,6 +2735,19 @@ var RANGE_BEFORE_REF = `\${{ github.event_name == 'pull_request' && github.event
 var RANGE_EVENT_REF = "${{ github.event_name }}";
 var RANGE_STEP_ENV = Object.freeze({ PIPEGEN_RANGE_BASE: BASE_CHECKOUT_REF, PIPEGEN_RANGE_HEAD: RANGE_HEAD_REF, PIPEGEN_RANGE_BEFORE: RANGE_BEFORE_REF, PIPEGEN_RANGE_EVENT: RANGE_EVENT_REF });
 var rangeScanStepId = `checker-run-${sha16(SECRETS_RANGE_ARTIFACT)}`;
+var HISTORY_STEP_ENV = Object.freeze({ PIPEGEN_HISTORY_HEAD: "${{ github.sha }}" });
+var historyScanStepId = `checker-run-${sha16(SECRETS_HISTORY_ARTIFACT)}`;
+var JOB_TOKEN_REF = "${{ github.token }}";
+var ZIZMOR_ONLINE_HOST = "github.com";
+var ZIZMOR_ONLINE_POLICY = Object.freeze((({ flags: _flags, required: _required, ...rest }) => ({
+  ...rest,
+  flags: { "gh-hostname": { values: [ZIZMOR_ONLINE_HOST] } },
+  required: { "gh-hostname": ZIZMOR_ONLINE_HOST },
+  tokenEnv: "GH_TOKEN"
+}))(ARGV_POLICIES.zizmor));
+var ZIZMOR_ONLINE_STEP_ENV = Object.freeze({ GH_TOKEN: JOB_TOKEN_REF });
+var ZIZMOR_ONLINE_ID = "workflow-lint-online";
+var zizmorOnlineStepId = `tool-run-${sha16(`${RESULT_ARTIFACT_PREFIX}${ZIZMOR_ONLINE_ID}`)}`;
 var RENDERER_INPUTS = Object.freeze({
   // the base commit, for the base-scan job only (the job rule is in job-rules.ts); no other ref is ever set
   "actions/checkout": { ref: { describe: "the event-switched base commit (BASE_CHECKOUT_REF) and nothing else", check: (v) => v === BASE_CHECKOUT_REF } },
@@ -2660,9 +2765,16 @@ var RENDERER_INPUTS = Object.freeze({
   },
   "actions/download-artifact": { name: ARTIFACT_NAME, path: OWN_FOLDER_PATH },
   "github/codeql-action/upload-sarif": { sarif_file: RUNNER_TEMP_PATH, category: rx(/^pipegen-[a-z0-9][a-z0-9-]{0,100}$/, "a category starting pipegen-") },
+  // G15a round 3 (PF-3): the Scorecard docker step reads the job's own token (contents and actions read), never a secret
+  "docker://ghcr.io/ossf/scorecard-action": { repo_token: { describe: "the job's own token (${{ github.token }})", check: (v) => v === "${{ github.token }}" } },
+  // G15a (carry C10): the digest is the run-time output of pipegen's digest step of the same image (the hand-off file image-publish uploaded,
+  // checked as sha256:<64 hex>), never a literal and never another step's output
   "actions/attest": {
     "subject-name": rx(/^(?:ghcr\.io|docker\.io)\/[a-z0-9][a-z0-9._/-]{0,200}$/, "an image name on ghcr.io or docker.io, with no tag"),
-    "subject-digest": rx(/^sha256:[0-9a-f]{64}$/, "a sha256 digest")
+    "subject-digest": rx(/^\$\{\{ steps\.pipegen-attest-digest-[0-9a-f]{16}\.outputs\.digest \}\}$/, "the digest output of pipegen's attest digest step (${{ steps.pipegen-attest-digest-<16 hex>.outputs.digest }}), never a literal", {
+      check: (all) => typeof all["subject-name"] === "string" && all["subject-digest"] === attestDigestRef(all["subject-name"]),
+      describe: "only as the digest step output of the image subject-name names"
+    })
   },
   "docker/build-push-action": {
     file: rx(PLAIN_REL_RE, "a repo-relative file path"),
@@ -2722,6 +2834,10 @@ var RENDERER_INPUTS = Object.freeze({
     // the warn-first checks and their dates (final review fix round A, ruling 3): the nightly's "switch to blocking" issues
     "warn-first": literalInput(["nightly"], warnFirstListProblem, "a JSON list of { needId, since }")
   }
+});
+var DOCKER_STEP_IMAGES = Object.freeze({ "ossf/scorecard-action": "ghcr.io/ossf/scorecard-action" });
+var DOCKER_STEP_INPUTS = Object.freeze({
+  "ossf/scorecard-action": Object.freeze({ repo_token: "${{ github.token }}" })
 });
 
 // src/util/safe-text.ts
@@ -3782,7 +3898,7 @@ function regionSpan(workspace, f, cache) {
     return no("the file cannot be read");
   }
 }
-var PROFILES = Object.freeze(Object.assign(/* @__PURE__ */ Object.create(null), { "trivy-image": "image", nuclei: "web", "zap-baseline": "zap" }));
+var PROFILES = Object.freeze(Object.assign(/* @__PURE__ */ Object.create(null), { "trivy-image": "image", nuclei: "web", "zap-baseline": "zap", "zap-af-active": "zap" }));
 var profileOf = (tool2) => Object.hasOwn(PROFILES, tool2) ? PROFILES[tool2] : "file";
 function uriSlot(f) {
   if (f.file !== void 0) return field(f.file);
@@ -4082,7 +4198,9 @@ var SARIF_TOOLS = Object.freeze(Object.assign(/* @__PURE__ */ Object.create(null
   nuclei: tool("Nuclei", "security-severity", { fileMode: "none", executionSuccessfulFalse: "ignored" }),
   ruff: tool("ruff", "level", { errorRules: ["invalid-syntax", "E999", "E902", "panic"] }),
   gosec: tool("gosec", "tag-word"),
-  bandit: tool("Bandit", "issue-severity")
+  bandit: tool("Bandit", "issue-severity"),
+  // G15a round 3 (PF-3): reported weekly, never gated (a scheduled category: never on the gate's job list); read only to scrub it
+  "scorecard-action": tool("Scorecard", "security-severity", { noFileUri: "no file associated with this alert" })
 }));
 var TRIVY_VULN_MESSAGE = /^Package: [^\n]*\nInstalled Version: [^\n]*\nVulnerability [^\n]*\nSeverity: [^\n]*\nFixed Version: ([^\n]*)(?:\n|$)/;
 function trivyFixable(message) {
@@ -4318,7 +4436,14 @@ function readRun(run, index, toolId, info, opts, limits, notes) {
     }
     let file;
     let uriUnmapped = false;
-    if (uri !== void 0) {
+    const noFile = uri !== void 0 && info.noFileUri !== void 0 && uri === info.noFileUri && (baseId === void 0 || baseId === "%SRCROOT%");
+    if (noFile) {
+      line = void 0;
+      startColumn = void 0;
+      endLine = void 0;
+      endColumn = void 0;
+    }
+    if (uri !== void 0 && !noFile) {
       if (info.fileMode === "none") {
         uriUnmapped = true;
       } else {
@@ -4422,92 +4547,6 @@ function parseSarif(json, toolId, opts = {}) {
 function parseSarifText(input, toolId, opts = {}) {
   const read = readJson(input, limitsFrom(opts.limits).maxBytes);
   return read.toolError === void 0 ? parseSarif(read.json, toolId, opts) : { findings: [], toolError: read.toolError, notes: [] };
-}
-
-// gate/src/zap.ts
-var ZAP_TOOL = "zap-baseline";
-var ZAP_JSON_VERIFIED = false;
-var UNVERIFIED_NOTE = "zap-json parsing is unverified against a real zap-baseline -J report";
-var MAX_PLUGIN_ID = 256;
-var MAX_URL_PATH = 2048;
-var MAX_SITES = 1e3;
-var METHOD = /^[A-Za-z]{1,16}$/;
-function severityOf(v) {
-  const n = typeof v === "number" ? v : typeof v === "string" && /^\d$/.test(v) ? Number(v) : NaN;
-  return n === 3 ? "high" : n === 2 ? "medium" : n === 1 ? "low" : n === 0 ? "info" : void 0;
-}
-function urlPath(uri) {
-  let url;
-  try {
-    url = new URL(uri);
-  } catch {
-    return void 0;
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") return void 0;
-  return url.pathname.length > MAX_URL_PATH ? void 0 : url.pathname;
-}
-function optString(o, key, where, nullOk = false) {
-  const v = getOwn(o, key);
-  if (v === void 0 || nullOk && v === null) return void 0;
-  if (typeof v !== "string") fail(`${where}: ${key} is not a string`);
-  return v;
-}
-function parseZapJson(json, toolId, opts = {}) {
-  return guarded((notes) => {
-    if (toolId !== ZAP_TOOL) fail(`${JSON.stringify(safeText(toolId, 60))} is not a tool whose ZAP report the gate reads`);
-    if (!isObj(json)) fail("the result is not a ZAP report (the top level is not an object)");
-    if (getOwn(json, "@programName") !== "ZAP") fail("the report is not from ZAP (@programName)");
-    const limits = limitsFrom(opts.limits);
-    const sites = getOwn(json, "site");
-    if (!Array.isArray(sites)) fail("the report has no site list");
-    if (sites.length === 0) fail("the report lists no site, so nothing was scanned");
-    if (sites.length > MAX_SITES) fail(`the report lists more than ${MAX_SITES} sites`);
-    const findings = [];
-    let unknownRisk = 0;
-    for (const [s, site] of sites.entries()) {
-      const at3 = `site ${s}`;
-      if (!isObj(site)) fail(`${at3} is not an object`);
-      const alerts = getOwn(site, "alerts");
-      if (!Array.isArray(alerts)) fail(`${at3} has no alerts list`);
-      for (const [a, alert] of alerts.entries()) {
-        const where = `${at3} alert ${a}`;
-        if (!isObj(alert)) fail(`${where} is not an object`);
-        const pluginid = getOwn(alert, "pluginid");
-        if (typeof pluginid !== "string" || pluginid === "" || pluginid.length > MAX_PLUGIN_ID) fail(`${where} has no usable pluginid (${shown(pluginid)})`);
-        const name = optString(alert, "name", where);
-        const title = optString(alert, "alert", where);
-        const risk = getOwn(alert, "riskcode");
-        if (risk !== void 0 && typeof risk !== "string" && typeof risk !== "number") fail(`${where}: riskcode is not a string or a number`);
-        let severity = severityOf(risk);
-        if (severity === void 0) {
-          severity = "high";
-          unknownRisk++;
-        }
-        const message = cutText(name ?? title ?? "", MAX_MESSAGE_CHARS);
-        const instances = optList(alert, "instances", where) ?? [];
-        const make = (file, method, uriUnmapped, uriId) => {
-          if (findings.length >= limits.maxResults) fail(`the report has more than ${limits.maxResults} findings`);
-          findings.push({ tool: toolId, ruleId: pluginid, severity, file, message, method, uriUnmapped, secret: false, ...uriId === void 0 ? {} : { uriId } });
-        };
-        if (instances.length === 0) make(void 0, void 0, false);
-        for (const [n, inst] of instances.entries()) {
-          const w = `${where} instance ${n}`;
-          if (!isObj(inst)) fail(`${w} is not an object`);
-          const uri = optString(inst, "uri", w, true);
-          const method = optString(inst, "method", w, true);
-          const file = uri === void 0 ? void 0 : urlPath(uri);
-          make(file, method !== void 0 && METHOD.test(method) ? method.toUpperCase() : void 0, file === void 0, file === void 0 && uri !== void 0 ? uriIdOf(uri) : void 0);
-        }
-      }
-    }
-    notes.push(UNVERIFIED_NOTE);
-    if (unknownRisk > 0) notes.push(`${unknownRisk} alert(s) had an unknown riskcode and are counted as high`);
-    return findings;
-  });
-}
-function parseZapJsonText(input, toolId, opts = {}) {
-  const read = readJson(input, limitsFrom(opts.limits).maxBytes);
-  return read.toolError === void 0 ? parseZapJson(read.json, toolId, opts) : { findings: [], toolError: read.toolError, notes: [] };
 }
 
 // gate/src/decide.ts
@@ -4672,8 +4711,7 @@ function decideGate(i) {
   for (const c of i.checks) {
     const e = c.entry;
     const floor = isFloorEntry(e);
-    const zapUnverified = e.tool === ZAP_TOOL && !ZAP_JSON_VERIFIED;
-    const level = !floor && (notProvenSet.has(e.needId) || zapUnverified) ? "not-proven" : !e.blocking && !floor ? "advisory" : "required";
+    const level = !floor && notProvenSet.has(e.needId) ? "not-proven" : !e.blocking && !floor ? "advisory" : "required";
     const findings = isFindingsEntry(e);
     const tool2 = e.tool ?? e.needId;
     const name = `${tool2} (${e.job})`;
@@ -4682,7 +4720,7 @@ function decideGate(i) {
     const state = (s) => {
       checks.push({ needId: e.needId, job: e.job, ...e.tool === void 0 ? {} : { tool: e.tool }, judgedBy: findings ? "findings" : "job status", state: uncovered.length === 0 ? s : `${s}; ${uncovered.join("; ")}` });
     };
-    if (level === "not-proven") notProven.push(ref2(zapUnverified && !notProvenSet.has(e.needId) ? "ZAP results are not verified yet, so this DAST check is judged as not proven (warnings only)" : "not proven: warnings only"));
+    if (level === "not-proven") notProven.push(ref2("not proven: warnings only"));
     const toolError2 = (why2, base) => {
       const blocks = level === "required";
       toolErrors.push({ ...ref2(why2), base, blocks });
@@ -5978,14 +6016,16 @@ var RangeFactsError = class extends Error {
 };
 var SKIP_REASONS = ["no-range", "no-merge-base"];
 var isRangeSkipped = (r) => Object.hasOwn(r, "skipped");
+var isHistory = (r) => Object.hasOwn(r, "history");
 var SHA_RE3 = /^[0-9a-f]{40}$/;
 var ZERO = "0".repeat(40);
 var MAX_FACTS_BYTES = 64 * 1024;
 var MAX_COMMITS = 1e7;
 var KEYS = ["base", "before", "canaries", "commits", "forced", "head", "pipegenRange"];
+var HISTORY_KEYS = ["canaries", "commits", "head", "history", "pipegenRange"];
 var CANARY_RULE_ID2 = `secret:${CANARY_RULE}`;
 var isObj2 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
-function parseRangeFacts(text) {
+function parseRangeFacts(text, kind = "range") {
   const bad = (why2) => {
     throw new RangeFactsError(`the commit-range facts ${why2}`);
   };
@@ -5998,6 +6038,12 @@ function parseRangeFacts(text) {
   }
   if (!isObj2(d)) return bad("are not in the form the range scan step writes");
   if (d.pipegenRange !== 1) bad("are of a version this gate does not read");
+  if (kind === "history") {
+    if (Object.keys(d).sort().join() !== HISTORY_KEYS.join() || d.history !== true) return bad("are not the full-history form the history scan step writes");
+    if (typeof d.head !== "string" || !SHA_RE3.test(d.head) || d.head === ZERO) bad("have a head that is not a commit sha");
+    return { history: true, head: d.head, commits: commitsOf(d.commits, bad), canaries: canariesOf(d.canaries, bad) };
+  }
+  if (kind !== "range") bad("are of a kind this gate does not read");
   if (Object.keys(d).sort().join() === "pipegenRange,skipped") {
     if (!SKIP_REASONS.includes(d.skipped)) bad("say the scan was skipped for a reason this gate does not know");
     return { skipped: d.skipped };
@@ -6006,8 +6052,13 @@ function parseRangeFacts(text) {
   for (const k of ["base", "head"]) if (typeof d[k] !== "string" || !SHA_RE3.test(d[k]) || d[k] === ZERO) bad(`have a ${k} that is not a commit sha`);
   if (d.before !== null && (typeof d.before !== "string" || !SHA_RE3.test(d.before) || d.before === ZERO)) bad("have a before that is not a commit sha");
   if (typeof d.forced !== "boolean") bad("do not say whether the push rewrote the branch");
-  if (typeof d.commits !== "number" || !Number.isSafeInteger(d.commits) || d.commits < 0 || d.commits > MAX_COMMITS) bad("have a commit count that is not a whole number");
-  const list = d.canaries;
+  return { base: d.base, head: d.head, before: d.before, forced: d.forced, commits: commitsOf(d.commits, bad), canaries: canariesOf(d.canaries, bad) };
+}
+function commitsOf(v, bad) {
+  if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0 || v > MAX_COMMITS) bad("have a commit count that is not a whole number");
+  return v;
+}
+function canariesOf(list, bad) {
   if (!Array.isArray(list) || list.length !== RANGE_CANARY_FILES.length) return bad(`do not name ${RANGE_CANARY_FILES.length} canary commits`);
   const canaries = list.map((c, i) => {
     if (!isObj2(c) || Object.keys(c).sort().join() !== "commit,path") return bad("have a canary that is not { commit, path }");
@@ -6017,9 +6068,9 @@ function parseRangeFacts(text) {
     return { commit: c.commit, path };
   });
   if (new Set(canaries.map((c) => c.commit)).size !== canaries.length) bad("name one canary commit twice");
-  return { base: d.base, head: d.head, before: d.before, forced: d.forced, commits: d.commits, canaries };
+  return canaries;
 }
-function readRangeFacts(path) {
+function readRangeFacts(path, kind = "range") {
   let st;
   try {
     st = lstatSync3(path);
@@ -6039,7 +6090,7 @@ function readRangeFacts(path) {
       if (n === 0) break;
       got += n;
     }
-    return parseRangeFacts(buf.subarray(0, got).toString("utf8"));
+    return parseRangeFacts(buf.subarray(0, got).toString("utf8"), kind);
   } catch (e) {
     if (e instanceof RangeFactsError) throw e;
     throw new RangeFactsError("the commit-range facts could not be read");
@@ -6066,6 +6117,9 @@ function applyRange(findings, facts) {
   if ((seen[tip] ?? 0) === 0) throw new RangeFactsError(`the scanner did not report the canary of the stream's last commit (${facts.canaries[tip].commit.slice(0, 12)}), so it has not read the commit range to its end`);
   const wrong = facts.canaries.filter((_, i) => seen[i] !== 1);
   if (wrong.length > 0) throw new RangeFactsError(`the scanner did not report the canary of commit ${wrong.map((c) => c.commit.slice(0, 12)).join(" and ")} exactly once, so it is not proven to have read the commit range once`);
+  if (isHistory(facts)) {
+    return { findings: kept, notes: [`the whole history up to ${facts.head.slice(0, 12)} (${facts.commits} commit(s), merges included, every ref of the checkout) was scanned to its end; both canary commits were read`] };
+  }
   const dropped = facts.before === null ? "" : `, and the commits the push replaced (the head before it, ${facts.before.slice(0, 12)})`;
   return {
     findings: kept,
@@ -6079,6 +6133,206 @@ var SKIP_NOTES = Object.freeze({
   "no-range": "no commit range on this event (a push that made the branch, workflow_dispatch or schedule), so no commit range was scanned",
   "no-merge-base": "this push rewrote the history of the branch and its old head is not in the checkout, so its commit range was not scanned"
 });
+
+// gate/src/zap.ts
+var ZAP_TOOL = "zap-baseline";
+var ZAP_AF_TOOL = "zap-af-active";
+var ZAP_TOOLS = /* @__PURE__ */ new Set([ZAP_TOOL, ZAP_AF_TOOL]);
+var MAX_PLUGIN_ID = 256;
+var MAX_URL_PATH = 2048;
+var MAX_SITES = 1e3;
+var METHOD = /^[A-Za-z]{1,16}$/;
+function severityOf(v) {
+  const n = typeof v === "number" ? v : typeof v === "string" && /^\d$/.test(v) ? Number(v) : NaN;
+  return n === 3 ? "high" : n === 2 ? "medium" : n === 1 ? "low" : n === 0 ? "info" : void 0;
+}
+function urlPath(uri) {
+  let url;
+  try {
+    url = new URL(uri);
+  } catch {
+    return void 0;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return void 0;
+  return url.pathname.length > MAX_URL_PATH ? void 0 : url.pathname;
+}
+function optString(o, key, where, nullOk = false) {
+  const v = getOwn(o, key);
+  if (v === void 0 || nullOk && v === null) return void 0;
+  if (typeof v !== "string") fail(`${where}: ${key} is not a string`);
+  return v;
+}
+function parseZapJson(json, toolId, opts = {}) {
+  return guarded((notes) => {
+    if (!ZAP_TOOLS.has(toolId)) fail(`${JSON.stringify(safeText(toolId, 60))} is not a tool whose ZAP report the gate reads`);
+    if (!isObj(json)) fail("the result is not a ZAP report (the top level is not an object)");
+    if (getOwn(json, "@programName") !== "ZAP") fail("the report is not from ZAP (@programName)");
+    const limits = limitsFrom(opts.limits);
+    const sites = getOwn(json, "site");
+    if (!Array.isArray(sites)) fail("the report has no site list");
+    if (sites.length === 0) fail("the report lists no site, so nothing was scanned");
+    if (sites.length > MAX_SITES) fail(`the report lists more than ${MAX_SITES} sites`);
+    const findings = [];
+    let unknownRisk = 0;
+    for (const [s, site] of sites.entries()) {
+      const at3 = `site ${s}`;
+      if (!isObj(site)) fail(`${at3} is not an object`);
+      const alerts = getOwn(site, "alerts");
+      if (!Array.isArray(alerts)) fail(`${at3} has no alerts list`);
+      for (const [a, alert] of alerts.entries()) {
+        const where = `${at3} alert ${a}`;
+        if (!isObj(alert)) fail(`${where} is not an object`);
+        const pluginid = getOwn(alert, "pluginid");
+        if (typeof pluginid !== "string" || pluginid === "" || pluginid.length > MAX_PLUGIN_ID) fail(`${where} has no usable pluginid (${shown(pluginid)})`);
+        const name = optString(alert, "name", where);
+        const title = optString(alert, "alert", where);
+        const risk = getOwn(alert, "riskcode");
+        if (risk !== void 0 && typeof risk !== "string" && typeof risk !== "number") fail(`${where}: riskcode is not a string or a number`);
+        let severity = severityOf(risk);
+        if (severity === void 0) {
+          severity = "high";
+          unknownRisk++;
+        }
+        const message = cutText(name ?? title ?? "", MAX_MESSAGE_CHARS);
+        const instances = optList(alert, "instances", where) ?? [];
+        const make = (file, method, uriUnmapped, uriId) => {
+          if (findings.length >= limits.maxResults) fail(`the report has more than ${limits.maxResults} findings`);
+          findings.push({ tool: toolId, ruleId: pluginid, severity, file, message, method, uriUnmapped, secret: false, ...uriId === void 0 ? {} : { uriId } });
+        };
+        if (instances.length === 0) make(void 0, void 0, false);
+        for (const [n, inst] of instances.entries()) {
+          const w = `${where} instance ${n}`;
+          if (!isObj(inst)) fail(`${w} is not an object`);
+          const uri = optString(inst, "uri", w, true);
+          const method = optString(inst, "method", w, true);
+          const file = uri === void 0 ? void 0 : urlPath(uri);
+          make(file, method !== void 0 && METHOD.test(method) ? method.toUpperCase() : void 0, file === void 0, file === void 0 && uri !== void 0 ? uriIdOf(uri) : void 0);
+        }
+      }
+    }
+    if (unknownRisk > 0) notes.push(`${unknownRisk} alert(s) had an unknown riskcode and are counted as high`);
+    return findings;
+  });
+}
+function parseZapJsonText(input, toolId, opts = {}) {
+  const read = readJson(input, limitsFrom(opts.limits).maxBytes);
+  return read.toolError === void 0 ? parseZapJson(read.json, toolId, opts) : { findings: [], toolError: read.toolError, notes: [] };
+}
+
+// gate/src/trivy-licence.ts
+var TRIVY_LICENCE_TOOL = TRIVY_LICENCE_RESULT.tool;
+var NO_LICENCE_RULE_SUFFIX = ":no-licence-data";
+var SEVERITY = Object.freeze(Object.assign(/* @__PURE__ */ Object.create(null), {
+  CRITICAL: "critical",
+  HIGH: "high",
+  MEDIUM: "medium",
+  LOW: "low",
+  UNKNOWN: "info"
+}));
+var PACKAGE_CLASSES = /* @__PURE__ */ new Set(["lang-pkgs", "os-pkgs"]);
+var LICENCE_CLASSES = /* @__PURE__ */ new Set(["license", "license-file"]);
+var MAX_RESULTS = 1e5;
+function ownText(o, key, where, required) {
+  const v = getOwn(o, key);
+  if (v === void 0 && !required) return "";
+  if (typeof v !== "string" || required && v === "") fail(`${where}: ${key} is not a non-empty string (${shown(v)})`);
+  if (v.length > MAX_ID_CHARS) fail(`${where}: ${key} is longer than ${MAX_ID_CHARS}`);
+  return v;
+}
+function ownList(o, key, where) {
+  const v = getOwn(o, key);
+  if (v === void 0 || v === null) return [];
+  if (!Array.isArray(v)) fail(`${where}: ${key} is not a list`);
+  return v;
+}
+function parseTrivyLicenceJson(json, toolId, opts = {}) {
+  return guarded((notes) => {
+    if (toolId !== TRIVY_LICENCE_TOOL) fail(`${JSON.stringify(safeText(toolId, 60))} is not a tool whose Trivy licence JSON the gate reads`);
+    if (!isObj(json)) fail("the result is not a Trivy JSON report (the top level is not an object)");
+    if (getOwn(json, "SchemaVersion") !== 2) fail(`the report's SchemaVersion is ${shown(getOwn(json, "SchemaVersion"))}, not 2 (the pinned trivy's)`);
+    if (getOwn(json, "ArtifactType") !== "filesystem") fail("the report is not of a filesystem scan (ArtifactType)");
+    const limits = limitsFrom(opts.limits);
+    const results = ownList(json, "Results", "the report");
+    if (results.length > MAX_RESULTS) fail(`the report has more than ${MAX_RESULTS} results`);
+    const findings = [];
+    let unknownSeverity = 0;
+    let unmapped = 0;
+    const push = (ruleId, severity, path, message) => {
+      if (findings.length >= limits.maxResults) fail(`the report has more than ${limits.maxResults} findings`);
+      const file = normaliseUri(path, { encoding: "raw" });
+      if (file === void 0) unmapped++;
+      findings.push({
+        tool: toolId,
+        ruleId: cutText(ruleId, MAX_ID_CHARS),
+        severity,
+        file,
+        line: 1,
+        message: cutText(message, MAX_MESSAGE_CHARS),
+        uriUnmapped: file === void 0,
+        secret: false,
+        ...file === void 0 ? { uriId: uriIdOf(path) } : {}
+      });
+    };
+    for (const [n, r] of results.entries()) {
+      const at3 = `result ${n}`;
+      if (!isObj(r)) fail(`${at3} is not an object`);
+      const target = ownText(r, "Target", at3, true);
+      const cls = ownText(r, "Class", at3, true);
+      if (PACKAGE_CLASSES.has(cls)) {
+        for (const [k, p] of ownList(r, "Packages", at3).entries()) {
+          const where = `${at3} package ${k}`;
+          if (!isObj(p)) fail(`${where} is not an object`);
+          const name = ownText(p, "Name", where, true);
+          const lics = ownList(p, "Licenses", where);
+          for (const l of lics) if (typeof l !== "string") fail(`${where}: Licenses holds a value that is not a string`);
+          if (lics.length > 0) continue;
+          push(
+            `${name}${NO_LICENCE_RULE_SUFFIX}`,
+            "info",
+            target,
+            `Artifact: ${target}
+PkgName: ${name}
+ No licence data: the package names no licence, so it counts as Unknown (a person checks it)`
+          );
+        }
+      } else if (LICENCE_CLASSES.has(cls)) {
+        for (const [k, l] of ownList(r, "Licenses", at3).entries()) {
+          const where = `${at3} licence ${k}`;
+          if (!isObj(l)) fail(`${where} is not an object`);
+          const name = ownText(l, "Name", where, true);
+          const pkg = ownText(l, "PkgName", where, false);
+          const path = ownText(l, "FilePath", where, false) || target;
+          const category = ownText(l, "Category", where, false);
+          const word = ownText(l, "Severity", where, false);
+          let severity = Object.hasOwn(SEVERITY, word) ? SEVERITY[word] : void 0;
+          if (severity === void 0) {
+            severity = "high";
+            unknownSeverity++;
+          }
+          push(
+            pkg === "" ? name : `${pkg}:${name}`,
+            severity,
+            path,
+            `Artifact: ${target}
+License ${name}
+PkgName: ${pkg}
+ Classification: ${category}
+ Path: ${path}`
+          );
+        }
+      } else {
+        fail(`${at3} is of class ${shown(cls)}, which the licence reader does not know`);
+      }
+    }
+    if (unknownSeverity > 0) notes.push(`${unknownSeverity} licence(s) had an unknown severity and are counted as high`);
+    if (unmapped > 0) notes.push(`${unmapped} finding(s) had a path that could not be mapped to a repository file`);
+    return findings;
+  });
+}
+function parseTrivyLicenceJsonText(input, toolId, opts = {}) {
+  const read = readJson(input, limitsFrom(opts.limits).maxBytes);
+  return read.toolError === void 0 ? parseTrivyLicenceJson(read.json, toolId, opts) : { findings: [], toolError: read.toolError, notes: [] };
+}
 
 // gate/src/scrub.ts
 var MAX_ERROR_CHARS = 300;
@@ -6128,8 +6382,9 @@ function withholder() {
     return v;
   };
 }
+var ZAP_SARIF_DRIVER = "ZAP";
 function sarifOut(tool2, findings, notes, key, extra = {}) {
-  const info = SARIF_TOOLS[tool2];
+  const info = tool2 === ZAP_AF_TOOL ? { driver: ZAP_SARIF_DRIVER } : SARIF_TOOLS[tool2];
   const withheld = withholder();
   const results = findings.map((f) => {
     const hide = withheld(f.file);
@@ -6221,10 +6476,10 @@ function scrubBytes(raw, opts) {
           return toolError(e instanceof StageError ? e.message : "the stage folder could not be read", key);
         }
       }
-      parsed = opts.range !== void 0 ? parseSarifText(raw, opts.tool, { commits: true, limits: { maxBytes } }) : stage === void 0 ? parseSarifText(raw, opts.tool, { workspace: opts.workspace, limits: { maxBytes } }) : parseSarifText(raw, opts.tool, { workspace: stage.files, exactNames: STAGED_NAME_RE, limits: { maxBytes } });
+      parsed = opts.tool === TRIVY_LICENCE_TOOL ? parseTrivyLicenceJsonText(raw, opts.tool, { limits: { maxBytes } }) : opts.range !== void 0 ? parseSarifText(raw, opts.tool, { commits: true, limits: { maxBytes } }) : stage === void 0 ? parseSarifText(raw, opts.tool, { workspace: opts.workspace, limits: { maxBytes } }) : parseSarifText(raw, opts.tool, { workspace: stage.files, exactNames: STAGED_NAME_RE, limits: { maxBytes } });
     } else if (opts.format === "zap-json") {
       if (opts.stage !== void 0 || opts.range !== void 0) return toolError("a stage folder or a commit range is only for the secrets tools", key);
-      if (opts.tool !== ZAP_TOOL) return toolError(`${JSON.stringify(safeText(opts.tool, 60))} is not a tool whose ZAP report the gate reads`, key);
+      if (!ZAP_TOOLS.has(opts.tool)) return toolError(`${JSON.stringify(safeText(opts.tool, 60))} is not a tool whose ZAP report the gate reads`, key);
       parsed = parseZapJsonText(raw, opts.tool, { limits: { maxBytes } });
     } else {
       return toolError("the result format is not one the gate reads", key);
@@ -6263,7 +6518,7 @@ function scrubBytes(raw, opts) {
       ...opts.range === void 0 ? {} : { regionOf: () => ({ ok: false, reason: "a secret in a commit of the range (the checkout's file is not that commit's)" }) }
     });
     const notes = [...parsed.notes, ...lineNotes(findings)].slice(0, MAX_NOTES).map((n) => clip(maskSecretShapes(n), MAX_NOTE_CHARS));
-    const bytes = Buffer.from(opts.format === "sarif" ? sarifOut(opts.tool, findings, notes, usedKey) : zapOut(findings, notes), "utf8");
+    const bytes = Buffer.from(opts.format === "sarif" || opts.tool === ZAP_AF_TOOL ? sarifOut(opts.tool, findings, notes, usedKey) : zapOut(findings, notes), "utf8");
     const written = bytes.toString("utf8");
     const holds = (text) => bytes.includes(text) || written.includes(JSON.stringify(text).slice(1, -1));
     if (usedKey !== void 0 && holds(usedKey)) return toolError("the output would hold the key, so it was not written", key);
@@ -6495,10 +6750,10 @@ function scrubFile(opts) {
     return fail1("the key could not be masked in the logs, so the scrub did not run");
   }
   let range;
-  if (opts.artifact === SECRETS_RANGE_ARTIFACT) {
+  if (opts.artifact === SECRETS_RANGE_ARTIFACT || opts.artifact === SECRETS_HISTORY_ARTIFACT) {
     if (opts.stage !== void 0) return fail1("the commit-range scan has no stage folder");
     try {
-      range = readRangeFacts(join3(dirname2(opts.raw), RANGE_FACTS_FILE));
+      range = readRangeFacts(join3(dirname2(opts.raw), RANGE_FACTS_FILE), opts.artifact === SECRETS_HISTORY_ARTIFACT ? "history" : "range");
     } catch (e) {
       return fail1(e instanceof RangeFactsError ? e.message : "the commit-range facts could not be read");
     }
@@ -7942,9 +8197,22 @@ function tokens(line) {
 function codeOwners(text) {
   if (typeof text !== "string") return [];
   const rules = [];
+  const canOwn = (raw) => {
+    const t = raw.trim();
+    return t !== "" && !t.startsWith("#");
+  };
   for (const raw of text.split(/\r?\n/)) {
-    if (rules.length >= MAX_RULES) break;
-    if (raw.length > MAX_LINE) continue;
+    if (rules.length >= MAX_RULES) {
+      if (canOwn(raw)) {
+        rules.push({ pattern: "", owners: [], unreadable: "count" });
+        break;
+      }
+      continue;
+    }
+    if (raw.length > MAX_LINE) {
+      if (canOwn(raw)) rules.push({ pattern: "", owners: [], unreadable: "line" });
+      continue;
+    }
     const t = tokens(raw.trim());
     const pattern = t[0];
     if (pattern === void 0) continue;
@@ -7964,7 +8232,12 @@ function codeOwners(text) {
   }
   return rules;
 }
+var STAR = 0;
+var ANY = 1;
 var compiled = /* @__PURE__ */ new WeakMap();
+var MAX_RULE_SEGMENTS = 64;
+var OWNERS_STEP_BUDGET = 4e8;
+var RULE_VISIT_STEPS = 16;
 function compile(rule) {
   const got = compiled.get(rule);
   if (got !== void 0) return got;
@@ -7975,6 +8248,11 @@ function compile(rule) {
   if (p.startsWith("/")) p = p.slice(1);
   let parts = p.split("/");
   if (!anchored) parts = ["**", ...parts];
+  if (parts.length > MAX_RULE_SEGMENTS) {
+    const c2 = { segs: [], dirOnly, ancestors: false, tooLong: true };
+    compiled.set(rule, c2);
+    return c2;
+  }
   const segs = parts.map((part, idx) => {
     if (part === "**") return idx === parts.length - 1 ? { kind: "globstar+" } : { kind: "globstar" };
     const toks = [];
@@ -7985,74 +8263,93 @@ function compile(rule) {
         continue;
       }
       if (c2 === "*") {
-        if (toks[toks.length - 1] !== "*") toks.push("*");
+        if (toks[toks.length - 1] !== STAR) toks.push(STAR);
         continue;
       }
-      toks.push(c2 === "?" ? "?" : c2);
+      toks.push(c2 === "?" ? ANY : c2);
     }
     return { kind: "glob", toks };
   });
-  const last = parts[parts.length - 1];
-  const ancestors = dirOnly || !/[*?]/.test(last);
-  const c = { segs, dirOnly, ancestors };
+  const lastSeg = segs[segs.length - 1];
+  const ancestors = dirOnly || lastSeg.kind === "glob" && !lastSeg.toks.some((t) => t === STAR || t === ANY);
+  const c = { segs, dirOnly, ancestors, tooLong: false };
   compiled.set(rule, c);
   return c;
 }
-function segMatch(toks, s) {
+function segMatch(toks, s, steps) {
   let t = 0;
   let i = 0;
   let star = -1;
   let mark = 0;
+  let n = 0;
+  let r;
   while (i < s.length) {
+    n++;
     const k = toks[t];
-    if (k === "*") {
+    if (k === STAR) {
       star = t++;
       mark = i;
-    } else if (k !== void 0 && (k === "?" || k === s[i])) {
+    } else if (k !== void 0 && (k === ANY || k === s[i])) {
       t++;
       i++;
     } else if (star >= 0) {
       t = star + 1;
       i = ++mark;
-    } else return false;
-  }
-  while (toks[t] === "*") t++;
-  return t === toks.length;
-}
-function matchesPrefix(c, parts, end) {
-  const memo = /* @__PURE__ */ new Map();
-  const go = (pi, si) => {
-    const key = pi * (end + 1) + si;
-    const hit = memo.get(key);
-    if (hit !== void 0) return hit;
-    let r;
-    const seg = c.segs[pi];
-    if (seg === void 0) r = si === end;
-    else if (seg.kind === "globstar+") r = si < end;
-    else if (seg.kind === "globstar") {
+    } else {
       r = false;
-      for (let j = si; j <= end && !r; j++) r = go(pi + 1, j);
-    } else r = si < end && segMatch(seg.toks, parts[si]) && go(pi + 1, si + 1);
-    memo.set(key, r);
-    return r;
-  };
-  return go(0, 0);
+      break;
+    }
+  }
+  if (r === void 0) {
+    while (toks[t] === STAR) {
+      t++;
+      n++;
+    }
+    r = t === toks.length;
+  }
+  steps.left -= n + 1;
+  return steps.left < 0 ? null : r;
 }
-function ruleMatches(rule, parts) {
-  const c = compile(rule);
-  for (let k = 1; k <= parts.length; k++) {
-    if (k === parts.length) {
-      if (!c.dirOnly && matchesPrefix(c, parts, k)) return true;
-    } else if (c.ancestors && matchesPrefix(c, parts, k)) return true;
+function ruleMatches(c, parts, steps) {
+  const n = parts.length;
+  let reach = [0];
+  for (const seg of c.segs) {
+    let next = [];
+    if (seg.kind === "glob") {
+      for (const j of reach) {
+        if (j >= n) continue;
+        const m = segMatch(seg.toks, parts[j], steps);
+        if (m === null) return null;
+        if (m) next.push(j + 1);
+      }
+    } else {
+      const from = reach[0] + (seg.kind === "globstar+" ? 1 : 0);
+      if ((steps.left -= n + 1 - from) < 0) return null;
+      next = [];
+      for (let j = from; j <= n; j++) next.push(j);
+    }
+    if (next.length === 0) return false;
+    reach = next;
+  }
+  for (const k of reach) {
+    if (k === n ? !c.dirOnly : k >= 1 && c.ancestors) return true;
   }
   return false;
 }
-function ownersOf(rules, path) {
+function ownersLookup(rules, path, steps = { left: OWNERS_STEP_BUDGET }) {
   const parts = path.split("/");
-  if (parts.length > 256 || parts.includes("")) return void 0;
-  let owners;
-  for (const r of rules) if (ruleMatches(r, parts)) owners = r.owners;
-  return owners;
+  if (parts.length > 256 || parts.includes("")) return { unresolved: "path" };
+  for (let i = rules.length - 1; i >= 0; i--) {
+    const r = rules[i];
+    if ((steps.left -= RULE_VISIT_STEPS) < 0) return { unresolved: "budget" };
+    if (r.unreadable !== void 0) return { unresolved: "unreadable" };
+    const c = compile(r);
+    if (c.tooLong) return { unresolved: "segments" };
+    const m = ruleMatches(c, parts, steps);
+    if (m === null) return { unresolved: "budget" };
+    if (m) return { owners: r.owners };
+  }
+  return { owners: void 0 };
 }
 var PIPEGEN_BLOCK_BEGIN = "# pipegen:begin";
 var PIPEGEN_BLOCK_END = "# pipegen:end";
@@ -8285,6 +8582,12 @@ async function buildPrDiff(gh, repo2, baseSha, headSha) {
   const r = addedLinesOf(files);
   return { added: r.added, complete: ok && r.complete, commit: headSha };
 }
+var UNRESOLVED_HOW = {
+  segments: ` The gate could not work out the code owners of this path: a CODEOWNERS rule of the base commit that could decide it has over ${MAX_RULE_SEGMENTS} segments, so nobody can approve: shorten that rule, or merge with an administrator bypass.`,
+  budget: " The gate could not work out the code owners of this path within its step budget (the paths are too deep for the CODEOWNERS rules of the base commit), so nobody can approve: shorten the paths, or merge with an administrator bypass.",
+  path: " The gate could not work out the code owners of this path: it has more than 256 parts or an empty part, so nobody can approve: shorten the path, or merge with an administrator bypass.",
+  unreadable: ` The gate could not work out the code owners of this path: the CODEOWNERS file of the base commit has a line over 4,096 characters or over 100,000 rules, which the gate does not read, so nobody can approve: shorten or split the file, or merge with an administrator bypass.`
+};
 var fp = (...parts) => createHash6("sha256").update(parts.join("\0")).digest("hex");
 function integrityFindings(pr, protectedPaths, rules, extra = {}) {
   const out = [];
@@ -8292,9 +8595,24 @@ function integrityFindings(pr, protectedPaths, rules, extra = {}) {
   const approvals = new Set(pr.approvals.map((a) => a.toLowerCase()));
   const isProtected = pathMatcher(protectedPaths);
   const blockOwners = extra.codeowners?.problem === void 0 && Array.isArray(extra.codeowners?.blockOwners) ? extra.codeowners.blockOwners.map((o) => String(o).toLowerCase()) : [];
-  const waived = (path) => (ownersOf(rules, path) ?? []).some((o) => approvals.has(o));
+  const steps = { left: typeof extra.ownerSteps === "number" ? extra.ownerSteps : OWNERS_STEP_BUDGET };
+  const lookups = /* @__PURE__ */ new Map();
+  const lookup = (path) => {
+    let r = lookups.get(path);
+    if (r === void 0) {
+      r = ownersLookup(rules, path, steps);
+      lookups.set(path, r);
+    }
+    return r;
+  };
+  const waived = (path) => {
+    const r = lookup(path);
+    return "owners" in r && (r.owners ?? []).some((o) => approvals.has(o));
+  };
   const waivedFile = (path) => {
-    const o = ownersOf(rules, path);
+    const r = lookup(path);
+    if (!("owners" in r)) return false;
+    const o = r.owners;
     return (o === void 0 || o.length === 0 ? blockOwners : o).some((x) => approvals.has(x));
   };
   const push = (ruleId, severity, file, message, key, line) => {
@@ -8308,7 +8626,9 @@ function integrityFindings(pr, protectedPaths, rules, extra = {}) {
     if (rules.length === 0) {
       return extra.codeowners?.found != null ? " CODEOWNERS of the base commit has no rule that names a user, so nobody can approve: add one, or merge with an administrator bypass." : " The base commit has no CODEOWNERS, so nobody can approve: add one (user owners, not only teams), or merge with an administrator bypass.";
     }
-    const o = ownersOf(rules, path);
+    const r = lookup(path);
+    if ("unresolved" in r) return UNRESOLVED_HOW[r.unresolved];
+    const o = r.owners;
     if ((o === void 0 || o.length === 0) && file && blockOwners.length > 0) {
       return " No CODEOWNERS rule names a user owner of this file, so an owner listed in pipegen's CODEOWNERS block (a user with write access, not the author) must approve the pull request on its current head commit.";
     }
@@ -9376,7 +9696,7 @@ async function findGatedRun(gh0, repo2, sha3, o) {
 import { createHash as createHash7 } from "node:crypto";
 
 // gate/src/generated/gate-view.ts
-var GATE_VERSION = "0.2.2";
+var GATE_VERSION = "0.2.3";
 var GATE_VIEW = [
   {
     "id": "actions-checkout",
@@ -9473,6 +9793,14 @@ var GATE_VIEW = [
       ".zap/**"
     ],
     "outputFile": "zap.json"
+  },
+  {
+    "id": "zap-af-active",
+    "categories": [
+      "dast"
+    ],
+    "configFiles": [],
+    "outputFile": "zap-active.json"
   },
   {
     "id": "trivy-config",
@@ -9589,6 +9917,13 @@ var GATE_VIEW = [
     "id": "cosign",
     "categories": [
       "signing"
+    ],
+    "configFiles": []
+  },
+  {
+    "id": "gh",
+    "categories": [
+      "deploy-verify"
     ],
     "configFiles": []
   },
@@ -9764,7 +10099,7 @@ var GATE_VIEW = [
       ".trivyignore.yaml",
       "trivy-secret.yaml"
     ],
-    "outputFile": "trivy-licence.sarif"
+    "outputFile": "trivy-licence.json"
   },
   {
     "id": "dependency-review-action",

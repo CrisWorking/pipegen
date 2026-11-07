@@ -47,6 +47,7 @@ import { expectedPins, loadNpmClosure, NpmClosureError } from './npm-closure.js'
 import { lastValue, parseArgv, type ParsedArgv } from './argv.js';
 import {
   ACTION_POLICIES, ARGV_POLICIES, DOCKER_ACTION_USES, BETTERLEAKS_FORBIDDEN_FLAGS, type InputSpec, BETTERLEAKS_FORBIDDEN_SUBCOMMANDS, BETTERLEAKS_SUBCOMMANDS, SECRETS_SCAN_CONFIG, type ArgvPolicy, type CommandPolicy, type FlagSpec,
+  TRIVY_LICENCE_RESULT,
 } from './tool-flags.js';
 import { BETTERLEAKS_GRAMMAR, NUCLEI_GRAMMAR, TRIVY_GRAMMAR, type FlagGrammar } from './tool-grammar.js';
 import { levenshtein, neverImage, neverListed } from './never-list.js';
@@ -157,8 +158,23 @@ const KEY_URL_RE = /^https:\/\/raw\.githubusercontent\.com\/([A-Za-z0-9-]{1,39})
  * by the sha256 of the reviewed binary, and the attestation is recorded in its entry comment as information only.
  */
 export const MUST_VERIFY: ReadonlySet<string> = new Set([
-  'betterleaks/betterleaks', 'aquasecurity/trivy', 'stackrox/kube-linter', 'securego/gosec',
+  'betterleaks/betterleaks', 'aquasecurity/trivy', 'stackrox/kube-linter', 'securego/gosec', 'cli/cli',
 ]);
+
+/**
+ * The one reviewed branch signer (G15a round 3, item c): cli/cli builds its releases with deployment.yml on trunk, started by
+ * workflow_dispatch, so its build-provenance attestation has no tag identity to bind. It is accepted only as this exact identity, a GitHub
+ * attestation of the pinned asset itself (the install package, whose sha256 is the pin), with the source commit the attestation recorded
+ * (sourceDigest). Checked live 2026-11-06 with an independent gh (progress LIVE line; L/fixtures-G15/v.json). Every other repo: tag only.
+ * Controller ruling G15a-R7 (spec 6): ACCEPTED. gh's release attestations are signed by
+ * cli/cli/.github/workflows/deployment.yml@refs/heads/trunk (verified live 2026-11-07 with a negative control).
+ */
+export const BRANCH_SIGNERS: Readonly<Record<string, string>> = Object.freeze({
+  'cli/cli': 'https://github.com/cli/cli/.github/workflows/deployment.yml@refs/heads/trunk',
+});
+const COMMIT_RE = /^[0-9a-f]{40}$/;
+/** A MUST_VERIFY repo whose tool is not named like the repo: cli/cli's tool is gh (a repo or package named `cli` is not gh). */
+const MUST_VERIFY_TOOL: Readonly<Record<string, string>> = Object.freeze({ 'cli/cli': 'gh' });
 
 /**
  * A value pipegen writes into a workflow: bounded, never a workflow expression, and printable (one line; only a
@@ -207,7 +223,7 @@ const stepSchema = z.strictObject({
     env: z.record(z.string().regex(ENV_RE), safeValue).optional(),
   }).optional(),
   // an output path starts with a letter, digit, `.` or `_` (review M-R2: never a word a tool could read as a flag)
-  output: z.strictObject({ path: z.union([z.literal(''), z.string().regex(REL_GLOB_RE).regex(/^[A-Za-z0-9._]/, 'an output path starts with a letter, a digit, . or _')]), format: z.enum(['sarif', 'junit', 'zap-json', 'none']) }),
+  output: z.strictObject({ path: z.union([z.literal(''), z.string().regex(REL_GLOB_RE).regex(/^[A-Za-z0-9._]/, 'an output path starts with a letter, a digit, . or _')]), format: z.enum(['sarif', 'junit', 'zap-json', 'json', 'none']) }),
 });
 
 const fixedSchema = z.strictObject({
@@ -226,6 +242,8 @@ const keylessSchema = z.strictObject({
   asset: z.string().max(255),
   identity: z.string().max(400),
   issuer: z.literal(OIDC_ISSUER),
+  /** The source commit the attestation records: required for a branch signer (BRANCH_SIGNERS), refused otherwise. */
+  sourceDigest: z.string().max(64).optional(),
   verifiedOn: z.string().max(10),
 });
 /** A check with a cosign key held in the entry's own repo (P10: kube-linter, gosec). */
@@ -243,6 +261,11 @@ const entrySchema = z.strictObject({
   languages: z.array(z.enum(LANGUAGES)).min(1),
   /** Server-recorded date of the pinned release (cooldown, ruling S26); file metadata, not returned. */
   releasedAt: z.string().regex(ISO_RE),
+  /**
+   * G15a: when this entry was pinned, for an entry added after the list's own pinnedOn (never before it, never in the future). Its cooldown,
+   * reviewedAt and verifiedOn count from it; every other entry keeps the list's. File metadata, not returned.
+   */
+  pinnedOn: z.string().regex(ISO_RE).optional(),
   candidate: candidateSchema,
   step: stepSchema,
   fixedInputs: fixedSchema,
@@ -282,16 +305,25 @@ const fileSchema = z.strictObject({
   // a pinnedOn in the future would let a release younger than the cooldown through
   if (!(pinnedOn <= Date.now())) ctx.addIssue({ code: 'custom', path: ['pinnedOn'], message: 'pinnedOn is in the future: the cooldown is measured from it' });
   f.tools.forEach((t, i) => {
-    if (t.reviewedAt !== PENDING && DATE_RE.test(t.reviewedAt) && t.reviewedAt < pinnedDay) {
-      ctx.addIssue({ code: 'custom', path: ['tools', i, 'reviewedAt'], message: `reviewedAt is before pinnedOn (${pinnedDay}): the review must cover the pins as they are` });
+    // G15a: an entry pinned after the list carries its own pin day, never earlier than the list's and never in the future
+    let at = pinnedOn;
+    let day = pinnedDay;
+    if (t.pinnedOn !== undefined) {
+      at = Date.parse(t.pinnedOn);
+      day = t.pinnedOn.slice(0, 10);
+      if (!(at >= pinnedOn)) ctx.addIssue({ code: 'custom', path: ['tools', i, 'pinnedOn'], message: `the entry's pinnedOn is before the list's (${f.pinnedOn}): an entry is never pinned earlier than the list` });
+      if (!(at <= Date.now())) ctx.addIssue({ code: 'custom', path: ['tools', i, 'pinnedOn'], message: 'the entry\'s pinnedOn is in the future: the cooldown is measured from it' });
+    }
+    if (t.reviewedAt !== PENDING && DATE_RE.test(t.reviewedAt) && t.reviewedAt < day) {
+      ctx.addIssue({ code: 'custom', path: ['tools', i, 'reviewedAt'], message: `reviewedAt is before pinnedOn (${day}): the review must cover the pins as they are` });
     }
     // pipegen's own repository is exempt (C6): its code is reviewed in this repository; the exact repo, nothing else
-    if (!(t.candidate.kind === 'action' && t.candidate.repo === PIPEGEN_OWN_REPO) && !(pinnedOn - Date.parse(t.releasedAt) >= COOLDOWN_DAYS * DAY_MS)) {
+    if (!(t.candidate.kind === 'action' && t.candidate.repo === PIPEGEN_OWN_REPO) && !(at - Date.parse(t.releasedAt) >= COOLDOWN_DAYS * DAY_MS)) {
       ctx.addIssue({ code: 'custom', path: ['tools', i, 'releasedAt'], message: `the release must be at least ${COOLDOWN_DAYS} days older than pinnedOn (cooldown, ruling S26)` });
     }
     // PS24: the signature check must cover the pins as they are
-    if (t.verifiedWith !== undefined && t.verifiedWith.verifiedOn < pinnedDay) {
-      ctx.addIssue({ code: 'custom', path: ['tools', i, 'verifiedWith', 'verifiedOn'], message: `verifiedOn is before pinnedOn (${pinnedDay}): the signature check must cover the pins as they are` });
+    if (t.verifiedWith !== undefined && t.verifiedWith.verifiedOn < day) {
+      ctx.addIssue({ code: 'custom', path: ['tools', i, 'verifiedWith', 'verifiedOn'], message: `verifiedOn is before pinnedOn (${day}): the signature check must cover the pins as they are` });
     }
   });
 });
@@ -397,6 +429,8 @@ function entryProblems(e: Entry): { message: string; path: (string | number)[] }
   // ---- outputs: platform entries scan nothing ----
   const output = e.step.output;
   if ((output.format === 'none') !== (output.path === '')) bad("output.path is '' exactly when output.format is none", 'step', 'output');
+  // G15a-R7 spec 7: json is Trivy's licence JSON, which only the scrub of trivy-licence reads (gate/src/trivy-licence.ts); no other entry declares it
+  if (output.format === 'json' && e.id !== TRIVY_LICENCE_RESULT.tool) bad(`output.format json is only trivy's licence scan (${TRIVY_LICENCE_RESULT.tool}), whose JSON the gate's scrub reads; every other findings tool writes sarif or zap-json`, 'step', 'output');
   if (e.categories.includes('platform') && output.format !== 'none') bad("a platform entry has output { path: '', format: 'none' }", 'step', 'output');
 
   // ---- fixed inputs are set by the template; choices never cover them ----
@@ -462,7 +496,12 @@ function entryProblems(e: Entry): { message: string; path: (string | number)[] }
       const at = args.flatMap((a, i) => (a === '-z' || a.startsWith('-z') ? [i] : []));
       return at.length === 1 && args[at[0] as number] === '-z' && args[(at[0] as number) + 1] === '-silent';
     };
-    if (!silent(cli?.command ?? []) || !silent(fx.args ?? [])) bad('the ZAP entry must pass exactly one -z, with the value -silent (in the command and fixedInputs.args): no add-on downloads at run time', 'step', 'cli', 'command');
+    // G15a round 6: the AF entry runs zap.sh itself, where -silent is a switch of its own (no add-on update, no call home); its argv policy
+    // allows only -cmd and -silent and requires both, so here it must hold -silent in the command and fixedInputs.args, and no -z
+    const afSilent = (args: readonly string[]) => args.includes('-silent') && !args.some((a) => a.startsWith('-z'));
+    if (cli?.command[0] === 'zap.sh') {
+      if (!afSilent(cli.command) || !afSilent(fx.args ?? [])) bad('the ZAP AF entry must pass -silent (in the command and fixedInputs.args) and no -z: no add-on downloads at run time', 'step', 'cli', 'command');
+    } else if (!silent(cli?.command ?? []) || !silent(fx.args ?? [])) bad('the ZAP entry must pass exactly one -z, with the value -silent (in the command and fixedInputs.args): no add-on downloads at run time', 'step', 'cli', 'command');
   }
   if (repo === 'semgrep/semgrep' || /(^|\/)semgrep$/.test(cli?.install.package ?? '')) out.push(...semgrepProblems(e));
 
@@ -621,7 +660,7 @@ function runsTool(e: Entry, repo: string, tool: string): boolean {
 function mustVerifyRepo(e: Entry): string | null {
   const name = lower(e.candidate.repo).split('/')[1];
   for (const r of MUST_VERIFY) {
-    const tool = r.slice(r.indexOf('/') + 1);
+    const tool = Object.hasOwn(MUST_VERIFY_TOOL, r) ? MUST_VERIFY_TOOL[r] as string : r.slice(r.indexOf('/') + 1);
     if (lower(e.candidate.repo) === r || name === tool || runsTool(e, r, tool)) return r;
   }
   return null;
@@ -652,6 +691,16 @@ function verifiedWithProblems(e: Entry): Problem[] {
     if (!SHA256_RE.test(v.keySha256)) bad("verifiedWith.keySha256 must be the key file's sha256 (64 hex characters)", 'keySha256');
     return out;
   }
+  const branchSigner = Object.hasOwn(BRANCH_SIGNERS, repo) ? BRANCH_SIGNERS[repo] : undefined;
+  if (branchSigner !== undefined && v.identity === branchSigner) {
+    // the reviewed branch signer: a GitHub attestation of the pinned asset, bound to the source commit it recorded
+    if (v.method !== 'github-attestation') bad(`verifiedWith.method must be github-attestation for ${c.repo}'s branch signer`, 'method');
+    if (v.sourceDigest === undefined || !COMMIT_RE.test(v.sourceDigest)) bad('verifiedWith.sourceDigest must be the source commit the attestation records (40 lowercase hex characters)', 'sourceDigest');
+    const pkg = e.step.cli?.install?.method === 'github-release' ? e.step.cli.install.package : undefined;
+    if (pkg === undefined || v.asset !== pkg) bad(`verifiedWith.asset must be the pinned install package (${pkg ?? 'none'}): a branch signer's attestation binds the asset itself`, 'asset');
+    return out;
+  }
+  if (v.sourceDigest !== undefined) bad(`verifiedWith.sourceDigest is recorded only for a reviewed branch signer; ${c.repo}'s identity is checked by its tag`, 'sourceDigest');
   const m = IDENTITY_RE.exec(v.identity);
   if (m === null) bad(`verifiedWith.identity must be the exact certificate identity https://github.com/${c.repo}/.github/workflows/<file>@refs/tags/${c.version} (never a regex, a branch or a commit)`, 'identity');
   else if (lower(`${m[1]}/${m[2]}`) !== repo) bad(`verifiedWith.identity is a workflow of ${m[1]}/${m[2]}, not of ${c.repo}`, 'identity');
@@ -682,6 +731,8 @@ function choiceProblems(tool: string, e: Entry, known: (name: string) => boolean
  */
 export const TRIVY_ALLOWED_FLAGS: ReadonlySet<string> = new Set([
   'disable-telemetry', 'skip-version-check', 'skip-check-update', 'format', 'output', 'exit-code', 'severity', 'scanners', 'ignore-unfixed',
+  // G11-2: the licence scan lists every package, so the gate sees the ones with no licence data (only with --format json; trivyProblems)
+  'list-all-pkgs',
 ]);
 /** The `--exit-code` of trivy, betterleaks and gitleaks: a finding is reported with 10, a code their errors never use (an error or a betterleaks partial scan exits 1). Keep equal to their `findingsExit` in tool-flags.ts. */
 const FINDINGS_EXIT_FLAG = '10';
@@ -799,8 +850,20 @@ function trivyProblems(e: Entry): Problem[] {
   // UNKNOWN, so any --severity filter hides some (G11: HIGH,CRITICAL hid every Unknown licence); the gate judges the severities itself
   const scanners = [...p.flags, ...pa.flags].filter((f) => f.name === 'scanners').flatMap((f) => f.value.split(','));
   if (scanners.includes('license') && severities.length > 0) bad('trivy\'s licence scan must report every severity (no --severity in the command, the fixed args or a choice): a filter hides the Unknown licences a person must look at (ruling S9)', 'step', 'cli', 'command');
+  // G11-2: the licence scan writes Trivy's JSON with every package listed (the gate's scrub reads it for this tool id: gate/src/trivy-licence.ts);
+  // every other trivy scan writes SARIF. The format, the package list and the file are fixed, never a choice
+  const formats = [...p.flags, ...pa.flags].filter((f) => f.name === 'format').map((f) => f.value);
+  const listAll = TRIVY_LICENCE_RESULT.listAll.slice(2);
+  if (scanners.includes('license')) {
+    if (lastValue(p, 'format') !== TRIVY_LICENCE_RESULT.format || lastValue(pa, 'format') !== TRIVY_LICENCE_RESULT.format || formats.some((v) => v !== TRIVY_LICENCE_RESULT.format)
+      || lastValue(p, listAll) !== 'true' || !args.includes(TRIVY_LICENCE_RESULT.listAll) || e.step.output.format !== 'json') {
+      bad(`trivy's licence scan runs with --format json ${TRIVY_LICENCE_RESULT.listAll}, in the command and fixedInputs.args, and its output format is json (G15a-R7: what the tool writes; the gate reads every package from Trivy's JSON and writes the scrubbed SARIF; a package with no licence data is an Unknown)`, 'step', 'cli', 'command');
+    }
+  } else if (formats.includes('json') || [...p.flags, ...pa.flags].some((f) => f.name === listAll)) {
+    bad(`only trivy's licence scan writes json (${TRIVY_LICENCE_RESULT.listAll} too): the gate reads every other trivy scan as SARIF`, 'step', 'cli', 'command');
+  }
   out.push(...choiceProblems('trivy', e, (k) => (g.value.has(k) || g.bool.has(k)) && TRIVY_ALLOWED_FLAGS.has(k),
-    (k) => (TRIVY_FORBIDDEN.has(k) || k === 'exit-code' || (TRIVY_REQUIRED_FLAGS as readonly string[]).includes(`--${k}`) ? `the AI may not choose trivy's --${k}` : null)));
+    (k) => (TRIVY_FORBIDDEN.has(k) || k === 'exit-code' || k === 'format' || k === 'output' || k === listAll || (TRIVY_REQUIRED_FLAGS as readonly string[]).includes(`--${k}`) ? `the AI may not choose trivy's --${k}` : null)));
   return out;
 }
 
@@ -1294,7 +1357,7 @@ export function loadReviewed(
 }
 
 function toReviewedTool(e: Entry): ReviewedTool {
-  const { releasedAt: _releasedAt, ...tool } = e;
+  const { releasedAt: _releasedAt, pinnedOn: _pinnedOn, ...tool } = e;
   return tool as ReviewedTool;
 }
 
@@ -1358,7 +1421,8 @@ export function reviewedFor(need: Need, language: Language, list: ReviewedTool[]
   if (category === undefined || category !== need.category) return [];
   // the switch is read (and refused in a release build) once per call, before any entry is looked at
   const boot = mode === 'full' && bootstrapProofs(env);
-  return list.filter((t) => t.categories.includes(category)
+  // G15a round 6: a nightly-only entry (the ZAP AF active scan) is pipegen's own, never offered for a need
+  return list.filter((t) => t.categories.includes(category) && !(Object.hasOwn(ARGV_POLICIES, t.id) && ARGV_POLICIES[t.id]?.nightlyOnly === true)
     && (t.languages.includes(language) || t.languages.includes('any'))
     && (mode === 'audit' || fullModeOk(t, boot)));
 }

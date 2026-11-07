@@ -17,13 +17,56 @@ import { loadBaseImages, type BaseImage } from './base-images.js';
 import { dockerfilesOf } from './created-judges/compose.js';
 import { imageBuildTag, renderImageCheckStep } from './image-handoff.js';
 import {
-  DAST_HANDOFF_STEP_ID, DAST_RAW_SHA_ENV, DAST_RAW_SHA_OUTPUT, dastAppStepId, dastCheckStepId, dastRawArtifact, dastRawShaRef, dastResultArtifact,
+  DAST_HANDOFF_STEP_ID, DAST_RAW_SHA_ENV, DAST_RAW_SHA_OUTPUT, dastAppStepId, dastCheckStepId, dastLaneOf, dastRawArtifact, dastRawShaRef, dastResultArtifact, ZAP_ACTIVE_LANE, type DastLane,
   IMAGE_ARCHIVE_FILE, imageArchiveArtifact, imageBuildJobId, IMAGE_BUILD_NEED, stepOutputForm, type RenderedStep, type ScanFact,
 } from './job-rules.js';
 import type { PlatformActions } from './pin.js';
 import { pipegenScriptStep } from './pipegen-script.js';
 import { RenderError } from './render-error.js';
 import { renderComposeUp, renderPlatformStep, renderRuntimeEnv, renderScrub, renderStep, renderUpload, scrubbedPath, type RenderResult } from './render-step.js';
+
+/**
+ * G15a round 4 (b3, P-4): the nightly DAST tool. Nuclei 3.11.1 with its pinned templates: its result is SARIF, and the gate's nuclei reader
+ * was checked against a real run of the pinned binary (test/fixtures/sarif/nuclei.sarif).
+ */
+export const NIGHTLY_DAST_TOOL = 'nuclei';
+/**
+ * G15a round 6 (P-4): the nightly ZAP Automation Framework active scan, beside nuclei, in its own lane (job-rules.ts ZAP_ACTIVE_LANE): the
+ * reviewed entry `zap-af-active` (the pinned zap-stable image) with pipegen's reviewed plan (zap-active.ts). Its report was captured from
+ * the pinned image and is read by the gate's ZAP reader (gate/src/zap.ts ZAP_AF_TOOL); the scrub writes it as SARIF for code scanning.
+ */
+export const ZAP_ACTIVE_TOOL = 'zap-af-active';
+export { ZAP_ACTIVE_LANE };
+/**
+ * The AF run job's timeout: the plan may take 5 minutes of spider, 5 of passive wait and 30 of active scan (zap-active.ts), on top of the
+ * pull of the ZAP image and the app start; the default 30 would cancel a scan that ran to its limits.
+ */
+export const ZAP_ACTIVE_JOB_MINUTES = 60;
+/** The note when the AF scan can not be written (the entry is missing, or its render is refused): nuclei still runs. */
+export const zapActiveNotRunNote = (why: string): string => `ZAP's active scan is not run nightly: ${why} Nuclei scans the app nightly instead.`;
+
+/**
+ * The nightly DAST spec of a merge-layer DAST check: the same check and service, run by the reviewed nuclei entry with nothing chosen (no AI
+ * value reaches it). Shared by the assembler and the referee, so both render the same steps.
+ */
+export function nightlyDastSpec(spec: StepSpec, nuclei: ReviewedTool): StepSpec {
+  if (typeof spec.service !== 'string') throw new RenderError('A DAST check belongs to one service.');
+  if (nuclei.id !== NIGHTLY_DAST_TOOL || nuclei.candidate.id !== NIGHTLY_DAST_TOOL) throw new RenderError('The nightly DAST scan runs only the reviewed nuclei entry.');
+  return { needId: spec.needId, service: spec.service, tool: nuclei.candidate, choices: {}, output: nuclei.step.output };
+}
+
+/**
+ * G15a round 6: the nightly ZAP AF spec of a merge-layer DAST check: the same service, in the zap-active lane (its need id, so its artifacts
+ * and jobs are the lane's), run by the reviewed AF entry with nothing chosen. Shared by the assembler and the referee.
+ */
+export function zapActiveSpec(spec: StepSpec, af: ReviewedTool): StepSpec {
+  if (typeof spec.service !== 'string') throw new RenderError('A DAST check belongs to one service.');
+  if (af.id !== ZAP_ACTIVE_TOOL || af.candidate.id !== ZAP_ACTIVE_TOOL) throw new RenderError("The nightly ZAP active scan runs only the reviewed ZAP AF entry.");
+  return { needId: ZAP_ACTIVE_LANE, service: spec.service, tool: af.candidate, choices: {}, output: af.step.output };
+}
+
+/** The render context options of a DAST spec's lane: the AF lane renders as pipegen's own nightly scan (a nightly-only entry needs it). */
+const laneCtx = (lane: DastLane): { nightly?: true } => (lane === ZAP_ACTIVE_LANE ? { nightly: true } : {});
 
 /** Where the app runs for the DAST check of one service: pipegen's compose file, or the image archive; the port it is published on. */
 export type DastStart = { kind: 'compose'; port: number; url: string; env: RuntimeEnv } | { kind: 'archive'; port: number; url: string };
@@ -73,9 +116,9 @@ export function renderDastAppStart(service: string, port: number): RenderedStep 
 }
 
 /** The raw result file of a DAST render (its path and name), checked. */
-function rawOf(r: RenderResult, service: string): { path: string; file: string; format: 'sarif' | 'zap-json' } {
+function rawOf(r: RenderResult, service: string, lane: DastLane): { path: string; file: string; format: 'sarif' | 'zap-json' } {
   const out = r.output;
-  const artifact = dastResultArtifact(service);
+  const artifact = dastResultArtifact(service, lane);
   const prefix = `\${{ runner.temp }}/pipegen-raw/${artifact}/`;
   if (out === null || !out.path.startsWith(prefix) || (out.format !== 'sarif' && out.format !== 'zap-json')) throw new RenderError('The DAST step writes no findings file in its own raw folder.');
   const file = out.path.slice(prefix.length);
@@ -84,12 +127,12 @@ function rawOf(r: RenderResult, service: string): { path: string; file: string; 
 }
 
 /** The hand-off step: the app still answers (C1a), then the raw result is copied to its hand-off folder and its sha256 written as the job output. */
-export function renderDastHandoffStep(service: string, file: string, url: string): RenderedStep {
-  const raw = dastRawArtifact(service);
+export function renderDastHandoffStep(service: string, file: string, url: string, lane: DastLane = 'dast'): RenderedStep {
+  const raw = dastRawArtifact(service, lane);
   return pipegenScriptStep(DAST_HANDOFF_STEP_ID, `pipegen: hand the raw scan result of ${slug(service)} on`, [
     `code="$(/usr/bin/curl --silent --max-time 10 --output /dev/null --write-out '%{http_code}' ${url}/ || true)"`,
     'case "$code" in [1-4][0-9][0-9]) ;; *) pg_fail "the app no longer answers after the scan (HTTP $code), so the scan can not be shown to have reached it" ;; esac',
-    `src="$RUNNER_TEMP/pipegen-raw/${dastResultArtifact(service)}/${file}"`,
+    `src="$RUNNER_TEMP/pipegen-raw/${dastResultArtifact(service, lane)}/${file}"`,
     'if [ ! -f "$src" ] || [ -L "$src" ]; then pg_fail "the scan left no regular result file"; fi',
     `dir="$RUNNER_TEMP/pipegen-out/${raw}"`,
     'mkdir -p "$RUNNER_TEMP/pipegen-out"',
@@ -102,10 +145,10 @@ export function renderDastHandoffStep(service: string, file: string, url: string
 }
 
 /** The scrub job's hash check: the downloaded raw result must be the one the run job handed on, then it goes to the raw folder the scrub reads. */
-export function renderDastCheckStep(service: string, file: string): RenderedStep {
-  const raw = dastRawArtifact(service);
-  const artifact = dastResultArtifact(service);
-  return pipegenScriptStep(dastCheckStepId(service), `pipegen: check the raw scan result of ${slug(service)}`, [
+export function renderDastCheckStep(service: string, file: string, lane: DastLane = 'dast'): RenderedStep {
+  const raw = dastRawArtifact(service, lane);
+  const artifact = dastResultArtifact(service, lane);
+  return pipegenScriptStep(dastCheckStepId(service, lane), `pipegen: check the raw scan result of ${slug(service)}`, [
     `src="$RUNNER_TEMP/pipegen-out/${raw}/${file}"`,
     `if ! [[ "$${DAST_RAW_SHA_ENV}" =~ ^[0-9a-f]{64}$ ]]; then pg_fail "the DAST run gave no sha256 for its raw result"; fi`,
     'if [ ! -f "$src" ] || [ -L "$src" ]; then pg_fail "the raw scan result is missing or not a regular file"; fi',
@@ -114,7 +157,7 @@ export function renderDastCheckStep(service: string, file: string): RenderedStep
     `mkdir "$RUNNER_TEMP/pipegen-raw/${artifact}"`,
     `cp -- "$src" "$RUNNER_TEMP/pipegen-raw/${artifact}/${file}"`,
     `chmod -R a-w "$RUNNER_TEMP/pipegen-raw/${artifact}"`,
-  ], { [DAST_RAW_SHA_ENV]: dastRawShaRef(slug(service)) });
+  ], { [DAST_RAW_SHA_ENV]: dastRawShaRef(slug(service), lane) });
 }
 
 /**
@@ -125,16 +168,17 @@ export function renderDastCheckStep(service: string, file: string): RenderedStep
 export function renderDastRun(spec: StepSpec, tool: ReviewedTool, platform: PlatformActions, draft: PipelineDraft, start: DastStart, opts: { blocking: boolean; checkout: readonly RenderedStep[] }): { steps: RenderedStep[]; outputs: Record<string, string>; needs: string[]; scan: RenderedStep[] } {
   const service = spec.service;
   if (service === undefined) throw new RenderError('A DAST check belongs to one service.');
-  const r = renderStep(spec, tool, platform, { profile: draft.profile, targets: { url: start.url }, blocking: opts.blocking });
-  const raw = rawOf(r, service);
+  const lane = dastLaneOf(spec.needId);
+  const r = renderStep(spec, tool, platform, { profile: draft.profile, targets: { url: start.url }, blocking: opts.blocking, ...laneCtx(lane) });
+  const raw = rawOf(r, service, lane);
   const startSteps: RenderedStep[] = start.kind === 'compose'
     ? [...opts.checkout, renderRuntimeEnv(start.env), renderComposeUp()]
     : [{ ...renderPlatformStep('download-artifact', platform, { name: imageArchiveArtifact(service), path: `\${{ runner.temp }}/pipegen-out/${imageArchiveArtifact(service)}` }), name: `Download the image archive of ${slug(service)}` },
       renderImageCheckStep(service), renderDastAppStart(service, start.port)];
-  const rawName = dastRawArtifact(service);
+  const rawName = dastRawArtifact(service, lane);
   const upload = { ...renderPlatformStep('upload-artifact', platform, { name: rawName, path: `\${{ runner.temp }}/pipegen-out/${rawName}` }), name: `Upload the raw scan result of ${slug(service)}` };
   return {
-    steps: [...startSteps, ...r.steps, renderDastHandoffStep(service, raw.file, start.url), upload],
+    steps: [...startSteps, ...r.steps, renderDastHandoffStep(service, raw.file, start.url, lane), upload],
     outputs: { [DAST_RAW_SHA_OUTPUT]: stepOutputForm(DAST_HANDOFF_STEP_ID, 'sha256') },
     needs: start.kind === 'archive' ? [imageBuildJobId(service)] : [],
     scan: r.steps,
@@ -145,11 +189,12 @@ export function renderDastRun(spec: StepSpec, tool: ReviewedTool, platform: Plat
 export function renderDastScrub(spec: StepSpec, tool: ReviewedTool, platform: PlatformActions, draft: PipelineDraft, gate: ReviewedTool, url: string): { steps: RenderedStep[]; scan: { stepId: string; fact: ScanFact } } {
   const service = spec.service;
   if (service === undefined) throw new RenderError('A DAST check belongs to one service.');
-  const raw = rawOf(renderStep(spec, tool, platform, { profile: draft.profile, targets: { url } }), service);
-  const rawName = dastRawArtifact(service);
-  const artifact = dastResultArtifact(service);
+  const lane = dastLaneOf(spec.needId);
+  const raw = rawOf(renderStep(spec, tool, platform, { profile: draft.profile, targets: { url }, ...laneCtx(lane) }), service, lane);
+  const rawName = dastRawArtifact(service, lane);
+  const artifact = dastResultArtifact(service, lane);
   const download = { ...renderPlatformStep('download-artifact', platform, { name: rawName, path: `\${{ runner.temp }}/pipegen-out/${rawName}` }), name: `Download the raw scan result of ${slug(service)}` };
-  const check = renderDastCheckStep(service, raw.file);
+  const check = renderDastCheckStep(service, raw.file, lane);
   return {
     steps: [download, check, renderScrub(artifact, raw.path, tool.id, raw.format, gate), renderUpload(artifact, scrubbedPath(raw.path), platform)],
     scan: { stepId: check.id as string, fact: { tool: tool.id, format: raw.format } },

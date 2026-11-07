@@ -167,7 +167,7 @@ describe('B6: slots in rendered steps (values only from the render context, pass
 describe('permanent refusals say why (no "6c" is left)', () => {
   it('schemathesis: pip not available yet; cosign: Plan G sign job; gosec: Go not supported', () => {
     expect(() => render('schemathesis')).toThrow(/pip.*not available yet|not available yet/);
-    expect(() => render('cosign')).toThrow(/Plan G's sign job/);
+    expect(() => render('cosign')).toThrow(/pipegen's own sign job/);
     expect(() => render('gosec')).toThrow(/Go is not supported in v0\.2/);
   });
   it('the whole reviewed list: every entry renders or throws a documented permanent RenderError, none mentions 6c', () => {
@@ -182,11 +182,12 @@ describe('permanent refusals say why (no "6c" is left)', () => {
         expect(e, t.id).toBeInstanceOf(RenderError);
         const m = (e as Error).message;
         expect(m, t.id).not.toMatch(/6c|ruling B6|rendered in 6/);
-        expect(m, t.id).toMatch(/Plan G|not available yet|job service|Go is not supported|render context does not have/);
+        expect(m, t.id).not.toMatch(/Plan [A-Z]\b|\bG\d+\b/);   // no internal id in a message a person reads
+        expect(m, t.id).toMatch(/pipegen's own|not available yet|job service|Go is not supported|render context does not have/);
         outcome[t.id] = m;
       }
     }
-    expect(Object.entries(outcome).filter(([, v]) => v !== 'rendered').map(([k]) => k).sort()).toEqual(['bandit', 'cosign', 'coverage-py', 'creosote', 'gosec', 'kube-linter', 'mypy', 'registry', 'schemathesis', 'vulture']);
+    expect(Object.entries(outcome).filter(([, v]) => v !== 'rendered').map(([k]) => k).sort()).toEqual(['bandit', 'cosign', 'coverage-py', 'creosote', 'gh', 'gosec', 'kube-linter', 'mypy', 'registry', 'schemathesis', 'vulture', 'zap-af-active']);
   });
 });
 

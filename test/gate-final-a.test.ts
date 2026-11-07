@@ -3,7 +3,7 @@
 // both use it, and the referee requires the file's gate step `with` to equal it exactly (no missing input, no extra input, no other value).
 import { Document } from 'yaml';
 import { describe, expect, it } from 'vitest';
-import { gateJobList, GateJobListError, type JobListEntry } from '../src/engine/gate-job-list.js';
+import { gateJobList, GateJobListError, resultFormat, type JobListEntry } from '../src/engine/gate-job-list.js';
 import { gateStepInputs, licenceLockfilesOf, nightlyStepInputs } from '../src/engine/gate-inputs.js';
 import { TRIVY_LICENCE_LOCKFILES } from '../src/engine/licence-lockfiles.js';
 import { GATE_FILES_DIR, GATE_FILES_FOLDER, PIPEGEN_GATE_USES, RESULT_ARTIFACT_NAME_RE, rendererInputProblems } from '../src/engine/tool-flags.js';
@@ -65,7 +65,7 @@ function workflow(jobs: Record<string, Job>): CreatedFile {
 function jobs(d: PipelineDraft, gateStep?: RenderedStep): Record<string, Job> {
   const out: Record<string, Job> = {};
   const ctx: RenderContext = { profile: d.profile };
-  const findings = d.steps.filter((s) => s.output.format === 'sarif');   // the other specs' jobs are the caller's
+  const findings = d.steps.filter((s) => resultFormat(s.output.format) === 'sarif');   // the other specs' jobs are the caller's
   const blocks = findings.map((s) => renderFindingsBlock(s, entry(s.tool.id), p, ctx, GATE));
   const baseBlocks = findings.map((s) => renderFindingsBlock(s, entry(s.tool.id), p, { ...ctx, base: true }, GATE));
   findings.forEach((s, i) => {

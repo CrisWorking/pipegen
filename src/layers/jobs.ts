@@ -48,8 +48,8 @@
 // - baseline-check (the gate in mode baseline-check, output `found`), gate (renderGateStep over the returned draft, its uploads, `if:
 //   always()`, needs = every job of the gate's list plus base-scan), nightly (renderNightlyStep: the warn-ending, finish-missing, update and
 //   warn-first issues; issues: write here only; no checkout, so it never pushes a file; concurrency pipegen-nightly);
-// - sign: G3's job for the delivered mode (signingMode), none for the proof (PROOF_SIGNING_MODE) or a skipped deploy; attest is "not signed
-//   yet (G15)" with a note, never another mode. GJ (Plan J): a signing or attestation need on a service that builds no image is report-only:
+// - sign: G3's job for the delivered mode (signingMode), none for the proof (PROOF_SIGNING_MODE) or a skipped deploy; an attest job that can
+//   not be written is "not signed" with a note, never another mode. GJ (Plan J): a signing or attestation need on a service that builds no image is report-only:
 //   its image leaves the signing plan, and with no service building an image there is no sign job at all; a note each (PIPEGEN.md, G9).
 import { isDeepStrictEqual } from 'node:util';
 import { keyOffers, specFor, BuilderError, workflowLintAvailable, type Offer } from '../debate/builder.js';
@@ -60,13 +60,13 @@ import { ArtifactNameError, resultArtifactName, slug } from '../engine/artifact-
 import { baseImageRef, loadBaseImages, nodeBaseImageId, type BaseImage } from '../engine/base-images.js';
 import { dockerfilesOf } from '../engine/created-judges/compose.js';
 import { egressSetsForTool, renderEgressStep, SHARED_CDN_SETS, type EgressSet } from '../engine/egress.js';
-import { gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES } from '../engine/gate-job-list.js';
+import { gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES, resultFormat } from '../engine/gate-job-list.js';
 import { SKIPPED_PART_NEEDS } from '../engine/gate-inputs.js';
 import { ARCHIVE_TOOL_IDS, renderImageArchiveScan, renderImageBuild } from '../engine/image-handoff.js';
-import { dastStartOf, renderDastRun, renderDastScrub, type DastStart } from '../engine/dast-handoff.js';
+import { dastStartOf, nightlyDastSpec, NIGHTLY_DAST_TOOL, renderDastRun, renderDastScrub, zapActiveNotRunNote, zapActiveSpec, ZAP_ACTIVE_JOB_MINUTES, ZAP_ACTIVE_LANE, ZAP_ACTIVE_TOOL, type DastStart } from '../engine/dast-handoff.js';
 import {
   BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, dastRunJobId, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, IMAGE_BUILD_NEED, imageBuildJobId, isReviewed,
-  isScrubStep, jobOutputsFor, NIGHTLY_CONCURRENCY, NO_SCANS, renderRangeFetchStep, type RenderedStep, type ScanFact,
+  isScrubStep, jobOutputsFor, CODE_SCANNING_JOB, DAST_UPLOAD_JOB, dastLaneOf, dastNightlyCategory, dastResultArtifact, type DastLane, HISTORY_UPLOAD_JOB, SECRETS_HISTORY_CATEGORY, SECRETS_HISTORY_JOB, NIGHTLY_CONCURRENCY, NIGHTLY_IF, NO_SCANS, SCORECARD_IF, SCORECARD_JOB, ZIZMOR_ONLINE_JOB, renderRangeFetchStep, type RenderedStep, type ScanFact,
 } from '../engine/job-rules.js';
 import { NEED_ID_CATEGORY, SCHEDULED_CATEGORIES } from '../engine/need-ids.js';
 import { MINIMUM_CATEGORIES, NO_HOOKS_CI_MANAGERS, NO_IMAGE_CATEGORIES, noImageServices, riskyTriggersOf, WORKFLOW_LINT_EXTRA, WORKFLOW_LINT_TOOL, workflowLintTools } from '../engine/needs.js';
@@ -76,11 +76,13 @@ import { APP_RUNNING_CATEGORIES, renderStarterTestRun } from '../engine/render-c
 import { RenderError } from '../engine/render-error.js';
 import {
   dedupeJobSteps, renderBaselineCheckStep, renderComposeUp, renderFindingsBlock, renderGateStep, renderGateUploads, renderJobPrelude, renderNightlyStep,
-  renderProjectScript, renderRangeBlock, renderRepoTool, renderRuntimeEnv, renderScrub, renderStep, renderUpload, scanFactOf, scrubbedPath, type RenderContext,
+  renderHistoryBlock, renderPlatformStep, renderZizmorOnline, renderProjectScript, renderRangeBlock, renderRepoTool, renderRuntimeEnv, renderScorecardBlock, renderScrub, renderStep, renderUpload, scanFactOf, scrubbedPath,
+  SCORECARD_ARTIFACT, SCORECARD_CATEGORY, type RenderContext,
 } from '../engine/render-step.js';
 import { projectScriptFor, repoToolFor, repoToolProblem, type RepoToolStep } from '../engine/reviewed.js';
 import { PLATFORM_USES, RANGE_TOOL } from '../engine/tool-flags.js';
 import { signedImageOwner } from '../engine/signing.js';
+import { codeSecurityAvailable } from '../github/availability.js';
 import type { SigningMode } from '../github/signing-mode.js';
 import { signJob, type SignJob } from './central.js';
 import type { Need, NeedCategory, PipelineDraft, ReviewedTool, Service, SkippablePart, StepSpec } from '../types.js';
@@ -110,7 +112,6 @@ const GATE_JOB_NAME = 'gate';
 /** v0.2 limits: categories pipegen does not render yet, each with the line the notes (and PIPEGEN.md) carry. */
 export const NOT_RENDERED_V02: Readonly<Partial<Record<NeedCategory, string>>> = Object.freeze({
   'api-dast': 'API testing against the API spec is not available yet: its tool (schemathesis) needs a reviewed hash-locked closure of its Python dependencies, planned for v0.4.',
-  scorecard: 'OpenSSF Scorecard is not run yet: its action runs a tag-pinned container image, and pipegen runs only images pinned by digest.',
   fuzzing: 'Fuzzing is built in v0.3.',
 });
 /** The PyPI publish action (S31): it builds or pulls a container at run time, so it is not rendered in v0.2. */
@@ -158,7 +159,7 @@ export interface AssembledJobs {
   merge: Record<string, Job>;
   /** The nightly job (the scheduled checks of v0.2 are limits, see NOT_RENDERED_V02). */
   nightly: Record<string, Job>;
-  /** G3's sign job for the delivered mode; null for none, the proof, a skipped deploy and attest (until G15). */
+  /** G3's sign job for the delivered mode; null for none, the proof, a skipped deploy and an attest job that can not be written. */
   sign: SignJob | null;
   notes: string[];
   /**
@@ -182,7 +183,7 @@ const show = (s: unknown): string => JSON.stringify(safeText(String(s), 60));
 const categoryOf = (id: string): string | undefined => (Object.hasOwn(NEED_ID_CATEGORY, id) ? (NEED_ID_CATEGORY as Readonly<Record<string, string>>)[id] : undefined);
 const FLOOR: ReadonlySet<string> = new Set(FLOOR_NEEDS);
 const isFloor = (needId: string): boolean => FLOOR.has(needId) || FLOOR.has(categoryOf(needId) ?? '');
-const isFindings = (t: ReviewedTool): boolean => t.step.output.format === 'sarif' || t.step.output.format === 'zap-json';
+const isFindings = (t: ReviewedTool): boolean => resultFormat(t.step.output.format) === 'sarif' || t.step.output.format === 'zap-json';
 const keyOf = (n: { id: string; service?: string }): string => {
   try { return needKeyOf(n); } catch (e) { if (e instanceof NeedKeyError) return fail(e.message); throw e; }
 };
@@ -369,12 +370,12 @@ function imageScanJob(c: Ctx, spec: StepSpec): Job {
 }
 
 /** G4-R1: the two jobs of a DAST check: the key-free run job (the app in containers, the scan, the raw hand-off) and the gate's scrub job. */
-function dastJobs(c: Ctx, spec: StepSpec, start: DastStart): { run: Job; scrub: Job } {
+function dastJobs(c: Ctx, spec: StepSpec, start: DastStart, blocking: boolean = blocks(c.draft, spec.needId, spec.service)): { run: Job; scrub: Job } {
   const service = spec.service as string;
   const t = toolOf(c, spec.tool.id);
-  const runId = dastRunJobId(service);
+  const runId = dastRunJobId(service, dastLaneOf(spec.needId));
   const checkout = start.kind === 'compose' ? renderJobPrelude({}, c.deps.platform).steps : [];
-  const r = renderDastRun(spec, t, c.deps.platform, c.draft, start, { blocking: blocks(c.draft, spec.needId, service), checkout });
+  const r = renderDastRun(spec, t, c.deps.platform, c.draft, start, { blocking, checkout });
   // the containers and the scanner's own hosts; the app's container is reached over the Docker networks (published on 127.0.0.1)
   const sets: EgressSet[] = [...egressSetsForTool(t), 'dockerhub', ...(start.kind === 'compose' && c.compose !== null ? c.compose.images : [])];
   const runEgress = egressStepFor(sets, { userSecret: false, dockerNetworks: true, job: runId });
@@ -638,6 +639,145 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     },
   };
 
+  // G15a round 3 (PF-3): Scorecard weekly, reported and never gated (a scheduled category: never on the gate's list). Its image runs as a
+  // docker step by the reviewed digest, with the job's read token and no secret; the scrubbed result goes to code scanning from its own job
+  // (security-events: write is never in the job that runs the image)
+  for (const n of draft.needs.filter((x) => x.layer === 'merge' && (categoryOf(x.id) ?? x.category) === 'scorecard')) {
+    const spec = specsOf(n).find((s) => toolOf(c, s.tool.id).id === 'scorecard-action');
+    if (spec === undefined) continue;
+    try {
+      const tool = toolOf(c, spec.tool.id);
+      const steps = renderScorecardBlock(tool, deps.platform, gate);
+      nightly[SCORECARD_JOB] = {
+        'runs-on': JOB_RUNNER, 'timeout-minutes': JOB_MINUTES, if: SCORECARD_IF, permissions: { contents: 'read', actions: 'read' }, 'cache-mode': 'none',
+        steps: [egressStepFor(egressSetsForTool(tool), { userSecret: false, dockerNetworks: false, job: SCORECARD_JOB }), ...steps],
+      };
+      const scrubbed = `\${{ runner.temp }}/pipegen-out/${SCORECARD_ARTIFACT}`;
+      nightly[CODE_SCANNING_JOB] = {
+        'runs-on': JOB_RUNNER, 'timeout-minutes': JOB_MINUTES, needs: [SCORECARD_JOB], permissions: { contents: 'read', 'security-events': 'write', actions: 'read' }, 'cache-mode': 'none',
+        steps: [
+          egressStepFor([], { userSecret: false, dockerNetworks: false, job: CODE_SCANNING_JOB }),
+          { ...renderPlatformStep('download-artifact', deps.platform, { name: SCORECARD_ARTIFACT, path: scrubbed }), name: 'Download the scrubbed Scorecard result' },
+          { ...renderPlatformStep('upload-sarif', deps.platform, { sarif_file: `${scrubbed}/scorecard.sarif`, category: SCORECARD_CATEGORY }), name: 'Upload the Scorecard result to code scanning' },
+        ],
+      };
+    } catch (e) {
+      if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e;
+      addNote(notes, `OpenSSF Scorecard is not run: ${safeText(e.message, 200)}`);
+    }
+  }
+
+  // G15a round 4 (b1, P-4): betterleaks over the whole history, nightly, when the merge layer scans the repository for secrets. Reported
+  // through code scanning from its own upload job, never gated; with no code scanning nothing would report it, so it is not written
+  const repoSecrets = draft.needs.some((n) => n.layer === 'merge' && n.id === 'secrets' && n.service === undefined && specsOf(n).some((s) => isFindings(toolOf(c, s.tool.id))));
+  if (repoSecrets && !codeSecurityAvailable(draft.profile, draft.capabilities)) {
+    addNote(notes, 'The nightly scan of the whole history for secrets is not run: it reports through code scanning, which this repository does not have.');
+  } else if (repoSecrets) {
+    try {
+      const tool = toolOf(c, RANGE_TOOL);
+      const b = renderHistoryBlock(tool, deps.platform, gate);
+      const prelude = renderJobPrelude({ fetchDepth: '0' }, deps.platform).steps;
+      nightly[SECRETS_HISTORY_JOB] = job(dedupeJobSteps([egressStepFor(egressSetsForTool(tool), { userSecret: false, dockerNetworks: false, job: SECRETS_HISTORY_JOB }), ...prelude, ...b.steps], { id: SECRETS_HISTORY_JOB, scans: new Map([[b.scan.stepId, b.scan.fact]]) }));
+      const scrubbed = `\${{ runner.temp }}/pipegen-out/${b.artifact}`;
+      const file = (b.result.output as { path: string }).path.split('/').pop() as string;
+      nightly[HISTORY_UPLOAD_JOB] = {
+        'runs-on': JOB_RUNNER, 'timeout-minutes': JOB_MINUTES, needs: [SECRETS_HISTORY_JOB], permissions: { contents: 'read', 'security-events': 'write', actions: 'read' }, 'cache-mode': 'none',
+        steps: [
+          egressStepFor([], { userSecret: false, dockerNetworks: false, job: HISTORY_UPLOAD_JOB }),
+          { ...renderPlatformStep('download-artifact', deps.platform, { name: b.artifact, path: scrubbed }), name: 'Download the scrubbed full-history secrets result' },
+          { ...renderPlatformStep('upload-sarif', deps.platform, { sarif_file: `${scrubbed}/${file}`, category: SECRETS_HISTORY_CATEGORY }), name: 'Upload the full-history secrets result to code scanning' },
+        ],
+      };
+    } catch (e) {
+      if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e;
+      addNote(notes, `The nightly scan of the whole history for secrets is not run: ${safeText(e.message, 200)}`);
+    }
+  }
+
+  // G15a round 5 (b2, P-4): zizmor online, nightly, when the merge layer lints the workflows with zizmor (offline there). The same reviewed entry
+  // under its online policy (no --offline, the host named) with the job's read token as GH_TOKEN; contents: read; a job-status check, never gated
+  const lintsWithZizmor = draft.needs.some((n) => n.layer === 'merge' && isLint(n) && specsOf(n).some((s) => s.tool.id === WORKFLOW_LINT_TOOL));
+  if (lintsWithZizmor) {
+    try {
+      const tool = toolOf(c, WORKFLOW_LINT_TOOL);
+      const r = renderZizmorOnline(tool, deps.platform, { profile: draft.profile });
+      const prelude = renderJobPrelude({}, deps.platform).steps;
+      nightly[ZIZMOR_ONLINE_JOB] = job(dedupeJobSteps([egressStepFor(egressSetsForTool(tool), { userSecret: false, dockerNetworks: false, job: ZIZMOR_ONLINE_JOB }), ...prelude, ...r.steps], { id: ZIZMOR_ONLINE_JOB, scans: NO_SCANS }));
+    } catch (e) {
+      if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e;
+      addNote(notes, `zizmor's online checks are not run nightly: ${safeText(e.message, 200)}`);
+    }
+  }
+
+  // G15a round 4 (b3, P-4): the nightly DAST scan. For each app the merge layer scans (a merge DAST check with a container start), nuclei with
+  // its pinned templates in the same key-free run job and scrub job, then code-scanning-dast uploads every scrubbed result. Reported, never
+  // gated (rendered as blocking, so no narrowing value). No code scanning: not written. Round 6: the ZAP AF active scan beside it, in its own
+  // pair (zap-active-run--<svc>, zap-active--<svc>); when it can not be written, nuclei still runs and a note says so
+  const nightlyDast = [...starts].filter(([s]) => draft.steps.includes(s) && draft.needs.some((n) => n.layer === 'merge' && n.id === s.needId && n.service === s.service));
+  if (nightlyDast.length > 0 && !codeSecurityAvailable(draft.profile, draft.capabilities)) {
+    addNote(notes, 'The nightly DAST scan is not run: it reports through code scanning, which this repository does not have.');
+  } else if (nightlyDast.length > 0) {
+    try {
+      const nuclei = toolOf(c, NIGHTLY_DAST_TOOL);
+      const af = c.byId.get(ZAP_ACTIVE_TOOL);
+      let afProblem: string | null = af === undefined || !isReviewed(af.candidate) ? 'the reviewed list has no reviewed ZAP AF entry.' : null;
+      // one lane's pair for a service: its jobs (with the archive start's image build), its scrub job id, the download and upload of its result
+      type Part = { lane: DastLane; jobs: Record<string, Job>; scrubId: string; uploads: RenderedStep[] };
+      const partOf = (ns: StepSpec, start: DastStart, label: string): Part => {
+        const service = ns.service as string;
+        const lane = dastLaneOf(ns.needId);
+        const pair = dastJobs(c, ns, start, true);
+        const id = jobIdFor(ns.needId, service);
+        const jobs: Record<string, Job> = {};
+        // the archive start reads the image this run builds: the nightly file builds it too (the same image-build job, no push)
+        for (const need of pair.run.needs ?? []) {
+          const b = builds.get(service);
+          if (need !== imageBuildJobId(service) || b === undefined) return fail(`The nightly DAST scan of ${show(service)} needs ${show(need)}, which the nightly file does not build.`);
+          jobs[need] = b;
+        }
+        // the AF plan can run longer than the default job time (its run job only)
+        jobs[dastRunJobId(service, lane)] = lane === ZAP_ACTIVE_LANE ? { ...pair.run, 'timeout-minutes': ZAP_ACTIVE_JOB_MINUTES } : pair.run;
+        jobs[id] = pair.scrub;
+        const artifact = dastResultArtifact(service, lane);
+        const scrubbed = `\${{ runner.temp }}/pipegen-out/${artifact}`;
+        const file = (ns.output.path.split('/').pop() as string);
+        return { lane, jobs, scrubId: id, uploads: [
+          { ...renderPlatformStep('download-artifact', deps.platform, { name: artifact, path: scrubbed }), name: `Download the scrubbed nightly ${label} result of ${slug(service)}` },
+          { ...renderPlatformStep('upload-sarif', deps.platform, { sarif_file: `${scrubbed}/${file}`, category: dastNightlyCategory(service, lane) }), name: `Upload the nightly ${label} result of ${slug(service)} to code scanning` },
+        ] };
+      };
+      const parts: Part[] = [];
+      const done = new Set<string>();
+      for (const [spec, start] of nightlyDast) {
+        const service = spec.service as string;
+        if (done.has(dastRunJobId(service))) continue;
+        done.add(dastRunJobId(service));
+        parts.push(partOf(nightlyDastSpec(spec, nuclei), start, 'DAST'));
+        // round 6: the ZAP AF active scan of the same app, in its own lane; a refusal keeps nuclei and says why (the AF lane is all or nothing)
+        if (af === undefined || afProblem !== null) continue;
+        try {
+          parts.push(partOf(zapActiveSpec(spec, af), start, 'ZAP active scan'));
+        } catch (e) {
+          if (!(e instanceof RenderError || e instanceof ArtifactNameError || e instanceof AssembleError)) throw e;
+          afProblem = safeText(e.message, 200);
+        }
+      }
+      const kept = parts.filter((x) => afProblem === null || x.lane !== ZAP_ACTIVE_LANE);
+      if (afProblem !== null) addNote(notes, zapActiveNotRunNote(afProblem));
+      const pairs: Record<string, Job> = Object.assign({}, ...kept.map((x) => x.jobs)) as Record<string, Job>;
+      const uploads = kept.flatMap((x) => x.uploads);
+      const scrubIds = kept.map((x) => x.scrubId);
+      Object.assign(nightly, pairs);
+      nightly[DAST_UPLOAD_JOB] = {
+        'runs-on': JOB_RUNNER, 'timeout-minutes': JOB_MINUTES, needs: scrubIds, permissions: { contents: 'read', 'security-events': 'write', actions: 'read' }, 'cache-mode': 'none',
+        steps: [egressStepFor([], { userSecret: false, dockerNetworks: false, job: DAST_UPLOAD_JOB }), ...uploads],
+      };
+    } catch (e) {
+      if (!(e instanceof RenderError || e instanceof ArtifactNameError || e instanceof AssembleError)) throw e;
+      addNote(notes, `The nightly DAST scan is not run: ${safeText(e.message, 200)}`);
+    }
+  }
+
   // 4. signing: G3's job for the delivered mode, none for the proof or a skipped deploy. GJ: a signing or attestation need on a service that
   // builds no image is report-only (its image leaves the plan; with no service building an image there is nothing to sign at all)
   for (const n of draft.needs) {
@@ -662,7 +802,7 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
   if (deps.mode !== 'none' && !input.skipped.some((p) => p.part === 'deploy') && !imageNone) {
     try { sign = signJob(draft, deps.mode, { reviewed: deps.reviewed, platform: deps.platform }); } catch (e) {
       if (!(e instanceof RenderError) || deps.mode !== 'attest') throw e;
-      addNote(notes, 'The images are not signed yet: attest signing lands in a later pipegen release, and pipegen never falls back to another mode.');
+      addNote(notes, `The images are not signed: the attest signing job could not be written (${safeText(e.message, 200)}), and pipegen never falls back to another mode.`);
     }
   }
   if (deps.mode === 'none' || input.skipped.some((p) => p.part === 'deploy') || imageNone) { const { signing: _s, ...rest } = draft; draft = rest; }
@@ -682,11 +822,18 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
   if (suggestions.length !== draft.suggestions.length) draft = { ...draft, suggestions };
   // G7 (carry G4→G7, ruling S31's pattern): the deploy layer's sbom and egress needs have no job of pipegen's in v0.2. pipegen never changes
   // the user's own deploy jobs, so their network is not locked (pipegen's image-publish and verify jobs start with the egress block; the
-  // keyless sign job has none until Sigstore's hosts are a reviewed set, G15), and no reviewed job makes the published image's SBOM yet.
+  // keyless and attest sign jobs have none, threat model T52: the per-run OIDC token host), and no reviewed job makes the published image's SBOM yet.
   // Neither is counted as covered: each leaves the draft with a plain note.
   const release = new Set(draft.needs.filter((n) => n.layer === 'deploy' && RELEASE_ONLY_NOTES.has(categoryOf(n.id) ?? n.category)));
   for (const n of release) addNote(notes, RELEASE_ONLY_NOTES.get(categoryOf(n.id) ?? n.category) as string);
   if (release.size > 0) draft = narrowed(draft, release);
+  // G15a-R7 spec 2: no Monday double run. The nightly file has a second cron entry when Scorecard runs weekly; every nightly job but Scorecard and
+  // the jobs that follow it (its code-scanning upload, through needs) runs only on the nightly entry
+  for (const [id, j] of Object.entries(nightly)) {
+    if (id === SCORECARD_JOB || (j.needs ?? []).includes(SCORECARD_JOB)) continue;
+    if (j.if !== undefined) fail(`The nightly job ${show(id)} already has a condition, so it can not be limited to the nightly cron.`);
+    nightly[id] = { ...j, if: NIGHTLY_IF };
+  }
   return { draft, push, merge, nightly, sign, notes, uncoveredMinimum: [...uncoveredMinimum.values()] };
 }
 
@@ -710,7 +857,7 @@ function withLintSteps(draft: PipelineDraft, plan: JobsPlan, reviewed: readonly 
 /** G7: the deploy-layer needs pipegen writes no job for in v0.2, each with its note (and PIPEGEN.md line, G9): never counted as covered. */
 export const RELEASE_ONLY_NOTES: ReadonlyMap<string, string> = new Map([
   ['sbom', 'The SBOM of the published image is not made yet: no reviewed job of pipegen\'s builds it after the image is published (v0.2). The image checks of pull requests still run.'],
-  ['egress', 'Your own deploy jobs keep their open network: pipegen never changes them (it only adds the pipegen-verify job they wait for). pipegen\'s own image publish and verify jobs run behind the network lock; a keyless signing job does not (Sigstore\'s hosts are not in a reviewed network set yet).'],
+  ['egress', 'Your own deploy jobs keep their open network: pipegen never changes them (it only adds the pipegen-verify job they wait for). pipegen\'s own image publish and verify jobs run behind the network lock; a keyless or attest signing job does not, because it needs a per-run token host that can not be listed exactly (only pipegen\'s own steps run there).'],
 ]);
 
 /** GJ: the note (and the PIPEGEN.md line, G9) of a signing or attestation need on a service that builds no image. */

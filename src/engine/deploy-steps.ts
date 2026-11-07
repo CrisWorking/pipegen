@@ -2,7 +2,8 @@
 // upload): pipegen's own fixed steps of the deploy layer, each one renderer shared by the builders (src/layers) and the referee, which
 // recognises them only by their exact content (like the pr-check lookup and the image hand-off).
 // - image-publish (job `image-publish` only): after the reviewed build-push step (`id: pipegen-build-push`, push true), the publish digest
-//   step writes the pushed image's digest, checked as sha256:<64 hex>, to `$RUNNER_TEMP/pipegen-out/<digest artifact>/digest`; the folder is
+//   step writes the pushed image's digest, checked as sha256:<64 hex> and (G15a-R11 r5-1) proven by the daemon's RepoDigests of the image the
+//   job built, to `$RUNNER_TEMP/pipegen-out/<digest artifact>/digest`; the folder is
 //   then uploaded as the service's digest artifact (`pipegen-out-image-digest--<svc>`, G2's name: B3 a's `pipegen-image-digest` does not pass
 //   the gate-bundled upload name checker). That tail is the order rule's exception for this job (job-rules.ts publishTailAt).
 // - pipegen-verify (job `pipegen-verify` only), after the gate action's find-run step (`id: pipegen-find-run`):
@@ -49,7 +50,9 @@ export const HEAD_CHECK_ENV: Readonly<Record<string, string>> = Object.freeze({ 
 export const DIGEST_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({
   PIPEGEN_RUN_ID: `\${{ steps.${FIND_RUN_STEP_ID}.outputs.run-id }}`, PIPEGEN_DIGEST_TOKEN: '${{ github.token }}',
 });
-export const PUBLISH_DIGEST_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_IMAGE_DIGEST: `\${{ steps.${BUILD_PUSH_STEP_ID}.outputs.digest }}` });
+export const PUBLISH_DIGEST_ENV: Readonly<Record<string, string>> = Object.freeze({
+  PIPEGEN_IMAGE_DIGEST: `\${{ steps.${BUILD_PUSH_STEP_ID}.outputs.digest }}`, PIPEGEN_IMAGE_ID: `\${{ steps.${BUILD_PUSH_STEP_ID}.outputs.imageid }}`,
+});
 
 /** A branch name as it may appear inside a single-quoted literal and an API path: plain characters only (signing.ts's rule). */
 const BRANCH_RE = /^(?!-)(?!.*\.\.)(?!.*\/\/)(?!.*\/$)[A-Za-z0-9._/-]{1,200}$/;
@@ -134,14 +137,30 @@ export function renderDigestStep(service: string): RenderedStep {
 }
 
 /**
- * The publish digest step of image-publish for the image of `service`: the reviewed build-push step's digest output, checked as
- * sha256:<64 hex>, written to the service's digest artifact folder (uploaded next, and read by the sign job and, by run id, the verify job).
+ * The publish digest step of image-publish for the image of `service`, published to `imageRepo` (publishedImageRepo): the reviewed build-push
+ * step's digest output, checked as sha256:<64 hex>, and proven to be the image this job built and pushed (G15a-R11 r5-1) before it is written
+ * to the service's digest artifact folder (uploaded next, and read by the sign job and, by run id, the verify job).
+ * Why the proof: on the docker driver with the classic image store, buildx pushes through the daemon and then asks the REGISTRY what the tag
+ * names to fill `digest`; anyone who can write to the package could move the tag in between, and pipegen would sign their image. So the step
+ * asks the daemon for its own record of the image the build made (by the build's `imageid`, never by the tag): its RepoDigests must hold
+ * exactly one entry for `<imageRepo>`, and it is `<imageRepo>@<digest>` (round 12). The daemon computes that entry from the manifest it pushed. Classic store: imageid is the config digest and
+ * RepoDigests gets the pushed manifest; containerd store: imageid is the manifest (or index) digest itself, also in RepoDigests. Checked live
+ * on both stores (G15a round 11); which store GitHub's hosted runners use is a G16 live item.
  */
-export function renderPublishDigestStep(service: string): RenderedStep {
+export function renderPublishDigestStep(service: string, imageRepo: string): RenderedStep {
   const artifact = artifactOf(service);
+  if (typeof imageRepo !== 'string' || !IMAGE_REPO_RE.test(imageRepo) || imageRepo.length > 255) throw new RenderError(`The published image repository ${show(String(imageRepo))} is not pipegen's plain ghcr.io form, so its digest can not be checked.`);
   return pipegenScriptStep(PUBLISH_DIGEST_STEP_ID, `pipegen: the digest of the published image of ${slug(service)}`, [
     'digest="$PIPEGEN_IMAGE_DIGEST"',
+    'image_id="$PIPEGEN_IMAGE_ID"',
     'if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then pg_fail "the image build gave no sha256:<64 hex> digest"; fi',
+    'if ! [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then pg_fail "the image build gave no sha256:<64 hex> image id"; fi',
+    'for t in docker jq; do command -v "$t" > /dev/null || pg_fail "this runner has no $t, which pipegen\'s publish digest check needs"; done',
+    `repo=${q(imageRepo)}`,
+    'want="$repo@$digest"',
+    `repo_digests="$(docker image inspect --format '{{json .RepoDigests}}' -- "$image_id")" || pg_fail "the Docker daemon has no record of the image this job built, so the digest of what it pushed can not be proven"`,
+    // round 12 (security r6 Nit 2): exactly one entry for the repository, and it is $want (one push of one build on a fresh runner)
+    'if ! printf \'%s\' "$repo_digests" | jq -e --arg repo "$repo" --arg want "$want" \'type == "array" and ([.[] | select(type != "string" or startswith($repo + "@"))] == [$want])\' > /dev/null; then pg_fail "the digest the build reported is not the image this job built and pushed (the Docker daemon\'s record of that image does not hold exactly one entry for $repo, $want): the tag may have been moved by another writer after the push, so nothing is handed on to be signed"; fi',
     `dir="$RUNNER_TEMP/pipegen-out/${artifact}"`,
     'mkdir -p "$RUNNER_TEMP/pipegen-out"',
     'mkdir "$dir"',

@@ -23,16 +23,17 @@
 //   tool needs at run time (image, local URL, Dockerfile, base ref) are slots from the render context (ruling B6): slots.ts.
 // Nothing here uploads (ruling B3).
 import { isDeepStrictEqual } from 'node:util';
-import { ArtifactNameError, RANGE_CANARY_FILES, RANGE_FACTS_FILE, resultArtifactName, SECRETS_RANGE_ARTIFACT } from './artifact-names.js';
+import { ArtifactNameError, RANGE_CANARY_FILES, RANGE_FACTS_FILE, resultArtifactName, SECRETS_HISTORY_ARTIFACT, SECRETS_RANGE_ARTIFACT } from './artifact-names.js';
 import { ASSET_RE, COMMIT_SHA_RE, DIGEST_RE, isGitHubRepo, isNpmName, isPypiName, parseImageRef, pep503, SHA256_RE, SRI_SHA512_RE, TAG_RE } from './names.js';
 import { closureRootDependencies, loadNpmClosure, NpmClosureError, pinOk, type NpmPin } from './npm-closure.js';
 import { EXPR, own, refuse, show } from './render-error.js';
 import type { RenderContext, RenderedStep, RenderResult } from './render-step.js';
 import { slotProblem, type SlotKind } from './slots.js';
-import { ARGV_POLICIES, PIP_CLOSURES, PLAIN_REL_RE, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, runsRepoCode, sha16, TEST_COMMANDS, type ArgvPolicy } from './tool-flags.js';
+import { ARGV_POLICIES, HISTORY_STEP_ENV, historyScanStepId, JOB_TOKEN_REF, PIP_CLOSURES, ZIZMOR_ONLINE_POLICY, PLAIN_REL_RE, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, runsRepoCode, sha16, TEST_COMMANDS, type ArgvPolicy } from './tool-flags.js';
 
 export { sha16 };   // defined in tool-flags.ts (the job rules need it too); re-exported for the callers that import it from here
 import { EXTRA_RULES_AT, tuningEffects, type TuningEffects } from './tuning.js';
+import { resultFormat } from './gate-job-list.js';
 import type { InstallSpec, ReviewedTool, Service, StepSpec } from '../types.js';
 
 /** Test and internal hooks: the argv policies and the pip closures the renderer reads (production passes neither). */
@@ -180,7 +181,7 @@ function templateEnv(tool: ReviewedTool, hooks: CliHooks): Record<string, string
   return env;
 }
 
-interface PinnedConfig { flag: string; content: string; fileName: string }
+interface PinnedConfig { flag: string; content: string; fileName: string; /** G15a round 6: named by its absolute path inside the work mount */ atMount?: true }
 
 /** The pinned config of an entry, cross-checked with its reviewed policy. Null when neither has one. */
 function configOf(tool: ReviewedTool, pol: ArgvPolicy): PinnedConfig | null {
@@ -193,7 +194,7 @@ function configOf(tool: ReviewedTool, pol: ArgvPolicy): PinnedConfig | null {
   if (p === undefined || p.flag !== fx.passAs.flag || p.content !== fx.content) return refuse(`The pinned config of ${show(tool.id)} differs from the one its argv policy reviewed.`);
   if (typeof p.fileName !== 'string' || !FILE_NAME_RE.test(p.fileName)) return refuse(`The argv policy of ${show(tool.id)} gives its config a file name that is not plain.`);
   if (!CONFIG_FLAG_RE.test(p.flag)) return refuse(`The config flag of ${show(tool.id)} is not a plain flag.`);
-  return { flag: p.flag, content: fx.content, fileName: p.fileName };
+  return { flag: p.flag, content: fx.content, fileName: p.fileName, ...(p.atMount === true ? { atMount: true as const } : {}) };
 }
 
 function checkInstall(tool: ReviewedTool, pol: ArgvPolicy): InstallSpec {
@@ -249,14 +250,14 @@ function wordOf(word: string, tool: ReviewedTool, spec: StepSpec, w: Words): str
 
 const isBoolChoice = (values: readonly string[]): boolean => values.length === 2 && values.includes('false') && values.includes('true');
 
-interface Built { main: string[]; then: string[][]; env: Record<string, string>; /** `"$PIPEGEN_ARG_n"` of the archive sub-folder choice */ sub?: string; /** repo-path slot variables (checked at run time) */ paths: string[]; fullHistory: boolean }
+interface Built { main: string[]; then: string[][]; env: Record<string, string>; /** G15a round 6: `NAME="$PIPEGEN_ARG_n"` of each env slot (docker -e) */ envWords: string[]; /** `"$PIPEGEN_ARG_n"` of the archive sub-folder choice */ sub?: string; /** repo-path slot variables (checked at run time) */ paths: string[]; fullHistory: boolean }
 
 /**
  * The words after the executable, as shell words: placeholders become quoted env variables, the pinned config flag goes
  * right after the leading subcommand words (a Go or urfave tool stops reading flags at the first plain word), and a
  * dedicated tool's choices are appended as `--<choice> "$V"` (a bool choice `--<choice>="$V"`).
  */
-function buildWords(tool: ReviewedTool, spec: StepSpec, pol: ArgvPolicy, config: PinnedConfig | null, configPath: string | null, slots: Slot[], tuned: TuningEffects): Built {
+function buildWords(tool: ReviewedTool, spec: StepSpec, pol: ArgvPolicy, config: PinnedConfig | null, configPath: string | null, slots: Slot[], tuned: TuningEffects, envSlots: readonly Slot[] = []): Built {
   const cli = tool.step.cli as NonNullable<typeof tool.step.cli>;
   const w: Words = { env: {}, index: new Map() };
   const rest = cli.command.slice(1);
@@ -276,6 +277,11 @@ function buildWords(tool: ReviewedTool, spec: StepSpec, pol: ArgvPolicy, config:
     if (at >= 0 && at + 1 < rest.length) main[at + 1] = v;
     else main.push(q(sl.key), v);
   }
+  // G15a round 6: an env slot is never a word of the command; the docker branch passes it as `-e NAME="$PIPEGEN_ARG_n"`
+  const envWords = envSlots.map((sl) => {
+    if (!NAME_RE.test(sl.key) || sl.key !== sl.key.toUpperCase() || !sl.key.startsWith('PIPEGEN_')) return refuse(`The env slot ${show(sl.key)} of ${show(tool.id)} is not a plain PIPEGEN_ name.`);
+    return `${sl.key}=${argVar(w, `env:${sl.key}`, sl.value)}`;
+  });
   // the archive folder: a tool run on the runner is told the checked-out folder where the reviewed command names its directory
   if (pol.archive !== undefined && pol.method !== 'docker') {
     let hit = 0;
@@ -307,7 +313,7 @@ function buildWords(tool: ReviewedTool, spec: StepSpec, pol: ArgvPolicy, config:
     if (isBoolChoice(values)) main.push(`--${name}=${v}`);
     else main.push(`--${name}`, v);
   }
-  return { main, then, env: w.env, ...(sub === undefined ? {} : { sub }), paths, fullHistory };
+  return { main, then, env: w.env, envWords, ...(sub === undefined ? {} : { sub }), paths, fullHistory };
 }
 
 
@@ -316,9 +322,9 @@ function buildWords(tool: ReviewedTool, spec: StepSpec, pol: ArgvPolicy, config:
 interface Slot { key: string; kind: SlotKind; value: string }
 
 /** The slot values of an entry, from the render context and the profile only, each checked by slots.ts. */
-function slotsOf(tool: ReviewedTool, pol: ArgvPolicy, service: Service | undefined, ctx: RenderContext, spec: StepSpec): Slot[] {
+function slotsOf(tool: ReviewedTool, pol: ArgvPolicy, service: Service | undefined, ctx: RenderContext, spec: StepSpec, table: Readonly<Record<string, SlotKind>> | undefined = pol.slots): Slot[] {
   const out: Slot[] = [];
-  for (const [key, kind] of Object.entries(pol.slots ?? {})) {
+  for (const [key, kind] of Object.entries(table ?? {})) {
     let value: string | undefined;
     let what: string;
     if (kind === 'image-digest') { value = ctx.targets?.image; what = 'the image to scan (an image target)'; }
@@ -446,6 +452,8 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   if (pol === undefined) return refuse(`${show(tool.id)} has no reviewed argv allowlist, so pipegen won't run it.`);
   if (pol.entrypoint === true) return refuse(`${show(tool.id)} is a job service (the image runs its own entrypoint), not a step; the job composer starts it.`);
   if (pol.needsSlot !== undefined) return refuse(`${show(tool.id)} ${pol.needsSlot}.`);
+  // G15a round 6: the ZAP AF active scan is pipegen's own nightly scan, never a need's step (the AI can not pick it: reviewedFor)
+  if (pol.nightlyOnly === true && ctx.nightly !== true) return refuse(`${show(tool.id)} runs only in pipegen's own nightly scan, never as a check of the pipeline.`);
   const install = checkInstall(tool, pol);
 
   const secrets = spec.secrets ?? [];
@@ -473,10 +481,16 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
 
   const config = configOf(tool, pol);
   // where the tool finds its config: a file on the runner, the work folder's own file (ZAP reads -c there), or a read-only mount
-  const configPath = config === null ? null : kind !== 'docker' ? `"${cfgBase}/${config.fileName}"` : inWork ? q(config.fileName) : q(`/pipegen-cfg/${config.fileName}`);
+  // G15a round 6: a config named by its absolute path in the work mount (zap.sh reads a relative -autorun path from /zap, not the cwd)
+  if (config?.atMount === true && !inWork) return refuse(`${show(tool.id)} names its config inside a work folder it does not mount.`);
+  const configPath = config === null ? null : kind !== 'docker' ? `"${cfgBase}/${config.fileName}"` : inWork ? q(config.atMount === true ? `${(mount as NonNullable<typeof mount>).at}/${config.fileName}` : config.fileName) : q(`/pipegen-cfg/${config.fileName}`);
   const slots = slotsOf(tool, pol, service, ctx, spec);
+  const envSlots = slotsOf(tool, pol, service, ctx, spec, pol.envSlots ?? {});
+  if (envSlots.length > 0 && !(kind === 'docker' && inWork && tool.categories.some((c) => DAST_CATEGORIES.has(c)) && envSlots.every((sl) => sl.kind === 'local-url'))) {
+    return refuse(`${show(tool.id)} passes a slot in the container env, which only a DAST step in a fresh work folder may do, and only the app's local URL.`);
+  }
   const tuned = tuningEffects(spec, tool, ctx);
-  const built = buildWords(tool, spec, pol, config, configPath, slots, tuned);
+  const built = buildWords(tool, spec, pol, config, configPath, slots, tuned, envSlots);
   const tplEnv = templateEnv(tool, hooks);
 
   const env: Record<string, string> = { ...tplEnv, ...built.env };
@@ -492,6 +506,12 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
     env.PIPEGEN_TUNED_CONFIG = tunedCfg.content;
   }
   if (tuned.extraRules.length > 0 && (archive === undefined || kind !== 'docker')) return refuse(`${show(tool.id)} has no rules archive to add rule folders from.`);
+  // G15a round 5 (b2): the online zizmor policy alone passes the job's own read token (contents: read), under its reviewed name, to a release binary
+  if (pol.tokenEnv !== undefined) {
+    if (pol !== ZIZMOR_ONLINE_POLICY || kind !== 'github-release' || pol.tokenEnv !== 'GH_TOKEN') return refuse(`${show(tool.id)} may not take the job's token.`);
+    env[pol.tokenEnv] = JOB_TOKEN_REF;
+    passed.push(pol.tokenEnv);
+  }
   for (const name of secrets) {
     if (!NAME_RE.test(name) || hooks.isDangerousName(name)) return refuse(`The secret name ${show(name)} can't be passed to a tool.`);
     env[name] = `\${{ secrets.${name} }}`;
@@ -560,6 +580,7 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
       }
     }
     for (const n of secrets) docker.push('-e', n);
+    for (const e of built.envWords) docker.push('-e', e);
     docker.push('"$PIPEGEN_IMAGE"', q(exe));
     prefix = docker.join(' ');
     // the result comes from the folder the tool wrote it in: the work folder, or the copied service folder it runs in (-w)
@@ -753,7 +774,7 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   const appRunning = tool.categories.some((c) => APP_RUNNING_CATEGORIES.has(c));
   const runId = runsRepoCode(pol, appRunning) ? `repocode-${sha16(artifact)}` : checker ? `checker-run-${sha16(artifact)}` : `tool-run-${sha16(artifact)}`;
   steps.push(runStep(`pipegen: run ${exe}`, run, env, runId));
-  return { steps, output: out === null ? null : { path: `\${{ runner.temp }}/pipegen-raw/${artifact}/${out}`, format: tool.step.output.format }, ...(built.fullHistory ? { fullHistory: true as const } : {}) };
+  return { steps, output: out === null ? null : { path: `\${{ runner.temp }}/pipegen-raw/${artifact}/${out}`, format: resultFormat(tool.step.output.format) }, ...(built.fullHistory ? { fullHistory: true as const } : {}) };
 }
 
 // ---------- the commit-range secrets scan (C9) ----------
@@ -812,8 +833,14 @@ export const RANGE_PIPEGEN_NOTE = [
  * `{ skipped: 'no-range' }` and exits 0; the gate reads that as not applicable on those events only, and blocks on a pull request event.
  * Any other failure fails the step and leaves no raw result (the scrub then reports a tool error). A merge from the default branch brings
  * that branch's newer commits into the range: a secret there blocks too (false blocks only, fail closed).
+ * G15a round 4 (b1, P-4), mode `history`: the nightly scan of the whole history is this step with no base. Its only outside value is the
+ * commit the run checked out (HISTORY_STEP_ENV, 40 hex digits, in the checkout); the stream is every ref of the full checkout (`--all`: the
+ * branches and tags `fetch-depth: 0` fetched) plus the tip canary, so the order check, the octopus check and the scanner read the same
+ * revisions. It writes the history form of the facts (gate/src/range.ts HistoryFacts) under SECRETS_HISTORY_ARTIFACT, never a skip: with no
+ * head it fails. Not covered: refs the checkout did not fetch (pull request heads, deleted branches), and commit messages, as for the range.
  */
-export function renderRangeScan(tool: ReviewedTool): RenderResult {
+export function renderRangeScan(tool: ReviewedTool, mode: 'range' | 'history' = 'range'): RenderResult {
+  const history = mode === 'history';
   const pol = own(ARGV_POLICIES, tool.id);
   if (tool.id !== RANGE_TOOL || pol === undefined || pol.method !== 'github-release') return refuse(`The commit-range scan runs the reviewed ${RANGE_TOOL} entry only, not ${show(tool.id)}.`);
   const install = checkInstall(tool, pol);
@@ -821,7 +848,7 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
   if (config === null || !config.content.startsWith('[extend]\n')) return refuse(`The pinned config of ${show(tool.id)} does not start with its [extend] table, so the range scan can not put its prefilter first.`);
   const out = tool.step.output.path;
   if (!PLAIN_OUT_RE.test(out) || tool.step.output.format !== 'sarif') return refuse(`${show(tool.id)} does not write a SARIF file with a plain name.`);
-  const artifact = SECRETS_RANGE_ARTIFACT;
+  const artifact = history ? SECRETS_HISTORY_ARTIFACT : SECRETS_RANGE_ARTIFACT;
   const exe = pol.exe;
   const outDir = `$RUNNER_TEMP/pipegen-raw/${artifact}`;
   const zero = '0'.repeat(40);
@@ -833,6 +860,13 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
     `work="$RUNNER_TEMP/pipegen-work/${artifact}"`,
     'mkdir -p "$RUNNER_TEMP/pipegen-work"',
     'mkdir "$work"',
+    ...(history ? [
+    // G15a round 4 (b1): the whole history from the commit this run checked out (40 hex digits; no range, no skip)
+    'head="$PIPEGEN_HISTORY_HEAD"',
+    `case "$head" in *[!0-9a-f]*|"") pg_fail "the commit the run checked out is not given as a commit sha, so the history is not scanned" ;; esac`,
+    `[ "\${#head}" -eq 40 ] || pg_fail "the commit the run checked out is not given as a commit sha, so the history is not scanned"`,
+    `[ "$head" != ${zero} ] || pg_fail "the commit the run checked out is not given as a commit sha, so the history is not scanned"`,
+    ] : [
     // the range: this event's base, head and (on a synchronize) before, each a commit sha (the hex test also stops `HEAD~000…`, which git resolves)
     'base="$PIPEGEN_RANGE_BASE"',
     'head="$PIPEGEN_RANGE_HEAD"',
@@ -854,6 +888,7 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
     'event="$PIPEGEN_RANGE_EVENT"',
     'case "$event" in pull_request|pull_request_review|merge_group|push|workflow_dispatch|schedule|workflow_call) ;; *) pg_fail "the event name is not one the range scan knows, so it is not scanned" ;; esac',
     `if [ "$base" = ${zero} ] || [ "$head" = ${zero} ]; then skip no-range "this event has no commit range (a push that made the branch, workflow_dispatch or schedule), so no commit range is scanned"; fi`,
+    ]),
     'git=(',
     '  "${sys[@]}"',
     '  GIT_CONFIG_NOSYSTEM=1',
@@ -880,6 +915,7 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
     'case "$gmaj$gmin" in *[!0-9]*|"") pg_fail "the version of git could not be read, so merge commits can not be scanned" ;; esac',
     `if [ "$gmaj" -lt ${REMERGE_GIT[0]} ] || { [ "$gmaj" -eq ${REMERGE_GIT[0]} ] && [ "$gmin" -lt ${REMERGE_GIT[1]} ]; }; then pg_fail "git $gv can not show what a merge commit added (--remerge-diff needs git ${REMERGE_GIT.join('.')}), so the commit range is not scanned"; fi`,
     '"${git[@]}" cat-file -e "$head^{commit}" 2> /dev/null || pg_fail "the commit $head is not in the checkout: the secrets job checks out the whole history (fetch-depth: 0)"',
+    ...(history ? [] : [
     // fix round 2 (m2): a push that rewrote the branch (its old head is not an ancestor of the new one): scan from where they meet; when the
     // old head is gone from the checkout, there is no such point, and the push is not scanned (on a push the range is informational)
     'forced=false',
@@ -902,6 +938,7 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
     '  fi',
     '  revs+=("$before")',
     'fi',
+    ]),
     'gitdir="$("${git[@]}" rev-parse --absolute-git-dir)"',
     'if [ -L "$gitdir" ] || [ ! -d "$gitdir" ]; then pg_fail "the git folder of the checkout is not a real folder"; fi',
     // two canary commits on the head, each its parent's tree plus one canary file (local objects only, dated after every real commit)
@@ -926,7 +963,7 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
     'done',
     'last="$parent"',
     // the stream: everything reachable from the tip canary (and before), not from the base; the two canaries must be its last commits
-    '"${git[@]}" rev-list --reverse "^$base" "$last" "${revs[@]}" > "$work/order.txt"',
+    history ? '"${git[@]}" rev-list --reverse --all "$last" > "$work/order.txt"' : '"${git[@]}" rev-list --reverse "^$base" "$last" "${revs[@]}" > "$work/order.txt"',
     'want="$("${sys[@]}" wc -l < "$work/order.txt")"',
     'case "$want" in *[!0-9]*|"") pg_fail "the commits of the range could not be counted" ;; esac',
     '[ "$want" -ge 2 ] || pg_fail "the commits of the range could not be counted"',
@@ -934,7 +971,7 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
     '[ "$tail2" = "${canaries[0]} ${canaries[1]} " ] || pg_fail "a commit of the range is dated after the canary commits, so the canary is not the last commit the scanner reads and the stream can not be proven read to its end"',
     'own=$((want - 2))',
     // fix round 2 (m3): --remerge-diff shows nothing of a merge with three or more parents, so a range that holds one is not scanned
-    '"${git[@]}" rev-list --min-parents=3 "^$base" "$last" "${revs[@]}" > "$work/octopus.txt"',
+    history ? '"${git[@]}" rev-list --min-parents=3 --all "$last" > "$work/octopus.txt"' : '"${git[@]}" rev-list --min-parents=3 "^$base" "$last" "${revs[@]}" > "$work/octopus.txt"',
     'if [ -s "$work/octopus.txt" ]; then pg_fail "the commit range holds an octopus merge (commit $("${sys[@]}" head -n 1 -- "$work/octopus.txt"), three or more parents), whose own changes can not be shown, so the range is not scanned: merge one branch at a time"; fi',
     // the scanner runs from an empty folder whose .git file names the checkout's git folder (no ignore file of the checkout is read)
     'src="$work/src"',
@@ -942,7 +979,7 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
     'printf \'gitdir: %s\\n\' "$gitdir" > "$src/.git"',
     `printf '%s' "$PIPEGEN_CONFIG" > "$work/${config.fileName}"`,
     `out="$work/${out}"`,
-    'logopts="--reverse --remerge-diff --text ^$base $last${revs[0]:+ ${revs[0]}}"',
+    history ? 'logopts="--reverse --remerge-diff --text --all $last"' : 'logopts="--reverse --remerge-diff --text ^$base $last${revs[0]:+ ${revs[0]}}"',
     'cd -- "$src"',
     ...allowlist(FIXED_PATH, []),
     'rc=0',
@@ -955,18 +992,24 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
     'if [ -f "$out" ] && [ ! -L "$out" ]; then',
     '  mkdir -p "$RUNNER_TEMP/pipegen-raw"',
     `  mkdir "${outDir}"`,
-    '  bjson=null',
-    `  [ "$before" = ${zero} ] || bjson="\\"$before\\""`,
-    `  printf '{"pipegenRange":1,"base":"%s","head":"%s","before":%s,"forced":%s,"commits":%s,"canaries":[{"commit":"%s","path":"${c1}"},{"commit":"%s","path":"${c2}"}]}\\n' "$base" "$head" "$bjson" "$forced" "$own" "\${canaries[0]}" "\${canaries[1]}" > "${outDir}/${RANGE_FACTS_FILE}"`,
+    ...(history ? [
+      `  printf '{"pipegenRange":1,"history":true,"head":"%s","commits":%s,"canaries":[{"commit":"%s","path":"${c1}"},{"commit":"%s","path":"${c2}"}]}\\n' "$head" "$own" "\${canaries[0]}" "\${canaries[1]}" > "${outDir}/${RANGE_FACTS_FILE}"`,
+    ] : [
+      '  bjson=null',
+      `  [ "$before" = ${zero} ] || bjson="\\"$before\\""`,
+      `  printf '{"pipegenRange":1,"base":"%s","head":"%s","before":%s,"forced":%s,"commits":%s,"canaries":[{"commit":"%s","path":"${c1}"},{"commit":"%s","path":"${c2}"}]}\\n' "$base" "$head" "$bjson" "$forced" "$own" "\${canaries[0]}" "\${canaries[1]}" > "${outDir}/${RANGE_FACTS_FILE}"`,
+    ]),
     `  mv -- "$out" "${outDir}/${out}"`,
     `  chmod -R a-w "${outDir}"`,
     'else',
     '  pg_fail "the tool left no regular result file"',
     'fi',
   ]);
-  const env: Record<string, string> = { ...RANGE_STEP_ENV, PIPEGEN_CONFIG: RANGE_PREFILTER + config.content };
+  const env: Record<string, string> = { ...(history ? HISTORY_STEP_ENV : RANGE_STEP_ENV), PIPEGEN_CONFIG: RANGE_PREFILTER + config.content };
   return {
-    steps: [releaseInstall(tool, install, exe, artifact), runStep('pipegen: scan the pull request\'s commits for secrets', run, env, rangeScanStepId)],
+    steps: [releaseInstall(tool, install, exe, artifact), history
+      ? runStep('pipegen: scan the whole history for secrets', run, env, historyScanStepId)
+      : runStep('pipegen: scan the pull request\'s commits for secrets', run, env, rangeScanStepId)],
     output: { path: `\${{ runner.temp }}/pipegen-raw/${artifact}/${out}`, format: 'sarif' },
     fullHistory: true,
   };

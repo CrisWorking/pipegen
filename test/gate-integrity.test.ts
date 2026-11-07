@@ -6,7 +6,7 @@
 import { describe, expect, it } from 'vitest';
 import type { GateGithub } from '../gate/src/baseline.js';
 import {
-  addedLinesOf, baseHasInstall, buildPrDiff, codeOwners, integrityFindings, loadCodeowners, ownersOf, parseConfigDoc, PIPEGEN_BLOCK_BEGIN, PIPEGEN_BLOCK_END, pipegenBlockOwners,
+  addedLinesOf, baseHasInstall, buildPrDiff, codeOwners, integrityFindings, loadCodeowners, ownersLookup, ownersOf, parseConfigDoc, PIPEGEN_BLOCK_BEGIN, PIPEGEN_BLOCK_END, pipegenBlockOwners,
   readConfigSections, readPrContext as readPrContextStrict, type CodeownersRule, type PrContext, type PrFile,
 } from '../gate/src/integrity.js';
 import { PROTECTED_PATHS_BASE } from '../src/types.js';
@@ -105,9 +105,12 @@ describe('codeowners: parsing', () => {
       expect(codeOwners(`/a @ok ${bad} @fine-1\n`), bad).toEqual([]);
     expect(codeOwners('/a @fine-1 @org/team user@example.com\n')).toEqual([{ pattern: '/a', owners: ['fine-1'] }]);
   });
-  it('a hostile huge file is bounded: only the first 100,000 rules count and a line over 4096 characters is skipped', () => {
+  it('a hostile huge file is bounded: only the first 100,000 rules count and a line over 4096 characters is not read', () => {
     const rules = codeOwners(`${'/' + 'a'.repeat(5000)} @a\n` + Array.from({ length: 100_050 }, (_, i) => `/p${i} @a`).join('\n'));
-    expect(rules.length).toBe(100_000);
+    // G15b-R1 S5: neither is dropped silently; each leaves an unreadable place a lookup can not pass (test/gate-codeowners-f7.test.ts)
+    expect(rules.length).toBe(100_001);
+    expect(rules[0]).toEqual({ pattern: '', owners: [], unreadable: 'line' });
+    expect(rules[100_000]).toEqual({ pattern: '', owners: [], unreadable: 'count' });
   });
 });
 
@@ -764,7 +767,7 @@ describe('hostile input never throws', () => {
       const rules = codeOwners(`${junk(40)}\n${junk(40)} @a ${junk(10)}\n`);
       const files = [file(junk(30) || 'x', { patch: `@@ -1 +1 @@\n${junk(50)}`, previous_filename: junk(10) || undefined })];
       expect(() => integrityFindings(ctx({ files, approvals: ['a'] }), PROTECTED, rules)).not.toThrow();
-      expect(() => ownersOf(rules, junk(30))).not.toThrow();
+      expect(() => ownersLookup(rules, junk(30))).not.toThrow();   // G15b-R1: ownersOf throws on purpose when a lookup is unresolved (a path with an empty part)
       expect(() => addedLinesOf(files)).not.toThrow();
     }
   });

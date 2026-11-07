@@ -28,6 +28,9 @@ const SHA = 'a'.repeat(40);
 const NEWER = 'b'.repeat(40);
 const DIGEST = `sha256:${'c'.repeat(64)}`;
 const RUN = '4242';
+/** G15a-R11 r5-1: the build's imageid on the classic image store (the config digest; the containerd store reports the manifest's, the digest). */
+const IMAGE_ID = `sha256:${'e'.repeat(64)}`;
+const IMAGE_REPO = 'ghcr.io/o/r-app';
 const ART = '777';
 /** Spelled at run time (test/no-secret-literals.test.ts): the fake job token and the header scheme. */
 const FAKE_T = ['pipegen', 'test', 'value'].join('-');
@@ -127,7 +130,8 @@ async function run(step: RenderedStep, env: Record<string, string> = {}, pathDir
     stepEnv[k] = String(v)
       .replace('${{ github.token }}', FAKE_T)
       .replace('${{ steps.pipegen-find-run.outputs.run-id }}', RUN)
-      .replace('${{ steps.pipegen-build-push.outputs.digest }}', DIGEST);
+      .replace('${{ steps.pipegen-build-push.outputs.digest }}', DIGEST)
+      .replace('${{ steps.pipegen-build-push.outputs.imageid }}', IMAGE_ID);
   }
   const all = {
     HOME: tmp, CURL_CA_BUNDLE: ca, RUNNER_TEMP: tmp, GITHUB_OUTPUT: out, GITHUB_API_URL: base, GITHUB_REPOSITORY: 'o/r',
@@ -292,17 +296,64 @@ describe.skipIf(!READY)('G7-R1 spec I2: the digest step runs', () => {
   });
 });
 
-describe.skipIf(!READY)('G7-R1 spec I2: the publish digest step runs', () => {
-  const step = renderPublishDigestStep('app');
-  it('publish digest: the build digest is written to the digest folder; anything else is refused', async () => {
+describe.skipIf(!READY)('G7-R1 spec I2, G15a-R11 r5-1: the publish digest step runs', () => {
+  const step = renderPublishDigestStep('app', IMAGE_REPO);
+  // a fake docker first on the PATH: it records its arguments and prints PIPEGEN_TEST_REPO_DIGESTS (or fails with PIPEGEN_TEST_DOCKER_CODE)
+  beforeAll(() => {
+    if (!READY) return;
+    writeFileSync(join(bin, 'docker'), [
+      '#!/bin/bash',
+      'printf \'%s\\n\' "$*" >> "$RUNNER_TEMP/docker-args"',
+      'if [ "${PIPEGEN_TEST_DOCKER_CODE:-0}" != 0 ]; then echo "Error: No such image" >&2; exit "$PIPEGEN_TEST_DOCKER_CODE"; fi',
+      'printf \'%s\\n\' "$PIPEGEN_TEST_REPO_DIGESTS"',
+    ].join('\n'), { mode: 0o755 });
+  });
+  const digests = (...refs: string[]): string => JSON.stringify(refs);
+  const wrote = (r: Ran): boolean => existsSync(join(r.tmp, 'pipegen-out', ARTIFACT, 'digest'));
+  it('publish digest: the build digest is written when the daemon\'s record of the built image holds <repo>@<digest>, on both image stores', async () => {
     api = fresh();
-    const r = await run(step);
-    expect(r.code, r.err).toBe(0);
-    expect(readFileSync(join(r.tmp, 'pipegen-out', ARTIFACT, 'digest'), 'utf8')).toBe(DIGEST);
+    // classic store: imageid is the config digest, RepoDigests gets the pushed manifest's digest; containerd store: imageid is the digest itself
+    for (const [store, id, rd] of [
+      ['classic', IMAGE_ID, digests(`${IMAGE_REPO}@${DIGEST}`)],
+      ['containerd', DIGEST, digests(`${IMAGE_REPO}@${DIGEST}`)],
+      ['classic, an entry of another repository too', IMAGE_ID, digests(`ghcr.io/o/r-web@sha256:${'d'.repeat(64)}`, `${IMAGE_REPO}@${DIGEST}`)],
+    ] as const) {
+      const r = await run(step, { PIPEGEN_IMAGE_ID: id, PIPEGEN_TEST_REPO_DIGESTS: rd });
+      expect(r.code, `${store}: ${r.err}`).toBe(0);
+      expect(readFileSync(join(r.tmp, 'pipegen-out', ARTIFACT, 'digest'), 'utf8'), store).toBe(DIGEST);
+      // the daemon is asked about the image this job built, by its id, never by the tag
+      expect(readFileSync(join(r.tmp, 'docker-args'), 'utf8'), store).toBe(`image inspect --format {{json .RepoDigests}} -- ${id}\n`);
+    }
+  });
+  it('publish digest: a digest the daemon did not push for this image (the tag moved in between), no record, or a bad digest or id is refused before anything is written', async () => {
+    api = fresh();
+    const ok = { PIPEGEN_IMAGE_ID: IMAGE_ID, PIPEGEN_TEST_REPO_DIGESTS: digests(`${IMAGE_REPO}@${DIGEST}`) };
+    const cases: [string, Record<string, string>][] = [
+      ['the swapped digest (another writer\'s manifest)', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: digests(`${IMAGE_REPO}@sha256:${'f'.repeat(64)}`) }],
+      ['the digest under another repository', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: digests(`ghcr.io/o/r-other@${DIGEST}`) }],
+      ['a prefix of the repository', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: digests(`ghcr.io/o/r-app-x@${DIGEST}`) }],
+      // round 12 (security r6 Nit 2): exactly one entry for the repository; two are refused, whichever the build reported
+      ['two entries for the repository, the reported digest second', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: digests(`${IMAGE_REPO}@sha256:${'f'.repeat(64)}`, `${IMAGE_REPO}@${DIGEST}`) }],
+      ['two entries for the repository, the reported digest first', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: digests(`${IMAGE_REPO}@${DIGEST}`, `${IMAGE_REPO}@sha256:${'f'.repeat(64)}`) }],
+      ['the reported entry twice', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: digests(`${IMAGE_REPO}@${DIGEST}`, `${IMAGE_REPO}@${DIGEST}`) }],
+      ['a non-string entry beside it', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: JSON.stringify([`${IMAGE_REPO}@${DIGEST}`, 1]) }],
+      ['no RepoDigests (never pushed by this daemon)', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: '[]' }],
+      ['RepoDigests null', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: 'null' }],
+      ['RepoDigests not JSON', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: `${IMAGE_REPO}@${DIGEST}` }],
+      ['the image is unknown to the daemon', { ...ok, PIPEGEN_TEST_DOCKER_CODE: '1' }],
+      ['no image id', { ...ok, PIPEGEN_IMAGE_ID: '' }],
+      ['an image id that is an option', { ...ok, PIPEGEN_IMAGE_ID: '--help' }],
+      ['an image id that is a name', { ...ok, PIPEGEN_IMAGE_ID: 'ghcr.io/o/r-app:pipegen' }],
+    ];
+    for (const [name, env] of cases) {
+      const b = await run(step, env);
+      expect(b.code, name).not.toBe(0);
+      expect(wrote(b), name).toBe(false);
+    }
     for (const bad of ['', 'sha256:abc', `${DIGEST} `, 'latest']) {
-      const b = await run(step, { PIPEGEN_IMAGE_DIGEST: bad });
+      const b = await run(step, { ...ok, PIPEGEN_IMAGE_DIGEST: bad });
       expect(b.code, bad).not.toBe(0);
-      expect(existsSync(join(b.tmp, 'pipegen-out', ARTIFACT, 'digest')), bad).toBe(false);
+      expect(wrote(b), bad).toBe(false);
     }
   });
 });

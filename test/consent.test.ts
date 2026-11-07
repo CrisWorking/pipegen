@@ -547,3 +547,11 @@ describe('consent screen (Plan U final review M2)', () => {
     expect(text).toMatch(/pipegen sends \d+ files? \(about \d+ KB\) from acme\//);
   });
 });
+
+describe('G15a-R9 spec r3-1: the ZAP active scan ceiling on the consent screen', () => {
+  it('a web app with a Dockerfile: the consent text shows the 5-minute headline and the 45-minute ceiling', () => {
+    const { est, text } = full({ p: profile({ services: [svc({ dockerfile: 'Dockerfile', port: 3000 })] }) });
+    expect(est.basis.join('\n')).toMatch(/up to 45 min/);
+    expect(text.replace(/\s+/g, ' ')).toMatch(/ZAP active scan[^\n]*about 5 min[^\n]*up to 45 min/);
+  });
+});

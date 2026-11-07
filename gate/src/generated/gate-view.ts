@@ -3,7 +3,7 @@
 import type { GateToolView } from '../settings.js';
 
 /** The version of this gate (nightly compares it with the newest gate-v<version> release). */
-export const GATE_VERSION = "0.2.2";
+export const GATE_VERSION = "0.2.3";
 
 export const GATE_VIEW: readonly GateToolView[] = [
   {
@@ -101,6 +101,14 @@ export const GATE_VIEW: readonly GateToolView[] = [
       ".zap/**"
     ],
     "outputFile": "zap.json"
+  },
+  {
+    "id": "zap-af-active",
+    "categories": [
+      "dast"
+    ],
+    "configFiles": [],
+    "outputFile": "zap-active.json"
   },
   {
     "id": "trivy-config",
@@ -217,6 +225,13 @@ export const GATE_VIEW: readonly GateToolView[] = [
     "id": "cosign",
     "categories": [
       "signing"
+    ],
+    "configFiles": []
+  },
+  {
+    "id": "gh",
+    "categories": [
+      "deploy-verify"
     ],
     "configFiles": []
   },
@@ -392,7 +407,7 @@ export const GATE_VIEW: readonly GateToolView[] = [
       ".trivyignore.yaml",
       "trivy-secret.yaml"
     ],
-    "outputFile": "trivy-licence.sarif"
+    "outputFile": "trivy-licence.json"
   },
   {
     "id": "dependency-review-action",

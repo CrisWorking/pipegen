@@ -16,7 +16,8 @@ import { deployGateOf } from '../src/audit/coverage/deploy-gate.js';
 import { floorNeeds } from '../src/engine/needs.js';
 import { RenderError } from '../src/engine/render-error.js';
 import { renderVerifySteps } from '../src/engine/signing.js';
-import { assemble, judgeAssembled, verifyPermissions, verifyTail, type AssembledFiles } from '../src/layers/assemble.js';
+import { assemble, judgeAssembled, keylessVerifyNote, verifyPermissions, verifyTail, type AssembledFiles } from '../src/layers/assemble.js';
+import { EGRESS_DOMAIN_SETS, KEYLESS_VERIFY_SETS } from '../src/engine/egress.js';
 import {
   deployTriggers, environmentPlan, generateCosignKeys, insertVerify, isMemoryFolder, MEMORY_DIR, planVerifyInserts, releaseJobs, renewVerifyJob, verifyJobYaml, type VerifyPlan,
 } from '../src/layers/deploy.js';
@@ -298,9 +299,9 @@ describe('G7 verify job: what pipegen-verify proves before a deploy', () => {
   });
 
   it('verify job: attest mode uses gh attestation verify --signer-workflow', () => {
-    // the reviewed pinned gh release lands with the re-pin batch (G15); a gh entry of the same form shows the rendered command
-    const cosign = REVIEWED.find((t) => t.id === 'cosign') as ReviewedTool;
-    const gh: ReviewedTool = { ...cosign, id: 'gh', candidate: { ...cosign.candidate, id: 'gh', name: 'cli/cli', repo: 'cli/cli' }, step: { ...cosign.step, cli: { ...(cosign.step.cli as NonNullable<ReviewedTool['step']['cli']>), command: ['gh', 'attestation', 'verify'] } } };
+    // G15a: the reviewed pinned gh release is on the list
+    const gh = REVIEWED.find((t) => t.id === 'gh') as ReviewedTool;
+    expect(gh).toBeDefined();
     const prof = profileOf([SERVER], { private: true });
     const draft = planned(prof, { over: { centralPin: PIN, signing: { mode: 'attest', images: [IMG] } } }).draft;
     const run = String(renderVerifySteps(gh, draft, IMG)[1]?.run);
@@ -308,12 +309,9 @@ describe('G7 verify job: what pipegen-verify proves before a deploy', () => {
     expect(run).toContain("--signer-workflow 'o/pipelines/.github/workflows/r--sign.yml'");
     expect(run).toContain(`--signer-digest '${PIN.sha}'`);
     expect(run).toContain("--repo 'o/r'");
-    // until the reviewed gh entry exists, an attest deploy of an image can not be verified: assembling its verify job is refused
-    expect(REVIEWED.some((t) => t.id === 'gh')).toBe(false);
-    expect(() => verifyTail(draft, REVIEWED)).toThrow(/reviewed pinned gh release.*G15/);
-    // with the gh entry of that form the job is assembled, with the attest permissions (G7-R1 sec M7), and the command above is its last step
-    const tail = verifyTail(draft, [...REVIEWED, gh]);
-    expect(String(tail.steps.at(-1)?.run)).toBe(run);
+    expect(run).toContain(' --no-public-good');
+    // G15a-R0b: attest verify is on; its job reaches gh's attestation hosts (test/g15-attest-verify.test.ts holds it to the referee)
+    expect(verifyTail(draft, REVIEWED).sets).toContain('github-attest');
     expect(verifyPermissions(draft)).toEqual({ contents: 'read', actions: 'read', packages: 'read', attestations: 'read' });
   });
 
@@ -959,10 +957,10 @@ describe('G7-R1 spec: the byte-level edit, the key, the network note, the enviro
     await expect(generateCosignKeys(async () => '/opt/cosign', { base: '/', isMemory: () => false })).rejects.not.toThrow(/pipegen finish/);
   });
 
-  it('G7-R1 spec I4: a keyless verify job whose Sigstore hosts are not a reviewed network set gets a release-blocker note', () => {
+  it('G7-R1 spec I4 (G15a: the release blocker is fixed): a keyless verify job reaches the reviewed Sigstore set, so no release-blocker note', () => {
     const kl = world('keyless');
-    expect(kl.a.notes.join('\n')).toMatch(/Your deploys stop for now: pipegen checks a keyless signature with Sigstore[\s\S]*before release/);
-    expect(world('key-env').a.notes.join('\n')).not.toMatch(/Your deploys stop for now/);
+    expect(kl.a.notes.join('\n')).not.toMatch(/Your deploys stop/);
+    expect(world('key-env').a.notes.join('\n')).not.toMatch(/Your deploys stop/);
   });
 
   it('G7-R1 minor: environments of workflows pipegen does not protect keep their branch rules, with a note', async () => {
@@ -1098,11 +1096,23 @@ describe('G7-R2 3-6: what the notes and messages say', () => {
     expect(world('keyless').v.preview.join('\n')).not.toMatch(/push only for some paths/);
     expect(String(renderHeadCheckStep('main').run)).toContain('if that commit starts a deploy; otherwise push again or re-run all jobs on the newest commit');
   });
-  it('G7-R2 6: the Sigstore note names no internal task and is keyed on the hosts the verify job may reach', () => {
-    const note = world('keyless').a.notes.find((n) => /Sigstore/.test(n) && /deploys stop/.test(n)) as string;
-    expect(note).toMatch(/before release/);
-    expect(note).not.toMatch(/\bG\d+\b/);
-    expect(readFileSync('src/layers/assemble.ts', 'utf8')).not.toMatch(/SIGSTORE_SET = 'sigstore'/);
+  it('G7-R2 6: the Sigstore note names no internal task and fires exactly when the verify job can not reach a host of the keyless verify set', () => {
+    // G15a-R7 spec 4: keyed on the verify job's own egress step and the hosts of the set (never a copied list), checked by behaviour
+    const w = world('keyless');
+    const verify = verifyOf(w);
+    expect(keylessVerifyNote(w.a.draft, verify)).toBeNull();
+    expect(w.a.notes.join('\n')).not.toMatch(/Your deploys stop/);
+    const hosts = KEYLESS_VERIFY_SETS.flatMap((x) => EGRESS_DOMAIN_SETS[x]);
+    expect(hosts.length).toBeGreaterThan(0);
+    for (const h of hosts) {
+      const cut: Job = { ...verify, steps: verify.steps.map((s, i) => (i === 0 ? { ...s, with: { ...s.with, 'allowed-domains': String(s.with?.['allowed-domains']).split('\n').filter((x) => x !== h).join('\n') } } : s)) };
+      const note = keylessVerifyNote(w.a.draft, cut);
+      expect(note, h).toMatch(/^Your deploys stop: pipegen checks a keyless signature with Sigstore/);
+      expect(note, h).not.toMatch(/\bG\d+\b|before release|adds them/);
+    }
+    // only keyless: a key-env verify job reaches no Sigstore host and gets no note
+    const ke = world('key-env');
+    expect(keylessVerifyNote(ke.a.draft, verifyOf(ke))).toBeNull();
   });
 });
 

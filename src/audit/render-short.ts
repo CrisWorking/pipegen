@@ -176,7 +176,7 @@ function costLine(r: AuditReport, c: RenderCtx): string {
   const included = e.includedMinutes;
   const heavy = typeof included === 'number' && Number.isFinite(included) && included > 0 && e.monthlyMinutes > included / 2
     ? ` (more than half of the ${num(included)} your plan includes)` : '';
-  return `Full setup cost: about ${num(e.setupMinutes)} Actions minutes to set up (cap ${num(e.setupMinutesCap)}), ${num(e.monthlyMinutes)}${atLeast ? ' or more' : ''} minutes a month${heavy}; ${ai}`;
+  return `Full setup cost: about ${num(e.setupMinutes)} Actions minutes (cap ${num(e.setupMinutesCap)}), then ${num(e.monthlyMinutes)}${atLeast ? ' or more' : ''} minutes a month${heavy}; ${ai}`;
 }
 
 /** The short terminal report as a Doc: `terminal` holds its lines (cleaned and wrapped at 100). */

@@ -31,8 +31,9 @@ import { CONTENT_FORMS, fingerprintAll, isQuotingFinding, keyId, keyProblem, mas
 import { fail, getOwn, isObj, MAX_RAW_BYTES, ReadError, readJson, type ParsedFinding, type ParseResult } from './parse-common.js';
 import { MAX_ADVISORY_IDS, SARIF_TOOLS, parseSarifText } from './sarif.js';
 import { applyStage, readStage, StageError, STAGED_NAME_RE, type Stage, type StagedFindings } from './stage.js';
-import { applyRange, isRangeSkipped, RANGE_FACTS_FILE, SKIP_NOTES, SKIP_REASONS, RangeFactsError, readRangeFacts, SECRETS_RANGE_ARTIFACT, SECRETS_RANGE_TOOL, type RangeRun } from './range.js';
-import { ZAP_TOOL, parseZapJsonText } from './zap.js';
+import { applyRange, isRangeSkipped, RANGE_FACTS_FILE, SKIP_NOTES, SKIP_REASONS, RangeFactsError, readRangeFacts, SECRETS_HISTORY_ARTIFACT, SECRETS_RANGE_ARTIFACT, SECRETS_RANGE_TOOL, type RangeRun } from './range.js';
+import { ZAP_AF_TOOL, ZAP_TOOL, ZAP_TOOLS, parseZapJsonText } from './zap.js';
+import { parseTrivyLicenceJsonText, TRIVY_LICENCE_TOOL } from './trivy-licence.js';
 
 export type ScrubFormat = 'sarif' | 'zap-json';
 export interface ScrubOptions {
@@ -59,7 +60,8 @@ export interface ScrubOptions {
    * C9: the facts of a commit-range scan (gate/src/range.ts), for the result of SECRETS_RANGE_ARTIFACT only: the SARIF of betterleaks in `git`
    * mode, every finding with its commit; the two canary commits are required and taken out. No stage folder, and no region of the checkout is
    * read (a secret of the range is in a commit, not in HEAD's files): its secrets take the line form. Facts that say the event had no range
-   * (fix round 1) give a result with no finding, marked `pipegenRangeSkipped`, and the raw file is not read.
+   * (fix round 1) give a result with no finding, marked `pipegenRangeSkipped`, and the raw file is not read. G15a round 4 (b1): the result of
+   * SECRETS_HISTORY_ARTIFACT (the nightly full-history scan) reads the history form only, the same way.
    */
   range?: RangeRun;
 }
@@ -122,8 +124,10 @@ function withholder(): (file: string | undefined) => boolean {
   };
 }
 
+/** G15a round 6: the driver name of the SARIF the scrub writes for a ZAP report (the nightly AF scan, for code scanning). */
+const ZAP_SARIF_DRIVER = 'ZAP';
 function sarifOut(tool: string, findings: readonly FingerprintedFinding[], notes: readonly string[], key: string | undefined, extra: Record<string, string> = {}): string {
-  const info = SARIF_TOOLS[tool];
+  const info = tool === ZAP_AF_TOOL ? { driver: ZAP_SARIF_DRIVER } : SARIF_TOOLS[tool];
   const withheld = withholder();
   const results = findings.map((f) => {
     const hide = withheld(f.file);
@@ -214,14 +218,18 @@ export function scrubBytes(raw: Uint8Array, opts: ScrubOptions): ScrubOutcome {
           return toolError(e instanceof StageError ? e.message : 'the stage folder could not be read', key);
         }
       }
-      parsed = opts.range !== undefined
+      // G11-2: the licence scan's raw result is Trivy's JSON with every package listed (the scrubbed result is SARIF, as for every tool);
+      // a SARIF file there is a tool error (the reader refuses it), so the packages with no licence data are never missed in silence
+      parsed = opts.tool === TRIVY_LICENCE_TOOL
+        ? parseTrivyLicenceJsonText(raw, opts.tool, { limits: { maxBytes } })
+        : opts.range !== undefined
         ? parseSarifText(raw, opts.tool, { commits: true, limits: { maxBytes } })   // C9: git mode writes repository paths; no workspace
         : stage === undefined
           ? parseSarifText(raw, opts.tool, { workspace: opts.workspace, limits: { maxBytes } })
           : parseSarifText(raw, opts.tool, { workspace: stage.files, exactNames: STAGED_NAME_RE, limits: { maxBytes } });
     } else if (opts.format === 'zap-json') {
       if (opts.stage !== undefined || opts.range !== undefined) return toolError('a stage folder or a commit range is only for the secrets tools', key);
-      if (opts.tool !== ZAP_TOOL) return toolError(`${JSON.stringify(safeText(opts.tool, 60))} is not a tool whose ZAP report the gate reads`, key);
+      if (!ZAP_TOOLS.has(opts.tool)) return toolError(`${JSON.stringify(safeText(opts.tool, 60))} is not a tool whose ZAP report the gate reads`, key);
       parsed = parseZapJsonText(raw, opts.tool, { limits: { maxBytes } });
     } else {
       return toolError('the result format is not one the gate reads', key);
@@ -258,7 +266,8 @@ export function scrubBytes(raw: Uint8Array, opts: ScrubOptions): ScrubOutcome {
       ...(opts.range === undefined ? {} : { regionOf: () => ({ ok: false as const, reason: 'a secret in a commit of the range (the checkout\'s file is not that commit\'s)' }) }),
     });
     const notes = [...parsed.notes, ...lineNotes(findings)].slice(0, MAX_NOTES).map((n) => clip(maskSecretShapes(n), MAX_NOTE_CHARS));
-    const bytes = Buffer.from(opts.format === 'sarif' ? sarifOut(opts.tool, findings, notes, usedKey) : zapOut(findings, notes), 'utf8');
+    // G15a round 6: the nightly AF scan's ZAP report is written as SARIF (code scanning reads it); zap-baseline's keeps the ZAP form the gate reads
+    const bytes = Buffer.from(opts.format === 'sarif' || opts.tool === ZAP_AF_TOOL ? sarifOut(opts.tool, findings, notes, usedKey) : zapOut(findings, notes), 'utf8');
 
     // the last check: nothing secret may have reached an allowlisted field (a file name, a rule id)
     // as written and as JSON writes it (a quote, a backslash or a newline in the text is escaped in the file)
@@ -525,10 +534,11 @@ export function scrubFile(opts: ScrubFileOptions): ScrubFileResult {
   // C9: the commit-range scan reads the history, not a stage folder: its coverage is proven by its count (the scan step) and its canary commits,
   // from the facts the step wrote beside its raw result
   let range: RangeRun | undefined;
-  if (opts.artifact === SECRETS_RANGE_ARTIFACT) {
+  // G15a round 4 (b1): the nightly full-history scan is the same step with no base; its artifact reads only the history form of the facts
+  if (opts.artifact === SECRETS_RANGE_ARTIFACT || opts.artifact === SECRETS_HISTORY_ARTIFACT) {
     if (opts.stage !== undefined) return fail1('the commit-range scan has no stage folder');
     try {
-      range = readRangeFacts(join(dirname(opts.raw), RANGE_FACTS_FILE));
+      range = readRangeFacts(join(dirname(opts.raw), RANGE_FACTS_FILE), opts.artifact === SECRETS_HISTORY_ARTIFACT ? 'history' : 'range');
     } catch (e) {
       return fail1(e instanceof RangeFactsError ? e.message : 'the commit-range facts could not be read');
     }

@@ -5,6 +5,7 @@
 import { createHash } from 'node:crypto';
 import { Document, parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
+import { GITHUB_ATTEST_SET, renderEgressStep } from '../src/engine/egress.js';
 import { aiChoiceNames, CODE_FILLED_CHOICES } from '../src/create/coverage.js';
 import { builderOffers } from '../src/debate/builder.js';
 import { jobIdFor } from '../src/engine/gate-job-list.js';
@@ -15,7 +16,7 @@ import { imageArchiveArtifact, imageBuildTag, renderImageArchiveScan, renderImag
 import { attestSignerWorkflow, COSIGN_ID, GH_ID, imageDigestArtifact, keylessIdentity, pubKeySha256, renderSignSteps, renderVerifySteps } from '../src/engine/signing.js';
 import { renderFindingsBlock, renderFindRunStep, renderJobPrelude, renderPlatformStep, renderScrub, renderStep, renderUpload, scrubbedPath, type RenderContext } from '../src/engine/render-step.js';
 import { RenderError } from '../src/engine/render-error.js';
-import { renderDigestStep } from '../src/engine/deploy-steps.js';
+import { BUILD_PUSH_STEP_ID, PUBLISH_TAG, publishedImageRepo, renderDigestStep, renderPublishDigestStep } from '../src/engine/deploy-steps.js';
 import { verifyTail, VERIFY_LIMIT } from './helpers/verify-tail.js';
 import type { Candidate, CreatedFile, KnownValueCheck, Need, PipelineDraft, ReviewedTool, Service, SigningPlan, StepSpec } from '../src/types.js';
 import { draftOf, GATE, imageProf, job, jobsOf, p, prof, show, workflow, type Job } from './helpers/gate-pipeline.js';
@@ -48,14 +49,10 @@ const PEM = [['-----BEGIN', 'PUBLIC KEY-----'].join(' '), 'MFkwEwYHKoZIzj0CAQYIK
 const PUB_SHA = createHash('sha256').update(PEM, 'utf8').digest('hex');
 const IMG = { service: 'app', repo: 'ghcr.io/o/r-app' } as const;
 const COSIGN = entry(COSIGN_ID);
-/** A fixture for the reviewed pinned gh release entry (the real one lands in G15's re-pin batch, ruling B3 d). */
+/** The reviewed pinned gh release entry (G15a, ruling B3 d), or a copy of it with its candidate changed (for the refusals). */
 const ghEntry = (over: Partial<Candidate> = {}): ReviewedTool => {
-  const candidate: Candidate = { id: GH_ID, name: 'cli/cli', kind: 'cli', repo: 'cli/cli', version: 'v2.80.0', pin: { checksum: 'c'.repeat(64) }, source: 'reviewed', reviewed: true, categories: ['attestation'], ...over };
-  return {
-    id: candidate.id, categories: ['attestation'], languages: ['any'], candidate: candidate as ReviewedTool['candidate'],
-    step: { cli: { install: { method: 'github-release', package: 'gh_2.80.0_linux_amd64.tar.gz', version: candidate.version }, command: ['gh', 'attestation', 'verify'] }, output: { path: '', format: 'none' } },
-    fixedInputs: {}, choices: {}, configFiles: [], reviewedBy: 'fixture', reviewedAt: '2026-11-05', proofs: 0,
-  };
+  const real = entry(GH_ID);
+  return { ...real, candidate: { ...real.candidate, ...over } as ReviewedTool['candidate'] };
 };
 /** A draft of only these steps (its other checks are not the point here). */
 const bare = (over: Partial<PipelineDraft> = {}): PipelineDraft => draftOf({ needs: [], steps: [], ...over });
@@ -82,11 +79,11 @@ const VERIFY_PERMS = { contents: 'read', actions: 'read', packages: 'read', atte
 /** A signing draft with the honest pipeline's checks too, so a caller file of jobsOf(draft) passes. */
 const withPipeline = (d: PipelineDraft): PipelineDraft => ({ ...d, needs: draftOf().needs, steps: draftOf().steps });
 const DEPLOY_ON_SIGN = { push: { branches: ['main'] }, pull_request: null, pull_request_review: { types: ['submitted', 'dismissed'] } };
-/** pipegen.yml with the honest pipeline and one caller job of `uses` (deploy condition and needs gate unless `over` says otherwise). */
+/** pipegen.yml with the honest pipeline and one caller job of `uses` (deploy condition, needs gate and image-publish (G15a-R9: a sign caller needs it) unless `over` says otherwise). */
 function deployCaller(d: PipelineDraft, uses: string, over: Record<string, unknown> = {}, on: unknown = DEPLOY_ON_SIGN, path = '.github/workflows/pipegen.yml'): CreatedFile {
   const base = workflow(jobsOf(d), { on });
   const doc = parseDocument(base.content);
-  doc.setIn(['jobs', 'signing'], doc.createNode({ uses, if: "github.event_name == 'push'", needs: ['gate'], permissions: SIGN_PERMS, ...over }));
+  doc.setIn(['jobs', 'signing'], doc.createNode({ uses, if: "github.event_name == 'push'", needs: ['gate', 'image-publish'], permissions: SIGN_PERMS, ...over }));
   return { ...base, path, content: doc.toString({ lineWidth: 0 }) };
 }
 const signFile = (jobs: Record<string, Job>): CreatedFile => ({ ...workflow(jobs, { on: { workflow_call: null } }), path: '.github/workflows/sign.yml' });
@@ -191,14 +188,15 @@ describe('G2: signing and verification steps (B3 b, d)', () => {
     const at = signingDraft(ATTEST);
     const gh = ghEntry();
     const ghSteps = renderVerifySteps(gh, at, IMG);
-    expect(ghSteps[0]?.env?.PIPEGEN_DL_URL).toBe('https://github.com/cli/cli/releases/download/v2.80.0/gh_2.80.0_linux_amd64.tar.gz');
-    expect(ghSteps[0]?.env?.PIPEGEN_DL_SHA256).toBe('c'.repeat(64));
+    expect(ghSteps[0]?.env?.PIPEGEN_DL_URL).toBe('https://github.com/cli/cli/releases/download/v2.103.3/gh_2.103.3_linux_amd64.tar.gz');
+    expect(ghSteps[0]?.env?.PIPEGEN_DL_SHA256).toBe('4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d');
     const ghRun = lastRun(ghSteps).run as string;
     // (G3 ruling: the sign workflow is the project's own central file, <project>--sign.yml, since its content is the draft's plan)
     expect(attestSignerWorkflow('o/pipelines', 'r')).toBe('o/pipelines/.github/workflows/r--sign.yml');
     // G2-R-sec 2: bound like keyless: the source is the app's default branch, the signer is the central sign workflow AT the central commit
     // pipegen pinned (a reusable workflow called at a commit signs with that commit), on a GitHub-hosted runner
-    expect(ghRun).toContain(`"$RUNNER_TEMP/pipegen-bin/pipegen-gh-verify/gh" attestation verify "oci://$ref" --repo 'o/r' --source-ref 'refs/heads/main' --signer-workflow 'o/pipelines/.github/workflows/r--sign.yml' --signer-digest '${'a'.repeat(40)}' --deny-self-hosted-runners`);
+    // G15a: and the deployed commit itself (--source-digest, the push's GITHUB_SHA, checked as 40 hex first)
+    expect(ghRun).toContain(`"$RUNNER_TEMP/pipegen-bin/pipegen-gh-verify/gh" attestation verify "oci://$ref" --repo 'o/r' --source-ref 'refs/heads/main' --source-digest "$GITHUB_SHA" --signer-workflow 'o/pipelines/.github/workflows/r--sign.yml' --signer-digest '${'a'.repeat(40)}' --no-public-good --deny-self-hosted-runners`);
     for (const defaultBranch of ['-x', 'a..b', "ma'in", 'ma in', '']) {
       expect(() => renderVerifySteps(gh, { ...at, profile: { ...at.profile, defaultBranch } }, IMG), defaultBranch).toThrow(RenderError);
     }
@@ -239,10 +237,17 @@ describe('G2: signing and verification steps (B3 b, d)', () => {
     const leaked = { ...digestDownload() };
     const pubOnOther: RenderedStep = { id: 'pipegen-verify-0000000000000000', name: 'x', run: 'echo "$PIPEGEN_COSIGN_PUB"', shell: 'bash', env: { PIPEGEN_COSIGN_PUB: '${{ vars.PIPEGEN_COSIGN_PUB }}' } };
     expect((await runWith([rawFile({ 'pipegen-verify': job([leaked, pubOnOther], { permissions: VERIFY_PERMS, environment: 'pipegen-signing' }) }, { on: { workflow_call: null } }, '.github/workflows/deploy-verify.yml')], keDraft)).ok).toBe(false);
-    // attest: with the gh entry the step is pipegen's; without it (the real list until G15) nothing renders it, so it is refused
-    const atFile = vf({ 'pipegen-verify': verifyJob(ghSteps) });
-    expect(show(await runWith([atFile], at, [...reviewedList(), gh]))).toBe('');
-    const noGh = await runWith([atFile], at);
+    // attest: with the real gh entry the step is pipegen's own verify step (recognised by content, in pipegen-verify); without the entry
+    // nothing renders it, so it is refused. G15a-R0b: attest verify is on; its job's egress step reaches gh's attestation hosts (the
+    // referee requires them there, test/g15-attest-verify.test.ts), and with them the job passes
+    const atJob = verifyJob(ghSteps);
+    const atEgress = { ...atJob, steps: [renderEgressStep(['ghcr', 'github-releases', GITHUB_ATTEST_SET], { dockerNetworks: false }), ...(atJob.steps as RenderedStep[]).slice(1)] };
+    const atFile = vf({ 'pipegen-verify': atEgress });
+    const withGh = await runWith([atFile], at, reviewedList());
+    expect(show(withGh)).toBe('');
+    // without them (the default egress step of these tests) it is refused
+    expect(has(await runWith([vf({ 'pipegen-verify': atJob })], at, reviewedList()), 'template', /attestation hosts/)).toBe(true);
+    const noGh = await runWith([atFile], at, reviewedList().filter((t) => t.id !== GH_ID));
     expect(noGh.ok).toBe(false);
     expect(noGh.notes.some((n) => /gh/.test(n)), noGh.notes.join('\n')).toBe(true);
   });
@@ -286,6 +291,12 @@ const deployFile = (extra: Record<string, Job>, on: unknown = DEPLOY_ON, path = 
  * publishes an image holds the keyless sign job of its plan too: an unsigned publish from a public repository must never ship.
  */
 const signedDraft = { ...pubDraft, signing: KEYLESS };
+/** G15a-R10 r4-2, r4-3: the published image's tag (the renderer's helper) and the digest hand-off image-publish ends with (releaseJobs' form). */
+const PUB_TAG = `${publishedImageRepo(pubDraft.profile.owner, pubDraft.profile.repo, 'app')}:${PUBLISH_TAG}`;
+const publishTail = (): RenderedStep[] => {
+  const name = imageDigestArtifact('app');
+  return [renderPublishDigestStep('app', publishedImageRepo(pubDraft.profile.owner, pubDraft.profile.repo, 'app')), { ...renderPlatformStep('upload-artifact', p, { name, path: `\${{ runner.temp }}/pipegen-out/${name}` }), name: 'Upload the image digest of app' }];
+};
 const keylessSign = (): Job => job([digestDownload(), ...renderSignSteps(COSIGN, 'keyless', IMG)], { permissions: { contents: 'read', [OIDC]: 'write', packages: 'write' }, if: DEPLOY_PUSH_IF, needs: ['gate', 'image-publish'] });
 
 describe('G2: the image hand-off (B6)', () => {
@@ -448,7 +459,8 @@ describe('G2: the image hand-off (B6)', () => {
     const lint = await runWith([imageFile({ 'lint--app': { ...own('app'), outputs: undefined } })], d);
     expect(has(lint, 'template', /build-push/), show(lint)).toBe(true);
     // image-publish: a Dockerfile of a service only
-    const pub = (w: Record<string, string>): Job => job([...renderJobPrelude({}, p).steps, { ...renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: 'ghcr.io/o/r-app:main' }, { push: 'true' }), with: { ...renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: 'ghcr.io/o/r-app:main' }, { push: 'true' }).with, ...w } }], { permissions: { contents: 'read', packages: 'write' } });
+    // (G15a-R10 r4-2, r4-3: the plan's tag, and the digest hand-off after the push)
+    const pub = (w: Record<string, string>): Job => job([...renderJobPrelude({}, p).steps, { id: BUILD_PUSH_STEP_ID, ...renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: PUB_TAG }, { push: 'true' }), with: { ...renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: PUB_TAG }, { push: 'true' }).with, ...w } }, ...publishTail()], { permissions: { contents: 'read', packages: 'write' } });
     // (G2-R1 I3: image-publish pushes only from a deploy job of pipegen.yml on a default-branch push, so it is judged there)
     const dep = (w: Record<string, string>): Job => ({ ...pub(w), if: DEPLOY_PUSH_IF, needs: ['gate'] });
     expect(show(await runWith([deployFile({ 'image-publish': dep({}), sign: keylessSign() })], signedDraft))).toBe('');
@@ -660,8 +672,9 @@ describe('G2 fix round 1 (ruling G2-R1)', () => {
   });
 
   it('referee: an image push runs only in a deploy job of pipegen.yml on a default-branch push (G2-R1 I3)', async () => {
-    const bp = renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: 'ghcr.io/o/r-app:latest' }, { push: 'true' });
-    const pub = (over: Job = {}): Job => job([...renderJobPrelude({}, p).steps, bp], { permissions: { contents: 'read', packages: 'write' }, ...over });
+    // (G15a-R10 r4-2, r4-3: the plan's tag, and the digest hand-off after the push)
+    const bp = { id: BUILD_PUSH_STEP_ID, ...renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: PUB_TAG }, { push: 'true' }) };
+    const pub = (over: Job = {}): Job => job([...renderJobPrelude({}, p).steps, bp, ...publishTail()], { permissions: { contents: 'read', packages: 'write' }, ...over });
     const deploy = (over: Job = {}): Job => pub({ if: DEPLOY_PUSH_IF, needs: ['gate'], ...over });
     expect(show(await runWith([deployFile({ 'image-publish': deploy(), sign: keylessSign() })], signedDraft))).toBe('');
     const refused = (r: { issues: { check: string; message: string }[] }): boolean => has(r, 'permissions', /writes to the image registry/);
@@ -713,7 +726,7 @@ describe('G2-R-sec2 (controller ruling): the sign job is held to the default-pus
     const SIGN = './.github/workflows/sign.yml';
     // allowed: reached only from a deploy caller of pipegen.yml; or the sign job itself a deploy job of pipegen.yml
     expect(show(await runWith([signFile({ sign: signJob() }), deployCaller(d, SIGN)], d))).toBe('');
-    const inline = workflow({ ...jobsOf(d), sign: signJob({ if: DEPLOY_PUSH_IF, needs: ['gate'] }) }, { on: DEPLOY_ON_SIGN });
+    const inline = workflow({ ...jobsOf(d), sign: signJob({ if: DEPLOY_PUSH_IF, needs: ['gate', 'image-publish'] }) }, { on: DEPLOY_ON_SIGN });
     expect(show(await runWith([inline], d))).toBe('');
     const cases: [string, CreatedFile[]][] = [
       ['a called file nobody judged calls', [signFile({ sign: signJob() })]],

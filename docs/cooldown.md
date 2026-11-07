@@ -18,6 +18,10 @@ The `cooldown` job in `.github/workflows/ci.yml` runs on every pull request. It 
 
 If anything is under 7 days old, or cannot be tied to an upstream date, the job fails and lists each item (unless the emergency path below applies). A tool kind or image the script cannot check (not on Docker Hub, no GitHub digest) fails with "needs owner review". Versions the PR did not change are never checked. A downgrade to an older version is fine, with one exception: a package too big for the full registry document is dated by its tarball's `Last-Modified`. The registry sometimes stores old tarballs again (vite 5.0.0, published in 2023, shows 2026), so a downgrade of such a package can look young. That is the safe direction. Wait until the date is 7 days old, or use the emergency path below.
 
+### The pin day of `data/reviewed-tools.yml`
+
+The loader (`src/engine/reviewed.ts`) checks the 7 days against the day a tool was pinned, so the list keeps that day. The list's own top-level `pinnedOn` is the pin day of every entry. An entry added later carries its own `pinnedOn` (for example `gh`, pinned 2026-11-06): it may not be before the list's, nor in the future, and that entry's release must be at least 7 days older than its own `pinnedOn`; its `reviewedAt` and `verifiedWith.verifiedOn` may not be before it either. Every other entry is still measured from the list's `pinnedOn`.
+
 ## Pins nobody changed
 
 The check above only looks at what a PR adds or changes. Upstream can still drift under an old pin: a tag moved to

@@ -44,7 +44,6 @@ import type { FpBy } from './fingerprint.js';
 import { DEFAULT_POLICY, policyProblem, SEVERITIES, type Policy } from './policy-default.js';
 import { SARIF_TOOLS } from './sarif.js';
 import type { ScrubbedFinding, ScrubbedResult } from './scrub.js';
-import { ZAP_JSON_VERIFIED, ZAP_TOOL } from './zap.js';
 
 export type { Policy } from './policy-default.js';
 export type GateMode = 'warn' | 'block';
@@ -353,15 +352,14 @@ export function decideGate(i: GateInput): GateResult {
   for (const c of i.checks) {
     const e = c.entry;
     const floor = isFloorEntry(e);
-    const zapUnverified = e.tool === ZAP_TOOL && !ZAP_JSON_VERIFIED;
-    const level: Level = !floor && (notProvenSet.has(e.needId) || zapUnverified) ? 'not-proven' : !e.blocking && !floor ? 'advisory' : 'required';
+    const level: Level = !floor && notProvenSet.has(e.needId) ? 'not-proven' : !e.blocking && !floor ? 'advisory' : 'required';
     const findings = isFindingsEntry(e);
     const tool = e.tool ?? e.needId;
     const name = `${tool} (${e.job})`;
     const ref = (reason: string): CheckRef => ({ needId: e.needId, job: e.job, ...(e.tool === undefined ? {} : { tool: e.tool }), reason });
     const uncovered = coverageOf(e.job);
     const state = (s: string): void => { checks.push({ needId: e.needId, job: e.job, ...(e.tool === undefined ? {} : { tool: e.tool }), judgedBy: findings ? 'findings' : 'job status', state: uncovered.length === 0 ? s : `${s}; ${uncovered.join('; ')}` }); };
-    if (level === 'not-proven') notProven.push(ref(zapUnverified && !notProvenSet.has(e.needId) ? 'ZAP results are not verified yet, so this DAST check is judged as not proven (warnings only)' : 'not proven: warnings only'));
+    if (level === 'not-proven') notProven.push(ref('not proven: warnings only'));
     const toolError = (why: string, base: boolean): void => {
       const blocks = level === 'required';
       toolErrors.push({ ...ref(why), base, blocks });

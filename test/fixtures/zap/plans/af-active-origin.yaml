@@ -1,0 +1,40 @@
+env:
+  contexts:
+    - name: pipegen
+      urls:
+        - "${PIPEGEN_ZAP_TARGET}"
+      includePaths:
+        - '\Q${PIPEGEN_ZAP_TARGET}\E(?:/.*)?'
+      excludePaths:
+        - '(?!\Q${PIPEGEN_ZAP_TARGET}\E(?:/.*)?$).*'
+  parameters:
+    failOnError: true
+    failOnWarning: false
+    progressToStdout: true
+jobs:
+  - type: passiveScan-config
+    parameters:
+      maxAlertsPerRule: 10
+      enableTags: false
+  - type: spider
+    parameters:
+      context: pipegen
+      url: "${PIPEGEN_ZAP_TARGET}"
+      maxDuration: 5
+  - type: passiveScan-wait
+    parameters:
+      maxDuration: 5
+  - type: activeScan
+    parameters:
+      context: pipegen
+      maxRuleDurationInMins: 5
+      maxScanDurationInMins: 30
+    policyDefinition:
+      defaultStrength: medium
+      defaultThreshold: medium
+  - type: report
+    parameters:
+      template: traditional-json
+      reportDir: /zap/wrk
+      reportFile: zap-active.json
+      reportTitle: pipegen ZAP active scan

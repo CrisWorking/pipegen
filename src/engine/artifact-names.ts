@@ -36,6 +36,12 @@ export function resultArtifactName(needId: string, service?: string, opts?: { ba
  */
 export const SECRETS_RANGE_ID = 'secrets-range';
 export const SECRETS_RANGE_ARTIFACT = resultArtifactName(SECRETS_RANGE_ID);
+/**
+ * G15a round 4 (b1, P-4): the result of the nightly scan of the whole history (betterleaks `git` mode, every ref of a full checkout, no base):
+ * `pipegen-out-secrets-history`. Reported (code scanning), never gated; its facts are the history form of the range facts (gate/src/range.ts).
+ */
+export const SECRETS_HISTORY_ID = 'secrets-history';
+export const SECRETS_HISTORY_ARTIFACT = resultArtifactName(SECRETS_HISTORY_ID);
 /** The tool of the commit-range scan: betterleaks in `git` mode, whichever reviewed tool scans the HEAD tree (tool-flags.ts RANGE_TOOL). */
 export const SECRETS_RANGE_TOOL = 'betterleaks';
 /** C9: the facts the range scan step writes beside its raw result (base, head, the commit count, the canary commits); the scrub reads them (gate/src/range.ts). */

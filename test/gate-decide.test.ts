@@ -580,13 +580,14 @@ describe('decideGate: coverage honesty and the per-category rules', () => {
     expect(r.pass).toBe(false);
     expect(decideGate(input({ checks: [check(e, [])] })).pass).toBe(true);
   });
-  it('ZAP is unverified: a blocking DAST need on ZAP is not proven (a warning), its findings and failures never block', () => {
+  it('ZAP is verified (G15a round 5, real reports of the pinned image): a required DAST check on ZAP blocks on a new high finding and on a tool error', () => {
     const e = entry({ needId: 'dast', job: 'dast--app', category: 'dast', tool: 'zap-baseline', format: 'zap-json' });
     const r = decideGate(input({ mode: 'block', checks: [check(e, [fnd({ tool: 'zap-baseline', severity: 'high' })])] }));
-    expect(r.pass).toBe(true);
-    expect(r.notProven.map((n) => n.job)).toEqual(['dast--app']);
-    expect(r.warnings).toHaveLength(1);
-    expect(decideGate(input({ checks: [{ ...check(e, []), result: 'failure', outputs: { status: 'tool-error', error: 'x' } }] })).pass).toBe(true);
+    expect(r.pass).toBe(false);
+    expect(r.notProven).toEqual([]);
+    expect(decideGate(input({ checks: [{ ...check(e, []), result: 'failure', outputs: { status: 'tool-error', error: 'x' } }] })).pass).toBe(false);
+    // a non-blocking ZAP check stays advisory, and a not-proven one warns, as for any tool
+    expect(decideGate(input({ mode: 'block', checks: [check(entry({ ...e, blocking: false }), [fnd({ tool: 'zap-baseline', severity: 'high' })])] })).pass).toBe(true);
   });
   it('licences: Forbidden (critical) and Restricted (high) block when new; Unknown (info) is a warning that needs a human and never blocks', () => {
     const e = entry({ needId: 'licences', job: 'licences', category: 'licences', tool: 'trivy-licence' });

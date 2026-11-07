@@ -49,7 +49,11 @@ export interface PrContext {
   approvalsComplete: boolean;          // false: the reviews could not be read in full; approvals is then empty
   problems: string[];                  // fixed texts about what could not be read (never repository text)
 }
-export interface CodeownersRule { pattern: string; owners: string[] }
+/**
+ * One CODEOWNERS rule. `unreadable` (G15b-R1 S5) marks the place of a line the parser could not keep (over MAX_LINE characters) or of the
+ * lines past MAX_RULES: such a place could hold the deciding rule, so a lookup that reaches it is unresolved (it owns nothing itself).
+ */
+export interface CodeownersRule { pattern: string; owners: string[]; unreadable?: 'line' | 'count' }
 export interface SectionChange { file: string; section: string; problem?: string }
 
 // ---------- paths ----------
@@ -353,7 +357,7 @@ export async function baseHasInstall(gh: GateGithub, repo: RepoId, baseSha: stri
 
 // ---------- CODEOWNERS ----------
 
-const MAX_RULES = 100_000;
+export const MAX_RULES = 100_000;
 export const MAX_LINE = 4096;
 const TEAM_RE = /^@[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9._-]+$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -379,14 +383,20 @@ function tokens(line: string): string[] {
 /**
  * Parse CODEOWNERS text: one rule per line, `pattern owner...`. Owners are user logins only (`@name`): `@org/team` and e-mail owners are
  * dropped (a team-only rule still owns its paths, with no user who can approve). Lines GitHub rejects are skipped: a pattern starting
- * with `!` or `\#`, or containing `[` `]`.
+ * with `!` or `\#`, or containing `[` `]`. G15b-R1 S5: a line over MAX_LINE characters, and the lines past MAX_RULES, are not dropped
+ * silently (that could hand their paths to an earlier rule's owners): each leaves an `unreadable` place that a lookup reaching it can not
+ * pass (fail closed). A blank or comment line can own nothing, so it never leaves one.
  */
 export function codeOwners(text: string | null): CodeownersRule[] {
   if (typeof text !== 'string') return [];
   const rules: CodeownersRule[] = [];
+  const canOwn = (raw: string): boolean => { const t = raw.trim(); return t !== '' && !t.startsWith('#'); };
   for (const raw of text.split(/\r?\n/)) {
-    if (rules.length >= MAX_RULES) break;
-    if (raw.length > MAX_LINE) continue;
+    if (rules.length >= MAX_RULES) {
+      if (canOwn(raw)) { rules.push({ pattern: '', owners: [], unreadable: 'count' }); break; }
+      continue;
+    }
+    if (raw.length > MAX_LINE) { if (canOwn(raw)) rules.push({ pattern: '', owners: [], unreadable: 'line' }); continue; }
     const t = tokens(raw.trim());
     const pattern = t[0];
     if (pattern === undefined) continue;
@@ -404,9 +414,44 @@ export function codeOwners(text: string | null): CodeownersRule[] {
   return rules;
 }
 
-type Seg = { kind: 'globstar' } | { kind: 'globstar+' } | { kind: 'glob'; toks: ('*' | '?' | string)[] };
-interface Compiled { segs: Seg[]; dirOnly: boolean; ancestors: boolean }
+/** A glob token: STAR (`*`), ANY (`?`), or one literal character (G15b-R1 S2: an escaped `\*` or `\?` is the literal character). */
+const STAR = 0;
+const ANY = 1;
+type Tok = typeof STAR | typeof ANY | string;
+type Seg = { kind: 'globstar' } | { kind: 'globstar+' } | { kind: 'glob'; toks: Tok[] };
+interface Compiled { segs: Seg[]; dirOnly: boolean; ancestors: boolean; tooLong: boolean }
 const compiled = new WeakMap<CodeownersRule, Compiled>();
+
+/**
+ * G15b (review-G17G-r1 F7): a rule has at most this many path segments (an unanchored rule's leading `**` counts). A longer rule is kept
+ * (skipping it could hand its paths to an earlier rule's owners), but a lookup that reaches it before any later rule matches is
+ * unresolved: the gate fails closed on that path and says why.
+ */
+export const MAX_RULE_SEGMENTS = 64;
+/**
+ * G15b (F7): the steps (DP positions visited, characters compared, and RULE_VISIT_STEPS per rule visited) one gate run may spend on
+ * CODEOWNERS lookups, shared by every path of the run; a standalone ownersLookup/ownersOf call gets its own. Measured (G15b-R1 S4, this
+ * machine): spending the whole budget takes 1.7 s with a 100,000-rule base file of plain rules, 2.7 s with the reviewer's 46-rule file
+ * against 256-part paths, 3.1 s with a 4,000-character part against `*a*a...b`, 3.6 s with a glob-heavy rule (4 to 9 ns a step): about
+ * 4 s at most. A 256-part path under the 46-rule file costs about 20,000 steps (a plain 3-part path about 1,000), so 3,000 such files
+ * spend about 6e7. Past the budget every remaining lookup is unresolved (fail closed).
+ */
+export const OWNERS_STEP_BUDGET = 400_000_000;
+/** The steps left; ownersLookup spends from it. */
+export interface OwnerSteps { left: number }
+/** A CODEOWNERS lookup: the owners (undefined when no rule matches), or why the gate could not work them out (it then waives nothing). */
+export type OwnersLookup = { owners: string[] | undefined } | { unresolved: Unresolved };
+/**
+ * Why a lookup is unresolved: a deciding rule over MAX_RULE_SEGMENTS; the step budget spent; the path has more than 256 parts or an empty
+ * part (G15b-R1 S1); an unreadable CODEOWNERS line, or rules past MAX_RULES (S5).
+ */
+export type Unresolved = 'segments' | 'budget' | 'path' | 'unreadable';
+/** G15b-R1 S4: the steps one rule visit costs (measured: a visit whose first segment fails takes about as long as 16 DP steps). */
+export const RULE_VISIT_STEPS = 16;
+/** ownersOf's failure: the lookup is unresolved (fail closed; the caller treats the path as owned by nobody it can count). */
+export class OwnersUnresolvedError extends Error {
+  constructor(readonly why: Unresolved) { super(`CODEOWNERS lookup unresolved (${why})`); this.name = 'OwnersUnresolvedError'; }
+}
 
 function compile(rule: CodeownersRule): Compiled {
   const got = compiled.get(rule);
@@ -418,73 +463,112 @@ function compile(rule: CodeownersRule): Compiled {
   if (p.startsWith('/')) p = p.slice(1);
   let parts = p.split('/');
   if (!anchored) parts = ['**', ...parts];
+  if (parts.length > MAX_RULE_SEGMENTS) {
+    const c = { segs: [], dirOnly, ancestors: false, tooLong: true };
+    compiled.set(rule, c);
+    return c;
+  }
   const segs: Seg[] = parts.map((part, idx) => {
     if (part === '**') return idx === parts.length - 1 ? { kind: 'globstar+' } : { kind: 'globstar' };
-    const toks: ('*' | '?' | string)[] = [];
+    const toks: Tok[] = [];
     for (let i = 0; i < part.length; i++) {
       const c = part[i] as string;
-      if (c === '\\' && i + 1 < part.length) { toks.push(part[++i] as string); continue; }
-      if (c === '*') { if (toks[toks.length - 1] !== '*') toks.push('*'); continue; }
-      toks.push(c === '?' ? '?' : c);
+      if (c === '\\' && i + 1 < part.length) { toks.push(part[++i] as string); continue; }   // an escaped character is literal (gitignore)
+      if (c === '*') { if (toks[toks.length - 1] !== STAR) toks.push(STAR); continue; }
+      toks.push(c === '?' ? ANY : c);
     }
     return { kind: 'glob', toks };
   });
-  const last = parts[parts.length - 1] as string;
-  // a final segment with a wildcard names files (`docs/*` is not the whole docs tree); a literal one names a file or a directory
-  const ancestors = dirOnly || !/[*?]/.test(last);
-  const c = { segs, dirOnly, ancestors };
+  const lastSeg = segs[segs.length - 1] as Seg;
+  // a final segment with a wildcard (or a final `**`) names files (`docs/*` is not the whole docs tree); a literal one names a file or a directory
+  const ancestors = dirOnly || (lastSeg.kind === 'glob' && !lastSeg.toks.some((t) => t === STAR || t === ANY));
+  const c = { segs, dirOnly, ancestors, tooLong: false };
   compiled.set(rule, c);
   return c;
 }
 
-/** `*` and `?` never cross a `/` (the segment is already split). Two-pointer match with backtracking on the last star. */
-function segMatch(toks: readonly ('*' | '?' | string)[], s: string): boolean {
-  let t = 0; let i = 0; let star = -1; let mark = 0;
+/**
+ * `*` and `?` never cross a `/` (the segment is already split). Two-pointer match with backtracking on the last star. Spends one step per
+ * loop turn from `steps`; returns null when they run out.
+ */
+function segMatch(toks: readonly Tok[], s: string, steps: OwnerSteps): boolean | null {
+  let t = 0; let i = 0; let star = -1; let mark = 0; let n = 0;
+  let r: boolean | undefined;
   while (i < s.length) {
+    n++;
     const k = toks[t];
-    if (k === '*') { star = t++; mark = i; }
-    else if (k !== undefined && (k === '?' || k === s[i])) { t++; i++; }
+    if (k === STAR) { star = t++; mark = i; }
+    else if (k !== undefined && (k === ANY || k === s[i])) { t++; i++; }
     else if (star >= 0) { t = star + 1; i = ++mark; }
-    else return false;
+    else { r = false; break; }
   }
-  while (toks[t] === '*') t++;
-  return t === toks.length;
+  if (r === undefined) { while (toks[t] === STAR) { t++; n++; } r = t === toks.length; }
+  steps.left -= n + 1;
+  return steps.left < 0 ? null : r;
 }
 
-function matchesPrefix(c: Compiled, parts: readonly string[], end: number): boolean {
-  const memo = new Map<number, boolean>();
-  const go = (pi: number, si: number): boolean => {
-    const key = pi * (end + 1) + si;
-    const hit = memo.get(key);
-    if (hit !== undefined) return hit;
-    let r: boolean;
-    const seg = c.segs[pi];
-    if (seg === undefined) r = si === end;
-    else if (seg.kind === 'globstar+') r = si < end;
-    else if (seg.kind === 'globstar') { r = false; for (let j = si; j <= end && !r; j++) r = go(pi + 1, j); }
-    else r = si < end && segMatch(seg.toks, parts[si] as string) && go(pi + 1, si + 1);
-    memo.set(key, r);
-    return r;
-  };
-  return go(0, 0);
-}
-
-function ruleMatches(rule: CodeownersRule, parts: readonly string[]): boolean {
-  const c = compile(rule);
-  for (let k = 1; k <= parts.length; k++) {
-    if (k === parts.length) { if (!c.dirOnly && matchesPrefix(c, parts, k)) return true; }
-    else if (c.ancestors && matchesPrefix(c, parts, k)) return true;
+/**
+ * G15b (F7): one DP over every prefix of the path at once. `reach` holds, in ascending order, the positions j (0..n) such that the
+ * segments so far match parts[0..j); a rule matches the prefix of k parts when the last row holds k. O(segments x parts) per rule (the
+ * old matcher ran a fresh DP per prefix and was about n^2.8 in the path length). Same answers as before: `**` matches zero or more whole
+ * parts, a final `**` one or more, a glob exactly one; the full path counts unless the rule is dir-only, a shorter prefix only when the
+ * rule names its descendants (`ancestors`). Returns null when the steps run out.
+ */
+function ruleMatches(c: Compiled, parts: readonly string[], steps: OwnerSteps): boolean | null {
+  const n = parts.length;
+  let reach: number[] = [0];
+  for (const seg of c.segs) {
+    let next: number[] = [];
+    if (seg.kind === 'glob') {
+      for (const j of reach) {
+        if (j >= n) continue;
+        const m = segMatch(seg.toks, parts[j] as string, steps);
+        if (m === null) return null;
+        if (m) next.push(j + 1);
+      }
+    } else {
+      const from = (reach[0] as number) + (seg.kind === 'globstar+' ? 1 : 0);   // reach is never empty here, and ascending
+      if ((steps.left -= n + 1 - from) < 0) return null;
+      next = [];
+      for (let j = from; j <= n; j++) next.push(j);
+    }
+    if (next.length === 0) return false;
+    reach = next;
+  }
+  for (const k of reach) {
+    if (k === n ? !c.dirOnly : k >= 1 && c.ancestors) return true;
   }
   return false;
 }
 
-/** The owners (users) of `path` by the LAST matching rule; `[]` when that rule has no user owner (it clears ownership); undefined when no rule matches. Case sensitive. */
-export function ownersOf(rules: readonly CodeownersRule[], path: string): string[] | undefined {
+/**
+ * The owners (users) of `path` by the LAST matching rule: `[]` when that rule has no user owner (it clears ownership), undefined when no
+ * rule matches. Case sensitive. Rules are tried from the last one back, so the first match decides. Fail closed (G15b, F7): reaching a
+ * rule over MAX_RULE_SEGMENTS before any match, or running out of `steps`, gives `unresolved`. G15b-R1: so do a path of more than 256 parts
+ * or with an empty part (S1: never "no owner", which would let pipegen's block owners waive), and reaching an unreadable place (S5).
+ * Every rule visited costs RULE_VISIT_STEPS (S4), so the budget tracks time with a huge base CODEOWNERS too.
+ */
+export function ownersLookup(rules: readonly CodeownersRule[], path: string, steps: OwnerSteps = { left: OWNERS_STEP_BUDGET }): OwnersLookup {
   const parts = path.split('/');
-  if (parts.length > 256 || parts.includes('')) return undefined;
-  let owners: string[] | undefined;
-  for (const r of rules) if (ruleMatches(r, parts)) owners = r.owners;
-  return owners;
+  if (parts.length > 256 || parts.includes('')) return { unresolved: 'path' };
+  for (let i = rules.length - 1; i >= 0; i--) {
+    const r = rules[i] as CodeownersRule;
+    if ((steps.left -= RULE_VISIT_STEPS) < 0) return { unresolved: 'budget' };
+    if (r.unreadable !== undefined) return { unresolved: 'unreadable' };
+    const c = compile(r);
+    if (c.tooLong) return { unresolved: 'segments' };
+    const m = ruleMatches(c, parts, steps);
+    if (m === null) return { unresolved: 'budget' };
+    if (m) return { owners: r.owners };
+  }
+  return { owners: undefined };
+}
+
+/** ownersLookup's owners; throws OwnersUnresolvedError when the lookup is unresolved (fail closed). */
+export function ownersOf(rules: readonly CodeownersRule[], path: string): string[] | undefined {
+  const r = ownersLookup(rules, path);
+  if ('unresolved' in r) throw new OwnersUnresolvedError(r.unresolved);
+  return r.owners;
 }
 
 /** The lines that open and close pipegen's own block in a CODEOWNERS file (the builder, src/engine/created-builders.ts, writes these). */
@@ -738,6 +822,14 @@ export async function buildPrDiff(gh: GateGithub, repo: RepoId, baseSha: string,
 
 // ---------- the rule ----------
 
+/** The fixed reason a finding gives when its path's owners are unresolved (G15b, G15b-R1): nobody can approve. */
+const UNRESOLVED_HOW: Record<Unresolved, string> = {
+  segments: ` The gate could not work out the code owners of this path: a CODEOWNERS rule of the base commit that could decide it has over ${MAX_RULE_SEGMENTS} segments, so nobody can approve: shorten that rule, or merge with an administrator bypass.`,
+  budget: ' The gate could not work out the code owners of this path within its step budget (the paths are too deep for the CODEOWNERS rules of the base commit), so nobody can approve: shorten the paths, or merge with an administrator bypass.',
+  path: ' The gate could not work out the code owners of this path: it has more than 256 parts or an empty part, so nobody can approve: shorten the path, or merge with an administrator bypass.',
+  unreadable: ` The gate could not work out the code owners of this path: the CODEOWNERS file of the base commit has a line over 4,096 characters or over 100,000 rules, which the gate does not read, so nobody can approve: shorten or split the file, or merge with an administrator bypass.`,
+};
+
 const fp = (...parts: string[]): string => createHash('sha256').update(parts.join('\0')).digest('hex');
 
 /**
@@ -755,17 +847,28 @@ const fp = (...parts: string[]): string => createHash('sha256').update(parts.joi
  */
 export function integrityFindings(
   pr: PrContext, protectedPaths: readonly string[], rules: readonly CodeownersRule[],
-  extra: { sectionChanges?: readonly SectionChange[]; codeowners?: { found: string | null; problem?: string; blockOwners?: readonly string[] } } = {},
+  extra: { sectionChanges?: readonly SectionChange[]; codeowners?: { found: string | null; problem?: string; blockOwners?: readonly string[] }; ownerSteps?: number } = {},
 ): Finding[] {
   const out: Finding[] = [];
   const seen = new Set<string>();
   const approvals = new Set(pr.approvals.map((a) => a.toLowerCase()));
   const isProtected = pathMatcher(protectedPaths);
   const blockOwners = extra.codeowners?.problem === undefined && Array.isArray(extra.codeowners?.blockOwners) ? extra.codeowners.blockOwners.map((o) => String(o).toLowerCase()) : [];
-  const waived = (path: string): boolean => (ownersOf(rules, path) ?? []).some((o) => approvals.has(o));
+  // G15b (F7): one step budget for every CODEOWNERS lookup of this run, and each path looked up once
+  const steps: OwnerSteps = { left: typeof extra.ownerSteps === 'number' ? extra.ownerSteps : OWNERS_STEP_BUDGET };
+  const lookups = new Map<string, OwnersLookup>();
+  const lookup = (path: string): OwnersLookup => {
+    let r = lookups.get(path);
+    if (r === undefined) { r = ownersLookup(rules, path, steps); lookups.set(path, r); }
+    return r;
+  };
+  /** An unresolved lookup waives nothing, not even by pipegen's block owners (fail closed). */
+  const waived = (path: string): boolean => { const r = lookup(path); return 'owners' in r && (r.owners ?? []).some((o) => approvals.has(o)); };
   /** For the file findings only (suppression, no-patch, case-extension): a file no rule gives a user owner is waived by an owner in pipegen's block. */
   const waivedFile = (path: string): boolean => {
-    const o = ownersOf(rules, path);   // user owners only (codeOwners drops teams and e-mails)
+    const r = lookup(path);
+    if (!('owners' in r)) return false;
+    const o = r.owners;   // user owners only (codeOwners drops teams and e-mails)
     return (o === undefined || o.length === 0 ? blockOwners : o).some((x) => approvals.has(x));
   };
   const push = (ruleId: string, severity: Finding['severity'], file: string | undefined, message: string, key: string, line?: number): void => {
@@ -782,7 +885,9 @@ export function integrityFindings(
         ? ' CODEOWNERS of the base commit has no rule that names a user, so nobody can approve: add one, or merge with an administrator bypass.'
         : ' The base commit has no CODEOWNERS, so nobody can approve: add one (user owners, not only teams), or merge with an administrator bypass.';
     }
-    const o = ownersOf(rules, path);
+    const r = lookup(path);
+    if ('unresolved' in r) return UNRESOLVED_HOW[r.unresolved];
+    const o = r.owners;
     if ((o === undefined || o.length === 0) && file && blockOwners.length > 0) {
       return ' No CODEOWNERS rule names a user owner of this file, so an owner listed in pipegen\'s CODEOWNERS block (a user with write access, not the author) must approve the pull request on its current head commit.';
     }

@@ -16,7 +16,9 @@
 # configFiles) and sets reviewedBy and reviewedAt in a PR. A release build refuses this list while any entry is
 # PENDING (ruling S21).
 #
-# Entry fields: categories (need categories, plus platform); languages; candidate (the exact
+# Entry fields: categories (need categories, plus platform); languages; pinnedOn (optional: the day an entry added after the
+# list's own pinnedOn was pinned, never before the list's and never in the future; that entry's 7-day cooldown, reviewedAt and
+# verifiedOn count from it, every other entry's from the list's pinnedOn at the end of this header); candidate (the exact
 # pin); step (the template: step.action for actions, step.cli for binaries and images; step.cli.plugins for npm or
 # pip packages installed next to the tool, exact and hashed); verifiedWith (the signature or attestation check made
 # when pinning: method, the signed asset, the exact certificate identity and issuer, the day; required for the
@@ -328,6 +330,8 @@ tools:
     proofs: 0
 
   # Records a GitHub build attestation for the image (v4, ruling S24: checked live).
+  # G15a (carry C10): push-to-registry fixed true (the attestation is stored next to the image; the attest job's digest step logs in to
+  #   ghcr.io first). The subject is the renderer's: the image name and the digest step's output (tool-flags.ts RENDERER_INPUTS), never a literal.
   # Source: git ref refs/tags/v4.2.2 of actions/attest (GitHub API), release published_at. Released 2026-08-04T20:36:29Z.
   - id: actions-attest
     categories: ["platform", "attestation"]
@@ -346,13 +350,16 @@ tools:
     step:
       action:
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
-        with: {}
+        with:
+          push-to-registry: "true"
       output: { path: "", format: none }
-    fixedInputs: {}
+    fixedInputs:
+      with:
+        push-to-registry: "true"
     choices: {}
     configFiles: []
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-11-06"
     proofs: 0
 
   # Egress control for proof and CI jobs (spike S8): Bullfrog in block mode, sudo off, so no later step can undo it.
@@ -385,14 +392,14 @@ tools:
         egress-policy: "block"
         dns-policy: "allowed-domains-only"
         enable-sudo: "false"
-    # allowed-domains: the labels of the reviewed host sets (src/engine/egress-sets.ts; E3-R1 added github-releases, trivy-db, osv). The
+    # allowed-domains: the labels of the reviewed host sets (src/engine/egress-sets.ts; E3-R1 added github-releases, trivy-db, osv; G15a sigstore). The
     # value a step carries is the sorted union of the chosen sets' hosts with github-core, one per line (tool-flags.ts allowedDomainsProblem, E9).
     choices:
-      allowed-domains: ["github-core", "npm", "pypi", "dockerhub", "ghcr", "github-releases", "trivy-db", "osv"]
+      allowed-domains: ["github-core", "npm", "pypi", "dockerhub", "ghcr", "github-releases", "trivy-db", "osv", "sigstore", "github-attest"]
       allowed-ips: ["172.16.0.0/12"]
     configFiles: []
     reviewedBy: Claude delegated DECISIONS 105
-    reviewedAt: "2026-11-04"
+    reviewedAt: "2026-11-06"
     proofs: 0
 
   # The registry:2 image, a local registry service for image builds in proof jobs (no scan output).
@@ -455,6 +462,83 @@ tools:
     configFiles: [".zap/**"]
     reviewedBy: Cristiano
     reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # G15a round 6 (P-4): the nightly ZAP Automation Framework active scan. The same pinned image as zap-baseline (zaproxy/zap-stable:20261016,
+  # ZAP 2.17.0; source and date as there). `zap.sh -cmd -silent` (no UI; no add-on update or install, no call home) runs pipegen's reviewed
+  # AF plan (src/engine/zap-active.ts ZAP_ACTIVE_PLAN, the plan the real reports in test/fixtures/zap were captured with, the target read
+  # from the container env ${PIPEGEN_ZAP_TARGET}) by its absolute path /zap/wrk/zap-active.yaml. Spider, passive wait, active scan with ZAP's
+  # default policy (no rule changed), and the traditional-json report the gate reads. Nightly only (tool-flags.ts nightlyOnly): never offered
+  # for a need; its result goes to code scanning. Re-reviewed by delegation (DECISIONS #105). G15a-R7: the context is the target's origin
+  # only (the quoted target then nothing or a path; every other URL excluded, since the AF also includes each context URL as `<url>.*`).
+  - id: zap-af-active
+    categories: ["dast"]
+    languages: ["any"]
+    releasedAt: "2026-10-16T09:36:50.415097Z"
+    candidate:
+      id: zap-af-active
+      name: "zaproxy/zaproxy"
+      kind: docker
+      repo: zaproxy/zaproxy
+      version: "20261016"
+      pin: { digest: "sha256:5ccfff9a411743ab2615136a2edd7416bec9ce41572fa94e935df38c14adb2b6" }
+      source: reviewed
+      reviewed: true
+      categories: ["dast"]
+    step:
+      cli:
+        install: { method: docker, package: "zaproxy/zap-stable", version: "20261016" }
+        command: ["zap.sh", "-cmd", "-silent"]
+      output: { path: "zap-active.json", format: zap-json }
+    fixedInputs:
+      args: ["-cmd", "-silent"]
+      config:
+        content: |
+          env:
+            contexts:
+              - name: pipegen
+                urls:
+                  - "${PIPEGEN_ZAP_TARGET}"
+                includePaths:
+                  - '\Q${PIPEGEN_ZAP_TARGET}\E(?:/.*)?'
+                excludePaths:
+                  - '(?!\Q${PIPEGEN_ZAP_TARGET}\E(?:/.*)?$).*'
+            parameters:
+              failOnError: true
+              failOnWarning: false
+              progressToStdout: true
+          jobs:
+            - type: passiveScan-config
+              parameters:
+                maxAlertsPerRule: 10
+                enableTags: false
+            - type: spider
+              parameters:
+                context: pipegen
+                url: "${PIPEGEN_ZAP_TARGET}"
+                maxDuration: 5
+            - type: passiveScan-wait
+              parameters:
+                maxDuration: 5
+            - type: activeScan
+              parameters:
+                context: pipegen
+                maxRuleDurationInMins: 5
+                maxScanDurationInMins: 30
+              policyDefinition:
+                defaultStrength: medium
+                defaultThreshold: medium
+            - type: report
+              parameters:
+                template: traditional-json
+                reportDir: /zap/wrk
+                reportFile: zap-active.json
+                reportTitle: pipegen ZAP active scan
+        passAs: { flag: "-autorun" }
+    choices: {}
+    configFiles: []
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-11-06"
     proofs: 0
 
   # Trivy config scan of Terraform and other infrastructure code. Release binary, no cache, only the checks built into the pinned binary.
@@ -814,6 +898,56 @@ tools:
     configFiles: []
     reviewedBy: Cristiano
     reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Verifies the build attestation of an image in attest mode (ruling B3 d, P-5; v0.2 Plan G G15a): the reviewed gh release, installed by its
+  #   sha256 and run by its absolute path in the job pipegen-verify only (src/engine/signing.ts renderVerifySteps), never the runner's gh.
+  # Source: release v2.103.3 of cli/cli: gh_2.103.3_linux_amd64.tar.gz sha256 from the release checksums file (gh_2.103.3_checksums.txt,
+  #   asset digest sha256:f756e7859d90dbb5e85aae5194206c37da220bec9bac23d3d659078a8e766fdc); the digest GitHub records for the asset agrees.
+  #   Released 2026-10-26T19:20:08Z (published_at): the newest non-prerelease at least 7 days old on 2026-11-06. Read by the controller on
+  #   2026-11-06 (G15-R0 5; the time of day was not recorded, so pinnedOn is that day's start: the stricter cooldown reading).
+  #   linux arm64 (not rendered): gh_2.103.3_linux_arm64.tar.gz sha256 ee32df2323c8847f5fac6cb6b4b69ca75828e9329a8f22f677021f7b3306ce63.
+  # Flags (G2-R1 carry; G7 progress line "bind the commit with --source-digest"): `gh attestation verify` at v2.103.3 has --source-digest,
+  #   --source-ref, --signer-digest, --cert-identity, --deny-self-hosted-runners and --signer-workflow (pkg/cmd/attestation/verify/verify.go:259-268,
+  #   read by the controller at the tag; not re-read offline here). --signer-workflow is a ^-anchored prefix regex with unescaped dots: pipegen
+  #   uses it only together with --signer-digest. The live checklist runs each flag on this version.
+  # verifiedWith: the release's build-provenance attestation, checked live 2026-11-06 with an independent gh 2.87.3 (`gh attestation verify
+  #   --repo cli/cli` on the pinned archive exits 0; a negative control exits 1). The subject is this archive's sha256 (the pin). Signer
+  #   deployment.yml@refs/heads/trunk (workflow_dispatch, github-hosted), issuer token.actions.githubusercontent.com, source commit 63837fb7…
+  #   cli/cli signs from a branch, so this identity is the one reviewed branch signer (BRANCH_SIGNERS in src/engine/reviewed.ts), bound to the
+  #   archive itself and the recorded source commit; cli/cli is on MUST_VERIFY.
+  - id: gh
+    categories: ["deploy-verify"]
+    languages: ["any"]
+    releasedAt: "2026-10-26T19:20:08Z"
+    pinnedOn: "2026-11-06T00:00:00Z"
+    candidate:
+      id: gh
+      name: "cli/cli"
+      kind: cli
+      repo: cli/cli
+      version: "v2.103.3"
+      pin: { checksum: "4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d" }
+      source: reviewed
+      reviewed: true
+      categories: ["deploy-verify"]
+    step:
+      cli:
+        install: { method: github-release, package: "gh_2.103.3_linux_amd64.tar.gz", version: "v2.103.3" }
+        command: ["gh", "attestation", "verify"]
+      output: { path: "", format: none }
+    fixedInputs: {}
+    choices: {}
+    configFiles: []
+    verifiedWith:
+      method: github-attestation
+      asset: "gh_2.103.3_linux_amd64.tar.gz"
+      identity: "https://github.com/cli/cli/.github/workflows/deployment.yml@refs/heads/trunk"
+      issuer: "https://token.actions.githubusercontent.com"
+      sourceDigest: "63837fb778d6a39f02be0ce76ff89f2bc8d74bdc"
+      verifiedOn: "2026-11-06"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-11-06"
     proofs: 0
 
   # Lints GitHub workflow files. Same release as data/pinned-binaries.yml (ruling S25). No shellcheck or pyflakes from the runner's PATH.
@@ -1253,10 +1387,10 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "trivy_0.76.0_Linux-64bit.tar.gz", version: "v0.76.0" }
-        command: ["trivy", "fs", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--format", "sarif", "--output", "trivy-licence.sarif", "--exit-code", "10", "."]
-      output: { path: "trivy-licence.sarif", format: sarif }
+        command: ["trivy", "fs", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--format", "json", "--list-all-pkgs", "--output", "trivy-licence.json", "--exit-code", "10", "."]
+      output: { path: "trivy-licence.json", format: json }
     fixedInputs:
-      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--format", "sarif", "--output", "trivy-licence.sarif", "--exit-code", "10"]
+      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--format", "json", "--list-all-pkgs", "--output", "trivy-licence.json", "--exit-code", "10"]
       config:
         content: "# pipegen's pinned trivy config: no cache kept between runs, and no repository trivy-secret.yaml (an empty path loads none)\ncache:\n  backend: memory\nsecret:\n  config: \"\"\n"
         passAs: { flag: "--config" }
@@ -1267,7 +1401,10 @@ tools:
     configFiles: []
     rootConfigFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml", "trivy-secret.yaml"]
     reviewedBy: Claude delegated DECISIONS 105
-    reviewedAt: "2026-10-30"
+    # G11-2 (2026-11-06): the scan writes Trivy's JSON with every package listed (--format json --list-all-pkgs), measured offline on the
+    #   pinned 0.76.0 (test/fixtures/trivy-licence-json): a package with no licence data appears only in the lang-pkgs result, with no
+    #   Licenses. The gate's scrub reads that file (gate/src/trivy-licence.ts) and writes the scrubbed SARIF; output.format is json, what the tool writes (G15a-R7; the scrub's result is SARIF).
+    reviewedAt: "2026-11-06"
     proofs: 0
     verifiedWith:
       method: cosign-bundle
@@ -1893,30 +2030,31 @@ tools:
   # it (loader and scripts/cooldown.ts exempt exactly `crisworking/pipegen`, nothing else). Every input is the renderer's (RENDERER_INPUTS);
   # the entry fixes none and offers no choice (ACTION_POLICIES row: none).
   # Reach (ruling S6, DECISIONS #83): the repository stays private until v0.4, so in v0.2 only CrisWorking-owned repositories can use it.
-  # Self-pin (C6 scheme; re-pinned 2026-11-04, Plan E task E9): pinned to 76b6c25 (the last commit that changes gate/dist or
-  #   gate/action.yml, bundle sha256 bae419e31b391fbfb2704cdad3331eb987e0b3d2e6c63426293714dd2eeaee30), which is the commit of the
-  #   annotated tag gate-v0.2.2. The version is bundle content (GATE_VERSION in the gate view), so it changes before the tag, never in the
-  #   re-pin commit. Previous pins: 99a0abe, tag gate-v0.2.1 (Plan D D9); a174da8, tag gate-v0.2.0 (Plan C). scripts/cooldown.ts requires
-  #   the tag gate-v<version> to resolve to the pin; release-check requires the pin's gate/dist and action.yml to equal HEAD's and the pin
-  #   to be on the default branch. Never rewrite history at or before the pin; merge with merge commits only.
-  # Source: commit 76b6c257d94d649993c4709a39bf4a3f7399f0c8 of CrisWorking/pipegen (committed 2026-11-04T18:54:37Z), tag gate-v0.2.2.
+  # Self-pin (C6 scheme; re-pinned 2026-11-07, Plan G task G15b, fix round G15b-R1): pinned to 468dd79 (the last commit that changes
+  #   gate/dist or gate/action.yml, bundle sha256 9ab707b220eba3a6b7c5ff4c0752367528ff08eef15e972f6a1b35be78b7a0ed), which is the commit
+  #   of the annotated tag gate-v0.2.3. The version is bundle content (GATE_VERSION in the gate view), so it changes before the tag, never
+  #   in the re-pin commit. Previous pins: 53da79e (the first local gate-v0.2.3, moved in G15b-R1 before any push); 76b6c25, tag
+  #   gate-v0.2.2 (Plan E E9); 99a0abe, tag gate-v0.2.1 (Plan D D9); a174da8, tag gate-v0.2.0 (Plan C). scripts/cooldown.ts requires the
+  #   tag gate-v<version> to resolve to the pin; release-check requires the pin's gate/dist and action.yml to equal HEAD's and the pin to
+  #   be on the default branch. Never rewrite history at or before the pin; merge with merge commits only.
+  # Source: commit 468dd79af999342fbd525d4dd6fbe57f7e47e375 of CrisWorking/pipegen (committed 2026-11-07T06:32:07Z), tag gate-v0.2.3.
   - id: pipegen-gate
     categories: ["gate"]
     languages: ["any"]
-    releasedAt: "2026-11-04T18:54:37Z"
+    releasedAt: "2026-11-07T06:32:07Z"
     candidate:
       id: pipegen-gate
       name: "pipegen-gate"
       kind: action
       repo: crisworking/pipegen
-      version: "0.2.2"
-      pin: { sha: "76b6c257d94d649993c4709a39bf4a3f7399f0c8" }
+      version: "0.2.3"
+      pin: { sha: "468dd79af999342fbd525d4dd6fbe57f7e47e375" }
       source: reviewed
       reviewed: true
       categories: ["gate"]
     step:
       action:
-        uses: crisworking/pipegen/gate@76b6c257d94d649993c4709a39bf4a3f7399f0c8
+        uses: crisworking/pipegen/gate@468dd79af999342fbd525d4dd6fbe57f7e47e375
         with: {}
       output: { path: "", format: none }
     fixedInputs:
@@ -1924,5 +2062,5 @@ tools:
     choices: {}
     configFiles: []
     reviewedBy: Claude delegated DECISIONS 105
-    reviewedAt: "2026-11-04"
+    reviewedAt: "2026-11-07"
     proofs: 0

@@ -40,7 +40,7 @@ import { Document, isMap, isScalar, isSeq, parse, type Scalar } from 'yaml';
 import { centralWorkflowFile, centralWorkflowPath, type CentralLayer } from '../engine/central-path.js';
 import { dependabotFile } from '../engine/created-builders.js';
 import {
-  CALLER_WORKFLOW, createdPathProblem, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, jobOutputsFor, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PR_CHECK_IF, PR_CHECK_JOB,
+  CALLER_WORKFLOW, createdPathProblem, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, jobOutputsFor, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PR_CHECK_IF, PR_CHECK_JOB, SCORECARD_CRON, SCORECARD_IF, SCORECARD_JOB,
   PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, WORKFLOW_CONCURRENCY, type RenderedStep,
 } from '../engine/job-rules.js';
 import { COMMIT_SHA_RE, isGitHubRepo } from '../engine/names.js';
@@ -51,8 +51,8 @@ import { RenderError } from '../engine/render-error.js';
 import { renderFindRunStep, stepsToYaml } from '../engine/render-step.js';
 import { FIND_RUN_STEP_ID, renderDigestStep, renderHeadCheckStep } from '../engine/deploy-steps.js';
 import { slug } from '../engine/artifact-names.js';
-import { egressSetsForTool } from '../engine/egress.js';
-import { EGRESS_DOMAIN_SETS, type EgressSet } from '../engine/egress-sets.js';
+import { ATTEST_VERIFY_SETS, EGRESS_DOMAIN_SETS, egressSetsForTool, KEYLESS_VERIFY_SETS } from '../engine/egress.js';
+import type { EgressSet } from '../engine/egress-sets.js';
 import { publishedImageServices } from '../engine/needs.js';
 import { COSIGN_ID, GH_ID, renderVerifySteps, type SignedImage } from '../engine/signing.js';
 import type { BaseImage } from '../engine/base-images.js';
@@ -70,7 +70,9 @@ export const PUSH_CALLER_JOB = 'pipegen-push';
 export const NIGHTLY_CALLER_JOB = 'pipegen-nightly';
 const CALLER_NAME: Readonly<Record<'merge' | 'push' | 'nightly', string>> = Object.freeze({ merge: 'pipegen', push: 'pipegen push', nightly: 'pipegen nightly' });
 /** The nightly schedule (plan "Caller triggers"). */
-export const NIGHTLY_CRON = '17 3 * * *';
+export { NIGHTLY_CRON } from '../engine/job-rules.js';
+import { NIGHTLY_CRON } from '../engine/job-rules.js';
+export { SCORECARD_CRON, SCORECARD_IF };
 /** The comment that marks the not-proven line of the merge file (G-S2): `not-proven: '[...]' # pipegen:not-proven`. */
 export const NOT_PROVEN_MARK = 'pipegen:not-proven';
 /** The verify-first job's id (the referee's permission and step tables are keyed by it). */
@@ -112,10 +114,25 @@ export function verifyPermissions(draft: PipelineDraft): Record<string, 'read'> 
   return out;
 }
 /**
- * G7-R1 spec I4, G7-R2 6: the hosts keyless verification reaches (Sigstore's TUF root and its transparency log). The note below is keyed on
- * whether the verify job's egress sets (the cosign entry's, plus github-core and ghcr) reach them, not on a set's name (G15 adds the set).
+ * G7-R1 spec I4, G7-R2 6, G15a, G15a-R7 spec 4: the hosts keyless verification reaches (Sigstore's TUF root and its transparency log), derived
+ * from the keyless verify job's own sets: a host added to the set is a host the note checks. The note is keyed on whether the verify job's own
+ * egress step reaches them, not on a set's name.
  */
-const SIGSTORE_HOSTS: readonly string[] = ['tuf-repo-cdn.sigstore.dev', 'rekor.sigstore.dev'];
+const SIGSTORE_HOSTS: readonly string[] = KEYLESS_VERIFY_SETS.flatMap((x) => EGRESS_DOMAIN_SETS[x]);
+/**
+ * The note for a keyless deploy whose verify job can not reach a Sigstore host behind its network lock (the verify job would then fail), or null:
+ * no keyless plan, no published image, or every host reached.
+ */
+export function keylessVerifyNote(draft: PipelineDraft, verify: Job): string | null {
+  const keyless = draft.signing?.mode === 'keyless' && publishedImageServices(draft.profile, draft.capabilities).length > 0;
+  if (!keyless || !SIGSTORE_HOSTS.some((h) => !egressHostsOf(verify).has(h))) return null;
+  return 'Your deploys stop: pipegen checks a keyless signature with Sigstore, whose hosts the verify job can not reach behind the network lock, so the verify job fails and a deploy of this image does not pass pipegen-verify.';
+}
+/** The hosts a job's egress step (the reviewed Bullfrog block) lets through: its allowed-domains, one per line; none without the step. */
+function egressHostsOf(j: Job): Set<string> {
+  const h = j.steps.find((x) => typeof x.uses === 'string' && x.with?.['allowed-domains'] !== undefined && /^bullfrogsec\/bullfrog@/i.test(x.uses));
+  return new Set(String(h?.with?.['allowed-domains'] ?? '').split('\n').filter((x) => x !== ''));
+}
 /** The job ids pipegen.yml reserves for its own jobs (a deploy job may not take one). */
 const RESERVED_IDS: ReadonlySet<string> = new Set([MERGE_CALLER_JOB, SIGN_JOB_ID, VERIFY_JOB_ID, PUSH_CALLER_JOB, NIGHTLY_CALLER_JOB, PR_CHECK_JOB, 'gate']);
 
@@ -392,7 +409,8 @@ export function assemble(input: PipelineDraft, opts: AssembleOpts): AssembledFil
 
   // 6. nightly (B5): the nightly job on schedule; no merge workflow, no not-proven list
   {
-    const nightlyOn = { schedule: [{ cron: NIGHTLY_CRON }] };
+    // G15a round 3 (PF-3): the weekly Scorecard entry, only when the scorecard job is written (its job runs on that entry alone)
+    const nightlyOn = { schedule: [{ cron: NIGHTLY_CRON }, ...(Object.hasOwn(a.nightly, SCORECARD_JOB) ? [{ cron: SCORECARD_CRON }] : [])] };
     const nightlyJobs = orderedAll(a.nightly);
     const comment = 'pipegen: the nightly issues (warn-ending, finish-missing, updates); written by pipegen. It never pushes a file.';
     const reason = 'Opens the nightly issues: the warning period ending, finish not run, pipegen updates.';
@@ -413,14 +431,10 @@ export function assemble(input: PipelineDraft, opts: AssembleOpts): AssembledFil
     const waitMinutes = runMinutes + VERIFY_GRACE_MINUTES;
     if (waitMinutes + VERIFY_MARGIN_MINUTES > MAX_JOB_MINUTES) fail(`The gated run can take ${runMinutes} minutes, longer than the verify job can wait (a job runs at most ${MAX_JOB_MINUTES} minutes).`);
     verify = verifyJob(draft, { gate: opts.gate, reviewed: opts.reviewed, platform: opts.platform, waitMinutes });
-    // G7-R1 spec I4 (a release blocker until G15): keyless verification reads Sigstore's hosts, which no reviewed network set holds yet, so
-    // under the network lock the verify job fails closed and every deploy of the image stops
-    const keyless = draft.signing?.mode === 'keyless' && publishedImageServices(draft.profile, draft.capabilities).length > 0;
-    const cosign = opts.reviewed.find((t) => t.id === COSIGN_ID);
-    const reach = new Set<string>(cosign === undefined ? [] : ['github-core', 'ghcr', ...egressSetsForTool(cosign)].flatMap((x) => EGRESS_DOMAIN_SETS[x as EgressSet] ?? []));
-    if (keyless && SIGSTORE_HOSTS.some((h) => !reach.has(h))) {
-      addNote(notes, 'Your deploys stop for now: pipegen checks a keyless signature with Sigstore, whose hosts are not in a reviewed network set yet, so the verify job can not reach them behind the network lock and fails. pipegen adds them before release; until then a deploy of this image does not pass pipegen-verify.');
-    }
+    // G7-R1 spec I4, re-keyed in G15a (carry A2): keyless verification reads Sigstore's hosts. The note is keyed on the hosts the verify job
+    // really gets (its egress step's allowed-domains), so it fires only if a later change leaves them out of the job's reach
+    const note = keylessVerifyNote(draft, verify);
+    if (note !== null) addNote(notes, note);
   }
 
   // 8. Dependabot (P-6, D0b): the github-actions entry appended to the user's file, or a new file; Renovate is kept
@@ -478,7 +492,8 @@ export function verifyJob(draft: PipelineDraft, deps: { gate: ReviewedTool; revi
  * The verify job's steps after find-run (G7), and the egress sets they need besides github-core: the head check; for the published image
  * (publishedImageServices: one per repository in v0.2) the digest step; and when the draft records a signing plan, that image's signature
  * check (signing.ts, from the reviewed cosign entry, or gh for attest). A published image the plan does not sign, a signing plan without
- * the image, a signing step that can not be rendered (attest until G15) and more than one published image are refused (fail closed).
+ * the image, a signing step that can not be rendered, an attest verify job while gh's network hosts are not a reviewed set (G15a) and more than
+ * one published image are refused (fail closed).
  */
 export function verifyTail(draft: PipelineDraft, reviewed: readonly ReviewedTool[]): { steps: RenderedStep[]; sets: EgressSet[] } {
   const steps: RenderedStep[] = [guard(() => renderHeadCheckStep(draft.profile.defaultBranch))];
@@ -496,10 +511,14 @@ export function verifyTail(draft: PipelineDraft, reviewed: readonly ReviewedTool
     const image = planned.find((i) => sameSlug(i?.service, service));
     if (image === undefined) fail(`The image of ${show(service)} is published, but the signing plan does not sign it, so a deploy of it could not be verified.`);
     const tool = reviewed.find((t) => t.id === (plan.mode === 'attest' ? GH_ID : COSIGN_ID));
-    if (tool === undefined) fail(plan.mode === 'attest' ? 'Attest-mode deploys are verified with the reviewed pinned gh release, which is not on the reviewed list yet (it lands with the re-pin batch, G15), so this deploy can not be verified.' : 'The reviewed list has no cosign entry, so no deploy can be verified.');
+    if (tool === undefined) fail(plan.mode === 'attest' ? 'Attest-mode deploys are verified with the reviewed pinned gh release, which is not on the reviewed list, so this deploy can not be verified.' : 'The reviewed list has no cosign entry, so no deploy can be verified.');
     steps.push(...guard(() => renderVerifySteps(tool as ReviewedTool, draft, image as SignedImage)));
     for (const x of egressSetsForTool(tool as ReviewedTool)) sets.add(x);
     sets.add('ghcr');
+    // G15a-R0b: gh's own hosts (the github-attest set, cited in egress-sets.ts)
+    if (plan.mode === 'attest') for (const x of ATTEST_VERIFY_SETS) sets.add(x);
+    // G15a (carries A2, A3): keyless verification reads Sigstore's trusted root and log; only this job gets that set (mode-scoped)
+    if (plan.mode === 'keyless') for (const x of KEYLESS_VERIFY_SETS) sets.add(x);
   }
   return { steps, sets: [...sets].sort() };
 }

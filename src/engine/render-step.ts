@@ -24,13 +24,13 @@ import { NEED_IDS, toolCoversNeed } from './need-ids.js';
 import type { PlatformActions } from './pin.js';
 import { tuningProblems } from './tuning.js';
 import { APP_RUNNING_CATEGORIES, projectScriptSteps, renderCliTool, renderRangeScan, repoToolSteps, sha16, type CliHooks, type RenderOptions } from './render-cli.js';
-import { ArtifactNameError, resultArtifactName, SECRETS_RANGE_ARTIFACT } from './artifact-names.js';
-import { repoToolFor, type ProjectScriptStep, type RepoToolStep } from './reviewed.js';
+import { ArtifactNameError, resultArtifactName, SECRETS_HISTORY_ARTIFACT, SECRETS_RANGE_ARTIFACT } from './artifact-names.js';
+import { argvPolicyProblems, repoToolFor, type ProjectScriptStep, type RepoToolStep, type ReviewedEntry } from './reviewed.js';
 import { own, RenderError, show } from './render-error.js';
-import { BASE_CHECKOUT_ID, BASELINE_CHECK_STEP_ID, checkExpressions, checkJobOrder, isDangerousName, isReviewed, narrowingChoiceProblem, STEP_KEYS, type JobContext, type RenderedStep, type ScanFact } from './job-rules.js';
+import { BASE_CHECKOUT_ID, BASELINE_CHECK_STEP_ID, checkExpressions, checkJobOrder, isDangerousName, isReviewed, narrowingChoiceProblem, NO_KEY_SCRUB_TOOLS, STEP_KEYS, ZAP_ACTIVE_LANE, type JobContext, type RenderedStep, type ScanFact } from './job-rules.js';
 import { GateJobListError } from './gate-job-list.js';
 import { gateStepInputs, nightlyStepInputs } from './gate-inputs.js';
-import { allowedDomainsProblem, BULLFROG_USES, egressDomains, BASE_CHECKOUT_REF, DOCKER_ACTION_USES, GATE_UPLOAD_FILES, gateUploadPath, uploadIfNoFiles, IMAGE_BUILT_ACTION_USES, isStagedTool, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath, scrubStepId, stagePath, stageStepId } from './tool-flags.js';
+import { ARGV_POLICIES, ZIZMOR_ONLINE_HOST, ZIZMOR_ONLINE_ID, ZIZMOR_ONLINE_POLICY, allowedDomainsProblem, BULLFROG_USES, egressDomains, BASE_CHECKOUT_REF, DOCKER_ACTION_USES, DOCKER_STEP_IMAGES, DOCKER_STEP_INPUTS, GATE_UPLOAD_FILES, gateUploadPath, uploadIfNoFiles, IMAGE_BUILT_ACTION_USES, isStagedTool, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath, scrubStepId, stagePath, stageStepId } from './tool-flags.js';
 
 export { RenderError };
 // the job rules live in job-rules.ts (one copy for the renderer, the emitter, the referee and the linters); re-exported for the callers that import them here
@@ -51,6 +51,8 @@ export interface RenderContext {
    * HIGH and CRITICAL, ignore-unfixed on, a pushing image build); absent counts as blocking, so no caller narrows a gate check by forgetting it.
    */
   blocking?: boolean;
+  /** G15a round 6: the render is of pipegen's own nightly scan (dast-handoff.ts zapActiveSpec): only then may a nightly-only entry render. */
+  nightly?: true;
 }
 
 /** `output`: where the tool's RAW result will be, `${{ runner.temp }}/pipegen-raw/<artifact>/<file>` (rulings S7 and B1: never uploadable; scrubbedPath gives the copy the scrub writes); null when the step makes none. */
@@ -89,7 +91,12 @@ export function validateSpec(spec: StepSpec, tool: ReviewedTool, ctx: RenderCont
     problem('tool', `the step's tool ${show(st.id)} is not the reviewed entry ${show(c.id)} at its reviewed version and pin.`);
   }
 
-  if (!(NEED_IDS as readonly string[]).includes(spec.needId)) problem('needId', `${show(spec.needId)} isn't a check pipegen knows.`);
+  // G15a round 6: a nightly-only entry (the ZAP AF active scan) renders only as pipegen's own nightly scan, in its lane (dast-handoff.ts
+  // zapActiveSpec), and that lane's id is a need id of nothing else
+  const nightlyOnly = Object.hasOwn(ARGV_POLICIES, tool.id) && ARGV_POLICIES[tool.id]?.nightlyOnly === true;
+  if (nightlyOnly || spec.needId === ZAP_ACTIVE_LANE) {
+    if (!(nightlyOnly && ctx.nightly === true && spec.needId === ZAP_ACTIVE_LANE)) problem('tool', `${show(tool.id)} runs only as pipegen's own nightly ZAP active scan (the ${ZAP_ACTIVE_LANE} lane), never as a check of the pipeline.`);
+  } else if (!(NEED_IDS as readonly string[]).includes(spec.needId)) problem('needId', `${show(spec.needId)} isn't a check pipegen knows.`);
   // a platform-only entry (checkout, setup, upload, login, ...) is a step helper, rendered by renderPlatformStep and never a check of a need; the referee refuses any spec that names one
   else if (!(tool.categories.length === 1 && tool.categories[0] === 'platform') && !toolCoversNeed(tool.categories, spec.needId)) problem('tool', `${show(tool.id)} does not cover the check ${show(spec.needId)} (its categories are ${tool.categories.map((c) => show(c)).join(', ')}).`);
 
@@ -514,8 +521,10 @@ export function renderScrub(artifact: string, rawPath: string, tool: string, for
   const out = scrubbedPath(rawPath);
   // C1c: the scrub of a secrets scan reads the stage folder's manifest, to map the findings back and to prove coverage by the canaries; the
   // commit-range scan (C9) reads the history, not a stage folder (its canaries are commits: the range facts beside its raw result)
-  const staged: Record<string, string> = isStagedTool(tool) && artifact !== SECRETS_RANGE_ARTIFACT ? { stage: stagePath(artifact) } : {};
-  const step = actionStep(gate, 'pipegen: scrub the result', {}, { mode: 'scrub', artifact, tool, format, raw: rawPath, out, 'fp-key': '${{ secrets.PIPEGEN_FP_KEY }}', ...staged });
+  const staged: Record<string, string> = isStagedTool(tool) && artifact !== SECRETS_RANGE_ARTIFACT && artifact !== SECRETS_HISTORY_ARTIFACT ? { stage: stagePath(artifact) } : {};
+  // G15a-R7 sec 3: no key for a key-free scrub (Scorecard): its job then names no secret at all
+  const key: Record<string, string> = NO_KEY_SCRUB_TOOLS.has(tool) ? {} : { 'fp-key': '${{ secrets.PIPEGEN_FP_KEY }}' };
+  const step = actionStep(gate, 'pipegen: scrub the result', {}, { mode: 'scrub', artifact, tool, format, raw: rawPath, out, ...key, ...staged });
   return { id: scrubStepId(artifact), ...step, if: 'always()' };
 }
 
@@ -562,6 +571,93 @@ export function renderRangeBlock(tool: ReviewedTool, platform: PlatformActions, 
   const artifact = SECRETS_RANGE_ARTIFACT;
   const scrub = renderScrub(artifact, out.path, tool.id, 'sarif', gate);
   return { steps: [...result.steps, scrub, renderUpload(artifact, scrubbedPath(out.path), platform)], artifact, scan, result };
+}
+
+/**
+ * G15a round 4 (b1, P-4): the nightly full-history secrets block, the range block's twin under SECRETS_HISTORY_ARTIFACT: the reviewed
+ * betterleaks entry's install, the history scan (renderRangeScan mode history), its scrub (no stage folder; the history facts) and its upload.
+ * The job's checkout takes the whole history (`result.fullHistory`).
+ */
+export function renderHistoryBlock(tool: ReviewedTool, platform: PlatformActions, gate: ReviewedTool): { steps: RenderedStep[]; artifact: string; scan: { stepId: string; fact: ScanFact }; result: RenderResult } {
+  if (!isReviewed(tool.candidate)) throw new RenderError(`${show(tool.id)} is not a reviewed tool, and pipegen never renders a tool that isn't.`);
+  const result = renderRangeScan(tool, 'history');
+  const out = result.output as NonNullable<RenderResult['output']>;
+  const scan = scanFactOf(result, tool.id) as { stepId: string; fact: ScanFact };
+  const artifact = SECRETS_HISTORY_ARTIFACT;
+  return { steps: [...result.steps, renderScrub(artifact, out.path, tool.id, 'sarif', gate), renderUpload(artifact, scrubbedPath(out.path), platform)], artifact, scan, result };
+}
+
+/**
+ * G15a round 5 (b2, P-4): zizmor online, for the nightly job ZIZMOR_ONLINE_JOB. The reviewed zizmor entry, which must be exactly in its reviewed
+ * offline form (command `zizmor --offline <positionals>`, args `--offline`, no follow-up, no env, no output), is run with
+ * `--gh-hostname github.com` in place of `--offline` under the second argv policy (ZIZMOR_ONLINE_POLICY, which the online form must pass), with the job's read token as GH_TOKEN, under its own artifact
+ * and step ids (ZIZMOR_ONLINE_ID). The install is the offline one's. A job-status check: no result file.
+ */
+export function renderZizmorOnline(tool: ReviewedTool, platform: PlatformActions, ctx: RenderContext): RenderResult {
+  if (!isReviewed(tool.candidate)) throw new RenderError(`${show(tool.id)} is not a reviewed tool, and pipegen never renders a tool that isn't.`);
+  const pol = own(ARGV_POLICIES, tool.id);
+  const cli = tool.step.cli;
+  if (tool.id !== ZIZMOR_ONLINE_POLICY.exe || pol === undefined || cli === undefined || tool.candidate.kind === 'action') throw new RenderError(`zizmor online runs the reviewed zizmor entry only, not ${show(tool.id)}.`);
+  const positionals = ZIZMOR_ONLINE_POLICY.positionals ?? [];
+  const offlineForm = isDeepStrictEqual(cli.command, [pol.exe, '--offline', ...positionals]) && isDeepStrictEqual(tool.fixedInputs.args, ['--offline'])
+    && cli.then === undefined && cli.env === undefined && tool.fixedInputs.env === undefined && tool.step.output.format === 'none' && tool.step.output.path === '';
+  if (!offlineForm) throw new RenderError(`The reviewed zizmor entry is not in its reviewed offline form (zizmor --offline ${positionals.join(' ')}), so pipegen does not run it online.`);
+  const online = { ...tool, step: { ...tool.step, cli: { ...cli, command: [pol.exe, '--gh-hostname', ZIZMOR_ONLINE_HOST, ...positionals] } }, fixedInputs: { ...tool.fixedInputs, args: ['--gh-hostname', ZIZMOR_ONLINE_HOST] } } as ReviewedTool;
+  const problems = argvPolicyProblems(online as unknown as ReviewedEntry, { [tool.id]: ZIZMOR_ONLINE_POLICY });
+  if (problems.length > 0) throw new RenderError(`The online form of zizmor does not pass its argv policy: ${problems.map((x) => x.message).join('; ')}.`);
+  const spec = { needId: ZIZMOR_ONLINE_ID, tool: tool.candidate, choices: {} } as unknown as StepSpec;
+  return renderCliTool({ spec, tool: online, service: undefined, ctx: { profile: ctx.profile }, hooks: cliHooks(platform), options: { policies: { [tool.id]: ZIZMOR_ONLINE_POLICY } } });
+}
+
+/** G15a round 3 (PF-3): the Scorecard result's artifact and the id of the step that moves its raw file under the runner temp folder. */
+export const SCORECARD_ARTIFACT = resultArtifactName('scorecard');
+/** The move step is the scan step of the Scorecard result (the run step that writes its raw file), so its id is the checker-run id of it. */
+export const SCORECARD_MOVE_STEP_ID = `checker-run-${sha16(SCORECARD_ARTIFACT)}`;
+/** The code-scanning category of the Scorecard upload. */
+export const SCORECARD_CATEGORY = 'pipegen-scorecard';
+
+/**
+ * A container action as a `docker://<image>@<digest>` step (G15a round 3, PF-3): only for a reviewed entry in DOCKER_STEP_IMAGES whose
+ * wrappedImage is that image at a tag, with the digest it recorded. Its inputs are the entry's fixed inputs plus DOCKER_STEP_INPUTS (a
+ * docker step gets no action.yml default), and nothing the AI chose. Throws RenderError for anything else.
+ */
+export function renderDockerActionStep(tool: ReviewedTool): RenderedStep {
+  if (!isReviewed(tool.candidate) || tool.candidate.kind !== 'action' || tool.step.action === undefined) throw new RenderError(`${show(tool.id)} is not a reviewed action.`);
+  const { path } = usesOf(tool);
+  const image = own(DOCKER_STEP_IMAGES, path);
+  const w = tool.wrappedImage;
+  if (image === undefined || w === undefined) throw new RenderError(`${show(tool.id)} is not a container action pipegen runs as a docker step.`);
+  if (!w.ref.startsWith(`${image}:`) || !/^sha256:[0-9a-f]{64}$/.test(w.digest)) throw new RenderError(`${show(tool.id)}'s recorded image is not ${image} at a tag with its digest.`);
+  if (Object.keys(tool.choices).length > 0) throw new RenderError(`${show(tool.id)} has choices; a docker step takes only its fixed inputs.`);
+  const fixed = tool.fixedInputs.with ?? {};
+  if (!same(tool.step.action.with ?? {}, fixed)) throw new RenderError(`The reviewed entry ${show(tool.id)} has a step template that disagrees with its fixed inputs.`);
+  const step: RenderedStep = { name: `pipegen: ${path} (its image, by digest)`, uses: `docker://${image}@${w.digest}`, with: { ...fixed, ...(own(DOCKER_STEP_INPUTS, path) ?? {}) } };
+  checkExpressions(step);
+  return step;
+}
+
+/**
+ * The Scorecard block of the weekly scorecard job (G15a round 3, PF-3): the docker step (its result file is fixed, scorecard.sarif in the
+ * workspace, which holds no checkout), pipegen's move step (a regular file only, never a link, to the raw result folder), the scrub and
+ * the upload. publish_results is false (the entry's fixed input). Throws RenderError for any tool but the reviewed Scorecard entry.
+ */
+export function renderScorecardBlock(tool: ReviewedTool, platform: PlatformActions, gate: ReviewedTool): RenderedStep[] {
+  if (usesOf(tool).path !== 'ossf/scorecard-action' || tool.step.output.format !== 'sarif' || tool.step.output.path !== 'scorecard.sarif') throw new RenderError(`${show(tool.id)} is not the reviewed Scorecard entry.`);
+  const docker = renderDockerActionStep(tool);
+  const raw = `\${{ runner.temp }}/pipegen-raw/${SCORECARD_ARTIFACT}/scorecard.sarif`;
+  const move: RenderedStep = {
+    id: SCORECARD_MOVE_STEP_ID, name: 'pipegen: move the Scorecard result under the runner temp folder',
+    run: [
+      'set -euo pipefail',
+      'src="$GITHUB_WORKSPACE/scorecard.sarif"',
+      `dst="$RUNNER_TEMP/pipegen-raw/${SCORECARD_ARTIFACT}"`,
+      'if [ -L "$src" ] || [ ! -f "$src" ]; then echo "::error::Scorecard wrote no regular result file"; exit 1; fi',
+      'mkdir -p -- "$dst"',
+      'mv -- "$src" "$dst/scorecard.sarif"',
+    ].join('\n'),
+  };
+  checkExpressions(move);
+  return [docker, move, renderScrub(SCORECARD_ARTIFACT, raw, tool.id, 'sarif', gate), renderUpload(SCORECARD_ARTIFACT, scrubbedPath(raw), platform)];
 }
 
 /**

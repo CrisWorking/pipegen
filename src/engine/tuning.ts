@@ -209,7 +209,7 @@ const DEFS: readonly TuningDef[] = [
     values: startScripts,
     emptyReason: (f) => `the service ${show(f.service?.name ?? f.spec.service ?? 'for this step')} has no start or serve script in its package.json, so pipegen can not start the app for the scan`,
     render: () => ({}),
-    describe: (values) => `Plan G starts the app with its own ${list(values)} script before the scan (adds coverage)`,
+    describe: (values) => `pipegen starts the app with its own ${list(values)} script before the scan (adds coverage)`,
   })),
   {
     id: 'hooks', tool: 'lefthook', kind: 'adds', max: 4, flags: [],

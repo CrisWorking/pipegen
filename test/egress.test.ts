@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, chmodSync, symlinkSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ACTION_EGRESS, E3_EGRESS_SETS, EGRESS_DOMAIN_SETS, egressSetsForTool, renderEgressCheckStep, renderEgressStep, REVIEWED_EGRESS_LABELS, type EgressSet } from '../src/engine/egress.js';
+import { ACTION_EGRESS, E3_EGRESS_SETS, EGRESS_DOMAIN_SETS, G15_EGRESS_SETS, egressSetsForTool, renderEgressCheckStep, renderEgressStep, REVIEWED_EGRESS_LABELS, type EgressSet } from '../src/engine/egress.js';
 import { RenderError } from '../src/engine/render-error.js';
 import { stepsToYaml } from '../src/engine/render-step.js';
 import { Document, parse } from 'yaml';
@@ -16,10 +16,11 @@ const HOST_RE = /^(?!-)[a-z0-9-]+(\.[a-z0-9-]+)+$/;
 describe('egress', () => {
   it('egress: sets github-core, npm, pypi, dockerhub (with production.cloudfront.docker.com and the R2 host), ghcr', () => {
     // the five reviewed choices, plus the E3-R1 exact-host sets (since E9 all eight are the bullfrog choices)
-    expect(Object.keys(EGRESS_DOMAIN_SETS).sort()).toEqual(['dockerhub', 'ghcr', 'github-core', 'github-releases', 'npm', 'osv', 'pypi', 'trivy-db']);
-    expect([...REVIEWED_EGRESS_LABELS, ...E3_EGRESS_SETS].sort()).toEqual([...bullfrog().choices['allowed-domains']!].sort());
+    // G15a: plus the mode-scoped Sigstore set (test/g15-sigstore.test.ts) and gh's attestation set (test/g15-attest-verify.test.ts)
+    expect(Object.keys(EGRESS_DOMAIN_SETS).sort()).toEqual(['dockerhub', 'ghcr', 'github-attest', 'github-core', 'github-releases', 'npm', 'osv', 'pypi', 'sigstore', 'trivy-db']);
+    expect([...REVIEWED_EGRESS_LABELS, ...E3_EGRESS_SETS, ...G15_EGRESS_SETS].sort()).toEqual([...bullfrog().choices['allowed-domains']!].sort());
     expect([...E3_EGRESS_SETS].sort()).toEqual(['github-releases', 'osv', 'trivy-db']);
-    expect([...REVIEWED_EGRESS_LABELS, ...E3_EGRESS_SETS].sort()).toEqual(Object.keys(EGRESS_DOMAIN_SETS).sort());
+    expect([...REVIEWED_EGRESS_LABELS, ...E3_EGRESS_SETS, ...G15_EGRESS_SETS].sort()).toEqual(Object.keys(EGRESS_DOMAIN_SETS).sort());
     const s = EGRESS_DOMAIN_SETS;
     expect(s['github-core']).toEqual(expect.arrayContaining(['github.com', 'api.github.com', 'codeload.github.com', 'objects.githubusercontent.com']));
     expect(s.npm).toEqual(['registry.npmjs.org']);

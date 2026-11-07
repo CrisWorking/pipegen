@@ -18,7 +18,12 @@ import { exec, sandbox, stepEnv, type Sandbox } from './helpers/step-harness.js'
 const needFor = (t: ReviewedTool): string => t.categories.find((c) => (NEED_IDS as readonly string[]).includes(c) && c !== 'platform') ?? 'sast';
 const ctx = ctxFor([service({ name: 'app', path: '.', scripts: ['test'] })], { image: `ghcr.io/o/app@sha256:${'a'.repeat(64)}`, url: 'http://localhost:8080' });
 const spec = (t: ReviewedTool, over: Partial<StepSpec> = {}): StepSpec => specFor(t, { needId: needFor(t), service: 'app', ...over });
-const render = (id: string, over: Partial<StepSpec> = {}): RenderResult => { const t = entry(id); return renderStepWith(spec(t, over), t, platform(), ctx); };
+// G15a round 6: a nightly-only entry (the ZAP AF active scan) renders only in its nightly lane
+const render = (id: string, over: Partial<StepSpec> = {}): RenderResult => {
+  const t = entry(id);
+  const nightly = ARGV_POLICIES[t.id]?.nightlyOnly === true;
+  return renderStepWith(spec(t, nightly ? { needId: 'zap-active', ...over } : over), t, platform(), nightly ? { ...ctx, nightly: true } : ctx);
+};
 const lastRun = (r: RenderResult): RenderedStep => r.steps.filter((s) => s.run !== undefined).at(-1) as RenderedStep;
 const dockerIds = (): string[] => reviewedList().filter((t) => ARGV_POLICIES[t.id]?.method === 'docker' && ARGV_POLICIES[t.id]?.entrypoint !== true).map((t) => t.id);
 /** Every word of a docker command line of a script (the lines that run /usr/bin/docker). */

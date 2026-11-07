@@ -6,8 +6,8 @@ import { EXPR, own, RenderError, show } from './render-error.js';
 import {
   BUILD_PUSH_STEP_ID, DIGEST_STEP_ENV, DIGEST_STEP_ID, FIND_RUN_STEP_ID, HEAD_CHECK_DIR, HEAD_CHECK_ENV, HEAD_CHECK_STEP_ID, imageDigestArtifact, PUBLISH_DIGEST_ENV, PUBLISH_DIGEST_STEP_ID,
 } from './deploy-steps.js';
-import { GATE_RESULT_ARTIFACT, resultArtifactName, SECRETS_RANGE_ARTIFACT, slug } from './artifact-names.js';
-import { ARGV_POLICIES, BASE_CHECKOUT_REF, GATE_OPTIONAL_UPLOADS, RANGE_BEFORE_REF, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, isGateUploadName, CHECKER_STEP_ID_RE, GATE_USES_RE, isStagedTool, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, stagePath, stageStepId, STAGE_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
+import { GATE_RESULT_ARTIFACT, resultArtifactName, SECRETS_HISTORY_ARTIFACT, SECRETS_RANGE_ARTIFACT, slug } from './artifact-names.js';
+import { ARGV_POLICIES, ATTEST_DIGEST_STEP_ID_RE, DOCKER_STEP_IMAGES, attestDigestRef, attestDigestStepId, BASE_CHECKOUT_REF, GATE_OPTIONAL_UPLOADS, HISTORY_STEP_ENV, historyScanStepId, ZIZMOR_ONLINE_STEP_ENV, zizmorOnlineStepId, RANGE_BEFORE_REF, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, isGateUploadName, CHECKER_STEP_ID_RE, GATE_USES_RE, isStagedTool, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, stagePath, stageStepId, STAGE_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
 
 /** One step of a job, as pipegen renders it. `usesComment` becomes the trailing `# <version>` comment on `uses:`. */
 export interface RenderedStep {
@@ -155,6 +155,8 @@ export function isFindRunStep(s: RenderedStep): boolean {
  */
 export function isKnownHarmless(s: RenderedStep): boolean {
   if (isPrCheckStep(s)) return true;   // G1 (BP-6): the exact pr-check lookup reads the API with the job's token, never the workspace
+  // G15a round 3 (PF-3): a reviewed container action as a docker step by digest (DOCKER_STEP_IMAGES; the referee holds it to the entry's digest)
+  if (s.id === undefined && s.run === undefined && isDockerStepUses(s.uses)) return true;
   const pinnedAction = s.uses !== undefined && s.run === undefined && TRUSTED_ACTION_RE.test(s.uses);
   if (isFindRunStep(s)) return true;
   if (s.id === undefined) return pinnedAction || isGateDecideStep(s);
@@ -246,7 +248,8 @@ export function checkJobOrder(steps: readonly RenderedStep[], job: Partial<JobCo
  * run. With `scans`, the step is the range tool's scan. One range scan per job.
  */
 export function rangeChainProblems(steps: readonly RenderedStep[], scans?: ReadonlyMap<string, ScanFact>): string[] {
-  const at = steps.flatMap((s, i) => (s.id === rangeScanStepId && s.run !== undefined ? [i] : []));
+  // G15a round 4 (b1): the full-history scan reads the git history the same way (historyScanStepId), and is held to the same chain
+  const at = steps.flatMap((s, i) => ((s.id === rangeScanStepId || s.id === historyScanStepId) && s.run !== undefined ? [i] : []));
   if (at.length === 0) return [];
   if (at.length > 1) return [`The job holds ${at.length} commit-range scan steps; it has one.`];
   const i = at[0] as number;
@@ -255,7 +258,7 @@ export function rangeChainProblems(steps: readonly RenderedStep[], scans?: Reado
   if (checkouts.length !== 1 || (checkouts[0] as number) > i || steps[checkouts[0] as number]?.with?.['fetch-depth'] !== '0') {
     problems.push(`Step ${i + 1} (${show(steps[i]?.name ?? '')}) scans the pull request's commits, so the job needs exactly one checkout before it, with fetch-depth: '0' (the whole history): a shallow checkout has no base commit to scan from.`);
   }
-  const fact = scans?.get(rangeScanStepId);
+  const fact = scans?.get(steps[i]?.id as string);
   if (scans !== undefined && (fact === undefined || fact.tool !== RANGE_TOOL || fact.format !== 'sarif')) problems.push(`Step ${i + 1} (${show(steps[i]?.name ?? '')}) is the commit-range scan, but its scan fact is not ${RANGE_TOOL} writing SARIF.`);
   return problems;
 }
@@ -289,7 +292,7 @@ export function stageChainProblems(steps: readonly RenderedStep[], scans?: Reado
   });
   if (scans !== undefined) {
     steps.forEach((s, i) => {
-      if (s.id === undefined || s.run === undefined || s.id === rangeScanStepId || !isStagedTool(scans.get(s.id)?.tool)) return;
+      if (s.id === undefined || s.run === undefined || s.id === rangeScanStepId || s.id === historyScanStepId || !isStagedTool(scans.get(s.id)?.tool)) return;
       const stageId = s.id.replace(/^tool-run-/, 'stage-');
       const stageAt = steps.findIndex((x) => isStageStep(x) && x.id === stageId);
       if (stageAt < 0 || stageAt > i) problems.push(`Step ${i + 1} (${show(s.name)}) scans for secrets, but the stage step of its result does not come before it in this job: the scanner reads the stage folder, which only the stage step fills (an empty or old folder would read as clean).`);
@@ -324,7 +327,7 @@ const isCheckout = (s: RenderedStep): boolean => s.run === undefined && s.uses !
 const SCRUB_INPUTS = ['artifact', 'tool', 'format', 'raw', 'out', 'fp-key'] as const;
 /** The ids a scan step of a result can have: the tool's run step, named by the hash of its artifact. */
 /** The DAST result a hash-check step id stands for (G4-R1), or undefined. */
-const dastCheckFor = (id: string): string | undefined => { const m = DAST_CHECK_ID_RE.exec(id); return m === null ? undefined : resultArtifactName('dast', m[1] as string); };
+const dastCheckFor = (id: string): string | undefined => { const m = DAST_CHECK_ID_RE.exec(id); return m === null ? undefined : resultArtifactName(m[1] as DastLane, m[2] as string); };
 const scanIdsOf = (artifact: string): string[] => [`tool-run-${sha16(artifact)}`, `checker-run-${sha16(artifact)}`];
 
 /**
@@ -343,14 +346,17 @@ export function scrubChainProblems(steps: readonly RenderedStep[], scans?: Reado
     if (!isScrubStep(s)) return;
     const at = `Step ${i + 1} (${show(s.name)})`;
     const w = s.with ?? {};
-    for (const k of SCRUB_INPUTS) if (typeof w[k] !== 'string' || w[k] === '') problems.push(`${at} is a scrub step with no ${k} input.`);
+    const keyFree = typeof w.tool === 'string' && NO_KEY_SCRUB_TOOLS.has(w.tool);
+    for (const k of SCRUB_INPUTS) if (!(keyFree && k === 'fp-key') && (typeof w[k] !== 'string' || w[k] === '')) problems.push(`${at} is a scrub step with no ${k} input.`);
+    // G15a-R7 sec 3: the Scorecard scrub never gets the key (its job runs a third-party container before it and needs no key)
+    if (keyFree && w['fp-key'] !== undefined) problems.push(`${at} scrubs the Scorecard result with the fingerprint key; the Scorecard scrub runs without it, so its job holds no secret.`);
     const artifact = w.artifact;
     if (typeof artifact !== 'string' || artifact === '') return;
     if (s.id !== scrubStepId(artifact)) problems.push(`${at} is a scrub step whose id is ${show(s.id ?? '')}, but a scrub step's id is ${scrubStepId(artifact)} for the result ${show(artifact)}.`);
     if (first.has(artifact)) problems.push(`${at} is a second scrub step for the result ${show(artifact)} in this job: a result has exactly one scrub.`);
     else first.set(artifact, i);
     const tool = w.tool;
-    if (typeof tool === 'string' && tool !== '' && !Object.hasOwn(ARGV_POLICIES, tool)) problems.push(`${at} scrubs for the tool ${show(tool)}, which is not a tool pipegen reviewed.`);
+    if (typeof tool === 'string' && tool !== '' && !Object.hasOwn(ARGV_POLICIES, tool) && !SCRUB_ONLY_TOOLS.has(tool)) problems.push(`${at} scrubs for the tool ${show(tool)}, which is not a tool pipegen reviewed.`);
     // G4-R1: a scrub of a handed-off DAST result follows its hash check (the scan ran in the dast-run job), in place of a scan step
     const scanAt = steps.findIndex((x) => x.run !== undefined && x.id !== undefined && (scanIdsOf(artifact).includes(x.id) || dastCheckFor(x.id) === artifact));
     if (scanAt < 0 || scanAt > i) {
@@ -358,7 +364,7 @@ export function scrubChainProblems(steps: readonly RenderedStep[], scans?: Reado
       return;
     }
     const scanTool = scans?.get(steps[scanAt]?.id as string)?.tool ?? (typeof tool === 'string' ? tool : undefined);
-    if (artifact === SECRETS_RANGE_ARTIFACT) {
+    if (artifact === SECRETS_RANGE_ARTIFACT || artifact === SECRETS_HISTORY_ARTIFACT) {
       // C9: the commit-range scan reads the history, never a stage folder; its scrub names none, and it scrubs the range tool's result
       if (w.stage !== undefined) problems.push(`${at} scrubs the commit-range scan, which reads the history and has no stage folder: its scrub names none.`);
       if (typeof tool === 'string' && tool !== RANGE_TOOL) problems.push(`${at} scrubs the commit-range scan as the tool ${show(tool)}, but that scan runs ${RANGE_TOOL}.`);
@@ -468,6 +474,55 @@ export const CONCURRENCY_GROUP = "${{ github.ref == format('refs/heads/{0}', git
 export const WORKFLOW_CONCURRENCY: Readonly<{ group: string; 'cancel-in-progress': true }> = Object.freeze({ group: CONCURRENCY_GROUP, 'cancel-in-progress': true });
 /** The nightly job's own concurrency (ruling B5, carry C7n: no overlapping nightly runs): the one job-level concurrency, on the job nightly only. */
 export const NIGHTLY_CONCURRENCY = 'pipegen-nightly';
+/**
+ * G15a round 3 (PF-3): Scorecard runs weekly from the nightly file, on its own cron entry; its job runs only on that entry (the one job
+ * condition of the nightly file). The scorecard job and its code-scanning upload are the jobs that may follow it.
+ */
+export const SCORECARD_CRON = '23 4 * * 1';
+export const SCORECARD_IF = `github.event.schedule == '${SCORECARD_CRON}'`;
+/** The nightly cron entry of the nightly file (B5). */
+export const NIGHTLY_CRON = '17 3 * * *';
+/**
+ * G15a-R7 spec 2: no Monday double run. Every job of the nightly file but the weekly ones runs only on the nightly cron entry; Scorecard runs
+ * only on its own (SCORECARD_IF), and its code-scanning upload follows it through needs. Written on every nightly job of pipegen's (layers/jobs.ts).
+ */
+export const NIGHTLY_IF = `github.event.schedule == '${NIGHTLY_CRON}'`;
+export const SCORECARD_JOB = 'scorecard';
+export const CODE_SCANNING_JOB = 'code-scanning';
+/**
+ * G15a round 4 (b1, P-4): the nightly full-history secrets scan (a full checkout, then render-step.ts renderHistoryBlock) and its own
+ * code-scanning upload job (its own, so a failed or skipped Scorecard run never holds it back, and the reverse), with its category.
+ */
+export const SECRETS_HISTORY_JOB = 'secrets-history';
+export const HISTORY_UPLOAD_JOB = 'code-scanning-history';
+export const SECRETS_HISTORY_CATEGORY = 'pipegen-secrets-history';
+/**
+ * G15a round 5 (b2, P-4): the nightly job that runs zizmor online (render-step.ts renderZizmorOnline): egress, a checkout, the install and the
+ * run with the job's read token. `contents: read` only; a job-status check, never gated. Its steps and file are held by the referee.
+ */
+export const ZIZMOR_ONLINE_JOB = 'workflow-lint-online';
+/**
+ * G15a round 4 (b3, P-4): the nightly DAST scan (dast-handoff.ts nightlyDastSpec: nuclei against each app the merge layer scans) runs in the same
+ * job pair as the merge layer's (dast-run--<svc>, dast--<svc>) of the nightly file; this job downloads each scrubbed result and uploads it
+ * to code scanning, one category per service. Reported, never gated.
+ */
+export const DAST_UPLOAD_JOB = 'code-scanning-dast';
+/** The code-scanning category of a nightly DAST result: `pipegen-dast-nightly--<svc>` (nuclei), `pipegen-zap-active-nightly--<svc>` (ZAP AF). */
+export const dastNightlyCategory = (service: string, lane: DastLane = 'dast'): string => `pipegen-${lane}-nightly--${slug(service)}`;
+/** G15a round 3 (PF-3): the reviewed tools whose result a scrub reads but that run as a docker step (no argv policy): Scorecard. */
+export const SCRUB_ONLY_TOOLS: ReadonlySet<string> = new Set(['scorecard-action']);
+/**
+ * G15a-R7 sec 3: the tools whose scrub runs without the fingerprint key (no `fp-key` input): Scorecard, whose image runs as a container action in
+ * the same job before the scrub. It is no secrets tool and has no quoting rule, so the scrub never needs the key for it (gate/src/scrub.ts
+ * needsKey), and the job holds no secret at all. Every other scrub carries the key.
+ */
+export const NO_KEY_SCRUB_TOOLS: ReadonlySet<string> = new Set(['scorecard-action']);
+/** A `docker://<image>@sha256:<64 hex>` uses of an image in DOCKER_STEP_IMAGES (the shape only; the referee checks the reviewed digest). */
+export function isDockerStepUses(uses: unknown): boolean {
+  if (typeof uses !== 'string' || !uses.startsWith('docker://')) return false;
+  const m = /^docker:\/\/([a-z0-9./-]{1,200})@sha256:[0-9a-f]{64}$/.exec(uses);
+  return m !== null && Object.values(DOCKER_STEP_IMAGES).includes(m[1] as string);
+}
 /** The app's nightly workflow (ruling B2): schedule only. */
 export const NIGHTLY_WORKFLOW = '.github/workflows/pipegen-nightly.yml';
 /** The app's local merge workflow of the public layout (G2/G43): called by pipegen.yml, so workflow_call only. */
@@ -627,6 +682,9 @@ export function narrowingChoiceProblem(name: string, value: string): string | nu
 
 /** The sign step (job sign only) and the verify steps (job pipegen-verify only): their ids, one per image (sha16 of the image repository). */
 export const SIGN_STEP_ID_RE = /^pipegen-sign-[0-9a-f]{16}$/;
+/** G15a (carry C10): the attest sign job's digest step (one per image; signing.ts renderAttestDigestStep), id and env. */
+export { ATTEST_DIGEST_STEP_ID_RE, attestDigestRef, attestDigestStepId };
+export const ATTEST_DIGEST_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_REGISTRY_TOKEN: '${{ secrets.GITHUB_TOKEN }}' });
 export const VERIFY_STEP_ID_RE = /^pipegen-verify-[0-9a-f]{16}$/;
 export const signStepId = (repo: string): string => `pipegen-sign-${sha16(`sign:${repo}`)}`;
 export const verifyStepId = (repo: string): string => `pipegen-verify-${sha16(`verify:${repo}`)}`;
@@ -670,30 +728,45 @@ const isImageArchiveStep = (s: RenderedStep): boolean => s.id === IMAGE_ARCHIVE_
 // against that output before anything reads it, scrubs and uploads the result. The fingerprint key is in the scrub only (render-step.ts),
 // so it never reaches a job that runs the app.
 
+/**
+ * G15a round 6: the DAST lanes. `dast`: the merge layer's DAST check, and nightly nuclei in the same pair (dast-run--<svc>, dast--<svc>);
+ * `zap-active`: the nightly ZAP AF active scan in a pair of its own (zap-active-run--<svc>, zap-active--<svc>), with its own raw and result
+ * artifacts, hash-check step and category, so the two nightly scans of one service never share an artifact of the run. The lane id is the
+ * need id of the lane's spec (dast-handoff.ts zapActiveSpec), so the renderer's artifact name and the lane's agree. No need is called
+ * zap-active: the gate's job list never names it.
+ */
+export type DastLane = 'dast' | 'zap-active';
+export const ZAP_ACTIVE_LANE = 'zap-active' satisfies DastLane;
+/** The lane of a DAST spec, by its need id. */
+export const dastLaneOf = (needId: string): DastLane => (needId === ZAP_ACTIVE_LANE ? ZAP_ACTIVE_LANE : 'dast');
 /** The run job of a service's DAST check, and its slug. */
 export const DAST_RUN = 'dast-run';
-export const dastRunJobId = (service: string): string => `${DAST_RUN}--${slug(service)}`;
-const DAST_RUN_JOB_RE = /^dast-run--([a-z0-9][a-z0-9-]{0,39})$/;
-export const dastRunSlugOf = (jobId: string | undefined): string | null => {
+const runHead = (lane: DastLane): string => `${lane}-run`;
+export const dastRunJobId = (service: string, lane: DastLane = 'dast'): string => `${runHead(lane)}--${slug(service)}`;
+const DAST_RUN_JOB_RE = /^(dast|zap-active)-run--([a-z0-9][a-z0-9-]{0,39})$/;
+/** The lane and service slug of a DAST run job id (either lane), or null. */
+export const dastRunOf = (jobId: string | undefined): { lane: DastLane; slug: string } | null => {
   const m = jobId === undefined ? null : DAST_RUN_JOB_RE.exec(jobId);
   if (m === null) return null;
-  try { return slug(m[1] as string) === m[1] ? (m[1] as string) : null; } catch { return null; }
+  try { return slug(m[2] as string) === m[2] ? { lane: m[1] as DastLane, slug: m[2] as string } : null; } catch { return null; }
 };
-/** The raw hand-off artifact (not a check's result: no need is called dast-raw, so the gate never reads it). */
+export const dastRunSlugOf = (jobId: string | undefined): string | null => dastRunOf(jobId)?.slug ?? null;
+/** The raw hand-off artifact (not a check's result: no need is called dast-raw or zap-active-raw, so the gate never reads it). */
 export const DAST_RAW_ID = 'dast-raw';
-export const dastRawArtifact = (service: string): string => resultArtifactName(DAST_RAW_ID, service);
+export const dastRawArtifact = (service: string, lane: DastLane = 'dast'): string => resultArtifactName(`${lane}-raw`, service);
 /** The DAST check's own result artifact (the scrub's). */
-export const dastResultArtifact = (service: string): string => resultArtifactName('dast', service);
+export const dastResultArtifact = (service: string, lane: DastLane = 'dast'): string => resultArtifactName(lane, service);
 /** The hand-off step of a run job (one per job) and its output. */
 export const DAST_HANDOFF_STEP_ID = 'pipegen-dast-handoff';
 export const DAST_RAW_SHA_OUTPUT = 'raw-sha256';
 const DAST_RAW_SHA_VALUE = stepOutputForm(DAST_HANDOFF_STEP_ID, 'sha256');
 const isDastHandoffStep = (s: RenderedStep): boolean => s.id === DAST_HANDOFF_STEP_ID && typeof s.run === 'string' && s.uses === undefined;
 /** The scrub job's hash check of the downloaded raw result: its id names the service, its one expression is that run job's output. */
-export const dastCheckStepId = (service: string): string => `pipegen-dast-check--${slug(service)}`;
-export const DAST_CHECK_ID_RE = /^pipegen-dast-check--([a-z0-9][a-z0-9-]{0,39})$/;
+export const dastCheckStepId = (service: string, lane: DastLane = 'dast'): string => `pipegen-${lane}-check--${slug(service)}`;
+/** Group 1: the lane, group 2: the service slug. */
+export const DAST_CHECK_ID_RE = /^pipegen-(dast|zap-active)-check--([a-z0-9][a-z0-9-]{0,39})$/;
 export const DAST_RAW_SHA_ENV = 'PIPEGEN_DAST_RAW_SHA256';
-export const dastRawShaRef = (slugged: string): string => `\${{ needs.${DAST_RUN}--${slugged}.outputs.${DAST_RAW_SHA_OUTPUT} }}`;
+export const dastRawShaRef = (slugged: string, lane: DastLane = 'dast'): string => `\${{ needs.${runHead(lane)}--${slugged}.outputs.${DAST_RAW_SHA_OUTPUT} }}`;
 /** The step that starts the app from its checked image archive (repo code, in a container only). */
 export const dastAppStepId = (service: string): string => `repocode-${sha16(`dast-app:${slug(service)}`)}`;
 /** The compose-up and runtime-env step ids (render-step.ts renderComposeUp / renderRuntimeEnv; spelled here, render-step imports this file). */
@@ -709,8 +782,9 @@ const RUNTIME_ENV_ID_RE = /^runtime-env-[0-9a-f]{16}$/;
  * starts, or null (the job is then held to the order rule as usual, which refuses a scanner after the app start).
  */
 function dastRunTailAt(steps: readonly RenderedStep[], jobId: string | undefined): number | null {
-  const s = dastRunSlugOf(jobId);
-  if (s === null || steps.some(isScrubStep)) return null;
+  const rj = dastRunOf(jobId);
+  if (rj === null || steps.some(isScrubStep)) return null;
+  const { slug: s, lane } = rj;
   if (JSON.stringify(steps).match(/secrets\.|github\.token/) !== null) return null;
   const k = steps.findIndex((x) => !isKnownHarmless(x));
   if (k < 0) return null;
@@ -725,10 +799,10 @@ function dastRunTailAt(steps: readonly RenderedStep[], jobId: string | undefined
   else return null;
   const toolFrom = i;
   while (isRun(at(i)) && (TOOL_STEP_ID_RE.test(at(i)?.id ?? '') || CHECKER_STEP_ID_RE.test(at(i)?.id ?? ''))) i++;
-  if (i === toolFrom || !scanIdsOf(dastResultArtifact(s)).includes(at(i - 1)?.id ?? '')) return null;
+  if (i === toolFrom || !scanIdsOf(dastResultArtifact(s, lane)).includes(at(i - 1)?.id ?? '')) return null;
   const h = at(i);
   const u = at(i + 1);
-  const raw = dastRawArtifact(s);
+  const raw = dastRawArtifact(s, lane);
   const folder = `\${{ runner.temp }}/pipegen-out/${raw}`;
   if (h === undefined || !isDastHandoffStep(h) || u === undefined || i + 2 !== steps.length) return null;
   const upload = uploadFolder(u) === raw && u.with?.name === raw && u.with?.path === folder && u.if === undefined && u['continue-on-error'] === undefined;
@@ -947,6 +1021,10 @@ export function checkExpressions(step: RenderedStep): void {
       if (group === 'env') {
         // C9: the commit-range scan step (its id, a run step) carries this event's base and head commits, each exactly its form
         if (step.id === rangeScanStepId && step.run !== undefined && step.uses === undefined && Object.hasOwn(RANGE_STEP_ENV, k) && RANGE_STEP_ENV[k] === v) continue;
+        // G15a round 4 (b1): the full-history scan step carries only the commit the run checked out
+        if (step.id === historyScanStepId && step.run !== undefined && step.uses === undefined && own(HISTORY_STEP_ENV, k) === v) continue;
+        // G15a round 5 (b2): the online zizmor run step carries only the job's own read token, as GH_TOKEN
+        if (step.id === zizmorOnlineStepId && step.run !== undefined && step.uses === undefined && own(ZIZMOR_ONLINE_STEP_ENV, k) === v) continue;
         // G4 (C9r1): the pre-push head fetch step carries exactly its own forms (the event's earlier head and the job's own token)
         if (step.id === RANGE_FETCH_STEP_ID && step.run !== undefined && step.uses === undefined && own(RANGE_FETCH_STEP_ENV, k) === v) continue;
         // G1 (BP-6): the pr-check lookup step, exactly as renderPrCheckStep writes it (every field that runs), carries the job's own token
@@ -958,11 +1036,12 @@ export function checkExpressions(step: RenderedStep): void {
         // step by content and holds each kind to its job; here only which expression a step of that id may hold)
         if (step.run !== undefined && step.uses === undefined && step.id !== undefined) {
           if (SIGN_STEP_ID_RE.test(step.id) && own(SIGN_STEP_ENV, k) === v) continue;
+          if (ATTEST_DIGEST_STEP_ID_RE.test(step.id) && own(ATTEST_DIGEST_STEP_ENV, k) === v) continue;
           if (VERIFY_STEP_ID_RE.test(step.id) && own(VERIFY_STEP_ENV, k) === v) continue;
           const ic = IMAGE_CHECK_ID_RE.exec(step.id);
           if (ic !== null && k === IMAGE_SHA_ENV && v === imageShaRef(ic[1] as string)) continue;
           const dc = DAST_CHECK_ID_RE.exec(step.id);
-          if (dc !== null && k === DAST_RAW_SHA_ENV && v === dastRawShaRef(dc[1] as string)) continue;
+          if (dc !== null && k === DAST_RAW_SHA_ENV && v === dastRawShaRef(dc[2] as string, dc[1] as DastLane)) continue;
         }
         const m = SECRET_REF_RE.exec(v);
         if (m === null || m[1] !== k || isDangerousName(k)) bad(`env value ${show(k)}`);

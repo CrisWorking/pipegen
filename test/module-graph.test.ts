@@ -47,7 +47,7 @@ describe('module graph (final review M6)', () => {
     expect(files.filter((f) => f.startsWith('src/ai/') || f.startsWith('src/github/'))).toEqual([]);
     for (const net of ['src/engine/discover.ts', 'src/engine/http.ts', 'src/engine/stats.ts']) expect(files).not.toContain(net);
     expect(files).toEqual([
-      'src/engine/discovery-limits.ts', 'src/engine/github-rate.ts', 'src/estimate/estimate.ts', 'src/types.ts',
+      'src/engine/discovery-limits.ts', 'src/engine/github-rate.ts', 'src/engine/zap-active.ts', 'src/estimate/estimate.ts', 'src/types.ts',
       'src/util/claude-fallback.ts', 'src/util/local-host.ts', 'src/util/output-limit.ts', 'src/util/package-data.ts', 'src/util/safe-text.ts',
     ]);
   });

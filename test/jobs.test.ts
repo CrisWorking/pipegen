@@ -197,7 +197,7 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
   it('assemble: nightly opens warn-ending, finish-missing and update issues (issues: write only there), never pushes files', async () => {
     const x = planned(profileOf(), { over: { warnFirst: { licences: { since: '2026-11-05' } } } });
     const a = assemble(x);
-    expect(Object.keys(a.nightly)).toEqual(['nightly']);
+    expect(Object.keys(a.nightly)).toEqual(['nightly', 'scorecard', 'code-scanning', 'secrets-history', 'code-scanning-history', 'workflow-lint-online']);   // G15a round 3: weekly Scorecard (its own job and upload); round 4: the full-history secrets scan and its upload; round 5: zizmor online
     const n = a.nightly.nightly as Job;
     // the gate action in nightly mode opens the issues (warn-ending, finish-missing, update, and the warn-first "switch to blocking" one)
     expect(n.steps.slice(1)).toEqual([renderNightlyStep(REVIEWED.find((t) => t.id === 'pipegen-gate') as never, a.draft)]);
@@ -259,13 +259,13 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
     const skipped = assemble({ ...x, draft: { ...x.draft, skipped: [{ part: 'deploy', reason: 't' }] } }, 'keyless');
     expect(skipped.sign).toBeNull();
     expect(skipped.draft.signing).toBeUndefined();
-    // attest: not signed yet (G15), a note, never another mode
+    // attest (G15a): the attest sign job (actions/attest with the digest step's output), never another mode
     const att = planned(profileOf([node({ dockerfile: 'Dockerfile', port: 3000 })], { private: true }), {
       caps: { ...CAPS, attestations: true, environments: true }, over: { centralPin: { repo: 'o/pipelines', sha: 'a'.repeat(40) }, signing: { mode: 'attest', images: [{ service: 'app', repo: 'ghcr.io/o/r-app' }] } },
     });
     const at = assemble(att, 'attest');
-    expect(at.sign).toBeNull();
-    expect(at.notes.join('\n')).toMatch(/not signed yet.*later pipegen release.*never falls back/);
+    expect(at.sign?.steps.map((s) => String(s.uses ?? s.id).replace(/@.*/, ''))).toEqual(['actions/download-artifact', expect.stringMatching(/^pipegen-attest-digest-[0-9a-f]{16}$/), 'actions/attest']);
+    expect(at.sign?.steps.some((s) => /^pipegen-sign-/.test(s.id ?? ''))).toBe(false);
   });
 
   it('assemble: steps only from specFor over keyOffers(DebateResult); advisory tools non-blocking', async () => {

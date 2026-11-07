@@ -13,7 +13,7 @@ import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from '
 import { RANGE_CANARY_FILES } from '../../src/engine/artifact-names.js';
 
 // the names the scrub needs, from the one leaf that spells them (scrub.ts imports only gate/src files and a few leaves)
-export { RANGE_FACTS_FILE, SECRETS_RANGE_ARTIFACT, SECRETS_RANGE_TOOL } from '../../src/engine/artifact-names.js';
+export { RANGE_FACTS_FILE, SECRETS_HISTORY_ARTIFACT, SECRETS_RANGE_ARTIFACT, SECRETS_RANGE_TOOL } from '../../src/engine/artifact-names.js';
 import { CANARY_RULE } from '../../src/ai/scan-staging.js';
 import type { ParsedFinding } from './parse-common.js';
 
@@ -24,31 +24,50 @@ export class RangeFactsError extends Error {}
  */
 export interface RangeFacts { base: string; head: string; before: string | null; forced: boolean; commits: number; canaries: readonly { commit: string; path: string }[] }
 /**
+ * G15a round 4 (b1, P-4): the facts of the nightly full-history scan, the same step with no base: every commit reachable from the checkout's
+ * refs and the two canary commits made on `head` (the commit the run checked out). `commits`: the commits of the stream that are not canaries.
+ * Read only for the history artifact (`parseRangeFacts(text, 'history')`), and never for the range artifact: the two never stand in for each other.
+ */
+export interface HistoryFacts { history: true; head: string; commits: number; canaries: readonly { commit: string; path: string }[] }
+/** Which facts a reader takes: the pull request's commit range (C9) or the nightly full history (G15a round 4). */
+export type FactsKind = 'range' | 'history';
+/**
  * Why the step scanned nothing: `no-range`, no commit range on this event (an all-zero base or head; fix round 1); `no-merge-base`, a push that
  * rewrote the branch and whose old head is gone from the checkout (fix round 2, m2).
  */
 export const SKIP_REASONS = ['no-range', 'no-merge-base'] as const;
 export type SkipReason = (typeof SKIP_REASONS)[number];
 export interface RangeSkipped { skipped: SkipReason }
-export type RangeRun = RangeFacts | RangeSkipped;
+export type RangeRun = RangeFacts | RangeSkipped | HistoryFacts;
 export const isRangeSkipped = (r: RangeRun): r is RangeSkipped => Object.hasOwn(r, 'skipped');
+export const isHistory = (r: RangeRun): r is HistoryFacts => Object.hasOwn(r, 'history');
 
 const SHA_RE = /^[0-9a-f]{40}$/;
 const ZERO = '0'.repeat(40);
 const MAX_FACTS_BYTES = 64 * 1024;
 const MAX_COMMITS = 10_000_000;
 const KEYS = ['base', 'before', 'canaries', 'commits', 'forced', 'head', 'pipegenRange'];
+const HISTORY_KEYS = ['canaries', 'commits', 'head', 'history', 'pipegenRange'];
 const CANARY_RULE_ID = `secret:${CANARY_RULE}`;
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
-/** The facts of one range scan, from the text of its facts file; throws RangeFactsError for anything but the forms the step writes. */
-export function parseRangeFacts(text: string): RangeRun {
+/**
+ * The facts of one range scan, from the text of its facts file; throws RangeFactsError for anything but the forms the step writes for that
+ * kind: `range` (the default) reads the commit-range forms (facts or a skip), `history` only the full-history form.
+ */
+export function parseRangeFacts(text: string, kind: FactsKind = 'range'): RangeRun {
   const bad = (why: string): never => { throw new RangeFactsError(`the commit-range facts ${why}`); };
   if (typeof text !== 'string' || text.length > MAX_FACTS_BYTES) bad('are over the size cap');
   let d: unknown;
   try { d = JSON.parse(text); } catch { return bad('are not JSON'); }
   if (!isObj(d)) return bad('are not in the form the range scan step writes');
   if (d.pipegenRange !== 1) bad('are of a version this gate does not read');
+  if (kind === 'history') {
+    if (Object.keys(d).sort().join() !== HISTORY_KEYS.join() || d.history !== true) return bad('are not the full-history form the history scan step writes');
+    if (typeof d.head !== 'string' || !SHA_RE.test(d.head) || d.head === ZERO) bad('have a head that is not a commit sha');
+    return { history: true, head: d.head as string, commits: commitsOf(d.commits, bad), canaries: canariesOf(d.canaries, bad) };
+  }
+  if (kind !== 'range') bad('are of a kind this gate does not read');
   if (Object.keys(d).sort().join() === 'pipegenRange,skipped') {
     if (!(SKIP_REASONS as readonly unknown[]).includes(d.skipped)) bad('say the scan was skipped for a reason this gate does not know');
     return { skipped: d.skipped as SkipReason };
@@ -57,10 +76,17 @@ export function parseRangeFacts(text: string): RangeRun {
   for (const k of ['base', 'head'] as const) if (typeof d[k] !== 'string' || !SHA_RE.test(d[k] as string) || d[k] === ZERO) bad(`have a ${k} that is not a commit sha`);
   if (d.before !== null && (typeof d.before !== 'string' || !SHA_RE.test(d.before) || d.before === ZERO)) bad('have a before that is not a commit sha');
   if (typeof d.forced !== 'boolean') bad('do not say whether the push rewrote the branch');
-  if (typeof d.commits !== 'number' || !Number.isSafeInteger(d.commits) || d.commits < 0 || d.commits > MAX_COMMITS) bad('have a commit count that is not a whole number');
-  const list = d.canaries;
+  return { base: d.base as string, head: d.head as string, before: d.before as string | null, forced: d.forced as boolean, commits: commitsOf(d.commits, bad), canaries: canariesOf(d.canaries, bad) };
+}
+
+function commitsOf(v: unknown, bad: (why: string) => never): number {
+  if (typeof v !== 'number' || !Number.isSafeInteger(v) || v < 0 || v > MAX_COMMITS) bad('have a commit count that is not a whole number');
+  return v as number;
+}
+
+function canariesOf(list: unknown, bad: (why: string) => never): { commit: string; path: string }[] {
   if (!Array.isArray(list) || list.length !== RANGE_CANARY_FILES.length) return bad(`do not name ${RANGE_CANARY_FILES.length} canary commits`);
-  const canaries = list.map((c, i) => {
+  const canaries = list.map((c: unknown, i) => {
     if (!isObj(c) || Object.keys(c).sort().join() !== 'commit,path') return bad('have a canary that is not { commit, path }');
     if (typeof c.commit !== 'string' || !SHA_RE.test(c.commit)) return bad('have a canary commit that is not a commit sha');
     const path = RANGE_CANARY_FILES[i] as string;
@@ -68,11 +94,11 @@ export function parseRangeFacts(text: string): RangeRun {
     return { commit: c.commit, path };
   });
   if (new Set(canaries.map((c) => c.commit)).size !== canaries.length) bad('name one canary commit twice');
-  return { base: d.base as string, head: d.head as string, before: d.before as string | null, forced: d.forced as boolean, commits: d.commits as number, canaries };
+  return canaries;
 }
 
-/** Reads the facts file at `path`: never through a link, a regular file, never blocking, at most 64 KiB. Throws RangeFactsError. */
-export function readRangeFacts(path: string): RangeRun {
+/** Reads the facts file at `path` (of `kind`, parseRangeFacts): never through a link, a regular file, never blocking, at most 64 KiB. Throws RangeFactsError. */
+export function readRangeFacts(path: string, kind: FactsKind = 'range'): RangeRun {
   let st;
   try { st = lstatSync(path); } catch { throw new RangeFactsError('the commit-range facts (range.json beside the raw result) are missing: the range scan step did not finish'); }
   if (st.isSymbolicLink() || !st.isFile()) throw new RangeFactsError('the commit-range facts are a link or not a regular file');
@@ -84,7 +110,7 @@ export function readRangeFacts(path: string): RangeRun {
     const buf = Buffer.alloc(opened.size);
     let got = 0;
     while (got < buf.length) { const n = readSync(fd, buf, got, buf.length - got, got); if (n === 0) break; got += n; }
-    return parseRangeFacts(buf.subarray(0, got).toString('utf8'));
+    return parseRangeFacts(buf.subarray(0, got).toString('utf8'), kind);
   } catch (e) {
     if (e instanceof RangeFactsError) throw e;
     throw new RangeFactsError('the commit-range facts could not be read');
@@ -99,7 +125,7 @@ export function readRangeFacts(path: string): RangeRun {
  * the order), so without it the stream was not read to its end. Throws RangeFactsError when a canary is missing or reported twice, or a
  * finding has no commit.
  */
-export function applyRange(findings: readonly ParsedFinding[], facts: RangeFacts): { findings: ParsedFinding[]; notes: string[] } {
+export function applyRange(findings: readonly ParsedFinding[], facts: RangeFacts | HistoryFacts): { findings: ParsedFinding[]; notes: string[] } {
   const seen = facts.canaries.map(() => 0);
   const kept: ParsedFinding[] = [];
   for (const f of findings) {
@@ -112,6 +138,9 @@ export function applyRange(findings: readonly ParsedFinding[], facts: RangeFacts
   if ((seen[tip] ?? 0) === 0) throw new RangeFactsError(`the scanner did not report the canary of the stream's last commit (${(facts.canaries[tip] as { commit: string }).commit.slice(0, 12)}), so it has not read the commit range to its end`);
   const wrong = facts.canaries.filter((_, i) => seen[i] !== 1);
   if (wrong.length > 0) throw new RangeFactsError(`the scanner did not report the canary of commit ${wrong.map((c) => c.commit.slice(0, 12)).join(' and ')} exactly once, so it is not proven to have read the commit range once`);
+  if (isHistory(facts)) {
+    return { findings: kept, notes: [`the whole history up to ${facts.head.slice(0, 12)} (${facts.commits} commit(s), merges included, every ref of the checkout) was scanned to its end; both canary commits were read`] };
+  }
   const dropped = facts.before === null ? '' : `, and the commits the push replaced (the head before it, ${facts.before.slice(0, 12)})`;
   return {
     findings: kept,

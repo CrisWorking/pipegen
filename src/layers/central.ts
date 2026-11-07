@@ -13,15 +13,15 @@
 //   G3-R3: no third-party action in a job that holds the key or the OIDC token, the referee holds it to that). key-env runs in environment pipegen-signing, whose
 //   secrets hold the key (default-branch deploys only), with --tlog-upload=false (no public log for a private repo); keyless asks for the
 //   OIDC token and the registry write that stores the signature (no environment, no key, no attestations). cache-mode: none. Attest mode
-//   (actions/attest v4) can not be written yet: its subject-digest is a run-time value, and the reviewed input table (tool-flags.ts, inside
-//   the gate bundle) takes only a literal digest (carry to G15, which also binds that digest to the image hand-off).
+//   (G15a): the digest hand-off, pipegen's digest step (the hand-off checked, the ghcr.io login, the digest as its output) and actions/attest v4
+//   with that output as its subject-digest (tool-flags.ts accepts only that form) and push-to-registry; OIDC token and attestations write.
 // - Egress (G4, carry G3 ruling 5 and P-3): the key-env job starts with the reviewed egress step (Bullfrog, block mode): github-core, the
 //   cosign release download (github-releases) and the registry the signature goes to (ghcr). It is the one step besides the three above the
 //   referee allows in a job that holds the key. key-env signs with --tlog-upload=false and --use-signing-config=false, so it needs no Sigstore
-//   host (as the proof's sign-roundtrip). The keyless job has none: it needs Sigstore's signing and log hosts and the per-run OIDC token host,
-//   which no reviewed set lists (a set is a gate-bundle change, egress-sets.ts), so a block would fail every keyless signature; it runs only
-//   pipegen's own steps (no repo code, no third-party action), and the live checklist decides its hosts. The artifact blob host of the digest
-//   download is not listable either (E0d-2; the same live item as every other job's artifacts).
+//   host (as the proof's sign-roundtrip). The keyless job has none (threat model T52, G15a ruling: the documented exception): it needs the
+//   per-run OIDC token host, a `*.actions.githubusercontent.com` name no exact-host set can list (pipegen never writes a wildcard), so a block
+//   would fail every keyless signature; it runs only pipegen's own steps (no repo code, no third-party action). The reviewed Sigstore set
+//   (egress-sets.ts) goes to the keyless verify job only. The artifact blob host of the digest download is not listable either (E0d-2).
 // - The caller job (G2-R-sec2): a deploy job of the app's pipegen.yml, `if: DEPLOY_PUSH_IF` (a push to the default branch), needing the
 //   job that holds the gate, pinned to the recorded central commit, granted exactly the sign job's permissions, passing no secret (the
 //   environment's secrets reach the called job through its own `environment:`). A repository outside pipegen's judged files can still call
@@ -35,7 +35,7 @@ import type { PlatformActions } from '../engine/pin.js';
 import { SIGNING_ENVIRONMENT } from '../engine/referee.js';
 import { RenderError, show } from '../engine/render-error.js';
 import { renderPlatformStep, stepsToYaml } from '../engine/render-step.js';
-import { COSIGN_ID, imageDigestArtifact, renderSignSteps, SIGN_REGISTRY, signedImageOwner, type SignedImage } from '../engine/signing.js';
+import { COSIGN_ID, imageDigestArtifact, renderAttestDigestStep, renderSignSteps, SIGN_REGISTRY, signedImageOwner, type SignedImage } from '../engine/signing.js';
 import { egressSetsForTool, renderEgressStep } from '../engine/egress.js';
 import { signingMode, type SigningMode } from '../github/signing-mode.js';
 import type { Capabilities, CreatedFile, PipelineDraft, RepoProfile, ReviewedTool, SigningPlan } from '../types.js';
@@ -161,15 +161,12 @@ function attestAction(platform: PlatformActions): ReviewedTool {
  * The sign job for the draft in this mode (job `sign`): G2's renderer only. For a private repository it sits in the project's central sign
  * workflow (sharedWorkflows); for a public one (keyless) G5 places it in the app's pipegen.yml as a deploy job (`if: DEPLOY_PUSH_IF`, needs
  * the gate), the file keylessIdentity names. Throws a RenderError for none, a mode that is not the code-chosen one, a draft without the
- * matching plan, an image off ghcr.io, a missing reviewed entry, and attest mode (not writable yet, see the header).
+ * matching plan, an image off ghcr.io, a missing reviewed entry, and an actions/attest entry that is not the reviewed v4 one.
  */
 export function signJob(draft: PipelineDraft, mode: SigningMode, deps: { reviewed: readonly ReviewedTool[]; platform: PlatformActions }): SignJob {
   const plan = planFor(draft, mode);
   if (plan === null) throw new RenderError('Nothing is signed here (the signing mode is none, or no service of the plan builds an image), so there is no sign job.');
-  if (plan.mode === 'attest') {
-    attestAction(deps.platform);
-    throw new RenderError('Attest signing can not be written yet: actions/attest takes the image digest as a literal input only (the reviewed input table lives in the gate bundle), and the digest is known only when the deploy runs. It lands with the gate re-pin batch (G15); until then this repository is not signed.');
-  }
+  if (plan.mode === 'attest') return attestJob(plan, deps.platform);
   const cosign = deps.reviewed.find((t) => t.id === COSIGN_ID);
   if (cosign === undefined) throw new RenderError('The reviewed list has no cosign entry, so nothing can sign.');
   for (const i of plan.images) {
@@ -192,6 +189,30 @@ export function signJob(draft: PipelineDraft, mode: SigningMode, deps: { reviewe
   if (plan.mode === 'key-env') job.steps.unshift(renderEgressStep([...new Set([...egressSetsForTool(cosign), 'ghcr' as const])].sort(), { dockerNetworks: false }));
   if (plan.mode === 'key-env') job.environment = SIGNING_ENVIRONMENT;
   return job;
+}
+
+/**
+ * G15a (carries C10-C12; G3-R1): the attest sign job. Per image: its digest hand-off (download), pipegen's digest step (the file checked as
+ * sha256:<64 hex>, the ghcr.io login for push-to-registry, the digest as the step's output) and the reviewed actions/attest v4 with that
+ * output as its subject-digest (never a literal). Nothing else runs in it (the referee's attest allowlist); no environment and no egress
+ * step (threat model T52: actions/attest needs the per-run OIDC token host, which no exact-host set can list).
+ */
+function attestJob(plan: SigningPlan & { mode: SignMode }, platform: PlatformActions): SignJob {
+  attestAction(platform);
+  for (const i of plan.images) {
+    if (!i.repo.startsWith(`${SIGN_REGISTRY}/`)) throw new RenderError(`The image ${show(i.repo)} is not on ${SIGN_REGISTRY}: the attest job stores the attestation with the workflow token, which logs in to ${SIGN_REGISTRY} only.`);
+  }
+  // G15a-R8 sec m3: every download first (as the cosign job), then per image its digest step and its attest: a download after a digest
+  // step (a run step) would break the order rule, so a plan of two images could not be delivered
+  const downloads = plan.images.map((i) => {
+    const name = imageDigestArtifact(i.service);
+    return renderPlatformStep('download-artifact', platform, { name, path: `\${{ runner.temp }}/pipegen-out/${name}` });
+  });
+  const steps = [...downloads, ...plan.images.flatMap((i) => {
+    const digest = renderAttestDigestStep(i);
+    return [digest, renderPlatformStep('attest', platform, { 'subject-name': i.repo, 'subject-digest': `\${{ steps.${digest.id as string}.outputs.digest }}` })];
+  })];
+  return { name: 'pipegen sign', 'runs-on': SIGN_RUNNER, 'timeout-minutes': SIGN_JOB_MINUTES, permissions: signPermissions('attest'), 'cache-mode': 'none', steps };
 }
 
 /** The project's central sign workflow path (central-path.ts), from the draft's repository name. */
@@ -230,7 +251,6 @@ export function signCallerJob(draft: PipelineDraft, mode: SigningMode, needs: re
   if (recordsOnly(draft)) return null;
   const plan = planFor(draft, mode);
   if (plan === null) return null;
-  if (plan.mode === 'attest') throw new RenderError('Attest signing can not be written yet (see signJob), so there is no sign workflow to call.');
   if (!Array.isArray(needs) || needs.length === 0 || needs.some((n) => typeof n !== 'string' || !JOB_ID_RE.test(n)) || new Set(needs).size !== needs.length) {
     throw new RenderError('The sign caller needs the job holding the gate (and image-publish), each a plain job id, once.');
   }

@@ -497,6 +497,12 @@ function trivyEntry(over: { command?: string[]; args?: string[]; verifiedWith?: 
     ...(over.choices === undefined ? {} : { choices: over.choices }),
   });
 }
+/** G15a-R7 spec 7: a trivy licence scan is the entry trivy-licence, whose output (what the tool writes) is declared json. */
+function licenceEntry(over: Parameters<typeof trivyEntry>[0]): Entry {
+  const e = trivyEntry(over) as Entry & { id: string; candidate: Entry; step: { output: Entry } };
+  e.id = 'trivy-licence'; e.candidate.id = 'trivy-licence'; e.step.output = { ...e.step.output, format: 'json' };
+  return e;
+}
 const JSCPD_ARGS = ['--baseline-from-ref', 'origin/main', '--fail-on-new-clones', '--no-gitignore'];
 const jscpdEntry = (over: BinOver = {}) => {
   const e = binEntry('kucherenko/jscpd', {
@@ -676,7 +682,8 @@ describe('loader rules (Plan P Task 5)', () => {
     rejects([trivyEntry({ command: ['trivy', 'plugin', 'install', 'x'], args: [] })], /trivy config\|image\|fs/);
     // shorthands read as pflag does: combined bools and glued values
     expect(load([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, '-fsarif', '-o=tool.sarif', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--exit-code', '10'] })])).toHaveLength(1);
-    expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--exit-code', '10'] })])).toHaveLength(1);
+    // (G15a G11-2: the licence scan writes Trivy's JSON with every package listed)
+    expect(load([licenceEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--format', 'json', '--list-all-pkgs', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--format', 'json', '--list-all-pkgs', '--exit-code', '10'] })])).toHaveLength(1);
     // S9 (Plan C final review fix round A): a licence scan with a severity filter does not load
     rejects([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--severity', 'HIGH,CRITICAL', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--exit-code', '10'] })], /licence scan must report every severity/);
     // the environment can set any flag: no TRIVY_* env at all
@@ -902,7 +909,8 @@ describe('loader rules (Plan P Task 5)', () => {
   it('reviewed: MUST_VERIFY repo without verifiedWith refused', () => {
     // ruling P12: jscpd is pinned by sha256 only (branch-signed release, advisory check, DEC #93); ruling P16: so is
     // hadolint, whose v2.15.1 attestation is signed from refs/heads/master (no tag identity to bind it to)
-    expect([...MUST_VERIFY].sort()).toEqual(['aquasecurity/trivy', 'betterleaks/betterleaks', 'securego/gosec', 'stackrox/kube-linter']);
+    // G15a round 3 (item c): cli/cli joins, its gh release attestation checked live 2026-11-06 (BRANCH_SIGNERS)
+    expect([...MUST_VERIFY].sort()).toEqual(['aquasecurity/trivy', 'betterleaks/betterleaks', 'cli/cli', 'securego/gosec', 'stackrox/kube-linter']);
     expect(load([jscpdEntry({ verifiedWith: null })])).toHaveLength(1);
     const hadolint = rawFile().tools.find((t) => t.id === 'hadolint') as Entry;
     expect(hadolint.verifiedWith).toBeUndefined();
@@ -914,6 +922,7 @@ describe('loader rules (Plan P Task 5)', () => {
       'securego/gosec': (v, repo) => binEntry(repo ?? 'securego/gosec', { verifiedWith: v }),
     };
     for (const repo of MUST_VERIFY) {
+      if (repo === 'cli/cli') continue;   // the real gh entry, below (its own pinnedOn and its branch signer; test/g15-gh.test.ts)
       const make = entries[repo] as (v: Entry | null, repo?: string) => Entry;
       rejects([make(null)], /verifiedWith is required/);
       rejects([make(null, repo.toUpperCase())], /verifiedWith is required/);
@@ -922,6 +931,12 @@ describe('loader rules (Plan P Task 5)', () => {
       const v = verified(repo);
       expect(load([make(v)])[0]?.verifiedWith, repo).toEqual(v); // it stays on the ReviewedTool (PS24)
     }
+    // cli/cli's tool is gh: the real entry without its check, or under another owner or name, is refused; a repo named `cli` is not gh
+    const ghReal = (): Entry => structuredClone(rawFile().tools.find((t) => t.id === 'gh') as Entry);
+    expect(loadAtReal([ghReal()])[0]?.verifiedWith).toMatchObject({ method: 'github-attestation' });
+    const noCheck = (repo: string): Entry => { const e = ghReal(); delete e.verifiedWith; e.candidate = { ...e.candidate, repo, name: repo }; return e; };
+    for (const r of ['cli/cli', 'CLI/cli', 'someone/gh', 'someone/mirror']) expect(() => loadAtReal([noCheck(r)]), r).toThrow(/verifiedWith is required/);
+    expect(load([binEntry('someone/cli')])).toHaveLength(1);
     // found by what it runs, whatever the repo is called
     rejects([binEntry('someone/scanner', { command: ['kube-linter', 'lint'], args: [] })], /verifiedWith is required/);
     // any entry may record one; it is checked the same way
@@ -1039,9 +1054,11 @@ describe('loader rules (Plan P Task 5)', () => {
     // none of the forbidden ones is allowlisted
     for (const f of BETTERLEAKS_FORBIDDEN_FLAGS) expect(BETTERLEAKS_ALLOWED_FLAGS.has(f.replace(/^-+/, ''))).toBe(false);
     const tail = ['--format', 'sarif', '--output', 'tool.sarif', '--exit-code', '10', '.'];
-    for (const f of ['--help', '-h', '--version', '-v', '--quiet', '-q', '--debug', '--no-progress', '--skip-db-update', '--list-all-pkgs', '-qv']) {
+    for (const f of ['--help', '-h', '--version', '-v', '--quiet', '-q', '--debug', '--no-progress', '--skip-db-update', '-qv']) {
       rejects([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, f, ...tail] })], /allowlist, ruling P13/);
     }
+    // (G15a G11-2: --list-all-pkgs is allowlisted for the licence scan only)
+    rejects([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, '--list-all-pkgs', ...tail] })], /only trivy's licence scan/);
     for (const f of ['--help', '-h', '-hv', '--log-level=debug', '--max-target-megabytes=1', '--baseline-path=x', '--enable-rule=x', '-ir', '--no-color']) {
       rejects([betterleaksEntry({ command: blCmd(f, ...(f === '-ir' ? ['x'] : [])) })], /allowlist, ruling P13|never use --verbose/);
     }
@@ -1052,7 +1069,8 @@ describe('loader rules (Plan P Task 5)', () => {
     rejects([betterleaksEntry({ command: blCmd('--no-color'), args: [...BL_ARGS, '--no-color'] })], /allowlist, ruling P13/);
     rejects([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, '--no-such', ...tail], args: [...TRIVY_FLAGS, '--no-such'] })], /unknown flag --no-such/);
     // allowlisted flags load (the trivy-licence shape of fix round A, S9: no --severity; the image and betterleaks shapes)
-    expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--exit-code', '10'] })])).toHaveLength(1);
+    // (G15a G11-2: the licence scan writes Trivy's JSON with every package listed)
+    expect(load([licenceEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--format', 'json', '--list-all-pkgs', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--format', 'json', '--list-all-pkgs', '--exit-code', '10'] })])).toHaveLength(1);
     expect(load([betterleaksEntry({ command: blCmd('--no-banner', '--ignore-gitleaks-allow'), args: BL_ARGS })])).toHaveLength(1);
     expect(load([nucleiEntry({ command: nucleiCmd('-u', 'http://localhost:8080', '-ni', '-as') })])).toHaveLength(1);
   });
@@ -1662,7 +1680,7 @@ describe('data/reviewed-tools.yml', () => {
     'actions-setup-node': '2026-10-29', betterleaks: '2026-10-30', gitleaks: '2026-10-30', 'docker-login-action': '2026-10-29', nuclei: '2026-10-29',
     // C4 fix rounds 1 and 2 (review-C4): tools that honour .gitignore run without it, bandit gets an explicit empty --ini, and every config name
     // has a scope (nested or root, see rootConfigFiles in the data file); oxlint lints an explicit file list
-    semgrep: '2026-10-30', 'trivy-config': '2026-10-30', 'trivy-image': '2026-10-30', 'trivy-licence': '2026-10-30', eslint: '2026-10-30', 'eslint-typescript': '2026-10-30',
+    semgrep: '2026-10-30', 'trivy-config': '2026-10-30', 'trivy-image': '2026-10-30', 'trivy-licence': '2026-11-06', eslint: '2026-10-30', 'eslint-typescript': '2026-10-30',
     ruff: '2026-10-30', 'ruff-format': '2026-10-30', prettier: '2026-10-30', knip: '2026-10-30', 'osv-scanner': '2026-10-30', jscpd: '2026-10-30', bandit: '2026-10-30', 'oxlint-typeaware': '2026-10-30',
     lefthook: '2026-10-30', syft: '2026-10-30', zizmor: '2026-10-30', hadolint: '2026-10-30', 'kube-linter': '2026-10-30', poutine: '2026-10-30',
     // D9 (ruling B5): c8 runs the service's tests (fixed table, after --) with the code-filled --lines={lines}
@@ -1818,7 +1836,8 @@ describe('data/reviewed-tools.yml', () => {
     for (const t of list) {
       const must = [...MUST_VERIFY].some((r) => t.candidate.repo.toLowerCase() === r);
       expect(t.verifiedWith !== undefined, t.id).toBe(must);
-      if (t.verifiedWith !== undefined) expect(t.verifiedWith.verifiedOn, t.id).toBe(pinnedDay);
+      // an entry with its own pinnedOn (gh, G15a) is checked on that day
+      if (t.verifiedWith !== undefined) expect(t.verifiedWith.verifiedOn, t.id).toBe(t.id === 'gh' ? '2026-11-06' : pinnedDay);
     }
     // key-based checks (P10): the upstream key file at the entry's tag, pinned by its sha256
     expect(byId(list, 'kube-linter')[0]?.verifiedWith).toEqual({
@@ -1844,7 +1863,11 @@ describe('data/reviewed-tools.yml', () => {
       if (t.candidate.repo === 'crisworking/pipegen') continue; // pipegen's own repository is exempt (C6): its code is reviewed in this repository
       const at = Date.parse(t.releasedAt);
       expect(Number.isFinite(at), t.id).toBe(true);
-      expect(pinnedOn - at, t.id).toBeGreaterThanOrEqual(COOLDOWN_DAYS * DAY);
+      // G15a: an entry pinned after the list (gh) counts from its own pin day, never earlier than the list's
+      const own = (t as { pinnedOn?: string }).pinnedOn;
+      const pin = own === undefined ? pinnedOn : Date.parse(own);
+      expect(pin, t.id).toBeGreaterThanOrEqual(pinnedOn);
+      expect(pin - at, t.id).toBeGreaterThanOrEqual(COOLDOWN_DAYS * DAY);
     }
     // the loader refuses an entry released less than the cooldown before pinnedOn
     const young = cliEntry();
@@ -1978,7 +2001,7 @@ describe('Task 6 review fix round 1 (P19-P27)', () => {
       expect(t?.fixedInputs.args, id).toEqual(expect.arrayContaining(['--exit-code', '10']));
       expect(ARGV_POLICIES[id]?.findingsExit, id).toEqual([10]);
       expect(t?.reviewedBy, id).toBe('Claude delegated DECISIONS 105');
-      expect(t?.reviewedAt, id).toBe('2026-10-30');   // re-reviewed for C1c (secrets) and for the config scopes (C4 fix round 2)
+      expect(t?.reviewedAt, id).toBe(id === 'trivy-licence' ? '2026-11-06' : '2026-10-30');   // re-reviewed for C1c (secrets) and for the config scopes (C4 fix round 2); G15a G11-2: the licence JSON
       // the old value (1), also only in the command or only in the fixed args, no longer loads
       refused(both(realEntry(id), swap('10', '1')), /--exit-code 10|--exit-code is a fixed arg: exactly 10|exit-code is one of "10"/);
     }

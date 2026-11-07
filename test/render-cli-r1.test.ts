@@ -390,7 +390,7 @@ describe('R-D: DAST steps (and only those) may use the host network', () => {
 
 describe('R-E (6c): the tools that wait for a target now render with one; the permanent refusals say why', () => {
   it('cosign and gosec are refused for good; trivy-image, syft, zap-baseline, nuclei, semgrep render with a target', () => {
-    for (const [id, why] of [['cosign', /Plan G's sign job/], ['gosec', /Go is not supported in v0\.2/]] as const) expect(() => render(id), id).toThrow(why);
+    for (const [id, why] of [['cosign', /pipegen's own sign job/], ['gosec', /Go is not supported in v0\.2/]] as const) expect(() => render(id), id).toThrow(why);
     for (const id of ['trivy-image', 'syft', 'zap-baseline', 'nuclei', 'semgrep']) expect(() => render(id), id).not.toThrow();
   });
 
