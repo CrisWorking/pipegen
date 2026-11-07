@@ -79,11 +79,11 @@ const VERIFY_PERMS = { contents: 'read', actions: 'read', packages: 'read', atte
 /** A signing draft with the honest pipeline's checks too, so a caller file of jobsOf(draft) passes. */
 const withPipeline = (d: PipelineDraft): PipelineDraft => ({ ...d, needs: draftOf().needs, steps: draftOf().steps });
 const DEPLOY_ON_SIGN = { push: { branches: ['main'] }, pull_request: null, pull_request_review: { types: ['submitted', 'dismissed'] } };
-/** pipegen.yml with the honest pipeline and one caller job of `uses` (deploy condition and needs gate unless `over` says otherwise). */
+/** pipegen.yml with the honest pipeline and one caller job of `uses` (deploy condition, needs gate and image-publish (G15a-R9: a sign caller needs it) unless `over` says otherwise). */
 function deployCaller(d: PipelineDraft, uses: string, over: Record<string, unknown> = {}, on: unknown = DEPLOY_ON_SIGN, path = '.github/workflows/pipegen.yml'): CreatedFile {
   const base = workflow(jobsOf(d), { on });
   const doc = parseDocument(base.content);
-  doc.setIn(['jobs', 'signing'], doc.createNode({ uses, if: "github.event_name == 'push'", needs: ['gate'], permissions: SIGN_PERMS, ...over }));
+  doc.setIn(['jobs', 'signing'], doc.createNode({ uses, if: "github.event_name == 'push'", needs: ['gate', 'image-publish'], permissions: SIGN_PERMS, ...over }));
   return { ...base, path, content: doc.toString({ lineWidth: 0 }) };
 }
 const signFile = (jobs: Record<string, Job>): CreatedFile => ({ ...workflow(jobs, { on: { workflow_call: null } }), path: '.github/workflows/sign.yml' });

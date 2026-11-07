@@ -127,7 +127,7 @@ describe('G15a-R9 spec r3-1: the 45-minute ZAP ceiling reaches the long report',
     const prof = profileOf([web()], { private: true, plan: 'free' });
     const est = estimate(prof, jobCategories(floorNeeds(prof, CAPS), { codeSecurity: true }), 1, { pushes: 40, prs: 10, capped: false }, null);
     const r = { ...freePrivateReport(EXCLUDED_PATTERNS), estimates: est };
-    const OPTS: RenderOptions = { knownValues: [], now: () => new Date('2026-11-07T00:00:00Z'), verbose: true };
+    const OPTS: RenderOptions = { knownValues: [], now: () => Date.parse('2026-11-07T00:00:00Z'), verbose: true };
     const flat = (s: string) => s.replace(/\s+/g, ' ');
     expect(flat(renderMarkdown(r, OPTS))).toMatch(/ZAP active scan[^\n]*about 5 min[^\n]*up to 45 min/);
     expect(flat(renderTerminal(r, OPTS))).toMatch(/ZAP active scan[^\n]*about 5 min[^\n]*up to 45 min/);

@@ -1229,11 +1229,7 @@ function judgeJob(fc: FileCtx, id: string, j: unknown): void {
   if (id === 'pipegen-verify' && fc.draft.capabilities.environments && envName !== SIGNING_ENVIRONMENT) {
     bad('permissions', `${where} must run in the environment ${SIGNING_ENVIRONMENT} (only deploys from the default branch pass it).`);
   }
-  // G15a-R8 sec m4: the sign job (the app's caller, or the inline keyless job) needs image-publish, else both start together after the gate and
-  // the image is pushed while the sign job finds no digest yet. The called sign job (a file started only by workflow_call, as the central sign
-  // workflow) needs nothing in its own file: its caller does
-  const calledOnly = fc.js.on === 'workflow_call' || (isObj(fc.js.on) && Object.keys(fc.js.on).length > 0 && Object.keys(fc.js.on).every((k) => k === 'workflow_call'));
-  if (id === 'sign' && !calledOnly && !needsList(j.needs).includes('image-publish')) bad('template', `${where}: the sign job must need image-publish, so it signs the digest the publish job uploaded and never runs beside it.`);
+  judgeSignNeeds(fc, id, j, caller, where);
   if (signing && !SIGNING_JOBS.has(id)) bad('permissions', `${where} runs in ${SIGNING_ENVIRONMENT} (in any spelling), whose secrets only the sign and pipegen-verify jobs may get.`);
   else if (signing && envName !== SIGNING_ENVIRONMENT) bad('permissions', `${where} must name the environment exactly ${SIGNING_ENVIRONMENT}.`);
   if (caller) return;
@@ -1957,6 +1953,48 @@ function judgeStepPolicy(fc: FileCtx, id: string, where: string, j: Obj, judged:
  * No job takes the gate's check name; the gate job (id `gate`) has the name the required check expects (GATE_CHECK_NAME, never a literal).
  * G1-R2 m1: a look-alike is compared normalized (gateNameLike: case, spaces, slashes), and a job id that is `gate` in another case counts too.
  */
+/** Whether a job of a workflow file writes to the image registry, read from its raw form (fail closed: a caller job may, so it counts). */
+function writesRegistryRaw(j: unknown): boolean {
+  if (!isObj(j)) return false;
+  if (j.uses !== undefined) return true;
+  const perms = j.permissions;
+  if (typeof perms === 'string' || (isObj(perms) && perms.packages === 'write')) return true;
+  return stepsOf(j).some((st) => typeof st.uses === 'string' && st.uses.toLowerCase().includes('build-push-action'));
+}
+
+/**
+ * G15a-R8 sec m4, G15a-R9 sec r3-1: the job that signs runs only after image-publish, so it signs the digest the publish job uploaded and never
+ * runs beside it (else both start together after the gate and the image is pushed while the sign job finds no digest yet). The rule follows
+ * the job that signs, whatever its id or file:
+ * - the job sign of a file with another trigger (the inline keyless job), and any job that calls a workflow holding a job sign (any id, any
+ *   spelling of sign), need image-publish in their own file;
+ * - in a file started only by workflow_call (the central sign workflow), the job sign needs every other job of that file that writes to the
+ *   image registry (its caller needs image-publish, above);
+ * - image-publish outside pipegen.yml is refused unless a job sign of its own file needs it (pipegen writes it only in pipegen.yml).
+ */
+function judgeSignNeeds(fc: FileCtx, id: string, j: Obj, caller: boolean, where: string): void {
+  const bad = issueFor(fc);
+  const needs = needsList(j.needs);
+  const jobs = isObj(fc.js.jobs) ? fc.js.jobs : {};
+  const isSign = (k: string): boolean => k.toLowerCase() === 'sign';
+  const calledOnly = fc.js.on === 'workflow_call' || (isObj(fc.js.on) && Object.keys(fc.js.on).length > 0 && Object.keys(fc.js.on).every((k) => k === 'workflow_call'));
+  if (caller) {
+    const called = calledFileOf(fc, fc.file.repo, j.uses);
+    const callsSign = called !== undefined && isObj(called.parsed.js.jobs) && Object.keys(called.parsed.js.jobs).some(isSign);
+    if (callsSign && !needs.includes('image-publish')) bad('template', `${where} calls the sign workflow, so it must need image-publish (whatever its id): the sign job must need image-publish, so it signs the digest the publish job uploaded and never runs beside it.`);
+  } else if (isSign(id)) {
+    if (!calledOnly && !needs.includes('image-publish')) bad('template', `${where}: the sign job must need image-publish, so it signs the digest the publish job uploaded and never runs beside it.`);
+    if (calledOnly) {
+      const missing = Object.entries(jobs).filter(([k, o]) => k !== id && writesRegistryRaw(o) && !needs.includes(k)).map(([k]) => show(k));
+      if (missing.length > 0) bad('template', `${where}: the job sign of a workflow started only by workflow_call must need every job of its file that writes to the image registry (it does not need ${missing.join(', ')}), so it never runs beside a push.`);
+    }
+  }
+  if (id === 'image-publish' && !(fc.file.repo === 'app' && fc.file.path === CALLER_WORKFLOW)) {
+    const signedAfter = Object.entries(jobs).some(([k, o]) => isSign(k) && isObj(o) && needsList(o.needs).includes(id));
+    if (!signedAfter) bad('template', `${where} runs outside ${CALLER_WORKFLOW}, where pipegen never writes it, and no job sign of its file needs it: image-publish runs outside ${CALLER_WORKFLOW} only where its file's sign job runs after it.`);
+  }
+}
+
 function judgeGateName(fc: FileCtx, id: string, j: Obj): void {
   const bad = issueFor(fc);
   if (id === 'gate') {
