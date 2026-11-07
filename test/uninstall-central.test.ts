@@ -166,9 +166,13 @@ describe('uninstall central: the last project (V-B4, V-N9)', () => {
     const w2 = world();
     w2.g.commitOn('o/pipelines', 'main', { '.github/workflows/shop--merge.yml': 'on: workflow_call # mine\n' });
     await afterRun1(w2);
-    const r2 = await run(w2, sampleRecord(w2), term({ yes: () => false }));
-    expect(filesAtPr(w2).get('.github/workflows/shop--merge.yml')).toBe('on: workflow_call # mine\n');
+    const t2 = term({ yes: () => false });
+    const r2 = await run(w2, sampleRecord(w2), t2);
     expect(r2.manual.some((m) => /shop--merge\.yml/.test(m.what))).toBe(true);
+    // the kept file is a leftover: the record stays at the user's no, so there is nothing to change on central
+    expect(t2.confirms.some((q) => q.startsWith('Remove the install record') && /shop--merge\.yml/.test(q))).toBe(true);
+    expect(w2.central.pulls).toEqual([]);
+    expect(w2.g.filesAt('o/pipelines', w2.g.head('o/pipelines')).get('.github/workflows/shop--merge.yml')).toBe('on: workflow_call # mine\n');
   });
 
   it('apply: public app repo → records-only pipelines PR removes only the record', async () => {

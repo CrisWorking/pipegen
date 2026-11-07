@@ -30,6 +30,10 @@
 //   the protection as before), or as still to do by hand, never as a new action. A leftover secret or environment with no creation date is
 //   never deleted (it may be one pipegen only overwrote). "Unfinished" (no PR to wait for) only when none of pipegen's own workflows is on
 //   the default branch (and, under full trust, the record has no mergedAt).
+// - V6 (M-r1-9, V5-R1 carry): phase B's preview also names the scratch repo cleanup (the scratch repo as GitHub shows it now, with
+//   pipegen's marker; a saved proof state's leftovers) and, with --delete-repos, each repo to be deleted (App mode: after its typed name;
+//   the central repo only after its pull request merged) or the `gh repo delete` command printed instead (token mode). Nothing of either is
+//   done without being in that preview.
 import type { Octokit } from '@octokit/rest';
 import { PromptCancelledError, type Prompter } from '../cli/io.js';
 import { readEnv, SETUP_BRANCH } from '../deliver/deliver.js';
@@ -44,7 +48,7 @@ import { isRateStop, type RateClock } from '../engine/github-rate.js';
 import { CALLER_WORKFLOW, createdPathProblem, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PUSH_WORKFLOW } from '../engine/job-rules.js';
 import { clockOf, GitHubAccessError } from '../github/client.js';
 import { VERIFY_JOB_ID } from '../layers/assemble.js';
-import { CENTRAL_REPO } from '../proof/target.js';
+import { CENTRAL_REPO, githubRead, SCRATCH_MARKER, SCRATCH_PREFIX } from '../proof/target.js';
 import type { EnvSettings, InstallEdit, InstallRecord, PipelineDraft, RecordApiRequest } from '../types.js';
 import { safeText } from '../util/safe-text.js';
 import { UninstallError } from './errors.js';
@@ -119,11 +123,28 @@ export interface UninstallPlan {
   centralLocks?: InstallRecord['central'];
   /** None of pipegen's own workflows is on the default branch (and, full trust, no mergedAt): no uninstall PR to wait for (V-S4). */
   unfinished: boolean;
+  /** Phase B (M-r1-9): the scratch repo `<owner>/pipegen-proof-<repo>` GitHub shows now with pipegen's marker (its id): run 2 empties it. */
+  scratch?: { repo: string; id: number };
+  /** Phase B: a saved proof state is there; run 2 cleans what it left first (E's cleanupLeftovers, the scratch repo never deleted there). */
+  proofCleanup: boolean;
+  /**
+   * Phase B with --delete-repos (V-S3): `delete` (App mode: its name typed then; `afterCentralPr`: only once the central pull request
+   * removing the record merged) or `command` (token mode: `gh repo delete` printed, nothing deleted). Any other repo is in skipped/manual.
+   */
+  deleteRepos: { repo: string; kind: 'scratch' | 'central'; how: 'delete' | 'command'; afterCentralPr?: true }[];
   skipped: { what: string; why: string }[];
 }
 
 /** `phase`: A (run 1, the default) or B (run 2). */
-export type PlanDeps = Omit<UninstallDeps, 'io'> & { phase?: UninstallPhase };
+export type PlanDeps = Omit<UninstallDeps, 'io'> & {
+  phase?: UninstallPhase;
+  /** --delete-repos (V-S3): run 2 deletes the scratch repo and, last project, the central repo. */
+  deleteRepos?: boolean;
+  /** Auth.canDeleteRepos: the App's consented Administration write. Without it (token mode) nothing is deleted; the commands are printed. */
+  canDeleteRepos?: boolean;
+  /** A saved proof state is there (StateStore): run 2 cleans what it left first. */
+  proofState?: boolean;
+};
 
 const show = (s: unknown, n = 120): string => safeText(String(s), n);
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -214,7 +235,7 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
     base: { appHead: '', appTree: '', centralHead: loaded.centralHead, recordBlobSha: loaded.blobSha },
     warnings: [...loaded.warnings], removeFiles: [], keepAsk: [], reverts: [], manual: [], deleteRulesets: [], deleteSecrets: [], deleteVariables: [],
     restoreVariables: [], deleteEnvironments: [], restoreEnvironments: [], settings: [], closePrs: [], deleteBranches: [], centralFiles: [], lastProject: false,
-    unfinished: false, skipped: [],
+    unfinished: false, skipped: [], proofCleanup: !inA && deps.proofState === true, deleteRepos: [],
   };
   const skip = (what: string, why: string): void => { u.skipped.push({ what, why }); };
   const manual = (what: string, why: string, step?: string): void => { u.manual.push({ what, why, ...(step === undefined ? {} : { step }) }); };
@@ -462,6 +483,7 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
   const otherPrs = centralPrs === null ? null : centralPrs.filter((p) => !(isObj(p) && ownHead(p, mine)));
   u.lastProject = otherRecords.length === 0 && otherFiles.length === 0 && otherPrs !== null && otherPrs.length === 0;
   if (u.lastProject && !typedTrust && rec.central !== undefined) u.centralLocks = rec.central;
+  if (!inA) await planRepos();
 
   // ---------- 4. the merge locks: rulesets, the org rule, classic protection (run 1; run 2 checks them done) ----------
   if (!inA) await doneLocks();
@@ -716,6 +738,46 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
   }
 
   /**
+   * Phase B (M-r1-9, V-S3): the scratch repo run 2 empties (GitHub's answer now: the exact name and pipegen's marker; a typed trust doesn't
+   * vouch for the scratch facts, a manual step then) and, with --delete-repos, the repos it deletes or the commands it prints.
+   */
+  async function planRepos(): Promise<void> {
+    const scratchName = `${SCRATCH_PREFIX}${appRef.repo}`;
+    const scratchFull = `${appRef.owner}/${scratchName}`;
+    const app = deps.canDeleteRepos === true;
+    const step = (full: string): string => `gh repo delete ${full}`;
+    if (!typedTrust) {
+      let d: unknown = null;
+      try { d = (await githubRead(gh, 'GET /repos/{owner}/{repo}', { owner: appRef.owner, repo: scratchName }, clock)).data; } catch (e) {
+        if (isRateStop(e) || e instanceof GitHubAccessError || statusOf(e) === 401 || statusOf(e) === undefined) throw e;
+        if (statusOf(e) !== 404) manual(`scratch repo ${scratchFull}`, `GitHub refused to show it (HTTP ${statusOf(e)}), so pipegen can't tell it is the one it made`, 'Check it on GitHub and delete it by hand if pipegen made it.');
+      }
+      if (isObj(d)) {
+        const id = d.id;
+        if (d.full_name !== scratchFull || !isObj(d.owner) || d.owner.login !== appRef.owner || d.description !== SCRATCH_MARKER || !(typeof id === 'number' && Number.isSafeInteger(id) && id > 0)) {
+          skip(`scratch repo ${scratchFull}`, 'it doesn\'t carry pipegen\'s marker (its description), so pipegen leaves it');
+        } else u.scratch = { repo: scratchFull, id };
+      }
+    }
+    if (deps.deleteRepos !== true) return;
+    const sc = rec.scratch;
+    if (u.scratch !== undefined) {
+      if (!app) u.deleteRepos.push({ repo: scratchFull, kind: 'scratch', how: 'command' });
+      else if (sc?.createdByPipegen === true && sc.repoId === u.scratch.id) u.deleteRepos.push({ repo: scratchFull, kind: 'scratch', how: 'delete' });
+      else manual(`repo ${scratchFull}`, sc?.repoId === undefined ? 'the install record holds no id of the scratch repo pipegen created, so pipegen only empties it' : 'it is not the scratch repo pipegen created (GitHub\'s id differs from the recorded one), so pipegen only empties it', step(scratchFull));
+    }
+    const centralFull = `${appRef.owner}/${CENTRAL_REPO}`;
+    const c = rec.central;
+    if (!u.lastProject) { skip(`repo ${centralFull}`, 'other projects use it (or pipegen can\'t tell none does), so pipegen keeps it'); return; }
+    if (typedTrust) return;   // TYPED_MANUAL: central facts are not granted
+    if (!app) { u.deleteRepos.push({ repo: centralFull, kind: 'central', how: 'command', afterCentralPr: true }); return; }
+    if (c?.createdByPipegen !== true) { skip(`repo ${centralFull}`, 'the install record doesn\'t say pipegen created it, so pipegen never deletes it'); return; }
+    if (c.repoId === undefined) { manual(`repo ${centralFull}`, 'the install record holds no id of it, so pipegen can\'t prove it is the repo it created; it keeps it', step(centralFull)); return; }
+    if (c.repoId !== loaded.centralRepoId) { skip(`repo ${centralFull}`, 'it is not the repo pipegen created (GitHub\'s id differs from the recorded one), so pipegen keeps it'); return; }
+    u.deleteRepos.push({ repo: centralFull, kind: 'central', how: 'delete', afterCentralPr: true });
+  }
+
+  /**
    * Phase B: each edit as run 1 left it. Done: the file is its original version (or gone, when pipegen made it), or pipegen's text is out
    * of it. Anything else is a manual step (pipegen never reverts in run 2), never a new action.
    */
@@ -932,6 +994,15 @@ export function previewUninstall(u: UninstallPlan): string {
         ? `  - this is the last project in ${CENTRAL_REPO}, but the install record doesn't vouch for its central ruleset, CODEOWNERS and Actions access: pipegen doesn't touch them (see the manual steps)`
         : `  - this is the last project in ${CENTRAL_REPO}; the install record lists no central ruleset, CODEOWNERS or Actions access of pipegen's, so pipegen doesn't touch them`
       : `  - other projects use ${CENTRAL_REPO}: its central ruleset, CODEOWNERS and Actions access stay`);
+  if (!inA) {
+    if (u.proofCleanup) later.push('  - clean up what the saved proof left in GitHub (as `pipegen cleanup` does; the scratch repo is not deleted there)');
+    if (u.scratch !== undefined) later.push(`  - empty the scratch repo ${show(u.scratch.repo, 140)} (it carries pipegen's marker): its proof/ branches, secrets, variables, workflow runs and caches`);
+    for (const d of u.deleteRepos) {
+      later.push(d.how === 'delete'
+        ? `  - delete the repo ${show(d.repo, 140)} (--delete-repos; you type its name then${d.afterCentralPr === true ? '; only once the central pull request removing the install record merged' : ''})`
+        : `  - print \`gh repo delete ${show(d.repo, 140)}\` (--delete-repos: this token can't delete repos, so pipegen deletes nothing)`);
+    }
+  }
   list(!inA ? 'This run:' : u.unfinished ? 'Next part (right after this one), pipegen will:' : 'Next run (after you merge the uninstall PR), pipegen will:', later);
   list('Not done (kept):', u.skipped.map((s) => `  - ${show(s.what, 200)}: ${show(s.why, 400)}`));
   const man: string[] = [];

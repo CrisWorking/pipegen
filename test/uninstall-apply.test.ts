@@ -879,16 +879,17 @@ describe('uninstall: the dispatcher (phase A, the wait for the merge, phase B)',
     await run(w2, rec2, term(), { phaseB: b.fn });
     expect(b.got).toHaveLength(2);
     expect(b.got[1]?.plan.warnings.some((x) => /aren't on the default branch/.test(x))).toBe(false);
-    // no phase-B runner in this build: it says so, nothing more is sent or asked
+    // V6: no runner given → phase-b.ts's applyPhaseB, after run 2's own preview and one yes
     const w3 = world();
     const rec3 = sampleRecord(w3);
     await run(w3, rec3);
     (w3.app.pulls[0] as { state: string }).state = 'closed';
     w3.merged.set(1, LATER);
     const t3 = term();
-    const none = await run(w3, rec3, t3);
-    expect(none.status).toBe('stopped');
-    expect(t3.confirms).toEqual([]);
+    const real = await run(w3, rec3, t3);
+    expect(real.phase).toBe('B');
+    expect(real.status).toMatch(/^b-/);
+    expect(t3.confirms.filter((q) => q.startsWith('Go ahead'))).toEqual([expect.stringMatching(/^Go ahead with run 2 /)]);
   });
 
   it('apply: no uninstall PR: unfinished → phase B in the same process; nothing to remove → phase B only when no pipegen workflow is live; a PR GitHub no longer shows → stop', async () => {

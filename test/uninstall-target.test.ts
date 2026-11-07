@@ -40,7 +40,13 @@ function fakeGh(handler: Handler = () => ({}), opts: { raw?: boolean; repo?: Rec
       calls.push({ route, params });
       if (opts.raw !== true && route === 'GET /repos/{owner}/{repo}') {
         const n = String(params.repo).toLowerCase();
-        return { status: 200, data: { id: IDS[n] ?? 999, full_name: `${OWNER}/${n}`, ...opts.repo }, headers: {} };
+        return { status: 200, data: { id: IDS[n] ?? 999, full_name: `${OWNER}/${n}`, default_branch: 'main', ...opts.repo }, headers: {} };
+      }
+      // V6 (V3-hook1): the central default branch target.ts reads before a shared central write: no other project there
+      if (opts.raw !== true && String(params.repo).toLowerCase() === 'pipelines') {
+        if (route === 'GET /repos/{owner}/{repo}/git/ref/{ref}' && params.ref === 'heads/main') return { status: 200, data: { object: { sha: CENTRAL_HEAD } }, headers: {} };
+        if (route === 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}' && params.commit_sha === CENTRAL_HEAD) return { status: 200, data: { sha: CENTRAL_HEAD, tree: { sha: CENTRAL_HEAD } }, headers: {} };
+        if (route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}' && params.tree_sha === CENTRAL_HEAD) return { status: 200, data: { truncated: false, tree: [] }, headers: {} };
       }
       const data = await handler(route, params);
       return { status: 200, data, headers: {} };
@@ -49,10 +55,13 @@ function fakeGh(handler: Handler = () => ({}), opts: { raw?: boolean; repo?: Rec
   return { gh: gh as unknown as Octokit, calls, writes: () => calls.filter((c) => !c.route.startsWith('GET ')) };
 }
 const clock = () => ({ budget: newRateBudget(), sleep: async () => {}, now: () => 0 });
+/** The central default head the fake answers (V6's last-project read), with an empty tree. */
+const CENTRAL_HEAD = 'e'.repeat(40);
 /** The terminal's typed-name question (V1's askTypedName in the real run): answers yes for `answer` (true: every name). */
 function asker(answer: boolean | string = true): AskName & { asked: { expected: string; question: string }[] } {
   const asked: { expected: string; question: string }[] = [];
-  const fn = async (expected: string, question: string) => { asked.push({ expected, question }); return answer === true || answer === expected; };
+  // V6 (spec N3): the number of each of pipegen's own central pull requests is typed too before the central repo goes
+  const fn = async (expected: string, question: string) => { asked.push({ expected, question }); return answer === true || answer === expected || (typeof answer === 'string' && /^[0-9]+$/.test(expected)); };
   return Object.assign(fn, { asked });
 }
 type ApiOpts = { askName?: AskName; centralRepoId?: number; typedNames?: boolean; raw?: boolean; repo?: Record<string, unknown> };
@@ -716,6 +725,7 @@ describe('V3 target: deleteCentralRepo', () => {
     if (route === 'GET /repos/{owner}/{repo}/actions/variables') return { total_count: (w.variables ?? []).length, variables: w.variables ?? [] };
     if (route === 'GET /repos/{owner}/{repo}/environments') return { total_count: (w.environments ?? []).length, environments: w.environments ?? [] };
     if (route === 'DELETE /repos/{owner}/{repo}') { state.deleted = true; return {}; }
+    if (route === 'GET /repos/{owner}/{repo}/keys' || route === 'GET /repos/{owner}/{repo}/hooks') return [];   // V6: no deploy key, no webhook
     throw httpErr(500);
   };
   const run = async (w: World, opts: { rec?: InstallRecord; typedAs?: string; askName?: AskName; central?: { owner: string; repo: string } } = {}) => {
@@ -905,6 +915,7 @@ describe('V3 fix round 1', () => {
         if (route === 'GET /repos/{owner}/{repo}/dependabot/secrets' || route === 'GET /repos/{owner}/{repo}/codespaces/secrets') return { total_count: 0, [LIST]: [] };
         if (route === 'GET /repos/{owner}/{repo}/actions/variables') return { total_count: (w.variables ?? []).length, variables: w.variables ?? [] };
         if (route === 'GET /repos/{owner}/{repo}/environments') return { total_count: (w.environments ?? []).length, environments: w.environments ?? [] };
+        if (route === 'GET /repos/{owner}/{repo}/keys' || route === 'GET /repos/{owner}/{repo}/hooks') return [];   // V6: no deploy key, no webhook
         if (route === 'DELETE /repos/{owner}/{repo}') { state.deleted = true; return {}; }
         throw httpErr(500);
       }, { raw: true });
@@ -1207,6 +1218,7 @@ describe('V3 fix round 2', () => {
       if (route === 'GET /repos/{owner}/{repo}/releases') return [];
       if (route === 'GET /repos/{owner}/{repo}/comments') { if (typeof w.comments === 'number') throw httpErr(w.comments); return w.comments ?? []; }
       if (route === 'DELETE /repos/{owner}/{repo}') { state.deleted = true; return {}; }
+      if (route === 'GET /repos/{owner}/{repo}/keys' || route === 'GET /repos/{owner}/{repo}/hooks') return [];   // V6: no deploy key, no webhook
       throw httpErr(500);
     }, { raw: true });
     const ask = asker('pipelines');
@@ -1395,7 +1407,7 @@ describe('V3 fix round 2', () => {
     expect(await ok.api.write(access, central, { pipegenSet: 'user' })).toEqual({ status: 'done' });
     expect(ok.writes()).toEqual([{ route: access, params: central }]);
     // each live read comes after the repo id check and right before its write
-    expect(ok.calls.map((c) => c.route)).toEqual(['GET /repos/{owner}/{repo}', 'GET /repos/{owner}/{repo}/actions/permissions/access', access]);
+    expect(ok.calls.map((c) => c.route)).toEqual(['GET /repos/{owner}/{repo}', 'GET /repos/{owner}/{repo}/git/ref/{ref}', 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}', 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}', 'GET /repos/{owner}/{repo}/actions/permissions/access', access]);
   });
 
   describe('V3 fix round 2b (ruling V3-R2b)', () => {
@@ -1502,7 +1514,8 @@ describe('V3 fix round 2', () => {
       }
       const ok = mk({ truncated: false, tree: [{ path: 'README.md', sha: sha(6), mode: '100644', type: 'blob' }, entry(sha(4))] });
       expect(await del(ok.api)).toEqual({ commit: sha(2), tree: sha(1) });
-      expect(ok.calls.filter((c) => c.route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}').map((c) => c.params)).toEqual([{ owner: OWNER, repo: 'pipelines', tree_sha: SHA, recursive: '1' }]);
+      // the parent tree once (V6's read of the central default branch, CENTRAL_HEAD, is the last-project check)
+      expect(ok.calls.filter((c) => c.route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}' && c.params.tree_sha !== CENTRAL_HEAD).map((c) => c.params)).toEqual([{ owner: OWNER, repo: 'pipelines', tree_sha: SHA, recursive: '1' }]);
     });
 
     it('R2b sec M-r2-4: the scan takes the Octokit namespaces from a client and refuses destructured, aliased, ?., bracket and .call forms and code inside ${…}', () => {
