@@ -8220,6 +8220,8 @@ function codeOwners(text) {
   return rules;
 }
 var compiled = /* @__PURE__ */ new WeakMap();
+var MAX_RULE_SEGMENTS = 64;
+var OWNERS_STEP_BUDGET = 4e8;
 function compile(rule) {
   const got = compiled.get(rule);
   if (got !== void 0) return got;
@@ -8230,6 +8232,11 @@ function compile(rule) {
   if (p.startsWith("/")) p = p.slice(1);
   let parts = p.split("/");
   if (!anchored) parts = ["**", ...parts];
+  if (parts.length > MAX_RULE_SEGMENTS) {
+    const c2 = { segs: [], dirOnly, ancestors: false, tooLong: true };
+    compiled.set(rule, c2);
+    return c2;
+  }
   const segs = parts.map((part, idx) => {
     if (part === "**") return idx === parts.length - 1 ? { kind: "globstar+" } : { kind: "globstar" };
     const toks = [];
@@ -8249,16 +8256,19 @@ function compile(rule) {
   });
   const last = parts[parts.length - 1];
   const ancestors = dirOnly || !/[*?]/.test(last);
-  const c = { segs, dirOnly, ancestors };
+  const c = { segs, dirOnly, ancestors, tooLong: false };
   compiled.set(rule, c);
   return c;
 }
-function segMatch(toks, s) {
+function segMatch(toks, s, steps) {
   let t = 0;
   let i = 0;
   let star = -1;
   let mark = 0;
+  let n = 0;
+  let r;
   while (i < s.length) {
+    n++;
     const k = toks[t];
     if (k === "*") {
       star = t++;
@@ -8269,45 +8279,59 @@ function segMatch(toks, s) {
     } else if (star >= 0) {
       t = star + 1;
       i = ++mark;
-    } else return false;
-  }
-  while (toks[t] === "*") t++;
-  return t === toks.length;
-}
-function matchesPrefix(c, parts, end) {
-  const memo = /* @__PURE__ */ new Map();
-  const go = (pi, si) => {
-    const key = pi * (end + 1) + si;
-    const hit = memo.get(key);
-    if (hit !== void 0) return hit;
-    let r;
-    const seg = c.segs[pi];
-    if (seg === void 0) r = si === end;
-    else if (seg.kind === "globstar+") r = si < end;
-    else if (seg.kind === "globstar") {
+    } else {
       r = false;
-      for (let j = si; j <= end && !r; j++) r = go(pi + 1, j);
-    } else r = si < end && segMatch(seg.toks, parts[si]) && go(pi + 1, si + 1);
-    memo.set(key, r);
-    return r;
-  };
-  return go(0, 0);
+      break;
+    }
+  }
+  if (r === void 0) {
+    while (toks[t] === "*") {
+      t++;
+      n++;
+    }
+    r = t === toks.length;
+  }
+  steps.left -= n + 1;
+  return steps.left < 0 ? null : r;
 }
-function ruleMatches(rule, parts) {
-  const c = compile(rule);
-  for (let k = 1; k <= parts.length; k++) {
-    if (k === parts.length) {
-      if (!c.dirOnly && matchesPrefix(c, parts, k)) return true;
-    } else if (c.ancestors && matchesPrefix(c, parts, k)) return true;
+function ruleMatches(c, parts, steps) {
+  const n = parts.length;
+  let reach = [0];
+  for (const seg of c.segs) {
+    let next = [];
+    if (seg.kind === "glob") {
+      for (const j of reach) {
+        if (j >= n) continue;
+        const m = segMatch(seg.toks, parts[j], steps);
+        if (m === null) return null;
+        if (m) next.push(j + 1);
+      }
+    } else {
+      const from = reach[0] + (seg.kind === "globstar+" ? 1 : 0);
+      if ((steps.left -= n + 1 - from) < 0) return null;
+      next = [];
+      for (let j = from; j <= n; j++) next.push(j);
+    }
+    if (next.length === 0) return false;
+    reach = next;
+  }
+  for (const k of reach) {
+    if (k === n ? !c.dirOnly : k >= 1 && c.ancestors) return true;
   }
   return false;
 }
-function ownersOf(rules, path) {
+function ownersLookup(rules, path, steps = { left: OWNERS_STEP_BUDGET }) {
   const parts = path.split("/");
-  if (parts.length > 256 || parts.includes("")) return void 0;
-  let owners;
-  for (const r of rules) if (ruleMatches(r, parts)) owners = r.owners;
-  return owners;
+  if (parts.length > 256 || parts.includes("")) return { owners: void 0 };
+  for (let i = rules.length - 1; i >= 0; i--) {
+    const r = rules[i];
+    const c = compile(r);
+    if (c.tooLong) return { unresolved: "segments" };
+    const m = ruleMatches(c, parts, steps);
+    if (m === null) return { unresolved: "budget" };
+    if (m) return { owners: r.owners };
+  }
+  return { owners: void 0 };
 }
 var PIPEGEN_BLOCK_BEGIN = "# pipegen:begin";
 var PIPEGEN_BLOCK_END = "# pipegen:end";
@@ -8547,9 +8571,24 @@ function integrityFindings(pr, protectedPaths, rules, extra = {}) {
   const approvals = new Set(pr.approvals.map((a) => a.toLowerCase()));
   const isProtected = pathMatcher(protectedPaths);
   const blockOwners = extra.codeowners?.problem === void 0 && Array.isArray(extra.codeowners?.blockOwners) ? extra.codeowners.blockOwners.map((o) => String(o).toLowerCase()) : [];
-  const waived = (path) => (ownersOf(rules, path) ?? []).some((o) => approvals.has(o));
+  const steps = { left: typeof extra.ownerSteps === "number" ? extra.ownerSteps : OWNERS_STEP_BUDGET };
+  const lookups = /* @__PURE__ */ new Map();
+  const lookup = (path) => {
+    let r = lookups.get(path);
+    if (r === void 0) {
+      r = ownersLookup(rules, path, steps);
+      lookups.set(path, r);
+    }
+    return r;
+  };
+  const waived = (path) => {
+    const r = lookup(path);
+    return "owners" in r && (r.owners ?? []).some((o) => approvals.has(o));
+  };
   const waivedFile = (path) => {
-    const o = ownersOf(rules, path);
+    const r = lookup(path);
+    if (!("owners" in r)) return false;
+    const o = r.owners;
     return (o === void 0 || o.length === 0 ? blockOwners : o).some((x) => approvals.has(x));
   };
   const push = (ruleId, severity, file, message, key, line) => {
@@ -8563,7 +8602,11 @@ function integrityFindings(pr, protectedPaths, rules, extra = {}) {
     if (rules.length === 0) {
       return extra.codeowners?.found != null ? " CODEOWNERS of the base commit has no rule that names a user, so nobody can approve: add one, or merge with an administrator bypass." : " The base commit has no CODEOWNERS, so nobody can approve: add one (user owners, not only teams), or merge with an administrator bypass.";
     }
-    const o = ownersOf(rules, path);
+    const r = lookup(path);
+    if ("unresolved" in r) {
+      return r.unresolved === "segments" ? ` The gate could not work out the code owners of this path: a CODEOWNERS rule of the base commit that could decide it has over ${MAX_RULE_SEGMENTS} segments, so nobody can approve: shorten that rule, or merge with an administrator bypass.` : " The gate could not work out the code owners of this path within its step budget (the paths are too deep for the CODEOWNERS rules of the base commit), so nobody can approve: shorten the paths, or merge with an administrator bypass.";
+    }
+    const o = r.owners;
     if ((o === void 0 || o.length === 0) && file && blockOwners.length > 0) {
       return " No CODEOWNERS rule names a user owner of this file, so an owner listed in pipegen's CODEOWNERS block (a user with write access, not the author) must approve the pull request on its current head commit.";
     }
