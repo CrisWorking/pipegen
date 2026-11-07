@@ -1,11 +1,12 @@
 // v0.2 Plan V V6 fix round 3 (ruling V6-R3): once central is deleted, what went with it is done and the run can finish (and a later run
 // that finds central gone after pipegen's own DELETE finishes too); a refusal that asks the user to change something keeps the local files
 // so the advice works; a DELETE GitHub refuses for good (4xx) is a manual step, not "run again"; each step says what to do by hand.
-import { existsSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import type { Octokit } from '@octokit/rest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { localRecordPath, recordFileText, recordHash, recordPath, withRecordMarker, writeLocalRecord } from '../src/deliver/record.js';
 import { centralWorkflowFile } from '../src/engine/central-path.js';
+import { GitHubRateLimitError } from '../src/engine/github-rate.js';
 import { CENTRAL_RULESET, requiredRulesetName } from '../src/layers/locks.js';
 import type { InstallEdit, InstallRecord } from '../src/types.js';
 import { uninstallStep, type StepDeps, type StepResult } from '../src/uninstall/apply.js';
@@ -93,7 +94,7 @@ describe('V6-R3 sec M1: once central is deleted, the run can finish', () => {
     expect(x.w.deleted).toContain('o/pipelines');
     expect(r2.status).toBe('b-partial');
     expect(existsSync(localRecordPath(APP, local(x.w)))).toBe(true);
-    expect((await progressOf(x.w))?.centralDeleteSent).toBe(x.w.central.id);
+    expect((await progressOf(x.w))?.centralDeleteSent).toMatchObject({ repoId: x.w.central.id, confirmed: true });
     x.w.fail = undefined;
     const err = await x.load().then(() => null, (e: unknown) => e);
     expect(err).toBeInstanceOf(UninstallError);
@@ -108,6 +109,68 @@ describe('V6-R3 sec M1: once central is deleted, the run can finish', () => {
     y.w.fail = (route, p) => (route === 'DELETE /repos/{owner}/{repo}' && p.repo === 'pipelines' ? 403 : undefined);
     await y.step();
     expect((await progressOf(y.w))?.centralDeleteSent).toBeUndefined();
+  });
+});
+
+describe('V6-R3 hook-2, hook-3: the "central delete sent" marker', () => {
+  /** Run 2 opened the central PR; the progress file then gets `marker` (as a run that sent the DELETE would leave it). */
+  const withMarker = async (marker: (w: World, hash: string) => unknown) => {
+    const x = await real();
+    await x.step();
+    const pf = await ProgressFile.open(APP, x.w.app.id, local(x.w));
+    pf.save({ ...pf.state!, centralDeleteSent: marker(x.w, recordHash(x.rec)) as never });
+    return x;
+  };
+  const hidden = (w: World) => { w.fail = (_route, p) => (p.repo === 'pipelines' ? 404 : undefined); };
+  it('record: central answering 404 finishes only for the exact repo id GitHub confirms gone, a confirmed marker of this local record, and no leftover; else the usual stop, the local files kept', async () => {
+    const keeps = async (x: Awaited<ReturnType<typeof withMarker>>) => {
+      await expect(x.load()).rejects.toThrow(/can't see o\/pipelines/);
+      expect(existsSync(localRecordPath(APP, local(x.w)))).toBe(true);
+      expect(existsSync(uninstallProgressPath(APP, local(x.w)))).toBe(true);
+    };
+    // hook-2: access lost, the repo still there by its id
+    const a = await withMarker((w, hash) => ({ repoId: w.central.id, recordHash: hash, confirmed: true }));
+    hidden(a.w);
+    await keeps(a);
+    // the marker of another local record (another install), or only pending (the DELETE never accepted), or none
+    const b = await withMarker((w) => ({ repoId: w.central.id, recordHash: 'f'.repeat(64), confirmed: true }));
+    b.w.g.repos.delete('o/pipelines');
+    await keeps(b);
+    const c = await withMarker((w, hash) => ({ repoId: w.central.id, recordHash: hash, confirmed: false }));
+    c.w.g.repos.delete('o/pipelines');
+    await keeps(c);
+    const d = await real();
+    await d.step();
+    d.w.g.repos.delete('o/pipelines');
+    await expect(d.load()).rejects.toThrow(/can't see o\/pipelines/);
+    expect(existsSync(localRecordPath(APP, local(d.w)))).toBe(true);
+    // a leftovers file that still lists something: a stop naming it, the files kept
+    const e = await withMarker((w, hash) => ({ repoId: w.central.id, recordHash: hash, confirmed: true }));
+    e.w.g.repos.delete('o/pipelines');
+    const lf = localRecordPath(APP, local(e.w)).replace(/\.json$/, '.leftovers.json');
+    writeFileSync(lf, `${JSON.stringify({ updatedAt: AT, items: [{ kind: 'branch', name: 'pipegen/setup', repo: 'o/shop' }] })}\n`, { mode: 0o600 });
+    await expect(e.load()).rejects.toThrow(/leftovers file/);
+    expect(existsSync(lf)).toBe(true);
+    expect(existsSync(localRecordPath(APP, local(e.w)))).toBe(true);
+    // all of it: finished
+    const f = await withMarker((w, hash) => ({ repoId: w.central.id, recordHash: hash, confirmed: true }));
+    f.w.g.repos.delete('o/pipelines');
+    await expect(f.load()).rejects.toThrow(/finished/);
+    expect(existsSync(localRecordPath(APP, local(f.w)))).toBe(false);
+  });
+
+  it('phase B: the repo DELETE throws (a rate stop) after the marker went pending: thrown, and no marker is left', async () => {
+    const x = await real();
+    await x.step();
+    mergePr(x.w, x.w.central, BR);
+    const loaded = await x.load();
+    const base = gh(x.w) as unknown as { request: (r: string, p: Record<string, unknown>) => Promise<unknown> };
+    const g = { request: async (route: string, params: Record<string, unknown> = {}) => {
+      if (route === 'DELETE /repos/{owner}/{repo}' && params.repo === 'pipelines') throw new GitHubRateLimitError('rate', { budgetSpent: true });
+      return base.request(route, params);
+    } } as unknown as Octokit;
+    await expect(uninstallStep(g, loaded, term().p, deps(x.w, APPMODE))).rejects.toBeInstanceOf(GitHubRateLimitError);
+    expect((await progressOf(x.w))?.centralDeleteSent).toBeUndefined();
   });
 });
 

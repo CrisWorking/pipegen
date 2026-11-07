@@ -99,6 +99,10 @@ function hook(w: World, route: string, params: Record<string, unknown>): { statu
       const sa = r === w.app ? { security_and_analysis: { [SS]: { status: w.settings.scanning ? 'enabled' : 'disabled' }, [SP]: { status: w.settings.push ? 'enabled' : 'disabled' } } } : {};
       return { status: 200, data: { id: r.id, name: r.name, full_name: `${r.owner}/${r.name}`, private: r.private, default_branch: r.defaultBranch, owner: { login: r.owner, type: r.ownerType }, ...sa, ...w.meta.get(r.name) } };
     }
+    case 'GET /repositories/{repository_id}': {
+      const r = [...w.g.repos.values()].find((x) => x.id === Number(p.repository_id));
+      return r === undefined ? { status: 404 } : { status: 200, data: { id: r.id, full_name: `${r.owner}/${r.name}` } };
+    }
     case 'DELETE /repos/{owner}/{repo}':
       w.g.repos.delete(full);
       w.deleted.push(full);
