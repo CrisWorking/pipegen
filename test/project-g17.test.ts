@@ -75,6 +75,8 @@ describe('G17 row 67 (N6): compose merge keys and variables, compose-<x> names, 
   it('a compose <<: *anchor merge key under build (and under the service) is resolved', () => {
     expect(compose('x-build: &b\n  context: ./apps/web\n  dockerfile: Dockerfile.ci\nservices:\n  web:\n    build:\n      <<: *b\n')).toEqual(['apps/web', 'apps/web/Dockerfile.ci']);
     expect(compose('x-svc: &s\n  build: ./apps/api\nservices:\n  api:\n    <<: *s\n    ports: ["3000:3000"]\n')).toEqual(['apps/api']);
+    // the mapping's own keys win over the merged ones
+    expect(compose('x-b: &b\n  context: ./apps/web\nservices:\n  api:\n    build:\n      <<: *b\n      context: ./apps/api\n')).toEqual(['apps/api']);
     expect(compose('x-a: &a\n  context: apps/a\nx-b: &b\n  dockerfile: Dockerfile.b\nservices:\n  w:\n    build:\n      <<: [*a, *b]\n')).toEqual(['apps/a', 'apps/a/Dockerfile.b']);
   });
   it('a compose ${VAR:-default} context uses the default; a bare ${VAR} is no reference', () => {
@@ -185,6 +187,9 @@ describe('G17 row 73: workflow build lines (a-e, k)', () => {
   it('(e) a ; inside quotes does not cut the build line', () => {
     expect(refs('docker build --build-arg "A=1;2" -f e/Dockerfile.ci e')).toEqual(['e', 'e/Dockerfile.ci']);
     expect(refs("docker build --label 'x=a|b&c' f")).toEqual(['f']);
+    // a path holding a quoted separator is no reference; a quote inside a word (it's) opens nothing
+    expect(refs('docker build -f "a;b/Dockerfile" .')).toEqual(['.']);
+    expect(refs("echo it's; docker build x; echo 'y'")).toEqual(['x']);
   });
   it('(k) a context expression with a quoted fallback gives that path', () => {
     expect(refs("          context: ${{ inputs.ctx || 'apps/web' }}")).toEqual(['apps/web']);
