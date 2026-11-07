@@ -271,8 +271,15 @@ describe('uninstall apply, phase A (V5)', () => {
       atFirstWrite = hasProgress(w) ? progressOf(w).phase : 'none';
       return undefined;
     });
+    let atFirstLock: unknown = 'no lock';
+    w.g.hooks.unshift((call) => {
+      if (call.route !== 'DELETE /repos/{owner}/{repo}/rulesets/{ruleset_id}' || atFirstLock !== 'no lock') return undefined;
+      atFirstLock = progressOf(w).prNumber;
+      return undefined;
+    });
     const r = await run(w, rec);
     expect(atFirstWrite).toBe('A');
+    expect(atFirstLock).toBe(1);   // the PR is in the progress file before any lock comes off
     expect(r.status).toBe('a-done');
     expect(r.phase).toBe('A');
     expect(r.pr).toEqual({ number: 1, url: 'https://github.com/o/shop/pull/1' });
@@ -352,6 +359,15 @@ describe('uninstall apply, phase A (V5)', () => {
     const r2 = await run(w2, sampleRecord(w2), t);
     expect(writes(w2)).not.toContain('DELETE /repos/{owner}/{repo}/rulesets/{ruleset_id}');
     expect(r2.skipped.some((s) => /not the one pipegen created|created at another time|created_at/i.test(s.why))).toBe(true);
+    // GitHub's answer turns into an "ask" (no created_at) after the preview: nothing sent, not done, run 1 stays to do (it asks the name next time)
+    const w3 = world();
+    w3.app.rulesets.set(41, liveRs());
+    const t3 = term({ go: () => { w3.app.rulesets.set(41, liveRs({ created_at: undefined })); return true; } });
+    const r3 = await run(w3, sampleRecord(w3), t3);
+    expect(writes(w3)).not.toContain('DELETE /repos/{owner}/{repo}/rulesets/{ruleset_id}');
+    expect(r3.status).toBe('failed');
+    expect(r3.failed.some((f) => f.what === 'ruleset pipegen (id 41)' && /type its name/.test(f.why))).toBe(true);
+    expect(progressOf(w3).phase).toBe('A');
   });
 
   it('apply: failure in one step reported, others continue', async () => {
@@ -484,18 +500,21 @@ describe('uninstall apply, phase A (V5)', () => {
     mkdirSync(dirname(lr), { recursive: true, mode: 0o700 });
     writeFileSync(lr, '{"recordHash":"x"}\n', { mode: 0o600 });
     let pending: Promise<unknown> = Promise.resolve();
+    let saved: Record<string, unknown> = {};
     let at = -1;
     w.g.hooks.unshift((call) => {
       if (call.route !== 'DELETE /repos/{owner}/{repo}/rulesets/{ruleset_id}' || h.stop.now) return undefined;
       // Ctrl-C while this delete is in flight: the stop begins, the interrupt hooks start
       h.stop.now = true;
       at = w.g.calls.length;
-      pending = Promise.all(h.fns.map((f) => f({ signal: new AbortController().signal, leftover: () => {} })));
+      pending = Promise.all(h.fns.map((f) => f({ signal: new AbortController().signal, leftover: () => {} }))).then(() => { saved = progressOf(w); });
       return undefined;
     });
     const r = await run(w, rec);
     await pending;
     expect(r.status).toBe('interrupted');
+    // the interrupt hook saved the progress after the write in flight settled (it holds that write)
+    expect((saved.done as string[] | undefined)?.some((d) => /ruleset pipegen \(id 41\)/.test(d))).toBe(true);
     // the write in flight settled; nothing after it, not even a read
     expect(at).toBeGreaterThan(0);
     expect(w.g.calls.slice(at)).toEqual([]);
@@ -656,6 +675,11 @@ describe('uninstall apply: the four conditions of the V4 security review and the
     const tok = a.deleteRulesets[0]?.typed;
     expect(tok).toBeDefined();
     await expect(b.api.deleteIfPipegens({ kind: 'ruleset', entry: rs() }, { typed: tok })).rejects.toBeInstanceOf(UninstallRefusal);
+    expect(writes(w2)).toEqual([]);
+    // a plan nobody confirmed is never applied
+    const never = await planUninstall(gh(w2), loadedOf(w2, sampleRecord(w2)), term().p, { interactive: true, local: local(w2) });
+    const pn = await ProgressFile.open({ owner: 'o', repo: 'shop' }, w2.app.id, local(w2));
+    await stops(applyPhaseA(gh(w2), never, pn), /confirmed plan/);
     expect(writes(w2)).toEqual([]);
     // a plan applied once is used up: it can't be applied a second time
     expect(await confirmPlan(b, term().p, { interactive: true, out: () => {} })).toBe(true);
