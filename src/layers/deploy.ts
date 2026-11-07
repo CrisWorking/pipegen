@@ -245,10 +245,12 @@ function checkEdit(text: string, mark: PipegenInserted, verify: Job): void {
   const was = parseYaml(mark.original, 'user');
   if (!('parsed' in now) || !('parsed' in was)) return refuse('with pipegen\'s job added the file would not be valid YAML');
   const jobs = now.parsed.js.jobs as Obj;
-  if (!isDeepStrictEqual(jobs[VERIFY_JOB], parseDocument(verifyJobYaml(verify)).toJS()[VERIFY_JOB])) refuse(`the ${VERIFY_JOB} job in the file is not the one pipegen writes`);
+  // G13 (G7-R2 carry): a called workflow holds no verify job, only pipegen's head checks
+  const called = mark.calledBy !== undefined;
+  if (called ? Object.hasOwn(jobs, VERIFY_JOB) || mark.jobs.length > 0 || mark.needs.length > 0 : !isDeepStrictEqual(jobs[VERIFY_JOB], parseDocument(verifyJobYaml(verify)).toJS()[VERIFY_JOB])) refuse(`the ${VERIFY_JOB} job in the file is not the one pipegen writes`);
   const rest = structuredClone(now.parsed.js);
   const restJobs = rest.jobs as Obj;
-  delete restJobs[VERIFY_JOB];
+  if (!called) delete restJobs[VERIFY_JOB];
   const origJobs = was.parsed.js.jobs as Obj;
   for (const n of mark.needs) {
     const j = restJobs[n.job];
@@ -290,13 +292,60 @@ export function renewVerifyJob(text: string, mark: PipegenInserted, verify: Job)
   return out;
 }
 
+// ---------- the head check in a called local workflow (G13, the G7-R2 carry, BINDING) ----------
+
+/** `./.github/workflows/<file>` → the workflow's path, else null (a remote call, an expression, anything else). */
+const LOCAL_CALL_RE = /^\.\/(\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml)$/;
+export function localCallOf(job: unknown): string | null {
+  const uses = isObj(job) ? job.uses : undefined;
+  return typeof uses === 'string' ? LOCAL_CALL_RE.exec(uses)?.[1] ?? null : null;
+}
+
+/**
+ * A local workflow that gated deploy jobs call: pipegen's head check (the verify job's own, exactly) goes in as the FIRST step of every one of
+ * its jobs, so a called job that waits for an approval, or is re-run alone, stops once a newer commit is on the default branch. Nothing else
+ * changes: no job, no needs. Every job must have a block list of steps (a job that calls another workflow in turn can't hold the step: refused).
+ * The result is checked like an insert (checkEdit with `calledBy`).
+ */
+export function insertHeadChecks(original: string, calledBy: readonly string[], verify: Job): { text: string; inserted: PipegenInserted; insertions: Insertion[] } {
+  if (calledBy.length === 0) refuse('no gated job calls it');
+  const { map } = parsedDoc(original);
+  const eol = eolOf(original);
+  const head = headCheckOf(verify);
+  const insertions: Insertion[] = [];
+  const ids: string[] = [];
+  for (const pair of map.items as Pair<YamlNode, YamlNode>[]) {
+    const id = isScalar(pair.key) && typeof pair.key.value === 'string' ? pair.key.value : null;
+    if (id === null || !isMap(pair.value) || pair.value.flow === true || pair.value.items.length === 0) refuse(`its job ${show(String(id))} is written in { } on one line; write it as an indented block, then run pipegen again`);
+    const job = pair.value as unknown as { items: Pair[] };
+    if (pairOf(job, 'uses') !== undefined) refuse(`its job ${show(id as string)} calls another workflow in turn, which can't start with pipegen's head check`);
+    const steps = pairOf(job, 'steps');
+    const sv = steps?.value;
+    if (steps === undefined || !isSeq(sv) || sv.flow === true || sv.items.length === 0) refuse(`its job ${show(id as string)} has no block list of steps to start with pipegen's head check; write its steps as a - list, then run pipegen again`);
+    const item0 = (sv as unknown as { items: YamlNode[] }).items[0] as YamlNode;
+    const dash = item0.range === undefined || item0.range === null ? -1 : original.lastIndexOf('-', item0.range[0] - 1);
+    const col = dash < 0 ? null : spacesBefore(original, dash);
+    if (col === null) return refuse(`the steps of its job ${show(id as string)} do not start each item on its own line`);
+    insertions.push({ at: lineStart(original, dash), text: `${indentLines(stepItemYaml(head), col)}\n`.replace(/\r?\n/g, eol) });
+    ids.push(id as string);
+  }
+  insertions.sort((a, b) => a.at - b.at);
+  let text = '';
+  let from = 0;
+  for (const i of insertions) { text += original.slice(from, i.at) + i.text; from = i.at; }
+  text += original.slice(from);
+  const inserted: PipegenInserted = { original, jobs: [], needs: [], headCheck: ids, calledBy: [...new Set(calledBy)].sort() };
+  checkEdit(text, inserted, verify);
+  return { text, inserted, insertions };
+}
+
 // ---------- the plan per deploy workflow ----------
 
 /**
  * Why the parts of a user's workflow that apply to pipegen's job too refuse the insert (the referee's judgeUserTop, asked first so the
  * workflow is a gap and not a refused delivery), or null.
  */
-function userTopProblem(js: Obj): string | null {
+function userTopProblem(js: Obj, opts: { permissions?: boolean } = {}): string | null {
   const env = js.env;
   if (env !== undefined && (!isObj(env) || Object.entries(env).some(([k, v]) => isDangerousName(k) || (typeof v === 'string' && v.includes('${{'))))) return 'its workflow-wide env would reach pipegen\'s job (a name that changes how tools run, or an expression)';
   const d = js.defaults;
@@ -306,7 +355,8 @@ function userTopProblem(js: Obj): string | null {
     if (!ok) return 'its defaults would change how pipegen\'s steps run';
   }
   const p = js.permissions;
-  if (p !== undefined) {
+  // G13: a called workflow gets no job of pipegen's, so its permissions are not held to pipegen's job ceiling
+  if (p !== undefined && opts.permissions !== false) {
     if (!isObj(p)) return 'it sets one permission level for every job (read-all or write-all), more than pipegen\'s job may have';
     for (const [k, v] of Object.entries(p)) {
       const level = typeof v === 'string' && Object.hasOwn(LEVEL, v) ? LEVEL[v] as number : undefined;
@@ -321,6 +371,68 @@ const headCheckJobs = (mark: PipegenInserted): string[] => mark.headCheck ?? [];
 /** G7-R-sec1: every step's if: of a job runs only when the steps before it passed (the job-level rule, gatedIfAllowed, per step). */
 const stepsGated = (job: unknown): boolean => isObj(job) && (!Array.isArray(job.steps) || job.steps.every((st) => !isObj(st) || gatedIfAllowed(st.if)));
 
+/** The jobs of every workflow text that call `path` (`uses: ./<path>`), as `<workflow>:<job>`; a text pipegen can't read that names the path counts as one unknown call. */
+function callersOf(path: string, texts: ReadonlyMap<string, string>): string[] {
+  const out: string[] = [];
+  for (const [wf, text] of texts) {
+    const parsed = parseYaml(text, 'user');
+    if (!('parsed' in parsed)) { if (text.includes(path)) out.push(`${wf}:?`); continue; }
+    const jobs = parsed.parsed.js.jobs;
+    if (!isObj(jobs)) continue;
+    for (const [id, job] of Object.entries(jobs)) if (localCallOf(job) === path) out.push(`${wf}:${id}`);
+  }
+  return out;
+}
+
+/**
+ * G13 (G7-R2 carry, BINDING): for each local workflow that gated deploy jobs call, pipegen's head check as the first step of each of its jobs
+ * (insertHeadChecks), when it can: the file is one of the repository's workflows, started only by workflow_call, called by no job pipegen
+ * doesn't gate (in any other run the check would refuse a pull request or a schedule), its env and defaults leave pipegen's step alone, and
+ * none of its steps can run after a failed check. Otherwise the caller job's residual note says what stays open. A called file that gets the
+ * check is no gap.
+ */
+function calledHeadChecks(draft: PipelineDraft, texts: ReadonlyMap<string, string>, verify: Job, calls: readonly { caller: string; job: string; path: string | null }[], deferred: Map<string, unknown>, out: VerifyPlan): void {
+  const covered = new Set<string>();
+  const why = new Map<string, string>();
+  const gatedCalls = new Set(calls.map((c) => `${c.caller}:${c.job}`));
+  for (const path of [...new Set(calls.map((c) => c.path).filter((x): x is string => x !== null))].sort()) {
+    const callers = [...new Set(calls.filter((c) => c.path === path).map((c) => c.caller))];
+    const no = (w: string): void => { why.set(path, w); };
+    const text = texts.get(path);
+    if (OWN_WORKFLOWS.has(path) || !draft.profile.existingWorkflows.some((w) => w.path === path)) { no('it is not one of this repository\'s workflows pipegen read'); continue; }
+    if (typeof text !== 'string') { no('pipegen could not read it'); continue; }
+    const parsed = parseYaml(text, 'user');
+    if (!('parsed' in parsed)) { no(`pipegen can not edit it safely (${safeText(parsed.problems.join('; '), 200)})`); continue; }
+    const js = parsed.parsed.js;
+    const triggers = triggersOf(js.on);
+    if (triggers === null || triggers.length !== 1 || triggers[0] !== 'workflow_call') { no('it is started by more than workflow_call, and pipegen\'s head check refuses any run but a push'); continue; }
+    const others = callersOf(path, texts).filter((c) => !gatedCalls.has(c));
+    if (others.length > 0) { no(`it is also called by ${others.map((c) => show(c)).join(', ')}, which pipegen doesn't gate, where the head check would stop every run`); continue; }
+    const top = userTopProblem(js, { permissions: false });
+    if (top !== null) { no(top); continue; }
+    const jobs = isObj(js.jobs) ? js.jobs : {};
+    const bad = Object.keys(jobs).filter((id) => !stepsGated(jobs[id]) || !readsContents(jobs[id], js.permissions));
+    if (bad.length > 0) { no(`its job ${bad.map(show).join(', ')} has a step that could run after pipegen's head check failed, or no contents: read for the check`); continue; }
+    let edit: ReturnType<typeof insertHeadChecks>;
+    try { edit = insertHeadChecks(text, callers, verify); } catch (e) {
+      if (!(e instanceof EditRefused || e instanceof RenderError)) throw e;
+      no(safeText(e.message, 200));
+      continue;
+    }
+    const file: CreatedFile = { path, content: edit.text, part: 'deploy-verify', reason: `Starts each job of this workflow, which pipegen's gated deploy jobs call, with pipegen's head check, so a called deploy that waited for an approval, or a re-run, stops once a newer commit is on the default branch.`, repo: 'app', inserted: edit.inserted };
+    out.inserts.push({ path, text: edit.text, inserted: edit.inserted, insertions: edit.insertions, file });
+    out.preview.push(`${path}: pipegen starts ${(edit.inserted.headCheck ?? []).map(show).join(', ')} with its head check (the workflow is called by ${callers.map((c) => show(c)).join(', ')}).`);
+    out.notProven.push({ part: 'deploy-verify', reason: `pipegen's edit of ${path} (its head checks) is not proven: the proof never runs a user's workflow beside real keys, so only the referee checked it.`, missingSecrets: [] });
+    covered.add(path);
+    deferred.delete(path);
+  }
+  for (const c of calls) {
+    if (c.path !== null && covered.has(c.path)) continue;
+    const reason = c.path === null ? 'it calls a workflow of another repository or one pipegen can\'t name' : `pipegen could not start ${c.path}'s jobs with its head check: ${why.get(c.path) ?? 'unknown'}`;
+    out.notes.push(`${c.caller}: the job ${show(c.job)} calls another workflow, so pipegen can not start it with its head check (${reason}): only ${VERIFY_JOB} checks that the commit is still the head of the default branch, before the job starts. So an older commit can still deploy when the called workflow waits for an approval and a newer commit ships first, or when someone re-runs this job (or "re-run failed jobs") on an older run. Approve deploys in order, re-run all jobs (never this job alone) after a newer commit, or move the deploy into a job with steps.`);
+  }
+}
+
 /**
  * The verify inserts of a draft's deploy workflows (see the file header). `texts`: each workflow's text as read (path → text); `verify`: the
  * verify job (assemble's AssembledFiles.verify; null when the deploy part is skipped, and then nothing is inserted and nothing is a gap).
@@ -329,6 +441,10 @@ export function planVerifyInserts(draft: PipelineDraft, texts: ReadonlyMap<strin
   const out: VerifyPlan = { inserts: [], gaps: [], notProven: [], preview: [], notes: [] };
   if (verify === null) return out;
   const def = draft.profile.defaultBranch;
+  // G13 (G7-R2 carry): a workflow started only by workflow_call is a gap only when no gated job calls it (decided after every caller)
+  const deferred = new Map<string, { triggers: string[]; why: string }>();
+  // the gated jobs that call a local workflow (caller path, job id, called path), and the calls whose head check is still to be decided
+  const calls: { caller: string; job: string; path: string | null }[] = [];
   for (const wf of draft.profile.existingWorkflows) {
     if (wf.deploys !== true || OWN_WORKFLOWS.has(wf.path)) continue;
     const gap = (why: string, triggers: string[] = Array.isArray(wf.triggers) ? [...wf.triggers] : []): void => { out.gaps.push({ path: wf.path, triggers, why }); };
@@ -341,6 +457,10 @@ export function planVerifyInserts(draft: PipelineDraft, texts: ReadonlyMap<strin
     if (triggers === null) { gap('its triggers can not be read; write `on:` as a name, a list or a map of events'); continue; }
     const kind = deployTriggers({ triggers });
     if (kind === 'workflow_run') { gap('it deploys after another workflow run (workflow_run), which runs with full rights on what that run produced, so pipegen adds no check to it; to have the check, deploy from a push to the default branch', triggers); continue; }
+    if (kind === 'other' && triggers.length === 1 && triggers[0] === 'workflow_call') {
+      deferred.set(wf.path, { triggers, why: 'it is started by workflow_call, not only by a push, so pipegen adds no check to it; to have the check, start it only on a push to the default branch, or call it from a deploy job pipegen protects' });
+      continue;
+    }
     if (kind === 'other') { gap(`it is started by ${triggers.filter((t) => t !== 'push').map((t) => safeText(t, 40)).join(', ') || 'no push'}, not only by a push, so pipegen adds no check to it; to have the check, start it only on a push to the default branch`, triggers); continue; }
     const branch = pushBranchProblem(js.on, def);
     if (branch !== null) { gap(branch, triggers); continue; }
@@ -402,10 +522,9 @@ export function planVerifyInserts(draft: PipelineDraft, texts: ReadonlyMap<strin
       out.preview.push(line);
       out.notes.push(line);
     }
-    for (const id of deployJobs.filter((x) => callsWorkflow(jobs[x]))) {
-      // G7-R2 3 (sec M1): what is not checked for such a job; the BINDING carry to G13 puts the head check into a local called workflow's jobs
-      out.notes.push(`${wf.path}: the job ${show(id)} calls another workflow, so pipegen can not start it with its head check: only ${VERIFY_JOB} checks that the commit is still the head of the default branch, before the job starts. So an older commit can still deploy when the called workflow waits for an approval and a newer commit ships first, or when someone re-runs this job (or "re-run failed jobs") on an older run. Approve deploys in order, re-run all jobs (never this job alone) after a newer commit, or move the deploy into a job with steps.`);
-    }
+    // G7-R2 3 (sec M1): a job that calls another workflow can't start with the head check; a local called workflow gets it in its own jobs
+    // (G13, below), and the note says what stays open for any call that doesn't
+    for (const id of deployJobs.filter((x) => callsWorkflow(jobs[x]))) calls.push({ caller: wf.path, job: id, path: localCallOf(jobs[id]) });
     // G7-R2 1c: the head check runs on the job's own runner or container: anything but GitHub's ubuntu runner may lack bash, curl or jq (it
     // fails closed and says which tool; the job stays gated)
     for (const id of headCheckJobs(edit.inserted).filter((x) => !plainUbuntu(jobs[x]))) {
@@ -421,6 +540,8 @@ export function planVerifyInserts(draft: PipelineDraft, texts: ReadonlyMap<strin
     }
     out.notProven.push({ part: 'deploy-verify', reason: `pipegen's edit of ${wf.path} (the ${VERIFY_JOB} job, its needs and the head checks) is not proven: the proof never runs a user's workflow beside real keys, so only the referee checked it.`, missingSecrets: [] });
   }
+  calledHeadChecks(draft, texts, verify, calls, deferred, out);
+  for (const [path, g] of deferred) out.gaps.push({ path, triggers: g.triggers, why: g.why });
   if (out.inserts.length > 0) {
     out.notes.push(`The ${VERIFY_JOB} job outputs the verified image digest (needs.${VERIFY_JOB}.outputs.digest): a signature protects only a deploy that uses that digest.`);
     // G7-R1 sec I1 (for G9's PIPEGEN.md): what the head check in the deploy job covers, and how to re-run and queue deploys
@@ -543,13 +664,13 @@ export const isMemoryFolder = (dir: string): boolean => {
 /**
  * A new encrypted cosign key pair (key-env, B3 c), made only in memory: the pinned cosign (resolved right before the exec, S24) writes it into
  * a fresh 0700 folder of a memory-backed filesystem, the texts are read back and checked, and the folder is removed whatever happens
- * (makeCosignKeyPair). A folder that is not memory-backed is refused, so the key never reaches a disk. Not yet called: `finish` still makes
- * the pair with makeCosignKeyPair in its tmpDir. BINDING carry G7-R1 → G13: finish calls this (and a finish-level test shows no key file
- * on a disk-backed folder).
+ * (makeCosignKeyPair). A folder that is not memory-backed is refused, so the key never reaches a disk. `finish` makes every pair it stores
+ * with this (G13, carry 28; test "finish: the cosign key is made in memory; no key file on a disk-backed folder"), and so does the full
+ * run for the pair deliver stores (key-env).
  */
 export async function generateCosignKeys(cosignBin: CosignResolver, deps: { exec?: CosignExec; base?: string; isMemory?: (dir: string) => boolean } = {}): Promise<{ privateKey: string; publicKey: string; password: string }> {
   const base = deps.base ?? MEMORY_DIR;
-  if (!(deps.isMemory ?? isMemoryFolder)(base)) throw new DeliverError(`pipegen makes the signing key only in memory (a tmpfs folder such as ${MEMORY_DIR}), so it never touches a disk, and ${show(base)} is not one on this machine. Run this step on Linux, where ${MEMORY_DIR} is in memory (WSL or a Linux container works too).`);
+  if (!(deps.isMemory ?? isMemoryFolder)(base)) throw new DeliverError(`pipegen makes the signing key only in memory (a tmpfs folder such as ${MEMORY_DIR}), so it never touches a disk, and ${show(base)} is not one on this machine. Run this step on Linux, where ${MEMORY_DIR} is in memory (WSL or a Linux container works too), or, on a public repository, use keyless signing, which needs no key.`);
   const pair = await makeCosignKeyPair(cosignBin, deps.exec, base);
   return { privateKey: pair.key, publicKey: pair.pub, password: pair.password };
 }

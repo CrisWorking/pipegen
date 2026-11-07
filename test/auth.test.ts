@@ -83,6 +83,13 @@ describe('permissionsTable', () => {
     expect(app?.why).toContain('delete the scratch repo after the proof if you allow it');
   });
 
+  it('permissionsTable (G13, S12): Issues read for update, the optional organisation rows say why', async () => {
+    const write = permissionsTable('write', { appCreatesRepos: false });
+    expect(write.find((r) => r.permission.startsWith('Issues'))?.why).toMatch(/pipegen update/);
+    expect(write.find((r) => r.permission.startsWith('Organization administration'))?.why).toMatch(/required workflow/);
+    expect(write.find((r) => r.permission.startsWith('Organization members'))?.why).toMatch(/code owners/);
+  });
+
   it('permissionsTable: the measured S1 write table (DECISIONS #88), nothing more', () => {
     const write = permissionsTable('write', { appCreatesRepos: true }).map((r) => r.permission);
     expect(permissionsTable('write', { appCreatesRepos: false }).map((r) => r.permission)).toEqual(write); // the same rows in token mode
@@ -90,6 +97,8 @@ describe('permissionsTable', () => {
       'Metadata: read', 'Contents: read and write', 'Workflows: read and write', 'Pull requests: read and write',
       'Actions: read and write', P(S_NAME, 'read and write'), 'Variables: read and write', 'Environments: read and write',
       'Administration: read and write', 'Checks: read (GitHub App only)',
+      // G13 (S12, E-b2): Issues read for `pipegen update`; the two organisation rows are optional
+      'Issues: read', 'Organization administration: read and write (organisation, optional)', 'Organization members: read (organisation, optional)',
     ]);
     const all = JSON.stringify(permissionsTable('write', { appCreatesRepos: true })) + JSON.stringify(permissionsTable('write', { appCreatesRepos: false })) + JSON.stringify(permissionsTable('read'));
     expect(all).not.toMatch(/Repository creation|Commit statuses/);
@@ -648,7 +657,7 @@ describe('probePermissions', () => {
 
   it('probePermissions: missing Secrets write reported with why', async () => {
     // App: GitHub lists the installation's exact permissions
-    const full = { metadata: 'read', contents: 'write', workflows: 'write', pull_requests: 'write', actions: 'write', [S_NAME.toLowerCase()]: 'read', actions_variables: 'write', environments: 'write', administration: 'write', checks: 'read' };
+    const full = { metadata: 'read', contents: 'write', workflows: 'write', pull_requests: 'write', actions: 'write', [S_NAME.toLowerCase()]: 'read', actions_variables: 'write', environments: 'write', administration: 'write', checks: 'read', issues: 'read' };
     const app = gh({
       [`GET ${API}/repos/o/r`]: repoOk,
       [`GET ${API}/user/installations`]: { body: { installations: [{ id: 1, account: { login: 'o' }, repository_selection: 'selected', permissions: full }] } },
@@ -670,7 +679,7 @@ describe('probePermissions', () => {
   });
 
   it('probePermissions: App repo access comes from the installation\'s repo list, not GET /repos', async () => {
-    const full = { metadata: 'read', contents: 'write', workflows: 'write', pull_requests: 'write', actions: 'write', [S_NAME.toLowerCase()]: 'write', actions_variables: 'write', environments: 'write', administration: 'write', checks: 'read' };
+    const full = { metadata: 'read', contents: 'write', workflows: 'write', pull_requests: 'write', actions: 'write', [S_NAME.toLowerCase()]: 'write', actions_variables: 'write', environments: 'write', administration: 'write', checks: 'read', issues: 'read' };
     const app = gh({
       [`GET ${API}/repos/o/r`]: repoOk,
       [`GET ${API}/repos/o/public-elsewhere`]: repoOk,   // any public repo answers 200 to anyone
@@ -740,6 +749,7 @@ describe('probePermissions', () => {
     const res = await probePermissions(client, 'o', ['r', 'pipelines'], { kind: 'fine-grained', clock: clock() });
     expect(res.missing.map((m) => m.permission)).toEqual(['Access to o/pipelines']);
     // every write level is unchecked for a fine-grained token (GitHub can't show it without writing), Checks is App only
-    expect(res.unchecked.map((m) => m.permission)).toEqual(permissionsTable('write', { appCreatesRepos: false }).map((p) => p.permission).filter((p) => /write/.test(p)));
+    // G13: Issues read is probed (unanswered here: unchecked); the optional organisation rows are never checked
+    expect(res.unchecked.map((m) => m.permission)).toEqual([...permissionsTable('write', { appCreatesRepos: false }).map((p) => p.permission).filter((p) => /write/.test(p) && !/optional/.test(p)), 'Issues: read']);
   });
 });

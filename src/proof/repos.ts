@@ -65,6 +65,11 @@ export interface ProofRepoOptions {
    */
   onCreated?: (repo: string, id: number) => void;
   /**
+   * G13-R2 3 (sec m2): called right after the PUT that changed the central repo's Actions access level, with the level before, so the state
+   * file keeps it even when a later step throws (Plan G: store.recordActionsAccess). It must write synchronously.
+   */
+  onAccessChanged?: (previous: string) => void;
+  /**
    * E8 fix rounds 1-2 (review M-3, O-2): gives the create permit right before pipegen creates a helper repo (App mode). Plan G
    * passes `() => store.createPermit()`, which only an armed StateStore gives, so no repo is made before the Ctrl-C cleanup is
    * registered. Without it, pipegen never creates a repo (a stop, before any create call); a throw stops the proof the same way.
@@ -90,6 +95,8 @@ export interface ProofRepos {
   defaultBranchState?: DefaultBranchState;
   /** Organisations only. */
   orgPerm?: OrgPermission;
+  /** G13 carry 24: the central repo's Actions access level before pipegen changed it (absent: unchanged). */
+  actionsAccess?: { previous: string };
   /** When ready: checkScratchAccess's result (E4 passes its `accepted` back when it checks again). */
   access?: ScratchAccess;
 }
@@ -103,7 +110,8 @@ const APP_CONFIGURE = 'GitHub → Settings → Applications → Installed GitHub
 /** `gh repo create <owner>/<name> --private --description "…"` for each name (validated GitHub names, a fixed description). */
 export function createCommands(owner: string, names: string[]): string[] {
   checkRepoNames(owner, names);
-  return names.map((n) => `gh repo create ${owner}/${n} --private --description "${helperDescription(n === CENTRAL_REPO ? 'central' : 'scratch')}"`);
+  // ruling V3-wiki (G14-R1 sec M5): no wiki (gh has no flag for projects; checkProofRepos names them when they are on)
+  return names.map((n) => `gh repo create ${owner}/${n} --private --disable-wiki --description "${helperDescription(n === CENTRAL_REPO ? 'central' : 'scratch')}"`);
 }
 
 // ---------- GitHub reads ----------
@@ -129,6 +137,8 @@ type Seen = { exists: false } | {
   exists: true; visibility: 'private' | 'public' | 'internal'; defaultBranch: string;
   /** null: GitHub didn't say. */
   description: string | null; allowForking: boolean | null;
+  /** G14-R1 (sec M5): the wiki and projects switches (null: GitHub didn't say). */
+  hasWiki?: boolean | null; hasProjects?: boolean | null;
 };
 
 /**
@@ -153,7 +163,7 @@ async function readHelper(gh: Octokit, owner: string, name: string, clock: RateC
     if (statusOf(e) === 404) return { exists: false };
     throw new GitHubAccessError(`pipegen couldn't read ${owner}/${name} (${saidOf(e)}).`, { status: statusOf(e) });
   }
-  const d = (data ?? {}) as { full_name?: unknown; default_branch?: unknown; description?: unknown; allow_forking?: unknown };
+  const d = (data ?? {}) as { full_name?: unknown; default_branch?: unknown; description?: unknown; allow_forking?: unknown; has_wiki?: unknown; has_projects?: unknown };
   if (typeof d.full_name !== 'string' || d.full_name.toLowerCase() !== `${owner}/${name}`.toLowerCase()) {
     throw new ProofStopError(`GitHub answered for ${safeText(String(d.full_name), 160)} when pipegen asked for ${owner}/${name} (renamed or transferred), `
       + `so pipegen won't use it. Rename or move that repo away from ${owner}/${name}, then run pipegen again.`);
@@ -164,6 +174,7 @@ async function readHelper(gh: Octokit, owner: string, name: string, clock: RateC
     exists: true, visibility, defaultBranch: d.default_branch,
     description: typeof d.description === 'string' ? d.description : null,
     allowForking: typeof d.allow_forking === 'boolean' ? d.allow_forking : null,
+    hasWiki: typeof d.has_wiki === 'boolean' ? d.has_wiki : null, hasProjects: typeof d.has_projects === 'boolean' ? d.has_projects : null,
   };
 }
 
@@ -505,9 +516,9 @@ export async function checkActionsAllowed(gh: Octokit, scratch: GuardedRepo, act
  * `pipelines` holds install records only): otherwise nothing is called. Read first; written only when different
  * ('enterprise' already covers an organisation). A refusal is a ProofStopError with the setting to change by hand.
  */
-export async function ensureActionsAccess(gh: Octokit, t: ProofTarget, app: ProofApp, clock: RateClock = clockOf(gh)): Promise<void> {
+export async function ensureActionsAccess(gh: Octokit, t: ProofTarget, app: ProofApp, clock: RateClock = clockOf(gh), onChanged?: (previous: string) => void, warn: (s: string) => void = () => {}): Promise<{ previous: string } | undefined> {
   const central = assertCentral(t, app);
-  if (!t.appPrivate) return;
+  if (!t.appPrivate) return undefined;
   const org = t.ownerType === 'Organization';
   const level = org ? 'organization' : 'user';
   let current: unknown;
@@ -516,16 +527,33 @@ export async function ensureActionsAccess(gh: Octokit, t: ProofTarget, app: Proo
   } catch (e) {
     rethrowHard(gh, e);
   }
-  if (current === level || (org && current === 'enterprise')) return;
+  if (current === level || (org && current === 'enterprise')) return undefined;
+  // G13 carry 24: the level before, for the install record (Plan V's uninstall puts it back); an unreadable one is 'none'
+  const previous = typeof current === 'string' && /^(?:none|user|organization|enterprise)$/.test(current) ? current : 'none';
+  // G14 (controller addendum): told through onChanged; a callback that throws leaves the level unrecorded, so it is said here and stops
+  const tell = (): void => {
+    try {
+      onChanged?.(previous);
+    } catch (e) {
+      warn(`Left behind: central Actions access was ${previous} before pipegen changed it on ${central.fullName}; set it back by hand if you uninstall (pipegen couldn't record it).`);
+      throw e;
+    }
+  };
   try {
     await guardedWrite(gh, central, 'PUT /repos/{owner}/{repo}/actions/permissions/access', { access_level: level }, clock);
   } catch (e) {
     if (e instanceof ScratchGuardError) throw e;
     rethrowHard(gh, e);
+    // G14 (controller addendum): a PUT that failed without a 4xx (a 5xx, no answer) may still have changed the level: recorded as changed
+    const status = statusOf(e);
+    if (!(typeof status === 'number' && status >= 400 && status < 500)) tell();
     const choice = org ? `Accessible from repositories in the ${t.owner} organization` : `Accessible from repositories owned by the user ${t.owner}`;
     throw new ProofStopError(`pipegen couldn't let ${t.scratch} use the workflows in ${central.fullName} (${saidOf(e)}). `
       + `Set it by hand: ${central.fullName} → Settings → Actions → General → Access → "${choice}", then run pipegen again.`);
   }
+  // G13-R2 3: told at once (outside the refusal handling above: a throw from the callback is not a refused PUT)
+  tell();
+  return { previous };
 }
 
 // ---------- default branch (S1) ----------
@@ -675,6 +703,15 @@ export async function checkProofRepos(gh: Octokit, app: ProofApp, opts: ProofRep
     }
   }
 
+  // G14-R1 (sec M5, ruling V3-wiki): a helper repo holds only what pipegen puts there; a wiki or projects switched on is named (pipegen
+  // never turns a setting of a repo it didn't make; the ones it makes have both off)
+  for (const r of helpers) {
+    const s = seen.get(r) as Seen;
+    if (!s.exists || result.created.includes(r.repo)) continue;
+    const on = [s.hasWiki === true ? 'wiki' : '', s.hasProjects === true ? 'projects' : ''].filter((x) => x !== '');
+    if (on.length > 0) io.err(`${r.fullName} has its ${on.join(' and ')} turned on. A helper repo should hold only what pipegen puts there: gh repo edit ${r.fullName} --enable-wiki=false --enable-projects=false`);
+  }
+
   result.repos = helpers.map((r) => {
     const s = seen.get(r) as Seen;
     if (s.exists) return { name: r.repo, exists: true, private: s.visibility === 'private' };
@@ -716,7 +753,8 @@ export async function checkProofRepos(gh: Octokit, app: ProofApp, opts: ProofRep
 
   // the proof's actions are allowed in the scratch repo (S13); the central workflows are callable (private projects)
   await checkActionsAllowed(gh, scratch, opts.actions, (w) => io.err(w), clock);
-  await ensureActionsAccess(gh, t, app, clock);
+  const changed = await ensureActionsAccess(gh, t, app, clock, opts.onAccessChanged, (w) => io.err(w));
+  if (changed !== undefined) result.actionsAccess = changed;
   result.defaultBranchState = await setScratchDefaultBranch(gh, scratch, clock);
   result.scratchDefaultBranch = t.defaultBranch;
   result.ready = true;

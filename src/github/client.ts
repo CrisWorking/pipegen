@@ -226,6 +226,8 @@ interface PermissionRow {
   tokenWhy?: string;
   /** Only a GitHub App can hold it (a fine-grained token has no Checks permission). */
   appOnly?: boolean;
+  /** G13 (S12): an optional organisation permission. Never required: probePermissions never reports it missing, and pipegen works without it. */
+  org?: boolean;
   /** A GET that needs this permission at read level (S1's header evidence), `{r}` = /repos/{owner}/{repo}. */
   probe?: string;
 }
@@ -249,6 +251,17 @@ const PERMISSIONS: readonly PermissionRow[] = [
     readWhy: 'Actions settings (access level, SHA pinning).', probe: '/actions/permissions',
   },
   { key: 'checks', name: 'Checks', write: 'read', why: 'Read the gate check result. A fine-grained token can\'t have it, so in token mode pipegen reads workflow runs and jobs instead.', appOnly: true },
+  // G13 (rulings S12, E-b2): `pipegen update` reads the update issues; the two organisation rows are optional (an organisation-owned repo only):
+  // without them pipegen plans no organisation required workflow and asks the owners itself
+  { key: 'issues', name: 'Issues', write: 'read', why: 'Read the update issues pipegen\'s nightly check opens (pipegen update). pipegen never writes an issue.', probe: '/issues?per_page=1' },
+  {
+    key: 'organization_administration', name: 'Organization administration', write: 'write', org: true,
+    why: 'Optional, organisation repos only: add the organisation rule that makes pipegen\'s required workflow run on every pull request.',
+  },
+  {
+    key: 'members', name: 'Organization members', write: 'read', org: true,
+    why: 'Optional, organisation repos only: read whether you own the organisation and who can write, to suggest code owners.',
+  },
 ];
 
 /**
@@ -291,7 +304,7 @@ const READ_PERMISSIONS: readonly PermissionRow[] = [
 
 const levelText = (l: Level) => (l === 'write' ? 'read and write' : 'read');
 const label = (p: PermissionRow, mode: Level): string =>
-  `${p.name}: ${levelText(mode === 'write' ? p.write : (p.read as Level))}${p.appOnly ? ' (GitHub App only)' : ''}`;
+  `${p.name}: ${levelText(mode === 'write' ? p.write : (p.read as Level))}${p.appOnly ? ' (GitHub App only)' : ''}${p.org ? ' (organisation, optional)' : ''}`;
 const rowsFor = (mode: Level) => (mode === 'write' ? PERMISSIONS : READ_PERMISSIONS);
 /** `app`: pipegen's own GitHub App login, which creates and deletes the helper repos (#87); else token mode, which never does. */
 const entry = (p: PermissionRow, mode: Level, app: boolean) => ({
@@ -696,7 +709,8 @@ export async function probePermissions(gh: Octokit, owner: string, repos: string
   const missing: Row[] = [];
   const unchecked: Row[] = [];
   const add = (list: Row[], r: Row) => { if (!list.some((x) => x.permission === r.permission)) list.push(r); };
-  const rows = rowsFor(mode).filter((p) => opts.kind === 'app' || !p.appOnly);
+  // G13 (S12): the optional organisation rows are never required, so never checked here
+  const rows = rowsFor(mode).filter((p) => (opts.kind === 'app' || !p.appOnly) && p.org !== true);
   const access = (repo: string) => `Access to ${repoName(owner, repo)}`;
   const NO_ACCESS = 'pipegen can\'t reach this repo with this token: it doesn\'t exist yet, or it isn\'t in the token\'s (or the App installation\'s) repository list.';
   const done = () => ({ missing, unchecked: unchecked.filter((u) => !missing.some((m) => m.permission === u.permission)) });

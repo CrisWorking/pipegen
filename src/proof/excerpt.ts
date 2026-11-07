@@ -562,7 +562,7 @@ function endsInsideKey(text: string): boolean {
  * Exported for the excerpt's tests (the scan only removes lines, so what holds here holds for errorExcerpt). `maxLogChars` replaces
  * MAX_LOG_CHARS in tests only.
  */
-export function unscannedExcerpt(logs: string, scrub: (text: string) => string, testOpts: { maxLogChars?: number } = {}): string[] {
+export function unscannedExcerpt(logs: string, scrub: (text: string) => string, testOpts: { maxLogChars?: number; counts?: { walkSteps: number } } = {}): string[] {
   const maxLogChars = testOpts.maxLogChars ?? MAX_LOG_CHARS;
   let text = String(logs);
   let guard = 0;
@@ -602,12 +602,15 @@ export function unscannedExcerpt(logs: string, scrub: (text: string) => string, 
   // - its text is part of a value that spans lines (the whole-text scrub before redact merged it with a neighbour).
   const lines0 = text.split('\n').map(readLine);
   const parents = new Set<number>();
+  // G17: the parent walk's step count, for the linear-time test (testOpts.counts): a count, so it doesn't depend on the machine
+  let walkSteps = 0;
   const stack: { cols: number; i: number }[] = [];
   lines0.forEach((r, i) => {
     const own = r.shown ?? r.rep;
     if (r.suspect) {
       // the stack holds the ancestors, indentation rising; at most 32 of them are looked at (M2: a step count, not a match count)
       for (let k = stack.length - 1, steps = 0; k >= 0 && steps < 32; k--, steps++) {
+        walkSteps++;
         const e = stack[k] as { cols: number; i: number };
         if (e.cols < r.colsMax || r.indentUnsure) {
           if (!(lines0[e.i] as Read).suspect) parents.add(e.i);
@@ -620,6 +623,7 @@ export function unscannedExcerpt(logs: string, scrub: (text: string) => string, 
     while (stack.length > 0 && (stack[stack.length - 1] as { cols: number }).cols >= cols) stack.pop();
     stack.push({ cols, i });
   });
+  if (testOpts.counts !== undefined) testOpts.counts.walkSteps = walkSteps;
   const jobs: string[] = [];
   // each reading scrubbed first, as the log text is before redact, so a known value doesn't count as a redact hit
   const jobOf: number[][] = lines0.map((r, i) =>

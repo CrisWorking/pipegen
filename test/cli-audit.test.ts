@@ -1646,7 +1646,7 @@ describe('npx pipegen: no command, --help, --type, --verbose and the type questi
     for (const argv of [['inspect', '--type', 'server'], ['inspect', '--verbose']]) {
       const r = await audit(argv, { cwd: dir });
       expect(r.code, argv.join(' ')).toBe(1);
-      expect(r.err).toMatch(/^--(type|verbose) works with pipegen audit only\./);
+      expect(r.err).toMatch(/^--(type|verbose) works with pipegen audit (and pipegen run )?only\./);
     }
   });
 

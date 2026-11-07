@@ -47,7 +47,7 @@ import {
   getAuth, GitHubAccessError, GITHUB_TIMEOUT_MS, hideToken, makeOctokit, permissionsTable, readAccessSteps, readGitHubContext,
 } from '../github/client.js';
 import { NotGitHubRepoError, readProject } from '../read/project.js';
-import { applyTypeOverrides, type TypeOverride } from '../read/project-type.js';
+import type { TypeOverride } from '../read/project-type.js';
 import type { AiProvider, Auth, Capabilities, RepoProfile, ReviewedTool } from '../types.js';
 import { packageVersion } from '../util/package-data.js';
 import { knownValuesFrom, makeSafeOutput, OUTPUT_CAP, usableKnownValues } from '../util/safe-output.js';
@@ -55,7 +55,7 @@ import { safeText } from '../util/safe-text.js';
 import { askConsent, consentScreen } from './consent.js';
 import { tokenLogin } from './inspect.js';
 import type { CliIO, Prompter } from './io.js';
-import { confirmTypes } from './type-confirm.js';
+import { typeStep } from './type-confirm.js';
 
 /** The AI providers `--ai` accepts (ruling S15). */
 export const AI_CHOICES = ['claude', 'openai', 'ollama'] as const;
@@ -180,22 +180,16 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
 
     // 2b. the types (B1): --type checked against the services read; else, at a terminal and without --json, the type
     //     question (S9). Both before any GitHub call; a cancel reads nothing from GitHub and prints no report.
-    let typeOverrides: readonly TypeOverride[] = flags.types ?? [];
-    if (typeOverrides.length > 0) {
-      try {
-        applyTypeOverrides(local, typeOverrides);
-      } catch (e) {
-        fail(clean(e instanceof Error ? e.message : String(e)));
-        return 1;
-      }
-    } else if (io.interactive === true && !flags.json && local.services.length > 0) {
-      const answer = await confirmTypes(scrubbed(io.prompt), local.services);
-      if (answer === 'cancel') {
-        fail(TYPE_CANCELLED);
-        return 0;
-      }
-      typeOverrides = answer;
+    const typed = await typeStep(scrubbed(io.prompt), io.interactive === true && !flags.json, local, flags.types ?? []);
+    if ('error' in typed) {
+      fail(clean(typed.error));
+      return 1;
     }
+    if ('cancel' in typed) {
+      fail(TYPE_CANCELLED);
+      return 0;
+    }
+    const typeOverrides: readonly TypeOverride[] = typed.overrides;
 
     // 3. GitHub, read-only, one rate budget for the whole run (S18). DoD run 2026-10-29 (Plan U: "discovery stops
     //    early, keeping what passed"): a rate stop at any point keeps what was read and goes on from the files; the

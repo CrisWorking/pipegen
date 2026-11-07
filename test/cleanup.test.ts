@@ -408,7 +408,8 @@ describe('E8 cleanup source scan', () => {
     const files = (readdirSync(root, { recursive: true }) as string[]).filter((f) => f.endsWith('.ts'));
     for (const f of files) {
       const src = readFileSync(join(root, f), 'utf8');
-      const allowed = f === join('proof', 'target.ts') || f === join('proof', 'cleanup.ts');
+      // Plan V V6 (V-S14): uninstall's phase-bound api is the one other caller, so run 2 empties the scratch repo only through E's functions
+      const allowed = f === join('proof', 'target.ts') || f === join('proof', 'cleanup.ts') || f === join('uninstall', 'apply.ts');
       if (!allowed) expect(src, f).not.toMatch(/\b(?:cleanupWrite|deleteScratchRepo)\b/);
     }
   });

@@ -97,7 +97,7 @@ function branchesInclude(patterns: string[], name: string): boolean {
 const isSet = (cfg: Obj, key: string) => key in cfg && cfg[key] !== null;
 
 /** Whether a push or pull_request filter lets `name` through (`branches` and `branches-ignore` together are invalid). */
-function branchFilter(cfg: Obj): (name: string) => boolean {
+export function branchFilter(cfg: Obj): (name: string) => boolean {
   const hasB = isSet(cfg, 'branches');
   const hasBi = isSet(cfg, 'branches-ignore');
   if (hasB && hasBi) return () => false;

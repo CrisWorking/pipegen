@@ -1264,3 +1264,158 @@ describe('G7-R3: STRONG and WEAK reasons; a job gated only by its runner or vars
     expect(src).toMatch(/\/\*\*[^\n]*\*\/\nexport const HEAD_CHECK_ENV:/);
   });
 });
+
+// ---------- G13: the G7-R2 carry (BINDING): the head check in the jobs of a local called workflow ----------
+
+const SHIP = '.github/workflows/ship.yml';
+/** A deploy that calls a local workflow (shape A: two-space indentation, a build job first). */
+const CALLER_A = [
+  'name: deploy',
+  'on:',
+  '  push:',
+  '    branches: [main]',
+  'jobs:',
+  '  build:',
+  '    runs-on: ubuntu-latest',
+  '    permissions:',
+  '      contents: read',
+  '    steps:',
+  '      - run: npm run build',
+  '  ship:',
+  '    needs: build',
+  '    uses: ./.github/workflows/ship.yml',
+  `    ${['sec', 'rets'].join('')}: inherit`,
+  '',
+].join('\n');
+/** The called workflow: an approval wait (environment) and a smoke job after it. */
+const CALLED_A = [
+  'on:',
+  '  workflow_call:',
+  'jobs:',
+  '  deploy:',
+  '    runs-on: ubuntu-latest',
+  '    environment: production',
+  '    steps:',
+  '      - run: ./ship.sh   # the user\'s own comment',
+  '  smoke:',
+  '    needs: deploy',
+  '    runs-on: ubuntu-latest',
+  '    steps:',
+  '      - run: ./smoke.sh',
+  '',
+].join('\n');
+/** Shape B: four-space indentation, the call is the only job, the called workflow has one job and no newline at the end. */
+const CALLER_B = 'on:\n    push:\n        branches:\n            - main\njobs:\n    release:\n        uses: ./.github/workflows/ship.yml\n';
+const CALLED_B = 'on: workflow_call\njobs:\n    publish:\n        runs-on: ubuntu-latest\n        environment:\n            name: production\n        steps:\n            -   run: ./publish.sh';
+const calledWorld = (caller: string, called: string, extra: [string, string][] = []): World => world('keyless', [[A, caller], [SHIP, called], ...extra]);
+const insertAt = (w: World, path: string) => w.v.inserts.find((i) => i.path === path);
+
+describe('G13: the head check in a local called workflow (G7-R2 carry, BINDING)', () => {
+  for (const [shape, caller, called, jobIds] of [['A', CALLER_A, CALLED_A, ['deploy', 'smoke']], ['B', CALLER_B, CALLED_B, ['publish']]] as const) {
+    it(`G13 G7-R2: every job of a called workflow starts with the head check; the called file is no gap (shape ${shape})`, async () => {
+      const w = calledWorld(caller, called);
+      const ins = insertAt(w, SHIP);
+      expect(ins?.inserted).toMatchObject({ original: called, jobs: [], needs: [], headCheck: [...jobIds], calledBy: [A] });
+      expect(w.v.gaps.map((g) => g.path)).not.toContain(SHIP);
+      const js = parse(ins?.text as string) as Obj;
+      const want = (parse(String(new (await import('yaml')).Document(renderHeadCheckStep('main'))) ) as Obj);
+      for (const id of jobIds) {
+        const steps = ((js.jobs as Obj)[id] as Obj).steps as Obj[];
+        expect(steps[0]?.id).toBe(HEAD_CHECK_STEP_ID);
+        expect(steps[0]?.run).toBe(want.run);
+        steps.shift();
+      }
+      expect(js).toEqual(parse(called));   // nothing else changed
+      // no residual "calls another workflow" note for the covered call; the preview says what pipegen did
+      expect(w.v.notes.join('\n')).not.toMatch(/calls another workflow, so pipegen can not start it/);
+      expect(w.v.preview.join('\n')).toMatch(/ship\.yml: pipegen starts .* with its head check/);
+      expect(shown(await judge(w))).toBe('');
+    });
+  }
+
+  it('G13 G7-R2: the referee refuses a called edit without every head check, with a step after it that runs on failure, or with no gated caller', async () => {
+    const w = calledWorld(CALLER_A, CALLED_A);
+    const ins = insertAt(w, SHIP) as VerifyPlan['inserts'][number];
+    const caller = insertAt(w, A)?.file as CreatedFile;
+    const head = ins.text.indexOf('      - id: pipegen-head-check', ins.text.indexOf('  smoke:'));
+    const end = ins.text.indexOf('      - run: ./smoke.sh');
+    expect(head).toBeGreaterThan(0);
+    // (a) smoke without its head check
+    const noSmoke = { ...ins.file, content: ins.text.slice(0, head) + ins.text.slice(end) };
+    expect(shown(await judge(w, [caller, noSmoke]))).toMatch(/smoke.*head check|Every job of a called workflow/);
+    // (b) a later step that runs after a failed check
+    const always = { ...ins.file, content: ins.text.replace('      - run: ./smoke.sh', '      - if: always()\n        run: ./smoke.sh') };
+    expect(shown(await judge(w, [caller, always]))).toMatch(/after pipegen's head check failed/);
+    // (c) the caller left out of the batch, or a caller that does not wait for pipegen-verify
+    expect(shown(await judge(w, [ins.file]))).toMatch(/names as its caller is not in this batch/);
+    const forged = { ...ins.file, inserted: { ...ins.inserted, calledBy: ['.github/workflows/other.yml'] } };
+    expect(shown(await judge(w, [caller, forged]))).toMatch(/names as its caller/);
+    // (d) a mark that claims a job pipegen added
+    const job = { ...ins.file, inserted: { ...ins.inserted, jobs: ['pipegen-verify'] } };
+    expect(shown(await judge(w, [caller, job]))).not.toBe('');
+  });
+
+  it('G13-R1 sec M1: the referee refuses a caller that does not wait for pipegen-verify, an anchored head check, defaults or env that change it, another trigger, a head check on no job', async () => {
+    const w = calledWorld(CALLER_A, CALLED_A);
+    const ins = insertAt(w, SHIP) as VerifyPlan['inserts'][number];
+    const caller = insertAt(w, A)?.file as CreatedFile;
+    const both = (content: string, original: string = ins.inserted.original as string): CreatedFile => ({ ...ins.file, content, inserted: { ...ins.inserted, original } } as CreatedFile);
+    expect(shown(await judge(w, [caller, ins.file]))).toBe('');
+    // (e) the caller calls this file but no longer waits for pipegen-verify
+    const cdoc = parseDocument(caller.content);
+    cdoc.setIn(['jobs', 'ship', 'needs'], 'build');
+    const unwaited = { ...caller, content: cdoc.toString({ lineWidth: 0 }) };
+    expect(shown(await judge(w, [unwaited, ins.file]))).toMatch(/has no job that calls this file and waits for pipegen-verify/);
+    // (f) the head check written through a YAML anchor
+    const anchored = ins.text.replace('      - id: pipegen-head-check', '      - &hc\n        id: pipegen-head-check');
+    expect(anchored).not.toBe(ins.text);
+    expect(shown(await judge(w, [caller, both(anchored)]))).toMatch(/uses a YAML anchor or alias/);
+    // (g) workflow defaults: only defaults.run.shell bash or sh
+    const withDefaults = (d: string, t: string): string => t.replace('jobs:\n', `${d}jobs:\n`);
+    const wd = 'defaults:\n  run:\n    working-directory: elsewhere\n';
+    expect(shown(await judge(w, [caller, both(withDefaults(wd, ins.text), withDefaults(wd, CALLED_A))]))).toMatch(/defaults that would change pipegen's head check/);
+    const pwsh = 'defaults:\n  run:\n    shell: pwsh\n';
+    expect(shown(await judge(w, [caller, both(withDefaults(pwsh, ins.text), withDefaults(pwsh, CALLED_A))]))).toMatch(/defaults that would change pipegen's head check/);
+    const shell = 'defaults:\n  run:\n    shell: bash\n';
+    expect(shown(await judge(w, [caller, both(withDefaults(shell, ins.text), withDefaults(shell, CALLED_A))]))).toBe('');
+    // (h) a workflow env that changes how the check runs
+    const env = `env:\n  ${['BASH', 'ENV'].join('_')}: ./evil.sh\n`;
+    expect(shown(await judge(w, [caller, both(withDefaults(env, ins.text), withDefaults(env, CALLED_A))]))).toMatch(/changes how code runs on the runner/);
+    // (i) started by more than workflow_call (in the file and its original)
+    const disp = (t: string): string => t.replace('  workflow_call:\n', '  workflow_call:\n  workflow_dispatch:\n');
+    expect(shown(await judge(w, [caller, both(disp(ins.text), disp(CALLED_A))]))).toMatch(/started by workflow_call alone/);
+    // (j) the mark names a head check on a job the file does not have
+    const ghost = { ...ins.file, inserted: { ...ins.inserted, headCheck: [...(ins.inserted.headCheck as string[]), 'ghost'] } } as CreatedFile;
+    expect(shown(await judge(w, [caller, ghost]))).toMatch(/Every job of a called workflow|not a job of the workflow/);
+    // (j2) a job left without the head check, and the mark leaving it out too: only the list check sees it
+    const head = ins.text.indexOf('      - id: pipegen-head-check', ins.text.indexOf('  smoke:'));
+    const end = ins.text.indexOf('      - run: ./smoke.sh');
+    const unmarked = { ...ins.file, content: ins.text.slice(0, head) + ins.text.slice(end), inserted: { ...ins.inserted, headCheck: ['deploy'] } } as CreatedFile;
+    expect(shown(await judge(w, [caller, unmarked]))).toMatch(/Every job of a called workflow pipegen edits must start with its head check/);
+    // (j3) a job added to the called file is named as such (the rest compare refuses it too)
+    const added = { ...ins.file, content: `${ins.text.trimEnd()}\n  extra:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n` } as CreatedFile;
+    expect(shown(await judge(w, [caller, added]))).toMatch(/adds or removes a job of the user's called workflow/);
+    // (j4) any other change to the user's file (a step's command) is refused
+    const changed = { ...ins.file, content: ins.text.replace('./ship.sh', './other.sh') } as CreatedFile;
+    expect(changed.content).not.toBe(ins.text);
+    expect(shown(await judge(w, [caller, changed]))).toMatch(/changes the user's called workflow beyond the head checks/);
+    // (k) update can not renew a verify job in a called file (it holds none)
+    expect(() => renewVerifyJob(ins.text, ins.inserted, w.a.verify as Job)).toThrow(/no pipegen-verify job/);
+  });
+
+  it('G13 G7-R2: no head check in a called workflow another, ungated workflow calls, or one started by more than workflow_call; the residual note says why', () => {
+    const lint = 'on: pull_request\njobs:\n  check:\n    uses: ./.github/workflows/ship.yml\n';
+    const w = world('keyless', [[A, CALLER_A], [SHIP, CALLED_A]], { profile: { existingWorkflows: [wfOf(A), wfOf(SHIP), { ...wfOf('.github/workflows/lint.yml'), deploys: false }] } });
+    const v = planVerifyInserts(w.a.draft, new Map([[A, CALLER_A], [SHIP, CALLED_A], ['.github/workflows/lint.yml', lint]]), w.a.verify);
+    expect(v.inserts.map((i) => i.path)).toEqual([A]);
+    expect(v.notes.join('\n')).toMatch(/"ship" calls another workflow.*also called by ".github\/workflows\/lint.yml:check"/s);
+    const dispatch = CALLED_A.replace('  workflow_call:', '  workflow_call:\n  workflow_dispatch:');
+    const u = calledWorld(CALLER_A, dispatch);
+    expect(insertAt(u, SHIP)).toBeUndefined();
+    expect(u.v.notes.join('\n')).toMatch(/started by more than workflow_call/);
+    // the called file is a gap when nothing pipegen gates calls it (a workflow_call deploy on its own)
+    const alone = world('keyless', [[SHIP, CALLED_A]]);
+    expect(alone.v.gaps.map((g) => g.path)).toEqual([SHIP]);
+    expect(alone.v.gaps[0]?.why).toMatch(/workflow_call/);
+  });
+});

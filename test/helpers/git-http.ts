@@ -60,6 +60,10 @@ async function serveCgi(root: string, req: IncomingMessage, res: ServerResponse)
   const out: Buffer[] = [];
   child.stdout.on('data', (c: Buffer) => out.push(c));
   child.stderr.on('data', () => {});
+  // http-backend may exit before reading the whole body (e.g. a rejected push); the reply is on stdout.
+  child.stdin.on('error', (e: NodeJS.ErrnoException) => {
+    if (e.code !== 'EPIPE') throw e;
+  });
   child.stdin.end(body);
   await new Promise<void>((ok) => child.on('close', () => ok()));
   const all = Buffer.concat(out);

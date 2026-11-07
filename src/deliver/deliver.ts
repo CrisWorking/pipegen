@@ -50,7 +50,7 @@ import { safeText } from '../util/safe-text.js';
 import {
   commitFiles, compareStatus, DeliverError, ghRead, ghWrite, isoAt, openOrUpdatePr, readHead, readRepo, readTree, refusedMove, setBranch, statusOf, type RepoRef, type TreeEntry,
 } from './git-data.js';
-import { addLocalLeftovers, centralPrBase, centralUpdateBranch, localRecordPath, ownWholeFile, RecordError, writeRecord, type Leftover, type LocalRecordDeps } from './record.js';
+import { addLocalLeftovers, centralPrBase, centralUpdateBranch, localRecordPath, ownWholeFile, protectedPathsForRecord, RecordError, writeRecord, type Leftover, type LocalRecordDeps } from './record.js';
 import { trustedPrevious } from './trust.js';
 
 export { DeliverError };
@@ -85,7 +85,7 @@ export interface DeliveryInput {
   /** The environments `finish` applies (with reviewers or not). */
   environments?: readonly { name: string; reviewers: boolean }[];
   /** ProofRepos.createdIds / RunState.scratchRepoId, as the run recorded them (Plan V §5 item 5). */
-  proofRepos?: { central?: { repoId?: number; createdByPipegen: boolean }; scratch?: { repoId?: number; createdByPipegen: boolean } };
+  proofRepos?: { central?: { repoId?: number; createdByPipegen: boolean; actionsAccess?: { previous: string } }; scratch?: { repoId?: number; createdByPipegen: boolean } };
   /**
    * The central repo's file list the central CODEOWNERS judge got (`createdInputs.centralFiles`, G8 "added after"; readCentralFileList).
    * Required, and not empty, for a private app and whenever a central file is delivered; deliver refuses a list that differs from the
@@ -522,7 +522,8 @@ function editOfFile(f: CreatedFile, d: DeliveryPlan, delivered: readonly Created
   if (f.inserted !== undefined) {
     if (f.repo !== 'app') throw new DeliverError(`${show(f.path)}: only an app workflow takes pipegen's inserted jobs.`);
     const originalSha = prev?.kind === 'verify-job' ? prev.originalSha : gitBlobSha(f.inserted.original);
-    return { repo: 'app', path: f.path, kind: 'verify-job', jobs: [...f.inserted.jobs], needs: f.inserted.needs.map((n) => ({ job: n.job, added: [...n.added] })), originalSha, writtenShas: appendSha(prev?.writtenShas ?? [], sha) };
+    const heads = f.inserted.headCheck ?? [];
+    return { repo: 'app', path: f.path, kind: 'verify-job', jobs: [...f.inserted.jobs], needs: f.inserted.needs.map((n) => ({ job: n.job, added: [...n.added] })), ...(heads.length > 0 ? { headCheck: [...heads] } : {}), originalSha, writtenShas: appendSha(prev?.writtenShas ?? [], sha) };
   }
   const original = (f.edited as { original: string }).original;
   const rule = CREATED_RULES.find((r) => r.repo === f.repo && r.mode === 'edit' && r.match(f.path, d.draft));
@@ -591,6 +592,8 @@ function buildRecord(x: RecordCtx): InstallRecord {
     ...(prev?.central ?? {}),
     createdByPipegen: prev?.central?.createdByPipegen === true || pc?.createdByPipegen === true,
     ...(pc?.repoId !== undefined ? { repoId: pc.repoId } : prev?.central?.repoId !== undefined ? { repoId: prev.central.repoId } : {}),
+    // G13 carry 24: the level before pipegen's first change; a later run's "before" is pipegen's own level, so the first one stays
+    ...(prev?.central?.actionsAccess !== undefined ? { actionsAccess: prev.central.actionsAccess } : pc?.actionsAccess !== undefined ? { actionsAccess: { previous: pc.actionsAccess.previous } } : {}),
   };
   const scratch = d.proofRepos?.scratch ?? prev?.scratch;
   const cosign = d.draft.signing?.cosignPubSha256 ?? prev?.cosignPubSha256;
@@ -605,7 +608,7 @@ function buildRecord(x: RecordCtx): InstallRecord {
     ...(prev?.orgRuleset === undefined ? {} : { orgRuleset: prev.orgRuleset }),
     ...(prev?.repoSettings === undefined ? {} : { repoSettings: prev.repoSettings }),
     central, ...(scratch === undefined ? {} : { scratch: { ...scratch } }),
-    planned: plannedOf(d), protectedPaths: [...d.protectedPaths],
+    planned: plannedOf(d), protectedPaths: protectedPathsForRecord(d.protectedPaths),
     ...(cosign === undefined ? {} : { cosignPubSha256: cosign }), ...(pub === undefined ? {} : { cosignPub: pub }), ...(prev?.blockFrom === undefined ? {} : { blockFrom: prev.blockFrom }),
   };
 }
@@ -793,7 +796,9 @@ export async function deliver(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vaul
     let env: EnvEntry | null = null;
     let key: SigningKey | null = null;
     let replacePair = false;
-    if (d.draft.signing?.mode === 'key-env') {
+    // G13 carry 60: a re-run whose trusted record already names this public key (a `finish --rotate-key` made it) keeps the stored pair
+    const keepPair = d.draft.signing?.mode === 'key-env' && deps.signingKey === undefined && typeof d.draft.signing.cosignPubSha256 === 'string' && prev?.cosignPubSha256 === d.draft.signing.cosignPubSha256;
+    if (d.draft.signing?.mode === 'key-env' && !keepPair) {
       const want = d.draft.signing.cosignPubSha256;
       if (deps.signingKey === undefined || typeof want !== 'string') throw new DeliverError('key-env signing needs the key pair pipegen made before the setup pull request, and its public key hash.');
       key = await deps.signingKey();

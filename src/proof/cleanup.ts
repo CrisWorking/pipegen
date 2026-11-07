@@ -35,7 +35,7 @@ import { MinutesMeter, proofStart } from './minutes.js';
 import type { PollClock } from './run.js';
 import { StateError, StateStore, type RunState } from './state.js';
 import {
-  assertCentral, assertScratch, cleanupWrite, deleteScratchRepo, githubRead, isProofTarget, proofTarget, ScratchGuardError, validBranchName,
+  assertCentral, assertScratch, cleanupWrite, deleteScratchRepo, githubRead, isProofTarget, ProofStopError, proofTarget, ScratchGuardError, validBranchName,
   type CleanupOp, type GuardedRepo, type ProofTarget,
 } from './target.js';
 
@@ -637,7 +637,10 @@ function stricterVerdict(base: ProofVerdict, extra: ProofVerdict | undefined): P
  * reason is kept when it refuses. A prove that returns after the stage left `proving` (a cap stop that saved `stopped`) records
  * no verdict: recordVerdict is refused outside `proving`, and the resume proves again.
  */
-export async function proveThenClean<T>(store: StateStore, prove: () => Promise<T>, cleanup: () => Promise<CleanupResult>, verdict?: (outcome: T) => ProofVerdict): Promise<{ outcome: T; cleanup: CleanupResult }> {
+export async function proveThenClean<T>(
+  store: StateStore, prove: () => Promise<T>, cleanup: () => Promise<CleanupResult>, verdict?: (outcome: T) => ProofVerdict,
+  opts: { stopDraft?: () => PipelineDraft | undefined } = {},
+): Promise<{ outcome: T; cleanup: CleanupResult }> {
   const best = (f: () => void): void => { try { f(); } catch { /* a state write never skips the cleanup */ } };
   let outcome!: T;
   let failed = false;
@@ -650,6 +653,14 @@ export async function proveThenClean<T>(store: StateStore, prove: () => Promise<
   }
   if (failed) {
     if (failure instanceof CapReachedError && store.state?.stage !== 'stopped') { const kind = failure.cap.kind; best(() => store.setStage('stopped', { stoppedBy: kind })); }
+    // G14-R1 (spec M2): a stop mid-proof (ProofStopError) keeps the latest draft the proof ran, as a failed verdict (a resume starts from
+    // it and proves it again; never a pass)
+    const stopDraft = failure instanceof ProofStopError && store.state?.stage === 'proving' ? opts.stopDraft?.() : undefined;
+    if (stopDraft !== undefined) {
+      let saved = false;
+      best(() => { store.recordVerdict({ ok: false, draft: stopDraft, stopped: (failure as Error).message }); saved = true; });
+      if (saved) best(() => store.setStage('stopped', { stoppedBy: 'proof-failed' }));
+    }
   } else {
     let v: ProofVerdict;
     try { v = stricterVerdict(proofVerdict(outcome), verdict === undefined ? undefined : verdict(outcome)); } catch { v = { ok: false }; }

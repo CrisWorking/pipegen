@@ -6,6 +6,7 @@ import { floorNeeds } from '../src/engine/needs.js';
 import { readPrecommit, readWorkflows } from '../src/read/workflows.js';
 import type { Capabilities, ExistingWorkflow, Layer, RepoProfile, Service } from '../src/types.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
+import { expectScaling } from './helpers/scaling.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
 
 // Ruling P33: a never-listed action (trivy-action, zizmor-action, …) is partial whatever its inputs. Older tests use
@@ -2887,22 +2888,31 @@ describe('mapCoverage (Plan P Task 3 fix round 1)', () => {
       'deploy', 'egress')).toBe('covered bullfrog');
   });
 
+  // G17: bounded as a ratio (expectScaling), not a wall-clock budget, so a loaded machine doesn't fail it
   it('fix round 1 (perf): the release-wide egress pass and the config-file pass stay linear', async () => {
-    const dir = makeTempDir();
     const bf20 = bfStep().repeat(20);
-    for (let f = 0; f < 10; f++) {
-      let body = `${relOn}jobs:\n`;
-      for (let j = 0; j < 100; j++) body += `  j${j}:\n    runs-on: ubuntu-latest\n    steps:\n${j % 2 ? run('echo') : ''}${bf20}${run('npm publish')}${run('trivy image --exit-code 1 app:1')}`;
-      writeIn(dir, `.github/workflows/w${f}.yml`, body);
-    }
-    writeIn(dir, 'trivy.yaml', 'x: 1\n');
-    const p = await profileOf(dir, base);
-    const t = performance.now();
-    const rows = await mapCoverage(p, floorNeeds(p, caps), dir, { capabilities: caps });
-    expect(performance.now() - t).toBeLessThan(5000);
-    expect(row(rows, 'deploy', 'egress', 'app').status).toBe('partial');
-    expect(row(rows, 'merge', 'image-scan', 'app').status).toBe('partial');
-  });
+    const repoOf = async (workflows: number) => {
+      const dir = makeTempDir();
+      for (let f = 0; f < workflows; f++) {
+        let body = `${relOn}jobs:\n`;
+        for (let j = 0; j < 100; j++) body += `  j${j}:\n    runs-on: ubuntu-latest\n    steps:\n${j % 2 ? run('echo') : ''}${bf20}${run('npm publish')}${run('trivy image --exit-code 1 app:1')}`;
+        writeIn(dir, `.github/workflows/w${f}.yml`, body);
+      }
+      writeIn(dir, 'trivy.yaml', 'x: 1\n');
+      return { dir, p: await profileOf(dir, base) };
+    };
+    const repos = { small: await repoOf(3), big: await repoOf(12) };
+    const big = await mapCoverage(repos.big.p, floorNeeds(repos.big.p, caps), repos.big.dir, { capabilities: caps });
+    expect(row(big, 'deploy', 'egress', 'app').status).toBe('partial');
+    expect(row(big, 'merge', 'image-scan', 'app').status).toBe('partial');
+    // 4 times the workflows: linear is about 4 times the time, a pass over every hit for each hit about 16 times
+    await expectScaling('egress and config passes', async (size) => {
+      const { dir, p } = repos[size];
+      const t = performance.now();
+      await mapCoverage(p, floorNeeds(p, caps), dir, { capabilities: caps });
+      return performance.now() - t;
+    }, 9);
+  }, 120_000);
 });
 
 describe('mapCoverage (Plan P final review I1, ruling P33)', () => {
