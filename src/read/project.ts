@@ -7,7 +7,7 @@ import { PATH_SHOWN_MAX, safeText } from '../util/safe-text.js';
 import { CODE_FILE_RE, PLAIN_PATH_RE, PORT_RULES, REQUIREMENTS_FILE_RE, asObj, asString, asStrings, baseOf, dirOf, inDir, isTestFile, pythonNames, readPyproject, requirementLines, type Obj } from './manifest.js';
 import { readEnv } from './env.js';
 import { copySources, dockerfilesOf, notStandaloneOf, type DockerCopy } from './service-kind.js';
-import { bakeBuildRefs, chooseContainerFile, composeBuildRefs, containerFilesIn, containerHintOf, isContainerFileName, workflowBuildRefs } from './container-file.js';
+import { bakeBuildRefs, bakeJsonBuildRefs, chooseContainerFile, composeBuildRefs, containerFilesIn, containerHintOf, isContainerFileName, workflowBuildRefs } from './container-file.js';
 import { finishProjectTypes, projectTypeOf, untrackedIgnoredOf } from './project-type.js';
 import { newQualityRun, npmLockfileVersion as npmLockfileVersionOf, readRepoFiles, readServiceQuality, type QualityRun } from './quality.js';
 import { MAX_WORKFLOWS, readPrecommit, readWorkflows, WORKFLOW_FILE } from './workflows.js';
@@ -109,8 +109,11 @@ const OTHER_APP_MANIFESTS = ['pyproject.toml', 'setup.py', 'go.mod'];
 const NOT_SERVICE_DIRS = ['.devcontainer', 'test', 'tests', '__tests__', 'fixtures', 'examples', 'docs', 'example', 'e2e', 'playwright', 'cypress', '.storybook', 'scripts', 'demo', 'samples', 'testdata', 'benchmark'];
 const plainPath = (p: string): string => (PLAIN_PATH_RE.test(p) ? p : 'a folder');
 /** GJ-R3 (H1 b): the compose and bake files whose build contexts count as image builds; GJ-R4 (N5): at most 20 of each, 2 MB of text in all. */
-const COMPOSE_FILE_RE = /^(?:docker-)?compose(?:\.[\w-]+)?\.ya?ml$/i;
-const BAKE_FILE_RE = /^docker-bake(?:\.[\w-]+)?\.hcl$/i;
+// G17 row 67 (N6): and `docker-compose-prod.yml` / `compose_dev.yaml` names, and `docker-bake.json`
+const COMPOSE_FILE_RE = /^(?:docker-)?compose(?:[._-][\w.-]+)?\.ya?ml$/i;
+const BAKE_FILE_RE = /^docker-bake(?:[._-][\w.-]+)?\.(?:hcl|json)$/i;
+/** G17 row 71: folders whose container files package the root app itself (the note may say "part of the root app" only for these). */
+const PACKAGING_DIRS = new Set(['docker', '.docker', 'deploy', 'deployment', 'deployments', 'container', 'containers', 'packaging']);
 const MAX_BUILD_FILES = 20;
 const MAX_BUILD_FILE_BYTES = 2_000_000;
 // Root files read by direct path so the file cap can never hide them.
@@ -409,9 +412,10 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
   // GJ-R4 (N5): at most MAX_BUILD_FILES of each kind and MAX_BUILD_FILE_BYTES of text in all, each skip noted
   const buildFileRefs = new Set<string>();
   let buildFileBytes = 0;
+  const overBudget: string[] = [];
   for (const [kind, re, parse] of [
     ['compose', COMPOSE_FILE_RE, (f: string, t: string) => composeBuildRefs(f, parseYamlLimited(t), buildFileRefs)],
-    ['bake', BAKE_FILE_RE, (f: string, t: string) => bakeBuildRefs(f, t, buildFileRefs)],
+    ['bake', BAKE_FILE_RE, (f: string, t: string) => (/\.json$/i.test(f) ? bakeJsonBuildRefs(f, JSON.parse(t), buildFileRefs) : bakeBuildRefs(f, t, buildFileRefs))],
   ] as const) {
     // GJ-R5: shallow paths first (then by name), so the cap never pushes out the root compose file
     const depth = (x: string) => x.split('/').length;
@@ -421,9 +425,14 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
       const t = await readFile(ctx, f);
       if (t === null) continue;
       buildFileBytes += Buffer.byteLength(t);
-      if (buildFileBytes > MAX_BUILD_FILE_BYTES) { note(ctx, `Skipped ${safeText(f, PATH_SHOWN_MAX)}: the compose and bake files pipegen reads for image builds are over 2 MB together.`); continue; }
+      if (buildFileBytes > MAX_BUILD_FILE_BYTES) { overBudget.push(f); continue; }
       try { parse(f, t); } catch { note(ctx, `Skipped ${safeText(f, PATH_SHOWN_MAX)}: it could not be parsed.`); }
     }
+  }
+  // G17 row 70: one note for every file the 2 MB budget skipped (it named each file, up to about 40 notes)
+  if (overBudget.length > 0) {
+    const shown = overBudget.slice(0, 5).map((f) => safeText(f, PATH_SHOWN_MAX)).join(', ') + (overBudget.length > 5 ? ', …' : '');
+    note(ctx, `Skipped ${overBudget.length === 1 ? shown : `${overBudget.length} files (${shown})`}: the compose and bake files pipegen reads for image builds are over 2 MB together.`);
   }
   const allBuildRefs: ReadonlySet<string> = new Set([...workflowRefs, ...buildFileRefs]);
   // Which directories are services: workspace packages that can run, else directories with a Dockerfile, else the root.
@@ -454,14 +463,22 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
     // as at 2450960, or (b) when a workflow, compose or bake file builds one of its container files (a pushed image, GJ-r1 N2); a folder
     // with its own manifest and only suffixed container files (client/Dockerfile.dev) is the root app's too
     const plainContainer = (d: string) => ctx.fileSet.has(inDir(d, 'Dockerfile')) || ctx.fileSet.has(inDir(d, 'Containerfile'));
-    const built = (d: string) => containerFilesIn(ctx.fileSet, d).some((f) => allBuildRefs.has(f));
-    const ownApp = (d: string) => (plainContainer(d) && (appManifest(d) || codeDirs.has(d))) || built(d);
+    // G17 row 72: a build whose context is the folder builds its plain Dockerfile or Containerfile (docker build tools)
+    const built = (d: string) => containerFilesIn(ctx.fileSet, d).some((f) => allBuildRefs.has(f)) || (allBuildRefs.has(d) && plainContainer(d));
+    const ownAppRaw = (d: string) => (plainContainer(d) && (appManifest(d) || codeDirs.has(d))) || built(d);
+    // G17 row 71: a folder under .github (a container action, .github/actions/n) is never the app's service
+    const inGithub = (d: string) => d === '.github' || d.startsWith('.github/');
+    const ownApp = (d: string) => !inGithub(d) && ownAppRaw(d);
     const subs = dockerDirs.filter((d) => d !== '.');
     if (appManifest('.') && subs.some((d) => !ownApp(d))) {
       dirs = ['.', ...subs.filter(ownApp)];
       for (const d of subs.filter((x) => !ownApp(x))) {
         const why = plainContainer(d) ? 'a plain Dockerfile but no app manifest or code' : 'container files but no plain Dockerfile or Containerfile';
-        note(ctx, `The folder ${plainPath(d)} has ${why}, and no workflow, compose or bake file builds it, so pipegen takes it as part of the root app and does not build or scan its image.`);
+        if (ownAppRaw(d)) { note(ctx, `The folder ${plainPath(d)} holds a GitHub Actions container file, not the app, so pipegen does not take it as a service and does not build or scan its image.`); continue; }
+        // G17 row 71: "part of the root app" only for a packaging folder (docker/, deploy/); a tools/ image or a container action is not the app
+        const what = inGithub(d) ? 'does not take it as a service of its own (a GitHub Actions container file is not the app)'
+          : PACKAGING_DIRS.has(baseOf(d)) ? 'takes it as part of the root app' : 'does not take it as a service of its own';
+        note(ctx, `The folder ${plainPath(d)} has ${why}, and no workflow, compose or bake file builds it, so pipegen ${what} and does not build or scan its image.`);
       }
     } else dirs = dockerDirs.length > 0 ? dockerDirs : ['.'];
   } else {
