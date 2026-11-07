@@ -180,7 +180,7 @@ function templateEnv(tool: ReviewedTool, hooks: CliHooks): Record<string, string
   return env;
 }
 
-interface PinnedConfig { flag: string; content: string; fileName: string }
+interface PinnedConfig { flag: string; content: string; fileName: string; /** G15a round 6: named by its absolute path inside the work mount */ atMount?: true }
 
 /** The pinned config of an entry, cross-checked with its reviewed policy. Null when neither has one. */
 function configOf(tool: ReviewedTool, pol: ArgvPolicy): PinnedConfig | null {
@@ -193,7 +193,7 @@ function configOf(tool: ReviewedTool, pol: ArgvPolicy): PinnedConfig | null {
   if (p === undefined || p.flag !== fx.passAs.flag || p.content !== fx.content) return refuse(`The pinned config of ${show(tool.id)} differs from the one its argv policy reviewed.`);
   if (typeof p.fileName !== 'string' || !FILE_NAME_RE.test(p.fileName)) return refuse(`The argv policy of ${show(tool.id)} gives its config a file name that is not plain.`);
   if (!CONFIG_FLAG_RE.test(p.flag)) return refuse(`The config flag of ${show(tool.id)} is not a plain flag.`);
-  return { flag: p.flag, content: fx.content, fileName: p.fileName };
+  return { flag: p.flag, content: fx.content, fileName: p.fileName, ...(p.atMount === true ? { atMount: true as const } : {}) };
 }
 
 function checkInstall(tool: ReviewedTool, pol: ArgvPolicy): InstallSpec {
@@ -249,14 +249,14 @@ function wordOf(word: string, tool: ReviewedTool, spec: StepSpec, w: Words): str
 
 const isBoolChoice = (values: readonly string[]): boolean => values.length === 2 && values.includes('false') && values.includes('true');
 
-interface Built { main: string[]; then: string[][]; env: Record<string, string>; /** `"$PIPEGEN_ARG_n"` of the archive sub-folder choice */ sub?: string; /** repo-path slot variables (checked at run time) */ paths: string[]; fullHistory: boolean }
+interface Built { main: string[]; then: string[][]; env: Record<string, string>; /** G15a round 6: `NAME="$PIPEGEN_ARG_n"` of each env slot (docker -e) */ envWords: string[]; /** `"$PIPEGEN_ARG_n"` of the archive sub-folder choice */ sub?: string; /** repo-path slot variables (checked at run time) */ paths: string[]; fullHistory: boolean }
 
 /**
  * The words after the executable, as shell words: placeholders become quoted env variables, the pinned config flag goes
  * right after the leading subcommand words (a Go or urfave tool stops reading flags at the first plain word), and a
  * dedicated tool's choices are appended as `--<choice> "$V"` (a bool choice `--<choice>="$V"`).
  */
-function buildWords(tool: ReviewedTool, spec: StepSpec, pol: ArgvPolicy, config: PinnedConfig | null, configPath: string | null, slots: Slot[], tuned: TuningEffects): Built {
+function buildWords(tool: ReviewedTool, spec: StepSpec, pol: ArgvPolicy, config: PinnedConfig | null, configPath: string | null, slots: Slot[], tuned: TuningEffects, envSlots: readonly Slot[] = []): Built {
   const cli = tool.step.cli as NonNullable<typeof tool.step.cli>;
   const w: Words = { env: {}, index: new Map() };
   const rest = cli.command.slice(1);
@@ -276,6 +276,11 @@ function buildWords(tool: ReviewedTool, spec: StepSpec, pol: ArgvPolicy, config:
     if (at >= 0 && at + 1 < rest.length) main[at + 1] = v;
     else main.push(q(sl.key), v);
   }
+  // G15a round 6: an env slot is never a word of the command; the docker branch passes it as `-e NAME="$PIPEGEN_ARG_n"`
+  const envWords = envSlots.map((sl) => {
+    if (!NAME_RE.test(sl.key) || sl.key !== sl.key.toUpperCase() || !sl.key.startsWith('PIPEGEN_')) return refuse(`The env slot ${show(sl.key)} of ${show(tool.id)} is not a plain PIPEGEN_ name.`);
+    return `${sl.key}=${argVar(w, `env:${sl.key}`, sl.value)}`;
+  });
   // the archive folder: a tool run on the runner is told the checked-out folder where the reviewed command names its directory
   if (pol.archive !== undefined && pol.method !== 'docker') {
     let hit = 0;
@@ -307,7 +312,7 @@ function buildWords(tool: ReviewedTool, spec: StepSpec, pol: ArgvPolicy, config:
     if (isBoolChoice(values)) main.push(`--${name}=${v}`);
     else main.push(`--${name}`, v);
   }
-  return { main, then, env: w.env, ...(sub === undefined ? {} : { sub }), paths, fullHistory };
+  return { main, then, env: w.env, envWords, ...(sub === undefined ? {} : { sub }), paths, fullHistory };
 }
 
 
@@ -316,9 +321,9 @@ function buildWords(tool: ReviewedTool, spec: StepSpec, pol: ArgvPolicy, config:
 interface Slot { key: string; kind: SlotKind; value: string }
 
 /** The slot values of an entry, from the render context and the profile only, each checked by slots.ts. */
-function slotsOf(tool: ReviewedTool, pol: ArgvPolicy, service: Service | undefined, ctx: RenderContext, spec: StepSpec): Slot[] {
+function slotsOf(tool: ReviewedTool, pol: ArgvPolicy, service: Service | undefined, ctx: RenderContext, spec: StepSpec, table: Readonly<Record<string, SlotKind>> | undefined = pol.slots): Slot[] {
   const out: Slot[] = [];
-  for (const [key, kind] of Object.entries(pol.slots ?? {})) {
+  for (const [key, kind] of Object.entries(table ?? {})) {
     let value: string | undefined;
     let what: string;
     if (kind === 'image-digest') { value = ctx.targets?.image; what = 'the image to scan (an image target)'; }
@@ -446,6 +451,8 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   if (pol === undefined) return refuse(`${show(tool.id)} has no reviewed argv allowlist, so pipegen won't run it.`);
   if (pol.entrypoint === true) return refuse(`${show(tool.id)} is a job service (the image runs its own entrypoint), not a step; the job composer starts it.`);
   if (pol.needsSlot !== undefined) return refuse(`${show(tool.id)} ${pol.needsSlot}.`);
+  // G15a round 6: the ZAP AF active scan is pipegen's own nightly scan, never a need's step (the AI can not pick it: reviewedFor)
+  if (pol.nightlyOnly === true && ctx.nightly !== true) return refuse(`${show(tool.id)} runs only in pipegen's own nightly scan, never as a check of the pipeline.`);
   const install = checkInstall(tool, pol);
 
   const secrets = spec.secrets ?? [];
@@ -473,10 +480,16 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
 
   const config = configOf(tool, pol);
   // where the tool finds its config: a file on the runner, the work folder's own file (ZAP reads -c there), or a read-only mount
-  const configPath = config === null ? null : kind !== 'docker' ? `"${cfgBase}/${config.fileName}"` : inWork ? q(config.fileName) : q(`/pipegen-cfg/${config.fileName}`);
+  // G15a round 6: a config named by its absolute path in the work mount (zap.sh reads a relative -autorun path from /zap, not the cwd)
+  if (config?.atMount === true && !inWork) return refuse(`${show(tool.id)} names its config inside a work folder it does not mount.`);
+  const configPath = config === null ? null : kind !== 'docker' ? `"${cfgBase}/${config.fileName}"` : inWork ? q(config.atMount === true ? `${(mount as NonNullable<typeof mount>).at}/${config.fileName}` : config.fileName) : q(`/pipegen-cfg/${config.fileName}`);
   const slots = slotsOf(tool, pol, service, ctx, spec);
+  const envSlots = slotsOf(tool, pol, service, ctx, spec, pol.envSlots ?? {});
+  if (envSlots.length > 0 && !(kind === 'docker' && inWork && tool.categories.some((c) => DAST_CATEGORIES.has(c)) && envSlots.every((sl) => sl.kind === 'local-url'))) {
+    return refuse(`${show(tool.id)} passes a slot in the container env, which only a DAST step in a fresh work folder may do, and only the app's local URL.`);
+  }
   const tuned = tuningEffects(spec, tool, ctx);
-  const built = buildWords(tool, spec, pol, config, configPath, slots, tuned);
+  const built = buildWords(tool, spec, pol, config, configPath, slots, tuned, envSlots);
   const tplEnv = templateEnv(tool, hooks);
 
   const env: Record<string, string> = { ...tplEnv, ...built.env };
@@ -566,6 +579,7 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
       }
     }
     for (const n of secrets) docker.push('-e', n);
+    for (const e of built.envWords) docker.push('-e', e);
     docker.push('"$PIPEGEN_IMAGE"', q(exe));
     prefix = docker.join(' ');
     // the result comes from the folder the tool wrote it in: the work folder, or the copied service folder it runs in (-w)

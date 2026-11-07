@@ -27,7 +27,7 @@ import { APP_RUNNING_CATEGORIES, projectScriptSteps, renderCliTool, renderRangeS
 import { ArtifactNameError, resultArtifactName, SECRETS_HISTORY_ARTIFACT, SECRETS_RANGE_ARTIFACT } from './artifact-names.js';
 import { argvPolicyProblems, repoToolFor, type ProjectScriptStep, type RepoToolStep, type ReviewedEntry } from './reviewed.js';
 import { own, RenderError, show } from './render-error.js';
-import { BASE_CHECKOUT_ID, BASELINE_CHECK_STEP_ID, checkExpressions, checkJobOrder, isDangerousName, isReviewed, narrowingChoiceProblem, STEP_KEYS, type JobContext, type RenderedStep, type ScanFact } from './job-rules.js';
+import { BASE_CHECKOUT_ID, BASELINE_CHECK_STEP_ID, checkExpressions, checkJobOrder, isDangerousName, isReviewed, narrowingChoiceProblem, STEP_KEYS, ZAP_ACTIVE_LANE, type JobContext, type RenderedStep, type ScanFact } from './job-rules.js';
 import { GateJobListError } from './gate-job-list.js';
 import { gateStepInputs, nightlyStepInputs } from './gate-inputs.js';
 import { ARGV_POLICIES, ZIZMOR_ONLINE_HOST, ZIZMOR_ONLINE_ID, ZIZMOR_ONLINE_POLICY, allowedDomainsProblem, BULLFROG_USES, egressDomains, BASE_CHECKOUT_REF, DOCKER_ACTION_USES, DOCKER_STEP_IMAGES, DOCKER_STEP_INPUTS, GATE_UPLOAD_FILES, gateUploadPath, uploadIfNoFiles, IMAGE_BUILT_ACTION_USES, isStagedTool, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath, scrubStepId, stagePath, stageStepId } from './tool-flags.js';
@@ -51,6 +51,8 @@ export interface RenderContext {
    * HIGH and CRITICAL, ignore-unfixed on, a pushing image build); absent counts as blocking, so no caller narrows a gate check by forgetting it.
    */
   blocking?: boolean;
+  /** G15a round 6: the render is of pipegen's own nightly scan (dast-handoff.ts zapActiveSpec): only then may a nightly-only entry render. */
+  nightly?: true;
 }
 
 /** `output`: where the tool's RAW result will be, `${{ runner.temp }}/pipegen-raw/<artifact>/<file>` (rulings S7 and B1: never uploadable; scrubbedPath gives the copy the scrub writes); null when the step makes none. */
@@ -89,7 +91,12 @@ export function validateSpec(spec: StepSpec, tool: ReviewedTool, ctx: RenderCont
     problem('tool', `the step's tool ${show(st.id)} is not the reviewed entry ${show(c.id)} at its reviewed version and pin.`);
   }
 
-  if (!(NEED_IDS as readonly string[]).includes(spec.needId)) problem('needId', `${show(spec.needId)} isn't a check pipegen knows.`);
+  // G15a round 6: a nightly-only entry (the ZAP AF active scan) renders only as pipegen's own nightly scan, in its lane (dast-handoff.ts
+  // zapActiveSpec), and that lane's id is a need id of nothing else
+  const nightlyOnly = Object.hasOwn(ARGV_POLICIES, tool.id) && ARGV_POLICIES[tool.id]?.nightlyOnly === true;
+  if (nightlyOnly || spec.needId === ZAP_ACTIVE_LANE) {
+    if (!(nightlyOnly && ctx.nightly === true && spec.needId === ZAP_ACTIVE_LANE)) problem('tool', `${show(tool.id)} runs only as pipegen's own nightly ZAP active scan (the ${ZAP_ACTIVE_LANE} lane), never as a check of the pipeline.`);
+  } else if (!(NEED_IDS as readonly string[]).includes(spec.needId)) problem('needId', `${show(spec.needId)} isn't a check pipegen knows.`);
   // a platform-only entry (checkout, setup, upload, login, ...) is a step helper, rendered by renderPlatformStep and never a check of a need; the referee refuses any spec that names one
   else if (!(tool.categories.length === 1 && tool.categories[0] === 'platform') && !toolCoversNeed(tool.categories, spec.needId)) problem('tool', `${show(tool.id)} does not cover the check ${show(spec.needId)} (its categories are ${tool.categories.map((c) => show(c)).join(', ')}).`);
 

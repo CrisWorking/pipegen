@@ -492,7 +492,12 @@ function entryProblems(e: Entry): { message: string; path: (string | number)[] }
       const at = args.flatMap((a, i) => (a === '-z' || a.startsWith('-z') ? [i] : []));
       return at.length === 1 && args[at[0] as number] === '-z' && args[(at[0] as number) + 1] === '-silent';
     };
-    if (!silent(cli?.command ?? []) || !silent(fx.args ?? [])) bad('the ZAP entry must pass exactly one -z, with the value -silent (in the command and fixedInputs.args): no add-on downloads at run time', 'step', 'cli', 'command');
+    // G15a round 6: the AF entry runs zap.sh itself, where -silent is a switch of its own (no add-on update, no call home); its argv policy
+    // allows only -cmd and -silent and requires both, so here it must hold -silent in the command and fixedInputs.args, and no -z
+    const afSilent = (args: readonly string[]) => args.includes('-silent') && !args.some((a) => a.startsWith('-z'));
+    if (cli?.command[0] === 'zap.sh') {
+      if (!afSilent(cli.command) || !afSilent(fx.args ?? [])) bad('the ZAP AF entry must pass -silent (in the command and fixedInputs.args) and no -z: no add-on downloads at run time', 'step', 'cli', 'command');
+    } else if (!silent(cli?.command ?? []) || !silent(fx.args ?? [])) bad('the ZAP entry must pass exactly one -z, with the value -silent (in the command and fixedInputs.args): no add-on downloads at run time', 'step', 'cli', 'command');
   }
   if (repo === 'semgrep/semgrep' || /(^|\/)semgrep$/.test(cli?.install.package ?? '')) out.push(...semgrepProblems(e));
 
@@ -1412,7 +1417,8 @@ export function reviewedFor(need: Need, language: Language, list: ReviewedTool[]
   if (category === undefined || category !== need.category) return [];
   // the switch is read (and refused in a release build) once per call, before any entry is looked at
   const boot = mode === 'full' && bootstrapProofs(env);
-  return list.filter((t) => t.categories.includes(category)
+  // G15a round 6: a nightly-only entry (the ZAP AF active scan) is pipegen's own, never offered for a need
+  return list.filter((t) => t.categories.includes(category) && !(Object.hasOwn(ARGV_POLICIES, t.id) && ARGV_POLICIES[t.id]?.nightlyOnly === true)
     && (t.languages.includes(language) || t.languages.includes('any'))
     && (mode === 'audit' || fullModeOk(t, boot)));
 }

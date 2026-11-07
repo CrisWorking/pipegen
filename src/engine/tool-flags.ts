@@ -13,6 +13,8 @@ import { policyProblem as gatePolicyProblem } from '../../gate/src/policy-defaul
 import { validDate } from '../../gate/src/date.js';
 // E9 (ruling B5): the reviewed egress host sets, a leaf with no imports
 import { EGRESS_DOMAIN_SETS } from './egress-sets.js';
+// G15a round 6: the reviewed AF plan of the nightly ZAP active scan, a leaf with no imports (its text is the policy's pinned config)
+import { ZAP_ACTIVE_PLAN, ZAP_ACTIVE_PLAN_FILE, ZAP_ACTIVE_TARGET_ENV } from './zap-active.js';
 
 /**
  * betterleaks flags pipegen never passes (catalogue §3 PC2: no egress, no config from the scanned repo). Taken from
@@ -92,7 +94,7 @@ export interface ArgvPolicy extends CommandPolicy {
    * tools pick the parser by name or extension (biome wants biome.json, the ESLint flat config must be .mjs, ruff .toml,
    * viper tools read the extension). One plain file name, never a path.
    */
-  readonly config?: { readonly flag: string; readonly content: string; readonly fileName: string };
+  readonly config?: { readonly flag: string; readonly content: string; readonly fileName: string; readonly atMount?: true };
   /**
    * Docker entries only (6b, ruling S26): where the renderer mounts a folder in the container. `source: 'repo'` is the
    * service folder (with `workdir` also `-w <at>`); `source: 'work'` is a fresh folder under runner temp that holds the
@@ -122,6 +124,16 @@ export interface ArgvPolicy extends CommandPolicy {
    * that is already in the command has its value replaced; otherwise `flag value` is appended.
    */
   readonly slots?: Readonly<Record<string, SlotKind>>;
+  /**
+   * G15a round 6: run-time slots passed into a docker DAST container as an environment variable (`-e NAME="$PIPEGEN_ARG_n"`), never as
+   * argv: the ZAP AF plan reads its target with the AF's own `${NAME}` substitution. Only a `local-url`, only for a docker DAST step.
+   */
+  readonly envSlots?: Readonly<Record<string, 'local-url'>>;
+  /**
+   * G15a round 6: the entry runs only in pipegen's own nightly lane (the ZAP AF active scan, dast-handoff.ts zapActiveSpec): never offered
+   * for a need (reviewed.ts reviewedFor), and the renderer refuses it unless the render context is that lane's (RenderContext.nightly).
+   */
+  readonly nightlyOnly?: true;
   /** For a `repo-path` slot: where the path comes from, a service's Dockerfile or the Kubernetes folder (context target, else `.` when the repo has Kubernetes files). */
   readonly repoPathFrom?: 'dockerfile' | 'k8s-dir';
   /**
@@ -276,6 +288,16 @@ const POLICIES = {
     method: 'docker', package: 'zaproxy/zap-stable', exe: 'zap-baseline.py', dialect: 'goflags', sub: [], flags: { J: 'output', z: { values: ['-silent'] } },
     findingsExit: [1, 2],   // 1: a FAIL alert, 2: a WARN alert (0 is a clean run)
     required: { J: null, z: '-silent' }, mount: { at: '/zap/wrk', source: 'work' }, config: { flag: '-c', content: "# pipegen's pinned ZAP baseline rules: the defaults, nothing ignored\n", fileName: 'zap-baseline.conf' },
+  },
+  // G15a round 6 (P-4): the nightly ZAP Automation Framework active scan, the same pinned image. `zap.sh -cmd -silent` (no UI; no add-on
+  // update, no call home) runs the reviewed plan (zap-active.ts) by its absolute path in the work folder (zap.sh reads a relative -autorun
+  // path from /zap); the target comes in the container env (the plan's ${PIPEGEN_ZAP_TARGET}), never as a word. The AF exits 0 with
+  // alerts and 1 on a plan error, so only exit 0 with a report is a scan (no findings exit). Nightly only: never offered for a need.
+  'zap-af-active': {
+    envSlots: { [ZAP_ACTIVE_TARGET_ENV]: 'local-url' }, network: 'host', asImageUser: true, nightlyOnly: true,
+    method: 'docker', package: 'zaproxy/zap-stable', exe: 'zap.sh', dialect: 'goflags', sub: [], flags: { cmd: 'bool', silent: 'bool' },
+    findingsExit: [],
+    required: { cmd: 'true', silent: 'true' }, mount: { at: '/zap/wrk', source: 'work' }, config: { flag: '-autorun', content: ZAP_ACTIVE_PLAN, fileName: ZAP_ACTIVE_PLAN_FILE, atMount: true },
   },
   // Semgrep CE 1.181.0: rules only from the verified archive (semgrepProblems), no metrics, no version check, and no file-size skip
   // (--max-target-bytes=0: by default semgrep silently skips every file over 1 MB, so padding a file would hide it from SAST; DECISIONS #108)
@@ -432,7 +454,7 @@ const POLICIES = {
 const READS_ONLY: readonly string[] = [
   // pinned config passed by flag
   'trivy-config', 'trivy-image', 'trivy-licence', 'betterleaks', 'gitleaks', 'osv-scanner', 'syft', 'actionlint', 'zizmor',
-  'biome', 'eslint', 'eslint-typescript', 'oxlint-typeaware', 'jscpd', 'hadolint', 'kube-linter', 'poutine', 'ruff', 'ruff-format', 'zap-baseline',
+  'biome', 'eslint', 'eslint-typescript', 'oxlint-typeaware', 'jscpd', 'hadolint', 'kube-linter', 'poutine', 'ruff', 'ruff-format', 'zap-baseline', 'zap-af-active',
   // no config file, but verified rules/templates only, no repo plugin mechanism on the allowlist
   'semgrep', 'nuclei',
 ];

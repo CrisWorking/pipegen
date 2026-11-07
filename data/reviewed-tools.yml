@@ -462,6 +462,80 @@ tools:
     reviewedAt: "2026-10-28"
     proofs: 0
 
+  # G15a round 6 (P-4): the nightly ZAP Automation Framework active scan. The same pinned image as zap-baseline (zaproxy/zap-stable:20261016,
+  # ZAP 2.17.0; source and date as there). `zap.sh -cmd -silent` (no UI; no add-on update or install, no call home) runs pipegen's reviewed
+  # AF plan (src/engine/zap-active.ts ZAP_ACTIVE_PLAN, the plan the real reports in test/fixtures/zap were captured with, the target read
+  # from the container env ${PIPEGEN_ZAP_TARGET}) by its absolute path /zap/wrk/zap-active.yaml. Spider, passive wait, active scan with ZAP's
+  # default policy (no rule changed), and the traditional-json report the gate reads. Nightly only (tool-flags.ts nightlyOnly): never offered
+  # for a need; its result goes to code scanning. Re-reviewed by delegation (DECISIONS #105).
+  - id: zap-af-active
+    categories: ["dast"]
+    languages: ["any"]
+    releasedAt: "2026-10-16T09:36:50.415097Z"
+    candidate:
+      id: zap-af-active
+      name: "zaproxy/zaproxy"
+      kind: docker
+      repo: zaproxy/zaproxy
+      version: "20261016"
+      pin: { digest: "sha256:5ccfff9a411743ab2615136a2edd7416bec9ce41572fa94e935df38c14adb2b6" }
+      source: reviewed
+      reviewed: true
+      categories: ["dast"]
+    step:
+      cli:
+        install: { method: docker, package: "zaproxy/zap-stable", version: "20261016" }
+        command: ["zap.sh", "-cmd", "-silent"]
+      output: { path: "zap-active.json", format: zap-json }
+    fixedInputs:
+      args: ["-cmd", "-silent"]
+      config:
+        content: |
+          env:
+            contexts:
+              - name: pipegen
+                urls:
+                  - "${PIPEGEN_ZAP_TARGET}"
+                includePaths:
+                  - "${PIPEGEN_ZAP_TARGET}.*"
+            parameters:
+              failOnError: true
+              failOnWarning: false
+              progressToStdout: true
+          jobs:
+            - type: passiveScan-config
+              parameters:
+                maxAlertsPerRule: 10
+                enableTags: false
+            - type: spider
+              parameters:
+                context: pipegen
+                url: "${PIPEGEN_ZAP_TARGET}"
+                maxDuration: 5
+            - type: passiveScan-wait
+              parameters:
+                maxDuration: 5
+            - type: activeScan
+              parameters:
+                context: pipegen
+                maxRuleDurationInMins: 5
+                maxScanDurationInMins: 30
+              policyDefinition:
+                defaultStrength: medium
+                defaultThreshold: medium
+            - type: report
+              parameters:
+                template: traditional-json
+                reportDir: /zap/wrk
+                reportFile: zap-active.json
+                reportTitle: pipegen ZAP active scan
+        passAs: { flag: "-autorun" }
+    choices: {}
+    configFiles: []
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-11-06"
+    proofs: 0
+
   # Trivy config scan of Terraform and other infrastructure code. Release binary, no cache, only the checks built into the pinned binary.
   # Source: release v0.76.0 of aquasecurity/trivy: trivy_0.76.0_Linux-64bit.tar.gz sha256 from the release checksums file. Released 2026-10-14T11:45:44Z.
   # Signature: pipegen's pinned cosign 3.1.3 ran `cosign verify-blob --bundle trivy_0.76.0_checksums.txt.sigstore.json

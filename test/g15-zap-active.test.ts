@@ -32,7 +32,8 @@ describe('zap-active: the reviewed AF plan', () => {
   });
 
   it('zap-active: the command runs the plan by its absolute path (zap.sh reads a relative one from /zap), silent, with no UI', () => {
-    expect([...ZAP_ACTIVE_COMMAND]).toEqual(['zap.sh', '-cmd', '-silent', '-autorun', '/zap/wrk/zap-active.yaml']);
+    expect([...ZAP_ACTIVE_COMMAND]).toEqual(['zap.sh', '-autorun', '/zap/wrk/zap-active.yaml', '-cmd', '-silent']);
+    // round 6: the order the renderer writes (the pinned config flag first), measured on the pinned image
   });
 
   it('zap-active: every value the target env can hold is a local-url slot value, which can not break out of a quoted YAML string', () => {

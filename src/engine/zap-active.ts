@@ -2,7 +2,8 @@
 // Taken from the plan the real reports were captured with (test/fixtures/zap/plans/af-active-capture.yaml, README there), with the
 // target replaced by the AF's own environment substitution: the run step passes the URL of the running app (a `local-url` slot,
 // slots.ts: http://localhost or http://127.0.0.1 with a port) into the container as ZAP_ACTIVE_TARGET_ENV, and nothing else.
-// Not wired into the nightly file yet: the step, its scrub to code scanning and the referee rules come with it (see the G15a report).
+// Round 6: run nightly by the reviewed entry zap-af-active (data/reviewed-tools.yml; tool-flags.ts holds this text as its pinned config), in
+// its own lane beside nuclei (dast-handoff.ts zapActiveSpec), scrubbed to SARIF for code scanning.
 
 /** The container env variable the plan reads the target from (`${…}` is the AF's substitution, measured on the pinned image). */
 export const ZAP_ACTIVE_TARGET_ENV = 'PIPEGEN_ZAP_TARGET';
@@ -10,8 +11,11 @@ export const ZAP_ACTIVE_TARGET_ENV = 'PIPEGEN_ZAP_TARGET';
 export const ZAP_ACTIVE_WORK = '/zap/wrk';
 export const ZAP_ACTIVE_PLAN_FILE = 'zap-active.yaml';
 export const ZAP_ACTIVE_REPORT = 'zap-active.json';
-/** The command: `-cmd` (no UI), `-silent` (no add-on update, no call home), `-autorun` the plan by its absolute path. */
-export const ZAP_ACTIVE_COMMAND = Object.freeze(['zap.sh', '-cmd', '-silent', '-autorun', `${ZAP_ACTIVE_WORK}/${ZAP_ACTIVE_PLAN_FILE}`] as const);
+/**
+ * The command as the renderer writes it: `-autorun` the plan by its absolute path (the pinned config flag goes first), `-cmd` (no UI),
+ * `-silent` (no add-on update, no call home). Round 6 measured this order on the pinned image (exit 0, the report written; G15a report).
+ */
+export const ZAP_ACTIVE_COMMAND = Object.freeze(['zap.sh', '-autorun', `${ZAP_ACTIVE_WORK}/${ZAP_ACTIVE_PLAN_FILE}`, '-cmd', '-silent'] as const);
 /**
  * The scan policy, reviewed: ZAP's default rules at their default strength and threshold (`medium`), none turned off or down; at most
  * 5 minutes per rule and 30 for the whole active scan. The AF exits 0 with alerts and 1 on a plan error (`failOnError`), so the run step

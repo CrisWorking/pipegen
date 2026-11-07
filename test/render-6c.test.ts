@@ -187,7 +187,7 @@ describe('permanent refusals say why (no "6c" is left)', () => {
         outcome[t.id] = m;
       }
     }
-    expect(Object.entries(outcome).filter(([, v]) => v !== 'rendered').map(([k]) => k).sort()).toEqual(['bandit', 'cosign', 'coverage-py', 'creosote', 'gh', 'gosec', 'kube-linter', 'mypy', 'registry', 'schemathesis', 'vulture']);
+    expect(Object.entries(outcome).filter(([, v]) => v !== 'rendered').map(([k]) => k).sort()).toEqual(['bandit', 'cosign', 'coverage-py', 'creosote', 'gh', 'gosec', 'kube-linter', 'mypy', 'registry', 'schemathesis', 'vulture', 'zap-af-active']);
   });
 });
 
