@@ -37,6 +37,11 @@ export const NIGHTLY_DAST_TOOL = 'nuclei';
  */
 export const ZAP_ACTIVE_TOOL = 'zap-af-active';
 export { ZAP_ACTIVE_LANE };
+/**
+ * The AF run job's timeout: the plan may take 5 minutes of spider, 5 of passive wait and 30 of active scan (zap-active.ts), on top of the
+ * pull of the ZAP image and the app start; the default 30 would cancel a scan that ran to its limits.
+ */
+export const ZAP_ACTIVE_JOB_MINUTES = 60;
 /** The note when the AF scan can not be written (the entry is missing, or its render is refused): nuclei still runs. */
 export const zapActiveNotRunNote = (why: string): string => `ZAP's active scan is not run nightly: ${why} Nuclei scans the app nightly instead.`;
 

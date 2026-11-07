@@ -63,7 +63,7 @@ import { egressSetsForTool, renderEgressStep, SHARED_CDN_SETS, type EgressSet } 
 import { gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES } from '../engine/gate-job-list.js';
 import { SKIPPED_PART_NEEDS } from '../engine/gate-inputs.js';
 import { ARCHIVE_TOOL_IDS, renderImageArchiveScan, renderImageBuild } from '../engine/image-handoff.js';
-import { dastStartOf, nightlyDastSpec, NIGHTLY_DAST_TOOL, renderDastRun, renderDastScrub, zapActiveNotRunNote, zapActiveSpec, ZAP_ACTIVE_LANE, ZAP_ACTIVE_TOOL, type DastStart } from '../engine/dast-handoff.js';
+import { dastStartOf, nightlyDastSpec, NIGHTLY_DAST_TOOL, renderDastRun, renderDastScrub, zapActiveNotRunNote, zapActiveSpec, ZAP_ACTIVE_JOB_MINUTES, ZAP_ACTIVE_LANE, ZAP_ACTIVE_TOOL, type DastStart } from '../engine/dast-handoff.js';
 import {
   BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, dastRunJobId, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, IMAGE_BUILD_NEED, imageBuildJobId, isReviewed,
   isScrubStep, jobOutputsFor, CODE_SCANNING_JOB, DAST_UPLOAD_JOB, dastLaneOf, dastNightlyCategory, dastResultArtifact, type DastLane, HISTORY_UPLOAD_JOB, SECRETS_HISTORY_CATEGORY, SECRETS_HISTORY_JOB, NIGHTLY_CONCURRENCY, NO_SCANS, SCORECARD_IF, SCORECARD_JOB, ZIZMOR_ONLINE_JOB, renderRangeFetchStep, type RenderedStep, type ScanFact,
@@ -735,7 +735,8 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
           if (need !== imageBuildJobId(service) || b === undefined) return fail(`The nightly DAST scan of ${show(service)} needs ${show(need)}, which the nightly file does not build.`);
           jobs[need] = b;
         }
-        jobs[dastRunJobId(service, lane)] = pair.run;
+        // the AF plan can run longer than the default job time (its run job only)
+        jobs[dastRunJobId(service, lane)] = lane === ZAP_ACTIVE_LANE ? { ...pair.run, 'timeout-minutes': ZAP_ACTIVE_JOB_MINUTES } : pair.run;
         jobs[id] = pair.scrub;
         const artifact = dastResultArtifact(service, lane);
         const scrubbed = `\${{ runner.temp }}/pipegen-out/${artifact}`;
