@@ -49,7 +49,7 @@ var require_constants = __commonJS({
     var NO_DOT_SLASH = `(?!${DOT_LITERAL}{0,1}${END_ANCHOR})`;
     var NO_DOTS_SLASH = `(?!${DOTS_SLASH})`;
     var QMARK_NO_DOT = `[^.${SLASH_LITERAL}]`;
-    var STAR = `${QMARK}*?`;
+    var STAR2 = `${QMARK}*?`;
     var SEP = "/";
     var POSIX_CHARS = {
       DOT_LITERAL,
@@ -65,7 +65,7 @@ var require_constants = __commonJS({
       NO_DOT_SLASH,
       NO_DOTS_SLASH,
       QMARK_NO_DOT,
-      STAR,
+      STAR: STAR2,
       START_ANCHOR,
       SEP
     };
@@ -912,7 +912,7 @@ var require_parse = __commonJS({
         NO_DOTS_SLASH,
         QMARK,
         QMARK_NO_DOT,
-        STAR,
+        STAR: STAR2,
         START_ANCHOR
       } = PLATFORM_CHARS;
       const globstar = (opts2) => {
@@ -920,7 +920,7 @@ var require_parse = __commonJS({
       };
       const nodot = opts.dot ? "" : NO_DOT;
       const qmarkNoDot = opts.dot ? QMARK : QMARK_NO_DOT;
-      let star = opts.bash === true ? globstar(opts) : STAR;
+      let star = opts.bash === true ? globstar(opts) : STAR2;
       if (opts.capture) {
         star = `(${star})`;
       }
@@ -1594,14 +1594,14 @@ var require_parse = __commonJS({
         NO_DOT,
         NO_DOTS,
         NO_DOTS_SLASH,
-        STAR,
+        STAR: STAR2,
         START_ANCHOR
       } = constants6.globChars(opts.windows);
       const nodot = opts.dot ? NO_DOTS : NO_DOT;
       const slashDot = opts.dot ? NO_DOTS_SLASH : NO_DOT;
       const capture = opts.capture ? "" : "?:";
       const state = { negated: false, prefix: "" };
-      let star = opts.bash === true ? ".*?" : STAR;
+      let star = opts.bash === true ? ".*?" : STAR2;
       if (opts.capture) {
         star = `(${star})`;
       }
@@ -8197,9 +8197,22 @@ function tokens(line) {
 function codeOwners(text) {
   if (typeof text !== "string") return [];
   const rules = [];
+  const canOwn = (raw) => {
+    const t = raw.trim();
+    return t !== "" && !t.startsWith("#");
+  };
   for (const raw of text.split(/\r?\n/)) {
-    if (rules.length >= MAX_RULES) break;
-    if (raw.length > MAX_LINE) continue;
+    if (rules.length >= MAX_RULES) {
+      if (canOwn(raw)) {
+        rules.push({ pattern: "", owners: [], unreadable: "count" });
+        break;
+      }
+      continue;
+    }
+    if (raw.length > MAX_LINE) {
+      if (canOwn(raw)) rules.push({ pattern: "", owners: [], unreadable: "line" });
+      continue;
+    }
     const t = tokens(raw.trim());
     const pattern = t[0];
     if (pattern === void 0) continue;
@@ -8219,9 +8232,12 @@ function codeOwners(text) {
   }
   return rules;
 }
+var STAR = 0;
+var ANY = 1;
 var compiled = /* @__PURE__ */ new WeakMap();
 var MAX_RULE_SEGMENTS = 64;
 var OWNERS_STEP_BUDGET = 4e8;
+var RULE_VISIT_STEPS = 16;
 function compile(rule) {
   const got = compiled.get(rule);
   if (got !== void 0) return got;
@@ -8247,15 +8263,15 @@ function compile(rule) {
         continue;
       }
       if (c2 === "*") {
-        if (toks[toks.length - 1] !== "*") toks.push("*");
+        if (toks[toks.length - 1] !== STAR) toks.push(STAR);
         continue;
       }
-      toks.push(c2 === "?" ? "?" : c2);
+      toks.push(c2 === "?" ? ANY : c2);
     }
     return { kind: "glob", toks };
   });
-  const last = parts[parts.length - 1];
-  const ancestors = dirOnly || !/[*?]/.test(last);
+  const lastSeg = segs[segs.length - 1];
+  const ancestors = dirOnly || lastSeg.kind === "glob" && !lastSeg.toks.some((t) => t === STAR || t === ANY);
   const c = { segs, dirOnly, ancestors, tooLong: false };
   compiled.set(rule, c);
   return c;
@@ -8270,10 +8286,10 @@ function segMatch(toks, s, steps) {
   while (i < s.length) {
     n++;
     const k = toks[t];
-    if (k === "*") {
+    if (k === STAR) {
       star = t++;
       mark = i;
-    } else if (k !== void 0 && (k === "?" || k === s[i])) {
+    } else if (k !== void 0 && (k === ANY || k === s[i])) {
       t++;
       i++;
     } else if (star >= 0) {
@@ -8285,7 +8301,7 @@ function segMatch(toks, s, steps) {
     }
   }
   if (r === void 0) {
-    while (toks[t] === "*") {
+    while (toks[t] === STAR) {
       t++;
       n++;
     }
@@ -8322,9 +8338,11 @@ function ruleMatches(c, parts, steps) {
 }
 function ownersLookup(rules, path, steps = { left: OWNERS_STEP_BUDGET }) {
   const parts = path.split("/");
-  if (parts.length > 256 || parts.includes("")) return { owners: void 0 };
+  if (parts.length > 256 || parts.includes("")) return { unresolved: "path" };
   for (let i = rules.length - 1; i >= 0; i--) {
     const r = rules[i];
+    if ((steps.left -= RULE_VISIT_STEPS) < 0) return { unresolved: "budget" };
+    if (r.unreadable !== void 0) return { unresolved: "unreadable" };
     const c = compile(r);
     if (c.tooLong) return { unresolved: "segments" };
     const m = ruleMatches(c, parts, steps);
@@ -8564,6 +8582,12 @@ async function buildPrDiff(gh, repo2, baseSha, headSha) {
   const r = addedLinesOf(files);
   return { added: r.added, complete: ok && r.complete, commit: headSha };
 }
+var UNRESOLVED_HOW = {
+  segments: ` The gate could not work out the code owners of this path: a CODEOWNERS rule of the base commit that could decide it has over ${MAX_RULE_SEGMENTS} segments, so nobody can approve: shorten that rule, or merge with an administrator bypass.`,
+  budget: " The gate could not work out the code owners of this path within its step budget (the paths are too deep for the CODEOWNERS rules of the base commit), so nobody can approve: shorten the paths, or merge with an administrator bypass.",
+  path: " The gate could not work out the code owners of this path: it has more than 256 parts or an empty part, so nobody can approve: shorten the path, or merge with an administrator bypass.",
+  unreadable: ` The gate could not work out the code owners of this path: the CODEOWNERS file of the base commit has a line over 4,096 characters or over 100,000 rules, which the gate does not read, so nobody can approve: shorten or split the file, or merge with an administrator bypass.`
+};
 var fp = (...parts) => createHash6("sha256").update(parts.join("\0")).digest("hex");
 function integrityFindings(pr, protectedPaths, rules, extra = {}) {
   const out = [];
@@ -8603,9 +8627,7 @@ function integrityFindings(pr, protectedPaths, rules, extra = {}) {
       return extra.codeowners?.found != null ? " CODEOWNERS of the base commit has no rule that names a user, so nobody can approve: add one, or merge with an administrator bypass." : " The base commit has no CODEOWNERS, so nobody can approve: add one (user owners, not only teams), or merge with an administrator bypass.";
     }
     const r = lookup(path);
-    if ("unresolved" in r) {
-      return r.unresolved === "segments" ? ` The gate could not work out the code owners of this path: a CODEOWNERS rule of the base commit that could decide it has over ${MAX_RULE_SEGMENTS} segments, so nobody can approve: shorten that rule, or merge with an administrator bypass.` : " The gate could not work out the code owners of this path within its step budget (the paths are too deep for the CODEOWNERS rules of the base commit), so nobody can approve: shorten the paths, or merge with an administrator bypass.";
-    }
+    if ("unresolved" in r) return UNRESOLVED_HOW[r.unresolved];
     const o = r.owners;
     if ((o === void 0 || o.length === 0) && file && blockOwners.length > 0) {
       return " No CODEOWNERS rule names a user owner of this file, so an owner listed in pipegen's CODEOWNERS block (a user with write access, not the author) must approve the pull request on its current head commit.";

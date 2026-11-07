@@ -388,6 +388,16 @@ describe('D0b fix round 1: CODEOWNERS re-run, symlink, overrides', () => {
       expect(text(coFile(replaceBlock(original, OLD, block), original), existCo, withFacts(OLD)), rule).toBe('');
     }
   });
+  it('G15b-R1 S6: a user rule the gate can not read (over 64 segments, or a line over 4,096 characters) gets its own refusal, not "the judge failed"', () => {
+    const deepRule = `/${Array.from({ length: 65 }, (_, i) => `d${i}`).join('/')} @dev`;
+    const longRule = `/${'a'.repeat(5000)} @dev`;
+    for (const [rule, why] of [[deepRule, /over 64 segments/], [longRule, /over 4,096 characters/]] as const) {
+      const original = `${OLD}${rule}\n`;
+      const t = text(coFile(replaceBlock(original, OLD, block), original), existCo, withFacts(OLD));
+      expect(t, rule.slice(0, 20)).toMatch(why);
+      expect(t).toMatch(/the gate could not work out who owns/);
+    }
+  });
   it('D0b re-review m2: codeownersLaterOverrides lists the rules after the block that touch a protected path', () => {
     const paths = codeownersProtectedPaths(existCo, reviewed);
     const after = '/src/ @carol\n/.github/workflows/deploy.yml @dev\n# x\nlefthook.yml @alice @bob\n';

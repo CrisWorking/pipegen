@@ -8,7 +8,7 @@
 import picomatch from 'picomatch';
 import { protectedMatcher } from '../protected-match.js';
 import { WORKFLOW_PATH } from '../../../gate/src/baseline.js';
-import { codeOwners, MAX_CODEOWNERS_BYTES, ownersOf } from '../../../gate/src/integrity.js';
+import { codeOwners, MAX_CODEOWNERS_BYTES, MAX_RULE_SEGMENTS, ownersOf, OwnersUnresolvedError, type Unresolved } from '../../../gate/src/integrity.js';
 import { CENTRAL_PROTECTED_PATHS, CODEOWNERS_BEGIN, CODEOWNERS_END, codeownersBlock, codeownersFile, codeownersOwnerProblem, codeownersProtectedPaths, codeownersReplace } from '../created-builders.js';
 import type { CreatedCtx } from '../created-files.js';
 import type { CreatedFile } from '../../types.js';
@@ -134,8 +134,26 @@ function ownedNames(repo: 'app' | 'central', paths: readonly string[], ctx: Crea
   return [...new Set(names.filter((n) => typeof n === 'string' && owned(n)))];
 }
 
+/** G15b-R1 S6: the refusal when the gate's matcher can not read the file far enough to tell who owns a probe path (fixed texts). */
+const UNREADABLE_RULE: Record<Unresolved, string> = {
+  segments: `a CODEOWNERS rule has over ${MAX_RULE_SEGMENTS} segments, so the gate could not work out who owns the paths it covers and nobody could approve a change there; shorten that rule`,
+  unreadable: 'a CODEOWNERS line is over 4,096 characters, or the file has over 100,000 rules, which the gate would not read: the gate could not work out who owns the paths after it and nobody could approve a change there; shorten or split it',
+  path: 'a probe path is too deep for the gate, so the gate could not work out who owns it',
+  budget: 'the CODEOWNERS file is too large for the gate to work out who owns the protected paths',
+};
+
 /** The judge for one repo: the app repo's file owns the gate's protected paths, the central repo's the workflows and install records. */
 function judge(repo: 'app' | 'central') {
+  const inner = judgeBody(repo);
+  return (file: CreatedFile, ctx: CreatedCtx): string[] => {
+    try { return inner(file, ctx); } catch (e) {
+      if (e instanceof OwnersUnresolvedError) return [`${UNREADABLE_RULE[e.why]}, so pipegen writes no CODEOWNERS`];
+      throw e;
+    }
+  };
+}
+
+function judgeBody(repo: 'app' | 'central') {
   return (file: CreatedFile, ctx: CreatedCtx): string[] => {
     const { draft } = ctx;
     const out: string[] = [];

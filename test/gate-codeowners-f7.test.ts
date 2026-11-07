@@ -6,7 +6,7 @@
 // lookup the gate cannot finish is "unresolved", which waives nothing and says why. Written first.
 import { describe, expect, it } from 'vitest';
 import {
-  codeOwners, integrityFindings, MAX_RULE_SEGMENTS, OWNERS_STEP_BUDGET, ownersLookup, ownersOf, OwnersUnresolvedError,
+  codeOwners, integrityFindings, MAX_RULE_SEGMENTS, OWNERS_STEP_BUDGET, ownersLookup, ownersOf, OwnersUnresolvedError, RULE_VISIT_STEPS,
   type CodeownersRule, type PrContext, type PrFile,
 } from '../gate/src/integrity.js';
 import { expectScaling } from './helpers/scaling.js';
@@ -131,6 +131,7 @@ describe('F7: a step budget, failing closed', () => {
 
 // ---------- differential: the new matcher equals the old one (copied here as the oracle) on random rules and paths ----------
 
+const W_STAR = '\0*'; const W_ANY = '\0?';
 type Seg = { kind: 'globstar' } | { kind: 'globstar+' } | { kind: 'glob'; toks: string[] };
 function oracleCompile(pattern: string): { segs: Seg[]; dirOnly: boolean; ancestors: boolean } {
   let p = pattern;
@@ -145,21 +146,22 @@ function oracleCompile(pattern: string): { segs: Seg[]; dirOnly: boolean; ancest
     const toks: string[] = [];
     for (let i = 0; i < part.length; i++) {
       const c = part[i] as string;
-      if (c === '\\' && i + 1 < part.length) { toks.push(part[++i] as string); continue; }
-      if (c === '*') { if (toks[toks.length - 1] !== '*') toks.push('*'); continue; }
-      toks.push(c === '?' ? '?' : c);
+      if (c === '\\' && i + 1 < part.length) { toks.push(part[++i] as string); continue; }   // G15b-R1 S2: an escaped * or ? is literal
+      if (c === '*') { if (toks[toks.length - 1] !== W_STAR) toks.push(W_STAR); continue; }
+      toks.push(c === '?' ? W_ANY : c);
     }
     return { kind: 'glob', toks };
   });
-  return { segs, dirOnly, ancestors: dirOnly || !/[*?]/.test(parts[parts.length - 1] as string) };
+  const lastSeg = segs[segs.length - 1] as Seg;
+  return { segs, dirOnly, ancestors: dirOnly || (lastSeg.kind === 'glob' && !lastSeg.toks.some((t) => t === W_STAR || t === W_ANY)) };
 }
 function oracleSeg(toks: readonly string[], s: string): boolean {
   let t = 0; let i = 0; let star = -1; let mark = 0;
   while (i < s.length) {
     const k = toks[t];
-    if (k === '*') { star = t++; mark = i; } else if (k !== undefined && (k === '?' || k === s[i])) { t++; i++; } else if (star >= 0) { t = star + 1; i = ++mark; } else return false;
+    if (k === W_STAR) { star = t++; mark = i; } else if (k !== undefined && (k === W_ANY || k === s[i])) { t++; i++; } else if (star >= 0) { t = star + 1; i = ++mark; } else return false;
   }
-  while (toks[t] === '*') t++;
+  while (toks[t] === W_STAR) t++;
   return t === toks.length;
 }
 function oracleOwnersOf(rules: readonly CodeownersRule[], path: string): string[] | undefined {
@@ -191,9 +193,9 @@ function oracleOwnersOf(rules: readonly CodeownersRule[], path: string): string[
 describe('F7: the new matcher gives the old matcher\'s answers', () => {
   it('2,000 random rule sets and paths (seeded): same owners', () => {
     let seed = 0x5eed;
-    const rnd = (n: number): number => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; };
+    const rnd = (n: number): number => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return (seed >>> 16) % n; };   // the high bits: the low bits of this LCG cycle short
     const pick = <T>(xs: readonly T[]): T => xs[rnd(xs.length)] as T;
-    const names = ['a', 'b', 'ab', 'src', 'x.js', '.github'];
+    const names = ['a', 'b', 'ab', 'src', 'x.js', '.github', '*', '?'];
     const segPat = ['a', 'b', '*', '?', 'a*', '*b', '**', 'src', '*.js', 'a?', '\\*', 'x.js'];
     let differ = 0;
     for (let round = 0; round < 2000; round++) {
@@ -211,5 +213,97 @@ describe('F7: the new matcher gives the old matcher\'s answers', () => {
       }
     }
     expect(differ).toBe(0);
+  });
+});
+
+// ---------- G15b-R1 (review-G15b security S1-S6): fail closed on every path the gate can not read, escaped wildcards literal ----------
+
+describe('G15b-R1: the reviewer\'s findings, fixed before the tag is pushed', () => {
+  it('S3: long paths (30 to 257 parts) with deep ** rules: the new matcher gives the old matcher\'s answers (seeded)', () => {
+    let seed = 0x1234;
+    const rnd = (n: number): number => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return (seed >>> 16) % n; };   // the high bits: the low bits of this LCG cycle short
+    const pick = <T>(xs: readonly T[]): T => xs[rnd(xs.length)] as T;
+    const names = ['a', 'b', 'src', 'x.js'];
+    const segPat = ['a', 'b', '*', '**', 'src', '*.js', '?'];
+    let differ = 0;
+    for (let round = 0; round < 300; round++) {
+      const rules: string[] = [];
+      for (let r = 0, nr = 1 + rnd(4); r < nr; r++) {
+        const segs = Array.from({ length: 1 + rnd(10) }, () => pick(segPat)).join('/');
+        rules.push(`${rnd(2) === 0 ? '/' : ''}${segs}${rnd(3) === 0 ? '/' : ''} @o${r}`);
+      }
+      const parsed = codeOwners(rules.join('\n'));
+      const len = [30, 60, 100, 255, 256, 257][rnd(6)] as number;
+      const path = Array.from({ length: len }, () => pick(names)).join('/');
+      const want = len > 256 ? { unresolved: 'path' } : { owners: oracleOwnersOf(parsed, path) };
+      const got = ownersLookup(parsed, path);
+      if (JSON.stringify(got) !== JSON.stringify(want)) { differ++; expect({ rules, len, got }).toEqual({ rules, len, got: want }); }
+    }
+    expect(differ).toBe(0);
+  });
+
+  const deep = (n: number): string => [...Array.from({ length: n - 1 }, () => 'a'), 'x.ts'].join('/');
+  it('S1: a path of more than 256 parts (or with an empty part) is unresolved, never "no owner"', () => {
+    const rules = codeOwners('* @lead\n');
+    expect(ownersLookup(rules, deep(256))).toEqual({ owners: ['lead'] });
+    expect(ownersLookup(rules, deep(257))).toEqual({ unresolved: 'path' });
+    expect(ownersLookup(rules, 'a//b')).toEqual({ unresolved: 'path' });
+    expect(() => ownersOf(rules, deep(257))).toThrow(OwnersUnresolvedError);
+  });
+  it('S1: `* @lead`, a block-owner approval can not waive a suppression at depth 257, and the finding says why', () => {
+    const rules = codeOwners(`* @lead\n# pipegen:begin\n/.github/workflows/ @blk\n# pipegen:end\n`);
+    const co = { codeowners: { found: '.github/CODEOWNERS', blockOwners: ['blk'] } };
+    expect(integrityFindings(ctx([suppression(deep(256))], ['blk']), [], rules, co).length).toBe(1);   // lead owns it: blk can not waive
+    const out = integrityFindings(ctx([suppression(deep(257))], ['blk', 'lead']), [], rules, co);
+    expect(out.map((f) => f.ruleId)).toEqual(['integrity:suppression']);
+    expect(out[0]?.message).toMatch(/could not work out the code owners of this path: it has more than 256 parts.*nobody can approve/);
+  });
+
+  it('S2: an escaped \\* or \\? matches literally (gitignore semantics): /src/\\* owns only src/* itself', () => {
+    const rules = codeOwners('* @lead\n/src/\\* @alice\n/x/a\\?c @bob\n');
+    expect(ownersOf(rules, 'src/*')).toEqual(['alice']);
+    expect(ownersOf(rules, 'src/*/y.ts')).toEqual(['alice']);   // a literal last segment names a directory too
+    expect(ownersOf(rules, 'src/app.ts')).toEqual(['lead']);
+    expect(ownersOf(rules, 'x/a?c')).toEqual(['bob']);
+    expect(ownersOf(rules, 'x/abc')).toEqual(['lead']);
+    // alice's approval no longer waives a suppression in src/app.ts
+    expect(integrityFindings(ctx([suppression('src/app.ts')], ['alice']), [], rules).map((f) => f.ruleId)).toEqual(['integrity:suppression']);
+    // a plain * and ? are still wildcards, and `\\*` mixed with a wildcard keeps both meanings
+    expect(ownersOf(codeOwners('/src/* @w\n'), 'src/app.ts')).toEqual(['w']);
+    expect(ownersOf(codeOwners('/src/a\\*b* @m\n'), 'src/a*bc')).toEqual(['m']);
+    expect(ownersOf(codeOwners('/src/a\\*b* @m\n'), 'src/axbc')).toBeUndefined();
+  });
+
+  it('S5: a CODEOWNERS line over 4,096 characters is not silently skipped: lookups that reach it are unresolved', () => {
+    const long = `/${'a'.repeat(5000)} @x`;
+    const rules = codeOwners(`* @lead\n${long}\n/src/ @src\n`);
+    expect(ownersLookup(rules, 'src/a.ts')).toEqual({ owners: ['src'] });   // a later rule matches: the long line can not matter
+    expect(ownersLookup(rules, 'lib/a.ts')).toEqual({ unresolved: 'unreadable' });
+    // a long comment or blank line can own nothing: still skipped
+    expect(ownersLookup(codeOwners(`* @lead\n# ${'c'.repeat(5000)}\n${' '.repeat(5000)}\n`), 'lib/a.ts')).toEqual({ owners: ['lead'] });
+  });
+  it('S5: rules past MAX_RULES are not silently dropped: every lookup that reaches the cut is unresolved', () => {
+    const text = Array.from({ length: 100_050 }, (_, i) => `/p${i} @a`).join('\n');
+    const rules = codeOwners(text);
+    expect(rules.length).toBe(100_001);
+    expect(ownersLookup(rules, 'p5')).toEqual({ unresolved: 'unreadable' });
+    // exactly MAX_RULES rules, then only comments: nothing is cut
+    const full = codeOwners(`${Array.from({ length: 100_000 }, (_, i) => `/p${i} @a`).join('\n')}\n# end\n\n`);
+    expect(full.length).toBe(100_000);
+    expect(ownersLookup(full, 'p5')).toEqual({ owners: ['a'] });
+  });
+  it('S5: in the gate an unreadable CODEOWNERS line waives nothing and says why', () => {
+    const rules = codeOwners(`* @lead\n/${'a'.repeat(5000)} @x\n`);
+    const out = integrityFindings(ctx([suppression('lib/a.ts')], ['lead']), [], rules);
+    expect(out.map((f) => f.ruleId)).toEqual(['integrity:suppression']);
+    expect(out[0]?.message).toMatch(/could not work out the code owners of this path: the CODEOWNERS file of the base commit has a line over 4,096 characters or over 100,000 rules.*nobody can approve/);
+  });
+
+  it('S4: every rule visited costs steps, so a huge base CODEOWNERS spends the budget in bounded time', () => {
+    const rules = codeOwners(`* @lead\n${Array.from({ length: 1000 }, (_, i) => `/q${i} @o`).join('\n')}\n`);
+    const steps = { left: OWNERS_STEP_BUDGET };
+    ownersLookup(rules, 'z/f.ts', steps);
+    // 1,001 rules visited; at least RULE_VISIT_STEPS each
+    expect(OWNERS_STEP_BUDGET - steps.left).toBeGreaterThanOrEqual(1001 * RULE_VISIT_STEPS);
   });
 });
