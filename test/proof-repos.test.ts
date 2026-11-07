@@ -74,8 +74,8 @@ describe('E1 repos (plan Task 1, preflight S1/S13/S19)', () => {
         { name: SCRATCH, exists: false, createCommand: createCommands(OWNER, [SCRATCH])[0] },
       ]);
       expect(i.all()).toContain('Create these private repos, then run pipegen again');
-      expect(i.all()).toContain(`gh repo create ${OWNER}/pipelines --private --description "pipegen central workflows and install records"`);
-      expect(i.all()).toContain(`gh repo create ${OWNER}/${SCRATCH} --private --description "pipegen proof runs (private scratch repo)"`);
+      expect(i.all()).toContain(`gh repo create ${OWNER}/pipelines --private --disable-wiki --description "pipegen central workflows and install records"`);
+      expect(i.all()).toContain(`gh repo create ${OWNER}/${SCRATCH} --private --disable-wiki --description "pipegen proof runs (private scratch repo)"`);
       expect(g.writes()).toEqual([]);
       expect(g.seen().some((s) => s.startsWith('POST'))).toBe(false);
     }
@@ -95,8 +95,9 @@ describe('E1 repos (plan Task 1, preflight S1/S13/S19)', () => {
     const posts = user.g.calls.filter((c) => c.method === 'POST');
     expect(posts.map((c) => c.url.pathname)).toEqual(['/user/repos', '/user/repos']);
     expect(posts.map((c) => JSON.parse(c.body ?? '{}'))).toEqual([
-      { name: 'pipelines', private: true, auto_init: true, description: 'pipegen central workflows and install records' },
-      { name: SCRATCH, private: true, auto_init: true, description: 'pipegen proof runs (private scratch repo)' },
+      // G14 (Plan V ruling V3-wiki): no wiki and no projects, so uninstall can show nothing user-made lives in either repo
+      { name: 'pipelines', private: true, auto_init: true, has_wiki: false, has_projects: false, description: 'pipegen central workflows and install records' },
+      { name: SCRATCH, private: true, auto_init: true, has_wiki: false, has_projects: false, description: 'pipegen proof runs (private scratch repo)' },
     ]);
     expect(user.i.all()).toContain(`Created the private repo ${OWNER}/pipelines.`);
 
@@ -659,5 +660,49 @@ describe('G13-R2: the Actions access level is reported the moment it changed (ru
     const g2 = world({ repos: both, access: 'user' });
     await checkProofRepos(g2.gh, app(), opts({ createPermit: permitFor(app()), onAccessChanged: (p) => { seen2.push(p); } }), i);
     expect(seen2).toEqual([]);
+  });
+});
+
+describe('G14 (controller addendum): the access level on a PUT that failed without a 4xx', () => {
+  it('access: a PUT that ends in a 5xx or no answer may have changed the level: onAccessChanged gets the earlier one; a 4xx did not change it', async () => {
+    const failPut = (status: number | undefined) => {
+      const g = world({ repos: both });
+      g.gh.hook.wrap('request', async (req, options) => {
+        const route = `${String(options.method)} ${String(options.url)}`;
+        if (route === 'PUT /repos/{owner}/{repo}/actions/permissions/access') {
+          throw Object.assign(new Error('fail'), status === undefined ? {} : { status, response: { status, data: { message: 'x' }, headers: {} } });
+        }
+        return req(options);
+      });
+      return g;
+    };
+    for (const status of [500, 502, undefined]) {
+      const seen: string[] = [];
+      await expect(checkProofRepos(failPut(status).gh, app(), opts({ createPermit: permitFor(app()), onAccessChanged: (p) => { seen.push(p); } }), io(true))).rejects.toThrow(/couldn't let/);
+      expect(seen).toEqual(['none']);
+    }
+    const seen4: string[] = [];
+    await expect(checkProofRepos(failPut(403).gh, app(), opts({ createPermit: permitFor(app()), onAccessChanged: (p) => { seen4.push(p); } }), io(true))).rejects.toThrow(/couldn't let/);
+    expect(seen4).toEqual([]);
+  });
+
+  it('repos: an existing helper repo with its wiki or projects on is named with the command to turn them off; none of it is changed (sec M5)', async () => {
+    const { g, i, result } = run({ repos: { pipelines: { private: true, hasWiki: true }, [SCRATCH]: { private: true, hasWiki: false, hasProjects: true } } });
+    await result;
+    expect(i.all()).toContain(`${OWNER}/pipelines has its wiki turned on`);
+    expect(i.all()).toContain(`${OWNER}/${SCRATCH} has its projects turned on`);
+    expect(i.all()).toContain(`gh repo edit ${OWNER}/${SCRATCH} --enable-wiki=false --enable-projects=false`);
+    expect(writePaths(g).filter((x) => x.startsWith('PATCH'))).toEqual([]);
+    // both off (or not said): nothing is named
+    const quiet = run({ repos: { pipelines: { private: true, hasWiki: false, hasProjects: false }, [SCRATCH]: { private: true } } });
+    await quiet.result;
+    expect(quiet.i.all()).not.toContain('turned on');
+  });
+
+  it('access: a callback that throws prints "Left behind: central Actions access was <previous>" and stops', async () => {
+    const g = world({ repos: both });
+    const i = io(true);
+    await expect(checkProofRepos(g.gh, app(), opts({ createPermit: permitFor(app()), onAccessChanged: () => { throw new Error('disk full'); } }), i)).rejects.toThrow();
+    expect(i.all()).toMatch(/Left behind: central Actions access was none/);
   });
 });

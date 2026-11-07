@@ -1,5 +1,5 @@
 // v0.2 Plan G G13: `pipegen run` (src/cli/run.ts) with fake stages, and its pure parts (src/cli/run-parts.ts) with the real modules.
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
@@ -21,7 +21,7 @@ import type { Octokit } from '@octokit/rest';
 import { AiSpendMeter } from '../src/ai/spend-meter.js';
 import type { mapCoverage } from '../src/audit/coverage.js';
 import type { CodeBundle } from '../src/ai/redact.js';
-import { proofReposFor, onCreatedFor, scanCounted, provenDraft, NOT_IN_SCOPE, NO_MEMORY_FOLDER, SECRET_FOUND, notProvableNotes, auditCredits, createdInputsFor, dastWayPast, defaultProof, fullRun, judgeBuilt, NEVER_SKIPPED, parseSkip, PROOF_NOT_BUILT, runCreators, SCOPE_LINE, UNPINNED, WINDOWS_REFUSAL, GATE_UNREACHABLE, guardRecord, insertedBlock, type Built, type BuildInput, type GitHubFacts, type RunDeps, type RunStages } from '../src/cli/run.js';
+import { proofReposFor, onCreatedFor, scanCounted, provenDraft, NOT_IN_SCOPE, NO_MEMORY_FOLDER, SECRET_FOUND, notProvableNotes, auditCredits, createdInputsFor, dastWayPast, defaultProof, fullRun, judgeBuilt, NEVER_SKIPPED, parseSkip, runCreators, SCOPE_LINE, UNPINNED, WINDOWS_REFUSAL, GATE_UNREACHABLE, guardRecord, insertedBlock, type Built, type BuildInput, type GitHubFacts, type RunDeps, type RunStages } from '../src/cli/run.js';
 import { assembledJobs, consentJobs, docFor, draftFromDebate, isAiNote, parseStrictness, pickOwners, prWaitMinutes, proofAssembler, proofLayout, warnFirstFor, signingFor } from '../src/cli/run-parts.js';
 import { EXIT_UNSAFE_FOLDER, TYPE_CANCELLED } from '../src/cli/audit.js';
 import { run as main, type Commands } from '../src/cli/main.js';
@@ -42,6 +42,7 @@ import type { CreatedFile, InstallRecord, Need, PipelineDraft, RepoProfile } fro
 import { fake } from './helpers/secret-repo.js';
 import { betterleaksAt, CLEAN, makeStub } from './helpers/gitleaks-stub.js';
 import { loadPinnedBinaries } from '../src/engine/linters.js';
+import { proofWorld } from './helpers/proof-world.js';
 import { API, CAPS, candidatesFor, choicesFor, need, NEEDS, profile, REVIEWED, scripted, svc } from './helpers/debate-fixtures.js';
 
 const homes: string[] = [];
@@ -54,6 +55,7 @@ const TK_KEY = ['to', 'ken'].join('');
 const TL_KEY = ['tok', 'ens'].join('');
 const SCANNER_DEP = ['secret', 'Scanner'].join('') as 'secretScanner';
 const GA = ['get', 'Au', 'th'].join('') as 'getAuth';
+const AF = ['au', 'th'].join('') as 'auth';
 const SEC_STAGE = ['sec', 'rets'].join('') as 'secrets';
 const PW_KEY = ['pass', 'word'].join('');
 const GH_KEY = ['gh', 'To', 'ken'].join('');
@@ -117,18 +119,19 @@ function builtOf(i: BuildInput, over: Partial<Built> = {}): Built {
 
 /** A passing proof: proving → verdict → proven → cleaned. */
 const passingProof: NonNullable<RunDeps['proof']> = async (x) => {
+  const repos = await x.checkRepos?.();
   x.store.setStage('proving');
   x.store.recordVerdict({ ok: true, draft: x.draft });
   x.store.setStage('proven');
   x.store.setStage('cleaned');
-  return { ok: true };
+  return { ok: true, ...(repos === undefined ? {} : { repos }) };
 };
 
 interface World {
   calls: string[]; got: Record<string, unknown[]>; vaults: SecretVault[]; builds: BuildInput[]; home: string;
   stages: Partial<RunStages>; deps: RunDeps;
 }
-function world(o: { local?: RepoProfile; facts?: GitHubFacts; debate?: DebateResult; who?: Record<string, unknown>; consent?: boolean; prState?: 'merged' | 'closed' | 'open'; built?: (i: BuildInput) => Built; record?: InstallRecord | null; central?: 'pinned' | 'central-pr'; gate?: boolean; proof?: RunDeps['proof']; deps?: Partial<RunDeps>; found?: CodeBundle['found'] } = {}): World {
+function world(o: { local?: RepoProfile; facts?: GitHubFacts; debate?: DebateResult; who?: Record<string, unknown>; consent?: boolean; prState?: 'merged' | 'closed' | 'open'; built?: (i: BuildInput) => Built; record?: InstallRecord | null; central?: 'pinned' | 'central-pr'; gate?: boolean; missingRepos?: string[]; proof?: RunDeps['proof']; deps?: Partial<RunDeps>; found?: CodeBundle['found'] } = {}): World {
   const calls: string[] = [];
   const got: Record<string, unknown[]> = {};
   const vaults: SecretVault[] = [];
@@ -147,6 +150,7 @@ function world(o: { local?: RepoProfile; facts?: GitHubFacts; debate?: DebateRes
     consent: async (f, p, prov, est, b, auth, extra) => { rec('consent', f, p, prov, est, b, auth, extra); return o.consent === false ? null : ({} as never); },
     state: async (p) => { rec('state', p); return StateStore.open(p, { home, env: {} }); },
     gateReachable: async () => { rec('gateReachable'); return o.gate ?? true; },
+    helperRepos: async () => { rec('helperRepos'); return o.missingRepos ?? []; },
     proofRepos: async (f, p, auth, store, runId, actions) => { rec('proofRepos', f, p, auth, store, runId, actions); return { ready: true, target: {} as never, repos: [], created: [] }; },
     needs: async (p, caps, b, aiP, writers) => { rec('needs', p, caps, b, aiP, writers); return { needs: [...NEEDS], notes: [], requireDeployApproval: true, layersSkipped: [], usage: [] } as never; },
     discover: async () => { rec('discover'); return candidatesFor(NEEDS, profile()); },
@@ -213,7 +217,8 @@ describe('G13: the run, in order', () => {
     const i = io();
     const code = await run(w, i);
     expect(code).toBe(0);
-    const order = ['readOrigin', 'localProject', 'getAuth', 'readProject', 'provider', 'bundle', 'activity', 'consent', 'state', 'proofRepos', 'needs', 'discover', 'debate', 'trusted', 'creators', 'secrets', 'credits', 'build', 'deliverCentral', 'readCentralFileList', 'build', 'preview', 'deliver', 'prState', 'finish'];
+    // G14 (ruling G14-R0 1): the read-only helper-repo check before consent; the writing one (checkProofRepos) inside the proof
+    const order = ['readOrigin', 'localProject', 'getAuth', 'readProject', 'provider', 'bundle', 'helperRepos', 'activity', 'consent', 'state', 'needs', 'discover', 'debate', 'trusted', 'creators', 'secrets', 'credits', 'build', 'proofRepos', 'deliverCentral', 'readCentralFileList', 'build', 'preview', 'deliver', 'prState', 'finish'];
     expect(w.calls.filter((c) => order.includes(c))).toEqual(order);
     const store = await StateStore.open({ owner: OWN, repo: 'r' }, { home: w.home, env: {} });
     expect(store.load()?.stage).toBe('delivered');
@@ -383,6 +388,18 @@ describe('G13: stages 8-15', () => {
     // every pinned reviewed action the proof could run is checked against the scratch repo's settings
     expect((w.got.proofRepos?.[5] as string[]).length).toBeGreaterThan(0);
     expect((w.got.proofRepos?.[5] as string[]).every((a) => /^[^/]+\/[^@]+@[0-9a-f]{40}$/.test(a))).toBe(true);
+    // G14, the cleanupAfterProof half: the proof gets getAuth's answer, and the production proof hands its canDeleteRepos to
+    // cleanupAfterProof (after the proof and in the armed Ctrl-C hook)
+    for (const may of [true, false]) {
+      let given: { canDeleteRepos?: boolean } | undefined;
+      const w2 = world({ who: { kind: 'app', canCreateRepos: true, canDeleteRepos: may }, proof: async (x) => { given = x[AF]; return passingProof(x); } });
+      expect(await run(w2)).toBe(0);
+      expect(given?.canDeleteRepos).toBe(may);
+      const pw = await proofWorld({ input: { [AF]: given as never } });
+      await pw.run();
+      await pw.armed[0]?.cleanup({ signal: new AbortController().signal } as never);
+      expect(pw.cleanupOpts.map((o) => o.canDeleteRepo)).toEqual([may, may]);
+    }
   });
 
   it('run: works with a GitHub App token', async () => {
@@ -664,14 +681,31 @@ describe('G13: one referee call and the guard on the same batch', () => {
 // ---------- the proof seam ----------
 
 describe('G13: the proof seam', () => {
-  it('run: the production proof seam stops before delivery with exit 2 (ruling G13-R0 1)', async () => {
-    expect(await defaultProof({} as never)).toEqual({ ok: false, stopped: PROOF_NOT_BUILT });
-    const w = world({ proof: defaultProof });
+  // G14 (ruling G14-R0 2) replaces G13's `run: the production proof seam stops before delivery with exit 2 (ruling G13-R0 1)`
+  it('run: the production default runs the proof; no RunDeps path skips it', async () => {
+    // no proof given: the production one runs (here it refuses, fail closed, because the fake build gives it no fix-loop referee)
+    const w = world({ deps: { proof: undefined } });
     const i = io();
-    expect(await run(w, i)).toBe(2);
-    expect(i.errs.join('\n')).toContain('the proof step');
+    expect(await run(w, i)).toBe(1);
+    expect(i.errs.join('\n')).toMatch(/no referee for the proof's fix loop/);
+    expect(w.calls).toContain('consent');
     for (const s of ['deliverCentral', 'deliver', 'preview', 'finish']) expect(w.calls).not.toContain(s);
     expect(w.vaults[0]?.names()).toEqual([]);
+    // the seam is called once, always: no flag, stage or dep goes around it, and the G13 stand-in is gone
+    const src = readFileSync(join(process.cwd(), 'src/cli/run.ts'), 'utf8');
+    expect(src.match(/\(deps\.proof \?\? defaultProof\)\(/g)?.length).toBe(1);
+    expect(src).not.toMatch(/PROOF_NOT_BUILT|deps\.proof === undefined/);
+    expect(typeof defaultProof).toBe('function');
+    // spec M5: the refusal above is the production proof's own (run-proof.ts makeRunProof), not a run.ts shortcut: the proof was entered
+    const proofSrc = readFileSync(join(process.cwd(), 'src/cli/run-proof.ts'), 'utf8');
+    expect(proofSrc).toContain('pipegen has no referee for the proof');
+    expect(src).not.toContain('no referee for the proof');
+    // with a fix-loop build it goes further: the production proof assembles its files (its own assembler refuses this fake draft's tool)
+    const w2 = world({ deps: { proof: undefined }, built: (x) => ({ ...builtOf(x), proof: { rebuild: async (d) => ({ files: [], assembled: d }), referee: async () => ({ ok: true, issues: [], demoted: [], notes: [] }), guard: async (f) => ({ ok: f, refused: [], notes: [] }) } }) });
+    const i2 = io();
+    expect(await run(w2, i2)).not.toBe(0);
+    expect(i2.errs.join('\n')).toMatch(/not a reviewed tool pipegen offered/);
+    for (const s of ['deliverCentral', 'deliver', 'preview', 'finish']) expect(w2.calls).not.toContain(s);
   });
 
   it('run: no delivery without the stage cleaned and a passed verdict', async () => {
@@ -921,6 +955,31 @@ describe('G13: main dispatch', () => {
   };
   const mio = (cwd: string) => { const i = io({}, { cwd }); return i; };
 
+  it('main: argv → main → resume; help lists resume; resume refuses --skip, --type and --strictness', async () => {
+    const dir = repoDir();
+    const { got, cmds } = fakes();
+    expect(await main(['resume', '--dir', dir, '--allow-broad-token'], mio(tmpdir()), cmds)).toBe(0);
+    expect(got.fullRun?.[0]).toBe(dir);
+    expect(got.fullRun?.[2]).toMatchObject({ resume: true, flags: { allowBroad: true } });
+    expect((got.fullRun?.[2] as RunDeps).flags).toEqual({ allowBroad: true });
+    for (const bad of [['--skip', 'tests'], ['--type', 'app=static-site'], ['--strictness', 'starter']]) {
+      const f = fakes();
+      const e = mio(tmpdir());
+      expect(await main(['resume', '--dir', dir, ...bad], e, f.cmds)).toBe(1);
+      expect(e.errs.join('\n')).toMatch(new RegExp(`${bad[0]} works with pipegen (audit and pipegen )?run only`));
+      expect(f.got.fullRun).toBeUndefined();
+    }
+    const h = mio(tmpdir());
+    expect(await main(['--help'], h)).toBe(0);
+    expect(h.lines.join('\n')).toMatch(/pipegen resume\s+Goes on with a run that stopped/);
+    // fullRun itself refuses them too (a caller other than main)
+    const w = world();
+    const i = io();
+    expect(await fullRun('/repo', i, { ...w.deps, resume: true, flags: { skip: 'tests' } })).toBe(1);
+    expect(i.errs.join('\n')).toMatch(/resume takes no --skip, --type or --strictness/);
+    expect(w.calls).toEqual([]);
+  });
+
   it('main: argv → main → cleanupCommand (--dir, --allow-broad-token); help lists run, finish, verify, update, cleanup', async () => {
     const dir = repoDir();
     const { got, cmds } = fakes();
@@ -934,7 +993,9 @@ describe('G13: main dispatch', () => {
     expect(help).toMatch(/npx pipegen\s+Audit this folder/);
     // spec M5: the help says what run does in this version (no proof step yet: it stops before spending anything)
     expect(help).not.toMatch(/proves it on a private test copy, then opens/);
-    expect(help).toMatch(/no proof step yet, so run stops before it asks to spend anything/);
+    // G14: the proof exists now; the help says so (spec M5's "no proof step yet" is gone)
+    expect(help).toMatch(/test copy \(the proof\), with its keys and branches cleaned up right after/);
+    expect(help).not.toMatch(/no proof step yet/);
   });
 
   it('main: no command is still the audit; run, finish, verify, update take only their own flags', async () => {
@@ -1165,14 +1226,6 @@ describe('G13-R1: before anything costs money', () => {
     expect(await run(w2)).toBe(0);
   });
 
-  it('run: with no proof built (the production default), the run stops before consent: no AI money, no secret asked (spec M5)', async () => {
-    const w = world({ deps: { proof: undefined } });
-    const i = io();
-    expect(await run(w, i)).toBe(2);
-    expect(i.errs.join('\n')).toContain(PROOF_NOT_BUILT);
-    for (const s of ['consent', 'scan', 'needs', 'discover', 'creators', 'secrets', 'state']) expect(w.calls).not.toContain(s);
-  });
-
   it('run: key-env with no memory folder is refused before consent (sec M4)', async () => {
     const keyCaps = { ...CAPS, attestations: false, environments: true, deploymentBranchPolicies: true };
     const local = LOCAL({ services: [{ ...APP, dockerfile: 'Dockerfile' }] });
@@ -1232,10 +1285,16 @@ describe('G13-R1: the meter, the state, the helper repos', () => {
 
   it('run: onCreated records the scratch repo only; the probe-P4 shape (pipelines, 4242) is not recorded (sec I5)', () => {
     const ids: number[] = [];
-    const cb = onCreatedFor({ scratchCreated: (id: number) => { ids.push(id); } } as never, 'r');
+    const st: { centralCreated?: boolean } = {};
+    const cb = onCreatedFor({ scratchCreated: (id: number) => { ids.push(id); }, update: (f: (n: typeof st) => void) => { f(st); } } as never, 'r');
     cb('pipelines', 4242);
     cb('pipegen-proof-other', 1);
     expect(ids).toEqual([]);
+    // G14-R1 (spec M1): the central repo pipegen made is remembered for a resume's record (never as the scratch id)
+    expect(st.centralCreated).toBe(true);
+    // and a resume's delivery record says so, though the repo exists by now (this run's check created nothing)
+    expect(proofReposFor({ created: [] }, { centralCreated: true }).central?.createdByPipegen).toBe(true);
+    expect(proofReposFor({ created: [] }, {}).central?.createdByPipegen).toBe(false);
     cb('pipegen-proof-r', 77);
     expect(ids).toEqual([77]);
   });
@@ -1342,6 +1401,15 @@ describe('G13-R2: a public app\'s central CODEOWNERS', () => {
 });
 
 describe('G13-R2: the state file never holds a known value (ruling G13-R2 4)', () => {
+  it('run: the state store\'s tokens hold the AI key too (G14, controller addendum)', async () => {
+    const w = world();
+    let guard: Parameters<RunStages['state']>[1] | undefined;
+    w.stages.state = async (p, g) => { guard = g; w.calls.push('state'); return StateStore.open(p, { home: w.home, env: {}, ...g }); };
+    const aiKey = ['made', 'up', 'ai', 'key', '0123456789'].join('-');
+    const other = ['other', 'ai', 'key', '0123456789'].join('-');
+    expect(await run(w, io({}, { env: { [['ANTHROPIC', 'API', 'KEY'].join('_')]: aiKey, [['OPENAI', 'API', 'KEY'].join('_')]: other } }))).toBe(0);
+    expect(guard?.tokens).toEqual([TK, aiKey, other]);
+  });
   it('run: the state store gets the run\'s known-value check (the vault and the key vault, live) and the GitHub token', async () => {
     const w = world();
     let guard: Parameters<RunStages['state']>[1] | undefined;

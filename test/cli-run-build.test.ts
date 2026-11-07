@@ -4,14 +4,17 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import type { Octokit } from '@octokit/rest';
-import { buildFiles, judgeBuilt, readRegular, runCreators, workflowTexts, type BuildInput, type BuildFacts } from '../src/cli/run.js';
+// the real referee, watched: the fix loop's referee must judge AssembledFiles.draft, never the input draft (carry 25)
+vi.mock(import('../src/engine/referee.js'), async (orig) => { const m = await orig(); return { ...m, referee: vi.fn(m.referee) }; });
+import { referee as watchedReferee } from '../src/engine/referee.js';
+import { buildFiles, judgeBuilt, proofBuildFor, readBuildFacts, readRegular, runCreators, workflowTexts, type BuildInput, type BuildFacts } from '../src/cli/run.js';
 import { strictNeeds, warnFirstFor } from '../src/cli/run-parts.js';
 import { judgeAssembled } from '../src/layers/assemble.js';
 import { ADVISORY_TOOLS } from '../src/debate/builder.js';
 import { docShapeProblem, pipegenDoc } from '../src/deliver/docs.js';
-import { deliver, planDelivery, type DeliveryInput } from '../src/deliver/deliver.js';
+import { deliver, planDelivery, previewText, type DeliveryInput } from '../src/deliver/deliver.js';
 import { InstallRecordSchema, protectedPathsOfRecord, readRecord, recordHash } from '../src/deliver/record.js';
 import { codeownersProtectedPaths } from '../src/engine/created-builders.js';
 import { FakeGitHub } from './helpers/deliver-github.js';
@@ -20,7 +23,7 @@ import { SecretVault } from '../src/create/secrets.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { floorNeeds, MINIMUM_CATEGORIES } from '../src/engine/needs.js';
 import type { Estimates } from '../src/estimate/estimate.js';
-import type { Need, PipelineDraft } from '../src/types.js';
+import type { InstallRecord, Need, PipelineDraft } from '../src/types.js';
 import { CAPS, LINTERS, node, p, planned, profileOf } from './helpers/assemble.js';
 import { REVIEWED } from './helpers/debate-fixtures.js';
 
@@ -320,3 +323,72 @@ describe('G13-R2: no user text tells the user to re-run with bare `npx pipegen` 
     expect(bad).toEqual([]);
   });
 });
+
+describe('G14 (controller addendum, BINDING): a re-run after a complete install builds', () => {
+  it('build: a re-run whose central CODEOWNERS already holds pipegen\'s block, through readBuildFacts and the real build, passes (centralFiles from the central tree)', async () => {
+    // the first install: pipegen's block went into the user's own central CODEOWNERS
+    const first = input(false);
+    const userCo = '* @someone\n';
+    const f1 = await buildFiles(first, { ...FACTS, centralCo: { path: '.github/CODEOWNERS', text: userCo, isSymlink: false, block: null, inserted: null } });
+    const edit = f1.locks.centralCodeowners?.edit;
+    const delivered = f1.locks.centralCodeowners?.file.content;
+    expect(edit?.inserted).toMatch(/pipegen/);
+    expect(delivered).toContain(edit?.inserted as string);
+    // the re-run: the central repo holds that file; the trusted record names the block pipegen inserted
+    const g = new FakeGitHub();
+    g.addRepo(`${OWN}/r`, { private: false, files: { 'package.json': readFileSync(join(first.dir, 'package.json'), 'utf8'), 'package-lock.json': readFileSync(join(first.dir, 'package-lock.json'), 'utf8') } });
+    g.addRepo(`${OWN}/pipelines`, { private: true, files: { 'README.md': 'central\n', '.github/CODEOWNERS': delivered as string, 'installs/r.json': '{}\n' } });
+    const prev = { files: [], edits: [{ repo: 'central', kind: 'codeowners', path: '.github/CODEOWNERS', inserted: edit?.inserted, anchor: edit?.anchor }] } as unknown as InstallRecord;
+    const i = { ...input(false), prev, facts: { ...first.facts, gh: g.octokit() } };
+    const facts = await readBuildFacts(i);
+    expect([...(facts.centralFiles ?? [])].sort()).toEqual(['.github/CODEOWNERS', 'README.md', 'installs/r.json']);
+    expect(facts.centralCo.inserted).toBe(edit?.inserted);
+    const files = await buildFiles(i, facts);
+    const judged = await judgeBuilt(i, files, facts, { linters: judgeDeps.linters, judge: noLinters });
+    expect(judged.report.issues.map((x) => `${x.file}: ${x.message}`)).toEqual([]);
+    expect(judged.guardProblems).toEqual([]);
+  });
+});
+
+describe('G14: the fix loop\'s build, referee and guard; AI-written files to the preview', () => {
+  it('run: the fix loop\'s guard runs on the referee\'s batch', async () => {
+    const i = input(false);
+    const guarded: string[][] = [];
+    const facts = { ...FACTS, centralFiles: [] } as unknown as BuildFacts;
+    const pb = proofBuildFor(i, facts, undefined, { linters: judgeDeps.linters, guard: async (files) => { guarded.push(files.map((f) => f.path).sort()); return { ok: [...files], refused: [], notes: [] }; }, runLinters: async () => [] });
+    const d = { ...i.draft, created: [{ repo: 'app', path: 'Dockerfile', content: 'FROM node:22\n', part: 'docker', reason: 'r' }, { repo: 'app', path: '.dockerignore', content: 'node_modules\n', part: 'docker', reason: 'r' }] } as PipelineDraft;
+    const report = await pb.referee(d);
+    const b = await pb.rebuild(d);
+    // carry 25: the referee judged the assembled draft of that build (seven arguments), never the input draft
+    const call = vi.mocked(watchedReferee).mock.calls.at(-1) ?? [];
+    expect(call).toHaveLength(7);
+    expect(call[1]).toBe(b.assembled);
+    expect(call[1]).not.toBe(d);
+    // the guard got exactly the app files of the batch the referee judged (a Dockerfile with its .dockerignore)
+    expect(guarded).toEqual([b.files.filter((f) => f.repo === 'app').map((f) => f.path).sort()]);
+    expect(guarded[0]).toEqual(expect.arrayContaining(['Dockerfile', '.dockerignore']));
+    // a guard refusal is an issue of the fix loop's referee
+    const refusing = proofBuildFor(i, facts, undefined, { linters: judgeDeps.linters, guard: async (files) => ({ ok: [], refused: files.filter((f) => f.path === 'Dockerfile').map((f) => ({ path: f.path, reason: 'no' })), notes: [] }), runLinters: async () => [] });
+    const r2 = await refusing.referee(d);
+    expect(r2.ok).toBe(false);
+    expect(r2.issues.some((x) => x.file === 'Dockerfile' && /guard refused/.test(x.message))).toBe(true);
+    expect(report.issues.filter((x) => /guard/.test(x.message))).toEqual([]);
+  });
+
+  it('run: the mid-run confirmation and the preview list the AI-written files (aiEdited)', async () => {
+    const i = input(false);
+    const d = { ...i.draft, created: [{ repo: 'app', path: 'Dockerfile', content: 'FROM node:22\n', part: 'docker', reason: 'r', aiEdited: true }, { repo: 'app', path: '.dockerignore', content: 'node_modules\n', part: 'docker', reason: 'r' }] } as PipelineDraft;
+    const built = await buildFiles({ ...i, draft: d }, FACTS);
+    // the delivered batch keeps aiEdited (E-b15)
+    expect(built.files.find((f) => f.path === 'Dockerfile')?.aiEdited).toBe(true);
+    const input2: DeliveryInput = {
+      draft: built.assembled.draft, files: built.files, locks: built.locks, ...({ [['secret', 'Names'].join('')]: [] } as unknown as Pick<DeliveryInput, 'secretNames'>),
+      protectedPaths: codeownersProtectedPaths(built.assembled.draft, REVIEWED), environments: [], proofRepos: { central: { createdByPipegen: false }, scratch: { createdByPipegen: false } }, centralFileList: ['README.md'],
+    };
+    const text = previewText(planDelivery(input2));
+    const at = text.lastIndexOf('  Dockerfile');
+    expect(at).toBeGreaterThan(-1);
+    expect(text.slice(0, at)).toMatch(/Written by the AI \(pipegen's fix loop changed them; read them closely\):\n\s*$/);
+  });
+});
+

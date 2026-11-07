@@ -467,7 +467,8 @@ export async function createHelperRepo(gh: Octokit, r: GuardedRepo, login: strin
   if (!org && (login === null || login.toLowerCase() !== t.owner.toLowerCase())) {
     refuse(`a repo for ${t.owner} can only be created by ${t.owner} (the token belongs to ${safeText(login ?? 'nobody known', 40)}).`);
   }
-  const body = { name: r.repo, private: true, auto_init: true, description: DESCRIPTIONS[r.kind] };
+  // G14 (Plan V ruling V3-wiki): no wiki and no projects, so an uninstall can show nothing user-made lives in a helper repo
+  const body = { name: r.repo, private: true, auto_init: true, has_wiki: false, has_projects: false, description: DESCRIPTIONS[r.kind] };
   let data: unknown;
   try {
     data = (await withRateLimit(() => {
