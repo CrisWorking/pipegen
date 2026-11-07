@@ -32,7 +32,7 @@ import { fail, getOwn, isObj, MAX_RAW_BYTES, ReadError, readJson, type ParsedFin
 import { MAX_ADVISORY_IDS, SARIF_TOOLS, parseSarifText } from './sarif.js';
 import { applyStage, readStage, StageError, STAGED_NAME_RE, type Stage, type StagedFindings } from './stage.js';
 import { applyRange, isRangeSkipped, RANGE_FACTS_FILE, SKIP_NOTES, SKIP_REASONS, RangeFactsError, readRangeFacts, SECRETS_HISTORY_ARTIFACT, SECRETS_RANGE_ARTIFACT, SECRETS_RANGE_TOOL, type RangeRun } from './range.js';
-import { ZAP_TOOL, parseZapJsonText } from './zap.js';
+import { ZAP_AF_TOOL, ZAP_TOOL, ZAP_TOOLS, parseZapJsonText } from './zap.js';
 import { parseTrivyLicenceJsonText, TRIVY_LICENCE_TOOL } from './trivy-licence.js';
 
 export type ScrubFormat = 'sarif' | 'zap-json';
@@ -124,8 +124,10 @@ function withholder(): (file: string | undefined) => boolean {
   };
 }
 
+/** G15a round 6: the driver name of the SARIF the scrub writes for a ZAP report (the nightly AF scan, for code scanning). */
+const ZAP_SARIF_DRIVER = 'ZAP';
 function sarifOut(tool: string, findings: readonly FingerprintedFinding[], notes: readonly string[], key: string | undefined, extra: Record<string, string> = {}): string {
-  const info = SARIF_TOOLS[tool];
+  const info = tool === ZAP_AF_TOOL ? { driver: ZAP_SARIF_DRIVER } : SARIF_TOOLS[tool];
   const withheld = withholder();
   const results = findings.map((f) => {
     const hide = withheld(f.file);
@@ -227,7 +229,7 @@ export function scrubBytes(raw: Uint8Array, opts: ScrubOptions): ScrubOutcome {
           : parseSarifText(raw, opts.tool, { workspace: stage.files, exactNames: STAGED_NAME_RE, limits: { maxBytes } });
     } else if (opts.format === 'zap-json') {
       if (opts.stage !== undefined || opts.range !== undefined) return toolError('a stage folder or a commit range is only for the secrets tools', key);
-      if (opts.tool !== ZAP_TOOL) return toolError(`${JSON.stringify(safeText(opts.tool, 60))} is not a tool whose ZAP report the gate reads`, key);
+      if (!ZAP_TOOLS.has(opts.tool)) return toolError(`${JSON.stringify(safeText(opts.tool, 60))} is not a tool whose ZAP report the gate reads`, key);
       parsed = parseZapJsonText(raw, opts.tool, { limits: { maxBytes } });
     } else {
       return toolError('the result format is not one the gate reads', key);
@@ -264,7 +266,8 @@ export function scrubBytes(raw: Uint8Array, opts: ScrubOptions): ScrubOutcome {
       ...(opts.range === undefined ? {} : { regionOf: () => ({ ok: false as const, reason: 'a secret in a commit of the range (the checkout\'s file is not that commit\'s)' }) }),
     });
     const notes = [...parsed.notes, ...lineNotes(findings)].slice(0, MAX_NOTES).map((n) => clip(maskSecretShapes(n), MAX_NOTE_CHARS));
-    const bytes = Buffer.from(opts.format === 'sarif' ? sarifOut(opts.tool, findings, notes, usedKey) : zapOut(findings, notes), 'utf8');
+    // G15a round 6: the nightly AF scan's ZAP report is written as SARIF (code scanning reads it); zap-baseline's keeps the ZAP form the gate reads
+    const bytes = Buffer.from(opts.format === 'sarif' || opts.tool === ZAP_AF_TOOL ? sarifOut(opts.tool, findings, notes, usedKey) : zapOut(findings, notes), 'utf8');
 
     // the last check: nothing secret may have reached an allowlisted field (a file name, a rule id)
     // as written and as JSON writes it (a quote, a backslash or a newline in the text is escaped in the file)

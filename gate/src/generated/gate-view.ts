@@ -103,6 +103,14 @@ export const GATE_VIEW: readonly GateToolView[] = [
     "outputFile": "zap.json"
   },
   {
+    "id": "zap-af-active",
+    "categories": [
+      "dast"
+    ],
+    "configFiles": [],
+    "outputFile": "zap-active.json"
+  },
+  {
     "id": "trivy-config",
     "categories": [
       "iac"

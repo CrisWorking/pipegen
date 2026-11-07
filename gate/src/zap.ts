@@ -13,6 +13,14 @@ import type { Severity } from '../../src/types.js';
 import { safeText } from '../../src/util/safe-text.js';
 
 export const ZAP_TOOL = 'zap-baseline';
+/**
+ * G15a round 6: the nightly ZAP Automation Framework active scan (reviewed entry `zap-af-active`, the same pinned image). Its report is the
+ * same traditional-json template (test/fixtures/zap/af-active-*.json), read by this reader under its own id; the scrub writes it as SARIF
+ * for code scanning (scrub.ts), never as the scrubbed ZAP form the merge-layer gate reads.
+ */
+export const ZAP_AF_TOOL = 'zap-af-active';
+/** The tool ids whose ZAP report this reader reads. */
+export const ZAP_TOOLS: ReadonlySet<string> = new Set([ZAP_TOOL, ZAP_AF_TOOL]);
 
 /**
  * VERIFIED (G15a round 5). The reader was run on real reports of the pinned image (zaproxy/zap-stable@sha256:5ccfff9a…, ZAP 2.17.0;
@@ -57,7 +65,7 @@ function optString(o: Obj, key: string, where: string, nullOk = false): string |
 /** Reads one parsed ZAP traditional-json report. Never throws. */
 export function parseZapJson(json: unknown, toolId: string, opts: ZapOptions = {}): ParseResult {
   return guarded((notes) => {
-    if (toolId !== ZAP_TOOL) fail(`${JSON.stringify(safeText(toolId, 60))} is not a tool whose ZAP report the gate reads`);
+    if (!ZAP_TOOLS.has(toolId)) fail(`${JSON.stringify(safeText(toolId, 60))} is not a tool whose ZAP report the gate reads`);
     if (!isObj(json)) fail('the result is not a ZAP report (the top level is not an object)');
     if (getOwn(json, '@programName') !== 'ZAP') fail('the report is not from ZAP (@programName)');
     const limits = limitsFrom(opts.limits);
