@@ -772,7 +772,10 @@ describe('uninstall apply: the four conditions of the V4 security review and the
     ]) await expect(call()).rejects.toBeInstanceOf(UninstallRefusal);
     // refused before anything is read or sent
     expect(w.g.calls.length).toBe(n);
-    expect(() => new PhaseApi(a.api, 'C' as 'A')).toThrow(UninstallRefusal);
+    // only takeApi makes one (V5-R1 I2): a caller holding the plan's api gets a refusal
+    const Made = PhaseApi as unknown as new (...a: unknown[]) => PhaseApi;
+    expect(() => new Made(a.api, 'A')).toThrow(UninstallRefusal);
+    expect(() => new Made({}, a.api, 'C')).toThrow(UninstallRefusal);
   });
 
   it('apply: run 2 is a fresh plan; nothing of run 1\'s answers or tokens is kept', async () => {
@@ -1060,7 +1063,7 @@ describe('uninstall apply: fix round 1 (V5-R1)', () => {
       seen.hasApi = 'api' in plan;
       const raw = (plans()[0] as UninstallPlan).api;
       const Ctor = api.constructor as new (...a: unknown[]) => PhaseApi;
-      for (const [k, make] of [['ctor', () => new Ctor(raw, 'A')], ['import', () => new PhaseApi(raw, 'A')], ['guessed', () => new Ctor({}, raw, 'A')]] as const) {
+      for (const [k, make] of [['ctor', () => new Ctor(raw, 'A')], ['import', () => new (PhaseApi as unknown as typeof Ctor)(raw, 'A')], ['guessed', () => new Ctor({}, raw, 'A')]] as const) {
         try { make(); seen[k] = 'made'; } catch (e) { seen[k] = (e as Error).constructor.name; }
       }
       try { takeApi(plans()[0] as UninstallPlan, 'B'); seen.again = 'made'; } catch (e) { seen.again = (e as Error).constructor.name; }

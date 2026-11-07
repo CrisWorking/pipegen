@@ -21,6 +21,10 @@
 // - M-r1-2: run 2 goes to phase B only when GitHub's merged_at on the recorded uninstall PR is set. No PR: an unfinished install goes on to
 //   phase B in the same process; a run 1 with nothing to remove goes to phase B only when no workflow of pipegen's is live on the default
 //   branch (else phase A again); a PR GitHub no longer shows (or not pipegen's) → stop with a manual step.
+// - V5-R1: a progress file past run 1 counts only for the record it was made for (its anchors' record blob sha); `B` reads merged_at again;
+//   the uninstall PR must target the default branch. The phase runner gets the plan without its api, and only takeApi makes a PhaseApi.
+//   pipegen/setup stays while a PR into it is open; pipegen/uninstall moves only while it points where pipegen set it (saved in the progress
+//   file); a run 1 with no PR remembers the workflows the user kept, so the next run goes on to run 2 (with the warning) instead of run 1.
 import { randomBytes } from 'node:crypto';
 import type { Octokit } from '@octokit/rest';
 import { PromptCancelledError, type Prompter } from '../cli/io.js';
@@ -66,7 +70,9 @@ export interface StepResult {
 }
 /** What phase B gets besides its confirmed plan and its phase-bound api (V6). */
 export interface PhaseBContext { progress: ProgressFile; workflowsLive: boolean; out: (line: string) => void; deps: StepDeps }
-export type PhaseBRunner = (gh: Octokit, plan: UninstallPlan, api: PhaseApi, ctx: PhaseBContext) => Promise<StepResult>;
+/** A confirmed plan as a phase runner gets it: without its unbound `api` (V5-R1 I2); every write goes through the PhaseApi beside it. */
+export type PhasePlan = Omit<UninstallPlan, 'api'>;
+export type PhaseBRunner = (gh: Octokit, plan: PhasePlan, api: PhaseApi, ctx: PhaseBContext) => Promise<StepResult>;
 export interface StepDeps extends PlanDeps {
   /** Where the preview and notes go (default: stdout). */
   out?: (line: string) => void;
@@ -124,13 +130,20 @@ export async function confirmPlan(plan: UninstallPlan, io: Prompter | undefined,
   return true;
 }
 
-/** The phase-bound api of a confirmed plan, once: the plan is dropped as it is taken (an apply uses its plan once). */
-function takeApi(plan: UninstallPlan, phase: UninstallPhase): PhaseApi {
+/**
+ * The phase-bound api of a confirmed plan, once: the plan is dropped as it is taken (an apply uses its plan once). The only maker of a
+ * PhaseApi (V5-R1 I2). The plan comes back without its `api`, so a runner can't reach the unbound UninstallApi; the typed-name tokens in its
+ * items still work through the PhaseApi, which sends to that same api.
+ */
+export function takeApi(plan: UninstallPlan, phase: UninstallPhase): { api: PhaseApi; plan: PhasePlan } {
   if (!confirmed.has(plan) || dropped.has(plan)) throw new UninstallError('pipegen sends nothing without the confirmed plan of this run (each plan is confirmed once and used once). Nothing more was changed.');
   if (plan.phase !== phase) throw new UninstallError(`This plan is for phase ${plan.phase}, not phase ${phase}. Nothing more was changed.`);
   dropPlan(plan);
-  return new PhaseApi(plan.api, phase);
+  const { api, ...rest } = plan;
+  return { api: new PhaseApi(PHASE_API_GUARD, api, phase), plan: rest };
 }
+/** Held by this module only: a PhaseApi is made by takeApi, never by a caller with an UninstallApi in hand. */
+const PHASE_API_GUARD: object = Object.freeze({});
 
 // ---------- the phase-bound api (M-r1-1) ----------
 
@@ -146,7 +159,8 @@ export class PhaseApi {
   readonly phase: UninstallPhase;
   readonly #api: UninstallApi;
 
-  constructor(api: UninstallApi, phase: UninstallPhase) {
+  constructor(guard: object, api: UninstallApi, phase: UninstallPhase) {
+    if (guard !== PHASE_API_GUARD) throw new UninstallRefusal('an uninstall api bound to a phase is made only from the confirmed plan of this run.');
     if (phase !== 'A' && phase !== 'B') throw new UninstallRefusal('an uninstall api is bound to phase A or B.');
     this.#api = api;
     this.phase = phase;
@@ -230,21 +244,38 @@ export async function uninstallStep(gh: Octokit, loaded: LoadedRecord, io: Promp
     const ctx: Ctx = { gh, loaded, io, deps, planDeps, out, clock, progress };
     const p = progress.state;
     if (p === null || p.phase === 'A') return await runA(ctx);
-    if (p.phase === 'B') return await runB(ctx, await workflowsLive(gh, loaded, clock));
+    // I1: past run 1, the file counts only for the record it was made for (phase A never writes the record; phase B removes it last)
+    if (p.anchors.recordBlobSha !== loaded.blobSha) {
+      const why = `the uninstall progress file ${progress.path} was made for another install record (pipegen was installed again, or the record changed since)`;
+      const step = `Check ${show(`${app.owner}/${app.repo}`, 140)}, move ${progress.path} away, then run \`pipegen uninstall\` again: it starts with the first run.`;
+      const r = result('stopped', null, [`pipegen stopped: ${why}. Nothing was changed.`, `Manual step: ${step}`]);
+      r.manual.push({ what: 'uninstall progress file', why, step });
+      return r;
+    }
+    if (p.phase === 'B' && p.prNumber === undefined) return await runB(ctx, (await liveWorkflow(gh, loaded, clock)) !== null);
     // run 1 is done: what next depends on GitHub, never on the progress file alone
     if (p.prNumber === undefined || p.unfinished === true) {
-      const live = await workflowsLive(gh, loaded, clock);
-      if (live) {
-        out(`pipegen's workflows (or its verify job) are still on ${show(loaded.app.defaultBranch, 100)}, and the first run needed no uninstall pull request: pipegen runs the first run again, so they are removed before anything they need.`);
+      const kept = new Set((p.keptWorkflows ?? []).filter((k) => loaded.record.files.some((f) => f.repo === 'app' && f.path === k)));
+      const live = await liveWorkflow(gh, loaded, clock, kept);
+      if (live !== null) {
+        out(`pipegen's workflow ${show(live, 200)} (or its verify job in it) is still on ${show(loaded.app.defaultBranch, 100)}, and the first run needed no uninstall pull request: pipegen runs the first run again, so it is removed before anything it needs. If pipegen can't remove it, take pipegen's part out of ${show(live, 200)} on ${show(loaded.app.defaultBranch, 100)} by hand, then run \`pipegen uninstall\` again.`);
         return await runA(ctx);
       }
-      return await runB(ctx, false);
+      return await runB(ctx, kept.size > 0 && (await liveWorkflow(gh, loaded, clock)) !== null);
     }
-    const pr = await prState(gh, app, loaded.app.repoId, p.prNumber, clock);
+    const pr = await prState(gh, app, loaded.app.repoId, loaded.app.defaultBranch, p.prNumber, clock);
     const num = `#${p.prNumber}`;
     const url = p.prUrl === undefined ? '' : ` (${show(p.prUrl, 300)})`;
+    if (p.phase === 'B' && pr !== 'merged' && pr !== 'gone' && pr !== 'foreign' && pr !== 'other-base') {
+      // B: the second run began, so its PR merged; GitHub showing it unmerged now is not something pipegen goes on from
+      const why = `the progress file says the second run began, but GitHub shows the uninstall pull request ${num} as not merged`;
+      const step = `Check ${show(`${app.owner}/${app.repo}`, 140)}: if pipegen's uninstall pull request merged, move ${progress.path} away and run \`pipegen uninstall\` again; if not, run \`pipegen finish\` to lock again.`;
+      const r = result('stopped', null, [`pipegen stopped: ${why}. Nothing was changed.`, `Manual step: ${step}`]);
+      r.manual.push({ what: `uninstall pull request ${num}`, why, step });
+      return r;
+    }
     switch (pr) {
-      case 'merged': return await runB(ctx, await workflowsLive(gh, loaded, clock));
+      case 'merged': return await runB(ctx, (await liveWorkflow(gh, loaded, clock)) !== null);
       case 'open': return result('waiting', 'A', [`The uninstall pull request ${num}${url} is still open. Merge it, then run \`pipegen uninstall\` again for the second run. Until you merge it, run \`pipegen finish\` to lock again.`]);
       case 'closed':
         progress.remove();
@@ -252,7 +283,9 @@ export async function uninstallStep(gh: Octokit, loaded: LoadedRecord, io: Promp
       default: {
         const why = pr === 'gone'
           ? `GitHub doesn't show the uninstall pull request ${num} any more (deleted, or this login can't see it), so pipegen can't tell whether it merged`
-          : `the pull request ${num} the progress file names is not pipegen's uninstall pull request (branch ${UNINSTALL_PR_BRANCH} of this repo)`;
+          : pr === 'other-base'
+            ? `the uninstall pull request ${num} targets another branch than the default branch ${show(loaded.app.defaultBranch, 100)}, so its changes are not where pipegen's gate runs`
+            : `the pull request ${num} the progress file names is not pipegen's uninstall pull request (branch ${UNINSTALL_PR_BRANCH} of this repo)`;
         const step = `Check ${show(`${app.owner}/${app.repo}`, 140)}: if pipegen's uninstall pull request merged, move ${progress.path} away and run \`pipegen uninstall\` again; if not, run \`pipegen finish\` to lock again.`;
         const r = result('stopped', null, [`pipegen stopped: ${why}. Nothing was changed.`, `Manual step: ${step}`]);
         r.manual.push({ what: `uninstall pull request ${num}`, why, step });
@@ -282,7 +315,7 @@ async function runA(c: Ctx): Promise<StepResult> {
     }
     if (r.status === 'a-done' && plan.unfinished) {
       for (const l of r.lines) c.out(l);
-      const b = await runB(c, await workflowsLive(c.gh, c.loaded, c.clock));
+      const b = await runB(c, (await liveWorkflow(c.gh, c.loaded, c.clock)) !== null);
       return { ...b, done: [...r.done, ...b.done], skipped: [...r.skipped, ...b.skipped], manual: [...r.manual, ...b.manual] };
     }
     return r;
@@ -303,8 +336,8 @@ async function runB(c: Ctx, live: boolean): Promise<StepResult> {
 /** M-r1-1: by the plan's own phase, with an api bound to it. */
 async function dispatch(c: Ctx, plan: UninstallPlan, live: boolean): Promise<StepResult> {
   if (plan.phase === 'A') return applyPhaseA(c.gh, plan, c.progress, { out: c.out, clock: c.clock });
-  const api = takeApi(plan, 'B');
-  return (c.deps.phaseB as PhaseBRunner)(c.gh, plan, api, { progress: c.progress, workflowsLive: live, out: c.out, deps: c.deps });
+  const taken = takeApi(plan, 'B');
+  return (c.deps.phaseB as PhaseBRunner)(c.gh, taken.plan, taken.api, { progress: c.progress, workflowsLive: live, out: c.out, deps: c.deps });
 }
 
 // ---------- phase A ----------
@@ -314,8 +347,12 @@ async function dispatch(c: Ctx, plan: UninstallPlan, live: boolean): Promise<Ste
  * locks, through the plan's phase-A api, with the progress saved before the first write, after the PR, on a failure and on Ctrl-C. Secrets,
  * variables, environments and settings are never sent here (run 2's). The install record is never written.
  */
-export async function applyPhaseA(gh: Octokit, plan: UninstallPlan, progress: ProgressFile, deps: { out?: (line: string) => void; clock?: RateClock } = {}): Promise<StepResult> {
-  const api = takeApi(plan, 'A');
+export async function applyPhaseA(gh: Octokit, confirmedPlan: UninstallPlan, progress: ProgressFile, deps: { out?: (line: string) => void; clock?: RateClock } = {}): Promise<StepResult> {
+  const { api, plan } = takeApi(confirmedPlan, 'A');
+  // M2: the head pipegen set pipegen/uninstall to in an earlier try of run 1 (read before this run saves over the file)
+  const prior = progress.state;
+  let uninstallHead = prior !== null && prior.phase === 'A' ? prior.uninstallHead : undefined;
+  let keptWorkflows: string[] = [];
   const clock = deps.clock ?? api.clock;
   const appRef: RepoRef = { owner: plan.app.owner, repo: plan.app.repo };
   const full = show(`${appRef.owner}/${appRef.repo}`, 140);
@@ -326,6 +363,7 @@ export async function applyPhaseA(gh: Octokit, plan: UninstallPlan, progress: Pr
   const save = (phase: 'A' | 'A-done'): void => {
     progress.save({
       phase, anchors: { ...plan.base }, ...(pr === undefined ? {} : { prNumber: pr.number, prUrl: pr.url }), ...(plan.unfinished ? { unfinished: true as const } : {}),
+      ...(uninstallHead === undefined ? {} : { uninstallHead }), keptWorkflows,
       done: [...r.done], leftovers: [...r.failed, ...r.manual.map((m) => ({ what: m.what, why: m.why, ...(m.step === undefined ? {} : { manual: m.step }) }))],
     });
   };
@@ -364,11 +402,24 @@ export async function applyPhaseA(gh: Octokit, plan: UninstallPlan, progress: Pr
   const steps: (() => Promise<void>)[] = [];
   steps.push(async () => {
     prOk = await attempt('uninstall pull request', undefined, async () => {
-      const opened = await uninstallPr(gh, plan, api, clock);
+      let opened: Awaited<ReturnType<typeof uninstallPr>>;
+      try {
+        opened = await uninstallPr(gh, plan, api, clock, {
+          head: uninstallHead,
+          set: (sha) => { uninstallHead = sha; save('A'); },
+        });
+      } catch (e) {
+        // spec M3 (V-S11): a 403 while building the PR names the exact step
+        if (statusOf(e) !== 403) throw e;
+        return { status: 'leftover', why: 'GitHub refused a write for the uninstall pull request (HTTP 403)', manual: `Give the token Contents: write and Pull requests: write on ${full} (or open the uninstall pull request by hand), then run \`pipegen uninstall\` again.` };
+      }
       if (opened === null) {
         r.done.push(`${full} needed no uninstall pull request: nothing of pipegen's to remove there`);
+        // M4: the workflows the user kept stay; the next run's live-workflow check passes them over (the run-2 preview still warns)
+        keptWorkflows = plan.keepAsk.filter((k) => k.keep && WORKFLOW_RE.test(k.path)).map((k) => k.path);
         return 'ok';
       }
+      if ('status' in opened) return opened;
       pr = opened.pr;
       r.pr = opened.pr;
       r.done.push(`uninstall pull request #${opened.pr.number}: ${opened.opened ? 'opened' : 'updated'}`);
@@ -399,6 +450,11 @@ export async function applyPhaseA(gh: Octokit, plan: UninstallPlan, progress: Pr
         const open = (await api.read('GET /repos/{owner}/{repo}/pulls', { ...appRef, head: `${appRef.owner}:${b.branch}`, state: 'open', per_page: 100 })).data;
         if (!Array.isArray(open) || open.some((p) => !isObj(p) || (p.state === 'open' && isObj(p.head) && p.head.ref === b.branch))) {
           return { status: 'kept', why: 'a pull request is still open on it (deleting the branch would close it), so pipegen leaves it', manual: `Close the pull request on ${b.branch} if you don't need it, then delete the branch by hand.` };
+        }
+        // sec M1: GitHub also closes the open pull requests INTO a deleted branch (the setup PR was closed unmerged, so none is retargeted)
+        const into = (await api.read('GET /repos/{owner}/{repo}/pulls', { ...appRef, base: b.branch, state: 'open', per_page: 100 })).data;
+        if (!Array.isArray(into) || into.some((p) => !isObj(p) || (p.state === 'open' && isObj(p.base) && p.base.ref === b.branch))) {
+          return { status: 'kept', why: 'a pull request into it is still open (deleting the branch would close it), so pipegen leaves it', manual: `Retarget or close the pull request into ${b.branch}, then delete the branch by hand.` };
         }
         return api.deleteBranch('app', b.branch);
       });
@@ -447,16 +503,19 @@ export async function applyPhaseA(gh: Octokit, plan: UninstallPlan, progress: Pr
   const finished = r.failed.length === 0;
   save(finished ? 'A-done' : 'A');
   r.status = finished ? 'a-done' : 'failed';
-  r.lines = [...summary(r), ...nextOf(plan, r, finished)];
+  r.lines = [...summary(r), ...nextOf(plan, r, finished, keptWorkflows, progress.path)];
   return r;
 }
 
 const DONE_WORDS: Readonly<Record<string, string>> = { deleted: 'deleted', gone: 'already gone', restored: 'put back as it was before pipegen', closed: 'closed', 'not-open': 'already closed', done: 'done' };
 
 /** What to do next after run 1 (the final message's end). */
-function nextOf(plan: UninstallPlan, r: StepResult, finished: boolean): string[] {
+function nextOf(plan: PhasePlan, r: StepResult, finished: boolean, kept: readonly string[], progressPath: string): string[] {
   if (!finished) return ['Some steps were not done (above). Run `pipegen uninstall` again: it plans the first run again and does what is left.'];
   if (plan.unfinished) return ['The first part is done.'];
+  if (r.pr === undefined && kept.length > 0) {
+    return [`${show(`${plan.app.owner}/${plan.app.repo}`, 140)} needed no uninstall pull request. You kept ${kept.map((k) => show(k, 200)).join(', ')} on ${show(plan.app.defaultBranch, 100)}: pipegen leaves ${kept.length === 1 ? 'it' : 'them'} as ${kept.length === 1 ? 'it is' : 'they are'}, and its merge locks are off now. Run \`pipegen uninstall\` again for the second run (secrets, variables, environments, settings, central); its preview warns that pipegen's workflow is still there. What this run did is saved in ${progressPath}.`];
+  }
   if (r.pr === undefined) return [`${show(`${plan.app.owner}/${plan.app.repo}`, 140)} needed no uninstall pull request. Run \`pipegen uninstall\` again for the second run (secrets, variables, environments, settings, central).`];
   return [`Merge the uninstall pull request #${r.pr.number} (${show(r.pr.url, 300)}), then run \`pipegen uninstall\` again for the second run (secrets, variables, environments, settings, central). The merge locks are off now: until you merge it, run \`pipegen finish\` to lock again.`];
 }
@@ -484,7 +543,7 @@ function reasonOf(e: unknown): string {
  * V-S9, right before the first write: the central default head and the record's blob at it as the preview read them (else a stop: nothing
  * sent), and the app's default head (moved → 'moved': plan again). The app's default branch gone → a stop.
  */
-async function recheck(gh: Octokit, plan: UninstallPlan, clock: RateClock): Promise<'ok' | 'moved'> {
+async function recheck(gh: Octokit, plan: PhasePlan, clock: RateClock): Promise<'ok' | 'moved'> {
   const central = centralOf({ owner: plan.app.owner, repo: plan.app.repo });
   const changed = (what: string): never => {
     throw new UninstallError(`${what} changed since the preview, so pipegen sent nothing. Run \`pipegen uninstall\` again to see the new plan. Nothing was changed.`);
@@ -505,12 +564,24 @@ async function recheck(gh: Octokit, plan: UninstallPlan, clock: RateClock): Prom
  * The uninstall PR of run 1, built on the preview's commit and tree (plan.base): one commit removing pipegen's workflows, one removing the
  * other files pipegen created, one per revert (restore, strip, delete). null when there is nothing to change.
  */
-async function uninstallPr(gh: Octokit, plan: UninstallPlan, api: PhaseApi, clock: RateClock): Promise<{ pr: { number: number; url: string }; opened: boolean } | null> {
+async function uninstallPr(
+  gh: Octokit, plan: PhasePlan, api: PhaseApi, clock: RateClock, branch: { head: string | undefined; set: (sha: string) => void },
+): Promise<{ pr: { number: number; url: string }; opened: boolean } | DeleteOutcome | null> {
   const workflows = plan.removeFiles.filter((f) => f.repo === 'app' && f.path.startsWith('.github/workflows/')).map((f) => f.path);
   const files = plan.removeFiles.filter((f) => f.repo === 'app' && !f.path.startsWith('.github/workflows/')).map((f) => f.path);
   const reverts = plan.reverts.filter((x) => x.result.kind !== 'manual');
   if (workflows.length + files.length + reverts.length === 0) return null;
   const appRef: RepoRef = { owner: plan.app.owner, repo: plan.app.repo };
+  // sec M2: pipegen/uninstall is moved only while it points where pipegen set it (absent: created); anything else is someone's work
+  const now = await branchHead(api, appRef, UNINSTALL_PR_BRANCH);
+  if (now !== null && now !== branch.head) {
+    const full = `${appRef.owner}/${appRef.repo}`;
+    return {
+      status: 'leftover',
+      why: `the branch ${UNINSTALL_PR_BRANCH} has commits pipegen didn't make (or this uninstall didn't set it), so pipegen doesn't move it`,
+      manual: `Look at ${UNINSTALL_PR_BRANCH} in ${show(full, 140)}, keep what you need, then delete it (gh api -X DELETE repos/${full}/git/refs/heads/${UNINSTALL_PR_BRANCH}) and run \`pipegen uninstall\` again.`,
+    };
+  }
   const tree = await readTree(gh, appRef, plan.base.appHead, clock);
   if (tree.tree !== plan.base.appTree) throw new UninstallError('GitHub gives another file tree for the commit the preview read, so pipegen builds no uninstall pull request on it.');
   let parent = plan.base.appHead;
@@ -545,6 +616,7 @@ async function uninstallPr(gh: Octokit, plan: UninstallPlan, api: PhaseApi, cloc
     lines.push(restore ? `- ${p}: put back to the version before pipegen's first change` : `- ${p}: pipegen's part taken out, the rest kept as it is`);
   }
   await api.setUninstallBranch('app', parent);
+  branch.set(parent);
   const shown = lines.length > 300 ? [...lines.slice(0, 300), `- and ${lines.length - 300} more`] : lines;
   const body = [
     `pipegen uninstall: this pull request removes pipegen from ${show(`${appRef.owner}/${appRef.repo}`, 140)}.`, '', ...shown, '',
@@ -569,13 +641,15 @@ async function branchHead(api: PhaseApi, app: RepoRef, branch: string): Promise<
 }
 
 /** The recorded uninstall PR on GitHub: merged (merged_at set), open, closed (unmerged), gone (404), or foreign (not pipegen's). */
-async function prState(gh: Octokit, app: RepoRef, repoId: number, n: number, clock: RateClock): Promise<'merged' | 'open' | 'closed' | 'gone' | 'foreign'> {
+async function prState(gh: Octokit, app: RepoRef, repoId: number, defaultBranch: string, n: number, clock: RateClock): Promise<'merged' | 'open' | 'closed' | 'gone' | 'foreign' | 'other-base'> {
   let d: unknown;
   try { d = await ghRead(gh, 'GET /repos/{owner}/{repo}/pulls/{pull_number}', app, { pull_number: n }, clock); } catch (e) {
     if (statusOf(e) === 404) return 'gone';
     throw e;
   }
   if (!isObj(d) || d.number !== n || !isObj(d.head) || d.head.ref !== UNINSTALL_PR_BRANCH || !isObj(d.head.repo) || d.head.repo.id !== repoId) return 'foreign';
+  // sec M6: merged into another branch, its changes are not on the default branch
+  if (!isObj(d.base) || d.base.ref !== defaultBranch) return 'other-base';
   if (typeof d.merged_at === 'string' && d.merged_at !== '') return 'merged';
   if (d.state === 'open') return 'open';
   if (d.state === 'closed') return 'closed';
@@ -583,26 +657,28 @@ async function prState(gh: Octokit, app: RepoRef, repoId: number, n: number, clo
 }
 
 /**
- * Whether a workflow of pipegen's still runs on the app's default branch: one of its four workflow paths, or any workflow holding its verify
- * job or head check. Anything pipegen can't read (the branch, too many workflows, a blob) counts as live (the safe side).
+ * The first workflow of pipegen's that still runs on the app's default branch (null: none): one of its four workflow paths, or any workflow
+ * holding its verify job or head check. `kept` (workflows the user chose to keep in a run 1 that needed no PR) are passed over. Anything
+ * pipegen can't read (the branch, too many workflows, a blob) counts as live (the safe side).
  */
-async function workflowsLive(gh: Octokit, loaded: LoadedRecord, clock: RateClock): Promise<boolean> {
+async function liveWorkflow(gh: Octokit, loaded: LoadedRecord, clock: RateClock, kept: ReadonlySet<string> = new Set()): Promise<string | null> {
   const app: RepoRef = { owner: loaded.app.owner, repo: loaded.app.repo };
   const head = await readHead(gh, app, loaded.app.defaultBranch, clock);
-  if (head === null) return true;
+  if (head === null) return loaded.app.defaultBranch;
   const { entries } = await readTree(gh, app, head, clock);
-  if (APP_WORKFLOWS.some((p) => entries.has(p))) return true;
-  const wf = [...entries].filter(([p, e]) => WORKFLOW_RE.test(p) && plainFile(e));
-  if (wf.length > MAX_SCANNED) return true;
-  for (const [, e] of wf) {
+  const own = APP_WORKFLOWS.find((p) => entries.has(p) && !kept.has(p));
+  if (own !== undefined) return own;
+  const wf = [...entries].filter(([p, e]) => WORKFLOW_RE.test(p) && plainFile(e) && !kept.has(p));
+  if (wf.length > MAX_SCANNED) return '.github/workflows';
+  for (const [p, e] of wf) {
     let text: string;
     try { text = await readBlobText(gh, app, e.sha, MAX_WORKFLOW_BYTES, clock); } catch (x) {
       if (isRateStop(x) || x instanceof GitHubAccessError || statusOf(x) === 401) throw x;
-      return true;
+      return p;
     }
-    if (text.includes(VERIFY_JOB_ID) || text.includes(HEAD_CHECK_STEP_ID)) return true;
+    if (text.includes(VERIFY_JOB_ID) || text.includes(HEAD_CHECK_STEP_ID)) return p;
   }
-  return false;
+  return null;
 }
 
 /** The app's lease (the proof's state folder): another pipegen run on this repo → a stop, nothing read or sent. */
