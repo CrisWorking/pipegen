@@ -391,6 +391,22 @@ describe('uninstall phase B: the phase-bound api and the source rules (V5-R1 car
       const file = name === 'fromCli' || name === 'scratch' || name === 'cleanup' ? 'src/cli/uninstall.ts' : 'src/uninstall/central.ts';
       expect(entryImportProblems(file, code).length, name).toBeGreaterThan(0);
     }
+    // V6-R2 sec M2: the r2 reviewer's forms (the code is parsed, not matched), in src/uninstall and in src/cli (V7's file)
+    const r2: Record<string, string> = {
+      F1: "const open = '/*';\nimport { UninstallApi as U } from './target.js';\nconst close = '*/';\nexport const f1 = (gh: never) => [open, close, new U(gh, { owner: 'o', repo: 'r', repoId: 1 })];",
+      F2: "const s = `x//`; import { deleteCentralRepo as d } from './target.js';\nexport const f2 = [s, d];",
+      F3: "import * as t from './t\\u0061rget.js';\nexport const f3 = t.UninstallApi;",
+      F4: "export const f4 = () => import('./t\\x61rget.js');",
+      F5: 'export const f5 = () => import(`./target.js`);',
+      F6: "import { \"UninstallApi\" as U2 } from './target.js';\nexport const f6 = U2;",
+      F7: "import { cleanupAfterProof } from '../proof/cleanup.js';\nexport const f7 = cleanupAfterProof;",
+    };
+    for (const [name, code] of Object.entries(r2)) {
+      expect(entryImportProblems('src/uninstall/zz-form.ts', code).length, `${name} uninstall`).toBeGreaterThan(0);
+      expect(entryImportProblems('src/cli/zz-form.ts', code.replaceAll("'./t", "'../uninstall/t").replaceAll('`./t', '`../uninstall/t')).length, `${name} cli`).toBeGreaterThan(0);
+    }
+    // F8: an allowed file hands a guarded binding on
+    expect(entryImportProblems('src/uninstall/apply.ts', "import { deleteCentralRepo } from './target.js';\nexport { deleteCentralRepo as dcr };").length, 'F8').toBeGreaterThan(0);
     // what is allowed stays allowed
     expect(entryImportProblems('src/uninstall/plan.ts', "import { UninstallApi } from './target.js'; new UninstallApi(gh, app);")).toEqual([]);
     expect(entryImportProblems('src/uninstall/apply.ts', "import { planUninstall } from './plan.js';\nimport { deleteCentralRepo, type UninstallApi } from './target.js';")).toEqual([]);

@@ -33,6 +33,8 @@ export interface World {
   org: Map<number, Record<string, unknown>>;
   /** merged_at of pull requests, by `<repo>#<number>`. */
   merged: Map<string, string>;
+  /** head.sha of merged pull requests (the branch head when it merged), by `<repo>#<number>`; an open one's is its branch head now. */
+  prHeads: Map<string, string>;
   /** The login that opened each pull request, by `<repo>#<number>` (default `o`). */
   authors: Map<string, string>;
   /** Extra fields of GET /repos/{owner}/{repo}, by repo name. */
@@ -61,7 +63,7 @@ export function world(o: { appRepo?: string; app?: Record<string, string>; centr
   const home = mkdtempSync(join(tmpdir(), 'pg-unb-'));
   homes.push(home);
   const w: World = {
-    g, app, central, scratch, home, out: [], vars: new Map(), org: new Map(), merged: new Map(), authors: new Map(),
+    g, app, central, scratch, home, out: [], vars: new Map(), org: new Map(), merged: new Map(), prHeads: new Map(), authors: new Map(),
     meta: new Map([['pipelines', { description: helperDescription('central'), has_wiki: false, has_discussions: false, forks_count: 0 }], [`pipegen-proof-${name}`, { description: SCRATCH_MARKER, has_wiki: false, has_discussions: false, forks_count: 0 }]]),
     settings: { pin: false, alerts: false, autofix: false, scanning: false, push: false, access: 'none' },
     runs: new Set(), caches: new Set(), lists: new Map(), deleted: [],
@@ -244,7 +246,9 @@ export function gh(w: World): Octokit {
     const r = w.g.repo(`${String(owner)}/${String(repo)}`);
     const n = (p as { number: number }).number;
     const key = `${r.name}#${n}`;
-    return { ...p, merged_at: w.merged.get(key) ?? null, user: { login: w.authors.get(key) ?? 'o' }, head: { ...(p as { head: object }).head, repo: { id: r.id, full_name: `${r.owner}/${r.name}` } } };
+    const ref = String((p as { head: { ref?: unknown } }).head.ref);
+    const sha = w.prHeads.get(key) ?? r.refs.get(`heads/${ref}`) ?? null;
+    return { ...p, merged_at: w.merged.get(key) ?? null, user: { login: w.authors.get(key) ?? 'o' }, head: { ...(p as { head: object }).head, sha, repo: { id: r.id, full_name: `${r.owner}/${r.name}` } } };
   };
   return { request: async (route: string, params: Record<string, unknown> = {}) => {
     const out = await w.g.request(route, params);
@@ -267,6 +271,7 @@ export function mergePr(w: World, repo: Repo, branch: string): number {
   repo.refs.set(`heads/${repo.defaultBranch}`, repo.refs.get(`heads/${branch}`) as string);
   pr.state = 'closed';
   w.merged.set(`${repo.name}#${pr.number}`, '2026-11-07T10:00:00Z');
+  w.prHeads.set(`${repo.name}#${pr.number}`, repo.refs.get(`heads/${branch}`) as string);
   return pr.number;
 }
 
