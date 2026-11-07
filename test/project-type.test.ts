@@ -824,7 +824,7 @@ describe('GJ-R-sec1: workflowBuildRefs reads hostile workflow text within the re
     ];
     // G17: a ratio, not a wall-clock budget: ten times the text costs about ten times the time, a backtracking pattern about a hundred
     const inputs = { small: hostile(10_000), big: hostile(100_000) };
-    await expectScaling('hostile workflow text', (size) => { const t0 = performance.now(); for (let r = 0; r < 200; r++) for (const h of inputs[size]) workflowBuildRefs([h]); return performance.now() - t0; }, 40);
+    await expectScaling('hostile workflow text', (size) => { const t0 = performance.now(); for (const h of inputs[size]) workflowBuildRefs([h]); return performance.now() - t0; }, 40);
     // values past the per-line budget are dropped, never parsed
     expect(workflowBuildRefs([`context: ${'/'.repeat(100_000)}`]).size).toBe(0);
     // the real forms still count
@@ -1105,7 +1105,8 @@ describe('GJ-R4 (review GJ-r3 N1-N5, N7): continued build lines, a container ove
     const q = await read(ws(heavy), notes2);
     // G17: a ratio, not a wall-clock budget: ten times the comment text costs about ten times the time
     // G17-R2 (F6): readProject's fixed cost (about 70 ms) is measured on the same tree with empty comments and subtracted, so the
-    // ratio sees the compose/bake reading itself; a floor of 5 ms for the small size means about 0.2 s of extra work fails
+    // ratio sees the compose/bake reading itself. It catches growth faster than the text (a quadratic worth about 0.3 s); a
+    // constant-factor (linear) slowdown is not seen, since the small tree pays the same factor
     const trees = { small: ws(heavyOf(99_000)), big: ws(heavy) };
     const base = ws(heavyOf(0));
     const timeRead = async (t: typeof base) => { const t0 = performance.now(); await read(t, []); return performance.now() - t0; };

@@ -1173,6 +1173,26 @@ describe('mapCoverage (Task 5, item 1: own scripts by name and content)', () => 
     for (const s of ['web', 'd1']) expect(row(over, 'push', 'unit-tests', s).status).toBe('unknown');
   }, 60_000);
 
+  it('own scripts (adversarial): G17-R3: a docker build after the results cap still counts as the image build', async () => {
+    const dir = makeTempDir();
+    const runs = (from: number) => Array.from({ length: 1_200 }, (_, i) => `(cd d${from + i} && vitest run)`).join(' ; ');
+    pkg(dir, { a: runs(0), b: runs(1_200) });
+    writeIn(dir, 'Dockerfile', 'FROM node:24\n');
+    ci(dir, run('npm run a && npm run b && docker build -t x .'));
+    const rows = await coverage(dir, { services: [svc('.', { scripts: ['start', 'test'], frameworks: ['express'], dockerfile: 'Dockerfile' })] });
+    expect(rows.find((r) => r.need.category === 'image-build')?.status).toBe('covered');
+  }, 60_000);
+
+  it('own scripts (adversarial): G17-R3: a capped script glob is unknown for every service, not only its own folder', async () => {
+    const dir = makeTempDir();
+    const scripts: Record<string, string> = {};
+    for (let i = 0; i < 250; i++) scripts[`t:${i}`] = `cd ../../services/d${i} && vitest run`;
+    pkg(dir, scripts, 'apps/web/package.json');
+    ci(dir, '      - run: npx run-s "t:*"\n        working-directory: apps/web\n');
+    const rows = await coverage(dir, { services: [svc('apps/web'), svc('services/d1')] });
+    for (const s of ['web', 'd1']) expect(row(rows, 'push', 'unit-tests', s).status).toBe('unknown');
+  }, 60_000);
+
   it('own scripts: G17-R2: removing repeats tells apart finds that differ only in a Set field', () => {
     const base = { categories: ['lint'], by: 'pre-commit', subject: 'x', dir: '.', reason: null } as const;
     const a = { ...base, hookSkip: { ids: new Set(['ruff-check']) } } as unknown as Found;
