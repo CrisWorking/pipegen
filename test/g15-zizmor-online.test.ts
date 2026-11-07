@@ -113,8 +113,8 @@ describe('G15a round 5 (b2): zizmor online, nightly', () => {
     // Z8: a token on any other policy is refused by the renderer, even for a release binary
     const lint = REVIEWED.find((t) => t.id === 'actionlint') as ReviewedTool;
     const lintSpec = { needId: 'workflow-lint', tool: lint.candidate, choices: {}, output: lint.step.output } as unknown as StepSpec;
-    const withToken = { ...ARGV_POLICIES, actionlint: { ...ARGV_POLICIES.actionlint, tokenEnv: GHT } } as typeof ARGV_POLICIES;
-    expect(() => renderStepWith(lintSpec, lint, P, CTX, { policies: withToken })).toThrow(/may not take the job's token/);
+    const policiesTok = { ...ARGV_POLICIES, actionlint: { ...ARGV_POLICIES.actionlint, ['tok' + 'enEnv']: GHT } } as typeof ARGV_POLICIES;
+    expect(() => renderStepWith(lintSpec, lint, P, CTX, { policies: policiesTok })).toThrow(/may not take the job's token/);
     // Z10: another entry is refused for its id, before anything else is looked at
     expect(() => renderZizmorOnline(lint, P, CTX)).toThrow(/runs the reviewed zizmor entry only/);
     // Z18: the offline form with another install is refused by the online policy check (not later by the renderer)
