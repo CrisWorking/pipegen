@@ -1,7 +1,7 @@
 // v0.2 Plan G, sub-task G15a, ruling G15a-R9 (re-review r3: spec APPROVED, security CHANGES REQUIRED). Each item as a failing test first.
 // sec r3-1: the sign-needs rule follows the job that signs, whatever its id or file: a caller of a workflow holding the job sign needs
 // image-publish; in a workflow_call-only file the job sign needs every job of that file that writes to the registry; image-publish outside
-// pipegen.yml is refused unless its file's sign job needs it. The three dodges of the r3 probe (zz-r3-sec.test.ts) are each a test.
+// pipegen.yml is refused unless its file's sign job needs it (amended by G15a-R10 r4-1: refused outright). The three dodges of the r3 probe (zz-r3-sec.test.ts) are each a test.
 // spec r3-1: the 45-minute ZAP ceiling reaches the long report (the consent screen is pinned in consent.test.ts).
 import { parse, stringify } from 'yaml';
 import { describe, expect, it } from 'vitest';
@@ -111,12 +111,13 @@ describe('G15a-R9 sec r3-1: the sign-needs rule follows the job that signs', () 
       const r = await judgeAssembled(world(signJ), JD);
       expect(r.ok, mode).toBe(false);
       expect(shown(r), mode).toMatch(/workflow started only by workflow_call must need every job of its file that writes to the image registry/);
-      expect(shown(r), mode).toMatch(/image-publish runs outside \.github\/workflows\/pipegen\.yml/);
+      expect(shown(r), mode).toMatch(/publishes outside \.github\/workflows\/pipegen\.yml/);
       expect(shown(r), mode).toMatch(CALLER_NEEDS);
-      // with the need inside the called file, the two in-file rules hold; the caller still needs image-publish in its own file
+      // with the need inside the called file, the in-file need rule holds; the caller still needs image-publish in its own file, and
+      // (G15a-R10 r4-1, amending R9) image-publish outside pipegen.yml is refused outright, its file's sign job or not
       const r2 = shown(await judgeAssembled(world({ ...signJ, needs: ['image-publish'] }), JD));
       expect(r2, mode).not.toMatch(/must need every job of its file/);
-      expect(r2, mode).not.toMatch(/image-publish runs outside/);
+      expect(r2, mode).toMatch(/publishes outside \.github\/workflows\/pipegen\.yml/);
       expect(r2, mode).toMatch(CALLER_NEEDS);
     }
   });
