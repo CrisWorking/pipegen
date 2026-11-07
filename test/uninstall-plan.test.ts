@@ -53,6 +53,8 @@ interface World {
   vars: Map<string, Map<string, { created_at: string; value: string }>>;
   protection: Record<string, unknown> | null; org: Map<number, Record<string, unknown>>;
   pullRepoId: Map<number, number>;
+  /** A page of a pull request list GitHub fails to serve (HTTP 502). */
+  pullsFailPage?: number;
 }
 const homes: string[] = [];
 afterEach(() => { for (const d of homes.splice(0)) rmSync(d, { recursive: true, force: true }); revertCalls.length = 0; });
@@ -109,7 +111,14 @@ function gh(w: World): Octokit {
   };
   return { request: async (route: string, params: Record<string, unknown> = {}) => {
     const out = await w.g.request(route, params);
-    if (route === 'GET /repos/{owner}/{repo}/pulls') return { ...out, data: Array.isArray(out.data) ? out.data.map((p) => withRepo(params.owner, params.repo, p)) : out.data };
+    if (route === 'GET /repos/{owner}/{repo}/pulls') {
+      // GitHub pages the list (per_page, at most 100; page from 1)
+      const per = Math.min(Number(params.per_page ?? 30), 100);
+      const page = Number(params.page ?? 1);
+      if (w.pullsFailPage === page) throw Object.assign(new Error('Bad Gateway'), { status: 502 });
+      const all = Array.isArray(out.data) ? out.data : [];
+      return { ...out, data: all.slice((page - 1) * per, page * per).map((p) => withRepo(params.owner, params.repo, p)) };
+    }
     if (route === 'GET /repos/{owner}/{repo}/pulls/{pull_number}') return { ...out, data: withRepo(params.owner, params.repo, out.data) };
     return out;
   } } as unknown as Octokit;
@@ -814,7 +823,11 @@ describe('uninstall plan: GitHub objects (V4)', () => {
     expect(previewUninstall(u)).toMatch(/trusted by typing/);
     expect(u.lastProject).toBe(true);
     expect(previewUninstall(u)).not.toMatch(/go too/);
-    expect(previewUninstall(u)).toMatch(/pipegen doesn't touch them/);
+    expect(previewUninstall(u)).toMatch(/pipegen doesn't touch them \(see the manual steps\)/);
+    // full trust, the last project, but the record lists no central lock: no pointer to a manual step that isn't there (M-r1-7)
+    const pf = previewUninstall(await plan(w, sampleRecord(w), term()));
+    expect(pf).toMatch(/last project/);
+    expect(pf).not.toMatch(/see the manual steps/);
   });
 });
 
@@ -954,6 +967,19 @@ describe('uninstall plan: reads, terminal and preview (V4)', () => {
     w2.pullRepoId.set(61, 424_242);
     expect((await plan(w2, rec2, term())).lastProject).toBe(false);
     w2.central.pulls.pop();
+    // the open central PRs are read page by page (M-r1-3): another project's PR on page 2 → not the last project
+    for (let i = 0; i < 100; i += 1) w2.central.pulls.push({ number: 100 + i, head: 'pipegen/uninstall-shop', base: 'main', title: 'mine', body: '', state: 'open', html_url: 'm' });
+    expect((await plan(w2, rec2, term())).lastProject).toBe(true);
+    w2.central.pulls.push({ number: 300, head: 'pipegen/update-other', base: 'main', title: 'other', body: '', state: 'open', html_url: 'o' });
+    expect((await plan(w2, rec2, term())).lastProject).toBe(false);
+    w2.central.pulls.pop();
+    // a page GitHub fails to serve: pipegen can't see every PR → not the last project
+    w2.pullsFailPage = 2;
+    expect((await plan(w2, rec2, term())).lastProject).toBe(false);
+    w2.pullsFailPage = 1;
+    expect((await plan(w2, rec2, term())).lastProject).toBe(false);
+    delete w2.pullsFailPage;
+    w2.central.pulls.splice(w2.central.pulls.length - 100, 100);
     // another project's central workflow with no record of it (records deleted, files left): still not the last project
     w2.g.commitOn('o/pipelines', 'main', { '.github/workflows/other--push.yml': 'x\n' });
     expect((await plan(w2, rec2, term(), { centralHead: w2.g.head('o/pipelines') })).lastProject).toBe(false);
@@ -1058,6 +1084,16 @@ describe('uninstall plan: reads, terminal and preview (V4)', () => {
     w2.app.pulls.push({ number: 3, head: 'pipegen/setup', base: 'main', title: 's', body: '', state: 'closed', html_url: 'x' });
     expect((await plan(w2, sampleRecord(w2), term(), { setupPr: 3 })).unfinished).toBe(false);
     expect((await plan(w2, sampleRecord(w2, { mergedAt: undefined }), term(), { setupPr: 3 })).unfinished).toBe(true);
+    // pipegen.yml removed by hand, but pipegen's verify job is still in the deploy workflow it edited: live, two runs (M-r1-4)
+    const deploy = 'jobs:\n  build:\n    runs-on: x\n';
+    const vj: InstallEdit = { repo: 'app', path: '.github/workflows/deploy.yml', kind: 'verify-job', jobs: ['build'], needs: [{ job: 'build', added: ['pipegen-verify'] }], originalSha: blob(deploy), writtenShas: [SHA('8')] };
+    const wv = world({ 'README.md': 'my app\n', '.github/workflows/deploy.yml': `${deploy}  pipegen-verify:\n    runs-on: x\n` });
+    expect((await plan(wv, sampleRecord(wv, { mergedAt: undefined, edits: [vj] }), term())).unfinished).toBe(false);
+    const wh = world({ 'README.md': 'my app\n', '.github/workflows/deploy.yml': 'jobs:\n  build:\n    steps:\n      - id: pipegen-head-check\n' });
+    expect((await plan(wh, sampleRecord(wh, { mergedAt: undefined, edits: [vj] }), term())).unfinished).toBe(false);
+    // the job taken out too: nothing of pipegen's runs, unfinished
+    const wn = world({ 'README.md': 'my app\n', '.github/workflows/deploy.yml': deploy });
+    expect((await plan(wn, sampleRecord(wn, { mergedAt: undefined, edits: [vj] }), term())).unfinished).toBe(true);
     // only pipegen's workflows count: its Dockerfile on the default branch doesn't make the install finished
     const wd = world({ 'README.md': 'my app\n', Dockerfile: FILES.Dockerfile as string });
     expect((await plan(wd, sampleRecord(wd, { mergedAt: undefined }), term())).unfinished).toBe(true);
@@ -1153,6 +1189,10 @@ describe('uninstall plan: reads, terminal and preview (V4)', () => {
     expect(t.confirms).toEqual([]);
     const done = u.done.join('\n');
     for (const x of ['.github/workflows/pipegen.yml', 'Dockerfile', 'CODEOWNERS', '.github/dependabot.yml', 'ruleset pipegen (id 41)', 'branch protection of main']) expect(done).toContain(x);
+    // a 404 can be "gone" or "can't see it": never "deleted"; a stripped file says only that pipegen's exact text is gone (M-r1-7)
+    expect(done).toMatch(/ruleset pipegen \(id 41\): GitHub doesn't show it \(already gone, or this login can't see it\)/);
+    expect(done).not.toMatch(/deleted/);
+    expect(done).toMatch(/\.github\/dependabot\.yml: pipegen's exact text is no longer in it/);
     expect(u.deleteSecrets.map((s) => s[SK].name)).toEqual(['PIPEGEN_FP_KEY']);
     expect(previewUninstall(u)).toMatch(/Done in the first run:[^]*CODEOWNERS/);
     // what run 1 didn't take out is still a manual step, never "done"
