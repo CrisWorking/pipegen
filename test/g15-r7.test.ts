@@ -11,7 +11,8 @@ import { estimate, jobMinutes } from '../src/estimate/estimate.js';
 import { floorNeeds, jobCategories, jobCounts } from '../src/engine/needs.js';
 import { DAST_UPLOAD_JOB, DEPLOY_PUSH_IF, HISTORY_UPLOAD_JOB, NIGHTLY_IF, NIGHTLY_WORKFLOW, SCORECARD_JOB, SIGN_STEP_ID_RE } from '../src/engine/job-rules.js';
 import { referee, type Linters } from '../src/engine/referee.js';
-import { renderPlatformStep } from '../src/engine/render-step.js';
+import { renderPlatformStep, renderScorecardBlock } from '../src/engine/render-step.js';
+import { scrubChainProblems } from '../src/engine/job-rules.js';
 import { renderEgressStep } from '../src/engine/egress.js';
 import { loadReviewed } from '../src/engine/reviewed.js';
 import { ZAP_ACTIVE_JOB_MINUTES } from '../src/engine/dast-handoff.js';
@@ -228,6 +229,20 @@ describe('G15a-R7 sec 3: the weekly Scorecard job holds no key', () => {
       delete s.with['fp-key'];
     });
     expect(missing).toMatch(/no fp-key input/);
+  });
+
+  it('job rules: each guard holds on its own: the scrub chain refuses the key in the Scorecard scrub, and the job rule refuses any secret in the scorecard job (mutant S3b)', async () => {
+    const card = REVIEWED.find((t) => t.id === 'scorecard-action') as ReviewedTool;
+    const steps = renderScorecardBlock(card, AP, GATE_T);
+    expect(scrubChainProblems(steps)).toEqual([]);
+    const keyed = steps.map((s) => (s.with?.mode === 'scrub' ? { ...s, with: { ...s.with, 'fp-key': `\${{ secrets.${KEY_NAME} }}` } } : s));
+    expect(scrubChainProblems(keyed).join('\n')).toMatch(/Scorecard result with the fingerprint key/);
+    // a secret on another step of the job (not the scrub): the job rule alone
+    const other = await judgeEdited(NIGHTLY_WORKFLOW, (doc) => {
+      const move = ((doc.jobs[SCORECARD_JOB] as Obj).steps as Obj[]).find((x) => typeof x.run === 'string') as Obj;
+      move.env = { ...(move.env ?? {}), X: `\${{ secrets.${KEY_NAME} }}` };
+    });
+    expect(other).toMatch(/weekly Scorecard job, which runs Scorecard's container and a scrub that needs no key: it names no secret/);
   });
 
   it('gate: the Scorecard scrub runs with no key at all', () => {
