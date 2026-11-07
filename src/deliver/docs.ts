@@ -14,7 +14,7 @@
 //     whole text on its cleaned forms. Run the builder inside withActiveVault (pipegenDocWith does; the referee already does).
 // No need keys, item ids, objection ids or dispute keys are ever printed, and neither is the creator's own AI note ("The AI explained ...").
 import { NEED_ID_CATEGORY } from '../engine/need-ids.js';
-import { FINDINGS_CATEGORIES, gateJobList, isResultFormat, jobIdFor, PIPEGEN_JOB_CATEGORIES, readableFormat, type JobListEntry } from '../engine/gate-job-list.js';
+import { FINDINGS_CATEGORIES, gateJobList, isResultFormat, jobIdFor, PIPEGEN_JOB_CATEGORIES, readableFormat, resultFormat, type JobListEntry } from '../engine/gate-job-list.js';
 import { HOOK_FILES, hookCommands, SECRETS_HOOK_ID, type HookCommand } from '../engine/created-builders.js';
 import { PUSH_CREDIT_WARNING } from '../audit/coverage/equivalents.js';
 import { cleanForDoc, CLEAN_DOC_MAX, CLEAN_DOC_PLACEHOLDER } from '../debate/clean.js';
@@ -38,7 +38,8 @@ import type { KnownValueCheck } from '../types.js';
 export const HISTORY_REWRITE_NOTE = 'After rewriting main\'s history (a force-push), the gate may stay in block mode until 10 green pushes to main have followed.';
 /**
  * The gate's ZAP rule (gate/src/zap.ts ZAP_TOOL, ZAP_JSON_VERIFIED): while ZAP's report is unverified the gate judges every non-floor check that runs ZAP as
- * not proven (a warning, never a block). Verified since G15a round 5 (real reports of the pinned image), so the not-proven lines are not written. Copied, not imported (gate/ is bundled); a test keeps both equal.
+ * not proven (a warning, never a block). Verified since G15a round 5 (real reports of the pinned image); G15a-R7 spec 3 removed the not-proven
+ * paths behind it (they could no longer run). Kept as the record of that state. Copied, not imported (gate/ is bundled); a test keeps both equal.
  */
 export const ZAP_TOOL = 'zap-baseline';
 export const ZAP_JSON_VERIFIED = true;
@@ -454,7 +455,6 @@ function warnOnlyWhy(draft: PipelineDraft, n: { id: string; category: string; se
   const cat = categoryOf(n.id, n.category);
   if (FLOOR_NEEDS.includes(n.id) || FLOOR_NEEDS.includes(cat)) return null;
   if (draft.notProven.some((x) => x.needId === n.id)) return 'it is not proven yet (see Not proven yet)';
-  if (!ZAP_JSON_VERIFIED && stepsOf(draft, n.id, n.service).some((s) => s.tool.id === ZAP_TOOL)) return 'ZAP results are not verified yet, so the gate does not let this check block';
   return null;
 }
 const NOT_REQUIRED = 'Runs on each pull request, but nothing requires it to pass.';
@@ -497,13 +497,11 @@ function modeOf(draft: PipelineDraft, reviewed: readonly ReviewedTool[], f: Fact
   try { key = jobIdFor(n.id, n.service); } catch { return FOR_INFO; }
   const e = f.list.find((x) => x.job === key && x.range !== true);
   if (e === undefined) {
-    const demoted = n.blocking && FINDINGS_CATEGORIES.has(cat) && specs.length > 0 && !specs.every((s) => readableFormat(cat, s.output.format));
+    const demoted = n.blocking && FINDINGS_CATEGORIES.has(cat) && specs.length > 0 && !specs.every((s) => readableFormat(cat, resultFormat(s.output.format)));
     return demoted ? 'Warns only: its tool writes no results file the gate can read.' : FOR_INFO;
   }
   const floor = FLOOR_NEEDS.includes(e.needId) || FLOOR_NEEDS.includes(e.category);
-  const zapUnverified = e.tool === ZAP_TOOL && !ZAP_JSON_VERIFIED;
   if (!floor && draft.notProven.some((x) => x.needId === e.needId)) return 'Warns only: it is not proven yet (see Not proven yet).';
-  if (!floor && zapUnverified) return 'Warns only: ZAP results are not verified yet, so the gate does not let this check block.';
   if (!floor && !e.blocking) return 'Warns only.';
   if (!f.gateRequired) return NOT_REQUIRED;
   if (e.warnFirst !== undefined) {
@@ -693,12 +691,10 @@ function missingMinimum(draft: PipelineDraft, f: Facts): { category: string; ser
 function notProvenSection(d: Doc, draft: PipelineDraft, data: DocData, reviewed: readonly ReviewedTool[], facts: Facts): void {
   const p = draft.profile;
   d.h(2, SECTION_TITLES[10] as string);
-  // ZAP while its report is unverified: the gate's own list says which checks run it
-  const zap = facts.list.filter((e) => e.tool === ZAP_TOOL && !ZAP_JSON_VERIFIED && !FLOOR_NEEDS.includes(e.needId) && !FLOOR_NEEDS.includes(e.category) && !draft.notProven.some((x) => x.needId === e.needId));
   // every file pipegen edited is not proven by design: derived here, so a "proven" line can never stand next to one
   const edits = draft.created.filter((f) => f.inserted !== undefined);
   const proofless = draft.steps.some((s) => reviewed.some((t) => t.id === s.tool.id && t.proofs === 0));
-  const warnOnly = draft.notProven.length > 0 || zap.length > 0 || edits.length > 0 || proofless;
+  const warnOnly = draft.notProven.length > 0 || edits.length > 0 || proofless;
   if (!warnOnly) d.p('Every check pipegen set up is proven.');
   for (const n of draft.notProven) {
     const cat = n.needId === undefined ? '' : categoryOf(n.needId, n.needId);
@@ -706,12 +702,6 @@ function notProvenSection(d: Doc, draft: PipelineDraft, data: DocData, reviewed:
     const names = strs(n.missingSecrets);
     const secrets = names.length === 0 ? '' : ` Secret names to set: ${names.map((x) => (SECRET_NAME_RE.test(x) ? `\`${x}\`` : fit(x, 60))).join(', ')}.`;
     d.li(`Part ${fit(n.part, 40)}${label === '' ? '' : `, ${label}`}: ${fit(n.reason)}${secrets}`);
-  }
-  for (const e of zap) {
-    const need = draft.needs.find((n) => n.layer === 'merge' && n.id === e.needId && jobIdFor(n.id, n.service) === e.job);
-    const spec = draft.steps.find((st) => st.needId === e.needId && st.service === need?.service && st.tool.id === ZAP_TOOL);
-    const label = Object.hasOwn(CATEGORY_TEXT, e.category) ? (CATEGORY_TEXT[e.category] as readonly [string, string])[0] : 'A check pipegen added';
-    d.li(`${label}${need?.service === undefined ? '' : `, service ${q(need.service)}`}, tool ${fit(spec?.tool.name ?? ZAP_TOOL, 80)}: ZAP results are not verified yet, so the gate judges this check as not proven. It only warns and never blocks a pull request.`);
   }
   for (const f of edits) d.li(`Part deploy-verify: pipegen edited ${q(f.path, 160)} (it added the verify job, \`needs\` entries and its head check as the first step of each deploy job, except a job that calls another workflow, or one pipegen gates only for its runner or vars and can not start with the check (see the notes)). Check the edit by hand before you rely on it.`);
   const link = secretsLink(p.owner, p.repo);

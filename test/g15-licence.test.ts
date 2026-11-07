@@ -130,8 +130,8 @@ describe('G15a G11-2: no licence data counts as Unknown', () => {
       expect(xs).toContain('--list-all-pkgs');
       expect(xs[xs.indexOf('--output') + 1]).toBe(TRIVY_LICENCE_RESULT.file);
     }
-    // the scrubbed result is SARIF, as for every other findings tool
-    expect(t.step.output).toEqual({ path: TRIVY_LICENCE_RESULT.file, format: 'sarif' });
+    // G15a-R7 spec 7: the entry declares what the tool writes (json); the scrubbed result is SARIF, as for every other findings tool
+    expect(t.step.output).toEqual({ path: TRIVY_LICENCE_RESULT.file, format: 'json' });
     // the loader refuses the licence scan without the JSON form, and any other trivy scan with it
     const text = readFileSync('data/reviewed-tools.yml', 'utf8');
     const file = parse(text) as { pinnedOn: string; tools: Record<string, any>[] };

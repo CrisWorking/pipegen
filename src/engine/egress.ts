@@ -100,11 +100,9 @@ export const KEYLESS_VERIFY_SETS: readonly EgressSet[] = Object.freeze([SIGSTORE
 /**
  * G15a (ruling G15a-R0b item 2): the sets the attest verify job reaches beyond its install and ghcr: gh's own hosts (the github-attest set,
  * each host cited in egress-sets.ts from the pinned gh v2.103.3 source and one live reading). gh runs with --no-public-good there, so the
- * public-good TUF is never fetched. null would refuse attest verify (fail closed) while a host is uncited.
+ * public-good TUF is never fetched.
  */
-export const ATTEST_VERIFY_SETS: readonly EgressSet[] | null = Object.freeze([GITHUB_ATTEST_SET]);
-/** Said only while ATTEST_VERIFY_SETS is null (a reviewed host of gh is missing): attest verify is then refused, never written to fail. */
-export const ATTEST_VERIFY_REFUSAL = 'gh reads the trust root of GitHub\'s own signing service from a host that is in no reviewed network set yet, so behind the network lock the verify job could only fail; pipegen refuses the attest deploy check instead of writing a job that never passes';
+export const ATTEST_VERIFY_SETS: readonly EgressSet[] = Object.freeze([GITHUB_ATTEST_SET]);
 
 /** The Docker network range a job's services and containers use (the reviewed `allowed-ips` choice). */
 const DOCKER_RANGE = '172.16.0.0/12';

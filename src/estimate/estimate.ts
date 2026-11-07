@@ -79,6 +79,11 @@ const JOB_MINUTES: Readonly<Record<string, number>> = Object.freeze({
   // Plan P Task 2: estimates, S5 didn't measure these.
   'workflow-lint': 1, 'dockerfile-lint': 1, duplication: 1, 'dependency-review': 1, licences: 1, scorecard: 1,
   'api-dast': 3,
+  // G15a-R7 spec 1: the nightly jobs of G15a. The full-history secrets scan reads every commit (2, like a code scan); zizmor online, the scrub
+  // jobs and the code-scanning uploads are quick jobs. The ZAP AF active scan took about 2 minutes against a one-page app on the pinned image
+  // (G15a report, round 6), but its plan may run 40 minutes and its job is allowed 60 (dast-handoff.ts ZAP_ACTIVE_JOB_MINUTES): counted at that limit.
+  'secrets-history': 2, 'workflow-lint-online': 1, 'dast-scrub': 1, 'code-scanning': 1,
+  'zap-active': 60,
 });
 /** Any other category (iac, sbom, signing, attestation, deploy-verify, anything new): not measured in S5. */
 const UNKNOWN_JOB_MINUTES = 2;
@@ -355,6 +360,10 @@ export function estimate(p: RepoProfile, jobs: JobCategories, variants: number, 
   );
 
   if (jobs.nightly?.includes('scorecard')) basis.push('Scorecard runs weekly; counted nightly (leans high).');
+  if (jobs.nightly?.includes('zap-active')) {
+    basis.push(`The nightly ZAP active scan of each web app is counted at its job limit, ${jobMinutes('zap-active')} min every night (it took about 2 min against a small app; a bigger app takes longer, up to that limit).`);
+  }
+  if (jobs.nightly?.includes('secrets-history')) basis.push('The nightly scans also include a secrets scan of the whole history (2 min) and the uploads to code scanning (1 min each).');
 
   // Monthly minutes.
   const pushes = count(activity.pushes);

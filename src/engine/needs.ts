@@ -735,7 +735,12 @@ export async function planNeeds(p: RepoProfile, caps: Capabilities, bundle: Code
  * in NIGHTLY (a check with no job still counts there when it is in NIGHTLY: scorecard). Both exports below read this,
  * so their lengths always agree.
  */
-function ciJobs(needs: Need[]): { layer: Layer | 'nightly'; category: string }[] {
+/**
+ * G15a-R7 spec 1: what the estimate is told about the repository. `codeSecurity`: whether it has code scanning (codeSecurityAvailable); the
+ * nightly history scan, the nightly DAST pairs and the code-scanning upload jobs are written only then. Not told, it counts them (leans high).
+ */
+export interface JobCountOptions { codeSecurity?: boolean }
+function ciJobs(needs: Need[], opts: JobCountOptions = {}): { layer: Layer | 'nightly'; category: string }[] {
   const out: { layer: Layer | 'nightly'; category: string }[] = [{ layer: 'nightly', category: 'nightly' }];
   const seen = new Set<string>();
   const seenNightly = new Set<string>();
@@ -755,6 +760,19 @@ function ciJobs(needs: Need[]): { layer: Layer | 'nightly'; category: string }[]
       out.push({ layer: 'nightly', category: nightlyCategory });
     }
   }
+  // G15a-R7 spec 1: the nightly jobs of G15a (layers/jobs.ts), each counted by its own category: zizmor's online run whenever the merge layer
+  // lints the workflows; with code scanning, the full-history secrets scan and its upload, per DAST service the ZAP AF active scan (its run job,
+  // at its job limit) and the two scrub jobs (nuclei's run job is the 'dast' entry above), one DAST upload job, and Scorecard's upload job
+  const merge = needs.filter((n) => n.layer === 'merge');
+  const nightly = (category: string): void => { out.push({ layer: 'nightly', category }); };
+  if (merge.some((n) => (jobGroup(n.category) ?? n.category) === 'workflow-lint' || n.id === 'workflow-lint')) nightly('workflow-lint-online');
+  if (opts.codeSecurity !== false) {
+    if (merge.some((n) => n.id === 'secrets' && n.service === undefined)) { nightly('secrets-history'); nightly('code-scanning'); }
+    const dast = [...new Set(merge.filter((n) => n.category === 'dast' && n.service !== undefined).map((n) => n.service as string))];
+    for (const _s of dast) { nightly('zap-active'); nightly('dast-scrub'); nightly('dast-scrub'); }
+    if (dast.length > 0) nightly('code-scanning');
+    if (merge.some((n) => n.category === 'scorecard')) nightly('code-scanning');
+  }
   return out;
 }
 
@@ -762,9 +780,9 @@ function ciJobs(needs: Need[]): { layer: Layer | 'nightly'; category: string }[]
  * CI jobs per layer, for Plan A's estimate() (ruling S10): see ciJobs. Nightly = merge-layer scanner and image-build jobs + 1
  * (the nightly job).
  */
-export function jobCounts(needs: Need[]): Record<Layer | 'nightly', number> {
+export function jobCounts(needs: Need[], opts: JobCountOptions = {}): Record<Layer | 'nightly', number> {
   const counts: Record<Layer | 'nightly', number> = { 'pre-commit': 0, push: 0, merge: 0, deploy: 0, nightly: 0 };
-  for (const j of ciJobs(needs)) counts[j.layer]++;
+  for (const j of ciJobs(needs, opts)) counts[j.layer]++;
   return counts;
 }
 
@@ -772,8 +790,8 @@ export function jobCounts(needs: Need[]): Record<Layer | 'nightly', number> {
  * The same CI jobs as jobCounts, listed by need category, so Plan A's estimate() can price each job by its category
  * (S5, DECISIONS #81). `jobCategories(n)[layer].length === jobCounts(n)[layer]` for every layer.
  */
-export function jobCategories(needs: Need[]): Record<Layer | 'nightly', string[]> {
+export function jobCategories(needs: Need[], opts: JobCountOptions = {}): Record<Layer | 'nightly', string[]> {
   const out: Record<Layer | 'nightly', string[]> = { 'pre-commit': [], push: [], merge: [], deploy: [], nightly: [] };
-  for (const j of ciJobs(needs)) out[j.layer].push(j.category);
+  for (const j of ciJobs(needs, opts)) out[j.layer].push(j.category);
   return out;
 }

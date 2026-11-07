@@ -13,22 +13,27 @@ type Job = { type: string; parameters?: Record<string, unknown>; policyDefinitio
 describe('zap-active: the reviewed AF plan', () => {
   it('zap-active: the plan is the captured plan with the target read from the container env (${PIPEGEN_ZAP_TARGET}), nothing else changed', () => {
     expect(ZAP_ACTIVE_TARGET_ENV).toBe('PIPEGEN_ZAP_TARGET');
-    expect(ZAP_ACTIVE_PLAN).toBe(CAPTURE.replaceAll('http://<target>:8080', '${PIPEGEN_ZAP_TARGET}'));
+    // G15a-R7 sec 4: but for the context, tied to the target's origin (the include quoted, every other URL excluded), re-measured on the pinned image
+    const origin = '\\Q${PIPEGEN_ZAP_TARGET}\\E(?:/.*)?';
+    const capture = CAPTURE.replaceAll('http://<target>:8080', '${PIPEGEN_ZAP_TARGET}')
+      .replace('        - "${PIPEGEN_ZAP_TARGET}.*"\n', `        - '${origin}'\n      excludePaths:\n        - '(?!${origin}$).*'\n`);
+    expect(ZAP_ACTIVE_PLAN).toBe(capture);
     expect(ZAP_ACTIVE_PLAN).not.toContain('${{');
   });
 
   it('zap-active: spider, passive wait, active scan with ZAP\'s default policy (no rule changed), and the traditional-json report the gate reads, in that order', () => {
-    const plan = parse(ZAP_ACTIVE_PLAN) as { env: { contexts: { name: string; urls: string[]; includePaths: string[] }[]; parameters: Record<string, unknown> }; jobs: Job[] };
+    const plan = parse(ZAP_ACTIVE_PLAN) as { env: { contexts: { name: string; urls: string[]; includePaths: string[]; excludePaths: string[] }[]; parameters: Record<string, unknown> }; jobs: Job[] };
     expect(plan.jobs.map((j) => j.type)).toEqual(['passiveScan-config', 'spider', 'passiveScan-wait', 'activeScan', 'report']);
     expect(plan.env.parameters).toEqual({ failOnError: true, failOnWarning: false, progressToStdout: true });
-    expect(plan.env.contexts).toEqual([{ name: 'pipegen', urls: ['${PIPEGEN_ZAP_TARGET}'], includePaths: ['${PIPEGEN_ZAP_TARGET}.*'] }]);
+    expect(plan.env.contexts).toEqual([{ name: 'pipegen', urls: ['${PIPEGEN_ZAP_TARGET}'], includePaths: ['\\Q${PIPEGEN_ZAP_TARGET}\\E(?:/.*)?'], excludePaths: ['(?!\\Q${PIPEGEN_ZAP_TARGET}\\E(?:/.*)?$).*'] }]);
     const active = plan.jobs[3] as Job;
     expect(active.policyDefinition).toEqual({ defaultStrength: ZAP_ACTIVE_POLICY.defaultStrength, defaultThreshold: ZAP_ACTIVE_POLICY.defaultThreshold });
     expect(ZAP_ACTIVE_POLICY).toMatchObject({ defaultStrength: 'medium', defaultThreshold: 'medium' });
     expect(active.parameters).toEqual({ context: 'pipegen', maxRuleDurationInMins: 5, maxScanDurationInMins: 30 });
     expect(plan.jobs[4]?.parameters).toMatchObject({ template: 'traditional-json', reportDir: '/zap/wrk', reportFile: ZAP_ACTIVE_REPORT });
     // nothing turns a rule off, filters an alert or runs a script
-    expect(ZAP_ACTIVE_PLAN).not.toMatch(/rules:|alertFilter|script|threshold: off|strength: off|exclude/i);
+    // (the context's one excludePaths entry, every URL outside the target's origin, only narrows what is scanned: G15a-R7 sec 4)
+    expect(ZAP_ACTIVE_PLAN.replace(/ {6}excludePaths:\n {8}- '\(\?!\\Q\$\{PIPEGEN_ZAP_TARGET\}\\E\(\?:\/\.\*\)\?\$\)\.\*'\n/, '')).not.toMatch(/rules:|alertFilter|script|threshold: off|strength: off|exclude/i);
   });
 
   it('zap-active: the command runs the plan by its absolute path (zap.sh reads a relative one from /zap), silent, with no UI', () => {

@@ -346,7 +346,10 @@ export function scrubChainProblems(steps: readonly RenderedStep[], scans?: Reado
     if (!isScrubStep(s)) return;
     const at = `Step ${i + 1} (${show(s.name)})`;
     const w = s.with ?? {};
-    for (const k of SCRUB_INPUTS) if (typeof w[k] !== 'string' || w[k] === '') problems.push(`${at} is a scrub step with no ${k} input.`);
+    const keyFree = typeof w.tool === 'string' && NO_KEY_SCRUB_TOOLS.has(w.tool);
+    for (const k of SCRUB_INPUTS) if (!(keyFree && k === 'fp-key') && (typeof w[k] !== 'string' || w[k] === '')) problems.push(`${at} is a scrub step with no ${k} input.`);
+    // G15a-R7 sec 3: the Scorecard scrub never gets the key (its job runs a third-party container before it and needs no key)
+    if (keyFree && w['fp-key'] !== undefined) problems.push(`${at} scrubs the Scorecard result with the fingerprint key; the Scorecard scrub runs without it, so its job holds no secret.`);
     const artifact = w.artifact;
     if (typeof artifact !== 'string' || artifact === '') return;
     if (s.id !== scrubStepId(artifact)) problems.push(`${at} is a scrub step whose id is ${show(s.id ?? '')}, but a scrub step's id is ${scrubStepId(artifact)} for the result ${show(artifact)}.`);
@@ -477,6 +480,13 @@ export const NIGHTLY_CONCURRENCY = 'pipegen-nightly';
  */
 export const SCORECARD_CRON = '23 4 * * 1';
 export const SCORECARD_IF = `github.event.schedule == '${SCORECARD_CRON}'`;
+/** The nightly cron entry of the nightly file (B5). */
+export const NIGHTLY_CRON = '17 3 * * *';
+/**
+ * G15a-R7 spec 2: no Monday double run. Every job of the nightly file but the weekly ones runs only on the nightly cron entry; Scorecard runs
+ * only on its own (SCORECARD_IF), and its code-scanning upload follows it through needs. Written on every nightly job of pipegen's (layers/jobs.ts).
+ */
+export const NIGHTLY_IF = `github.event.schedule == '${NIGHTLY_CRON}'`;
 export const SCORECARD_JOB = 'scorecard';
 export const CODE_SCANNING_JOB = 'code-scanning';
 /**
@@ -501,6 +511,12 @@ export const DAST_UPLOAD_JOB = 'code-scanning-dast';
 export const dastNightlyCategory = (service: string, lane: DastLane = 'dast'): string => `pipegen-${lane}-nightly--${slug(service)}`;
 /** G15a round 3 (PF-3): the reviewed tools whose result a scrub reads but that run as a docker step (no argv policy): Scorecard. */
 export const SCRUB_ONLY_TOOLS: ReadonlySet<string> = new Set(['scorecard-action']);
+/**
+ * G15a-R7 sec 3: the tools whose scrub runs without the fingerprint key (no `fp-key` input): Scorecard, whose image runs as a container action in
+ * the same job before the scrub. It is no secrets tool and has no quoting rule, so the scrub never needs the key for it (gate/src/scrub.ts
+ * needsKey), and the job holds no secret at all. Every other scrub carries the key.
+ */
+export const NO_KEY_SCRUB_TOOLS: ReadonlySet<string> = new Set(['scorecard-action']);
 /** A `docker://<image>@sha256:<64 hex>` uses of an image in DOCKER_STEP_IMAGES (the shape only; the referee checks the reviewed digest). */
 export function isDockerStepUses(uses: unknown): boolean {
   if (typeof uses !== 'string' || !uses.startsWith('docker://')) return false;

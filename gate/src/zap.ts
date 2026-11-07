@@ -30,7 +30,6 @@ export const ZAP_TOOLS: ReadonlySet<string> = new Set([ZAP_TOOL, ZAP_AF_TOOL]);
  * (baseline exit 3, AF exit 1), and the run step fails. A required DAST check on ZAP blocks like any other required check.
  */
 export const ZAP_JSON_VERIFIED = true;
-const UNVERIFIED_NOTE = 'zap-json parsing is unverified against a real zap-baseline -J report';
 const MAX_PLUGIN_ID = 256;
 const MAX_URL_PATH = 2048;
 const MAX_SITES = 1000;
@@ -112,7 +111,6 @@ export function parseZapJson(json: unknown, toolId: string, opts: ZapOptions = {
         }
       }
     }
-    if (!ZAP_JSON_VERIFIED) notes.push(UNVERIFIED_NOTE);
     if (unknownRisk > 0) notes.push(`${unknownRisk} alert(s) had an unknown riskcode and are counted as high`);
     return findings;
   });

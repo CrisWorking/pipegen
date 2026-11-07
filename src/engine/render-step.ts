@@ -27,7 +27,7 @@ import { APP_RUNNING_CATEGORIES, projectScriptSteps, renderCliTool, renderRangeS
 import { ArtifactNameError, resultArtifactName, SECRETS_HISTORY_ARTIFACT, SECRETS_RANGE_ARTIFACT } from './artifact-names.js';
 import { argvPolicyProblems, repoToolFor, type ProjectScriptStep, type RepoToolStep, type ReviewedEntry } from './reviewed.js';
 import { own, RenderError, show } from './render-error.js';
-import { BASE_CHECKOUT_ID, BASELINE_CHECK_STEP_ID, checkExpressions, checkJobOrder, isDangerousName, isReviewed, narrowingChoiceProblem, STEP_KEYS, ZAP_ACTIVE_LANE, type JobContext, type RenderedStep, type ScanFact } from './job-rules.js';
+import { BASE_CHECKOUT_ID, BASELINE_CHECK_STEP_ID, checkExpressions, checkJobOrder, isDangerousName, isReviewed, narrowingChoiceProblem, NO_KEY_SCRUB_TOOLS, STEP_KEYS, ZAP_ACTIVE_LANE, type JobContext, type RenderedStep, type ScanFact } from './job-rules.js';
 import { GateJobListError } from './gate-job-list.js';
 import { gateStepInputs, nightlyStepInputs } from './gate-inputs.js';
 import { ARGV_POLICIES, ZIZMOR_ONLINE_HOST, ZIZMOR_ONLINE_ID, ZIZMOR_ONLINE_POLICY, allowedDomainsProblem, BULLFROG_USES, egressDomains, BASE_CHECKOUT_REF, DOCKER_ACTION_USES, DOCKER_STEP_IMAGES, DOCKER_STEP_INPUTS, GATE_UPLOAD_FILES, gateUploadPath, uploadIfNoFiles, IMAGE_BUILT_ACTION_USES, isStagedTool, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath, scrubStepId, stagePath, stageStepId } from './tool-flags.js';
@@ -522,7 +522,9 @@ export function renderScrub(artifact: string, rawPath: string, tool: string, for
   // C1c: the scrub of a secrets scan reads the stage folder's manifest, to map the findings back and to prove coverage by the canaries; the
   // commit-range scan (C9) reads the history, not a stage folder (its canaries are commits: the range facts beside its raw result)
   const staged: Record<string, string> = isStagedTool(tool) && artifact !== SECRETS_RANGE_ARTIFACT && artifact !== SECRETS_HISTORY_ARTIFACT ? { stage: stagePath(artifact) } : {};
-  const step = actionStep(gate, 'pipegen: scrub the result', {}, { mode: 'scrub', artifact, tool, format, raw: rawPath, out, 'fp-key': '${{ secrets.PIPEGEN_FP_KEY }}', ...staged });
+  // G15a-R7 sec 3: no key for a key-free scrub (Scorecard): its job then names no secret at all
+  const key: Record<string, string> = NO_KEY_SCRUB_TOOLS.has(tool) ? {} : { 'fp-key': '${{ secrets.PIPEGEN_FP_KEY }}' };
+  const step = actionStep(gate, 'pipegen: scrub the result', {}, { mode: 'scrub', artifact, tool, format, raw: rawPath, out, ...key, ...staged });
   return { id: scrubStepId(artifact), ...step, if: 'always()' };
 }
 

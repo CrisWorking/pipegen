@@ -166,6 +166,8 @@ export const MUST_VERIFY: ReadonlySet<string> = new Set([
  * workflow_dispatch, so its build-provenance attestation has no tag identity to bind. It is accepted only as this exact identity, a GitHub
  * attestation of the pinned asset itself (the install package, whose sha256 is the pin), with the source commit the attestation recorded
  * (sourceDigest). Checked live 2026-11-06 with an independent gh (progress LIVE line; L/fixtures-G15/v.json). Every other repo: tag only.
+ * Controller ruling G15a-R7 (spec 6): ACCEPTED. gh's release attestations are signed by
+ * cli/cli/.github/workflows/deployment.yml@refs/heads/trunk (verified live 2026-11-07 with a negative control).
  */
 export const BRANCH_SIGNERS: Readonly<Record<string, string>> = Object.freeze({
   'cli/cli': 'https://github.com/cli/cli/.github/workflows/deployment.yml@refs/heads/trunk',
@@ -221,7 +223,7 @@ const stepSchema = z.strictObject({
     env: z.record(z.string().regex(ENV_RE), safeValue).optional(),
   }).optional(),
   // an output path starts with a letter, digit, `.` or `_` (review M-R2: never a word a tool could read as a flag)
-  output: z.strictObject({ path: z.union([z.literal(''), z.string().regex(REL_GLOB_RE).regex(/^[A-Za-z0-9._]/, 'an output path starts with a letter, a digit, . or _')]), format: z.enum(['sarif', 'junit', 'zap-json', 'none']) }),
+  output: z.strictObject({ path: z.union([z.literal(''), z.string().regex(REL_GLOB_RE).regex(/^[A-Za-z0-9._]/, 'an output path starts with a letter, a digit, . or _')]), format: z.enum(['sarif', 'junit', 'zap-json', 'json', 'none']) }),
 });
 
 const fixedSchema = z.strictObject({
@@ -427,6 +429,8 @@ function entryProblems(e: Entry): { message: string; path: (string | number)[] }
   // ---- outputs: platform entries scan nothing ----
   const output = e.step.output;
   if ((output.format === 'none') !== (output.path === '')) bad("output.path is '' exactly when output.format is none", 'step', 'output');
+  // G15a-R7 spec 7: json is Trivy's licence JSON, which only the scrub of trivy-licence reads (gate/src/trivy-licence.ts); no other entry declares it
+  if (output.format === 'json' && e.id !== TRIVY_LICENCE_RESULT.tool) bad(`output.format json is only trivy's licence scan (${TRIVY_LICENCE_RESULT.tool}), whose JSON the gate's scrub reads; every other findings tool writes sarif or zap-json`, 'step', 'output');
   if (e.categories.includes('platform') && output.format !== 'none') bad("a platform entry has output { path: '', format: 'none' }", 'step', 'output');
 
   // ---- fixed inputs are set by the template; choices never cover them ----
@@ -852,8 +856,8 @@ function trivyProblems(e: Entry): Problem[] {
   const listAll = TRIVY_LICENCE_RESULT.listAll.slice(2);
   if (scanners.includes('license')) {
     if (lastValue(p, 'format') !== TRIVY_LICENCE_RESULT.format || lastValue(pa, 'format') !== TRIVY_LICENCE_RESULT.format || formats.some((v) => v !== TRIVY_LICENCE_RESULT.format)
-      || lastValue(p, listAll) !== 'true' || !args.includes(TRIVY_LICENCE_RESULT.listAll) || e.step.output.format !== 'sarif') {
-      bad(`trivy's licence scan runs with --format json ${TRIVY_LICENCE_RESULT.listAll}, in the command and fixedInputs.args, and its output format is sarif (the gate reads every package from Trivy's JSON and writes the scrubbed SARIF; a package with no licence data is an Unknown)`, 'step', 'cli', 'command');
+      || lastValue(p, listAll) !== 'true' || !args.includes(TRIVY_LICENCE_RESULT.listAll) || e.step.output.format !== 'json') {
+      bad(`trivy's licence scan runs with --format json ${TRIVY_LICENCE_RESULT.listAll}, in the command and fixedInputs.args, and its output format is json (G15a-R7: what the tool writes; the gate reads every package from Trivy's JSON and writes the scrubbed SARIF; a package with no licence data is an Unknown)`, 'step', 'cli', 'command');
     }
   } else if (formats.includes('json') || [...p.flags, ...pa.flags].some((f) => f.name === listAll)) {
     bad(`only trivy's licence scan writes json (${TRIVY_LICENCE_RESULT.listAll} too): the gate reads every other trivy scan as SARIF`, 'step', 'cli', 'command');

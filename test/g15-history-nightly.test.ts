@@ -4,6 +4,7 @@
 // pipegen-secrets-history). Reported, never gated. With no code scanning, nothing would report it, so the job is not written and a note says so.
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { describe, expect, it } from 'vitest';
+import { NIGHTLY_IF } from '../src/engine/job-rules.js';
 import { assemble as assembleFiles, judgeAssembled, NIGHTLY_CRON } from '../src/layers/assemble.js';
 import type { CreatedFile, ReviewedTool } from '../src/types.js';
 import { assemble as assembleJobs, CAPS, LINTERS, p as P, planned, profileOf, shown } from './helpers/assemble.js';
@@ -39,7 +40,7 @@ describe('G15a round 4 (b1): betterleaks over the full history, nightly', () => 
     expect((w.doc.on as Obj).schedule).toEqual(expect.arrayContaining([{ cron: NIGHTLY_CRON }]));
     const job = jobsOf(w.doc)[SECRETS_HISTORY_JOB] as Obj;
     expect(job.permissions).toEqual({ contents: 'read' });
-    expect(job.if).toBeUndefined();
+    expect(job.if).toBe(NIGHTLY_IF); // G15a-R7 spec 2: the nightly cron only (no Monday double run)
     const steps = stepsOf(w.doc);
     expect(String(steps[0]?.uses)).toMatch(/bullfrog/);
     const checkout = steps.find((s) => /actions\/checkout/.test(String(s.uses))) as Obj;

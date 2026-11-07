@@ -60,13 +60,13 @@ import { ArtifactNameError, resultArtifactName, slug } from '../engine/artifact-
 import { baseImageRef, loadBaseImages, nodeBaseImageId, type BaseImage } from '../engine/base-images.js';
 import { dockerfilesOf } from '../engine/created-judges/compose.js';
 import { egressSetsForTool, renderEgressStep, SHARED_CDN_SETS, type EgressSet } from '../engine/egress.js';
-import { gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES } from '../engine/gate-job-list.js';
+import { gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES, resultFormat } from '../engine/gate-job-list.js';
 import { SKIPPED_PART_NEEDS } from '../engine/gate-inputs.js';
 import { ARCHIVE_TOOL_IDS, renderImageArchiveScan, renderImageBuild } from '../engine/image-handoff.js';
 import { dastStartOf, nightlyDastSpec, NIGHTLY_DAST_TOOL, renderDastRun, renderDastScrub, zapActiveNotRunNote, zapActiveSpec, ZAP_ACTIVE_JOB_MINUTES, ZAP_ACTIVE_LANE, ZAP_ACTIVE_TOOL, type DastStart } from '../engine/dast-handoff.js';
 import {
   BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, dastRunJobId, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, IMAGE_BUILD_NEED, imageBuildJobId, isReviewed,
-  isScrubStep, jobOutputsFor, CODE_SCANNING_JOB, DAST_UPLOAD_JOB, dastLaneOf, dastNightlyCategory, dastResultArtifact, type DastLane, HISTORY_UPLOAD_JOB, SECRETS_HISTORY_CATEGORY, SECRETS_HISTORY_JOB, NIGHTLY_CONCURRENCY, NO_SCANS, SCORECARD_IF, SCORECARD_JOB, ZIZMOR_ONLINE_JOB, renderRangeFetchStep, type RenderedStep, type ScanFact,
+  isScrubStep, jobOutputsFor, CODE_SCANNING_JOB, DAST_UPLOAD_JOB, dastLaneOf, dastNightlyCategory, dastResultArtifact, type DastLane, HISTORY_UPLOAD_JOB, SECRETS_HISTORY_CATEGORY, SECRETS_HISTORY_JOB, NIGHTLY_CONCURRENCY, NIGHTLY_IF, NO_SCANS, SCORECARD_IF, SCORECARD_JOB, ZIZMOR_ONLINE_JOB, renderRangeFetchStep, type RenderedStep, type ScanFact,
 } from '../engine/job-rules.js';
 import { NEED_ID_CATEGORY, SCHEDULED_CATEGORIES } from '../engine/need-ids.js';
 import { MINIMUM_CATEGORIES, NO_HOOKS_CI_MANAGERS, NO_IMAGE_CATEGORIES, noImageServices, riskyTriggersOf, WORKFLOW_LINT_EXTRA, WORKFLOW_LINT_TOOL, workflowLintTools } from '../engine/needs.js';
@@ -183,7 +183,7 @@ const show = (s: unknown): string => JSON.stringify(safeText(String(s), 60));
 const categoryOf = (id: string): string | undefined => (Object.hasOwn(NEED_ID_CATEGORY, id) ? (NEED_ID_CATEGORY as Readonly<Record<string, string>>)[id] : undefined);
 const FLOOR: ReadonlySet<string> = new Set(FLOOR_NEEDS);
 const isFloor = (needId: string): boolean => FLOOR.has(needId) || FLOOR.has(categoryOf(needId) ?? '');
-const isFindings = (t: ReviewedTool): boolean => t.step.output.format === 'sarif' || t.step.output.format === 'zap-json';
+const isFindings = (t: ReviewedTool): boolean => resultFormat(t.step.output.format) === 'sarif' || t.step.output.format === 'zap-json';
 const keyOf = (n: { id: string; service?: string }): string => {
   try { return needKeyOf(n); } catch (e) { if (e instanceof NeedKeyError) return fail(e.message); throw e; }
 };
@@ -827,6 +827,13 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
   const release = new Set(draft.needs.filter((n) => n.layer === 'deploy' && RELEASE_ONLY_NOTES.has(categoryOf(n.id) ?? n.category)));
   for (const n of release) addNote(notes, RELEASE_ONLY_NOTES.get(categoryOf(n.id) ?? n.category) as string);
   if (release.size > 0) draft = narrowed(draft, release);
+  // G15a-R7 spec 2: no Monday double run. The nightly file has a second cron entry when Scorecard runs weekly; every nightly job but Scorecard and
+  // the jobs that follow it (its code-scanning upload, through needs) runs only on the nightly entry
+  for (const [id, j] of Object.entries(nightly)) {
+    if (id === SCORECARD_JOB || (j.needs ?? []).includes(SCORECARD_JOB)) continue;
+    if (j.if !== undefined) fail(`The nightly job ${show(id)} already has a condition, so it can not be limited to the nightly cron.`);
+    nightly[id] = { ...j, if: NIGHTLY_IF };
+  }
   return { draft, push, merge, nightly, sign, notes, uncoveredMinimum: [...uncoveredMinimum.values()] };
 }
 

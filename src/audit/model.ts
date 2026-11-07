@@ -48,6 +48,7 @@ import { readOnlyTokenHint } from '../github/client.js';
 import { readDefaultSetup, type DefaultSetup } from '../github/code-scanning-setup.js';
 import { lastCompletedRun } from '../github/workflow-runs.js';
 import { signingMode } from '../github/signing-mode.js';
+import { codeSecurityAvailable } from '../github/availability.js';
 import { readHeadCommit, type HeadCommit } from '../read/git-head.js';
 import { readGitIndexPaths } from '../read/git-index.js';
 import { loadIgnore } from '../read/gitignore.js';
@@ -472,7 +473,7 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
   const wouldAdd = wouldAddRows(profile, coverage, deps, caps);
 
   const activity = await activityOf(deps, profile);
-  const estimates = estimate(profile, jobCategories(estimateNeeds(profile, caps, needs)), 2, activity ?? { pushes: 0, prs: 0, capped: false }, { name: 'claude', model: DEFAULT_MODEL });
+  const estimates = estimate(profile, jobCategories(estimateNeeds(profile, caps, needs), { codeSecurity: codeSecurityAvailable(profile, caps) }), 2, activity ?? { pushes: 0, prs: 0, capped: false }, { name: 'claude', model: DEFAULT_MODEL });
   if (activity === null) {
     const line = "Activity: pipegen couldn't read this repo's pushes and pull requests for the last 30 days, so monthly minutes assume 0 of each (the real number is likely higher).";
     const at = estimates.basis.findIndex((b) => b.startsWith('Activity:'));

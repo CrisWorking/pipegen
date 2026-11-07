@@ -24,6 +24,15 @@ export const ZAP_ACTIVE_COMMAND = Object.freeze(['zap.sh', '-autorun', `${ZAP_AC
 export const ZAP_ACTIVE_POLICY = Object.freeze({ defaultStrength: 'medium', defaultThreshold: 'medium', maxRuleDurationInMins: 5, maxScanDurationInMins: 30 } as const);
 
 const T = `\${${ZAP_ACTIVE_TARGET_ENV}}`;
+/**
+ * G15a-R7 sec 4: the context is the target's origin only. ZAP matches a context regex against the whole URL (Java regex). `\Q…\E` quotes the
+ * target (its dots are literal; a local URL holds no `\E`), and after it comes nothing or a path: never `:30001` (a longer port), `@host` (another
+ * authority) or `.evil` (a longer host). The AF also adds each context URL as an include of its own, `<url>.*` unquoted (measured on the pinned
+ * image: with the include alone, a link to http://<host>:8080 from the target http://<host>:808 was still actively scanned), so every URL outside
+ * the origin is excluded as well, and an exclude wins over an include. Re-measured on the pinned image (G15a report, round 7): the fixture
+ * target gives the same alert types, and the other origin is no longer scanned.
+ */
+const ORIGIN = `\\Q${T}\\E(?:/.*)?`;
 /** The plan text the run step writes into the work folder. Spider and passive wait 5 minutes at most each; the report is the traditional-json template the gate reads (gate/src/zap.ts). */
 export const ZAP_ACTIVE_PLAN = [
   'env:',
@@ -32,7 +41,9 @@ export const ZAP_ACTIVE_PLAN = [
   '      urls:',
   `        - "${T}"`,
   '      includePaths:',
-  `        - "${T}.*"`,
+  `        - '${ORIGIN}'`,
+  '      excludePaths:',
+  `        - '(?!${ORIGIN}$).*'`,
   '  parameters:',
   '    failOnError: true',
   '    failOnWarning: false',

@@ -497,6 +497,12 @@ function trivyEntry(over: { command?: string[]; args?: string[]; verifiedWith?: 
     ...(over.choices === undefined ? {} : { choices: over.choices }),
   });
 }
+/** G15a-R7 spec 7: a trivy licence scan is the entry trivy-licence, whose output (what the tool writes) is declared json. */
+function licenceEntry(over: Parameters<typeof trivyEntry>[0]): Entry {
+  const e = trivyEntry(over) as Entry & { id: string; candidate: Entry; step: { output: Entry } };
+  e.id = 'trivy-licence'; e.candidate.id = 'trivy-licence'; e.step.output = { ...e.step.output, format: 'json' };
+  return e;
+}
 const JSCPD_ARGS = ['--baseline-from-ref', 'origin/main', '--fail-on-new-clones', '--no-gitignore'];
 const jscpdEntry = (over: BinOver = {}) => {
   const e = binEntry('kucherenko/jscpd', {
@@ -677,7 +683,7 @@ describe('loader rules (Plan P Task 5)', () => {
     // shorthands read as pflag does: combined bools and glued values
     expect(load([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, '-fsarif', '-o=tool.sarif', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--exit-code', '10'] })])).toHaveLength(1);
     // (G15a G11-2: the licence scan writes Trivy's JSON with every package listed)
-    expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--format', 'json', '--list-all-pkgs', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--format', 'json', '--list-all-pkgs', '--exit-code', '10'] })])).toHaveLength(1);
+    expect(load([licenceEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--format', 'json', '--list-all-pkgs', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--format', 'json', '--list-all-pkgs', '--exit-code', '10'] })])).toHaveLength(1);
     // S9 (Plan C final review fix round A): a licence scan with a severity filter does not load
     rejects([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--severity', 'HIGH,CRITICAL', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--exit-code', '10'] })], /licence scan must report every severity/);
     // the environment can set any flag: no TRIVY_* env at all
@@ -1064,7 +1070,7 @@ describe('loader rules (Plan P Task 5)', () => {
     rejects([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, '--no-such', ...tail], args: [...TRIVY_FLAGS, '--no-such'] })], /unknown flag --no-such/);
     // allowlisted flags load (the trivy-licence shape of fix round A, S9: no --severity; the image and betterleaks shapes)
     // (G15a G11-2: the licence scan writes Trivy's JSON with every package listed)
-    expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--format', 'json', '--list-all-pkgs', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--format', 'json', '--list-all-pkgs', '--exit-code', '10'] })])).toHaveLength(1);
+    expect(load([licenceEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--format', 'json', '--list-all-pkgs', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--format', 'json', '--list-all-pkgs', '--exit-code', '10'] })])).toHaveLength(1);
     expect(load([betterleaksEntry({ command: blCmd('--no-banner', '--ignore-gitleaks-allow'), args: BL_ARGS })])).toHaveLength(1);
     expect(load([nucleiEntry({ command: nucleiCmd('-u', 'http://localhost:8080', '-ni', '-as') })])).toHaveLength(1);
   });

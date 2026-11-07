@@ -33,6 +33,7 @@ import { ARGV_POLICIES, HISTORY_STEP_ENV, historyScanStepId, JOB_TOKEN_REF, PIP_
 
 export { sha16 };   // defined in tool-flags.ts (the job rules need it too); re-exported for the callers that import it from here
 import { EXTRA_RULES_AT, tuningEffects, type TuningEffects } from './tuning.js';
+import { resultFormat } from './gate-job-list.js';
 import type { InstallSpec, ReviewedTool, Service, StepSpec } from '../types.js';
 
 /** Test and internal hooks: the argv policies and the pip closures the renderer reads (production passes neither). */
@@ -773,7 +774,7 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   const appRunning = tool.categories.some((c) => APP_RUNNING_CATEGORIES.has(c));
   const runId = runsRepoCode(pol, appRunning) ? `repocode-${sha16(artifact)}` : checker ? `checker-run-${sha16(artifact)}` : `tool-run-${sha16(artifact)}`;
   steps.push(runStep(`pipegen: run ${exe}`, run, env, runId));
-  return { steps, output: out === null ? null : { path: `\${{ runner.temp }}/pipegen-raw/${artifact}/${out}`, format: tool.step.output.format }, ...(built.fullHistory ? { fullHistory: true as const } : {}) };
+  return { steps, output: out === null ? null : { path: `\${{ runner.temp }}/pipegen-raw/${artifact}/${out}`, format: resultFormat(tool.step.output.format) }, ...(built.fullHistory ? { fullHistory: true as const } : {}) };
 }
 
 // ---------- the commit-range secrets scan (C9) ----------

@@ -49,6 +49,23 @@ The plan the AF reports were taken with, `<target>` standing for `clean` or `vul
 `failOnError: true`, `failOnWarning: false`. The plan pipegen renders (`src/engine/zap-active.ts`) is this plan with the
 target URL of the running app.
 
+## The origin-only AF plan (`plans/af-active-origin.yaml`, G15a-R7)
+
+The plan pipegen renders since G15a-R7 (`src/engine/zap-active.ts` `ZAP_ACTIVE_PLAN`, byte for byte): the capture plan with the target
+read from the container env (`${PIPEGEN_ZAP_TARGET}`) and the context tied to the target's origin:
+`includePaths: ['\Q${PIPEGEN_ZAP_TARGET}\E(?:/.*)?']` and `excludePaths: ['(?!\Q${PIPEGEN_ZAP_TARGET}\E(?:/.*)?$).*']`.
+Re-measured on 2026-11-07 on the same pinned image, same `docker create` options, network `pgr7-net` (reports not kept as fixtures;
+logs in the ledger, `tmp-G15a/r7-zap/`):
+
+| Run | Plan | Target | Exit | Alerts (pluginid riskcode) |
+|---|---|---|---|---|
+| fixture target | origin-only | `http://vuln:8080` (`vuln.py`) | 0 | 40026 3, 40012 3, 10038 2, 10020 2, 10036 1, 10021 1: the fixture's six alert types |
+| include only | the include above, no exclude | `http://vuln2:808`, a page linking to `http://vuln2:8080/search?q=hello` | 0 | the other origin `http://vuln2:8080` was actively scanned (40012, 40026 there) |
+| origin-only | origin-only | same | 0 | only `http://vuln2:808` (10055, 10036); nothing of `http://vuln2:8080` |
+
+The second row is why the exclude is there: the AF adds each context URL as an include of its own, `<url>.*` unquoted, so the quoted
+include alone does not keep a longer port (`:8080` after `:808`) out. An exclude wins over an include.
+
 ## sha256
 
 ```
@@ -57,6 +74,7 @@ a3b5f66c25245200825c7012cd2952ca90ccd3c090609511ba875f9279ea5a93  af-active-clea
 497813b5706a9f1207348b676cdffc4b598f39b9cb976a6340dedddc244e09b6  baseline-alerts.json
 ba56b4f9ef74e711d1c1193df7d26961562c654ab6916c8c8bc9450acb5ba74b  baseline-clean.json
 00cf5a65437b9d0dfb1c968595f84a03e5826ccaf02d9ddd2048d083a2ab715e  plans/af-active-capture.yaml
+95eff223f04629883fa91149fb7c04b906b9e04cd592ddf54218bf8ec78dd265  plans/af-active-origin.yaml
 ```
 
 `zap-traditional-json.json` is older (Plan C): a unit-test output of the ZAP reports add-on, see `../sarif/README.md`.

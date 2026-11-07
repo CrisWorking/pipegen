@@ -6,6 +6,7 @@
 // (test/fixtures/sarif/nuclei.sarif, captured from the pinned binary; gate/src/sarif.ts SARIF_TOOLS.nuclei).
 // Round 6: ZAP's active scan (an Automation Framework plan) runs nightly too, in its own pair beside nuclei (test/g15-zap-nightly.test.ts).
 import { describe, expect, it } from 'vitest';
+import { NIGHTLY_IF } from '../src/engine/job-rules.js';
 import { DAST_HANDOFF_STEP_ID, dastCheckStepId, dastRawArtifact, DAST_UPLOAD_JOB, dastNightlyCategory, NIGHTLY_WORKFLOW } from '../src/engine/job-rules.js';
 import { nightlyDastSpec, NIGHTLY_DAST_TOOL } from '../src/engine/dast-handoff.js';
 import { RenderError } from '../src/engine/render-error.js';
@@ -67,7 +68,7 @@ describe('G15a round 4 (b3): the nightly DAST scan', () => {
     expect(run, 'the nightly run job').toBeDefined();
     expect(scrub, 'the nightly scrub job').toBeDefined();
     expect(run.permissions).toEqual({ contents: 'read' });
-    expect(run.if).toBeUndefined();
+    expect(run.if).toBe(NIGHTLY_IF); // G15a-R7 spec 2: the nightly cron only (no Monday double run)
     expect(JSON.stringify(run)).not.toMatch(KEY_RE);
     expect(JSON.stringify(run)).not.toMatch(/zap/);
     const scan = run.steps.find((s) => /nuclei/.test(s.name) && s.id?.startsWith('tool-run-') === true);

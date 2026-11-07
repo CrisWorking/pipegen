@@ -5,6 +5,7 @@
 // read (the entry's output is `none`, as offline). Never gated.
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { describe, expect, it } from 'vitest';
+import { NIGHTLY_IF } from '../src/engine/job-rules.js';
 import { assemble as assembleFiles, judgeAssembled } from '../src/layers/assemble.js';
 import type { CreatedFile, ReviewedTool, StepSpec } from '../src/types.js';
 import { CAPS, LINTERS, p as P, planned, profileOf, shown } from './helpers/assemble.js';
@@ -138,12 +139,12 @@ describe('G15a round 5 (b2): zizmor online, nightly', () => {
     expect(() => checkExpressions({ ...off, env: { ...off.env, [GHT]: TOK_REF } })).toThrow(RenderError);
   });
 
-  it('render: the nightly file runs zizmor online (egress, checkout, install, run; contents: read; no condition) and the referee passes', async () => {
+  it('render: the nightly file runs zizmor online (egress, checkout, install, run; contents: read; the nightly condition only) and the referee passes', async () => {
     const w = world();
     const job = jobsOf(w.doc)[ZIZMOR_ONLINE_JOB] as Obj;
     expect(job).toBeDefined();
     expect(job.permissions).toEqual({ contents: 'read' });
-    expect(job.if).toBeUndefined();
+    expect(job.if).toBe(NIGHTLY_IF); // G15a-R7 spec 2: the nightly cron only (no Monday double run)
     expect(job.needs).toBeUndefined();
     const steps = stepsOf(w.doc);
     expect(steps.map((s) => s.name)).toEqual(['Limit network egress', 'Check out the repository', 'pipegen: install zizmor', 'pipegen: run zizmor']);

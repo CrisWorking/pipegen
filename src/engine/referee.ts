@@ -33,7 +33,7 @@ import { findSecretLike } from '../ai/redact.js';
 import { activeSafeText as safeText, anyString, anyYamlScalar, scrubForDisplay, vaultHolds, withActiveVault } from '../util/known-values.js';
 import { GATE_CHECK_NAME, type CreatedFile, type KnownValueCheck, type OutputFormat, type PipegenInserted, type PipelineDraft, type ReviewedTool, type RuntimeEnv, type Service, type StepSpec } from '../types.js';
 import { ArtifactNameError, resultArtifactName, slug } from './artifact-names.js';
-import { FINDINGS_CATEGORIES, gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES, readableFormat, type JobListEntry } from './gate-job-list.js';
+import { FINDINGS_CATEGORIES, gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES, readableFormat, resultFormat, type JobListEntry } from './gate-job-list.js';
 import { GATE_JSON_INPUTS, gateStepInputs, NIGHTLY_JSON_INPUTS, nightlyStepInputs } from './gate-inputs.js';
 import { runLinters } from './linters.js';
 import { COMMIT_SHA_RE, parseImageRef } from './names.js';
@@ -46,7 +46,7 @@ import { docRecomputeProblem } from '../deliver/docs.js';
 import { createdFileProblems, duplicatePathProblems, type CreatedInputs, type CreatedRule } from './created-files.js';
 import {
   ACTION_PATH_RE, CALLER_WORKFLOW, checkExpressions, createdPathProblem, checkJobOrder, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, gateResultUploadProblems, IF_VALUES,
-  CALLER_TRIGGERS, IMAGE_ARCHIVE_STEP_ID, IMAGE_BUILD_NEED, imageBuildJobId, imageBuildSlugOf, imageCheckStepId, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, LOCAL_MERGE_WORKFLOW, narrowingChoiceProblem, NIGHTLY_CONCURRENCY, NIGHTLY_WORKFLOW, SCORECARD_IF, SCORECARD_JOB, PR_CHECK_IF, PR_CHECK_JOB, ZIZMOR_ONLINE_JOB, DAST_UPLOAD_JOB,
+  CALLER_TRIGGERS, IMAGE_ARCHIVE_STEP_ID, IMAGE_BUILD_NEED, imageBuildJobId, imageBuildSlugOf, imageCheckStepId, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, LOCAL_MERGE_WORKFLOW, narrowingChoiceProblem, NIGHTLY_CONCURRENCY, NIGHTLY_IF, NIGHTLY_WORKFLOW, SCORECARD_IF, SCORECARD_JOB, PR_CHECK_IF, PR_CHECK_JOB, ZIZMOR_ONLINE_JOB, DAST_UPLOAD_JOB,
   PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, REQUIRED_JOB, REQUIRED_NAME, requiredWorkflowForm, renderRangeFetchStep, SECRET_REF_RE, SIGN_STEP_ID_RE, ATTEST_DIGEST_STEP_ID_RE, attestDigestRef, attestDigestStepId, BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, DAST_HANDOFF_STEP_ID, dastAppStepId, dastCheckStepId, dastRunJobId, dastRunSlugOf, DAST_CHECK_ID_RE, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, BASELINE_STEP_IFS,
   STEP_KEYS as STEP_KEY_LIST, WORKFLOW_CONCURRENCY, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact,
 } from './job-rules.js';
@@ -64,7 +64,7 @@ import { FIND_RUN_STEP_ID, renderDigestStep, renderHeadCheckStep, renderPublishD
 import { strongReason } from './deploy-gating.js';
 import { ARCHIVE_TOOL_IDS, imageBuildTag, renderImageArchiveScan, renderImageBuild } from './image-handoff.js';
 import { dastStartOf, nightlyDastSpec, NIGHTLY_DAST_TOOL, renderDastRun, renderDastScrub, zapActiveSpec, ZAP_ACTIVE_LANE, ZAP_ACTIVE_TOOL } from './dast-handoff.js';
-import { ATTEST_VERIFY_REFUSAL, ATTEST_VERIFY_SETS, KEYLESS_VERIFY_SETS, SHARED_CDN_SETS } from './egress.js';
+import { ATTEST_VERIFY_SETS, KEYLESS_VERIFY_SETS, SHARED_CDN_SETS } from './egress.js';
 import { EGRESS_DOMAIN_SETS, GITHUB_ATTEST_SET, SIGSTORE_SET } from './egress-sets.js';
 import { allowedDomainsProblem, ARGV_POLICIES, BULLFROG_USES, CACHE_LOCKS, GATE_OPTIONAL_UPLOADS, PLAIN_REL_RE, PLATFORM_USES, RANGE_TOOL, RENDERER_INPUTS, rendererInputProblems, SCRUB_SECRET, uploadIfNoFiles } from './tool-flags.js';
 
@@ -396,7 +396,7 @@ interface Expected {
 }
 
 /** A judged job, kept for the checks that need every file judged first (the gate's binding to the jobs it lists). */
-interface JobRecord { file: string; id: string; judged: readonly Judged[]; outputs: unknown }
+interface JobRecord { file: string; id: string; judged: readonly Judged[]; outputs: unknown; needs: readonly unknown[] }
 /** The key of a workflow file in every map of the referee. */
 const fileKey = (f: CreatedFile): string => `${f.repo}:${f.path}`;
 
@@ -1142,6 +1142,8 @@ function judgeJobIf(fc: FileCtx, id: string, j: Obj, where: string): void {
   const scorecardJob = id === SCORECARD_JOB && isNightlyFile(fc);
   if (scorecardJob && j.if !== SCORECARD_IF) { bad('template', `${where} is the weekly Scorecard job: it runs only on its own cron entry (if: ${SCORECARD_IF}), never on every nightly run.`); return; }
   if (j.if === SCORECARD_IF) { if (!scorecardJob) bad('template', `${where}: the weekly condition (if: ${SCORECARD_IF}) is written only on the job ${SCORECARD_JOB} of the nightly file.`); return; }
+  // G15a-R7 spec 2: the nightly condition, on a steps job of the nightly file only (never the scorecard job, above, or a caller job)
+  if (j.if === NIGHTLY_IF) { if (!isNightlyFile(fc) || j.uses !== undefined) bad('template', `${where}: the nightly condition (if: ${NIGHTLY_IF}) is written only on a job of the nightly file.`); return; }
   if (j.if === undefined) return;
   if (j.if === PR_CHECK_IF) { const p = prCheckIfProblem(fc, id, j); if (p !== null) bad('template', `${where}: ${p}`); return; }
   if (j.if === DEPLOY_PUSH_IF) { const p = deployIfProblem(fc, id, j); if (p !== null) bad('template', `${where}: ${p}`); return; }
@@ -1237,7 +1239,7 @@ function judgeJob(fc: FileCtx, id: string, j: unknown): void {
   judgeServices(fc, where, j.services);
   if (!Array.isArray(j.steps)) { bad('template', `${where} has no list of steps.`); judgeOutputs(fc, id, where, j, []); return; }
   const judged = judgeJobSteps(fc, where, j.steps, true, id);
-  fc.ex.jobs.push({ file: fileKey(fc.file), id, judged, outputs: j.outputs });
+  fc.ex.jobs.push({ file: fileKey(fc.file), id, judged, outputs: j.outputs, needs: needsList(j.needs) });
   judgeOutputs(fc, id, where, j, judged);
   judgeStepPolicy(fc, id, where, j, judged);
   judgeGateSteps(fc, id, where, j, judged);
@@ -1285,8 +1287,6 @@ function judgeVerifyJob(fc: FileCtx, where: string, j: Obj, judged: readonly Jud
     const k = plan === undefined || plan === null || !Array.isArray(plan.images) ? -1 : plan.images.findIndex((i) => { try { return slug(String(i?.service)) === s; } catch { return false; } });
     const verify = k < 0 ? -1 : at(`${VERIFY_SOURCE}:${k}`);
     if (verify < 0 || verify < digest) bad(`must check the signature of the image of ${show(service)} after its digest step: this repository signs in mode ${mode}, so a deploy of an image pipegen did not sign (or one verified in mode none) is never let through.`);
-    // G15a (open question 3): an attest verify job is refused while gh's own Sigstore hosts are in no reviewed set (it could only fail)
-    if (mode === 'attest' && ATTEST_VERIFY_SETS === null) bad(`checks an attest-mode image, which pipegen does not verify yet: ${ATTEST_VERIFY_REFUSAL}.`);
     // G15a (carry A2): keyless verification reads Sigstore's trusted root and log, so the job's egress step must reach them (else it fails
     // closed at run time and every deploy stops)
     // G15a-R0b: attest verification reads GitHub's trust root and downloads the attestation bundle, so the same holds for gh's hosts
@@ -1375,8 +1375,10 @@ function judgeSignPermissions(fc: FileCtx, where: string, j: Obj, judged: readon
  * egress step, actions/attest) and no other run step: any of them could read the key or the token, or swap what the sign step runs.
  */
 const SIGN_JOB_KINDS: ReadonlySet<StepKind> = new Set(['download-artifact', 'sign']);
+const isAttestDigestStep = (x: Judged): boolean => x.kind === 'sign' && typeof x.step.id === 'string' && ATTEST_DIGEST_STEP_ID_RE.test(x.step.id);
 function judgeSignJobSteps(fc: FileCtx, where: string, judged: readonly Judged[]): void {
-  if (judged.some((x) => x.kind === 'attest')) { judgeAttestJobSteps(fc, where, judged); return; }
+  // G15a-R7 sec 2: an attest digest step makes the job an attest sign job too (a digest step with no actions/attest after it is refused there)
+  if (judged.some((x) => x.kind === 'attest' || isAttestDigestStep(x))) { judgeAttestJobSteps(fc, where, judged); return; }
   if (!judged.some((x) => x.kind === 'sign' && typeof x.step.id === 'string' && SIGN_STEP_ID_RE.test(x.step.id))) return;
   judged.forEach((x, i) => {
     // G4 (carry G3 ruling 5, P-3): the one exception, the reviewed egress step (Bullfrog, its template judged like any action) as the job's first step
@@ -1385,34 +1387,55 @@ function judgeSignJobSteps(fc: FileCtx, where: string, judged: readonly Judged[]
   });
 }
 
+/** The images of the draft's attest plan (none in another mode). */
+const attestImages = (draft: PipelineDraft): readonly { repo?: unknown }[] => {
+  const plan = draft.signing;
+  return plan === undefined || plan === null || plan.mode !== 'attest' || !Array.isArray(plan.images) ? [] : plan.images;
+};
+/**
+ * Why the actions/attest step at `i` of a sign job does not attest an image of the plan as pipegen writes it, or null when it does: it names an
+ * image of the draft's attest plan, its subject-digest is the output of that image's digest step, and that step is pipegen's own (recognised
+ * by content as the final step of that image's sign source) earlier in the same job. Shared by the job rule and the "never published unsigned" rule.
+ */
+function attestStepProblem(judged: readonly Judged[], i: number, images: readonly { repo?: unknown }[]): string | null {
+  const x = judged[i] as Judged;
+  const what = `step ${i + 1} (${show(String(x.step.name ?? x.step.uses ?? x.kind))})`;
+  const name = x.step.with?.['subject-name'];
+  const k = images.findIndex((img) => img?.repo === name);
+  if (k < 0) return `attests ${show(String(name))} in ${what}, which is not an image of the draft's signing plan.`;
+  if (x.step.with?.['subject-digest'] !== attestDigestRef(String(name))) return `gives ${what} a subject-digest that is not the output of the image's digest step (the hand-off image-publish uploaded).`;
+  const d = judged.findIndex((y) => y.step.id === attestDigestStepId(String(name)));
+  const digest = judged[d];
+  if (d < 0 || d > i || digest?.kind !== 'sign' || digest.match?.source !== `${SIGN_SOURCE}:${k}` || digest.match.final !== true) {
+    return `attests ${show(String(name))} in ${what} without pipegen's own digest step of that image before it in the job (its digest must be the hand-off file, checked as sha256:<64 hex>).`;
+  }
+  return null;
+}
+
 /**
  * G15a (carries C10, C11; G3-R1, G3-R2): the attest sign job holds the OIDC token, so it runs only the digest downloads, pipegen's attest digest
  * steps (recognised by content, signing.ts renderAttestDigestStep: the hand-off file, DIGEST_RE, the step output) and the reviewed
  * actions/attest steps: no egress step (T52), no checkout, no login action, no other run step or action. Each attest step names an image
  * of the draft's plan, and its subject-digest is the output of that image's digest step, earlier in the same job (the input table accepts
- * only that form; here the step must also be there, and be pipegen's own).
+ * only that form; here the step must also be there, and be pipegen's own). G15a-R7 sec 2: each digest step is followed by the attest step of
+ * its image (a digest step alone attests nothing, and the image would be pushed with no attestation).
  */
 // (an egress step only narrows the job's network, so it may stand there too; pipegen writes none: threat model T52)
 const ATTEST_JOB_KINDS: ReadonlySet<StepKind> = new Set(['harden', 'download-artifact', 'sign', 'attest']);
 function judgeAttestJobSteps(fc: FileCtx, where: string, judged: readonly Judged[]): void {
   const bad = (m: string): void => fc.add(fc.file.path, 'permissions', `${where} ${m}`);
-  const plan = fc.draft.signing;
-  const images = plan === undefined || plan === null || plan.mode !== 'attest' || !Array.isArray(plan.images) ? [] : plan.images;
+  const images = attestImages(fc.draft);
   judged.forEach((x, i) => {
     const what = `step ${i + 1} (${show(String(x.step.name ?? x.step.uses ?? x.kind))})`;
     if (!ATTEST_JOB_KINDS.has(x.kind)) { bad(`holds the OIDC token, so it runs only an egress step, the digest downloads, pipegen's digest steps and the reviewed actions/attest; ${what} is none of them.`); return; }
-    if (x.kind === 'sign' && !(typeof x.step.id === 'string' && ATTEST_DIGEST_STEP_ID_RE.test(x.step.id))) bad(`runs ${what}, a cosign sign step, next to actions/attest: one job signs in one mode.`);
-    if (x.kind !== 'attest') return;
-    const name = x.step.with?.['subject-name'];
-    const k = images.findIndex((img) => img?.repo === name);
-    if (k < 0) { bad(`attests ${show(String(name))} in ${what}, which is not an image of the draft's signing plan.`); return; }
-    const want = attestDigestRef(String(name));
-    if (x.step.with?.['subject-digest'] !== want) { bad(`gives ${what} a subject-digest that is not the output of the image's digest step (the hand-off image-publish uploaded).`); return; }
-    const d = judged.findIndex((y) => y.step.id === attestDigestStepId(String(name)));
-    const digest = judged[d];
-    if (d < 0 || d > i || digest?.kind !== 'sign' || digest.match?.source !== `${SIGN_SOURCE}:${k}` || digest.match.final !== true) {
-      bad(`attests ${show(String(name))} in ${what} without pipegen's own digest step of that image before it in the job (its digest must be the hand-off file, checked as sha256:<64 hex>).`);
+    if (x.kind === 'sign' && !isAttestDigestStep(x)) bad(`runs ${what}, a cosign sign step, next to actions/attest: one job signs in one mode.`);
+    if (isAttestDigestStep(x)) {
+      const after = judged.slice(i + 1).some((y) => y.kind === 'attest' && attestDigestStepId(String(y.step.with?.['subject-name'])) === x.step.id && y.step.with?.['subject-digest'] === attestDigestRef(String(y.step.with?.['subject-name'])));
+      if (!after) bad(`holds the digest step of ${show(String(x.step.id))} with no actions/attest of that image after it: the image would be pushed with no attestation.`);
     }
+    if (x.kind !== 'attest') return;
+    const problem = attestStepProblem(judged, i, images);
+    if (problem !== null) bad(problem);
   });
 }
 
@@ -1492,7 +1515,7 @@ const safeRunId = (service: string): string => { try { return dastRunJobId(servi
 const SIGSTORE_HOSTS: ReadonlySet<string> = new Set(EGRESS_DOMAIN_SETS[SIGSTORE_SET]);
 const KEYLESS_VERIFY_HOSTS: readonly string[] = KEYLESS_VERIFY_SETS.flatMap((x) => EGRESS_DOMAIN_SETS[x]);
 /** G15a-R0b: the hosts of gh's attestation set (the attest verify job's, ATTEST_VERIFY_SETS). */
-const ATTEST_VERIFY_HOSTS: readonly string[] = (ATTEST_VERIFY_SETS ?? []).flatMap((x) => EGRESS_DOMAIN_SETS[x]);
+const ATTEST_VERIFY_HOSTS: readonly string[] = ATTEST_VERIFY_SETS.flatMap((x) => EGRESS_DOMAIN_SETS[x]);
 const ATTEST_HOSTS: ReadonlySet<string> = new Set(EGRESS_DOMAIN_SETS[GITHUB_ATTEST_SET]);
 /** G4-R1 (E3-R3): the hosts of the shared-CDN egress sets (anyone can serve from them). */
 const SHARED_CDN_HOSTS: ReadonlySet<string> = new Set([...SHARED_CDN_SETS].flatMap((s) => EGRESS_DOMAIN_SETS[s]));
@@ -1817,6 +1840,49 @@ function judgeUploadsPerFile(ex: Expectations, add: Add): void {
   }
 }
 
+/** A raw DAST hand-off artifact (job-rules.ts dastRawArtifact): `pipegen-out-<lane>-raw--<svc>`; group 1 the lane, group 2 the service slug (absent for a name with no service). */
+const RAW_HANDOFF_RE = /^pipegen-out-([a-z0-9](?:[a-z0-9-]*[a-z0-9])?)-raw(?:--([a-z0-9][a-z0-9-]*))?$/;
+const DAST_LANES: ReadonlySet<string> = new Set(['dast', ZAP_ACTIVE_LANE]);
+/**
+ * G15a-R7 sec 1: code scanning is sent only what a scrub wrote. In every job, each upload-sarif `sarif_file` is the `out` of a recognised scrub
+ * step of a job this job needs (in the same file), whose job also uploads that scrub's artifact; and this job downloads that artifact, under its
+ * result name into its own folder, before the upload. A raw hand-off (`pipegen-out-<lane>-raw--<svc>`, the unscrubbed DAST result) is downloaded
+ * only by its own scrub job `<lane>--<svc>`: nowhere else could it be read, uploaded or sent on. The assembler writes exactly this; the rule is
+ * the backstop for a changed or wrongly built file set.
+ */
+function judgeSarifUploads(ex: Expectations, add: Add): void {
+  const byFile = new Map<string, JobRecord[]>();
+  for (const r of ex.jobs) byFile.set(r.file, [...(byFile.get(r.file) ?? []), r]);
+  for (const r of ex.jobs) {
+    const path = r.file.slice(r.file.indexOf(':') + 1);
+    const repo = r.file.slice(0, r.file.indexOf(':')) as CreatedFile['repo'];
+    const where = `the job ${show(r.id)}`;
+    r.judged.forEach((x, i) => {
+      if (x.kind !== 'download-artifact') return;
+      const name = x.step.with?.name;
+      const m = typeof name === 'string' ? RAW_HANDOFF_RE.exec(name) : null;
+      if (m === null) return;
+      const own = m[2] !== undefined && DAST_LANES.has(m[1] as string) && r.id === `${m[1]}--${m[2]}`;
+      if (!own) add(path, 'permissions', `${where}, step ${i + 1}, downloads the raw hand-off ${show(String(name))}, which only its own scrub job ${m[2] === undefined ? '' : show(`${m[1]}--${m[2]}`)} may read: the raw result leaves the run job only to be scrubbed.`, undefined, repo);
+    });
+    r.judged.forEach((x, i) => {
+      if (x.kind !== 'upload-sarif') return;
+      const file = x.step.with?.sarif_file;
+      const needed = new Set(r.needs.filter((n): n is string => typeof n === 'string'));
+      const scrubs = (byFile.get(r.file) ?? []).filter((n) => needed.has(n.id)).flatMap((n) => n.judged
+        .filter((y) => y.kind === 'scrub' && isScrubStep(y.step) && typeof file === 'string' && y.step.with?.out === file)
+        .filter((y) => n.judged.some((u) => u.kind === 'upload-artifact' && u.step.with?.name === y.step.with?.artifact)));
+      const artifact = scrubs[0]?.step.with?.artifact;
+      const folder = `\${{ runner.temp }}/pipegen-out/${String(artifact)}`;
+      const downloaded = typeof artifact === 'string' && typeof file === 'string' && file.startsWith(`${folder}/`)
+        && r.judged.slice(0, i).some((z) => z.kind === 'download-artifact' && z.step.with?.name === artifact && z.step.with?.path === folder);
+      if (scrubs.length !== 1 || !downloaded) {
+        add(path, 'permissions', `${where}, step ${i + 1}: the file it sends to code scanning (${show(String(file))}) is not the scrubbed output of a scrub step in a job it needs, downloaded in this job under its result name; code scanning gets only what the scrub wrote, never a raw result.`, undefined, repo);
+      }
+    });
+  }
+}
+
 /** The output format of a spec's reviewed tool, only for a spec that rendered and that a parsed file holds a step of (an action spec counts as reviewed): the one rule of the blocking rule and the job list. */
 function reviewedFormatOf(ex: Expectations): (spec: StepSpec, index: number) => OutputFormat | undefined {
   return (s, si) => {
@@ -1824,7 +1890,7 @@ function reviewedFormatOf(ex: Expectations): (spec: StepSpec, index: number) => 
     const t = ex.byId.get(s.tool.id);
     if (t === undefined || !sameCandidate(s.tool, t.candidate)) return undefined;
     if (t.candidate.kind !== 'action' && !(ex.rendered.has(`spec:${si}`) && ex.matched.has(`spec:${si}`))) return undefined;
-    return t.step.output.format;
+    return resultFormat(t.step.output.format);
   };
 }
 
@@ -1842,6 +1908,8 @@ function judgeStepPolicy(fc: FileCtx, id: string, where: string, j: Obj, judged:
   const row = own(JOB_STEP_POLICY, id);
   const power = privileged(j, secrets, fc.ex);
   if (id === SCORECARD_JOB && !isNightlyFile(fc)) bad('permissions', `${where}: the job ${SCORECARD_JOB} is the weekly Scorecard job of the nightly file only.`);
+  // G15a-R7 sec 3: the Scorecard job runs a third-party container before its scrub, which runs without the key: the job names no secret at all
+  if (id === SCORECARD_JOB && judged.some((x) => x.secrets.size > 0)) bad('permissions', `${where} is the weekly Scorecard job, which runs Scorecard's container and a scrub that needs no key: it names no secret.`);
   if (id === DAST_UPLOAD_JOB && !isNightlyFile(fc)) bad('permissions', `${where}: the job ${DAST_UPLOAD_JOB} uploads the nightly DAST results of the nightly file only.`);
   // G15a round 5 (b2): the online zizmor steps (they carry the job's token) run only in the job ZIZMOR_ONLINE_JOB of the nightly file, and that
   // job runs no other tool step
@@ -1990,7 +2058,8 @@ function judgeJobSteps(fc: FileCtx, where: string, steps: unknown[], job: boolea
   for (const x of judged) {
     const m = x.match === undefined || !x.match.final || x.kind !== 'tool' || !x.harmlessId || x.step.id === undefined ? null : /^spec:(\d+)(?::base|:archive)?$/.exec(x.match.source);
     const spec = m === null ? undefined : fc.draft.steps[Number(m[1])];
-    const format = spec === undefined || !isObj(spec) || !isObj(spec.tool) ? undefined : fc.ex.byId.get(spec.tool.id)?.step.output.format;
+    const raw = spec === undefined || !isObj(spec) || !isObj(spec.tool) ? undefined : fc.ex.byId.get(spec.tool.id)?.step.output.format;
+    const format = raw === undefined ? undefined : resultFormat(raw);
     if (spec !== undefined && x.step.id !== undefined && (format === 'sarif' || format === 'zap-json')) scans.set(x.step.id, { tool: spec.tool.id, format });
     // G4-R1: the hash check of a handed-off DAST result stands for its scan step (the scan ran in the run job)
     const dc = x.match === undefined ? null : new RegExp(`^${DAST_CHECK_SOURCE}:(\\d+)$`).exec(x.match.source);
@@ -2676,17 +2745,27 @@ async function judgeFiles(allFiles: CreatedFile[], draft: PipelineDraft, platfor
     if (!runs) add(j.file, 'unreviewed', `The job "workflow-lint" runs no ${WORKFLOW_LINT_TOOL} step: workflow lint runs ${WORKFLOW_LINT_TOOL} (poutine only next to it), never another tool in its place.`);
   }
   // G5-R1 I1, carry G5→G7 1: a repository that signs never publishes an image unsigned: a job that pushes an image (build-push with push)
-  // needs a sign job of the judged files holding the plan's sign (or attest) step. The mode is re-derived from the repository and its
+  // needs a sign job of the judged files holding, for every image of the plan, its sign (or attest) step. The mode is re-derived from the repository and its
   // capabilities (signingMode), never taken from the draft's recorded plan: a stripped plan is no way around it. Mode none is a repository
   // that signs nothing (private Free).
   const signingOwn = signingMode(draft.profile, draft.capabilities);
   if ((draft.signing !== undefined && draft.signing !== null) || signingOwn !== 'none') {
     const publishes = ex.jobs.some((j) => j.judged.some((x) => x.entryId === BUILD_PUSH_ID && x.step.with?.push !== 'false'));
-    const signs = ex.jobs.some((j) => j.id === 'sign' && j.judged.some((x) => x.kind === 'sign' || x.kind === 'attest'));
-    if (publishes && !signs) add('(draft)', 'permissions', `This repository signs in mode ${show(String(draft.signing?.mode ?? signingOwn))} and a job publishes an image, but the judged files hold no sign job with the plan's sign step: the image would be published unsigned.`);
+    // G15a-R7 sec 2: per image of the plan. Cosign modes: that image's final sign step (SIGN_STEP_ID_RE, the last run step of its sign source),
+    // never only the install. Attest mode: an actions/attest step of that image that passes attestStepProblem (its subject-digest the output
+    // of the image's own digest step before it)
+    const images = draft.signing !== undefined && draft.signing !== null && Array.isArray(draft.signing.images) ? draft.signing.images : [];
+    const signJobs = ex.jobs.filter((j) => j.id === 'sign');
+    const attest = draft.signing?.mode === 'attest';
+    const signed = (k: number): boolean => signJobs.some((j) => j.judged.some((x, i) => (attest
+      ? x.kind === 'attest' && x.step.with?.['subject-name'] === images[k]?.repo && attestStepProblem(j.judged, i, images) === null
+      : x.kind === 'sign' && typeof x.step.id === 'string' && SIGN_STEP_ID_RE.test(x.step.id) && x.match?.source === `${SIGN_SOURCE}:${k}` && x.match.final === true)));
+    const signs = images.length > 0 && images.every((_img, k) => signed(k));
+    if (publishes && !signs) add('(draft)', 'permissions', `This repository signs in mode ${show(String(draft.signing?.mode ?? signingOwn))} and a job publishes an image, but the judged files hold no sign job with the plan's sign step of every image: an image would be published unsigned.`);
   }
   judgeBaseTwins(ex, add);
   judgeUploadsPerFile(ex, add);
+  judgeSarifUploads(ex, add);
   const demoted = blockingRule(draft, ex, add, notes);
 
   // the workflow linters (7b): an issue on pipegen's lines, a note on a user's own

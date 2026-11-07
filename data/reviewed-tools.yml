@@ -16,7 +16,9 @@
 # configFiles) and sets reviewedBy and reviewedAt in a PR. A release build refuses this list while any entry is
 # PENDING (ruling S21).
 #
-# Entry fields: categories (need categories, plus platform); languages; candidate (the exact
+# Entry fields: categories (need categories, plus platform); languages; pinnedOn (optional: the day an entry added after the
+# list's own pinnedOn was pinned, never before the list's and never in the future; that entry's 7-day cooldown, reviewedAt and
+# verifiedOn count from it, every other entry's from the list's pinnedOn at the end of this header); candidate (the exact
 # pin); step (the template: step.action for actions, step.cli for binaries and images; step.cli.plugins for npm or
 # pip packages installed next to the tool, exact and hashed); verifiedWith (the signature or attestation check made
 # when pinning: method, the signed asset, the exact certificate identity and issuer, the day; required for the
@@ -467,7 +469,8 @@ tools:
   # AF plan (src/engine/zap-active.ts ZAP_ACTIVE_PLAN, the plan the real reports in test/fixtures/zap were captured with, the target read
   # from the container env ${PIPEGEN_ZAP_TARGET}) by its absolute path /zap/wrk/zap-active.yaml. Spider, passive wait, active scan with ZAP's
   # default policy (no rule changed), and the traditional-json report the gate reads. Nightly only (tool-flags.ts nightlyOnly): never offered
-  # for a need; its result goes to code scanning. Re-reviewed by delegation (DECISIONS #105).
+  # for a need; its result goes to code scanning. Re-reviewed by delegation (DECISIONS #105). G15a-R7: the context is the target's origin
+  # only (the quoted target then nothing or a path; every other URL excluded, since the AF also includes each context URL as `<url>.*`).
   - id: zap-af-active
     categories: ["dast"]
     languages: ["any"]
@@ -497,7 +500,9 @@ tools:
                 urls:
                   - "${PIPEGEN_ZAP_TARGET}"
                 includePaths:
-                  - "${PIPEGEN_ZAP_TARGET}.*"
+                  - '\Q${PIPEGEN_ZAP_TARGET}\E(?:/.*)?'
+                excludePaths:
+                  - '(?!\Q${PIPEGEN_ZAP_TARGET}\E(?:/.*)?$).*'
             parameters:
               failOnError: true
               failOnWarning: false
@@ -1383,7 +1388,7 @@ tools:
       cli:
         install: { method: github-release, package: "trivy_0.76.0_Linux-64bit.tar.gz", version: "v0.76.0" }
         command: ["trivy", "fs", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--format", "json", "--list-all-pkgs", "--output", "trivy-licence.json", "--exit-code", "10", "."]
-      output: { path: "trivy-licence.json", format: sarif }
+      output: { path: "trivy-licence.json", format: json }
     fixedInputs:
       args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--format", "json", "--list-all-pkgs", "--output", "trivy-licence.json", "--exit-code", "10"]
       config:
@@ -1398,7 +1403,7 @@ tools:
     reviewedBy: Claude delegated DECISIONS 105
     # G11-2 (2026-11-06): the scan writes Trivy's JSON with every package listed (--format json --list-all-pkgs), measured offline on the
     #   pinned 0.76.0 (test/fixtures/trivy-licence-json): a package with no licence data appears only in the lang-pkgs result, with no
-    #   Licenses. The gate's scrub reads that file (gate/src/trivy-licence.ts) and writes the scrubbed SARIF, so output.format stays sarif.
+    #   Licenses. The gate's scrub reads that file (gate/src/trivy-licence.ts) and writes the scrubbed SARIF; output.format is json, what the tool writes (G15a-R7; the scrub's result is SARIF).
     reviewedAt: "2026-11-06"
     proofs: 0
     verifiedWith:

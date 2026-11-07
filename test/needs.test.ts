@@ -270,12 +270,15 @@ describe('jobCounts', () => {
     expect(c.deploy).toBe(4);  // sbom, deploy-verify, signing, attestation
     // merge-layer scanners: secrets, sast, deps, image-scan, dast, iac = 6, + the image build the image scan and
     // DAST need (S5's real nightly built it, final review M8), + the nightly job itself
-    expect(c.nightly).toBe(9); // + scorecard (public repo): counted only in the nightly
+    // + scorecard (public repo): counted only in the nightly = 9; G15a-R7 spec 1: + zizmor online, the history scan and its upload, the ZAP AF
+    // run job and the two scrub jobs of the DAST service, the DAST upload, Scorecard's upload = 17
+    expect(c.nightly).toBe(9 + 1 + 2 + 3 + 1 + 1);
+    expect(jobCounts(needs, { codeSecurity: false }).nightly).toBe(9 + 1);
     expect(Object.keys(c).sort()).toEqual(['deploy', 'merge', 'nightly', 'pre-commit', 'push']);
     // two services: per-service needs count twice, repo-wide ones once
     const two = jobCounts(floorNeeds(profile({ services: [web(), lib()] }), PUBLIC));
     expect(two.push).toBe(2 + 4 * 2 + 1);   // hooks-ci, secrets + (sast, deps, unit-tests, lint) × 2 + workflow-lint
-    expect(two.nightly).toBe(1 + 2 * 2 + 3 + 1 + 1); // scorecard + secrets + (sast, deps) × 2 + web's image-build, image-scan and dast + nightly
+    expect(two.nightly).toBe(1 + 2 * 2 + 3 + 1 + 1 + 1 + 2 + 3 + 1 + 1); // scorecard + secrets + (sast, deps) × 2 + web's image-build, image-scan and dast + nightly; G15a-R7 as above, for web only
     expect(jobCounts([]).nightly).toBe(1);
   });
 
@@ -1005,7 +1008,7 @@ describe('planNeeds: Plan P rules', () => {
       if (job === null) for (const l of ['push', 'merge', 'deploy'] as const) expect(cat[l], `${rule.category} ${l}`).not.toContain(rule.category);
       else expect(rule.layers.some((l) => cat[l].includes(job as string)), `${rule.category} has a job`).toBe(true);
     }
-    const mergeOrCard = new Set([...cat.merge, 'scorecard', 'nightly']);
+    const mergeOrCard = new Set([...cat.merge, 'scorecard', 'nightly', 'workflow-lint-online', 'secrets-history', 'zap-active', 'dast-scrub', 'code-scanning']);
     for (const c of cat.nightly) expect(mergeOrCard.has(c), c).toBe(true);
   });
 
