@@ -257,10 +257,10 @@ export class PhaseApi {
     return deleteCentralRepo(api.gh, api.central, rec, { askName: (expected, question) => api.ask(expected, question), clock: api.clock });
   }
   /** V6-R1 sec I1: deleteCentralRepo's checks, read only (token mode: whether pipegen may tell the user to delete it); nothing asked or sent. */
-  async checkCentralRepo(rec: InstallRecord): Promise<CentralDeleteResult> {
+  async checkCentralRepo(rec: InstallRecord, knownHeads: Readonly<Record<string, string>>): Promise<CentralDeleteResult> {
     this.#only('B', 'the central repo check');
     const api = this.#api;
-    return deleteCentralRepo(api.gh, api.central, rec, { askName: async () => { throw new UninstallRefusal('the central repo check asks nothing.'); }, clock: api.clock, dryRun: true });
+    return deleteCentralRepo(api.gh, api.central, rec, { askName: async () => { throw new UninstallRefusal('the central repo check asks nothing.'); }, clock: api.clock, dryRun: true, knownHeads });
   }
   /** One of E's cleanup writes on the scratch repo (cleanupWrite: its own guard and op list). */
   async scratchCleanup(r: GuardedRepo, op: CleanupOp): Promise<{ status: number; data: unknown }> {

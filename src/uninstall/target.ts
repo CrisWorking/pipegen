@@ -1091,8 +1091,11 @@ const REPO_DELETE_GUARD: object = Object.freeze({});
 /** `unchecked`: what pipegen couldn't read before the delete (the token's permission), named in the typed-name question (sec N-M2). */
 export interface CentralDeleteResult {
   deleted: boolean; why?: string; command?: string; unchecked?: string[];
-  /** V6-R1 sec I1 (`dryRun`): every check passed, nothing asked or sent; `prs`: pipegen's own central pull requests to check first. */
-  ready?: true; prs?: number[];
+  /**
+   * V6-R1 sec I1 (`dryRun`): every check passed, nothing asked or sent; `prs`: pipegen's own central pull requests to check first; `own`:
+   * pipegen's own central branches that would go with the repo (hook-1: ready only while each is at a head pipegen recorded).
+   */
+  ready?: boolean; prs?: number[]; own?: { branch: string; sha: string }[];
 }
 /** The README GitHub's `auto_init` writes for the repo pipegen creates (`# pipelines` and its description): nothing of the user's. */
 const AUTO_README = (desc: string): Set<string> => new Set([
@@ -1118,7 +1121,7 @@ const listed = (xs: readonly unknown[]): string => `${xs.slice(0, MAX_LISTED).ma
  * never deleted before it, so a declined or refused delete keeps them). `dryRun` (V6-R1 sec I1, token mode): the same checks, read only;
  * `{ deleted: false, ready: true, prs, unchecked }` when they pass, nothing asked and nothing sent.
  */
-export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: InstallRecord, io: { askName: AskName; clock?: RateClock; prAuthor?: string; dryRun?: true }): Promise<CentralDeleteResult> {
+export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: InstallRecord, io: { askName: AskName; clock?: RateClock; prAuthor?: string; dryRun?: true; knownHeads?: Readonly<Record<string, string>> }): Promise<CentralDeleteResult> {
   const owner = rec?.app?.owner;
   if (central?.repo !== CENTRAL_REPO || typeof owner !== 'string' || central.owner !== owner) refuse(`${show(`${central?.owner}/${central?.repo}`)} is not the central repo of ${show(String(owner))}.`);
   const c = rec.central;
@@ -1285,7 +1288,14 @@ export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: Inst
 
   const first = await check();
   if ('why' in first) return notDeleted(first.why);
-  if (io.dryRun === true) return { deleted: false, ready: true, command, ...(first.prs.length > 0 ? { prs: first.prs } : {}), ...(first.unread.length > 0 ? { unchecked: first.unread.map((x) => `${x} of ${full}`) } : {}) };
+  if (io.dryRun === true) {
+    // hook-1 (V6-R1): pipegen's own branches go with the repo; each must be at a head pipegen recorded (`knownHeads`), else it may hold a
+    // teammate's commit and pipegen doesn't tell the user to delete the repo
+    const own = first.own.map((x) => { const i = x.lastIndexOf('@'); return { branch: x.slice(0, i), sha: x.slice(i + 1) }; });
+    const foreign = own.filter((b) => io.knownHeads?.[b.branch] !== b.sha);
+    if (foreign.length > 0) return { deleted: false, ready: false, own, command, why: `pipegen's own branch ${listed(foreign.map((b) => b.branch))} of ${full} is not at a commit pipegen recorded (it may hold someone's work), and it would go with the repo, so pipegen doesn't tell you to delete it: look at it, keep what you need, delete the branch, then run pipegen again` };
+    return { deleted: false, ready: true, command, ...(own.length > 0 ? { own } : {}), ...(first.prs.length > 0 ? { prs: first.prs } : {}), ...(first.unread.length > 0 ? { unchecked: first.unread.map((x) => `${x} of ${full}`) } : {}) };
+  }
   // spec N3: each of pipegen's own central pull requests (exact branch and head repo) by its number typed: its author can't be proved
   for (const n of first.prs) {
     const typed = await io.askName(String(n), `${full} holds the pull request #${n} from a pipegen branch of its own, but the install record doesn't say who opened it, so pipegen can't prove it is pipegen's. Check it on GitHub (it goes with the repo).`);

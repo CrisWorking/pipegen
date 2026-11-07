@@ -136,6 +136,39 @@ describe('V6-R1: token mode prints gh repo delete only after the gates App mode 
   });
 });
 
+describe('V6-R1 hook-1: token mode and pipegen\'s own central branches', () => {
+  it('apply: token mode names pipegen\'s own central branches that go with the repo, and prints gh repo delete only while each is at a head pipegen recorded', async () => {
+    const central = /gh repo delete o\/pipelines/;
+    const setup = async () => {
+      const w = world();
+      await afterRun1(w);
+      const rec = sampleRecord(w, { central: { repoId: w.central.id, createdByPipegen: true } });
+      await run(w, rec, term(), { deleteRepos: true, canDeleteRepos: false });
+      mergePr(w, w.central, BR);
+      return { w, rec };
+    };
+    // the central uninstall branch where pipegen set it: the command, and the branch named
+    const a = await setup();
+    const ra = await run(a.w, a.rec, term(), { deleteRepos: true, canDeleteRepos: false });
+    const step = ra.manual.find((m) => central.test(m.step ?? ''));
+    expect(step?.why).toMatch(/pipegen\/uninstall-shop/);
+    // a teammate's commit on the central uninstall branch after the merge: no command, the branch named
+    const b = await setup();
+    b.w.g.commitOn('o/pipelines', BR, { '.github/workflows/shop--merge.yml': 'on: workflow_call # teammate\n' }, 'teammate');
+    const rb = await run(b.w, b.rec, term(), { deleteRepos: true, canDeleteRepos: false });
+    expect(rb.lines.join('\n')).not.toMatch(central);
+    expect(rb.manual.some((m) => /pipelines/.test(m.what) && /pipegen\/uninstall-shop/.test(m.why))).toBe(true);
+    // pipegen's update branch, whose head pipegen never recorded: no command, the branch named
+    const c = await setup();
+    c.w.central.refs.set('heads/pipegen/update-shop', c.w.g.head('o/pipelines'));
+    c.w.g.commitOn('o/pipelines', 'pipegen/update-shop', { '.github/workflows/shop--push.yml': 'on: workflow_call # wip\n' }, 'wip');
+    const rc = await run(c.w, c.rec, term(), { deleteRepos: true, canDeleteRepos: false });
+    expect(rc.lines.join('\n')).not.toMatch(central);
+    expect(rc.manual.some((m) => /pipelines/.test(m.what) && /pipegen\/update-shop/.test(m.why))).toBe(true);
+    expect(c.w.deleted).toEqual([]);
+  });
+});
+
 describe('V6-R1: the second run 2 in production (spec I1)', () => {
   it('record: after the central PR merged, the second run 2 loads the record from the blob pipegen read before (anchor and local hash both checked); any mismatch stops', async () => {
     const setup = async () => {

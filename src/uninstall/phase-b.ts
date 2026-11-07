@@ -449,11 +449,14 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
     }
     if (tokenMode) {
       let res: CentralDeleteResult;
-      try { res = await api.checkCentralRepo(rec); } catch (e) {
+      // hook-1: the heads pipegen recorded for its own central branches (the central uninstall branch it set, sec M1)
+      const known: Record<string, string> = centralHead === undefined ? {} : { [uninstallBranch({ owner: appRef.owner, repo: appRef.repo, repoId: plan.app.repoId }, 'central')]: centralHead };
+      try { res = await api.checkCentralRepo(rec, known); } catch (e) {
         hardStop(e);
         r.failed.push({ what, why: reasonOf(e), manual: 'Run `pipegen uninstall --delete-repos` again.' });
         return;
       }
+      const ownNames = (res.own ?? []).map((b) => `${show(b.branch, 120)} (at ${b.sha.slice(0, 12)})`).join(' and ');
       if (res.ready !== true) {
         const why = show(res.why ?? 'pipegen\'s checks did not pass', 400);
         r.skipped.push({ what, why });
@@ -462,7 +465,8 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
       }
       const prs = (res.prs ?? []).length > 0 ? `; check its pull requests ${(res.prs ?? []).map((n) => `#${n}`).join(', ')} are pipegen's first` : '';
       const unread = (res.unchecked ?? []).length > 0 ? `; pipegen couldn't read ${show((res.unchecked ?? []).join(' or '), 200)}` : '';
-      r.manual.push({ what, why: `${noApp}. pipegen checked it holds nothing but pipegen's${prs}${unread}`, step: command });
+      const branchesToo = ownNames === '' ? '' : `; pipegen's own branches ${ownNames} go with it`;
+      r.manual.push({ what, why: `${noApp}. pipegen checked it holds nothing but pipegen's${branchesToo}${prs}${unread}`, step: command });
       return;
     }
     // V6-R1 sec M2: pipegen's own central branches go with the repo, inside deleteCentralRepo (named in its question): never before it
