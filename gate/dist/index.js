@@ -1978,6 +1978,56 @@ var EGRESS_DOMAIN_SETS = Object.freeze({
   [GITHUB_ATTEST_SET]: Object.freeze(["tmaproduction.blob.core.windows.net", "tuf-repo.github.com"])
 });
 
+// src/engine/zap-active.ts
+var ZAP_ACTIVE_TARGET_ENV = "PIPEGEN_ZAP_TARGET";
+var ZAP_ACTIVE_WORK = "/zap/wrk";
+var ZAP_ACTIVE_PLAN_FILE = "zap-active.yaml";
+var ZAP_ACTIVE_REPORT = "zap-active.json";
+var ZAP_ACTIVE_COMMAND = Object.freeze(["zap.sh", "-autorun", `${ZAP_ACTIVE_WORK}/${ZAP_ACTIVE_PLAN_FILE}`, "-cmd", "-silent"]);
+var ZAP_ACTIVE_POLICY = Object.freeze({ defaultStrength: "medium", defaultThreshold: "medium", maxRuleDurationInMins: 5, maxScanDurationInMins: 30 });
+var T = `\${${ZAP_ACTIVE_TARGET_ENV}}`;
+var ZAP_ACTIVE_PLAN = [
+  "env:",
+  "  contexts:",
+  "    - name: pipegen",
+  "      urls:",
+  `        - "${T}"`,
+  "      includePaths:",
+  `        - "${T}.*"`,
+  "  parameters:",
+  "    failOnError: true",
+  "    failOnWarning: false",
+  "    progressToStdout: true",
+  "jobs:",
+  "  - type: passiveScan-config",
+  "    parameters:",
+  "      maxAlertsPerRule: 10",
+  "      enableTags: false",
+  "  - type: spider",
+  "    parameters:",
+  "      context: pipegen",
+  `      url: "${T}"`,
+  "      maxDuration: 5",
+  "  - type: passiveScan-wait",
+  "    parameters:",
+  "      maxDuration: 5",
+  "  - type: activeScan",
+  "    parameters:",
+  "      context: pipegen",
+  `      maxRuleDurationInMins: ${ZAP_ACTIVE_POLICY.maxRuleDurationInMins}`,
+  `      maxScanDurationInMins: ${ZAP_ACTIVE_POLICY.maxScanDurationInMins}`,
+  "    policyDefinition:",
+  `      defaultStrength: ${ZAP_ACTIVE_POLICY.defaultStrength}`,
+  `      defaultThreshold: ${ZAP_ACTIVE_POLICY.defaultThreshold}`,
+  "  - type: report",
+  "    parameters:",
+  "      template: traditional-json",
+  `      reportDir: ${ZAP_ACTIVE_WORK}`,
+  `      reportFile: ${ZAP_ACTIVE_REPORT}`,
+  "      reportTitle: pipegen ZAP active scan",
+  ""
+].join("\n");
+
 // src/engine/tool-flags.ts
 var OXLINT_EXTENSIONS = ["js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx", "vue", "astro", "svelte"];
 var TRIVY_PINNED_CONFIG = `# pipegen's pinned trivy config: no cache kept between runs, and no repository trivy-secret.yaml (an empty path loads none)
@@ -2040,6 +2090,26 @@ var POLICIES = {
     required: { J: null, z: "-silent" },
     mount: { at: "/zap/wrk", source: "work" },
     config: { flag: "-c", content: "# pipegen's pinned ZAP baseline rules: the defaults, nothing ignored\n", fileName: "zap-baseline.conf" }
+  },
+  // G15a round 6 (P-4): the nightly ZAP Automation Framework active scan, the same pinned image. `zap.sh -cmd -silent` (no UI; no add-on
+  // update, no call home) runs the reviewed plan (zap-active.ts) by its absolute path in the work folder (zap.sh reads a relative -autorun
+  // path from /zap); the target comes in the container env (the plan's ${PIPEGEN_ZAP_TARGET}), never as a word. The AF exits 0 with
+  // alerts and 1 on a plan error, so only exit 0 with a report is a scan (no findings exit). Nightly only: never offered for a need.
+  "zap-af-active": {
+    envSlots: { [ZAP_ACTIVE_TARGET_ENV]: "local-url" },
+    network: "host",
+    asImageUser: true,
+    nightlyOnly: true,
+    method: "docker",
+    package: "zaproxy/zap-stable",
+    exe: "zap.sh",
+    dialect: "goflags",
+    sub: [],
+    flags: { cmd: "bool", silent: "bool" },
+    findingsExit: [],
+    required: { cmd: "true", silent: "true" },
+    mount: { at: "/zap/wrk", source: "work" },
+    config: { flag: "-autorun", content: ZAP_ACTIVE_PLAN, fileName: ZAP_ACTIVE_PLAN_FILE, atMount: true }
   },
   // Semgrep CE 1.181.0: rules only from the verified archive (semgrepProblems), no metrics, no version check, and no file-size skip
   // (--max-target-bytes=0: by default semgrep silently skips every file over 1 MB, so padding a file would hide it from SAST; DECISIONS #108)
@@ -2373,6 +2443,7 @@ var READS_ONLY = [
   "ruff",
   "ruff-format",
   "zap-baseline",
+  "zap-af-active",
   // no config file, but verified rules/templates only, no repo plugin mechanism on the allowlist
   "semgrep",
   "nuclei"
@@ -3820,7 +3891,7 @@ function regionSpan(workspace, f, cache) {
     return no("the file cannot be read");
   }
 }
-var PROFILES = Object.freeze(Object.assign(/* @__PURE__ */ Object.create(null), { "trivy-image": "image", nuclei: "web", "zap-baseline": "zap" }));
+var PROFILES = Object.freeze(Object.assign(/* @__PURE__ */ Object.create(null), { "trivy-image": "image", nuclei: "web", "zap-baseline": "zap", "zap-af-active": "zap" }));
 var profileOf = (tool2) => Object.hasOwn(PROFILES, tool2) ? PROFILES[tool2] : "file";
 function uriSlot(f) {
   if (f.file !== void 0) return field(f.file);
@@ -4473,6 +4544,8 @@ function parseSarifText(input, toolId, opts = {}) {
 
 // gate/src/zap.ts
 var ZAP_TOOL = "zap-baseline";
+var ZAP_AF_TOOL = "zap-af-active";
+var ZAP_TOOLS = /* @__PURE__ */ new Set([ZAP_TOOL, ZAP_AF_TOOL]);
 var ZAP_JSON_VERIFIED = true;
 var UNVERIFIED_NOTE = "zap-json parsing is unverified against a real zap-baseline -J report";
 var MAX_PLUGIN_ID = 256;
@@ -4501,7 +4574,7 @@ function optString(o, key, where, nullOk = false) {
 }
 function parseZapJson(json, toolId, opts = {}) {
   return guarded((notes) => {
-    if (toolId !== ZAP_TOOL) fail(`${JSON.stringify(safeText(toolId, 60))} is not a tool whose ZAP report the gate reads`);
+    if (!ZAP_TOOLS.has(toolId)) fail(`${JSON.stringify(safeText(toolId, 60))} is not a tool whose ZAP report the gate reads`);
     if (!isObj(json)) fail("the result is not a ZAP report (the top level is not an object)");
     if (getOwn(json, "@programName") !== "ZAP") fail("the report is not from ZAP (@programName)");
     const limits = limitsFrom(opts.limits);
@@ -6306,8 +6379,9 @@ function withholder() {
     return v;
   };
 }
+var ZAP_SARIF_DRIVER = "ZAP";
 function sarifOut(tool2, findings, notes, key, extra = {}) {
-  const info = SARIF_TOOLS[tool2];
+  const info = tool2 === ZAP_AF_TOOL ? { driver: ZAP_SARIF_DRIVER } : SARIF_TOOLS[tool2];
   const withheld = withholder();
   const results = findings.map((f) => {
     const hide = withheld(f.file);
@@ -6402,7 +6476,7 @@ function scrubBytes(raw, opts) {
       parsed = opts.tool === TRIVY_LICENCE_TOOL ? parseTrivyLicenceJsonText(raw, opts.tool, { limits: { maxBytes } }) : opts.range !== void 0 ? parseSarifText(raw, opts.tool, { commits: true, limits: { maxBytes } }) : stage === void 0 ? parseSarifText(raw, opts.tool, { workspace: opts.workspace, limits: { maxBytes } }) : parseSarifText(raw, opts.tool, { workspace: stage.files, exactNames: STAGED_NAME_RE, limits: { maxBytes } });
     } else if (opts.format === "zap-json") {
       if (opts.stage !== void 0 || opts.range !== void 0) return toolError("a stage folder or a commit range is only for the secrets tools", key);
-      if (opts.tool !== ZAP_TOOL) return toolError(`${JSON.stringify(safeText(opts.tool, 60))} is not a tool whose ZAP report the gate reads`, key);
+      if (!ZAP_TOOLS.has(opts.tool)) return toolError(`${JSON.stringify(safeText(opts.tool, 60))} is not a tool whose ZAP report the gate reads`, key);
       parsed = parseZapJsonText(raw, opts.tool, { limits: { maxBytes } });
     } else {
       return toolError("the result format is not one the gate reads", key);
@@ -6441,7 +6515,7 @@ function scrubBytes(raw, opts) {
       ...opts.range === void 0 ? {} : { regionOf: () => ({ ok: false, reason: "a secret in a commit of the range (the checkout's file is not that commit's)" }) }
     });
     const notes = [...parsed.notes, ...lineNotes(findings)].slice(0, MAX_NOTES).map((n) => clip(maskSecretShapes(n), MAX_NOTE_CHARS));
-    const bytes = Buffer.from(opts.format === "sarif" ? sarifOut(opts.tool, findings, notes, usedKey) : zapOut(findings, notes), "utf8");
+    const bytes = Buffer.from(opts.format === "sarif" || opts.tool === ZAP_AF_TOOL ? sarifOut(opts.tool, findings, notes, usedKey) : zapOut(findings, notes), "utf8");
     const written = bytes.toString("utf8");
     const holds = (text) => bytes.includes(text) || written.includes(JSON.stringify(text).slice(1, -1));
     if (usedKey !== void 0 && holds(usedKey)) return toolError("the output would hold the key, so it was not written", key);
@@ -9651,6 +9725,14 @@ var GATE_VIEW = [
       ".zap/**"
     ],
     "outputFile": "zap.json"
+  },
+  {
+    "id": "zap-af-active",
+    "categories": [
+      "dast"
+    ],
+    "configFiles": [],
+    "outputFile": "zap-active.json"
   },
   {
     "id": "trivy-config",
