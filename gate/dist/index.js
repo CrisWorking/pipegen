@@ -1985,6 +1985,10 @@ var ZAP_ACTIVE_PLAN_FILE = "zap-active.yaml";
 var ZAP_ACTIVE_REPORT = "zap-active.json";
 var ZAP_ACTIVE_COMMAND = Object.freeze(["zap.sh", "-autorun", `${ZAP_ACTIVE_WORK}/${ZAP_ACTIVE_PLAN_FILE}`, "-cmd", "-silent"]);
 var ZAP_ACTIVE_POLICY = Object.freeze({ defaultStrength: "medium", defaultThreshold: "medium", maxRuleDurationInMins: 5, maxScanDurationInMins: 30 });
+var ZAP_ACTIVE_SPIDER_MINUTES = 5;
+var ZAP_ACTIVE_PASSIVE_MINUTES = 5;
+var ZAP_ACTIVE_START_MINUTES = 5;
+var ZAP_ACTIVE_CEILING_MINUTES = ZAP_ACTIVE_SPIDER_MINUTES + ZAP_ACTIVE_PASSIVE_MINUTES + ZAP_ACTIVE_POLICY.maxScanDurationInMins + ZAP_ACTIVE_START_MINUTES;
 var T = `\${${ZAP_ACTIVE_TARGET_ENV}}`;
 var ORIGIN = `\\Q${T}\\E(?:/.*)?`;
 var ZAP_ACTIVE_PLAN = [
@@ -2010,10 +2014,10 @@ var ZAP_ACTIVE_PLAN = [
   "    parameters:",
   "      context: pipegen",
   `      url: "${T}"`,
-  "      maxDuration: 5",
+  `      maxDuration: ${ZAP_ACTIVE_SPIDER_MINUTES}`,
   "  - type: passiveScan-wait",
   "    parameters:",
-  "      maxDuration: 5",
+  `      maxDuration: ${ZAP_ACTIVE_PASSIVE_MINUTES}`,
   "  - type: activeScan",
   "    parameters:",
   "      context: pipegen",
@@ -4545,92 +4549,6 @@ function parseSarifText(input, toolId, opts = {}) {
   return read.toolError === void 0 ? parseSarif(read.json, toolId, opts) : { findings: [], toolError: read.toolError, notes: [] };
 }
 
-// gate/src/zap.ts
-var ZAP_TOOL = "zap-baseline";
-var ZAP_AF_TOOL = "zap-af-active";
-var ZAP_TOOLS = /* @__PURE__ */ new Set([ZAP_TOOL, ZAP_AF_TOOL]);
-var ZAP_JSON_VERIFIED = true;
-var MAX_PLUGIN_ID = 256;
-var MAX_URL_PATH = 2048;
-var MAX_SITES = 1e3;
-var METHOD = /^[A-Za-z]{1,16}$/;
-function severityOf(v) {
-  const n = typeof v === "number" ? v : typeof v === "string" && /^\d$/.test(v) ? Number(v) : NaN;
-  return n === 3 ? "high" : n === 2 ? "medium" : n === 1 ? "low" : n === 0 ? "info" : void 0;
-}
-function urlPath(uri) {
-  let url;
-  try {
-    url = new URL(uri);
-  } catch {
-    return void 0;
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") return void 0;
-  return url.pathname.length > MAX_URL_PATH ? void 0 : url.pathname;
-}
-function optString(o, key, where, nullOk = false) {
-  const v = getOwn(o, key);
-  if (v === void 0 || nullOk && v === null) return void 0;
-  if (typeof v !== "string") fail(`${where}: ${key} is not a string`);
-  return v;
-}
-function parseZapJson(json, toolId, opts = {}) {
-  return guarded((notes) => {
-    if (!ZAP_TOOLS.has(toolId)) fail(`${JSON.stringify(safeText(toolId, 60))} is not a tool whose ZAP report the gate reads`);
-    if (!isObj(json)) fail("the result is not a ZAP report (the top level is not an object)");
-    if (getOwn(json, "@programName") !== "ZAP") fail("the report is not from ZAP (@programName)");
-    const limits = limitsFrom(opts.limits);
-    const sites = getOwn(json, "site");
-    if (!Array.isArray(sites)) fail("the report has no site list");
-    if (sites.length === 0) fail("the report lists no site, so nothing was scanned");
-    if (sites.length > MAX_SITES) fail(`the report lists more than ${MAX_SITES} sites`);
-    const findings = [];
-    let unknownRisk = 0;
-    for (const [s, site] of sites.entries()) {
-      const at3 = `site ${s}`;
-      if (!isObj(site)) fail(`${at3} is not an object`);
-      const alerts = getOwn(site, "alerts");
-      if (!Array.isArray(alerts)) fail(`${at3} has no alerts list`);
-      for (const [a, alert] of alerts.entries()) {
-        const where = `${at3} alert ${a}`;
-        if (!isObj(alert)) fail(`${where} is not an object`);
-        const pluginid = getOwn(alert, "pluginid");
-        if (typeof pluginid !== "string" || pluginid === "" || pluginid.length > MAX_PLUGIN_ID) fail(`${where} has no usable pluginid (${shown(pluginid)})`);
-        const name = optString(alert, "name", where);
-        const title = optString(alert, "alert", where);
-        const risk = getOwn(alert, "riskcode");
-        if (risk !== void 0 && typeof risk !== "string" && typeof risk !== "number") fail(`${where}: riskcode is not a string or a number`);
-        let severity = severityOf(risk);
-        if (severity === void 0) {
-          severity = "high";
-          unknownRisk++;
-        }
-        const message = cutText(name ?? title ?? "", MAX_MESSAGE_CHARS);
-        const instances = optList(alert, "instances", where) ?? [];
-        const make = (file, method, uriUnmapped, uriId) => {
-          if (findings.length >= limits.maxResults) fail(`the report has more than ${limits.maxResults} findings`);
-          findings.push({ tool: toolId, ruleId: pluginid, severity, file, message, method, uriUnmapped, secret: false, ...uriId === void 0 ? {} : { uriId } });
-        };
-        if (instances.length === 0) make(void 0, void 0, false);
-        for (const [n, inst] of instances.entries()) {
-          const w = `${where} instance ${n}`;
-          if (!isObj(inst)) fail(`${w} is not an object`);
-          const uri = optString(inst, "uri", w, true);
-          const method = optString(inst, "method", w, true);
-          const file = uri === void 0 ? void 0 : urlPath(uri);
-          make(file, method !== void 0 && METHOD.test(method) ? method.toUpperCase() : void 0, file === void 0, file === void 0 && uri !== void 0 ? uriIdOf(uri) : void 0);
-        }
-      }
-    }
-    if (unknownRisk > 0) notes.push(`${unknownRisk} alert(s) had an unknown riskcode and are counted as high`);
-    return findings;
-  });
-}
-function parseZapJsonText(input, toolId, opts = {}) {
-  const read = readJson(input, limitsFrom(opts.limits).maxBytes);
-  return read.toolError === void 0 ? parseZapJson(read.json, toolId, opts) : { findings: [], toolError: read.toolError, notes: [] };
-}
-
 // gate/src/decide.ts
 var NOT_RUN_FORK = "not run on a fork PR (no secrets): a maintainer must run it from a branch of this repository";
 var NOT_SCANNED_RULE_ID = "secret:not-scanned";
@@ -4793,8 +4711,7 @@ function decideGate(i) {
   for (const c of i.checks) {
     const e = c.entry;
     const floor = isFloorEntry(e);
-    const zapUnverified = e.tool === ZAP_TOOL && !ZAP_JSON_VERIFIED;
-    const level = !floor && (notProvenSet.has(e.needId) || zapUnverified) ? "not-proven" : !e.blocking && !floor ? "advisory" : "required";
+    const level = !floor && notProvenSet.has(e.needId) ? "not-proven" : !e.blocking && !floor ? "advisory" : "required";
     const findings = isFindingsEntry(e);
     const tool2 = e.tool ?? e.needId;
     const name = `${tool2} (${e.job})`;
@@ -4803,7 +4720,7 @@ function decideGate(i) {
     const state = (s) => {
       checks.push({ needId: e.needId, job: e.job, ...e.tool === void 0 ? {} : { tool: e.tool }, judgedBy: findings ? "findings" : "job status", state: uncovered.length === 0 ? s : `${s}; ${uncovered.join("; ")}` });
     };
-    if (level === "not-proven") notProven.push(ref2(zapUnverified && !notProvenSet.has(e.needId) ? "ZAP results are not verified yet, so this DAST check is judged as not proven (warnings only)" : "not proven: warnings only"));
+    if (level === "not-proven") notProven.push(ref2("not proven: warnings only"));
     const toolError2 = (why2, base) => {
       const blocks = level === "required";
       toolErrors.push({ ...ref2(why2), base, blocks });
@@ -6216,6 +6133,91 @@ var SKIP_NOTES = Object.freeze({
   "no-range": "no commit range on this event (a push that made the branch, workflow_dispatch or schedule), so no commit range was scanned",
   "no-merge-base": "this push rewrote the history of the branch and its old head is not in the checkout, so its commit range was not scanned"
 });
+
+// gate/src/zap.ts
+var ZAP_TOOL = "zap-baseline";
+var ZAP_AF_TOOL = "zap-af-active";
+var ZAP_TOOLS = /* @__PURE__ */ new Set([ZAP_TOOL, ZAP_AF_TOOL]);
+var MAX_PLUGIN_ID = 256;
+var MAX_URL_PATH = 2048;
+var MAX_SITES = 1e3;
+var METHOD = /^[A-Za-z]{1,16}$/;
+function severityOf(v) {
+  const n = typeof v === "number" ? v : typeof v === "string" && /^\d$/.test(v) ? Number(v) : NaN;
+  return n === 3 ? "high" : n === 2 ? "medium" : n === 1 ? "low" : n === 0 ? "info" : void 0;
+}
+function urlPath(uri) {
+  let url;
+  try {
+    url = new URL(uri);
+  } catch {
+    return void 0;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return void 0;
+  return url.pathname.length > MAX_URL_PATH ? void 0 : url.pathname;
+}
+function optString(o, key, where, nullOk = false) {
+  const v = getOwn(o, key);
+  if (v === void 0 || nullOk && v === null) return void 0;
+  if (typeof v !== "string") fail(`${where}: ${key} is not a string`);
+  return v;
+}
+function parseZapJson(json, toolId, opts = {}) {
+  return guarded((notes) => {
+    if (!ZAP_TOOLS.has(toolId)) fail(`${JSON.stringify(safeText(toolId, 60))} is not a tool whose ZAP report the gate reads`);
+    if (!isObj(json)) fail("the result is not a ZAP report (the top level is not an object)");
+    if (getOwn(json, "@programName") !== "ZAP") fail("the report is not from ZAP (@programName)");
+    const limits = limitsFrom(opts.limits);
+    const sites = getOwn(json, "site");
+    if (!Array.isArray(sites)) fail("the report has no site list");
+    if (sites.length === 0) fail("the report lists no site, so nothing was scanned");
+    if (sites.length > MAX_SITES) fail(`the report lists more than ${MAX_SITES} sites`);
+    const findings = [];
+    let unknownRisk = 0;
+    for (const [s, site] of sites.entries()) {
+      const at3 = `site ${s}`;
+      if (!isObj(site)) fail(`${at3} is not an object`);
+      const alerts = getOwn(site, "alerts");
+      if (!Array.isArray(alerts)) fail(`${at3} has no alerts list`);
+      for (const [a, alert] of alerts.entries()) {
+        const where = `${at3} alert ${a}`;
+        if (!isObj(alert)) fail(`${where} is not an object`);
+        const pluginid = getOwn(alert, "pluginid");
+        if (typeof pluginid !== "string" || pluginid === "" || pluginid.length > MAX_PLUGIN_ID) fail(`${where} has no usable pluginid (${shown(pluginid)})`);
+        const name = optString(alert, "name", where);
+        const title = optString(alert, "alert", where);
+        const risk = getOwn(alert, "riskcode");
+        if (risk !== void 0 && typeof risk !== "string" && typeof risk !== "number") fail(`${where}: riskcode is not a string or a number`);
+        let severity = severityOf(risk);
+        if (severity === void 0) {
+          severity = "high";
+          unknownRisk++;
+        }
+        const message = cutText(name ?? title ?? "", MAX_MESSAGE_CHARS);
+        const instances = optList(alert, "instances", where) ?? [];
+        const make = (file, method, uriUnmapped, uriId) => {
+          if (findings.length >= limits.maxResults) fail(`the report has more than ${limits.maxResults} findings`);
+          findings.push({ tool: toolId, ruleId: pluginid, severity, file, message, method, uriUnmapped, secret: false, ...uriId === void 0 ? {} : { uriId } });
+        };
+        if (instances.length === 0) make(void 0, void 0, false);
+        for (const [n, inst] of instances.entries()) {
+          const w = `${where} instance ${n}`;
+          if (!isObj(inst)) fail(`${w} is not an object`);
+          const uri = optString(inst, "uri", w, true);
+          const method = optString(inst, "method", w, true);
+          const file = uri === void 0 ? void 0 : urlPath(uri);
+          make(file, method !== void 0 && METHOD.test(method) ? method.toUpperCase() : void 0, file === void 0, file === void 0 && uri !== void 0 ? uriIdOf(uri) : void 0);
+        }
+      }
+    }
+    if (unknownRisk > 0) notes.push(`${unknownRisk} alert(s) had an unknown riskcode and are counted as high`);
+    return findings;
+  });
+}
+function parseZapJsonText(input, toolId, opts = {}) {
+  const read = readJson(input, limitsFrom(opts.limits).maxBytes);
+  return read.toolError === void 0 ? parseZapJson(read.json, toolId, opts) : { findings: [], toolError: read.toolError, notes: [] };
+}
 
 // gate/src/trivy-licence.ts
 var TRIVY_LICENCE_TOOL = TRIVY_LICENCE_RESULT.tool;
