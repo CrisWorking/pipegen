@@ -281,13 +281,14 @@ async function finishedAfterCentralDelete(gh: Octokit, app: RepoRef, uapp: Unins
   const st = progress.state;
   const sent = st?.phase === 'B' ? st.centralDeleteSent : undefined;
   if (sent === undefined || !sent.confirmed) return;
-  // hook-2: the marker belongs to this machine's local record file (the same install), and GitHub answers 404 for that exact repo id. The
-  // owner is still seen: the app repo of the same owner was read just before (a 404 for central alone may be lost access, not gone).
+  // hook-2, V6-R4 Info 1: what carries "gone" is the confirmed marker (GitHub accepted pipegen's own DELETE of that id, right after the
+  // re-check saw it). The marker must belong to this machine's local record file (the same install). The by-id read can't tell a deleted
+  // repo from one this token can't see (both answer 404); it only rules out the repo still being visible under another name.
   const vouched = await readLocalRecord(app, deps.local ?? {}).catch(() => null);
   if (vouched === null || vouched.recordHash !== sent.recordHash) return;
   try {
     await githubRead(gh, 'GET /repositories/{repository_id}', { repository_id: sent.repoId }, clock);
-    return;   // GitHub still has that repo: hidden from this token, not gone
+    return;   // GitHub shows that id (under another name): not gone
   } catch (e) {
     if (statusOf(e) !== 404) { if (isRateStop(e) || e instanceof GitHubAccessError) throw e; return; }
   }
@@ -303,8 +304,12 @@ async function finishedAfterCentralDelete(gh: Octokit, app: RepoRef, uapp: Unins
       if ((e as { code?: unknown } | null)?.code !== 'ENOENT') throw new UninstallError(`pipegen deleted ${full} in its last run, but it couldn't remove ${p}: remove it by hand, and ${progress.path} too.`, { cause: e });
     }
   }
+  // V6-R4 M1: what the last run left besides central itself is named here: the progress file that held it goes now
+  const centralWhat = `repo ${central.owner}/${central.repo}`;
+  const left = (st?.leftovers ?? []).filter((x) => x.what !== centralWhat);
   progress.remove();
-  throw new UninstallFinished(`pipegen deleted ${full} in its last run (GitHub now answers 404 for it), so the uninstall of ${show(`${app.owner}/${app.repo}`)} is finished. pipegen removed its local files${gone.length > 0 ? ` (${gone.map((g) => show(g, 300)).join(', ')})` : ''} and ${progress.path}.`);
+  const still = left.length === 0 ? '' : `\nStill yours to do (pipegen can't come back to them: the install record is gone):\n${left.slice(0, 50).map((x) => `  - ${show(x.what, 200)}: ${show(x.why, 300)}${x.manual === undefined ? '' : `\n    ${show(x.manual, 300)}`}`).join('\n')}${left.length > 50 ? `\n  - and ${left.length - 50} more` : ''}`;
+  throw new UninstallFinished(`pipegen deleted ${full} in its last run (GitHub now answers 404 for it), so the uninstall of ${show(`${app.owner}/${app.repo}`)} is finished. pipegen removed its local files${gone.length > 0 ? ` (${gone.map((g) => show(g, 300)).join(', ')})` : ''} and ${progress.path}.${still}`);
 }
 
 /** trustedPrevious's note, without the clause meant for deliver (uninstall writes no new record). */

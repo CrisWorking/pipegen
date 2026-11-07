@@ -1105,8 +1105,8 @@ export interface CentralDeleteResult {
   retry?: true;
   /** V6-R3: the step for the user when it is not the caller's usual one (an own branch to delete, a DELETE GitHub refused for good). */
   step?: string;
-  /** V6-R3 sec M1: the DELETE was sent and GitHub accepted it, but pipegen could not confirm the repo is gone. */
-  sent?: true;
+  /** V6-R4 Info 4: GitHub accepted the DELETE, but pipegen couldn't save that in its progress file. */
+  progressNotSaved?: true;
 }
 /** The README GitHub's `auto_init` writes for the repo pipegen creates (`# pipelines` and its description): nothing of the user's. */
 const AUTO_README = (desc: string): Set<string> => new Set([
@@ -1342,24 +1342,27 @@ export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: Inst
   if (again.prs.some((n) => !first.prs.includes(n))) return notDeleted(`${full} got a new pull request while pipegen asked, so it doesn't delete it; run pipegen again`, 'retry');
   if (again.own.join('\n') !== first.own.join('\n')) return notDeleted(`a branch of pipegen's in ${full} moved while pipegen asked, so it doesn't delete it; run pipegen again`, 'retry');
   io.beforeDelete?.();
-  try {
-    await api.sendRepoDelete(REPO_DELETE_GUARD, api.central);
-    io.deleteAccepted?.();   // hook-3: GitHub accepted it (2xx)
-  } catch (e) {
+  try { await api.sendRepoDelete(REPO_DELETE_GUARD, api.central); } catch (e) {
     if (e instanceof UninstallRefusal) throw e;
     hardStop(e);
     const s = statusOf(e);
     // V6-R3 spec I1: only a server error (5xx) or no answer may pass on a later run; a 4xx (the token can't delete it) won't
     if (s !== undefined && s < 500) {
-      return { ...notDeleted(`GitHub refused to delete ${full} (HTTP ${s}): this token can't delete it`), step: `pipegen checked ${full} holds nothing but its own. Delete it yourself in its Settings (General → Danger Zone) if you want it gone; pipegen can't delete it for you after this run.` };
+      // V6-R4 Info 6: say what pipegen couldn't read
+      const unreadNote = first.unread.length > 0 ? ` (it couldn't read ${first.unread.join(' or ')})` : '';
+      return { ...notDeleted(`GitHub refused to delete ${full} (HTTP ${s}): this token can't delete it`), step: `pipegen checked ${full} holds nothing but its own${unreadNote}. Delete it yourself in its Settings (General → Danger Zone) if you want it gone; pipegen can't delete it for you after this run.` };
     }
     return notDeleted(`GitHub refused to delete ${full}${s === undefined ? '' : ` (HTTP ${s})`}`, 'retry');
   }
+  // hook-3, V6-R4 Info 4: GitHub accepted it (2xx); a local failure to note that is not a refusal of the DELETE
+  let progressNotSaved = false;
+  try { io.deleteAccepted?.(); } catch { progressNotSaved = true; }
+  const noted = progressNotSaved ? { progressNotSaved: true as const } : {};
   try { await api.read('GET /repos/{owner}/{repo}', { ...cr }); } catch (e) {
     hardStop(e);
     const s = statusOf(e);
-    if (s === 404) return first.unread.length > 0 ? { deleted: true, unchecked: first.unread.map((x) => `${x} of ${full} (not read before the delete)`) } : { deleted: true };
-    return { ...notDeleted(`pipegen could not confirm that ${full} is gone after the delete (GitHub answered ${s === undefined ? 'nothing' : `HTTP ${s}`}); check it`, 'retry'), sent: true };
+    if (s === 404) return { deleted: true, ...noted, ...(first.unread.length > 0 ? { unchecked: first.unread.map((x) => `${x} of ${full} (not read before the delete)`) } : {}) };
+    return { ...notDeleted(`pipegen could not confirm that ${full} is gone after the delete (GitHub answered ${s === undefined ? 'nothing' : `HTTP ${s}`}); check it`, 'retry'), ...noted };
   }
-  return { ...notDeleted(`GitHub still shows ${full} after the delete`, 'retry'), sent: true };
+  return { ...notDeleted(`GitHub still shows ${full} after the delete`, 'retry'), ...noted };
 }

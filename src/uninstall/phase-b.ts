@@ -264,6 +264,8 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
       if (statusOf(e) === 404) throw new UninstallError(`pipegen can't see ${appRef.owner}/pipelines now (deleted, or this login has no access to it), where the preview read the install record, so it sent nothing. Check it on GitHub (and the token's access to it), then run \`pipegen uninstall\` again. Nothing was changed.`);
       throw e;
     }
+    // V6-R4 Info 2: GitHub shows central alive with the id a "delete sent" marker names: the marker is disproved, drop it
+    if (deleteSent !== undefined && isObj(repo) && repo.id === deleteSent.repoId) deleteSent = undefined;
     const def = isObj(repo) ? repo.default_branch : undefined;
     if (typeof def !== 'string') changed(`The central repo ${appRef.owner}/pipelines`);
     const head = (await api.read('GET /repos/{owner}/{repo}/git/ref/{ref}', { ...ref, ref: `heads/${String(def)}` })).data;
@@ -498,7 +500,7 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
       if (attempted && !accepted) { deleteSent = undefined; save(); }
     }
     if (res.deleted) {
-      r.done.push(`${what}: deleted`);
+      r.done.push(`${what}: deleted${res.progressNotSaved === true ? ', but the progress file could not be saved' : ''}`);
       // V6-R3 sec M1: what was left inside central went with it (GitHub answered 404 after the DELETE)
       const inRepo = new Set(c.inRepo ?? []);
       for (const f of r.failed.filter((x) => inRepo.has(x.what))) r.done.push(`${f.what}: went with the repo`);
