@@ -190,6 +190,16 @@ describe('V6-R1: the second run 2 in production (spec I1)', () => {
     const e = await setup();
     e.w.merged.clear();
     await expect(e.load()).rejects.toBeInstanceOf(UninstallError);
+    // the merged PR went onto another branch than central's default one: stop
+    const g = await setup();
+    const gp = g.w.central.pulls.find((p) => p.head === BR)!;
+    gp.base = 'release';
+    await expect(g.load()).rejects.toThrow(/No install record/);
+    // the progress file is not at stage B (run 2 never began): "no install record"
+    const k = await setup();
+    const kf = await ProgressFile.open(APP, k.w.app.id, local(k.w));
+    kf.save({ ...kf.state!, phase: 'A-done' });
+    await expect(k.load()).rejects.toThrow(/No install record/);
     // not at stage B (no progress file): "no install record"
     const f = await setup();
     (await ProgressFile.open(APP, f.w.app.id, local(f.w))).remove();
@@ -248,6 +258,11 @@ describe('V6-R1: the central branches (sec M1, M2)', () => {
     await run(c.w, c.rec, tc, { deleteRepos: true, canDeleteRepos: true });
     expect(c.w.deleted).toEqual(['o/pipelines']);
     expect(tc.typed.some((q) => /Type pipelines to go on/.test(q) && /pipegen\/update-shop/.test(q) && /pipegen\/uninstall-shop/.test(q))).toBe(true);
+    // a commit lands on pipegen's update branch while pipegen asks: not deleted
+    const m = await setup();
+    const tm = term({ type: (_q, exp) => { if (exp === 'pipelines') m.w.g.commitOn('o/pipelines', 'pipegen/update-shop', { 'later.txt': 'x\n' }, 'later'); return exp; } });
+    await run(m.w, m.rec, tm, { deleteRepos: true, canDeleteRepos: true });
+    expect(m.w.deleted).toEqual([]);
     // another branch still keeps it
     const d = await setup();
     d.w.central.refs.set('heads/team', d.w.g.head('o/pipelines'));
@@ -376,6 +391,17 @@ describe('V6-R1: central now (sec M4, M5, spec M2, M5)', () => {
     const pr = w.central.pulls[0]!;
     pr.base = 'release';
     expect((await centralNow(readApi(w), APP, w.central.id))?.pr?.merged).toBe(false);
+
+    // the record gone from central, but the merged PR went onto another branch: the re-check stops, nothing sent
+    const y = world();
+    await afterRun1(y);
+    y.g.commitOn('o/pipelines', 'main', { [recordPath('shop')]: null }, 'gone');
+    y.central.refs.set(`heads/${BR}`, y.g.head('o/pipelines'));
+    y.central.pulls.push({ number: 3, head: BR, base: 'release', title: 't', body: '', state: 'closed', html_url: 'https://github.com/o/pipelines/pull/3' });
+    y.merged.set('pipelines#3', AT);
+    const ny = y.g.calls.length;
+    await expect(run(y, sampleRecord(y))).rejects.toBeInstanceOf(UninstallError);
+    expect(y.g.calls.slice(ny).filter((c) => !c.route.startsWith('GET '))).toEqual([]);
 
     // a merged central PR of an earlier uninstall, and the record back in central (installed again): not done, the record stays
     const x = world();
