@@ -2046,7 +2046,7 @@ tools:
       name: "pipegen-gate"
       kind: action
       repo: crisworking/pipegen
-      version: "0.2.2"
+      version: "0.2.3"
       pin: { sha: "76b6c257d94d649993c4709a39bf4a3f7399f0c8" }
       source: reviewed
       reviewed: true

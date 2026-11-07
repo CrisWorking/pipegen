@@ -9674,7 +9674,7 @@ async function findGatedRun(gh0, repo2, sha3, o) {
 import { createHash as createHash7 } from "node:crypto";
 
 // gate/src/generated/gate-view.ts
-var GATE_VERSION = "0.2.2";
+var GATE_VERSION = "0.2.3";
 var GATE_VIEW = [
   {
     "id": "actions-checkout",

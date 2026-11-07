@@ -89,7 +89,7 @@ describe('C6: the pipegen-gate reviewed entry', () => {
   it('the renderer accepts the real entry exactly as it accepts the fixture (same uses path, no inputs)', () => {
     const a = renderScrub('pipegen-out-sast--app', '${{ runner.temp }}/pipegen-raw/pipegen-out-sast--app/semgrep.sarif', 'semgrep', 'sarif', real());
     const b = renderScrub('pipegen-out-sast--app', '${{ runner.temp }}/pipegen-raw/pipegen-out-sast--app/semgrep.sarif', 'semgrep', 'sarif', gateEntry());
-    // the uses comment names each entry's own tag (the fixture stays at gate-v0.2.0; the real entry is gate-v0.2.2 since E9)
+    // the uses comment names each entry's own tag (the fixture stays at gate-v0.2.0; the real entry is gate-v0.2.3 since G15b)
     expect({ ...a, uses: a.uses?.split('@')[0], usesComment: '' }).toEqual({ ...b, uses: b.uses?.split('@')[0], usesComment: '' });
     expect(a.usesComment).toBe(`gate-v${real().candidate.version}`);
     expect(b.usesComment).toBe(`gate-v${gateEntry().candidate.version}`);
@@ -132,7 +132,7 @@ describe('C6 fix round 1: the cooldown skips the AGE rule for pipegen\'s own rep
     expect(PIPEGEN_GATE_USES.startsWith(`${PIPEGEN_OWN_REPO}/`)).toBe(true);
   });
   it('the entry\'s version is a bare semver (the tag is gate-v<version>)', () => {
-    expect(real().candidate.version).toBe('0.2.2');   // gate-v0.2.2 (E9; gate-v0.2.1 was D9); the version is bundle content (GATE_VERSION), so it changes before the tag
+    expect(real().candidate.version).toBe('0.2.3');   // gate-v0.2.3 (G15b; gate-v0.2.2 was E9, gate-v0.2.1 D9); the version is bundle content (GATE_VERSION), so it changes before the tag
   });
   it('tag == pin passes with no age check and no release lookup (pre-merge mode: no default-branch check)', async () => {
     const r = await run(onlyGate(), tagRoute());
