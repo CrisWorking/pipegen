@@ -24,7 +24,7 @@ import { unlinkSync } from 'node:fs';
 import type { Octokit } from '@octokit/rest';
 import type { Prompter } from '../cli/io.js';
 import { DeliverError, statusOf, type RepoRef } from '../deliver/git-data.js';
-import { localFinishPendingPath, localRecordPath, readLocalLeftovers, type Leftover } from '../deliver/record.js';
+import { localFinishPendingPath, localRecordPath, readLocalLeftovers, readLocalRecord, type Leftover } from '../deliver/record.js';
 import { isRateStop } from '../engine/github-rate.js';
 import { GitHubAccessError } from '../github/client.js';
 import { assertScratch, githubRead, proofTarget, ProofStopError, SCRATCH_MARKER, ScratchGuardError, validBranchName, type GuardedRepo } from '../proof/target.js';
@@ -479,13 +479,24 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
     }
     // V6-R1 sec M2: pipegen's own central branches go with the repo, inside deleteCentralRepo (named in its question): never before it
     let res;
-    const sent = (): void => { deleteSent = rec.central?.repoId ?? loaded.centralRepoId; save(); };
-    try { res = await api.removeCentralRepo(rec, known, sent); } catch (e) {
-      hardStop(e);
-      r.failed.push({ what, why: reasonOf(e), manual: 'Run `pipegen uninstall --delete-repos` again.' });
-      return;
+    // V6-R3 sec M1, hook-3: the marker is pending right before the DELETE, confirmed only once GitHub accepts it; any other way out clears it
+    const vouched = await readLocalRecord(appRef, ctx.deps.local ?? {}).catch(() => null);
+    let attempted = false;
+    let accepted = false;
+    const repoId = rec.central?.repoId ?? loaded.centralRepoId;
+    const marker = vouched === null ? undefined : {
+      beforeDelete: () => { attempted = true; deleteSent = { repoId, recordHash: vouched.recordHash, confirmed: false }; save(); },
+      deleteAccepted: () => { accepted = true; deleteSent = { repoId, recordHash: vouched.recordHash, confirmed: true }; save(); },
+    };
+    try {
+      try { res = await api.removeCentralRepo(rec, known, marker); } catch (e) {
+        hardStop(e);
+        r.failed.push({ what, why: reasonOf(e), manual: 'Run `pipegen uninstall --delete-repos` again.' });
+        return;
+      }
+    } finally {
+      if (attempted && !accepted) { deleteSent = undefined; save(); }
     }
-    if (!res.deleted && res.sent !== true && deleteSent !== undefined) { deleteSent = undefined; save(); }   // GitHub refused it: no marker
     if (res.deleted) {
       r.done.push(`${what}: deleted`);
       // V6-R3 sec M1: what was left inside central went with it (GitHub answered 404 after the DELETE)

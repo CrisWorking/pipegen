@@ -29,6 +29,7 @@ import { confirmView, TYPED_VIEW_FIELDS, trustedPrevious } from '../deliver/trus
 import type { InstallRecord } from '../types.js';
 import { safeText } from '../util/safe-text.js';
 import { UninstallError, UninstallFinished } from './errors.js';
+import { githubRead } from '../proof/target.js';
 import { ProgressFile } from './progress.js';
 
 /** The app repo as GitHub reports it now (readRepo), never as the record says. */
@@ -275,10 +276,21 @@ async function fromRun2Blob(
  * and the progress file are removed, and UninstallFinished says so. A leftovers file that still lists something keeps them all (a stop
  * naming it). Not this case: returns, and the usual stop follows.
  */
-async function finishedAfterCentralDelete(app: RepoRef, uapp: UninstallApp, central: RepoRef, deps: UninstallDeps): Promise<void> {
+async function finishedAfterCentralDelete(gh: Octokit, app: RepoRef, uapp: UninstallApp, central: RepoRef, deps: UninstallDeps, clock: RateClock): Promise<void> {
   const progress = await ProgressFile.open(app, uapp.repoId, deps.local ?? {});
   const st = progress.state;
-  if (st === null || st.phase !== 'B' || st.centralDeleteSent === undefined) return;
+  const sent = st?.phase === 'B' ? st.centralDeleteSent : undefined;
+  if (sent === undefined || !sent.confirmed) return;
+  // hook-2: the marker belongs to this machine's local record file (the same install), and GitHub answers 404 for that exact repo id. The
+  // owner is still seen: the app repo of the same owner was read just before (a 404 for central alone may be lost access, not gone).
+  const vouched = await readLocalRecord(app, deps.local ?? {}).catch(() => null);
+  if (vouched === null || vouched.recordHash !== sent.recordHash) return;
+  try {
+    await githubRead(gh, 'GET /repositories/{repository_id}', { repository_id: sent.repoId }, clock);
+    return;   // GitHub still has that repo: hidden from this token, not gone
+  } catch (e) {
+    if (statusOf(e) !== 404) { if (isRateStop(e) || e instanceof GitHubAccessError) throw e; return; }
+  }
   const full = show(`${central.owner}/${central.repo}`);
   const leftovers = await readLocalLeftovers(app, deps.local ?? {}).catch(() => null);
   const lf = localRecordPath(app, deps.local ?? {}).replace(/\.json$/, '.leftovers.json');
@@ -333,7 +345,7 @@ async function load(gh: Octokit, app: RepoRef, deps: UninstallDeps): Promise<Loa
   const centralName = show(`${central.owner}/${central.repo}`);
   const c = await readRepo(gh, central, clock);
   if (c === null) {
-    await finishedAfterCentralDelete(app, uapp, central, deps);
+    await finishedAfterCentralDelete(gh, app, uapp, central, deps, clock);
     throw new UninstallError(`${none} (pipegen can't see ${centralName}, where it keeps its install records.)`);
   }
   if (!c.private) throw new UninstallError(`${centralName} is public; pipegen keeps install records only in a private one, so it won't act on a record there. Nothing was changed.`);

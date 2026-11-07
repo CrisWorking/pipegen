@@ -1133,7 +1133,7 @@ const listed = (xs: readonly unknown[]): string => `${xs.slice(0, MAX_LISTED).ma
  * never deleted before it, so a declined or refused delete keeps them). `dryRun` (V6-R1 sec I1, token mode): the same checks, read only;
  * `{ deleted: false, ready: true, prs, unchecked }` when they pass, nothing asked and nothing sent.
  */
-export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: InstallRecord, io: { askName: AskName; clock?: RateClock; prAuthor?: string; dryRun?: true; knownHeads?: Readonly<Record<string, string>>; beforeDelete?: () => void }): Promise<CentralDeleteResult> {
+export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: InstallRecord, io: { askName: AskName; clock?: RateClock; prAuthor?: string; dryRun?: true; knownHeads?: Readonly<Record<string, string>>; beforeDelete?: () => void; deleteAccepted?: () => void }): Promise<CentralDeleteResult> {
   const owner = rec?.app?.owner;
   if (central?.repo !== CENTRAL_REPO || typeof owner !== 'string' || central.owner !== owner) refuse(`${show(`${central?.owner}/${central?.repo}`)} is not the central repo of ${show(String(owner))}.`);
   const c = rec.central;
@@ -1342,7 +1342,10 @@ export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: Inst
   if (again.prs.some((n) => !first.prs.includes(n))) return notDeleted(`${full} got a new pull request while pipegen asked, so it doesn't delete it; run pipegen again`, 'retry');
   if (again.own.join('\n') !== first.own.join('\n')) return notDeleted(`a branch of pipegen's in ${full} moved while pipegen asked, so it doesn't delete it; run pipegen again`, 'retry');
   io.beforeDelete?.();
-  try { await api.sendRepoDelete(REPO_DELETE_GUARD, api.central); } catch (e) {
+  try {
+    await api.sendRepoDelete(REPO_DELETE_GUARD, api.central);
+    io.deleteAccepted?.();   // hook-3: GitHub accepted it (2xx)
+  } catch (e) {
     if (e instanceof UninstallRefusal) throw e;
     hardStop(e);
     const s = statusOf(e);
