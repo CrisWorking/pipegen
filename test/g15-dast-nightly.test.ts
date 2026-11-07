@@ -4,9 +4,7 @@
 // app in containers, the scan, the raw hand-off) and dast--<svc> (the sha256 check, the scrub, the upload). code-scanning-dast downloads
 // each scrubbed result and uploads it to code scanning. Reported, never gated. Its format is the real nuclei 3.11.1 SARIF
 // (test/fixtures/sarif/nuclei.sarif, captured from the pinned binary; gate/src/sarif.ts SARIF_TOOLS.nuclei).
-// ZAP's active scan (an Automation Framework plan) is NOT run: its report can not be taken from the pinned zap-stable image offline (no image,
-// no source here then; round 5 verified the reader and wrote the plan, src/engine/zap-active.ts, but not its run job). It stays refused
-// (fail closed), with a note, until its run job, code-scanning form and referee rules exist.
+// Round 6: ZAP's active scan (an Automation Framework plan) runs nightly too, in its own pair beside nuclei (test/g15-zap-nightly.test.ts).
 import { describe, expect, it } from 'vitest';
 import { DAST_HANDOFF_STEP_ID, dastCheckStepId, dastRawArtifact, DAST_UPLOAD_JOB, dastNightlyCategory, NIGHTLY_WORKFLOW } from '../src/engine/job-rules.js';
 import { nightlyDastSpec, NIGHTLY_DAST_TOOL } from '../src/engine/dast-handoff.js';
@@ -84,7 +82,8 @@ describe('G15a round 4 (b3): the nightly DAST scan', () => {
     expect(sc?.with).toMatchObject({ artifact: 'pipegen-out-dast--app', tool: 'nuclei', format: 'sarif', raw: '${{ runner.temp }}/pipegen-raw/pipegen-out-dast--app/nuclei.sarif' });
     const up = a.nightly[DAST_UPLOAD_JOB] as Job;
     expect(DAST_UPLOAD_JOB).toBe('code-scanning-dast');
-    expect(up.needs).toEqual(['dast--app']);
+    // round 6: the ZAP AF active scan's scrub job beside nuclei's (test/g15-zap-nightly.test.ts)
+    expect(up.needs).toEqual(['dast--app', 'zap-active--app']);
     expect(up.permissions).toEqual({ contents: 'read', 'security-events': 'write', actions: 'read' });
     const dl = up.steps.find((s) => /download-artifact/.test(String(s.uses)));
     expect(dl?.with?.name).toBe('pipegen-out-dast--app');
@@ -94,8 +93,8 @@ describe('G15a round 4 (b3): the nightly DAST scan', () => {
     // never gated: the merge file's gate does not read the nightly scan, and the nightly file has no gate
     expect(JSON.stringify(a.merge)).not.toMatch(/code-scanning-dast|pipegen-dast-nightly/);
     expect(a.nightly.gate).toBeUndefined();
-    // ZAP's active scan is refused, with a plain note
-    expect(a.notes.join('\n')).toMatch(/ZAP's active scan is not run nightly yet\. Nuclei scans the app nightly instead\./);
+    // round 6: ZAP's active scan runs nightly too (its own pair), so no refusal note
+    expect(a.notes.join('\n')).not.toMatch(/ZAP's active scan is not run nightly/);
     expect(shown(await judge(fs, a.draft))).toBe('');
   });
 
@@ -106,14 +105,14 @@ describe('G15a round 4 (b3): the nightly DAST scan', () => {
       expect(a.nightly[`dast--${s}`], s).toBeDefined();
     }
     const up = a.nightly[DAST_UPLOAD_JOB] as Job;
-    expect(up.needs).toEqual(['dast--api', 'dast--web']);
-    expect(up.steps.filter((s) => /upload-sarif/.test(String(s.uses))).map((s) => s.with?.category)).toEqual([dastNightlyCategory('api'), dastNightlyCategory('web')]);
+    expect(up.needs).toEqual(['dast--api', 'zap-active--api', 'dast--web', 'zap-active--web']);
+    expect(up.steps.filter((s) => /upload-sarif/.test(String(s.uses))).map((s) => s.with?.category)).toEqual([dastNightlyCategory('api'), dastNightlyCategory('api', 'zap-active'), dastNightlyCategory('web'), dastNightlyCategory('web', 'zap-active')]);
     expect(shown(await judge(fs, a.draft))).toBe('');
   });
 
   it('assemble: without code scanning nothing would report the nightly DAST scan, so it is not written and a note says so', () => {
     const { a } = world({ ...CAPS, codeScanning: false }, [web()], true);
-    expect(Object.keys(a.nightly).filter((k) => k.startsWith('dast') || k === DAST_UPLOAD_JOB)).toEqual([]);
+    expect(Object.keys(a.nightly).filter((k) => k.startsWith('dast') || k.startsWith('zap-active') || k === DAST_UPLOAD_JOB)).toEqual([]);
     expect(a.notes.join('\n')).toMatch(/The nightly DAST scan is not run: it reports through code scanning, which this repository does not have\./);
   });
 

@@ -63,10 +63,10 @@ import { egressSetsForTool, renderEgressStep, SHARED_CDN_SETS, type EgressSet } 
 import { gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES } from '../engine/gate-job-list.js';
 import { SKIPPED_PART_NEEDS } from '../engine/gate-inputs.js';
 import { ARCHIVE_TOOL_IDS, renderImageArchiveScan, renderImageBuild } from '../engine/image-handoff.js';
-import { dastStartOf, nightlyDastSpec, NIGHTLY_DAST_TOOL, renderDastRun, renderDastScrub, ZAP_ACTIVE_REFUSED_NOTE, type DastStart } from '../engine/dast-handoff.js';
+import { dastStartOf, nightlyDastSpec, NIGHTLY_DAST_TOOL, renderDastRun, renderDastScrub, zapActiveNotRunNote, zapActiveSpec, ZAP_ACTIVE_LANE, ZAP_ACTIVE_TOOL, type DastStart } from '../engine/dast-handoff.js';
 import {
   BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, dastRunJobId, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, IMAGE_BUILD_NEED, imageBuildJobId, isReviewed,
-  isScrubStep, jobOutputsFor, CODE_SCANNING_JOB, DAST_UPLOAD_JOB, dastNightlyCategory, dastResultArtifact, HISTORY_UPLOAD_JOB, SECRETS_HISTORY_CATEGORY, SECRETS_HISTORY_JOB, NIGHTLY_CONCURRENCY, NO_SCANS, SCORECARD_IF, SCORECARD_JOB, ZIZMOR_ONLINE_JOB, renderRangeFetchStep, type RenderedStep, type ScanFact,
+  isScrubStep, jobOutputsFor, CODE_SCANNING_JOB, DAST_UPLOAD_JOB, dastLaneOf, dastNightlyCategory, dastResultArtifact, type DastLane, HISTORY_UPLOAD_JOB, SECRETS_HISTORY_CATEGORY, SECRETS_HISTORY_JOB, NIGHTLY_CONCURRENCY, NO_SCANS, SCORECARD_IF, SCORECARD_JOB, ZIZMOR_ONLINE_JOB, renderRangeFetchStep, type RenderedStep, type ScanFact,
 } from '../engine/job-rules.js';
 import { NEED_ID_CATEGORY, SCHEDULED_CATEGORIES } from '../engine/need-ids.js';
 import { MINIMUM_CATEGORIES, NO_HOOKS_CI_MANAGERS, NO_IMAGE_CATEGORIES, noImageServices, riskyTriggersOf, WORKFLOW_LINT_EXTRA, WORKFLOW_LINT_TOOL, workflowLintTools } from '../engine/needs.js';
@@ -373,7 +373,7 @@ function imageScanJob(c: Ctx, spec: StepSpec): Job {
 function dastJobs(c: Ctx, spec: StepSpec, start: DastStart, blocking: boolean = blocks(c.draft, spec.needId, spec.service)): { run: Job; scrub: Job } {
   const service = spec.service as string;
   const t = toolOf(c, spec.tool.id);
-  const runId = dastRunJobId(service);
+  const runId = dastRunJobId(service, dastLaneOf(spec.needId));
   const checkout = start.kind === 'compose' ? renderJobPrelude({}, c.deps.platform).steps : [];
   const r = renderDastRun(spec, t, c.deps.platform, c.draft, start, { blocking, checkout });
   // the containers and the scanner's own hosts; the app's container is reached over the Docker networks (published on 127.0.0.1)
@@ -711,45 +711,66 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
 
   // G15a round 4 (b3, P-4): the nightly DAST scan. For each app the merge layer scans (a merge DAST check with a container start), nuclei with
   // its pinned templates in the same key-free run job and scrub job, then code-scanning-dast uploads every scrubbed result. Reported, never
-  // gated (rendered as blocking, so no narrowing value). ZAP's active scan stays refused: its report is not verified. No code scanning: not written
+  // gated (rendered as blocking, so no narrowing value). No code scanning: not written. Round 6: the ZAP AF active scan beside it, in its own
+  // pair (zap-active-run--<svc>, zap-active--<svc>); when it can not be written, nuclei still runs and a note says so
   const nightlyDast = [...starts].filter(([s]) => draft.steps.includes(s) && draft.needs.some((n) => n.layer === 'merge' && n.id === s.needId && n.service === s.service));
   if (nightlyDast.length > 0 && !codeSecurityAvailable(draft.profile, draft.capabilities)) {
     addNote(notes, 'The nightly DAST scan is not run: it reports through code scanning, which this repository does not have.');
   } else if (nightlyDast.length > 0) {
     try {
       const nuclei = toolOf(c, NIGHTLY_DAST_TOOL);
-      const pairs: Record<string, Job> = {};
-      const uploads: RenderedStep[] = [];
-      const scrubIds: string[] = [];
-      for (const [spec, start] of nightlyDast) {
-        const service = spec.service as string;
-        if (Object.hasOwn(pairs, dastRunJobId(service))) continue;
-        const ns = nightlyDastSpec(spec, nuclei);
-        const jobs = dastJobs(c, ns, start, true);
+      const af = c.byId.get(ZAP_ACTIVE_TOOL);
+      let afProblem: string | null = af === undefined || !isReviewed(af.candidate) ? 'the reviewed list has no reviewed ZAP AF entry.' : null;
+      // one lane's pair for a service: its jobs (with the archive start's image build), its scrub job id, the download and upload of its result
+      type Part = { lane: DastLane; jobs: Record<string, Job>; scrubId: string; uploads: RenderedStep[] };
+      const partOf = (ns: StepSpec, start: DastStart, label: string): Part => {
+        const service = ns.service as string;
+        const lane = dastLaneOf(ns.needId);
+        const pair = dastJobs(c, ns, start, true);
         const id = jobIdFor(ns.needId, service);
+        const jobs: Record<string, Job> = {};
         // the archive start reads the image this run builds: the nightly file builds it too (the same image-build job, no push)
-        for (const need of jobs.run.needs ?? []) {
+        for (const need of pair.run.needs ?? []) {
           const b = builds.get(service);
           if (need !== imageBuildJobId(service) || b === undefined) return fail(`The nightly DAST scan of ${show(service)} needs ${show(need)}, which the nightly file does not build.`);
-          pairs[need] = b;
+          jobs[need] = b;
         }
-        pairs[dastRunJobId(service)] = jobs.run;
-        pairs[id] = jobs.scrub;
-        scrubIds.push(id);
-        const artifact = dastResultArtifact(service);
+        jobs[dastRunJobId(service, lane)] = pair.run;
+        jobs[id] = pair.scrub;
+        const artifact = dastResultArtifact(service, lane);
         const scrubbed = `\${{ runner.temp }}/pipegen-out/${artifact}`;
-        const file = (nuclei.step.output.path.split('/').pop() as string);
-        uploads.push(
-          { ...renderPlatformStep('download-artifact', deps.platform, { name: artifact, path: scrubbed }), name: `Download the scrubbed nightly DAST result of ${slug(service)}` },
-          { ...renderPlatformStep('upload-sarif', deps.platform, { sarif_file: `${scrubbed}/${file}`, category: dastNightlyCategory(service) }), name: `Upload the nightly DAST result of ${slug(service)} to code scanning` },
-        );
+        const file = (ns.output.path.split('/').pop() as string);
+        return { lane, jobs, scrubId: id, uploads: [
+          { ...renderPlatformStep('download-artifact', deps.platform, { name: artifact, path: scrubbed }), name: `Download the scrubbed nightly ${label} result of ${slug(service)}` },
+          { ...renderPlatformStep('upload-sarif', deps.platform, { sarif_file: `${scrubbed}/${file}`, category: dastNightlyCategory(service, lane) }), name: `Upload the nightly ${label} result of ${slug(service)} to code scanning` },
+        ] };
+      };
+      const parts: Part[] = [];
+      const done = new Set<string>();
+      for (const [spec, start] of nightlyDast) {
+        const service = spec.service as string;
+        if (done.has(dastRunJobId(service))) continue;
+        done.add(dastRunJobId(service));
+        parts.push(partOf(nightlyDastSpec(spec, nuclei), start, 'DAST'));
+        // round 6: the ZAP AF active scan of the same app, in its own lane; a refusal keeps nuclei and says why (the AF lane is all or nothing)
+        if (af === undefined || afProblem !== null) continue;
+        try {
+          parts.push(partOf(zapActiveSpec(spec, af), start, 'ZAP active scan'));
+        } catch (e) {
+          if (!(e instanceof RenderError || e instanceof ArtifactNameError || e instanceof AssembleError)) throw e;
+          afProblem = safeText(e.message, 200);
+        }
       }
+      const kept = parts.filter((x) => afProblem === null || x.lane !== ZAP_ACTIVE_LANE);
+      if (afProblem !== null) addNote(notes, zapActiveNotRunNote(afProblem));
+      const pairs: Record<string, Job> = Object.assign({}, ...kept.map((x) => x.jobs)) as Record<string, Job>;
+      const uploads = kept.flatMap((x) => x.uploads);
+      const scrubIds = kept.map((x) => x.scrubId);
       Object.assign(nightly, pairs);
       nightly[DAST_UPLOAD_JOB] = {
         'runs-on': JOB_RUNNER, 'timeout-minutes': JOB_MINUTES, needs: scrubIds, permissions: { contents: 'read', 'security-events': 'write', actions: 'read' }, 'cache-mode': 'none',
         steps: [egressStepFor([], { userSecret: false, dockerNetworks: false, job: DAST_UPLOAD_JOB }), ...uploads],
       };
-      addNote(notes, ZAP_ACTIVE_REFUSED_NOTE);
     } catch (e) {
       if (!(e instanceof RenderError || e instanceof ArtifactNameError || e instanceof AssembleError)) throw e;
       addNote(notes, `The nightly DAST scan is not run: ${safeText(e.message, 200)}`);

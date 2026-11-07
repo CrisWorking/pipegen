@@ -327,7 +327,7 @@ const isCheckout = (s: RenderedStep): boolean => s.run === undefined && s.uses !
 const SCRUB_INPUTS = ['artifact', 'tool', 'format', 'raw', 'out', 'fp-key'] as const;
 /** The ids a scan step of a result can have: the tool's run step, named by the hash of its artifact. */
 /** The DAST result a hash-check step id stands for (G4-R1), or undefined. */
-const dastCheckFor = (id: string): string | undefined => { const m = DAST_CHECK_ID_RE.exec(id); return m === null ? undefined : resultArtifactName('dast', m[1] as string); };
+const dastCheckFor = (id: string): string | undefined => { const m = DAST_CHECK_ID_RE.exec(id); return m === null ? undefined : resultArtifactName(m[1] as DastLane, m[2] as string); };
 const scanIdsOf = (artifact: string): string[] => [`tool-run-${sha16(artifact)}`, `checker-run-${sha16(artifact)}`];
 
 /**
@@ -497,7 +497,8 @@ export const ZIZMOR_ONLINE_JOB = 'workflow-lint-online';
  * to code scanning, one category per service. Reported, never gated.
  */
 export const DAST_UPLOAD_JOB = 'code-scanning-dast';
-export const dastNightlyCategory = (service: string): string => `pipegen-dast-nightly--${slug(service)}`;
+/** The code-scanning category of a nightly DAST result: `pipegen-dast-nightly--<svc>` (nuclei), `pipegen-zap-active-nightly--<svc>` (ZAP AF). */
+export const dastNightlyCategory = (service: string, lane: DastLane = 'dast'): string => `pipegen-${lane}-nightly--${slug(service)}`;
 /** G15a round 3 (PF-3): the reviewed tools whose result a scrub reads but that run as a docker step (no argv policy): Scorecard. */
 export const SCRUB_ONLY_TOOLS: ReadonlySet<string> = new Set(['scorecard-action']);
 /** A `docker://<image>@sha256:<64 hex>` uses of an image in DOCKER_STEP_IMAGES (the shape only; the referee checks the reviewed digest). */
@@ -711,30 +712,45 @@ const isImageArchiveStep = (s: RenderedStep): boolean => s.id === IMAGE_ARCHIVE_
 // against that output before anything reads it, scrubs and uploads the result. The fingerprint key is in the scrub only (render-step.ts),
 // so it never reaches a job that runs the app.
 
+/**
+ * G15a round 6: the DAST lanes. `dast`: the merge layer's DAST check, and nightly nuclei in the same pair (dast-run--<svc>, dast--<svc>);
+ * `zap-active`: the nightly ZAP AF active scan in a pair of its own (zap-active-run--<svc>, zap-active--<svc>), with its own raw and result
+ * artifacts, hash-check step and category, so the two nightly scans of one service never share an artifact of the run. The lane id is the
+ * need id of the lane's spec (dast-handoff.ts zapActiveSpec), so the renderer's artifact name and the lane's agree. No need is called
+ * zap-active: the gate's job list never names it.
+ */
+export type DastLane = 'dast' | 'zap-active';
+export const ZAP_ACTIVE_LANE = 'zap-active' satisfies DastLane;
+/** The lane of a DAST spec, by its need id. */
+export const dastLaneOf = (needId: string): DastLane => (needId === ZAP_ACTIVE_LANE ? ZAP_ACTIVE_LANE : 'dast');
 /** The run job of a service's DAST check, and its slug. */
 export const DAST_RUN = 'dast-run';
-export const dastRunJobId = (service: string): string => `${DAST_RUN}--${slug(service)}`;
-const DAST_RUN_JOB_RE = /^dast-run--([a-z0-9][a-z0-9-]{0,39})$/;
-export const dastRunSlugOf = (jobId: string | undefined): string | null => {
+const runHead = (lane: DastLane): string => `${lane}-run`;
+export const dastRunJobId = (service: string, lane: DastLane = 'dast'): string => `${runHead(lane)}--${slug(service)}`;
+const DAST_RUN_JOB_RE = /^(dast|zap-active)-run--([a-z0-9][a-z0-9-]{0,39})$/;
+/** The lane and service slug of a DAST run job id (either lane), or null. */
+export const dastRunOf = (jobId: string | undefined): { lane: DastLane; slug: string } | null => {
   const m = jobId === undefined ? null : DAST_RUN_JOB_RE.exec(jobId);
   if (m === null) return null;
-  try { return slug(m[1] as string) === m[1] ? (m[1] as string) : null; } catch { return null; }
+  try { return slug(m[2] as string) === m[2] ? { lane: m[1] as DastLane, slug: m[2] as string } : null; } catch { return null; }
 };
-/** The raw hand-off artifact (not a check's result: no need is called dast-raw, so the gate never reads it). */
+export const dastRunSlugOf = (jobId: string | undefined): string | null => dastRunOf(jobId)?.slug ?? null;
+/** The raw hand-off artifact (not a check's result: no need is called dast-raw or zap-active-raw, so the gate never reads it). */
 export const DAST_RAW_ID = 'dast-raw';
-export const dastRawArtifact = (service: string): string => resultArtifactName(DAST_RAW_ID, service);
+export const dastRawArtifact = (service: string, lane: DastLane = 'dast'): string => resultArtifactName(`${lane}-raw`, service);
 /** The DAST check's own result artifact (the scrub's). */
-export const dastResultArtifact = (service: string): string => resultArtifactName('dast', service);
+export const dastResultArtifact = (service: string, lane: DastLane = 'dast'): string => resultArtifactName(lane, service);
 /** The hand-off step of a run job (one per job) and its output. */
 export const DAST_HANDOFF_STEP_ID = 'pipegen-dast-handoff';
 export const DAST_RAW_SHA_OUTPUT = 'raw-sha256';
 const DAST_RAW_SHA_VALUE = stepOutputForm(DAST_HANDOFF_STEP_ID, 'sha256');
 const isDastHandoffStep = (s: RenderedStep): boolean => s.id === DAST_HANDOFF_STEP_ID && typeof s.run === 'string' && s.uses === undefined;
 /** The scrub job's hash check of the downloaded raw result: its id names the service, its one expression is that run job's output. */
-export const dastCheckStepId = (service: string): string => `pipegen-dast-check--${slug(service)}`;
-export const DAST_CHECK_ID_RE = /^pipegen-dast-check--([a-z0-9][a-z0-9-]{0,39})$/;
+export const dastCheckStepId = (service: string, lane: DastLane = 'dast'): string => `pipegen-${lane}-check--${slug(service)}`;
+/** Group 1: the lane, group 2: the service slug. */
+export const DAST_CHECK_ID_RE = /^pipegen-(dast|zap-active)-check--([a-z0-9][a-z0-9-]{0,39})$/;
 export const DAST_RAW_SHA_ENV = 'PIPEGEN_DAST_RAW_SHA256';
-export const dastRawShaRef = (slugged: string): string => `\${{ needs.${DAST_RUN}--${slugged}.outputs.${DAST_RAW_SHA_OUTPUT} }}`;
+export const dastRawShaRef = (slugged: string, lane: DastLane = 'dast'): string => `\${{ needs.${runHead(lane)}--${slugged}.outputs.${DAST_RAW_SHA_OUTPUT} }}`;
 /** The step that starts the app from its checked image archive (repo code, in a container only). */
 export const dastAppStepId = (service: string): string => `repocode-${sha16(`dast-app:${slug(service)}`)}`;
 /** The compose-up and runtime-env step ids (render-step.ts renderComposeUp / renderRuntimeEnv; spelled here, render-step imports this file). */
@@ -750,8 +766,9 @@ const RUNTIME_ENV_ID_RE = /^runtime-env-[0-9a-f]{16}$/;
  * starts, or null (the job is then held to the order rule as usual, which refuses a scanner after the app start).
  */
 function dastRunTailAt(steps: readonly RenderedStep[], jobId: string | undefined): number | null {
-  const s = dastRunSlugOf(jobId);
-  if (s === null || steps.some(isScrubStep)) return null;
+  const rj = dastRunOf(jobId);
+  if (rj === null || steps.some(isScrubStep)) return null;
+  const { slug: s, lane } = rj;
   if (JSON.stringify(steps).match(/secrets\.|github\.token/) !== null) return null;
   const k = steps.findIndex((x) => !isKnownHarmless(x));
   if (k < 0) return null;
@@ -766,10 +783,10 @@ function dastRunTailAt(steps: readonly RenderedStep[], jobId: string | undefined
   else return null;
   const toolFrom = i;
   while (isRun(at(i)) && (TOOL_STEP_ID_RE.test(at(i)?.id ?? '') || CHECKER_STEP_ID_RE.test(at(i)?.id ?? ''))) i++;
-  if (i === toolFrom || !scanIdsOf(dastResultArtifact(s)).includes(at(i - 1)?.id ?? '')) return null;
+  if (i === toolFrom || !scanIdsOf(dastResultArtifact(s, lane)).includes(at(i - 1)?.id ?? '')) return null;
   const h = at(i);
   const u = at(i + 1);
-  const raw = dastRawArtifact(s);
+  const raw = dastRawArtifact(s, lane);
   const folder = `\${{ runner.temp }}/pipegen-out/${raw}`;
   if (h === undefined || !isDastHandoffStep(h) || u === undefined || i + 2 !== steps.length) return null;
   const upload = uploadFolder(u) === raw && u.with?.name === raw && u.with?.path === folder && u.if === undefined && u['continue-on-error'] === undefined;
@@ -1008,7 +1025,7 @@ export function checkExpressions(step: RenderedStep): void {
           const ic = IMAGE_CHECK_ID_RE.exec(step.id);
           if (ic !== null && k === IMAGE_SHA_ENV && v === imageShaRef(ic[1] as string)) continue;
           const dc = DAST_CHECK_ID_RE.exec(step.id);
-          if (dc !== null && k === DAST_RAW_SHA_ENV && v === dastRawShaRef(dc[1] as string)) continue;
+          if (dc !== null && k === DAST_RAW_SHA_ENV && v === dastRawShaRef(dc[2] as string, dc[1] as DastLane)) continue;
         }
         const m = SECRET_REF_RE.exec(v);
         if (m === null || m[1] !== k || isDangerousName(k)) bad(`env value ${show(k)}`);

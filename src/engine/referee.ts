@@ -63,7 +63,7 @@ import { NO_IMAGE_CATEGORIES, noImageServices, publishedImageServices, WORKFLOW_
 import { FIND_RUN_STEP_ID, renderDigestStep, renderHeadCheckStep, renderPublishDigestStep } from './deploy-steps.js';
 import { strongReason } from './deploy-gating.js';
 import { ARCHIVE_TOOL_IDS, imageBuildTag, renderImageArchiveScan, renderImageBuild } from './image-handoff.js';
-import { dastStartOf, nightlyDastSpec, NIGHTLY_DAST_TOOL, renderDastRun, renderDastScrub } from './dast-handoff.js';
+import { dastStartOf, nightlyDastSpec, NIGHTLY_DAST_TOOL, renderDastRun, renderDastScrub, zapActiveSpec, ZAP_ACTIVE_LANE, ZAP_ACTIVE_TOOL } from './dast-handoff.js';
 import { ATTEST_VERIFY_REFUSAL, ATTEST_VERIFY_SETS, KEYLESS_VERIFY_SETS, SHARED_CDN_SETS } from './egress.js';
 import { EGRESS_DOMAIN_SETS, GITHUB_ATTEST_SET, SIGSTORE_SET } from './egress-sets.js';
 import { allowedDomainsProblem, ARGV_POLICIES, BULLFROG_USES, CACHE_LOCKS, GATE_OPTIONAL_UPLOADS, PLAIN_REL_RE, PLATFORM_USES, RANGE_TOOL, RENDERER_INPUTS, rendererInputProblems, SCRUB_SECRET, uploadIfNoFiles } from './tool-flags.js';
@@ -311,7 +311,7 @@ const PUBLISH_DIGEST_SOURCE = 'publish-digest';
 const SOURCE_KIND: Readonly<Record<string, StepKind>> = Object.freeze({ [SIGN_SOURCE]: 'sign', [VERIFY_SOURCE]: 'verify', [IMAGE_ARCHIVE_SOURCE]: 'image-archive', [IMAGE_CHECK_SOURCE]: 'image-check',
   [DEPLOY_HEAD_SOURCE]: 'verify', [DEPLOY_DIGEST_SOURCE]: 'verify', [PUBLISH_DIGEST_SOURCE]: 'publish-digest',
   // G4-R1: the raw DAST result's hash check (it reads a download and the run job's output only, like a checker)
-  'dast-check': 'tool', 'nightly-dast-check': 'tool' });
+  'dast-check': 'tool', 'nightly-dast-check': 'tool', 'nightly-zap-check': 'tool' });
 const sourceKind = (source: string): StepKind | undefined => { const head = source.slice(0, source.indexOf(':')); return source.includes(':') ? own(SOURCE_KIND, head) : undefined; };
 /** The service slug a source of the image hand-off names (`image-archive:<slug>`, `image-check:<slug>`). */
 const sourceSlug = (source: string): string => source.slice(source.indexOf(':') + 1);
@@ -536,6 +536,11 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
       add(`draft.steps[${i}]`, 'unreviewed', `The step for ${show(spec.needId)} runs ${show(t.id)}, which does not cover the check ${show(spec.needId)} (its categories are ${t.categories.map((c) => show(c)).join(', ')}); a tool of another kind would leave the check undone, so it is not run.`);
       return;
     }
+    // G15a round 6: a nightly-only entry (the ZAP AF active scan) is pipegen's own nightly scan, never a check of the draft
+    if (Object.hasOwn(ARGV_POLICIES, t.id) && ARGV_POLICIES[t.id]?.nightlyOnly === true) {
+      add(`draft.steps[${i}]`, 'unreviewed', `The step for ${show(spec.needId)} runs ${show(t.id)}, which is pipegen's own nightly scan and never a check of the pipeline, so no job may run it for that check.`);
+      return;
+    }
     const blocking = blockingOf(spec.needId, spec.service);
     if (t.candidate.kind === 'action') {   // actions are judged by their template (judgeAction), not by a re-render
       // G2 (F2-R11): a blocking need's action spec never carries a narrowing value (an image build that pushes), chosen or by default
@@ -739,6 +744,25 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
       } catch (e) {
         if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e;
         notes.push(`The nightly DAST scan can not be rendered, so no step may claim to be it: ${safeText(e.message, 200)}`);
+        continue;
+      }
+      // G15a round 6: the ZAP AF active scan of the same app (zapActiveSpec, nothing chosen), in its own lane, rendered as the nightly scan
+      const afT = byId.get(ZAP_ACTIVE_TOOL);
+      if (afT === undefined || !isReviewed(afT.candidate)) continue;
+      try {
+        const start = dastStartOf(draft, spec.service);
+        if ('problem' in start) continue;
+        const zs = zapActiveSpec(spec, afT);
+        const s = slug(spec.service);
+        record(`${NIGHTLY_ZAP_SOURCE}:${s}`, ctxs.map((c) => renderStep(zs, afT, platform, { ...c, blocking: true, nightly: true }).steps), false, true, readsWorkspace(afT.id), undefined, undefined);
+        const run = renderDastRun(zs, afT, platform, draft, start, { blocking: true, checkout: [] }).steps;
+        const handoff = run.filter((x) => x.id === DAST_HANDOFF_STEP_ID);
+        record(`${ZAP_HANDOFF_SOURCE}:${s}`, [handoff, handoff], false, true, false, undefined, undefined);
+        const check = renderDastScrub(zs, afT, platform, draft, ex.byId.get(PIPEGEN_ACTION_IDS.gate) ?? afT, start.url).steps.filter((x) => x.id === dastCheckStepId(spec.service as string, ZAP_ACTIVE_LANE));
+        record(`${NIGHTLY_ZAP_CHECK_SOURCE}:${s}`, [check, check], false, true, false, undefined, undefined);
+      } catch (e) {
+        if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e;
+        notes.push(`The nightly ZAP active scan can not be rendered, so no step may claim to be it: ${safeText(e.message, 200)}`);
       }
     }
   }
@@ -894,6 +918,14 @@ const DAST_CHECK_SOURCE = 'dast-check';
 /** G15a round 4 (b3): the nightly DAST scan's own steps (run job) and the hash check of its raw result (scrub job): nightly file only. */
 const NIGHTLY_DAST_SOURCE = 'nightly-dast';
 const NIGHTLY_DAST_CHECK_SOURCE = 'nightly-dast-check';
+/**
+ * G15a round 6: the nightly ZAP AF active scan's own steps (its pull and run, in zap-active-run--<svc>), its hand-off (there) and the hash
+ * check of its raw result (in zap-active--<svc>): nightly file only. The app start and the archive check are the merge pair's own sources,
+ * allowed in the AF run job of the nightly file too (the same steps).
+ */
+const NIGHTLY_ZAP_SOURCE = 'nightly-zap';
+const NIGHTLY_ZAP_CHECK_SOURCE = 'nightly-zap-check';
+const ZAP_HANDOFF_SOURCE = 'zap-handoff';
 /** G4 (C9r1): the source name of the pre-push head fetch step of the secrets job. */
 const RANGE_FETCH_SOURCE = 'range-fetch';
 /** The gate job's own name (the second half of GATE_CHECK_NAME). */
@@ -1430,13 +1462,22 @@ function judgeDastJobs(fc: FileCtx, id: string, where: string, j: Obj, judged: r
     // G15a round 4 (b3): the nightly DAST scan and its hash check belong to the nightly file; the scan to its own run job only
     if ((src.startsWith(`${NIGHTLY_DAST_SOURCE}:`) || src.startsWith(`${NIGHTLY_DAST_CHECK_SOURCE}:`)) && !isNightlyFile(fc)) bad('permissions', `${where}: the step ${show(x.step.name)} is the nightly DAST scan's, so it runs only in the nightly file.`);
     if (src.startsWith(`${NIGHTLY_DAST_SOURCE}:`) && id !== `dast-run--${src.slice(NIGHTLY_DAST_SOURCE.length + 1)}`) bad('permissions', `${where}: the nightly DAST step ${show(x.step.name)} runs only in its own job dast-run--${src.slice(NIGHTLY_DAST_SOURCE.length + 1)}, which holds no key and no secret.`);
-    for (const head of [DAST_HANDOFF_SOURCE, DAST_APP_SOURCE]) {
-      if (src.startsWith(`${head}:`) && id !== `dast-run--${src.slice(head.length + 1)}`) bad('permissions', `${where}: the step ${show(x.step.name)} belongs to the DAST run job dast-run--${src.slice(head.length + 1)} only.`);
+    // G15a round 6: the ZAP AF active scan, its hand-off and its hash check belong to the nightly file; the scan and the hand-off to its own run job
+    if ([NIGHTLY_ZAP_SOURCE, NIGHTLY_ZAP_CHECK_SOURCE, ZAP_HANDOFF_SOURCE].some((h) => src.startsWith(`${h}:`)) && !isNightlyFile(fc)) bad('permissions', `${where}: the step ${show(x.step.name)} is the nightly ZAP active scan's, so it runs only in the nightly file.`);
+    for (const head of [NIGHTLY_ZAP_SOURCE, ZAP_HANDOFF_SOURCE]) {
+      if (src.startsWith(`${head}:`) && id !== `${ZAP_ACTIVE_LANE}-run--${src.slice(head.length + 1)}`) bad('permissions', `${where}: the nightly ZAP active scan step ${show(x.step.name)} runs only in its own job ${ZAP_ACTIVE_LANE}-run--${src.slice(head.length + 1)}, which holds no key and no secret.`);
     }
+    // the app start: the DAST run job of its service, or (nightly file only) the same service's ZAP AF run job
+    if (src.startsWith(`${DAST_APP_SOURCE}:`)) {
+      const s = src.slice(DAST_APP_SOURCE.length + 1);
+      if (id !== `dast-run--${s}` && !(isNightlyFile(fc) && id === `${ZAP_ACTIVE_LANE}-run--${s}`)) bad('permissions', `${where}: the step ${show(x.step.name)} belongs to the DAST run job dast-run--${s} only.`);
+    }
+    if (src.startsWith(`${DAST_HANDOFF_SOURCE}:`) && id !== `dast-run--${src.slice(DAST_HANDOFF_SOURCE.length + 1)}`) bad('permissions', `${where}: the step ${show(x.step.name)} belongs to the DAST run job dast-run--${src.slice(DAST_HANDOFF_SOURCE.length + 1)} only.`);
     const c = typeof x.step.id === 'string' ? DAST_CHECK_ID_RE.exec(x.step.id) : null;
     if (c !== null) {
-      if (id !== `dast--${c[1] as string}`) bad('permissions', `${where}: the hash check of the raw DAST result sits only in the job dast--${c[1] as string}.`);
-      if (!needsList(j.needs).includes(`dast-run--${c[1] as string}`)) bad('not-gate-readable', `${where} checks the raw DAST result of dast-run--${c[1] as string} but does not need that job.`);
+      const [lane, s] = [c[1] as string, c[2] as string];
+      if (id !== `${lane}--${s}`) bad('permissions', `${where}: the hash check of the raw DAST result sits only in the job ${lane}--${s}.`);
+      if (!needsList(j.needs).includes(`${lane}-run--${s}`)) bad('not-gate-readable', `${where} checks the raw DAST result of ${lane}-run--${s} but does not need that job.`);
     }
   }
   if (dastRunSlugOf(id) !== null) {
@@ -1959,6 +2000,9 @@ function judgeJobSteps(fc: FileCtx, where: string, steps: unknown[], job: boolea
     // G15a round 4 (b3): the nightly DAST hash check stands for its nuclei scan
     const nformat = fc.ex.byId.get(NIGHTLY_DAST_TOOL)?.step.output.format;
     if (x.match?.source.startsWith(`${NIGHTLY_DAST_CHECK_SOURCE}:`) === true && x.step.id !== undefined && x.harmlessId && nformat === 'sarif') scans.set(x.step.id, { tool: NIGHTLY_DAST_TOOL, format: nformat });
+    // G15a round 6: the ZAP AF hash check stands for its scan (ZAP's JSON, scrubbed to SARIF for code scanning)
+    const zformat = fc.ex.byId.get(ZAP_ACTIVE_TOOL)?.step.output.format;
+    if (x.match?.source.startsWith(`${NIGHTLY_ZAP_CHECK_SOURCE}:`) === true && x.step.id !== undefined && x.harmlessId && zformat === 'zap-json') scans.set(x.step.id, { tool: ZAP_ACTIVE_TOOL, format: zformat });
     // C9: the commit-range scan, recognised by content as the range source's own step
     if ((x.match?.source === 'range:secrets' || x.match?.source === 'history:secrets') && x.match.final && x.kind === 'tool' && x.harmlessId && x.step.id !== undefined) scans.set(x.step.id, { tool: RANGE_TOOL, format: 'sarif' });
   }
