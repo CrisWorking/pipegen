@@ -958,10 +958,9 @@ describe('mapCoverage (fix round 5)', () => {
     expect(row(under, 'push', 'lint', 's0').status).toBe('covered');
     expect(row(under, 'push', 'lint', 's1').status).toBe('missing');
     const { rows: over } = await run(5_001);
-    // Each 5,000-service run is large (several GB over the 8 runs scaling needs), so growth is timed at 1,250 against 2,500
-    // services, under the cap: 2 times the services is about 2 times the time when linear, 4 when quadratic. The over-cap run
-    // above does less work than the under-cap one by design, so it cannot be slower than the scaling shown here.
-    await expectScaling('services under the cap', async (size) => (await run(size === 'small' ? 1_250 : 2_500)).ms, 6);
+    // G17-R1: per-row service lookups go through a map built once, so 4 times the services (up to the cap) is about 4 times the
+    // time when linear, 16 when quadratic. The over-cap run above does less work than the under-cap one by design.
+    await expectScaling('services under the cap', async (size) => (await run(size === 'small' ? 1_250 : 5_000)).ms, 9);
     for (const s of ['s0', 's1', 's5000']) expect(row(over, 'push', 'lint', s)).toEqual(expect.objectContaining({ status: 'unknown', why: TOO_MANY }));
     // a run at the repo root covers every service whatever their number
     for (const s of ['s0', 's1', 's5000']) expect(row(over, 'push', 'sast', s).status).toBe('covered');
@@ -1114,8 +1113,50 @@ describe('mapCoverage (Task 5, item 1: own scripts by name and content)', () => 
       if (size === 'big') status = r;
       return ms;
     }, 9);
-    expect(status).toBe('missing'); // past the script cap nothing is counted
+    expect(status).toBe('unknown'); // G17-R1: past the script cap the row is unknown, never missing
   });
+
+  it('own scripts (adversarial): G17-R1: a short chain that calls the next script three times keeps its lists bounded (linear, not 2^n)', async () => {
+    let status = '';
+    // below the script cap: each script's result is deduplicated, so 40 links cost about twice 20 links (2^n before the fix)
+    await expectScaling('short script chain', async (size) => {
+      const n = size === 'small' ? 20 : 40;
+      const dir = makeTempDir();
+      const scripts: Record<string, string> = {};
+      for (let i = 0; i < n; i++) scripts[`s${i}`] = `npm run s${i + 1} && npm run s${i + 1} || npm run s${i + 1}`;
+      scripts[`s${n}`] = 'vitest run';
+      pkg(dir, scripts);
+      ci(dir, run('npm run s0'));
+      const started = performance.now();
+      const r = row(await coverage(dir), 'push', 'unit-tests', 'app').status;
+      const ms = performance.now() - started;
+      if (size === 'big') status = r;
+      return ms;
+    }, 6);
+    expect(status).toBe('partial'); // the || ignores the exit code, as for a short chain
+  }, 60_000);
+
+  it('own scripts (adversarial): G17-R1: a script whose runs exceed the entry cap is unknown, never covered or missing', async () => {
+    const at = async (n: number) => {
+      const dir = makeTempDir();
+      pkg(dir, { s0: `${Array.from({ length: n }, (_, i) => `(cd d${i} && vitest run)`).join(' ; ')} ; npm run x`, x: 'jest' });
+      ci(dir, run('npm run s0'));
+      return coverage(dir, { services: [svc('d1'), svc('d2')] });
+    };
+    const under = await at(1_990);
+    expect(row(under, 'push', 'unit-tests', 'd1').status).toBe('covered');
+    const over = await at(2_100);
+    for (const s of ['d1', 'd2']) expect(row(over, 'push', 'unit-tests', s)).toMatchObject({ status: 'unknown', why: expect.stringContaining('more results than pipegen keeps') });
+  }, 60_000);
+
+  it('own scripts (adversarial): G17-R1: past the script cap, a call to a script not counted by name is unknown, not missing', async () => {
+    const dir = makeTempDir();
+    const scripts: Record<string, string> = { 'ci-tests': 'vitest run' };
+    for (let i = 0; i < 1_001; i++) scripts[`f${i}`] = 'echo hi';
+    pkg(dir, scripts);
+    ci(dir, run(`${Array.from({ length: 1_001 }, (_, i) => `npm run f${i}`).join(' && ')} && npm run ci-tests`));
+    expect(row(await coverage(dir), 'push', 'unit-tests', 'app')).toMatchObject({ status: 'unknown', why: expect.stringContaining('more package scripts than pipegen follows') });
+  }, 60_000);
 
   it('own scripts: a husky hook running an own script is read the same way', async () => {
     const dir = makeTempDir();

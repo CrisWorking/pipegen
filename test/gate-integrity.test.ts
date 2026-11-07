@@ -4,6 +4,7 @@
 // network. Written first (strict test-first). The CODEOWNERS glob table follows GitHub's documented examples (gitignore rules, with
 // the documented exceptions); see the open point in task-C4-report.md.
 import { describe, expect, it } from 'vitest';
+import { expectScaling } from './helpers/scaling.js';
 import type { GateGithub } from '../gate/src/baseline.js';
 import {
   addedLinesOf, baseHasInstall, buildPrDiff, codeOwners, integrityFindings, loadCodeowners, ownersOf, parseConfigDoc, PIPEGEN_BLOCK_BEGIN, PIPEGEN_BLOCK_END, pipegenBlockOwners,
@@ -161,11 +162,15 @@ describe("codeowners: GitHub's documented glob examples (rule, path, owned?)", (
   it('a path no rule matches has no owners (undefined)', () => {
     expect(ownersOf(codeOwners('/a/ @x\n'), 'b/c')).toBeUndefined();
   });
-  it('matching is bounded: many ** segments against a long path finish quickly', () => {
-    const rules = codeOwners(`${Array.from({ length: 30 }, () => '**').join('/')}/z @o\n`);
-    const t = Date.now();
-    ownersOf(rules, Array.from({ length: 200 }, () => 'a').join('/'));
-    expect(Date.now() - t).toBeLessThan(1000);
+  it('matching is bounded: many ** segments against a long path finish quickly', async () => {
+    const path = Array.from({ length: 200 }, () => 'a').join('/');
+    // G17-R1: ratio, not a wall-clock budget: twice the ** segments is about twice the time (a backtracking matcher grows far faster)
+    await expectScaling('many ** segments', (size) => {
+      const rules = codeOwners(`${Array.from({ length: size === 'small' ? 15 : 30 }, () => '**').join('/')}/z @o\n`);
+      const t = performance.now();
+      ownersOf(rules, path);
+      return performance.now() - t;
+    }, 6);
   });
 });
 
