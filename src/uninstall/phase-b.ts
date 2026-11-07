@@ -355,6 +355,9 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
       if (posId(id)) await one(`cache ${id}`, () => api.scratchCleanup(s, { op: 'delete-cache', cacheId: id }));
     }
     if (left === 0) r.done.push(`${what}: emptied (its proof/ branches, secrets, variables, workflow runs and caches)`);
+    if (!plan.deleteRepos.some((x) => x.kind === 'scratch' && x.how === 'delete')) {
+      r.skipped.push({ what: `the default branch ${show(def, 100)} of ${what}`, why: `it keeps the copy of your code the proof used (pipegen removes only what the proof added): delete the repo when you don't need it (gh repo delete ${s.fullName}, or run \`pipegen uninstall --delete-repos\` with the pipegen App)` });
+    }
   }
 
   /** 2: the settings the user chose to turn off (V-S6), each read first by target.ts and changed only while it is still as pipegen set it. */

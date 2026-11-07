@@ -7,6 +7,7 @@ import { recordPath } from '../src/deliver/record.js';
 import { CENTRAL_RULESET } from '../src/layers/locks.js';
 import type { InstallEdit, InstallRecord } from '../src/types.js';
 import { uninstallStep, type StepDeps, type StepResult } from '../src/uninstall/apply.js';
+import { applyPhaseB } from '../src/uninstall/phase-b.js';
 import { ProgressFile } from '../src/uninstall/progress.js';
 import type { LoadedRecord } from '../src/uninstall/record.js';
 import { deleteCentralRepo, UninstallApi, UninstallRefusal, type AskName } from '../src/uninstall/target.js';
@@ -63,6 +64,19 @@ describe('uninstall central: the last project (V-B4, V-N9)', () => {
     expect(w.deleted).not.toContain('o/pipelines');
     expect(t.typed.some((q) => /Type pipelines to go on/.test(q))).toBe(false);
     expect([...r2.skipped, ...r2.manual].some((s) => /pipelines/.test(s.what) && /other project/.test(s.why))).toBe(true);
+    // the last project at the preview, but another project's record arrives before the delete: central is kept, its branches too
+    const x = world();
+    await afterRun1(x);
+    const xrec = sampleRecord(x, { central: { repoId: x.central.id, createdByPipegen: true } });
+    await run(x, xrec, term(), { deleteRepos: true, canDeleteRepos: true });
+    mergePr(x, x.central, prBranch(x));
+    const tx = term();
+    const gox = tx.p.confirm;
+    tx.p.confirm = async (m, d) => { if (m.startsWith('Go ahead')) x.g.commitOn('o/pipelines', 'main', { [recordPath('cart')]: '{}\n' }); return gox(m, d); };
+    const nx = x.g.calls.length;
+    await run(x, xrec, tx, { deleteRepos: true, canDeleteRepos: true });
+    expect(x.deleted).not.toContain('o/pipelines');
+    expect(x.g.calls.slice(nx).filter((c) => !c.route.startsWith('GET ') && c.params.repo === 'pipelines')).toEqual([]);
     // the other project's files are untouched
     const now = w.g.filesAt('o/pipelines', w.g.head('o/pipelines'));
     expect(now.has(recordPath('cart'))).toBe(true);
@@ -168,6 +182,24 @@ describe('uninstall central: the last project (V-B4, V-N9)', () => {
       expect(w.g.calls.some((c) => c.route === 'GET /repos/{owner}/{repo}/rulesets/{ruleset_id}' && c.params.repo === 'pipelines'), JSON.stringify(other)).toBe(false);
       expect(w.settings.access).toBe('user');
     }
+    // another project's workflow, or its open central pull request, arrives after the preview: run 2 reads central again first
+    for (const late of ['file', 'pr'] as const) {
+      const x = world();
+      const lx = centralLocks(x);
+      await afterRun1(x);
+      const t = term();
+      const go = t.p.confirm;
+      t.p.confirm = async (m, d) => {
+        if (m.startsWith('Go ahead')) {
+          if (late === 'file') x.g.commitOn('o/pipelines', 'main', { '.github/workflows/cart--push.yml': MERGE_WF });
+          else x.central.pulls.push({ number: 9, head: 'pipegen/update-cart', base: 'main', title: 'x', body: '', state: 'open', html_url: 'https://github.com/o/pipelines/pull/9' });
+        }
+        return go(m, d);
+      };
+      await run(x, sampleRecord(x, { central: lx.central, edits: lx.edits }), t);
+      expect(x.central.rulesets.has(55), late).toBe(true);
+      expect(x.g.calls.some((c) => c.route === 'GET /repos/{owner}/{repo}/rulesets/{ruleset_id}' && c.params.repo === 'pipelines'), late).toBe(false);
+    }
     // an open central pull request of another project (its update branch)
     const w = world();
     const locks = centralLocks(w);
@@ -268,6 +300,12 @@ describe('uninstall central: --delete-repos (V-S3, V-B5)', () => {
     expect(f.w.g.routes()).not.toContain('DELETE /repos/{owner}/{repo}');
     expect(rf.lines.join('\n')).toMatch(/gh repo delete o\/pipelines/);
     expect(ft.typed.some((q) => /Type (pipelines|pipegen-proof-shop) to go on/.test(q))).toBe(false);
+    // phase B itself checks the App's right again: a plan that says delete reaches a token-mode run → the command only
+    const g = await setup();
+    const runner: NonNullable<StepDeps['phaseB']> = (gh2, plan, api, ctx) => applyPhaseB(gh2, { ...plan, deleteRepos: [{ repo: 'o/pipegen-proof-shop', kind: 'scratch', how: 'delete' }] }, api, { ...ctx, deps: { ...ctx.deps, canDeleteRepos: false } });
+    const rg = await run(g.w, g.rec, term(), { deleteRepos: true, canDeleteRepos: false, phaseB: runner });
+    expect(g.w.deleted).toEqual([]);
+    expect(rg.manual.some((m) => m.step === 'gh repo delete o/pipegen-proof-shop')).toBe(true);
   });
 
   it('central: org rule still present → --required.yml kept and the central repo not deleted', async () => {

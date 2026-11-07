@@ -61,7 +61,15 @@ describe('uninstall phase B: secrets, variables, environments, settings (V6)', (
         { name: 'pipegen-deploy', created: true, changed: [], branchPolicyIds: [], githubCreatedAt: AT },
       ],
     });
+    // the progress file says run 2 began before the first write (a hard stop from there on is resumed as run 2)
+    let atFirstWrite: unknown = 'no write';
+    w.g.hooks.unshift((call) => {
+      if (call.route.startsWith('GET ') || atFirstWrite !== 'no write') return undefined;
+      atFirstWrite = (JSON.parse(readFileSync(uninstallProgressPath({ owner: 'o', repo: 'shop' }, local(w)), 'utf8')) as { phase: string }).phase;
+      return undefined;
+    });
     const r = await run(w, rec);
+    expect(atFirstWrite).toBe('B');
     expect(r.phase).toBe('B');
     expect(r.status).toBe('b-waiting');   // the central pull request is open: merge it, then run again
     // every secret is deleted before any environment
@@ -170,10 +178,20 @@ describe('uninstall phase B: secrets, variables, environments, settings (V6)', (
     const t3 = term();
     const go3 = t3.p.confirm;
     t3.p.confirm = async (m, d) => { if (m.startsWith('Go ahead')) w3.meta.set('pipegen-proof-shop', { description: 'mine now' }); return go3(m, d); };
+    // (and below: another repo of that name, with pipegen's marker, made after the preview: another GitHub id)
     await run(w3, sampleRecord(w3, { scratch: { repoId: w3.scratch!.id, createdByPipegen: true } }), t3);
     expect(w3.out.join('\n')).toMatch(/empty the scratch repo o\/pipegen-proof-shop/);
     expect(writes(w3).filter((x) => x.endsWith('pipegen-proof-shop'))).toEqual([]);
     expect(w3.scratch!.stored.has('MY_KEY')).toBe(true);
+    const w4 = world();
+    await afterRun1(w4);
+    w4.scratch!.stored.set('MY_KEY', AT);
+    const t4 = term();
+    const go4 = t4.p.confirm;
+    t4.p.confirm = async (m, d) => { if (m.startsWith('Go ahead')) w4.scratch!.id = 987_654; return go4(m, d); };
+    await run(w4, sampleRecord(w4, { scratch: { repoId: w4.scratch!.id, createdByPipegen: true } }), t4);
+    expect(writes(w4).filter((x) => x.endsWith('pipegen-proof-shop'))).toEqual([]);
+    expect(w4.scratch!.stored.has('MY_KEY')).toBe(true);
 
     // the source scan: E's scratch writers are called only from apply.ts (the phase-bound api), never from another file
     const dir = join(import.meta.dirname, '..', 'src', 'uninstall');
@@ -181,6 +199,21 @@ describe('uninstall phase B: secrets, variables, environments, settings (V6)', (
       const code = readFileSync(join(dir, f), 'utf8').replace(/\/\/.*$/gm, '');
       expect(code, f).not.toMatch(/\b(?:cleanupWrite|deleteScratchSecret|deleteScratchRepo|cleanupLeftovers|guardedWrite)\s*\(/);
     }
+  });
+});
+
+describe('uninstall phase B: settings (V-S6)', () => {
+  it('phase B: the settings pipegen turned on are turned off only when the user says yes', async () => {
+    const w = world();
+    await afterRun1(w);
+    Object.assign(w.settings, { pin: true, alerts: true, scanning: true, push: true });
+    const rec = sampleRecord(w, { repoSettings: { shaPinningRequired: { previous: false }, vulnerabilityAlerts: { previous: false }, secretScanning: { previous: false }, pushProtection: { previous: false } } });
+    const t = term({ yes: (q) => (/^Turn off (secret scanning|push protection)/.test(q) ? true : undefined) });
+    const r = await run(w, rec, t);
+    expect(t.confirms.filter((q) => q.startsWith('Turn off'))).toHaveLength(4);
+    expect(w.settings).toMatchObject({ scanning: false, push: false, alerts: true, pin: true });   // the default keeps them on
+    expect(writes(w).filter((x) => /vulnerability-alerts|actions\/permissions /.test(x))).toEqual([]);
+    expect(r.done.some((d) => /secret scanning and push protection/.test(d))).toBe(true);
   });
 });
 
@@ -231,7 +264,7 @@ describe('uninstall phase B: the record and the local files (V-N5)', () => {
     expect(text(r)).toMatch(/Merge the central pull request/);
 
     // a step that failed: the record stays unless the user says yes to the listed leftovers
-    const failing = async (yes: boolean) => {
+    const failing = async (yes: boolean | undefined) => {
       const x = world();
       await afterRun1(x);
       x.app.stored.set('PIPEGEN_FP_KEY', AT);
@@ -245,6 +278,8 @@ describe('uninstall phase B: the record and the local files (V-N5)', () => {
     expect(filesAtPr(no.x).has(recordPath('shop'))).toBe(true);
     expect(filesAtPr(no.x).has('.github/workflows/shop--merge.yml')).toBe(false);
     expect(no.res.status).toBe('b-partial');
+    const dflt = await failing(undefined);   // the question's own default (Enter): keep it
+    expect(filesAtPr(dflt.x).has(recordPath('shop'))).toBe(true);
     const yes = await failing(true);
     expect(filesAtPr(yes.x).has(recordPath('shop'))).toBe(false);
     const tip2 = yes.x.g.head('o/pipelines', 'pipegen/uninstall-shop');
