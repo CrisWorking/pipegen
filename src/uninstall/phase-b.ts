@@ -13,8 +13,9 @@
 //      none of these goes: the gate still needs them;
 //   3. central (central.ts): the last-project locks first, then one central PR with this project's exact files and the record last;
 //   4. --delete-repos (V-S3): App mode only (Auth.canDeleteRepos): the scratch repo (its name typed; E's scratch repo delete: name, marker,
-//      recorded id) and, last project with the central PR merged and the org rule gone (M-r1-5), the central repo (pipegen's central
-//      branches deleted first, then deleteCentralRepo's checks and typed names). Token mode: the `gh repo delete` commands, nothing deleted;
+//      recorded id) and, last project with the central PR merged and the org rule gone (M-r1-5), the central repo (deleteCentralRepo's
+//      checks and typed names; pipegen's own central branches go with it, never before it: V6-R1 sec M2). Token mode: the `gh repo delete`
+//      commands only after the same gates, read only (V6-R1 sec I1), nothing deleted;
 //   5. the local files (V-N5): the local record file, `.finish-pending.json`, the leftovers file (each of its entries handled: gone on GitHub,
 //      or put back now) and the progress file, only when nothing is left over;
 //   6. the final message: done, kept, manual steps, and how to remove the pipegen App from the repo (F9).
@@ -23,7 +24,7 @@ import { unlinkSync } from 'node:fs';
 import type { Octokit } from '@octokit/rest';
 import type { Prompter } from '../cli/io.js';
 import { DeliverError, statusOf, type RepoRef } from '../deliver/git-data.js';
-import { centralUpdateBranch, localFinishPendingPath, localRecordPath, readLocalLeftovers, type Leftover } from '../deliver/record.js';
+import { localFinishPendingPath, localRecordPath, readLocalLeftovers, type Leftover } from '../deliver/record.js';
 import { isRateStop } from '../engine/github-rate.js';
 import { GitHubAccessError } from '../github/client.js';
 import { assertScratch, githubRead, proofTarget, ProofStopError, SCRATCH_MARKER, ScratchGuardError, validBranchName, type GuardedRepo } from '../proof/target.js';
@@ -32,7 +33,7 @@ import { safeText } from '../util/safe-text.js';
 import type { PhaseApi, PhaseBContext, PhasePlan, StepResult } from './apply.js';
 import { runCentral, type CentralOutcome, type Report } from './central.js';
 import { UninstallError } from './errors.js';
-import { UninstallRefusal, uninstallBranch, type DeleteOutcome } from './target.js';
+import { UninstallRefusal, uninstallBranch, type CentralDeleteResult, type DeleteOutcome } from './target.js';
 
 /**
  * Run 2's statuses (V7 maps them): `b-done` everything done and the local files removed; `b-waiting` the central pull request is open
@@ -60,6 +61,8 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
   const live = ctx.workflowsLive;
   const interactive = ctx.deps.interactive === true && ctx.io !== undefined;
   const prior = ctx.progress.state;
+  // V6-R1 sec M1: the head pipegen set the central uninstall branch to in an earlier run 2 (read before this run saves over the file)
+  let centralHead = prior?.phase === 'B' ? prior.centralUninstallHead : undefined;
 
   // V-S9: the record as the preview read it (or this project's central PR that removed it, merged), before anything is sent
   await recheck();
@@ -69,6 +72,7 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
       phase: 'B', anchors: { ...plan.base },
       ...(prior?.prNumber === undefined ? {} : { prNumber: prior.prNumber, ...(prior.prUrl === undefined ? {} : { prUrl: prior.prUrl }) }),
       ...(prior?.unfinished === true ? { unfinished: true as const } : {}),
+      ...(centralHead === undefined ? {} : { centralUninstallHead: centralHead }),
       done: [...r.done], leftovers: [...r.failed, ...r.manual.map((m) => ({ what: m.what, why: m.why, ...(m.step === undefined ? {} : { manual: m.step }) }))],
     });
   };
@@ -108,7 +112,15 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
   };
   /** A plan item that needed a typed name it doesn't hold is never sent. */
   const named = (x: { confirmedByName: boolean }): boolean => !plan.typedNames || x.confirmedByName;
+  /** Spec M1 (V6-R1): a name the user didn't type is kept AND a leftover, so the record's question lists it (the record is how pipegen comes back). */
+  const notTyped = (what: string): void => {
+    r.skipped.push({ what, why: NOT_TYPED });
+    r.manual.push({ what, why: NOT_TYPED, step: `Delete it by hand on GitHub if it is pipegen's, or run \`pipegen uninstall\` again and type its name.` });
+  };
   const typedOf = <T extends { typed?: unknown }>(x: T): { typed?: NonNullable<T['typed']> } => (x.typed === undefined ? {} : { typed: x.typed as NonNullable<T['typed']> });
+
+  // spec M1 (V6-R1): the names the user declined to type at the preview are leftovers too (the objects are still there)
+  for (const x of plan.skipped) if (x.why.startsWith(NOT_TYPED)) r.manual.push({ what: x.what, why: x.why, step: 'Delete it by hand on GitHub if it is pipegen\'s, or run `pipegen uninstall` again and type its name.' });
 
   const steps: (() => Promise<void>)[] = [];
   // ---------- 1. the scratch repo ----------
@@ -120,7 +132,7 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
     const what = `secret ${show(s.secret.name, 100)}${scopeText(s.secret.scope)}`;
     steps.push(async () => {
       if (live) { r.skipped.push({ what, why: LIVE }); return; }
-      if (!named(s)) { r.skipped.push({ what, why: NOT_TYPED }); return; }
+      if (!named(s)) { notTyped(what); return; }
       await attempt(what, undefined, () => api.deleteIfPipegens({ kind: 'secret', entry: s.secret }, typedOf(s)));
     });
   }
@@ -128,7 +140,7 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
     const what = `variable ${show(v.name, 100)}${scopeText(v.scope)}`;
     steps.push(async () => {
       if (live) { r.skipped.push({ what, why: LIVE }); return; }
-      if (!named(v)) { r.skipped.push({ what, why: NOT_TYPED }); return; }
+      if (!named(v)) { notTyped(what); return; }
       await attempt(what, undefined, () => api.deleteIfPipegens({ kind: 'variable', entry: v.entry }, typedOf(v)));
     });
   }
@@ -136,7 +148,7 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
     const what = `variable ${show(v.name, 100)}`;
     steps.push(async () => {
       if (live) { r.skipped.push({ what, why: LIVE }); return; }
-      if (v.confirmedByName !== true || v.typed === undefined) { r.skipped.push({ what, why: NOT_TYPED }); return; }
+      if (v.confirmedByName !== true || v.typed === undefined) { notTyped(what); return; }
       await attempt(what, undefined, () => api.restoreVariable(v.entry, v.pipegenValue, v.typed));
     });
   }
@@ -144,7 +156,7 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
     const what = `environment ${show(e.name, 100)}`;
     steps.push(async () => {
       if (live) { r.skipped.push({ what, why: LIVE }); return; }
-      if (!named(e)) { r.skipped.push({ what, why: NOT_TYPED }); return; }
+      if (!named(e)) { notTyped(what); return; }
       await attempt(what, undefined, () => api.deleteIfPipegens(e.owned, typedOf(e)));
     });
   }
@@ -152,10 +164,10 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
     const what = `environment ${show(e.name, 100)}`;
     steps.push(async () => {
       if (live) { r.skipped.push({ what, why: LIVE }); return; }
-      if (e.confirmedByName !== true || e.typed === undefined) { r.skipped.push({ what, why: NOT_TYPED }); return; }
+      if (e.confirmedByName !== true || e.typed === undefined) { notTyped(what); return; }
       if (e.diff !== '' && await attempt(what, undefined, () => api.restoreEnvironment(e.entry, e.shown, e.typed))) restoredEnvs.add(e.name);
       for (const p of e.deleteBranchPolicies) {
-        if (plan.typedNames && p.typed === undefined) { r.skipped.push({ what: `branch rule ${p.id} of ${what}`, why: NOT_TYPED }); continue; }
+        if (plan.typedNames && p.typed === undefined) { notTyped(`branch rule ${p.id} of ${what}`); continue; }
         await attempt(`branch rule ${p.id} of ${what}`, undefined, () => api.deleteBranchPolicy(e.entry, p.id, p.typed));
       }
       if (e.diff === '') restoredEnvs.add(e.name);
@@ -163,6 +175,8 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
   }
   const off = plan.settings.filter((s) => s.turnOff && named(s));
   if (off.length > 0) steps.push(settingsStep);
+  const offNotTyped = plan.settings.filter((s) => s.turnOff && !named(s));
+  if (offNotTyped.length > 0) steps.push(async () => { for (const s of offNotTyped) notTyped(`setting ${show(s.key, 60)}`); });
   // ---------- 3. central ----------
   let central: CentralOutcome | null = null;
   steps.push(async () => {
@@ -170,6 +184,7 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
       central = await runCentral({
         gh, api, plan, rec, centralRepoId: rec.central?.repoId ?? loaded.centralRepoId, ownerType: loaded.app.ownerType, live, io: ctx.io, interactive, report,
         outcome: (what, manual, fn) => attempt(what, manual, fn),
+        branch: { head: centralHead, set: (sha) => { centralHead = sha; save(); } },
       });
     } catch (e) {
       if (isRateStop(e) || e instanceof GitHubAccessError || statusOf(e) === 401) throw e;
@@ -242,7 +257,8 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
     };
     let repo: unknown;
     try { repo = (await api.read('GET /repos/{owner}/{repo}', { ...ref })).data; } catch (e) {
-      if (statusOf(e) === 404) return;   // central gone: nothing of central to change (central.ts says so)
+      // V6-R1 (sec M4, spec M2): the preview read the record there, so a 404 now is "can't tell" (deleted, or no access): a stop
+      if (statusOf(e) === 404) throw new UninstallError(`pipegen can't see ${appRef.owner}/pipelines now (deleted, or this login has no access to it), where the preview read the install record, so it sent nothing. Check it on GitHub (and the token's access to it), then run \`pipegen uninstall\` again. Nothing was changed.`);
       throw e;
     }
     const def = isObj(repo) ? repo.default_branch : undefined;
@@ -261,7 +277,7 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
       const branch = uninstallBranch({ owner: appRef.owner, repo: appRef.repo, repoId: plan.app.repoId }, 'central');
       const prs = (await api.read('GET /repos/{owner}/{repo}/pulls', { ...ref, head: `${appRef.owner}:${branch}`, state: 'closed', per_page: 100 })).data;
       const cid = rec.central?.repoId ?? loaded.centralRepoId;
-      if (Array.isArray(prs) && prs.some((p) => isObj(p) && isObj(p.head) && p.head.ref === branch && isObj(p.head.repo) && p.head.repo.id === cid && typeof p.merged_at === 'string' && p.merged_at !== '')) return;
+      if (Array.isArray(prs) && prs.some((p) => isObj(p) && isObj(p.head) && p.head.ref === branch && isObj(p.head.repo) && p.head.repo.id === cid && isObj(p.base) && p.base.ref === def && typeof p.merged_at === 'string' && p.merged_at !== '')) return;
     }
     changed(`The install record ${String(rp)} in ${appRef.owner}/pipelines`);
   }
@@ -307,6 +323,9 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
       return;
     }
     const def = typeof d.default_branch === 'string' ? d.default_branch : s.target.defaultBranch;
+    // V6-R1 sec I1: `gh repo delete` only for the scratch repo the record says pipegen created (its id recorded and equal to GitHub's)
+    const recorded = rec.scratch?.createdByPipegen === true && rec.scratch.repoId === sc.id;
+    const orDelete = recorded ? `, or delete the repo: gh repo delete ${s.fullName}` : '';
     let left = 0;
     const one = async (item: string, fn: () => Promise<unknown>): Promise<void> => {
       try { await fn(); } catch (e) {
@@ -314,7 +333,7 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
         const st = statusOf(e);
         if (typeof st === 'number' && SCRATCH_GONE.has(st)) return;
         left += 1;
-        r.failed.push({ what: `${item} of ${what}`, why: reasonOf(e), manual: `Delete it in ${s.fullName} by hand, or delete the repo: gh repo delete ${s.fullName}` });
+        r.failed.push({ what: `${item} of ${what}`, why: reasonOf(e), manual: `Delete it in ${s.fullName} by hand${orDelete}` });
       }
     };
     const list = async (route: string, key: string | null, params: Record<string, unknown> = {}): Promise<unknown[] | null> => {
@@ -323,7 +342,7 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
         const items = key === null ? x : isObj(x) ? x[key] : undefined;
         if (!Array.isArray(items)) throw new UninstallError('unreadable');
         if (key !== null && isObj(x) && typeof x.total_count === 'number' && x.total_count > items.length) {
-          r.manual.push({ what: `${key.replace(/_/g, ' ')} of ${what}`, why: 'there are more than pipegen reads at once', step: `Run \`pipegen uninstall\` again, or delete the repo: gh repo delete ${s.fullName}` });
+          r.manual.push({ what: `${key.replace(/_/g, ' ')} of ${what}`, why: 'there are more than pipegen reads at once', step: `Run \`pipegen uninstall\` again${orDelete}` });
         }
         return items;
       } catch (e) {
@@ -356,7 +375,9 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
     }
     if (left === 0) r.done.push(`${what}: emptied (its proof/ branches, secrets, variables, workflow runs and caches)`);
     if (!plan.deleteRepos.some((x) => x.kind === 'scratch' && x.how === 'delete')) {
-      r.skipped.push({ what: `the default branch ${show(def, 100)} of ${what}`, why: `it keeps the copy of your code the proof used (pipegen removes only what the proof added): delete the repo when you don't need it (gh repo delete ${s.fullName}, or run \`pipegen uninstall --delete-repos\` with the pipegen App)` });
+      r.skipped.push({ what: `the default branch ${show(def, 100)} of ${what}`, why: recorded
+        ? `it keeps the copy of your code the proof used (pipegen removes only what the proof added): delete the repo when you don't need it (gh repo delete ${s.fullName}, or run \`pipegen uninstall --delete-repos\` with the pipegen App)`
+        : 'it keeps the copy of your code the proof used (pipegen removes only what the proof added); the install record holds no id of this repo, so check it is the one pipegen made before you delete it' });
     }
   }
 
@@ -371,56 +392,84 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
     if (Object.keys(sa).length > 0) await attempt(`setting: ${keys.has('secretScanning') ? 'secret scanning' : ''}${keys.has('secretScanning') && keys.has('pushProtection') ? ' and ' : ''}${keys.has('pushProtection') ? 'push protection' : ''}`, undefined, () => api.write('PATCH /repos/{owner}/{repo}', { ...appRef, security_and_analysis: sa }));
   }
 
-  /** 4: one repo of --delete-repos: App mode deletes (typed name, every check); token mode prints the command (V-S3). */
+  /**
+   * 4: one repo of --delete-repos (V-S3). App mode deletes (typed name, every check). Token mode (V6-R1 sec I1) prints `gh repo delete` only
+   * after the same gates: the scratch repo read now (exact name, pipegen's marker, the recorded id); the central repo only as the last
+   * project, with the org rule gone, the central PR merged and deleteCentralRepo's own checks passed (read only). Otherwise the reason.
+   */
   async function repoStep(d: PhasePlan['deleteRepos'][number]): Promise<void> {
     const what = `repo ${show(d.repo, 140)}`;
     const command = `gh repo delete ${d.repo}`;
-    if (d.how !== 'delete' || ctx.deps.canDeleteRepos !== true) {
-      r.manual.push({ what, why: '--delete-repos: this token can\'t delete repos (only the pipegen App, with the Administration write you consented to, can), so pipegen deleted nothing', step: command });
-      return;
-    }
+    const tokenMode = d.how !== 'delete' || ctx.deps.canDeleteRepos !== true;
+    const noApp = '--delete-repos: this token can\'t delete repos (only the pipegen App, with the Administration write you consented to, can), so pipegen deleted nothing';
+    const hardStop = (e: unknown): void => { if (isRateStop(e) || e instanceof GitHubAccessError || statusOf(e) === 401) throw e; };
     if (d.kind === 'scratch') {
       let s: GuardedRepo;
       try { s = assertScratch(proofTarget({ owner: appRef.owner, repo: appRef.repo, private: loaded.app.private, ownerType: loaded.app.ownerType, defaultBranch: loaded.app.defaultBranch }), appRef); } catch (e) {
         if (!(e instanceof ProofStopError || e instanceof ScratchGuardError)) throw e;
-        r.manual.push({ what, why: show(e.message, 200), step: command });
+        r.manual.push({ what, why: show(e.message, 200), step: 'Check it on GitHub; delete it by hand only if it is the scratch repo pipegen made.' });
         return;
       }
-      if (s.fullName !== d.repo) { r.manual.push({ what, why: 'it is not the scratch repo of this app', step: command }); return; }
+      if (s.fullName !== d.repo) { r.manual.push({ what, why: 'it is not the scratch repo of this app', step: 'Check it on GitHub.' }); return; }
+      if (tokenMode) {
+        const recId = rec.scratch?.createdByPipegen === true ? rec.scratch.repoId : undefined;
+        let x: unknown;
+        try { x = (await githubRead(gh, 'GET /repos/{owner}/{repo}', { owner: s.owner, repo: s.repo }, api.clock)).data; } catch (e) {
+          hardStop(e);
+          if (statusOf(e) === 404) { r.done.push(`${what}: already gone`); return; }
+          r.failed.push({ what, why: reasonOf(e), manual: 'Run `pipegen uninstall --delete-repos` again.' });
+          return;
+        }
+        if (!isObj(x) || x.full_name !== s.fullName || x.description !== SCRATCH_MARKER || !posId(recId) || x.id !== recId) {
+          r.skipped.push({ what, why: 'it is not the scratch repo the install record says pipegen created (the exact name, pipegen\'s marker and the recorded id), so pipegen doesn\'t tell you to delete it' });
+          return;
+        }
+        r.manual.push({ what, why: noApp, step: command });
+        return;
+      }
       let res;
       try { res = await api.scratchRepoDelete(s, rec.scratch?.repoId); } catch (e) {
-        if (isRateStop(e) || e instanceof GitHubAccessError || statusOf(e) === 401) throw e;
-        r.failed.push({ what, why: reasonOf(e), manual: command });
+        hardStop(e);
+        r.failed.push({ what, why: reasonOf(e), manual: 'Run `pipegen uninstall --delete-repos` again.' });
         return;
       }
       if (res.deleted) r.done.push(`${what}: deleted`);
-      else { r.skipped.push({ what, why: show(res.why ?? 'not deleted', 400) }); r.manual.push({ what, why: show(res.why ?? 'not deleted', 400), step: command }); }
+      else { r.skipped.push({ what, why: show(res.why ?? 'not deleted', 400) }); r.manual.push({ what, why: show(res.why ?? 'not deleted', 400), step: 'Check it on GitHub; delete it by hand only if it is the scratch repo pipegen made.' }); }
       return;
     }
-    // the central repo: last project now, its PR merged (the record gone from central), the org rule gone (M-r1-5)
+    // the central repo: last project now, the org rule gone (M-r1-5), its PR merged (the record gone from central)
     const c = central as CentralOutcome | null;
-    if (c === null) { r.failed.push({ what, why: 'not done: the central part of this run did not finish', manual: command }); return; }
+    if (c === null) { r.failed.push({ what, why: 'not done: the central part of this run did not finish', manual: 'Run `pipegen uninstall --delete-repos` again.' }); return; }
     if (!c.last) { r.skipped.push({ what, why: `${c.lastWhy}, so pipegen keeps it` }); return; }
-    if (c.orgRule !== null) { r.skipped.push({ what, why: `${c.orgRule}, so pipegen keeps ${d.repo}` }); r.manual.push({ what, why: c.orgRule, step: `Delete the org rule in the organisation's settings (Rulesets), then run \`pipegen uninstall --delete-repos\` again (or ${command}).` }); return; }
+    if (c.orgRule !== null) { r.skipped.push({ what, why: `${c.orgRule}, so pipegen keeps ${d.repo}` }); r.manual.push({ what, why: c.orgRule, step: 'Delete the org rule in the organisation\'s settings (Rulesets), then run `pipegen uninstall --delete-repos` again.' }); return; }
     if (!c.merged) {
       const url = c.pr === undefined ? '' : ` #${c.pr.number} (${show(c.pr.url, 300)})`;
       r.manual.push({ what, why: 'the central pull request that removes the install record is not merged yet, so the repo stays for now', step: `Merge the central pull request${url}, then run \`pipegen uninstall --delete-repos\` again.` });
       return;
     }
-    // pipegen's own central branches first (deleteCentralRepo keeps a repo with any branch but the default one)
-    const ref: RepoRef = { owner: appRef.owner, repo: 'pipelines' };
-    for (const b of [uninstallBranch({ owner: appRef.owner, repo: appRef.repo, repoId: plan.app.repoId }, 'central'), centralUpdateBranch(appRef.repo)]) {
-      let there = true;
-      try { await api.read('GET /repos/{owner}/{repo}/git/ref/{ref}', { ...ref, ref: `heads/${b}` }); } catch (e) {
-        if (statusOf(e) !== 404) throw e;
-        there = false;
+    if (tokenMode) {
+      let res: CentralDeleteResult;
+      try { res = await api.checkCentralRepo(rec); } catch (e) {
+        hardStop(e);
+        r.failed.push({ what, why: reasonOf(e), manual: 'Run `pipegen uninstall --delete-repos` again.' });
+        return;
       }
-      if (there) await attempt(`branch ${b} of ${ref.owner}/pipelines`, `gh api -X DELETE repos/${ref.owner}/pipelines/git/refs/heads/${b}`, () => api.deleteBranch('central', b));
+      if (res.ready !== true) {
+        const why = show(res.why ?? 'pipegen\'s checks did not pass', 400);
+        r.skipped.push({ what, why });
+        r.manual.push({ what, why, step: 'Check it on GitHub; pipegen doesn\'t tell you to delete it while it holds that.' });
+        return;
+      }
+      const prs = (res.prs ?? []).length > 0 ? `; check its pull requests ${(res.prs ?? []).map((n) => `#${n}`).join(', ')} are pipegen's first` : '';
+      const unread = (res.unchecked ?? []).length > 0 ? `; pipegen couldn't read ${show((res.unchecked ?? []).join(' or '), 200)}` : '';
+      r.manual.push({ what, why: `${noApp}. pipegen checked it holds nothing but pipegen's${prs}${unread}`, step: command });
+      return;
     }
+    // V6-R1 sec M2: pipegen's own central branches go with the repo, inside deleteCentralRepo (named in its question): never before it
     let res;
     try { res = await api.removeCentralRepo(rec); } catch (e) {
-      if (isRateStop(e) || e instanceof GitHubAccessError || statusOf(e) === 401) throw e;
-      r.failed.push({ what, why: reasonOf(e), manual: command });
+      hardStop(e);
+      r.failed.push({ what, why: reasonOf(e), manual: 'Run `pipegen uninstall --delete-repos` again.' });
       return;
     }
     if (res.deleted) {

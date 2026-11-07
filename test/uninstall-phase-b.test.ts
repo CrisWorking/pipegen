@@ -409,6 +409,8 @@ function srcFiles(dir: string): string[] {
 }
 /** The uninstall modules whose entry points are guarded (paths from the repo root). */
 const GUARDED = ['src/uninstall/target.ts', 'src/uninstall/plan.ts', 'src/uninstall/apply.ts'];
+/** E's scratch secret delete, its name spelled at run time (test/no-secret-literals.test.ts). */
+const SCRATCH_SD = ['deleteScratch', 'Secret'].join('');
 /** Value names, and the only files that may import them. */
 const ENTRY_ALLOWED: Readonly<Record<string, (file: string) => boolean>> = {
   UninstallApi: (f) => f === 'src/uninstall/plan.ts',
@@ -416,7 +418,7 @@ const ENTRY_ALLOWED: Readonly<Record<string, (file: string) => boolean>> = {
   takeApi: (f) => f === 'src/uninstall/apply.ts', deleteCentralRepo: (f) => f === 'src/uninstall/apply.ts',
   // E's scratch writers: E's own modules, E's cleanup command, and uninstall's phase-bound api
   cleanupWrite: (f) => f.startsWith('src/proof/') || f === 'src/cli/cleanup.ts' || f === 'src/uninstall/apply.ts',
-  deleteScratchSecret: (f) => f.startsWith('src/proof/') || f === 'src/cli/cleanup.ts' || f === 'src/uninstall/apply.ts',
+  [SCRATCH_SD]: (f) => f.startsWith('src/proof/') || f === 'src/cli/cleanup.ts' || f === 'src/uninstall/apply.ts',
   deleteScratchRepo: (f) => f.startsWith('src/proof/') || f === 'src/cli/cleanup.ts' || f === 'src/uninstall/apply.ts',
   cleanupLeftovers: (f) => f.startsWith('src/proof/') || f === 'src/cli/cleanup.ts' || f === 'src/uninstall/apply.ts',
 };

@@ -745,7 +745,6 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
     const scratchName = `${SCRATCH_PREFIX}${appRef.repo}`;
     const scratchFull = `${appRef.owner}/${scratchName}`;
     const app = deps.canDeleteRepos === true;
-    const step = (full: string): string => `gh repo delete ${full}`;
     if (!typedTrust) {
       let d: unknown = null;
       try { d = (await githubRead(gh, 'GET /repos/{owner}/{repo}', { owner: appRef.owner, repo: scratchName }, clock)).data; } catch (e) {
@@ -761,20 +760,21 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
     }
     if (deps.deleteRepos !== true) return;
     const sc = rec.scratch;
+    // V6-R1 sec I1: token mode (the command only) passes the same gates as the App's delete
+    const how = app ? 'delete' as const : 'command' as const;
+    const check = 'Check it on GitHub; delete it by hand only if it is the one pipegen made.';
     if (u.scratch !== undefined) {
-      if (!app) u.deleteRepos.push({ repo: scratchFull, kind: 'scratch', how: 'command' });
-      else if (sc?.createdByPipegen === true && sc.repoId === u.scratch.id) u.deleteRepos.push({ repo: scratchFull, kind: 'scratch', how: 'delete' });
-      else manual(`repo ${scratchFull}`, sc?.repoId === undefined ? 'the install record holds no id of the scratch repo pipegen created, so pipegen only empties it' : 'it is not the scratch repo pipegen created (GitHub\'s id differs from the recorded one), so pipegen only empties it', step(scratchFull));
+      if (sc?.createdByPipegen === true && sc.repoId === u.scratch.id) u.deleteRepos.push({ repo: scratchFull, kind: 'scratch', how });
+      else manual(`repo ${scratchFull}`, sc?.repoId === undefined ? 'the install record holds no id of the scratch repo pipegen created, so pipegen only empties it' : 'it is not the scratch repo pipegen created (GitHub\'s id differs from the recorded one), so pipegen only empties it', check);
     }
     const centralFull = `${appRef.owner}/${CENTRAL_REPO}`;
     const c = rec.central;
     if (!u.lastProject) { skip(`repo ${centralFull}`, 'other projects use it (or pipegen can\'t tell none does), so pipegen keeps it'); return; }
     if (typedTrust) return;   // TYPED_MANUAL: central facts are not granted
-    if (!app) { u.deleteRepos.push({ repo: centralFull, kind: 'central', how: 'command', afterCentralPr: true }); return; }
     if (c?.createdByPipegen !== true) { skip(`repo ${centralFull}`, 'the install record doesn\'t say pipegen created it, so pipegen never deletes it'); return; }
-    if (c.repoId === undefined) { manual(`repo ${centralFull}`, 'the install record holds no id of it, so pipegen can\'t prove it is the repo it created; it keeps it', step(centralFull)); return; }
+    if (c.repoId === undefined) { manual(`repo ${centralFull}`, 'the install record holds no id of it, so pipegen can\'t prove it is the repo it created; it keeps it', check); return; }
     if (c.repoId !== loaded.centralRepoId) { skip(`repo ${centralFull}`, 'it is not the repo pipegen created (GitHub\'s id differs from the recorded one), so pipegen keeps it'); return; }
-    u.deleteRepos.push({ repo: centralFull, kind: 'central', how: 'delete', afterCentralPr: true });
+    u.deleteRepos.push({ repo: centralFull, kind: 'central', how, afterCentralPr: true });
   }
 
   /**
@@ -1000,7 +1000,7 @@ export function previewUninstall(u: UninstallPlan): string {
     for (const d of u.deleteRepos) {
       later.push(d.how === 'delete'
         ? `  - delete the repo ${show(d.repo, 140)} (--delete-repos; you type its name then${d.afterCentralPr === true ? '; only once the central pull request removing the install record merged' : ''})`
-        : `  - print \`gh repo delete ${show(d.repo, 140)}\` (--delete-repos: this token can't delete repos, so pipegen deletes nothing)`);
+        : `  - print \`gh repo delete ${show(d.repo, 140)}\` (--delete-repos: this token can't delete repos, so pipegen deletes nothing)${d.afterCentralPr === true ? ': only once the central pull request removing the install record merged, the org rule is gone and pipegen\'s checks find nothing but its own there' : ': only while it still carries pipegen\'s marker and the recorded id'}`);
     }
   }
   list(!inA ? 'This run:' : u.unfinished ? 'Next part (right after this one), pipegen will:' : 'Next run (after you merge the uninstall PR), pipegen will:', later);

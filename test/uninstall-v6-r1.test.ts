@@ -41,6 +41,7 @@ async function afterRun1(w: World, recordBlobSha = blob(RECORD_TEXT)): Promise<v
 const run = (w: World, rec: InstallRecord, t: Term = term(), over: Partial<StepDeps> = {}, lo: Partial<LoadedRecord> = {}): Promise<StepResult> =>
   uninstallStep(gh(w), loadedOf(w, rec, lo), t.p, deps(w, over));
 const BR = 'pipegen/uninstall-shop';
+const A_NAME = 'PIPEGEN_A';
 const OWNERS_INS = '# pipegen:begin\n/.github/workflows/ @o\n# pipegen:end\n';
 const filesAtPr = (w: World): Map<string, string> => w.g.filesAt('o/pipelines', w.g.head('o/pipelines', BR));
 const all = (w: World, r: StepResult): string => [...w.out, ...r.lines, ...r.manual.map((m) => `${m.what} ${m.why} ${m.step ?? ''}`), ...r.skipped.map((s) => `${s.what} ${s.why}`), ...r.failed.map((f) => `${f.what} ${f.why} ${f.manual ?? ''}`)].join('\n');
@@ -78,7 +79,7 @@ describe('V6-R1: token mode prints gh repo delete only after the gates App mode 
     await run(q2, rec2, term(), { deleteRepos: true, canDeleteRepos: false });
     mergePr(q2, q2.central, BR);
     const r2 = await run(q2, rec2, term(), { deleteRepos: true, canDeleteRepos: false });
-    expect(all(q2, r2)).not.toMatch(central);
+    expect(r2.lines.join('\n')).not.toMatch(central);   // the preview names the command only with its conditions
     expect(r2.manual.some((m) => /pipegen-required--shop/.test(m.why))).toBe(true);
 
     // Q3: the run that opens the central PR: not merged yet, so no command
@@ -112,7 +113,7 @@ describe('V6-R1: token mode prints gh repo delete only after the gates App mode 
     await run(q3d, rec3d, term(), { deleteRepos: true, canDeleteRepos: false });
     mergePr(q3d, q3d.central, BR);
     const r3d = await run(q3d, rec3d, term(), { deleteRepos: true, canDeleteRepos: false });
-    expect(all(q3d, r3d)).not.toMatch(central);
+    expect(all(q3d, r3d)).not.toMatch(central);   // not planned at all: the preview doesn't name it either
 
     // Q4: the scratch repo carries the marker, but the record holds no id of it: never the command
     const q4 = world();
@@ -160,7 +161,7 @@ describe('V6-R1: the second run 2 in production (spec I1)', () => {
     expect(again.record).toEqual(a.rec);
     expect(again.trust).toBe('full');
     expect(again.blobSha).toBe(blob(recordFileText(a.rec)));
-    expect(again.warnings.join('\n')).toMatch(/central pull request/);
+    expect(again.warnings.join('\n')).toMatch(/central uninstall pull request #\d+ removed it/);
     const r2 = await uninstallStep(gh(a.w), again, a.t.p, deps(a.w));
     expect(r2.status).toBe('b-done');
     expect(existsSync(localRecordPath(APP, local(a.w)))).toBe(false);
@@ -322,7 +323,8 @@ describe('V6-R1: central now (sec M4, M5, spec M2, M5)', () => {
     const lrb = localFiles(b);
     b.app.stored.set('PIPEGEN_A', AT);
     b.fail = (route, p) => {
-      if (route === `DELETE /repos/{owner}/{repo}/actions/${SEC}/{secret_name}` && p.secret_name === 'PIPEGEN_A') b.fail = (_r, q) => (String(q.repo) === 'pipelines' ? 404 : undefined);
+      const first = route === `DELETE /repos/{owner}/{repo}/actions/${SEC}/{secret_name}` && Object.values(p).includes(A_NAME);
+      if (first) b.fail = (_r, q) => (String(q.repo) === 'pipelines' ? 404 : undefined);
       return undefined;
     };
     const rb = await run(b, sampleRecord(b, { [SEC]: [{ name: 'PIPEGEN_A', scope: 'repo', created: true, githubCreatedAt: AT }] }));
@@ -473,7 +475,7 @@ describe('V6-R1: Ctrl-C and a rate stop in run 2 (sec M7)', () => {
     w.app.stored.set('PIPEGEN_A', AT);
     w.app.stored.set('PIPEGEN_B', AT);
     const rec = sampleRecord(w, { [SEC]: [{ name: 'PIPEGEN_A', scope: 'repo', created: true, githubCreatedAt: AT }, { name: 'PIPEGEN_B', scope: 'repo', created: true, githubCreatedAt: AT }] });
-    w.fail = (route, p) => { if (route === `DELETE /repos/{owner}/{repo}/actions/${SEC}/{secret_name}` && p.secret_name === 'PIPEGEN_A') h.stop.now = true; return undefined; };
+    w.fail = (route, p) => { if (route === `DELETE /repos/{owner}/{repo}/actions/${SEC}/{secret_name}` && Object.values(p).includes(A_NAME)) h.stop.now = true; return undefined; };
     const r = await run(w, rec);
     expect(r.status).toBe('interrupted');
     expect(w.app.stored.has('PIPEGEN_A')).toBe(false);
@@ -493,7 +495,7 @@ describe('V6-R1: Ctrl-C and a rate stop in run 2 (sec M7)', () => {
     const rec = sampleRecord(w, { [SEC]: [{ name: 'PIPEGEN_A', scope: 'repo', created: true, githubCreatedAt: AT }, { name: 'PIPEGEN_B', scope: 'repo', created: true, githubCreatedAt: AT }] });
     const base = gh(w) as unknown as { request: (r: string, p: Record<string, unknown>) => Promise<unknown> };
     const g = { request: async (route: string, params: Record<string, unknown> = {}) => {
-      if (route === `DELETE /repos/{owner}/{repo}/actions/${SEC}/{secret_name}` && params.secret_name === 'PIPEGEN_A') throw new GitHubRateLimitError('rate', { budgetSpent: true });
+      if (route === `DELETE /repos/{owner}/{repo}/actions/${SEC}/{secret_name}` && Object.values(params).includes(A_NAME)) throw new GitHubRateLimitError('rate', { budgetSpent: true });
       return base.request(route, params);
     } } as unknown as Octokit;
     const err = await uninstallStep(g, loadedOf(w, rec), term().p, deps(w)).then(() => null, (e: unknown) => e);

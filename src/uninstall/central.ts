@@ -13,6 +13,9 @@
 //   on `pipegen/uninstall-<name>`: this project's exact files (the plan's list, V-B4: never a glob), each only at a version pipegen wrote;
 //   when last, the central CODEOWNERS (removed when pipegen created it, else only pipegen's block taken out through V2); the install record
 //   LAST, only with nothing left over or the user's yes to the listed ones. A public app (records only, V-N13): only the record.
+// V6-R1: central answering 404 is "can't tell" (never merged, never the last project); the central uninstall branch moves only while it is
+// where pipegen set it (sec M1); after the merge, a project that joined once the locks came off is named (sec M5); an org rule pipegen
+// can't read is still there (sec M3).
 import type { Octokit } from '@octokit/rest';
 import type { Prompter } from '../cli/io.js';
 import { readBlobText, statusOf, type RepoRef, type TreeEntry } from '../deliver/git-data.js';
@@ -54,6 +57,19 @@ export interface CentralNow {
   ref: RepoRef; defaultBranch: string; head: string; tree: string; entries: Map<string, TreeEntry>;
   /** This project's central uninstall PR (the newest on its exact branch from the recorded central repo), as GitHub shows it now. */
   pr: { number: number; url: string; merged: boolean; open: boolean } | null;
+}
+
+/** The head of `branch` of `ref` now, or null (no such branch). */
+async function branchHead(api: PhaseApi, ref: RepoRef, branch: string): Promise<string | null> {
+  try {
+    const d = (await api.read('GET /repos/{owner}/{repo}/git/ref/{ref}', { ...ref, ref: `heads/${branch}` })).data;
+    const sha = isObj(d) && isObj(d.object) ? d.object.sha : undefined;
+    if (typeof sha !== 'string' || !SHA_RE.test(sha)) throw new UninstallRefusal(`GitHub's answer about the branch ${show(branch, 120)} of ${ref.owner}/${ref.repo} could not be read.`);
+    return sha;
+  } catch (e) {
+    if (statusOf(e) === 404) return null;
+    throw e;
+  }
 }
 
 /** `<owner>/pipelines` now (null: GitHub answers 404 for it). Errors other than 404 pass through. */
@@ -120,29 +136,31 @@ export async function lastProjectNow(api: PhaseApi, app: RepoRef, now: CentralNo
 
 /**
  * M-r1-5: the org required-workflow rule of this project, still there (why, naming it), or null (gone, or there is none). It is the
- * recorded id, or any org rule GitHub shows by its name or requiring this project's `<name>--required.yml`. A recorded rule pipegen can't
- * read counts as still there.
+ * recorded id, or any org rule GitHub shows by its name or requiring this project's `<name>--required.yml`. V6-R1 (sec M3, spec I2): what
+ * pipegen can't read (the list, 100 or more rules, one rule's detail) counts as still there. Only a user account whose fully trusted record
+ * lists no org rule has none, and nothing is read then (a typed trust never vouches that there is none).
  */
-export async function orgRuleNow(api: PhaseApi, rec: InstallRecord, app: RepoRef & { ownerType: 'User' | 'Organization' }): Promise<string | null> {
+export async function orgRuleNow(api: PhaseApi, rec: InstallRecord, app: RepoRef & { ownerType: 'User' | 'Organization' }, trust: 'full' | 'typed'): Promise<string | null> {
   const name = requiredRulesetName(app.repo);
   const path = centralWorkflowFile(app.repo, 'required');
   const recorded = rec.orgRuleset;
-  if (app.ownerType !== 'Organization' && recorded === undefined) return null;
+  if (app.ownerType !== 'Organization' && recorded === undefined && trust === 'full') return null;
   const present = `the org required-workflow rule ${name} of ${show(app.owner, 40)} still requires ${path}`;
+  const cant = (what: string): string => `pipegen can't read ${what}, so it can't tell the org required-workflow rule ${name} (it requires ${path}) is gone`;
   let list: unknown;
   try { list = (await api.read('GET /orgs/{org}/rulesets', { org: app.owner, per_page: 100 })).data; } catch (e) {
     if (isRateStop(e) || e instanceof GitHubAccessError || statusOf(e) === 401) throw e;
-    return recorded === undefined ? null : `pipegen can't read the organisation's rulesets, so it can't tell the org required-workflow rule ${name} is gone`;
+    return cant(`the rulesets of ${show(app.owner, 40)}`);
   }
-  if (!Array.isArray(list) || list.length >= 100) return recorded === undefined ? null : `pipegen can't read every ruleset of the organisation, so it can't tell the org required-workflow rule ${name} is gone`;
+  if (!Array.isArray(list) || list.length >= 100) return cant(`every ruleset of ${show(app.owner, 40)}`);
   for (const x of list) {
     if (!isObj(x)) continue;
     if (x.name === name || (recorded !== undefined && x.id === recorded.id)) return present;
-    if (!posId(x.id)) continue;
+    if (!posId(x.id)) return cant(`every ruleset of ${show(app.owner, 40)}`);
     let d: unknown;
     try { d = (await api.read('GET /orgs/{org}/rulesets/{ruleset_id}', { org: app.owner, ruleset_id: x.id })).data; } catch (e) {
       if (isRateStop(e) || e instanceof GitHubAccessError || statusOf(e) === 401) throw e;
-      continue;
+      return cant(`the org ruleset ${x.id}`);
     }
     const rules = isObj(d) && Array.isArray(d.rules) ? d.rules : [];
     if (rules.some((r) => isObj(r) && isObj(r.parameters) && Array.isArray(r.parameters.workflows) && r.parameters.workflows.some((w) => isObj(w) && w.path === path))) return present;
@@ -151,7 +169,7 @@ export async function orgRuleNow(api: PhaseApi, rec: InstallRecord, app: RepoRef
 }
 
 export interface CentralOutcome {
-  /** The central PR that removed the record merged (or central is gone): the repo deletes and the local files may go on. */
+  /** The central PR that removed the record merged: the repo deletes and the local files may go on. Central not seen: false (can't tell). */
   merged: boolean;
   /** The central PR this run opened or updated. */
   pr?: { number: number; url: string };
@@ -163,6 +181,8 @@ export async function runCentral(o: {
   gh: Octokit; api: PhaseApi; plan: PhasePlan; rec: InstallRecord; centralRepoId: number; ownerType: 'User' | 'Organization';
   live: boolean; io: Prompter | undefined; interactive: boolean; report: Report;
   outcome: (what: string, manual: string | undefined, fn: () => Promise<DeleteOutcome>) => Promise<boolean>;
+  /** V6-R1 sec M1: the head pipegen last set the central uninstall branch to (the progress file), and where to save a new one. */
+  branch: { head: string | undefined; set: (sha: string) => void };
 }): Promise<CentralOutcome> {
   const { api, plan, rec, report } = o;
   const app: RepoRef = { owner: plan.app.owner, repo: plan.app.repo };
@@ -170,14 +190,23 @@ export async function runCentral(o: {
   const rp = recordPath(app.repo);
   const now = await centralNow(api, app, o.centralRepoId);
   if (now === null) {
-    report.skip(full, 'GitHub doesn\'t show it (deleted, or this login can\'t see it): nothing to change there');
-    return { merged: true, last: true, lastWhy: '', orgRule: null };
+    // V6-R1 (sec M4, spec M2): a 404 is "can't tell" (deleted, or no access now): never merged, never the last project, the local files stay
+    report.manual(full, `pipegen can't see ${full} now (deleted, or this login has no access to it), so it can't tell what of this project is left there`, `Check ${full} on GitHub (and the token's access to it), then run \`pipegen uninstall\` again.`);
+    return { merged: false, last: false, lastWhy: `pipegen can't see ${full}`, orgRule: null };
   }
-  const orgRule = await orgRuleNow(api, rec, { ...app, ownerType: o.ownerType });
+  const orgRule = await orgRuleNow(api, rec, { ...app, ownerType: o.ownerType }, plan.trust);
   const lp = await lastProjectNow(api, app, now, o.centralRepoId);
   if (now.pr?.merged === true && !now.entries.has(rp)) {
     report.done(`central pull request #${now.pr.number} in ${full}: merged; this project's install record is gone from ${full}`);
+    if (!lp.last) await joinedSince();
     return { merged: true, last: lp.last, lastWhy: lp.why, orgRule };
+  }
+  // V6-R1 sec M1 (as V5-R1 M2): the central uninstall branch is moved only while it is absent or where pipegen set it
+  const branchName = uninstallBranch({ owner: app.owner, repo: app.repo, repoId: 1 }, 'central');
+  const at = await branchHead(api, now.ref, branchName);
+  if (at !== null && at !== o.branch.head) {
+    report.fail(`central branch ${branchName} of ${full}`, `it has commits pipegen didn't make (or this uninstall didn't set it), so pipegen doesn't move it`, `Look at ${branchName} in ${full}, keep what you need, then delete it (gh api -X DELETE repos/${full}/git/refs/heads/${branchName}) and run \`pipegen uninstall\` again.`);
+    return { merged: false, ...(now.pr?.open === true ? { pr: { number: now.pr.number, url: now.pr.url } } : {}), last: lp.last, lastWhy: lp.why, orgRule };
   }
 
   // ---------- the central locks: only the last project, and only those the plan holds (full trust); BEFORE the central PR ----------
@@ -193,6 +222,8 @@ export async function runCentral(o: {
     for (const n of lockNames) report.skip(`${n} of ${full}`, why);
   } else if (locks !== undefined) {
     if (posId(locks.rulesetId)) {
+      // spec M1 (V6-R1): a name not typed is a leftover: the record's question lists it
+      const rulesetStep = `Delete the central ruleset ${locks.rulesetId} of ${full} by hand (Settings → Rules → Rulesets) if it is pipegen's, or run \`pipegen uninstall\` again and type its name.`;
       const target = { kind: 'central-ruleset' as const, id: locks.rulesetId, ...(locks.rulesetCreatedAt === undefined ? {} : { createdAt: locks.rulesetCreatedAt }) };
       await o.outcome(`central ruleset (id ${locks.rulesetId}) of ${full}`, `gh api -X DELETE repos/${full}/rulesets/${locks.rulesetId}`, async () => {
         const first = await api.deleteIfPipegens(target);
@@ -200,10 +231,10 @@ export async function runCentral(o: {
         // V-N2: a central ruleset with no creation date (or a typed-names run): its name typed now, for that very ruleset
         let t: TypedName | null;
         try { t = await api.confirm(target); } catch (e) {
-          if (e instanceof UninstallRefusal) return { status: 'kept', why: `${NOT_TYPED} (${show(e.message, 200)})` };
+          if (e instanceof UninstallRefusal) return { status: 'kept', why: `${NOT_TYPED} (${show(e.message, 200)})`, manual: rulesetStep };
           throw e;
         }
-        if (t === null) return { status: 'kept', why: NOT_TYPED };
+        if (t === null) return { status: 'kept', why: NOT_TYPED, manual: rulesetStep };
         return api.deleteIfPipegens(target, { typed: t });
       });
     }
@@ -280,13 +311,32 @@ export async function runCentral(o: {
     return { merged: !now.entries.has(rp), last: lp.last, lastWhy: lp.why, orgRule };
   }
   await api.setUninstallBranch('central', parent);
+  o.branch.set(parent);
   const text = [
     `pipegen uninstall: this pull request removes ${show(`${app.owner}/${app.repo}`, 140)} from ${full}.`, '', ...body.slice(0, 300), '',
+    ...(lp.last && !o.live ? [`This was the last project in ${full}, so pipegen took its central locks off. Merge it only while no other project uses ${full}; if one joined since, close this pull request and run \`pipegen uninstall\` again.`, ''] : []),
     'After you merge it, run `pipegen uninstall` again to finish (and, with --delete-repos, to delete the repos pipegen made).',
   ].join('\n');
   const pr = await api.openUninstallPr('central', { base: now.defaultBranch, title: `pipegen: uninstall ${show(rec.name, 100)}`, body: text });
   report.done(`central pull request #${pr.number} in ${full}: ${pr.opened ? 'opened' : 'updated'}`);
   return { merged: false, pr: { number: pr.number, url: pr.url }, last: lp.last, lastWhy: lp.why, orgRule };
+
+  /**
+   * V6-R1 sec M5: after the merge, another project is there, and the locks the record holds are gone (the central ruleset reads 404, or
+   * the CODEOWNERS pipegen created is gone): this project took them off as the last one, and the newcomer needs them back.
+   */
+  async function joinedSince(): Promise<void> {
+    const held = plan.trust === 'full' ? rec.central : undefined;
+    if (held === undefined || now === null) return;
+    let off = held.codeowners?.created === true && !now.entries.has(held.codeowners.path);
+    if (!off && posId(held.rulesetId)) {
+      try { await api.read('GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', { ...now.ref, ruleset_id: held.rulesetId }); } catch (e) {
+        if (isRateStop(e) || e instanceof GitHubAccessError || statusOf(e) === 401) throw e;
+        off = statusOf(e) === 404;
+      }
+    }
+    if (off) report.manual(`central locks of ${full}`, `pipegen took them off when this was the last project, but ${lp.why} now`, `Run \`pipegen finish\` in each of those projects to lock ${full} again (its central ruleset, CODEOWNERS block and Actions access).`);
+  }
 
   /** The central CODEOWNERS pipegen created → removed; one it edited → only pipegen's block out (V2); else a manual step. */
   async function codeowners(co: NonNullable<NonNullable<InstallRecord['central']>['codeowners']>): Promise<void> {
