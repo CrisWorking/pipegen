@@ -960,7 +960,7 @@ describe('mapCoverage (fix round 5)', () => {
     const { rows: over } = await run(5_001);
     // G17-R1: per-row service lookups go through a map built once, so 4 times the services (up to the cap) is about 4 times the
     // time when linear, 16 when quadratic. The over-cap run above does less work than the under-cap one by design.
-    await expectScaling('services under the cap', async (size) => (await run(size === 'small' ? 1_250 : 5_000)).ms, 9);
+    await expectScaling('services under the cap', async (size) => (await run(size === 'small' ? 1_250 : 5_000)).ms, 6);
     for (const s of ['s0', 's1', 's5000']) expect(row(over, 'push', 'lint', s)).toEqual(expect.objectContaining({ status: 'unknown', why: TOO_MANY }));
     // a run at the repo root covers every service whatever their number
     for (const s of ['s0', 's1', 's5000']) expect(row(over, 'push', 'sast', s).status).toBe('covered');
