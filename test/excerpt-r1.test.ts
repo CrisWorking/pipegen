@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { knownValueScrubber, redact } from '../src/ai/redact.js';
 import { SecretVault } from '../src/create/secrets.js';
-import { indentCols, keyMarkerFrom, unscannedExcerpt } from '../src/proof/excerpt.js';
+import { indentCols, keyMarkerFrom, MAX_LOG_CHARS, unscannedExcerpt } from '../src/proof/excerpt.js';
 import { repoFiles, root } from './helpers/repo-files.js';
 import { fake } from './helpers/secret-repo.js';
 import { expectScaling } from './helpers/scaling.js';
@@ -156,12 +156,15 @@ describe('excerpt fix round 1: linear time (M2)', () => {
   // G17: bounded as ratios (expectScaling), not wall-clock budgets, so a loaded machine doesn't fail them
   it('excerpt r1 M2: dropped lines full of `[` stay linear in the line length (p7)', async () => {
     // the same total size in short and in long lines: a linear check costs about the same, the old `/\[[^\]]*\]/` grows with the line
-    const brackets = (len: number) => { const line = `${'['.repeat(len - 1)}${ESC}`; return Array(Math.floor(MAX / 4 / (line.length + 1))).fill(line).join('\n'); };
+    const brackets = (len: number) => { const line = `${'['.repeat(len - 1)}${ESC}`; return Array(Math.floor(MAX / 2 / (line.length + 1))).fill(line).join('\n'); };
     const input = { small: brackets(256), big: brackets(4091) };
+    // G17: both inputs are over MAX_LOG_CHARS, so the head-cut path (only the last MAX_LOG_CHARS are read) is part of what is timed
+    expect(input.small.length).toBeGreaterThan(MAX_LOG_CHARS);
+    expect(input.big.length).toBeGreaterThan(MAX_LOG_CHARS);
     await expectScaling('brackets', (size) => { const t0 = performance.now(); unscannedExcerpt(input[size], (x) => x); return performance.now() - t0; }, 4);
   }, 120_000);
 
-  it('excerpt r1 M2: a tab staircase before SGR lines stays linear in the log size (p5)', () => {
+  it('excerpt r1 M2: a tab staircase before SGR lines stays linear in the log size (p5)', async () => {
     const staircase = (total: number) => {
       const stair: string[] = [];
       for (let i = 0, used = 0; ; i++) {
@@ -174,12 +177,18 @@ describe('excerpt fix round 1: linear time (M2)', () => {
     };
     // the walk is counted, not timed (G17): the step cap holds it to 32 steps a line; the uncapped walk (a match count) went over the
     // whole stack for every SGR line, about 300 million steps on this log
-    const log = staircase(MAX / 4);
+    // a filler head puts the log over the cap so the head-cut path runs too; the staircase itself sits in the part that is kept
+    const log = `${'filler\n'.repeat(20_000)}${staircase(MAX_LOG_CHARS)}`;
+    expect(log.length).toBeGreaterThan(MAX_LOG_CHARS);
     const counts = { walkSteps: 0 };
     unscannedExcerpt(log, (x) => x, { counts });
     const lines = log.split('\n').length;
     expect(counts.walkSteps, `${counts.walkSteps} steps for ${lines} lines`).toBeLessThanOrEqual(32 * lines);
     expect(counts.walkSteps).toBeGreaterThan(lines);
+    // and the time grows with the log (G17): an eighth of the cap against the whole cap, below it so no head is cut from either; linear
+    // is about 8 times, a walk over the whole stack for each SGR line about 64 times
+    const logs = { small: staircase(MAX_LOG_CHARS / 8), big: staircase(MAX_LOG_CHARS - 1) };
+    await expectScaling('staircase', (size) => { const t0 = performance.now(); unscannedExcerpt(logs[size], (x) => x); return performance.now() - t0; }, 16);
   }, 120_000);
 });
 
