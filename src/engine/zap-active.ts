@@ -23,6 +23,16 @@ export const ZAP_ACTIVE_COMMAND = Object.freeze(['zap.sh', '-autorun', `${ZAP_AC
  */
 export const ZAP_ACTIVE_POLICY = Object.freeze({ defaultStrength: 'medium', defaultThreshold: 'medium', maxRuleDurationInMins: 5, maxScanDurationInMins: 30 } as const);
 
+/** The plan's own time limits of the spider and the passive wait, in minutes (the active scan's is ZAP_ACTIVE_POLICY.maxScanDurationInMins). */
+export const ZAP_ACTIVE_SPIDER_MINUTES = 5;
+export const ZAP_ACTIVE_PASSIVE_MINUTES = 5;
+/** The image pull and the app start before the scan, at most (measured: under 2 minutes on a small app). */
+export const ZAP_ACTIVE_START_MINUTES = 5;
+/**
+ * G15a-R8 spec 1: the most one nightly AF run can take by the plan's own limits: spider, passive wait, active scan and the start (45). The job's
+ * timeout (dast-handoff.ts ZAP_ACTIVE_JOB_MINUTES, 60) only guards a hang; the estimate shows this ceiling beside its 5-minute headline.
+ */
+export const ZAP_ACTIVE_CEILING_MINUTES = ZAP_ACTIVE_SPIDER_MINUTES + ZAP_ACTIVE_PASSIVE_MINUTES + ZAP_ACTIVE_POLICY.maxScanDurationInMins + ZAP_ACTIVE_START_MINUTES;
 const T = `\${${ZAP_ACTIVE_TARGET_ENV}}`;
 /**
  * G15a-R7 sec 4: the context is the target's origin only. ZAP matches a context regex against the whole URL (Java regex). `\Q…\E` quotes the
@@ -57,10 +67,10 @@ export const ZAP_ACTIVE_PLAN = [
   '    parameters:',
   '      context: pipegen',
   `      url: "${T}"`,
-  '      maxDuration: 5',
+  `      maxDuration: ${ZAP_ACTIVE_SPIDER_MINUTES}`,
   '  - type: passiveScan-wait',
   '    parameters:',
-  '      maxDuration: 5',
+  `      maxDuration: ${ZAP_ACTIVE_PASSIVE_MINUTES}`,
   '  - type: activeScan',
   '    parameters:',
   '      context: pipegen',

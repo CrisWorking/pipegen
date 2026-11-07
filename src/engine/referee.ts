@@ -1229,6 +1229,9 @@ function judgeJob(fc: FileCtx, id: string, j: unknown): void {
   if (id === 'pipegen-verify' && fc.draft.capabilities.environments && envName !== SIGNING_ENVIRONMENT) {
     bad('permissions', `${where} must run in the environment ${SIGNING_ENVIRONMENT} (only deploys from the default branch pass it).`);
   }
+  // G15a-R8 sec m4: the sign job (the app's caller, or the inline keyless job) needs image-publish, else both start together after the gate and
+  // the image is pushed while the sign job finds no digest yet (the called job in the central file needs nothing: its caller does)
+  if (id === 'sign' && fc.file.repo !== 'central' && !needsList(j.needs).includes('image-publish')) bad('permissions', `${where}: the sign job must need image-publish, so it signs the digest the publish job uploaded and never runs beside it.`);
   if (signing && !SIGNING_JOBS.has(id)) bad('permissions', `${where} runs in ${SIGNING_ENVIRONMENT} (in any spelling), whose secrets only the sign and pipegen-verify jobs may get.`);
   else if (signing && envName !== SIGNING_ENVIRONMENT) bad('permissions', `${where} must name the environment exactly ${SIGNING_ENVIRONMENT}.`);
   if (caller) return;
@@ -1840,9 +1843,12 @@ function judgeUploadsPerFile(ex: Expectations, add: Add): void {
   }
 }
 
-/** A raw DAST hand-off artifact (job-rules.ts dastRawArtifact): `pipegen-out-<lane>-raw--<svc>`; group 1 the lane, group 2 the service slug (absent for a name with no service). */
-const RAW_HANDOFF_RE = /^pipegen-out-([a-z0-9](?:[a-z0-9-]*[a-z0-9])?)-raw(?:--([a-z0-9][a-z0-9-]*))?$/;
-const DAST_LANES: ReadonlySet<string> = new Set(['dast', ZAP_ACTIVE_LANE]);
+/**
+ * A raw DAST hand-off artifact (job-rules.ts dastRawArtifact): `pipegen-out-<lane>-raw--<svc>`; group 1 the lane, group 2 the service slug.
+ * G15a-R8 sec m2: anchored on the two lanes, so a service whose slug ends in -raw (`pipegen-out-image-archive--api-raw`) is no hand-off; no need
+ * id is dast-raw or zap-active-raw, and a scrubbed name (`pipegen-out-<lane>--…`) never starts with `pipegen-out-<lane>-raw--`.
+ */
+const RAW_HANDOFF_RE = /^pipegen-out-(dast|zap-active)-raw--([a-z0-9][a-z0-9-]*)$/;
 /**
  * G15a-R7 sec 1: code scanning is sent only what a scrub wrote. In every job, each upload-sarif `sarif_file` is the `out` of a recognised scrub
  * step of a job this job needs (in the same file), whose job also uploads that scrub's artifact; and this job downloads that artifact, under its
@@ -1860,10 +1866,14 @@ function judgeSarifUploads(ex: Expectations, add: Add): void {
     r.judged.forEach((x, i) => {
       if (x.kind !== 'download-artifact') return;
       const name = x.step.with?.name;
-      const m = typeof name === 'string' ? RAW_HANDOFF_RE.exec(name) : null;
+      // G15a-R8 sec m1: a download with no name fetches every artifact of the run (the raw hand-offs too): each download names its artifact and folder
+      if (typeof name !== 'string' || name === '' || typeof x.step.with?.path !== 'string' || x.step.with.path === '') {
+        add(path, 'permissions', `${where}, step ${i + 1}, is a download-artifact step that names no artifact and folder (name and path); without a name it downloads every artifact of the run, the raw hand-offs too.`, undefined, repo);
+        return;
+      }
+      const m = RAW_HANDOFF_RE.exec(name);
       if (m === null) return;
-      const own = m[2] !== undefined && DAST_LANES.has(m[1] as string) && r.id === `${m[1]}--${m[2]}`;
-      if (!own) add(path, 'permissions', `${where}, step ${i + 1}, downloads the raw hand-off ${show(String(name))}, which only its own scrub job ${m[2] === undefined ? '' : show(`${m[1]}--${m[2]}`)} may read: the raw result leaves the run job only to be scrubbed.`, undefined, repo);
+      if (r.id !== `${m[1]}--${m[2]}`) add(path, 'permissions', `${where}, step ${i + 1}, downloads the raw hand-off ${show(name)}, which only its own scrub job ${show(`${m[1]}--${m[2]}`)} may read: the raw result leaves the run job only to be scrubbed.`, undefined, repo);
     });
     r.judged.forEach((x, i) => {
       if (x.kind !== 'upload-sarif') return;

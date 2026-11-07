@@ -26,6 +26,7 @@ import { isOutputLimit } from '../util/output-limit.js';
 import { hostPlace } from '../util/local-host.js';
 import { packageDataPath } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
+import { ZAP_ACTIVE_CEILING_MINUTES } from '../engine/zap-active.js';
 
 /** How the basis line starts when the activity count is a lower bound (Activity.capped); the audit report reads it. */
 export const ACTIVITY_CAPPED_PREFIX = 'Activity: at least';
@@ -80,10 +81,11 @@ const JOB_MINUTES: Readonly<Record<string, number>> = Object.freeze({
   'workflow-lint': 1, 'dockerfile-lint': 1, duplication: 1, 'dependency-review': 1, licences: 1, scorecard: 1,
   'api-dast': 3,
   // G15a-R7 spec 1: the nightly jobs of G15a. The full-history secrets scan reads every commit (2, like a code scan); zizmor online, the scrub
-  // jobs and the code-scanning uploads are quick jobs. The ZAP AF active scan took about 2 minutes against a one-page app on the pinned image
-  // (G15a report, round 6), but its plan may run 40 minutes and its job is allowed 60 (dast-handoff.ts ZAP_ACTIVE_JOB_MINUTES): counted at that limit.
+  // jobs and the code-scanning uploads are quick jobs. G15a-R8 spec 1: the ZAP AF active scan took about 2 minutes against a small app on the
+  // pinned image; with this table's 50% margin and the start it counts 5 (the headline: monthly, setup and the proof's cap). Its plan's own limits
+  // allow up to ZAP_ACTIVE_CEILING_MINUTES (45), shown beside it in a basis line; the job's 60-minute timeout only guards a hang.
   'secrets-history': 2, 'workflow-lint-online': 1, 'dast-scrub': 1, 'code-scanning': 1,
-  'zap-active': 60,
+  'zap-active': 5,
 });
 /** Any other category (iac, sbom, signing, attestation, deploy-verify, anything new): not measured in S5. */
 const UNKNOWN_JOB_MINUTES = 2;
@@ -361,7 +363,8 @@ export function estimate(p: RepoProfile, jobs: JobCategories, variants: number, 
 
   if (jobs.nightly?.includes('scorecard')) basis.push('Scorecard runs weekly; counted nightly (leans high).');
   if (jobs.nightly?.includes('zap-active')) {
-    basis.push(`The nightly ZAP active scan of each web app is counted at its job limit, ${jobMinutes('zap-active')} min every night (it took about 2 min against a small app; a bigger app takes longer, up to that limit).`);
+    const extra = (ZAP_ACTIVE_CEILING_MINUTES - jobMinutes('zap-active')) * NIGHTS_PER_MONTH;
+    basis.push(`The nightly ZAP active scan of each web app is counted at about ${jobMinutes('zap-active')} min a night (it took about 2 min on a small app); its plan lets a big app take up to ${ZAP_ACTIVE_CEILING_MINUTES} min, which is up to ${extra.toLocaleString('en-US')} more minutes a month for each web app.`);
   }
   if (jobs.nightly?.includes('secrets-history')) basis.push('The nightly scans also include a secrets scan of the whole history (2 min) and the uploads to code scanning (1 min each).');
 

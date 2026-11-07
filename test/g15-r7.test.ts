@@ -312,12 +312,13 @@ describe('G15a-R7 sec 4: the ZAP AF context is the target\'s origin only', () =>
 
 describe('G15a-R7 spec 1: the monthly-minutes estimate counts the new nightly jobs', () => {
   const needs = () => floorNeeds(profileOf([web()]), CAPS);
-  it('estimate: the nightly history scan, workflow-lint-online, the ZAP AF pair at its 60-minute limit, the scrub and upload jobs and the weekly Scorecard are counted; without code scanning only the online lint is', () => {
+  it('estimate: the nightly history scan, workflow-lint-online, the ZAP AF pair, the scrub and upload jobs and the weekly Scorecard are counted; without code scanning only the online lint is', () => {
     const on = jobCategories(needs(), { codeSecurity: true }).nightly;
     for (const c of ['secrets-history', 'workflow-lint-online', 'zap-active', 'dast-scrub', 'code-scanning', 'scorecard']) expect(on, c).toContain(c);
     expect(on.filter((c) => c === 'code-scanning')).toHaveLength(3);
     expect(on.filter((c) => c === 'dast-scrub')).toHaveLength(2);
-    expect(jobMinutes('zap-active')).toBe(ZAP_ACTIVE_JOB_MINUTES);
+    // (G15a-R8 spec 1: the headline is 5 a night; the job's 60-minute timeout only guards a hang: test/g15-r8.test.ts)
+    expect(jobMinutes('zap-active')).toBe(5);
     expect(ZAP_ACTIVE_JOB_MINUTES).toBe(60);
     expect(jobCounts(needs(), { codeSecurity: true }).nightly).toBe(on.length);
     const off = jobCategories(needs(), { codeSecurity: false }).nightly;
@@ -327,14 +328,7 @@ describe('G15a-R7 spec 1: the monthly-minutes estimate counts the new nightly jo
     expect(jobCategories(needs()).nightly).toEqual(on);
   });
 
-  it('estimate: the AF lane is priced at its job limit, every night, with a basis line that says so', () => {
-    const jobs = jobCategories(needs(), { codeSecurity: true });
-    const est = estimate(profileOf([web()], { private: true, plan: 'free' }), jobs, 1, { pushes: 0, prs: 0, capped: false }, null);
-    expect(est.basis.join('\n')).toMatch(/ZAP active scan[^\n]*60 min/);
-    const without = { ...jobs, nightly: jobs.nightly.filter((c) => c !== 'zap-active') };
-    const less = estimate(profileOf([web()], { private: true, plan: 'free' }), without, 1, { pushes: 0, prs: 0, capped: false }, null);
-    expect(est.monthlyMinutes - less.monthlyMinutes).toBe(30 * 60);
-  });
+  // (G15a-R8 spec 1 replaced the AF lane's pricing test: test/g15-r8.test.ts "the headline is 5 a night …")
 });
 
 // ---------- spec 3, 6, 7 ----------

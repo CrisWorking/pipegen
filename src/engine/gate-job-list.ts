@@ -19,9 +19,10 @@ export const PIPEGEN_JOB_CATEGORIES: ReadonlySet<string> = new Set(['gate', 'sig
  */
 export const resultFormat = (format: OutputFormat): Exclude<OutputFormat, 'json'> => (format === 'json' ? 'sarif' : format);
 /** Whether a tool's output format is one the gate reads for a need of this category (B7): SARIF, and ZAP's JSON for DAST. */
-export const readableFormat = (category: string, format: OutputFormat): boolean => format === 'sarif' || (category === 'dast' && format === 'zap-json');
+// (G15a-R8 spec 5: both read a tool's raw output format through resultFormat themselves, so a caller can not forget the mapping)
+export const readableFormat = (category: string, format: OutputFormat): boolean => resultFormat(format) === 'sarif' || (category === 'dast' && format === 'zap-json');
 /** Formats that are findings files (they go through the scrub and are compared with the base); `none` and `junit` are judged by job status (ruling B2). */
-export const isResultFormat = (format: OutputFormat): boolean => format === 'sarif' || format === 'zap-json';
+export const isResultFormat = (format: OutputFormat): boolean => resultFormat(format) === 'sarif' || format === 'zap-json';
 
 /**
  * One entry of the gate's job list. `service` is the service's slug, `job` the id of the job that runs the check (its

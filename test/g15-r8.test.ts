@@ -152,8 +152,8 @@ describe('G15a-R8 spec 1: the ZAP AF scan at 5 minutes a night, its ceiling besi
 describe('G15a-R8 spec 2, 5', () => {
   it('render-short: the cost line says "then N minutes a month"', () => {
     const r = freePrivateReport([]);
-    const doc = buildShortDoc(r, ctxFor({ knownValues: [], now: () => Date.parse('2026-10-27T12:00:00Z') }, r));
-    const line = doc.terminal.join('\n').replace(/\n {2,}/g, ' ').split('\n').find((l) => l.startsWith('Full setup cost:')) as string;
+    const doc = buildShortDoc(r, ctxFor('terminal', { knownValues: [], now: () => Date.parse('2026-10-27T12:00:00Z') }, false, r.profile.services));
+    const line = (doc.terminal ?? []).join('\n').replace(/\n {2,}/g, ' ').split('\n').find((l) => l.startsWith('Full setup cost:')) as string;
     expect(line).toMatch(/then [\d,]+( or more)? minutes a month/);
   });
 

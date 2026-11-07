@@ -202,15 +202,16 @@ function attestJob(plan: SigningPlan & { mode: SignMode }, platform: PlatformAct
   for (const i of plan.images) {
     if (!i.repo.startsWith(`${SIGN_REGISTRY}/`)) throw new RenderError(`The image ${show(i.repo)} is not on ${SIGN_REGISTRY}: the attest job stores the attestation with the workflow token, which logs in to ${SIGN_REGISTRY} only.`);
   }
-  const steps = plan.images.flatMap((i) => {
+  // G15a-R8 sec m3: every download first (as the cosign job), then per image its digest step and its attest: a download after a digest
+  // step (a run step) would break the order rule, so a plan of two images could not be delivered
+  const downloads = plan.images.map((i) => {
     const name = imageDigestArtifact(i.service);
-    const digest = renderAttestDigestStep(i);
-    return [
-      renderPlatformStep('download-artifact', platform, { name, path: `\${{ runner.temp }}/pipegen-out/${name}` }),
-      digest,
-      renderPlatformStep('attest', platform, { 'subject-name': i.repo, 'subject-digest': `\${{ steps.${digest.id as string}.outputs.digest }}` }),
-    ];
+    return renderPlatformStep('download-artifact', platform, { name, path: `\${{ runner.temp }}/pipegen-out/${name}` });
   });
+  const steps = [...downloads, ...plan.images.flatMap((i) => {
+    const digest = renderAttestDigestStep(i);
+    return [digest, renderPlatformStep('attest', platform, { 'subject-name': i.repo, 'subject-digest': `\${{ steps.${digest.id as string}.outputs.digest }}` })];
+  })];
   return { name: 'pipegen sign', 'runs-on': SIGN_RUNNER, 'timeout-minutes': SIGN_JOB_MINUTES, permissions: signPermissions('attest'), 'cache-mode': 'none', steps };
 }
 
