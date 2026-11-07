@@ -4,7 +4,8 @@
 // container env (PIPEGEN_ZAP_TARGET, the plan's ${…}), never as a word. Nightly only: never offered for a need, and the renderer refuses it
 // outside the nightly lane. In the nightly file it runs in its own pair (zap-active-run--<svc>, zap-active--<svc>), like nuclei's; the scrub
 // turns the real AF report (test/fixtures/zap/af-active-*.json) into SARIF, and code-scanning-dast uploads it. Reported, never gated.
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { parseDocument } from 'yaml';
@@ -12,11 +13,12 @@ import { readScrubbed, scrubBytes } from '../gate/src/scrub.js';
 import { parseZapJsonText, ZAP_AF_TOOL, ZAP_TOOL } from '../gate/src/zap.js';
 import { GATE_VIEW } from '../gate/src/generated/gate-view.js';
 import { RenderError } from '../src/engine/render-error.js';
-import { renderStep } from '../src/engine/render-step.js';
-import { reviewedFor } from '../src/engine/reviewed.js';
+import { renderStep, renderStepWith, validateSpec } from '../src/engine/render-step.js';
+import { renderCliTool } from '../src/engine/render-cli.js';
+import { argvPolicyProblems, loadReviewed, reviewedFor, type ReviewedEntry } from '../src/engine/reviewed.js';
 import { ARGV_POLICIES } from '../src/engine/tool-flags.js';
-import { ZAP_ACTIVE_COMMAND, ZAP_ACTIVE_PLAN, ZAP_ACTIVE_TARGET_ENV } from '../src/engine/zap-active.js';
-import { nightlyDastSpec, zapActiveSpec, ZAP_ACTIVE_LANE } from '../src/engine/dast-handoff.js';
+import { ZAP_ACTIVE_COMMAND, ZAP_ACTIVE_PLAN, ZAP_ACTIVE_POLICY, ZAP_ACTIVE_TARGET_ENV } from '../src/engine/zap-active.js';
+import { nightlyDastSpec, zapActiveSpec, ZAP_ACTIVE_JOB_MINUTES, ZAP_ACTIVE_LANE } from '../src/engine/dast-handoff.js';
 import {
   DAST_HANDOFF_STEP_ID, DAST_UPLOAD_JOB, dastCheckStepId, dastNightlyCategory, dastRawArtifact, dastResultArtifact, dastRunJobId, NIGHTLY_WORKFLOW,
 } from '../src/engine/job-rules.js';
@@ -270,5 +272,73 @@ describe('G15a round 6: the nightly ZAP AF pair', () => {
     // and the referee does not recognise it as the merge layer's DAST step
     const ok = world();
     expect(shown(await judge(ok.fs, x.draft))).toMatch(/runs "zap-af-active", which is pipegen's own nightly scan and never a check of the pipeline/);
+  });
+});
+
+describe('G15a round 6: the mutation survivors (A2, A3, A5, A8, A12, A13, A15, A16, A29, A30) and the AF job timeout', () => {
+  const PROF = profileOf([web()]);
+  const SPEC = zapActiveSpec(MERGE_SPEC, AF);
+  const hadolint = REVIEWED.find((t) => t.id === 'hadolint') as ReviewedTool;
+
+  it('render: each nightly-only guard holds on its own: the renderer refuses outside the nightly lane, validateSpec refuses the lane for any other entry or need (A2, A3)', () => {
+    // the renderer, reached without validateSpec
+    const hooks = {} as Parameters<typeof renderCliTool>[0]['hooks'];
+    expect(() => renderCliTool({ spec: SPEC, tool: AF, service: PROF.services[0], ctx: { profile: PROF, targets: { url: URL } }, hooks, options: {} })).toThrow(/runs only in pipegen's own nightly scan/);
+    // validateSpec alone
+    const lane = /runs only as pipegen's own nightly ZAP active scan/;
+    expect(validateSpec(SPEC, AF, { profile: PROF, nightly: true })).toEqual([]);
+    expect(validateSpec(SPEC, AF, { profile: PROF }).join(' ')).toMatch(lane);
+    expect(validateSpec({ ...SPEC, needId: 'dast' }, AF, { profile: PROF, nightly: true }).join(' ')).toMatch(lane);
+    expect(validateSpec({ ...SPEC, tool: NUCLEI.candidate, output: NUCLEI.step.output }, NUCLEI, { profile: PROF, nightly: true }).join(' ')).toMatch(lane);
+  });
+
+  it('render: an env slot is refused on any step but a docker DAST step in a fresh work folder, and for any value but the local URL (A5, A29)', () => {
+    const lint = { needId: 'dockerfile-lint', service: 'app', tool: hadolint.candidate, choices: {}, output: hadolint.step.output } as unknown as StepSpec;
+    const withEnv = { ...ARGV_POLICIES, hadolint: { ...ARGV_POLICIES.hadolint, envSlots: { PIPEGEN_X: 'local-url' } } } as typeof ARGV_POLICIES;
+    expect(() => renderStepWith(lint, hadolint, P, { profile: PROF, targets: { url: URL } }, { policies: withEnv })).toThrow(/passes a slot in the container env/);
+    const imageSlot = { ...ARGV_POLICIES, 'zap-af-active': { ...ARGV_POLICIES['zap-af-active'], envSlots: { [ZAP_ACTIVE_TARGET_ENV]: 'image-digest' } } } as unknown as typeof ARGV_POLICIES;
+    expect(() => renderStepWith(SPEC, AF, P, { profile: PROF, targets: { url: URL, image: `ghcr.io/o/app@sha256:${'a'.repeat(64)}` }, nightly: true }, { policies: imageSlot })).toThrow(/passes a slot in the container env/);
+  });
+
+  it('reviewed: an AF entry without -silent is refused by its argv policy and by the loader\'s ZAP rule, each on its own (A8, A30)', () => {
+    const entry = { ...AF, step: { ...AF.step, cli: { ...AF.step.cli, command: ['zap.sh', '-cmd'] } }, fixedInputs: { ...AF.fixedInputs, args: ['-cmd'] } } as unknown as ReviewedEntry;
+    expect(argvPolicyProblems(entry).map((x) => x.message).join(' ')).toMatch(/-silent/);
+    // the loader, with a policy that would let it through: its ZAP rule still refuses
+    const dir = mkdtempSync(join(tmpdir(), 'pg-zap-'));
+    const file = join(dir, 'reviewed-tools.yml');
+    const text = readFileSync(join(import.meta.dirname, '..', 'data', 'reviewed-tools.yml'), 'utf8');
+    const at = text.indexOf('  - id: zap-af-active');
+    const edited = text.slice(0, at) + text.slice(at).replace('command: ["zap.sh", "-cmd", "-silent"]', 'command: ["zap.sh", "-cmd"]').replace('args: ["-cmd", "-silent"]', 'args: ["-cmd"]');
+    writeFileSync(file, edited);
+    const loose = { ...ARGV_POLICIES, 'zap-af-active': { ...ARGV_POLICIES['zap-af-active'], required: { cmd: 'true' } } } as typeof ARGV_POLICIES;
+    expect(() => loadReviewed(file, { argvPolicies: loose })).toThrow(/the ZAP AF entry must pass -silent/);
+  });
+
+  it('dast-handoff: the AF spec drops every choice of the merge check (A12)', () => {
+    expect(zapActiveSpec({ ...MERGE_SPEC, choices: { x: 'y' } } as StepSpec, AF).choices).toEqual({});
+  });
+
+  it('referee: the AF run job in the merge file under its own id, or its hash check in nuclei\'s scrub job → refused with their own reasons (A13, A15, A16)', async () => {
+    const { a, fs } = world();
+    const merge = fs.find((f) => f.path === '.github/workflows/pipegen.yml') as CreatedFile;
+    const d = parseDocument(merge.content);
+    d.setIn(['jobs', 'zap-active-run--app'], d.createNode(JSON.parse(JSON.stringify(a.nightly['zap-active-run--app']))));
+    const out = shown(await judge(withFile(fs, { ...merge, content: d.toString({ lineWidth: 0 }) }), a.draft));
+    expect(out).toMatch(/is the nightly ZAP active scan's, so it runs only in the nightly file/);
+    expect(out).toMatch(/belongs to the DAST run job dast-run--app only/);
+    const night = nightlyOf(fs);
+    const check = (a.nightly['zap-active--app'] as Job).steps.find((x) => x.id === dastCheckStepId('app', ZAP_ACTIVE_LANE));
+    const inNuclei = editJob(night, 'dast--app', (j) => { j.steps.splice(1, 0, JSON.parse(JSON.stringify(check))); j.needs = ['dast-run--app', 'zap-active-run--app']; });
+    expect(shown(await judge(withFile(fs, inNuclei), a.draft))).toMatch(/the hash check of the raw DAST result sits only in the job zap-active--app/);
+  });
+
+  it('assemble: the AF run job has the time its plan can take (spider, passive wait and active scan at their limits) and more', () => {
+    const { a } = world();
+    const budget = 5 + 5 + ZAP_ACTIVE_POLICY.maxScanDurationInMins;
+    expect(ZAP_ACTIVE_JOB_MINUTES).toBeGreaterThanOrEqual(budget + 15);
+    expect((a.nightly['zap-active-run--app'] as Job)['timeout-minutes']).toBe(ZAP_ACTIVE_JOB_MINUTES);
+    // the other jobs keep the default
+    expect((a.nightly['dast-run--app'] as Job)['timeout-minutes']).toBe(30);
+    expect((a.nightly['zap-active--app'] as Job)['timeout-minutes']).toBe(30);
   });
 });
