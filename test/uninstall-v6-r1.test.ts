@@ -120,6 +120,22 @@ describe('V6-R1: token mode prints gh repo delete only after the gates App mode 
     await afterRun1(q4);
     const r4 = await run(q4, sampleRecord(q4), term(), { deleteRepos: true, canDeleteRepos: false });
     expect(all(q4, r4)).not.toMatch(/gh repo delete o\/pipegen-proof-shop/);
+    // ... nor in the step for a scratch item pipegen couldn't delete
+    const q4f = world();
+    await afterRun1(q4f);
+    q4f.runs.add(31);
+    q4f.fail = (route) => (route === 'DELETE /repos/{owner}/{repo}/actions/runs/{run_id}' ? 500 : undefined);
+    const r4f = await run(q4f, sampleRecord(q4f), term(), { deleteRepos: true, canDeleteRepos: false });
+    expect(r4f.failed.some((f) => /run 31/.test(f.what))).toBe(true);
+    expect(all(q4f, r4f)).not.toMatch(/gh repo delete o\/pipegen-proof-shop/);
+    // another repo of that name (another GitHub id) after the preview: no command
+    const q4e = world();
+    await afterRun1(q4e);
+    const t4e = term();
+    const go4e = t4e.p.confirm;
+    t4e.p.confirm = async (m, d) => { if (m.startsWith('Go ahead')) q4e.scratch!.id = 987_654; return go4e(m, d); };
+    const r4e = await run(q4e, sampleRecord(q4e, { scratch: { repoId: q4e.scratch!.id, createdByPipegen: true } }), t4e, { deleteRepos: true, canDeleteRepos: false });
+    expect(r4e.lines.join('\n')).not.toMatch(/gh repo delete o\/pipegen-proof-shop/);
     // the recorded id equal to GitHub's: the command
     const q4b = world();
     await afterRun1(q4b);
