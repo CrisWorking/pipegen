@@ -1986,6 +1986,7 @@ var ZAP_ACTIVE_REPORT = "zap-active.json";
 var ZAP_ACTIVE_COMMAND = Object.freeze(["zap.sh", "-autorun", `${ZAP_ACTIVE_WORK}/${ZAP_ACTIVE_PLAN_FILE}`, "-cmd", "-silent"]);
 var ZAP_ACTIVE_POLICY = Object.freeze({ defaultStrength: "medium", defaultThreshold: "medium", maxRuleDurationInMins: 5, maxScanDurationInMins: 30 });
 var T = `\${${ZAP_ACTIVE_TARGET_ENV}}`;
+var ORIGIN = `\\Q${T}\\E(?:/.*)?`;
 var ZAP_ACTIVE_PLAN = [
   "env:",
   "  contexts:",
@@ -1993,7 +1994,9 @@ var ZAP_ACTIVE_PLAN = [
   "      urls:",
   `        - "${T}"`,
   "      includePaths:",
-  `        - "${T}.*"`,
+  `        - '${ORIGIN}'`,
+  "      excludePaths:",
+  `        - '(?!${ORIGIN}$).*'`,
   "  parameters:",
   "    failOnError: true",
   "    failOnWarning: false",
@@ -4547,7 +4550,6 @@ var ZAP_TOOL = "zap-baseline";
 var ZAP_AF_TOOL = "zap-af-active";
 var ZAP_TOOLS = /* @__PURE__ */ new Set([ZAP_TOOL, ZAP_AF_TOOL]);
 var ZAP_JSON_VERIFIED = true;
-var UNVERIFIED_NOTE = "zap-json parsing is unverified against a real zap-baseline -J report";
 var MAX_PLUGIN_ID = 256;
 var MAX_URL_PATH = 2048;
 var MAX_SITES = 1e3;
@@ -4620,7 +4622,6 @@ function parseZapJson(json, toolId, opts = {}) {
         }
       }
     }
-    if (!ZAP_JSON_VERIFIED) notes.push(UNVERIFIED_NOTE);
     if (unknownRisk > 0) notes.push(`${unknownRisk} alert(s) had an unknown riskcode and are counted as high`);
     return findings;
   });
