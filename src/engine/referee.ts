@@ -185,8 +185,9 @@ export const JOB_STEP_POLICY: Readonly<Record<string, readonly StepKind[]>> = Ob
   'base-scan': ['harden', 'checkout', 'setup', 'stage', 'tool', 'scrub', 'upload-artifact'],
   // no checkout: this job holds PIPEGEN_FP_KEY and reads only the API and artifacts (C3 review m9, like the gate job's S21)
   'baseline-check': ['harden', 'download-artifact', 'gate'],
-  // G7 (B3 a): the publish digest step and the upload of the digest folder, after the build (job-rules.ts publishTailAt)
-  'image-publish': ['harden', 'checkout', 'setup-buildx', 'docker-login', 'build-push', 'publish-digest', 'upload-artifact'],
+  // G7 (B3 a): the publish digest step and the upload of the digest folder, after the build (job-rules.ts publishTailAt). G15a-R11 r5-4: no
+  // setup-buildx (releaseJobs builds on the default docker driver; a docker-container builder would be a design change, with the order rule)
+  'image-publish': ['harden', 'checkout', 'docker-login', 'build-push', 'publish-digest', 'upload-artifact'],
   // G2: the cosign sign steps of the draft's signing plan (B3 b); attest mode signs with the reviewed actions/attest after pipegen's digest
   // step (a sign-kind step, G15a). G15a (carry C11): no checkout and no login action (cosign and the digest step log in themselves)
   sign: ['harden', 'download-artifact', 'attest', 'sign'],
@@ -681,7 +682,7 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
   for (const service of publishedImageServices(draft.profile, draft.capabilities)) {
     try {
       const digest = [renderDigestStep(service)];
-      const published = [renderPublishDigestStep(service)];
+      const published = [renderPublishDigestStep(service, publishedImageRepo(draft.profile.owner, draft.profile.repo, service))];
       record(`${DEPLOY_DIGEST_SOURCE}:${slug(service)}`, [digest, digest], false, true, false, undefined, undefined);
       record(`${PUBLISH_DIGEST_SOURCE}:${slug(service)}`, [published, published], false, true, false, undefined, undefined);
     } catch (e) { if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e; notes.push(`The digest steps of ${show(service)} can not be rendered, so no step may claim to be them: ${safeText(e.message, 200)}`); }
@@ -1586,13 +1587,17 @@ function judgeImageHandoff(fc: FileCtx, id: string, where: string, j: Obj, judge
     const at = `${where}, step ${i + 1}`;
     const w = x.step.with ?? {};
     if (id === 'image-publish') {
-      const pubSvc = fc.draft.profile.services.find((svc) => isRootPath(svc.path) && svc.dockerfile !== undefined && svc.dockerfile !== '' && w.file === svc.dockerfile);
+      // G15a-R11 r5-2: bound to the PUBLISHED service (publishedImageServices: exactly one in v0.2), never to any root service whose
+      // Dockerfile the build names: its Dockerfile, and (G15a-R10 r4-3) exactly its image, the one the sign job signs (the renderer's helper)
+      const published = publishedImageServices(fc.draft.profile, fc.draft.capabilities);
+      const pubSvc = published.length === 1 ? fc.draft.profile.services.find((svc) => svc.name === published[0]) : undefined;
       if (pubSvc === undefined) {
-        bad('template', `${at}: build-push in image-publish builds the Dockerfile of a service at the repository root (its build context), not ${show(String(w.file ?? '(none)'))}.`);
+        bad('template', `${at}: build-push in image-publish builds the Dockerfile of a service at the repository root that pipegen publishes, and this plan publishes ${published.length === 0 ? 'none' : 'more than one'}.`);
       } else {
-        // G15a-R10 r4-3: the tag is exactly the image the plan signs (the renderer's helper), never another repository, tag or registry
-        const want = `${publishedImageRepo(fc.draft.profile.owner, fc.draft.profile.repo, pubSvc.name)}:${PUBLISH_TAG}`;
-        if (w.tags !== want) bad('template', `${at}: image-publish tags must be exactly ${safeText(want, 200)}, the image the sign job signs.`);
+        if (w.file !== pubSvc.dockerfile) bad('template', `${at}: build-push in image-publish builds the Dockerfile of a service at the repository root that pipegen publishes (here ${show(String(pubSvc.dockerfile))} of ${show(pubSvc.name)}), not ${show(String(w.file ?? '(none)'))}.`);
+        let want = '';
+        try { want = `${publishedImageRepo(fc.draft.profile.owner, fc.draft.profile.repo, pubSvc.name)}:${PUBLISH_TAG}`; } catch (e) { if (!(e instanceof RenderError)) throw e; }
+        if (want === '' || w.tags !== want) bad('template', `${at}: image-publish tags must be exactly ${want === '' ? 'the published image' : safeText(want, 200)}, the image the sign job signs.`);
       }
       // G15a-R10 r4-2: a pushing build hands its digest on: the digest step and its upload follow it, as the job's last two steps
       if (w.push !== 'false' && !(judged[i + 1]?.kind === 'publish-digest' && judged[i + 2]?.kind === 'upload-artifact' && i + 2 === judged.length - 1)) {
@@ -2564,6 +2569,9 @@ function judgeAction(fc: FileCtx, js: Obj): void {
   // G2-R1 m1: the signing, verification and image hand-off steps are held to their jobs, which a composite action has none of
   judged.forEach((x, i) => {
     if (x.kind === 'sign' || x.kind === 'verify' || x.kind === 'image-archive' || x.kind === 'image-check') bad('permissions', `In the action, step ${i + 1}: a ${x.kind} step runs only in its own job, never in a composite action.`);
+    // G15a-R11 r5-3: nor a registry step (a build, a login, a builder, the publish digest step, an attestation): the registry rules read a
+    // job's own steps, so a composite (central or local) would hide a push from them; pipegen writes none of these in a composite
+    else if (x.kind === 'build-push' || x.entryId === BUILD_PUSH_ID || x.kind === 'docker-login' || x.kind === 'setup-buildx' || x.kind === 'publish-digest' || x.kind === 'attest') bad('permissions', `In the action, step ${i + 1}: a ${x.kind === 'unrecognised' ? 'build-push' : x.kind} step runs only in its own job, never in a composite action.`);
   });
 }
 

@@ -70,7 +70,7 @@ function imagePublish(): Job {
     'runs-on': 'ubuntu-24.04', 'timeout-minutes': 30, permissions: { contents: 'read', packages: 'write' }, 'cache-mode': 'none',
     steps: [egressStepFor(['dockerhub', 'ghcr'], { [['user', 'Sec' + 'ret'].join('')]: false, dockerNetworks: true, job: 'image-publish' } as unknown as Parameters<typeof egressStepFor>[1]), ...renderJobPrelude({}, p).steps,
       { id: BUILD_PUSH_STEP_ID, ...renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: `ghcr.io/o/r-app:${PUBLISH_TAG}` }, { push: 'true' }) },
-      renderPublishDigestStep('app'), { ...renderPlatformStep('upload-artifact', p, { name: artifact, path: `\${{ runner.temp }}/pipegen-out/${artifact}` }), name: 'Upload the image digest of app' }],
+      renderPublishDigestStep('app', 'ghcr.io/o/r-app'), { ...renderPlatformStep('upload-artifact', p, { name: artifact, path: `\${{ runner.temp }}/pipegen-out/${artifact}` }), name: 'Upload the image digest of app' }],
   };
 }
 /** A key-env private draft (environments with the proven branch policy) whose app has a Dockerfile; the needs of the plain profile. */

@@ -457,7 +457,7 @@ export function releaseJobs(draft: PipelineDraft, deps: { platform: PlatformActi
       ...renderJobPrelude({}, deps.platform).steps,
       renderPlatformStep('docker-login', deps.platform, { username: '${{ github.actor }}', password: '${{ secrets.GITHUB_TOKEN }}' }, { registry: 'ghcr.io' }),
       { id: BUILD_PUSH_STEP_ID, ...renderPlatformStep('build-push', deps.platform, { file: svc.dockerfile, tags: `${repo}:${PUBLISH_TAG}` }, { push: 'true' }) },
-      renderPublishDigestStep(name),
+      renderPublishDigestStep(name, repo),
       { ...renderPlatformStep('upload-artifact', deps.platform, { name: artifact, path: `\${{ runner.temp }}/pipegen-out/${artifact}` }), name: `Upload the image digest of ${name}` },
     ];
   } catch (e) { if (e instanceof RenderError) return fail(e.message); throw e; }

@@ -295,7 +295,7 @@ const signedDraft = { ...pubDraft, signing: KEYLESS };
 const PUB_TAG = `${publishedImageRepo(pubDraft.profile.owner, pubDraft.profile.repo, 'app')}:${PUBLISH_TAG}`;
 const publishTail = (): RenderedStep[] => {
   const name = imageDigestArtifact('app');
-  return [renderPublishDigestStep('app'), { ...renderPlatformStep('upload-artifact', p, { name, path: `\${{ runner.temp }}/pipegen-out/${name}` }), name: 'Upload the image digest of app' }];
+  return [renderPublishDigestStep('app', publishedImageRepo(pubDraft.profile.owner, pubDraft.profile.repo, 'app')), { ...renderPlatformStep('upload-artifact', p, { name, path: `\${{ runner.temp }}/pipegen-out/${name}` }), name: 'Upload the image digest of app' }];
 };
 const keylessSign = (): Job => job([digestDownload(), ...renderSignSteps(COSIGN, 'keyless', IMG)], { permissions: { contents: 'read', [OIDC]: 'write', packages: 'write' }, if: DEPLOY_PUSH_IF, needs: ['gate', 'image-publish'] });
 
