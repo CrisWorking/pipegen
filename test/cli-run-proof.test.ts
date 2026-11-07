@@ -13,7 +13,7 @@ vi.mock('../src/util/exit-hooks.js', async (orig) => {
 vi.mock(import('../src/debate/decide.js'), async (orig) => { const m = await orig(); return { ...m, optionRunOf: vi.fn(m.optionRunOf) }; });
 import { optionRunOf as watchedOptionRunOf } from '../src/debate/decide.js';
 
-import { CONFIRM_QUESTION, DECLINED_REASON, dropDeclined, guardedKeys, midRunConfirm, nextCandidateFrom, proofWorkflowsOf, REPOS_NOT_READY, CENTRAL_CHANGED, PRIVATE_REASON } from '../src/cli/run-proof.js';
+import { CONFIRM_QUESTION, DECLINED_REASON, dropDeclined, NO_MINUTES_FOR_REPROOF, REPROOF_FAILED, guardedKeys, midRunConfirm, nextCandidateFrom, proofWorkflowsOf, REPOS_NOT_READY, CENTRAL_CHANGED, PRIVATE_REASON } from '../src/cli/run-proof.js';
 import { proofAssembler } from '../src/cli/run-parts.js';
 import { assemble } from '../src/layers/assemble.js';
 import { node, p as PLAT, planned, profileOf } from './helpers/assemble.js';
@@ -1030,6 +1030,93 @@ describe('G14-R2: a decline is proven again without the declined files (ruling G
     const parts = [{ part: 'pipeline', needId: 'sast', status: 'proven', detail: 'ok' }, { part: 'pipeline', needId: 'sast', status: 'proven', detail: 'ok' }];
     const out = dropDeclined({ draft, result: { ok: true, parts, findings: [], minutesUsed: 0, runUrls: [] } } as never, new Set(files.map((f) => f.path)));
     expect(out.stopped).toMatch(/and the sast part must be proven$/);
+  });
+});
+
+describe('G14-R2b: a decline reverts to pipegen\'s own files; the stop paths, the minutes, the checks, the draft format', () => {
+  const ROOT = svc({ name: 'app', path: '.', language: 'node', packageManager: 'npm', scripts: ['test', 'start'] });
+  const OWN_DF: CreatedFile = { repo: 'app', path: 'Dockerfile', content: 'FROM node:24-slim\nCOPY . .\n', part: 'docker', reason: 'pipegen made it' };
+  const AI_DF: CreatedFile = { ...OWN_DF, content: 'FROM node:24-slim\nRUN echo ai-fix\nCOPY . .\n', aiEdited: true };
+  // a loop that makes an AI fix of pipegen's own Dockerfile, asks, is told no, and ends with the (still AI-fixed) draft passing
+  const fixThenDecline = (w: Awaited<ReturnType<typeof proofWorld>>, ends: 'pass' | 'fail' = 'pass') => {
+    w.ops.fixLoop = async (d, deps) => {
+      await deps.prove(d, 'pr');
+      const fixed = { ...d, created: d.created.map((f) => (f.path === 'Dockerfile' ? AI_DF : f)) } as PipelineDraft;
+      const run = await deps.prove(fixed, 'pr');
+      expect(await deps.confirm?.([AI_DF])).toBe(false);
+      return (ends === 'pass' ? { result: run.result, draft: fixed } : { result: failOn('sast'), draft: fixed, stopped: 'the loop gave up' }) as never;
+    };
+  };
+
+  it('run: declining an AI-fixed Dockerfile → the extra proof runs pipegen\'s own Dockerfile, and it can pass (NOTE)', async () => {
+    const w = await proofWorld({ services: [ROOT], draft: (d) => ({ ...d, created: [OWN_DF] }), confirm: false });
+    fixThenDecline(w);
+    const r = await w.run();
+    const last = w.evals.at(-1)?.d;
+    expect(last?.created.find((f) => f.path === 'Dockerfile')).toEqual(OWN_DF);
+    expect(r.ok).toBe(true);
+    expect(r.draft?.created.find((f) => f.path === 'Dockerfile')).toEqual(OWN_DF);
+    // pipegen's own file is not a declined part: no "left out" note for docker
+    expect(r.draft?.notProven.some((n) => n.part === 'docker' && n.reason === DECLINED_REASON)).toBe(false);
+  });
+
+  it('run: decline, then a failed loop → the saved draft is the one without the declined files, with no per-job marks (m1)', async () => {
+    const w = await proofWorld({ services: [ROOT], draft: (d) => ({ ...d, created: [OWN_DF] }), confirm: false, results: [PASS] });
+    fixThenDecline(w, 'fail');
+    const r = await w.run();
+    expect(r.ok).toBe(false);
+    const saved = w.store.state?.draft as PipelineDraft;
+    expect(saved.created.find((f) => f.path === 'Dockerfile')).toEqual(OWN_DF);
+    expect(saved.notProven.some((n) => n.needId !== undefined)).toBe(false);
+    // the resume's start: the saved draft (as run.ts passes it) proves without a refusal
+    w.store.setStage('proving');
+    const again = await proofWorld({ services: [ROOT], input: { store: w.store, draft: saved, resume: true } });
+    const r2 = await again.run();
+    expect(r2.ok).toBe(true);
+    expect(again.evals[0]?.d.created.find((f) => f.path === 'Dockerfile')).toEqual(OWN_DF);
+  });
+
+  it('run: 1.5 variants of minutes left → no extra proof, NO_MINUTES_FOR_REPROOF (m2)', async () => {
+    const w = await proofWorld({ services: [ROOT], draft: (d) => ({ ...d, created: [OWN_DF] }), confirm: false, input: { variantMinutes: 67 } });
+    fixThenDecline(w);
+    const n0 = w.evals.length;
+    const r = await w.run();
+    expect(r.ok).toBe(false);
+    expect(r.stopped).toContain(NO_MINUTES_FOR_REPROOF.slice(0, 60));
+    expect(w.evals.length - n0).toBe(2);
+    expect((w.store.state?.draft as PipelineDraft).created.find((f) => f.path === 'Dockerfile')).toEqual(OWN_DF);
+  });
+
+  it('run: the referee or the guard refuses the draft without the declined files → REPROOF_FAILED, no extra proof (m3)', async () => {
+    for (const which of ['referee', 'guard'] as const) {
+      const w = await proofWorld({ services: [ROOT], draft: (d) => ({ ...d, created: [OWN_DF] }), confirm: false });
+      fixThenDecline(w);
+      const b = w.input.build as NonNullable<typeof w.input.build>;
+      const isReverted = (d: PipelineDraft) => d.created.find((f) => f.path === 'Dockerfile')?.aiEdited !== true;
+      w.input.build = {
+        ...b,
+        referee: async (d) => (which === 'referee' && isReverted(d) ? { ok: false, issues: [{ file: 'Dockerfile', check: 'template', message: 'refused' }], demoted: [], notes: [] } as never : b.referee(d)),
+        guard: async (files) => (which === 'guard' && files.some((f) => f.path === 'Dockerfile' && f.aiEdited !== true) ? { ok: [], refused: [{ path: 'Dockerfile', reason: 'no' }], notes: [] } : b.guard(files)),
+      };
+      const r = await w.run();
+      expect(r.ok).toBe(false);
+      expect(r.stopped).toContain(REPROOF_FAILED);
+      expect(w.evals.length).toBe(2);
+    }
+  });
+
+  it('run: a draft that does not match the state format is not saved mid-proof; the earlier one stays (m5)', async () => {
+    const w = await proofWorld({ services: [ROOT], draft: (d) => ({ ...d, created: [OWN_DF] }) });
+    let after: PipelineDraft | undefined;
+    w.ops.fixLoop = async (d, deps) => {
+      await deps.prove(d, 'pr');
+      const odd = { ...d, created: [{ ...OWN_DF, part: 'not-a-part' }] } as unknown as PipelineDraft;
+      const run = await deps.prove(odd, 'pr');
+      after = w.store.load()?.draft;
+      return { result: run.result, draft: d } as never;
+    };
+    await w.run();
+    expect(after?.created).toEqual([OWN_DF]);
   });
 });
 
