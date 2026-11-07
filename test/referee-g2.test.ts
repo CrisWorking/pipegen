@@ -16,7 +16,7 @@ import { imageArchiveArtifact, imageBuildTag, renderImageArchiveScan, renderImag
 import { attestSignerWorkflow, COSIGN_ID, GH_ID, imageDigestArtifact, keylessIdentity, pubKeySha256, renderSignSteps, renderVerifySteps } from '../src/engine/signing.js';
 import { renderFindingsBlock, renderFindRunStep, renderJobPrelude, renderPlatformStep, renderScrub, renderStep, renderUpload, scrubbedPath, type RenderContext } from '../src/engine/render-step.js';
 import { RenderError } from '../src/engine/render-error.js';
-import { renderDigestStep } from '../src/engine/deploy-steps.js';
+import { BUILD_PUSH_STEP_ID, PUBLISH_TAG, publishedImageRepo, renderDigestStep, renderPublishDigestStep } from '../src/engine/deploy-steps.js';
 import { verifyTail, VERIFY_LIMIT } from './helpers/verify-tail.js';
 import type { Candidate, CreatedFile, KnownValueCheck, Need, PipelineDraft, ReviewedTool, Service, SigningPlan, StepSpec } from '../src/types.js';
 import { draftOf, GATE, imageProf, job, jobsOf, p, prof, show, workflow, type Job } from './helpers/gate-pipeline.js';
@@ -291,6 +291,12 @@ const deployFile = (extra: Record<string, Job>, on: unknown = DEPLOY_ON, path = 
  * publishes an image holds the keyless sign job of its plan too: an unsigned publish from a public repository must never ship.
  */
 const signedDraft = { ...pubDraft, signing: KEYLESS };
+/** G15a-R10 r4-2, r4-3: the published image's tag (the renderer's helper) and the digest hand-off image-publish ends with (releaseJobs' form). */
+const PUB_TAG = `${publishedImageRepo(pubDraft.profile.owner, pubDraft.profile.repo, 'app')}:${PUBLISH_TAG}`;
+const publishTail = (): RenderedStep[] => {
+  const name = imageDigestArtifact('app');
+  return [renderPublishDigestStep('app'), { ...renderPlatformStep('upload-artifact', p, { name, path: `\${{ runner.temp }}/pipegen-out/${name}` }), name: 'Upload the image digest of app' }];
+};
 const keylessSign = (): Job => job([digestDownload(), ...renderSignSteps(COSIGN, 'keyless', IMG)], { permissions: { contents: 'read', [OIDC]: 'write', packages: 'write' }, if: DEPLOY_PUSH_IF, needs: ['gate', 'image-publish'] });
 
 describe('G2: the image hand-off (B6)', () => {
@@ -453,7 +459,8 @@ describe('G2: the image hand-off (B6)', () => {
     const lint = await runWith([imageFile({ 'lint--app': { ...own('app'), outputs: undefined } })], d);
     expect(has(lint, 'template', /build-push/), show(lint)).toBe(true);
     // image-publish: a Dockerfile of a service only
-    const pub = (w: Record<string, string>): Job => job([...renderJobPrelude({}, p).steps, { ...renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: 'ghcr.io/o/r-app:main' }, { push: 'true' }), with: { ...renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: 'ghcr.io/o/r-app:main' }, { push: 'true' }).with, ...w } }], { permissions: { contents: 'read', packages: 'write' } });
+    // (G15a-R10 r4-2, r4-3: the plan's tag, and the digest hand-off after the push)
+    const pub = (w: Record<string, string>): Job => job([...renderJobPrelude({}, p).steps, { id: BUILD_PUSH_STEP_ID, ...renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: PUB_TAG }, { push: 'true' }), with: { ...renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: PUB_TAG }, { push: 'true' }).with, ...w } }, ...publishTail()], { permissions: { contents: 'read', packages: 'write' } });
     // (G2-R1 I3: image-publish pushes only from a deploy job of pipegen.yml on a default-branch push, so it is judged there)
     const dep = (w: Record<string, string>): Job => ({ ...pub(w), if: DEPLOY_PUSH_IF, needs: ['gate'] });
     expect(show(await runWith([deployFile({ 'image-publish': dep({}), sign: keylessSign() })], signedDraft))).toBe('');
@@ -665,8 +672,9 @@ describe('G2 fix round 1 (ruling G2-R1)', () => {
   });
 
   it('referee: an image push runs only in a deploy job of pipegen.yml on a default-branch push (G2-R1 I3)', async () => {
-    const bp = renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: 'ghcr.io/o/r-app:latest' }, { push: 'true' });
-    const pub = (over: Job = {}): Job => job([...renderJobPrelude({}, p).steps, bp], { permissions: { contents: 'read', packages: 'write' }, ...over });
+    // (G15a-R10 r4-2, r4-3: the plan's tag, and the digest hand-off after the push)
+    const bp = { id: BUILD_PUSH_STEP_ID, ...renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: PUB_TAG }, { push: 'true' }) };
+    const pub = (over: Job = {}): Job => job([...renderJobPrelude({}, p).steps, bp, ...publishTail()], { permissions: { contents: 'read', packages: 'write' }, ...over });
     const deploy = (over: Job = {}): Job => pub({ if: DEPLOY_PUSH_IF, needs: ['gate'], ...over });
     expect(show(await runWith([deployFile({ 'image-publish': deploy(), sign: keylessSign() })], signedDraft))).toBe('');
     const refused = (r: { issues: { check: string; message: string }[] }): boolean => has(r, 'permissions', /writes to the image registry/);

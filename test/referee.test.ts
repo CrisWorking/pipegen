@@ -9,6 +9,7 @@ import { JOB_PERMISSIONS, JOB_STEP_POLICY, pipegenLines, referee, type Linters, 
 import { gateJobList, jobIdFor } from '../src/engine/gate-job-list.js';
 import { attestDigestRef, jobOutputsFor } from '../src/engine/job-rules.js';
 import { renderAttestDigestStep } from '../src/engine/signing.js';
+import { BUILD_PUSH_STEP_ID, imageDigestArtifact, PUBLISH_TAG, publishedImageRepo, renderPublishDigestStep } from '../src/engine/deploy-steps.js';
 import { dedupeJobSteps, RenderError, renderFindRunStep, renderGateStep, renderJobPrelude, renderNightlyStep, renderPlatformStep, renderProjectScript, renderScrub, renderStep, renderUpload, scrubbedPath, stepsToYaml, type RenderContext, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
 import { resultArtifactName } from '../src/engine/artifact-names.js';
 import { NEED_ID_CATEGORY, NEED_IDS } from '../src/engine/need-ids.js';
@@ -136,6 +137,13 @@ describe('referee: the renderer and the referee agree', () => {
     const profN = { ...prof, services: [service({ ...svc, scripts: [] }), service({ ...svc, name: 'script-app' }), ...Array.from({ length: 12 }, (_, i) => service({ ...svc, scripts: [], name: `app${i + 2}` }))] };
     const ctxN: RenderContext = { ...ctx, profile: profN };
     const perNeed = new Map<string, number>();
+    const publishForm = (steps: RenderedStep[], name: string): RenderedStep[] => {
+      const artifact = imageDigestArtifact(name);
+      // the tag is that of the root service whose Dockerfile it builds: every service here shares the Dockerfile, so the referee binds it to app
+      const tags = `${publishedImageRepo(profN.owner, profN.repo, 'app')}:${PUBLISH_TAG}`;
+      return [...steps.map((st) => (st.uses?.startsWith('docker/build-push-action@') === true ? { ...st, id: BUILD_PUSH_STEP_ID, with: { ...st.with, tags, push: 'true' } } : st)),
+        renderPublishDigestStep(name), { ...renderPlatformStep('upload-artifact', p, { name: artifact, path: `\${{ runner.temp }}/pipegen-out/${artifact}` }), name: `Upload the image digest of ${name}` }];
+    };
     for (const t of reviewedList()) {
       if (t.id === 'pipegen-gate') continue;   // pipegen's own gate action is rendered by the gate helpers (renderScrub, renderGateStep), not as a tool job
       if (t.categories.includes('platform') && !t.categories.includes('image-build')) continue;   // the platform actions are rendered below, by their helpers
@@ -152,7 +160,9 @@ describe('referee: the renderer and the referee agree', () => {
           // G4-R1: the egress step is every job's first step (the referee's backstop), so its own check's job is just that step
           ? renderStep(spec, t, p, ctxN).steps
           : t.id === 'docker-build-push-action'
-          ? [...prelude(), renderPlatformStep('setup-buildx', p), renderPlatformStep('docker-login', p, loginInputs(), { registry: 'ghcr.io' }), ...renderStep(spec, t, p, { ...ctxN, targets: { image: 'ghcr.io/o/app:pr-1' } }).steps]
+          // (G15a-R10 r4-2, r4-3: image-publish pushes the plan's image and ends with the digest hand-off, as releaseJobs writes it)
+          // (no setup-buildx: releaseJobs writes none, and before the digest tail it would be repo code to the order rule)
+          ? publishForm([...prelude(), renderPlatformStep('docker-login', p, loginInputs(), { registry: 'ghcr.io' }), ...renderStep(spec, t, p, { ...ctxN, targets: { image: 'ghcr.io/o/app:pr-1' } }).steps], spec.service as string)
           : toolJob(spec, ctxN);
       } catch (e) {
         if (!(e instanceof RenderError)) throw e;

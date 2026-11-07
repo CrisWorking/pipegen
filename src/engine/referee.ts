@@ -60,7 +60,7 @@ import { projectScriptFor, repoToolFor } from './reviewed.js';
 import { slotProblem, type SlotKind } from './slots.js';
 import { expectedSigningSteps, signedImageOwner } from './signing.js';
 import { NO_IMAGE_CATEGORIES, noImageServices, publishedImageServices, WORKFLOW_LINT_TOOL } from './needs.js';
-import { FIND_RUN_STEP_ID, renderDigestStep, renderHeadCheckStep, renderPublishDigestStep } from './deploy-steps.js';
+import { FIND_RUN_STEP_ID, PUBLISH_TAG, publishedImageRepo, renderDigestStep, renderHeadCheckStep, renderPublishDigestStep } from './deploy-steps.js';
 import { strongReason } from './deploy-gating.js';
 import { ARCHIVE_TOOL_IDS, imageBuildTag, renderImageArchiveScan, renderImageBuild } from './image-handoff.js';
 import { dastStartOf, nightlyDastSpec, NIGHTLY_DAST_TOOL, renderDastRun, renderDastScrub, zapActiveSpec, ZAP_ACTIVE_LANE, ZAP_ACTIVE_TOOL } from './dast-handoff.js';
@@ -1586,8 +1586,17 @@ function judgeImageHandoff(fc: FileCtx, id: string, where: string, j: Obj, judge
     const at = `${where}, step ${i + 1}`;
     const w = x.step.with ?? {};
     if (id === 'image-publish') {
-      if (!fc.draft.profile.services.some((svc) => isRootPath(svc.path) && svc.dockerfile !== undefined && svc.dockerfile !== '' && w.file === svc.dockerfile)) {
+      const pubSvc = fc.draft.profile.services.find((svc) => isRootPath(svc.path) && svc.dockerfile !== undefined && svc.dockerfile !== '' && w.file === svc.dockerfile);
+      if (pubSvc === undefined) {
         bad('template', `${at}: build-push in image-publish builds the Dockerfile of a service at the repository root (its build context), not ${show(String(w.file ?? '(none)'))}.`);
+      } else {
+        // G15a-R10 r4-3: the tag is exactly the image the plan signs (the renderer's helper), never another repository, tag or registry
+        const want = `${publishedImageRepo(fc.draft.profile.owner, fc.draft.profile.repo, pubSvc.name)}:${PUBLISH_TAG}`;
+        if (w.tags !== want) bad('template', `${at}: image-publish tags must be exactly ${safeText(want, 200)}, the image the sign job signs.`);
+      }
+      // G15a-R10 r4-2: a pushing build hands its digest on: the digest step and its upload follow it, as the job's last two steps
+      if (w.push !== 'false' && !(judged[i + 1]?.kind === 'publish-digest' && judged[i + 2]?.kind === 'upload-artifact' && i + 2 === judged.length - 1)) {
+        bad('template', `${at}: after its pushing build, image-publish must end with the digest step and its upload (its last two steps), so the sign job gets the digest it pushed.`);
       }
       return;
     }
@@ -1970,7 +1979,7 @@ function writesRegistryRaw(j: unknown): boolean {
  *   spelling of sign), need image-publish in their own file;
  * - in a file started only by workflow_call (the central sign workflow), the job sign needs every other job of that file that writes to the
  *   image registry (its caller needs image-publish, above);
- * - image-publish outside pipegen.yml is refused unless a job sign of its own file needs it (pipegen writes it only in pipegen.yml).
+ * - image-publish (any spelling) and any job with a build that pushes are refused outside pipegen.yml, outright (G15a-R10 r4-1, amending R9).
  */
 function judgeSignNeeds(fc: FileCtx, id: string, j: Obj, caller: boolean, where: string): void {
   const bad = issueFor(fc);
@@ -1989,9 +1998,11 @@ function judgeSignNeeds(fc: FileCtx, id: string, j: Obj, caller: boolean, where:
       if (missing.length > 0) bad('template', `${where}: the job sign of a workflow started only by workflow_call must need every job of its file that writes to the image registry (it does not need ${missing.join(', ')}), so it never runs beside a push.`);
     }
   }
-  if (id === 'image-publish' && !(fc.file.repo === 'app' && fc.file.path === CALLER_WORKFLOW)) {
-    const signedAfter = Object.entries(jobs).some(([k, o]) => isSign(k) && isObj(o) && needsList(o.needs).includes(id));
-    if (!signedAfter) bad('template', `${where} runs outside ${CALLER_WORKFLOW}, where pipegen never writes it, and no job sign of its file needs it: image-publish runs outside ${CALLER_WORKFLOW} only where its file's sign job runs after it.`);
+  // G15a-R10 r4-1 (amends R9): image-publish, under any spelling, and any job with a build that pushes, only in pipegen.yml, where every sign
+  // job is tied to that one job; elsewhere refused outright (a stand-in image-publish in pipegen.yml would meet every need by its id alone)
+  const pushes = stepsOf(j).some((st) => typeof st.uses === 'string' && st.uses.toLowerCase().includes('build-push-action') && !(isObj(st.with) && (st.with.push === 'false' || st.with.push === false)));
+  if ((id.toLowerCase() === 'image-publish' || pushes) && !(fc.file.repo === 'app' && fc.file.path === CALLER_WORKFLOW)) {
+    bad('template', `${where} publishes outside ${CALLER_WORKFLOW} (the job image-publish, or a build that pushes): pipegen publishes only from ${CALLER_WORKFLOW}, where every sign job is tied to that one job.`);
   }
 }
 

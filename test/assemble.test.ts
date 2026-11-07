@@ -17,7 +17,7 @@ import {
 } from '../src/engine/job-rules.js';
 import { protectedMatcher } from '../src/engine/protected-match.js';
 import { referee, type RefereeReport } from '../src/engine/referee.js';
-import { DIGEST_STEP_ID, FIND_RUN_STEP_ID, renderHeadCheckStep } from '../src/engine/deploy-steps.js';
+import { BUILD_PUSH_STEP_ID, DIGEST_STEP_ID, FIND_RUN_STEP_ID, imageDigestArtifact, PUBLISH_TAG, renderHeadCheckStep, renderPublishDigestStep } from '../src/engine/deploy-steps.js';
 import { insertVerify } from '../src/layers/deploy.js';
 import { renderFindRunStep, renderJobPrelude, renderPlatformStep, stepsToYaml } from '../src/engine/render-step.js';
 import {
@@ -62,12 +62,15 @@ const C = (layer: 'merge' | 'push' | 'nightly', project = 'r'): string => centra
 const JD = { platform: p, reviewed: REVIEWED, linters: LINTERS, [['gh', 'Tok' + 'en'].join('')]: null, refereeDeps: { runLinters: async () => [] } } as unknown as Omit<Parameters<typeof judgeAssembled>[1], 'extra' | 'referee'>;
 const judge = (a: AssembledFiles, extra: CreatedFile[] = []): Promise<RefereeReport> => judgeAssembled(a, { ...JD, extra });
 
-/** The deploy layer's image-publish job (G7 builds the real one): egress, checkout, the reviewed build-push with push. */
+/** The deploy layer's image-publish job (G7 builds the real one): egress, checkout, the reviewed build-push with push, then (G15a-R10 r4-2,
+ * r4-3) the plan's tag and the digest hand-off as its last two steps. */
 function imagePublish(): Job {
+  const artifact = imageDigestArtifact('app');
   return {
     'runs-on': 'ubuntu-24.04', 'timeout-minutes': 30, permissions: { contents: 'read', packages: 'write' }, 'cache-mode': 'none',
     steps: [egressStepFor(['dockerhub', 'ghcr'], { [['user', 'Sec' + 'ret'].join('')]: false, dockerNetworks: true, job: 'image-publish' } as unknown as Parameters<typeof egressStepFor>[1]), ...renderJobPrelude({}, p).steps,
-      renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: 'ghcr.io/o/r-app:latest' }, { push: 'true' })],
+      { id: BUILD_PUSH_STEP_ID, ...renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: `ghcr.io/o/r-app:${PUBLISH_TAG}` }, { push: 'true' }) },
+      renderPublishDigestStep('app'), { ...renderPlatformStep('upload-artifact', p, { name: artifact, path: `\${{ runner.temp }}/pipegen-out/${artifact}` }), name: 'Upload the image digest of app' }],
   };
 }
 /** A key-env private draft (environments with the proven branch policy) whose app has a Dockerfile; the needs of the plain profile. */
