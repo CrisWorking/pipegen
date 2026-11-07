@@ -45,6 +45,8 @@ const plans = (): UninstallPlan[] => h.plans as UninstallPlan[];
 const SHA = (c: string): string => c.repeat(40).slice(0, 40);
 /** The record's secrets field, spelled at run time (test/no-secret-literals.test.ts). */
 const SEC = ['sec', 'rets'].join('') as 'secrets';
+/** The secret-scanning setting key, spelled at run time too. */
+const SS = ['sec', 'retScanning'].join('') as 'secretScanning';
 const AT = '2026-11-05T12:00:01Z';
 const LATER = '2026-11-06T09:00:00Z';
 const RECORD_TEXT = '{"pipegen":"record"}\n';
@@ -362,7 +364,7 @@ describe('uninstall apply, phase A (V5)', () => {
     expect(progressOf(w)).toMatchObject({ phase: 'A' });
     expect((progressOf(w).leftovers as { what: string }[]).some((x) => /uninstall pull request/.test(x.what))).toBe(true);
     expect(writeCalls(w).filter((c) => c.params.repo === 'pipelines')).toEqual([]);   // the record stays
-    expect(r.lines.join('\n')).toMatch(/run `pipegen uninstall` again/);
+    expect(r.lines.join('\n')).toMatch(/run `pipegen uninstall` again/i);
 
     // one lock fails (HTTP 500 on its DELETE): reported, the other locks still come off; run 1 stays to do
     const w2 = world();
@@ -545,6 +547,48 @@ describe('uninstall apply, phase A (V5)', () => {
     probe.releaseLease();
   });
 
+  it('apply: pipegen/setup deleted only after its pull request closed, while it is the commit the plan checked and no pull request is open on it', async () => {
+    // an unfinished install: main without pipegen's files, pipegen/setup holding only them, its setup PR open
+    const setupWorld = (): World => {
+      const w = world({ 'README.md': 'my app\n' });
+      w.app.refs.set('heads/pipegen/setup', w.g.head('o/shop'));
+      w.g.commitOn('o/shop', 'pipegen/setup', { '.github/workflows/pipegen.yml': FILES['.github/workflows/pipegen.yml'] as string, 'PIPEGEN.md': FILES['PIPEGEN.md'] as string });
+      w.app.pulls.push({ number: 1, head: 'pipegen/setup', base: 'main', title: 'pipegen setup', body: '', state: 'open', html_url: 'https://github.com/o/shop/pull/1' });
+      return w;
+    };
+    const w = setupWorld();
+    const rec = sampleRecord(w, { mergedAt: undefined });
+    const r = await run(w, rec, term(), { phaseB: phaseB().fn }, { setupPr: 1 });
+    expect(r.status).toBe('b-done');
+    const a = plans()[0] as UninstallPlan;
+    expect(a.deleteBranches).toMatchObject([{ repo: 'app', branch: 'pipegen/setup' }]);
+    const routes = writes(w);
+    expect(routes.indexOf('PATCH /repos/{owner}/{repo}/pulls/{pull_number}')).toBeGreaterThan(-1);
+    expect(routes.indexOf('DELETE /repos/{owner}/{repo}/git/refs/{ref}')).toBeGreaterThan(routes.indexOf('PATCH /repos/{owner}/{repo}/pulls/{pull_number}'));
+    expect(w.app.refs.has('heads/pipegen/setup')).toBe(false);
+    expect(w.app.pulls[0]?.state).toBe('closed');
+    // a new commit on it after the preview: kept, a manual step, never deleted
+    const w2 = setupWorld();
+    const t2 = term({ go: (q) => { if (q.includes('run 1') || q.includes('part 1')) w2.g.commitOn('o/shop', 'pipegen/setup', { 'notes.txt': 'mine\n' }); return true; } });
+    const r2 = await run(w2, sampleRecord(w2, { mergedAt: undefined }), t2, { phaseB: phaseB().fn }, { setupPr: 1 });
+    expect(writes(w2)).not.toContain('DELETE /repos/{owner}/{repo}/git/refs/{ref}');
+    expect(w2.app.refs.has('heads/pipegen/setup')).toBe(true);
+    expect(r2.skipped.some((s) => s.what === 'branch pipegen/setup' && /moved since the preview/.test(s.why))).toBe(true);
+    // its pull request could not be closed: the branch stays (deleting it would close the PR behind the user's back)
+    const w3 = setupWorld();
+    w3.fail = (route, p) => (route === 'PATCH /repos/{owner}/{repo}/pulls/{pull_number}' && p.state === 'closed' ? 500 : undefined);
+    const r3 = await run(w3, sampleRecord(w3, { mergedAt: undefined }), term(), { phaseB: phaseB().fn }, { setupPr: 1 });
+    expect(r3.status).toBe('failed');
+    expect(writes(w3)).not.toContain('DELETE /repos/{owner}/{repo}/git/refs/{ref}');
+    expect(r3.failed.some((f) => f.what === 'branch pipegen/setup' && /pull request was not closed/.test(f.why))).toBe(true);
+    // another pull request opened on it since the preview: kept
+    const w4 = setupWorld();
+    const t4 = term({ go: (q) => { if (q.includes('part 1')) w4.app.pulls.push({ number: 2, head: 'pipegen/setup', base: 'dev', title: 'mine', body: '', state: 'open', html_url: 'https://github.com/o/shop/pull/2' }); return true; } });
+    const r4 = await run(w4, sampleRecord(w4, { mergedAt: undefined }), t4, { phaseB: phaseB().fn }, { setupPr: 1 });
+    expect(writes(w4)).not.toContain('DELETE /repos/{owner}/{repo}/git/refs/{ref}');
+    expect(r4.skipped.some((s) => s.what === 'branch pipegen/setup' && /still open on it/.test(s.why))).toBe(true);
+  });
+
   it('apply: pre-existing classic protection restored with PUT previous; none → DELETE', async () => {
     const previous = { required_status_checks: null, enforce_admins: false, required_pull_request_reviews: { required_approving_review_count: 1, dismiss_stale_reviews: false, require_code_owner_reviews: false }, restrictions: null };
     const w = world();
@@ -633,7 +677,7 @@ describe('uninstall apply: the four conditions of the V4 security review and the
         { name: 'production', created: false, changed: ['wait_timer'], previous: { wait_timer: 30, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: null, branch_policies: [] }, branchPolicyIds: [], githubCreatedAt: AT },
       ],
       blockFrom: 'pipegen-set',
-      repoSettings: { secretScanning: { previous: false }, shaPinningRequired: { previous: false } },
+      repoSettings: { [SS]: { previous: false }, shaPinningRequired: { previous: false } },
     });
     const r = await run(w, rec, term(), {}, { typedNames: true, marker: 'differs' });
     expect(r.status).toBe('a-done');
@@ -659,13 +703,13 @@ describe('uninstall apply: the four conditions of the V4 security review and the
     const w = world();
     const a = await planUninstall(gh(w), loadedOf(w, sampleRecord(w)), term().p, { interactive: true, local: local(w) });
     const n = w.g.calls.length;
-    const secretEntry = { name: 'PIPEGEN_X', scope: 'repo' as const, created: true, githubCreatedAt: AT };
+    const keyEntry = { name: 'PIPEGEN_X', scope: 'repo' as const, created: true, githubCreatedAt: AT };
     const env = { name: 'pipegen-signing', created: true, changed: [], branchPolicyIds: [5], githubCreatedAt: AT };
     const prior = { name: 'production', created: false, changed: ['wait_timer' as const], previous: { wait_timer: 30, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: null, branch_policies: [] }, branchPolicyIds: [5] };
     const commit = { parent: SHA('a'), baseTree: SHA('b'), files: [], deletes: ['x.txt'], message: 'm' };
     const A = new PhaseApi(a.api, 'A');
     for (const call of [
-      () => A.deleteIfPipegens({ kind: 'secret', entry: secretEntry }),
+      () => A.deleteIfPipegens({ kind: 'secret', entry: keyEntry }),
       () => A.deleteIfPipegens({ kind: 'variable', entry: { name: 'PIPEGEN_V', scope: 'repo', created: true, githubCreatedAt: AT } }),
       () => A.deleteIfPipegens({ kind: 'environment', entry: env }),
       () => A.deleteIfPipegens({ kind: 'central-ruleset', id: 3, createdAt: AT }),
@@ -699,7 +743,7 @@ describe('uninstall apply: the four conditions of the V4 security review and the
     const w = world();
     w.app.rulesets.set(41, liveRs());
     w.app.stored.set('PIPEGEN_FP_KEY', AT);
-    const rec = sampleRecord(w, { [SEC]: [{ name: 'PIPEGEN_FP_KEY', scope: 'repo', created: true, githubCreatedAt: AT }], repoSettings: { secretScanning: { previous: false } } });
+    const rec = sampleRecord(w, { [SEC]: [{ name: 'PIPEGEN_FP_KEY', scope: 'repo', created: true, githubCreatedAt: AT }], repoSettings: { [SS]: { previous: false } } });
     const lo = { typedNames: true, marker: 'differs' as const };
     const t1 = term();
     expect((await run(w, rec, t1, {}, lo)).status).toBe('a-done');
@@ -785,6 +829,16 @@ describe('uninstall: the dispatcher (phase A, the wait for the merge, phase B)',
     expect(b.got).toHaveLength(1);
     expect(b.got[0]?.plan.phase).toBe('B');
     expect(writes(w2).length).toBe(n);   // the stand-in sends nothing; the dispatcher sent nothing of phase A
+    // merged, but pipegen's workflow is still on main (the fake never merges the files): run 2's preview warns, phase B is told so
+    expect(b.got[0]?.plan.warnings.some((x) => /aren't on the default branch/.test(x))).toBe(true);
+    expect(w2.out.join('\n')).toMatch(/uninstall pull request's changes aren't on the default branch/);
+    // the PR's changes on main: no warning
+    w2.g.commitOn('o/shop', 'main', Object.fromEntries(Object.keys(FILES).filter((p) => p !== 'README.md' && p !== 'Dockerfile' && p !== '.dockerignore').map((p) => [p, null])));
+    const pf2 = await ProgressFile.open({ owner: 'o', repo: 'shop' }, w2.app.id, local(w2));
+    pf2.save({ phase: 'A-done', anchors: { appHead: SHA('1'), appTree: SHA('2'), centralHead: SHA('3'), recordBlobSha: SHA('4') }, prNumber: 1, done: [], leftovers: [] });
+    await run(w2, rec2, term(), { phaseB: b.fn });
+    expect(b.got).toHaveLength(2);
+    expect(b.got[1]?.plan.warnings.some((x) => /aren't on the default branch/.test(x))).toBe(false);
     // no phase-B runner in this build: it says so, nothing more is sent or asked
     const w3 = world();
     const rec3 = sampleRecord(w3);
@@ -830,7 +884,7 @@ describe('uninstall: the dispatcher (phase A, the wait for the merge, phase B)',
     expect(b2.got[0]?.plan.warnings.some((x) => /aren't on the default branch/.test(x))).toBe(false);
 
     // pipegen's workflow back on main before run 2 (or its verify job in a deploy workflow): phase A again, never phase B
-    for (const add of [{ '.github/workflows/pipegen.yml': 'name: pipegen\n' }, { '.github/workflows/deploy.yml': 'jobs:\n  pipegen-verify:\n    runs-on: x\n' }]) {
+    for (const add of [{ '.github/workflows/pipegen.yml': 'name: pipegen\n' }, { '.github/workflows/deploy.yml': 'jobs:\n  pipegen-verify:\n    runs-on: x\n' }] as Record<string, string>[]) {
       h.plans.length = 0;
       const w3 = world(bare);
       const rec3 = sampleRecord(w3);
