@@ -164,12 +164,17 @@ describe('V6-R3 hook-2, hook-3: the "central delete sent" marker', () => {
     await x.step();
     mergePr(x.w, x.w.central, BR);
     const loaded = await x.load();
+    let atDelete: unknown;
     const base = gh(x.w) as unknown as { request: (r: string, p: Record<string, unknown>) => Promise<unknown> };
     const g = { request: async (route: string, params: Record<string, unknown> = {}) => {
-      if (route === 'DELETE /repos/{owner}/{repo}' && params.repo === 'pipelines') throw new GitHubRateLimitError('rate', { budgetSpent: true });
+      if (route === 'DELETE /repos/{owner}/{repo}' && params.repo === 'pipelines') {
+        atDelete = (await progressOf(x.w))?.centralDeleteSent;   // saved before the request goes out: pending
+        throw new GitHubRateLimitError('rate', { budgetSpent: true });
+      }
       return base.request(route, params);
     } } as unknown as Octokit;
     await expect(uninstallStep(g, loaded, term().p, deps(x.w, APPMODE))).rejects.toBeInstanceOf(GitHubRateLimitError);
+    expect(atDelete).toMatchObject({ repoId: x.w.central.id, confirmed: false });
     expect((await progressOf(x.w))?.centralDeleteSent).toBeUndefined();
   });
 });
