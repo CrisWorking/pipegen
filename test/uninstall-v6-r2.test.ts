@@ -95,6 +95,14 @@ describe('V6-R2 sec I1: App mode never advises gh repo delete on a refusal', () 
     const re = await run(e.w, e.rec, te, app);
     expect(e.w.deleted).toEqual([]);
     expect(steps(re).filter((s) => CMD.test(s))).toEqual([]);
+    // a list pipegen can't read (not a permission answer): a refusal a later run may not meet, so the local files stay
+    const g = await merged();
+    g.w.lists.set('central:keys', 500);
+    const rg = await run(g.w, g.rec, term(), app);
+    expect(g.w.deleted).toEqual([]);
+    expect(steps(rg).filter((s) => CMD.test(s))).toEqual([]);
+    expect(rg.failed.some((x) => /pipelines/.test(x.what) && /deploy keys/.test(x.why))).toBe(true);
+    expect(existsSync(g.lr)).toBe(true);
     // every check passed and the user declined `pipelines`: the command is theirs to run
     const f = await merged();
     const rf = await run(f.w, f.rec, term({ type: (_q, exp) => (exp === 'pipelines' ? 'no' : exp) }), app);
@@ -187,6 +195,16 @@ describe('V6-R2 sec M1: a merged central PR counts only at the head pipegen set'
     expect(rx.status).toBe('b-partial');
     expect(rx.failed.some((f) => /central ruleset/.test(f.what))).toBe(true);
     expect(existsSync(xlr)).toBe(true);
+    // the ruleset read fails (not 404): pipegen can't tell it is gone, a leftover too; the created CODEOWNERS back: a leftover
+    x.central.rulesets.delete(55);
+    x.fail = (route) => (route === 'GET /repos/{owner}/{repo}/rulesets/{ruleset_id}' ? 500 : undefined);
+    const ry = await run(x, xrec);
+    expect(ry.failed.some((f) => /central ruleset/.test(f.what))).toBe(true);
+    x.fail = undefined;
+    x.g.commitOn('o/pipelines', 'main', { '.github/CODEOWNERS': OWNERS_INS }, 'back');
+    const rz = await run(x, xrec);
+    expect(rz.failed.some((f) => /CODEOWNERS/.test(f.what))).toBe(true);
+    expect(rz.failed.some((f) => /central ruleset/.test(f.what))).toBe(false);
   });
 
   it('record: a typed vouch stays a typed trust through the blob rebuild (the view only, typed names, nothing that needs full trust)', async () => {
