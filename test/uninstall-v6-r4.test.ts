@@ -80,14 +80,21 @@ describe('V6-R4 M1: the finished path names what is still the user\'s to do', ()
     mergePr(x.w, x.w.central, BR);
     const r2 = await x.step(yes);
     expect(x.w.deleted).toContain('o/pipelines');
-    expect(r2.failed.some((f) => f.what.includes(A_NAME))).toBe(true);   // not settled with central: it isn't inside central
+    const left = r2.failed.find((f) => f.what.includes(A_NAME));
+    expect(left).toBeDefined();   // not settled with central: it isn't inside central
+    expect(left?.manual).toBeTruthy();
     x.w.fail = undefined;
+    // a central entry an earlier run left in the progress file is not repeated: central itself is gone
+    const pf = await ProgressFile.open(APP, x.w.app.id, local(x.w));
+    const st = pf.state!;
+    pf.save({ ...st, leftovers: [...(st.phase === 'B' ? st.leftovers : []), { what: 'repo o/pipelines', why: 'kept for now', manual: 'Run it again.' }] } as typeof st);
     const err = await x.load().then(() => null, (e: unknown) => e);
     expect(err).toBeInstanceOf(UninstallError);
     const msg = (err as Error).message;
     expect(msg).toMatch(/finished/);
     expect(msg).toContain(A_NAME);
     expect(msg).toMatch(/still yours to do/i);
+    expect(msg).toContain(left!.manual!);
     expect(msg).not.toMatch(/repo o\/pipelines:/);
   });
 });
@@ -112,6 +119,16 @@ describe('V6-R4 Info 1, Info 2: the marker', () => {
     const r = await x.step(term(), {});
     expect(r.status).toBe('b-waiting');
     expect((await progressOf(x.w))?.centralDeleteSent).toBeUndefined();
+  });
+
+  it('phase B: a confirmed marker for another repo id is kept when the run sees central alive', async () => {
+    const x = await real();
+    await x.step();
+    const pf = await ProgressFile.open(APP, x.w.app.id, local(x.w));
+    const other = { repoId: x.w.central.id + 1, recordHash: recordHash(x.rec), confirmed: true };
+    pf.save({ ...pf.state!, centralDeleteSent: other });
+    await x.step(term(), {});
+    expect((await progressOf(x.w))?.centralDeleteSent).toEqual(other);
   });
 });
 
