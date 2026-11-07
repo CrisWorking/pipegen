@@ -139,17 +139,17 @@ describe('needs schema', () => {
 });
 
 describe('floorNeeds scaling (G17-R1)', () => {
-  it('per-service lookups use a map: 8 times the services is about 8 times the time, not 64', async () => {
+  it('per-service lookups use a map: 4 times the services is about 4 times the time, not 16', async () => {
     const many = (n: number) => profile({ monorepo: 'npm-workspaces', services: Array.from({ length: n }, (_, i) => web({ name: `s${i}`, path: `apps/s${i}` })) });
     let needs: Need[] = [];
     await expectScaling('floorNeeds services', (size) => {
-      const p = many(size === 'small' ? 2_000 : 16_000);
+      const p = many(size === 'small' ? 4_000 : 16_000);
       const t = performance.now();
       const r = floorNeeds(p, PUBLIC);
       const ms = performance.now() - t;
       if (size === 'big') needs = r;
       return ms;
-    }, 16);
+    }, 6);
     expect(find(needs, 'push', 'unit-tests', 's15999').length).toBe(1);
   }, 120_000);
 });

@@ -1,7 +1,7 @@
 // Coverage mapper (see ../coverage.ts for the rules): own package.json scripts, read and followed per (dir, script).
 import { posix } from 'node:path';
 import { asObj } from '../../read/manifest.js';
-import { MAX_GLOB_NAME, MAX_GLOB_WORK, MAX_PACKAGE_FILES, MAX_SCRIPTS, MAX_SCRIPT_FILES, MAX_SCRIPT_TARGETS } from './bounds.js';
+import { MAX_GLOB_NAME, MAX_GLOB_WORK, MAX_PACKAGE_FILES, MAX_SCRIPTS, MAX_SCRIPT_FILES, MAX_SCRIPT_RESULTS, MAX_SCRIPT_TARGETS } from './bounds.js';
 import { UNKNOWN_PREFIX, flagGiven, gateOf, gated } from './settings.js';
 import {
   OK_COMMANDS, PYTEST_NO_RUN, SCRIPT_CATEGORIES, shebangOk, UNKNOWN_SCRIPT_CATEGORIES, globCappedWhy, probeCall, scanShell, scriptCall, type CmdInfo,
@@ -37,6 +37,44 @@ const PLAN_P_SCRIPT_CATEGORIES: ReadonlySet<string> = new Set(['format', 'type-c
 /** How npm runs a script: `/bin/sh -c` on POSIX (https://docs.npmjs.com/cli/v11/using-npm/scripts), so no -e. */
 const NPM_SCRIPT_SHELL: ShellMode = { errexit: false, pipefail: false, followed: true };
 
+/**
+ * G17-R1: one entry per distinct Found (plain data, compared whole), so a result list is bounded by its distinct values, not
+ * by the call paths that reach them (a script calling the next one three times was 3^n entries).
+ */
+function dedupeFound(xs: readonly Found[]): Found[] {
+  const seen = new Set<string>();
+  return xs.filter((x) => {
+    const k = JSON.stringify(x);
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
+const capSubject = (s: string) => `${s.charAt(0).toLowerCase()}${s.slice(1)}`;
+/** G17-R1: past MAX_SCRIPT_RESULTS a call is never covered, never missing: unknown, saying why. */
+const resultsCapped = (f: Pick<Found, 'by' | 'subject' | 'dir'>): Found => ({
+  categories: UNKNOWN_SCRIPT_CATEGORIES, by: f.by, subject: f.subject, dir: f.dir, reason: null,
+  partialWhy: `${f.subject} runs more results than pipegen keeps (${MAX_SCRIPT_RESULTS.toLocaleString('en-US')}), so it can't tell what ${capSubject(f.subject)} runs.`,
+});
+/** G17-R1: a script's own result list, deduplicated, or one unknown entry when it is still over MAX_SCRIPT_RESULTS. */
+const capped = (xs: Found[], who: Pick<Found, 'by' | 'subject' | 'dir'>): Found[] => {
+  const d = dedupeFound(xs);
+  return d.length > MAX_SCRIPT_RESULTS ? [resultsCapped(who)] : d;
+};
+/**
+ * The caller's reason (an `||`, a pipe, …) comes first; the script's own why is kept when the caller has none. G17-R1 (3):
+ * a run pipegen couldn't follow (every category unknown: a cap, an unreadable file) stays unknown with its why whatever the
+ * caller's reason, as at the top level, so an unknown never turns into missing on the way up.
+ */
+function callerReason(f: Found, g: Found): Pick<Found, 'reason' | 'partialWhy'> {
+  if (g.categories.length > 0 && g.categories.every((c) => c.startsWith(UNKNOWN_PREFIX))) return { reason: null, ...(g.partialWhy === undefined ? {} : { partialWhy: g.partialWhy }) };
+  return { reason: f.reason ?? g.reason, ...(f.reason === null && g.partialWhy !== undefined ? { partialWhy: g.partialWhy } : {}) };
+}
+
+/** G17-R1 (3): past MAX_SCRIPTS, a call to an own script is unknown (as for a script counted by name), never dropped. */
+const scriptsCappedWhy = (subject: string) => `There are more package scripts than pipegen follows (${MAX_SCRIPTS.toLocaleString('en-US')}), so it can't tell what ${capSubject(subject)} runs.`;
+
 /** The `scripts` of `<dir>/package.json` (string values only), or null when it can't be read. */
 function packageScripts(ctx: Ctx, dir: string): Promise<ReadonlyMap<string, string> | null> {
   let r = ctx.pkgScripts.get(dir);
@@ -60,19 +98,19 @@ function packageScripts(ctx: Ctx, dir: string): Promise<ReadonlyMap<string, stri
  * text is read as npm runs it (sh -c, no -e), and the own scripts it calls in turn are read the same way. Worked out
  * once per (dir, name); a cycle, an unreadable package.json or a missing script gives [].
  */
-async function scriptRuns(ctx: Ctx, dir: string, name: string): Promise<Found[]> {
+async function scriptRuns(ctx: Ctx, dir: string, name: string): Promise<Found[] | 'capped'> {
   const key = `${dir}\u0000${name}`;
   const known = ctx.scriptMemo.get(key);
   if (known !== undefined) return known;
-  if (ctx.scriptMemo.size >= MAX_SCRIPTS) return [];
+  if (ctx.scriptMemo.size >= MAX_SCRIPTS) return 'capped';
   ctx.scriptMemo.set(key, []); // being worked out: a script that calls itself (directly or not) adds nothing
   const text = (await packageScripts(ctx, dir))?.get(name);
   if (text === undefined) return [];
   const inner = gated(await resolveScripts(ctx, scanShell(text, dir, ctx.sigs, ctx.budget, NPM_SCRIPT_SHELL)), gateOf([text], [], undefined, ctx.sigs.softEnv, ctx.sigs.configFiles));
-  const out = inner.flatMap((g) => {
+  const out = capped(inner.flatMap((g) => {
     const categories = g.categories.filter((x) => SCRIPT_CATEGORIES.has(x.startsWith(UNKNOWN_PREFIX) ? x.slice(UNKNOWN_PREFIX.length) : x));
     return categories.length === 0 ? [] : [{ ...g, categories, hookRun: false }];
-  });
+  }), { by: `your own \`${name}\``, subject: `Your own \`${name}\``, dir });
   ctx.scriptMemo.set(key, out);
   return out;
 }
@@ -84,10 +122,20 @@ async function scriptRuns(ctx: Ctx, dir: string, name: string): Promise<Found[]>
  */
 export async function resolveScripts(ctx: Ctx, found: Found[]): Promise<Found[]> {
   if (!found.some((f) => f.script !== undefined || f.byName !== undefined || f.scriptFile !== undefined || f.composeRun !== undefined || f.dockerBuild !== undefined || f.composeBuild !== undefined)) return found;
+  // G17-R1: a hard cap on the entries the followed scripts add, checked before each concatenation (like addFound/MAX_HITS):
+  // past it the whole call is unknown, so a partial list can never read as covered. The step's own finds are bounded by the
+  // scan budget and MAX_HITS, so only what scripts add counts here.
   const out: Found[] = [];
+  let added = 0;
+  const push = (xs: readonly Found[]): boolean => {
+    if (added + xs.length > MAX_SCRIPT_RESULTS) return false;
+    added += xs.length;
+    out.push(...xs);
+    return true;
+  };
   for (const f0 of found) {
     // P55 (batch B): the Dockerfiles a build command builds add the checks in their RUN lines; the build itself stays as it is
-    if (f0.dockerBuild !== undefined || f0.composeBuild !== undefined) out.push(...(await buildRuns(ctx, f0, resolveScripts)));
+    if ((f0.dockerBuild !== undefined || f0.composeBuild !== undefined) && !push(await buildRuns(ctx, f0, resolveScripts))) return [resultsCapped(f0)];
     // P59 (4): a compose command here may use other files or services when the job sets COMPOSE_FILE / COMPOSE_PROFILES,
     // which only the step's gate knows: a placeholder that the step makes unknown then, and drops otherwise
     if (f0.composeRun !== undefined || f0.composeBuild !== undefined) {
@@ -98,13 +146,20 @@ export async function resolveScripts(ctx: Ctx, found: Found[]): Promise<Found[]>
     if (f === null) continue;
     if (f.byName !== undefined) {
       const lowered0 = await byNameRun(ctx, f);
-      const langs = lowered0 === null || f.dir === null ? undefined : byNameLangs(lowered0, await scriptRuns(ctx, f.dir, f.byName));
+      const runs0 = lowered0 === null || f.dir === null ? [] : await scriptRuns(ctx, f.dir, f.byName);
+      const langs = lowered0 === null || f.dir === null || runs0 === 'capped' ? undefined : byNameLangs(lowered0, runs0);
       const lowered = lowered0 === null ? null : { ...lowered0, ...(langs === undefined ? {} : { langs }) };
       if (lowered !== null) out.push(lowered);
       // Plan P Task 3 (PS11): what the script's text runs for the Plan P categories (`npm run test:coverage` →
       // coverage) counts through that text only, as for any other own script (the older ones keep the by-name rule)
       if (f.dir !== null && lowered !== null && !lowered.categories.some((c) => c.startsWith(UNKNOWN_PREFIX))) {
-        for (const g of await scriptRuns(ctx, f.dir, f.byName)) {
+        const runs = await scriptRuns(ctx, f.dir, f.byName);
+        if (runs === 'capped') { // G17-R1 (3): what the text runs can't be read past the cap: unknown, not dropped
+          out.push({ categories: UNKNOWN_SCRIPT_CATEGORIES, by: f.by, subject: f.subject, dir: f.dir, reason: null, partialWhy: scriptsCappedWhy(f.subject) });
+          continue;
+        }
+        const extras: Found[] = [];
+        for (const g of runs) {
           // P55 (batch B): a linter in a script counted by another name (`test: xo && … && ava`) counts for lint too; the
           // `lint` script itself already counts for lint by its name
           const extra = g.categories.filter((c) => {
@@ -112,17 +167,17 @@ export async function resolveScripts(ctx: Ctx, found: Found[]): Promise<Found[]>
             return PLAN_P_SCRIPT_CATEGORIES.has(bare) || (bare === 'lint' && !f.categories.includes('lint'));
           });
           if (extra.length > 0) {
-            out.push({
-              categories: extra, by: f.by, subject: f.subject, dir: g.dir, reason: f.reason ?? g.reason,
-              ...(f.reason === null && g.partialWhy !== undefined ? { partialWhy: g.partialWhy } : {}), ...carriedConfig(g),
+            extras.push({
+              categories: extra, by: f.by, subject: f.subject, dir: g.dir, ...callerReason(f, g), ...carriedConfig(g),
             });
           }
         }
+        if (!push(extras)) return [resultsCapped(f)];
       }
       continue;
     }
     if (f.scriptFile !== undefined) {
-      for (const g of await scriptFileRuns(ctx, f)) out.push(g);
+      if (!push(await scriptFileRuns(ctx, f))) return [resultsCapped(f)];
       continue;
     }
     if (f.script === undefined) {
@@ -135,15 +190,19 @@ export async function resolveScripts(ctx: Ctx, found: Found[]): Promise<Found[]>
       out.push({ categories: UNKNOWN_SCRIPT_CATEGORIES, by: f.by, subject: f.subject, dir: f.dir, reason: null, partialWhy: globCappedWhy(f.subject) });
       continue;
     }
-    for (const name of names) for (const g of await scriptRuns(ctx, f.dir, name)) {
-      out.push({ // the script's own `cd` counts: `cd api && jest` tests the api service only
-        categories: g.categories, by: f.by, subject: f.subject, dir: g.dir, reason: f.reason ?? g.reason,
-        ...(f.reason === null && g.partialWhy !== undefined ? { partialWhy: g.partialWhy } : {}),
-        ...(g.envGate === undefined ? {} : { envGate: g.envGate }), ...carriedConfig(g),
-      });
+    for (const name of names) {
+      const runs = await scriptRuns(ctx, f.dir, name);
+      // G17-R1 (3): past the script cap the call is unknown (coverage.ts, fix round 3), never dropped as if it ran nothing
+      const mapped: Found[] = runs === 'capped'
+        ? [{ categories: UNKNOWN_SCRIPT_CATEGORIES, by: f.by, subject: f.subject, dir: f.dir, reason: null, partialWhy: scriptsCappedWhy(f.subject) }]
+        : runs.map((g) => ({ // the script's own `cd` counts: `cd api && jest` tests the api service only
+          categories: g.categories, by: f.by, subject: f.subject, dir: g.dir, ...callerReason(f, g),
+          ...(g.envGate === undefined ? {} : { envGate: g.envGate }), ...carriedConfig(g),
+        }));
+      if (!push(dedupeFound(mapped))) return [resultsCapped(f)];
     }
   }
-  return out;
+  return dedupeFound(out);
 }
 
 /** How bash runs a script file (`bash x.sh`, `./x.sh`): no -e unless the file sets it (`set -e`, read by scanShell). */
@@ -188,7 +247,7 @@ async function scriptFileRuns(ctx: Ctx, f: Found): Promise<Found[]> {
       return [];
     }
     const inner = gated(await resolveScripts(ctx, scanShell(t.ok, f.dir, ctx.sigs, ctx.budget, SCRIPT_FILE_SHELL)), gateOf([t.ok], [], undefined, ctx.sigs.softEnv, ctx.sigs.configFiles));
-    runs = inner.flatMap((g): Found[] => {
+    runs = capped(inner.flatMap((g): Found[] => {
       const categories = g.categories.filter((x) => SCRIPT_CATEGORIES.has(x.startsWith(UNKNOWN_PREFIX) ? x.slice(UNKNOWN_PREFIX.length) : x));
       if (categories.length === 0) return [];
       // P50 (I4): a run in a folder pipegen can't place (`cd "$(dirname "$0")"`) could be any service's: unknown
@@ -197,12 +256,11 @@ async function scriptFileRuns(ctx: Ctx, f: Found): Promise<Found[]> {
           partialWhy: `${f.subject} changes to a folder pipegen can't place before it runs ${g.subject.charAt(0).toLowerCase()}${g.subject.slice(1)}, so it can't tell which service that checks.` }];
       }
       return [{ ...g, categories, hookRun: false }];
-    });
+    }), f);
     ctx.scriptMemo.set(key, runs);
   }
   return runs.map((g) => ({ // the script's own `cd` counts, as for a package script
-    categories: g.categories, by: f.by, subject: f.subject, dir: g.dir, reason: f.reason ?? g.reason,
-    ...(f.reason === null && g.partialWhy !== undefined ? { partialWhy: g.partialWhy } : {}),
+    categories: g.categories, by: f.by, subject: f.subject, dir: g.dir, ...callerReason(f, g),
     ...(g.envGate === undefined ? {} : { envGate: g.envGate }), ...carriedConfig(g),
   }));
 }
@@ -352,11 +410,14 @@ async function byNameRun(ctx: Ctx, f: Found): Promise<Found | null> {
   const cls = await classifyScript(ctx, f.dir, f.byName);
   if (cls.capped === 'globs') return { ...f, categories: f.categories.map((c) => `${UNKNOWN_PREFIX}${c}`), reason: null, partialWhy: globCappedWhy(f.subject) };
   if (cls.capped === 'scripts') {
-    return { ...f, categories: f.categories.map((c) => `${UNKNOWN_PREFIX}${c}`), reason: null, partialWhy: `There are more package scripts than pipegen follows (${MAX_SCRIPTS.toLocaleString('en-US')}), so it can't tell what ${f.subject.charAt(0).toLowerCase()}${f.subject.slice(1)} runs.` };
+    return { ...f, categories: f.categories.map((c) => `${UNKNOWN_PREFIX}${c}`), reason: null, partialWhy: scriptsCappedWhy(f.subject) };
   }
   if (!cls.real) return null;
   if (cls.soft !== null) return { ...f, reason: f.reason ?? cls.soft };
-  const runs = (await scriptRuns(ctx, f.dir, f.byName)).filter((g) => g.categories.some((c) => f.categories.includes(c)));
+  const all = await scriptRuns(ctx, f.dir, f.byName);
+  // G17-R1 (3): the script's text can't be read past the cap, so its reason can't be known: unknown, as for classifyScript's cap
+  if (all === 'capped') return { ...f, categories: f.categories.map((c) => `${UNKNOWN_PREFIX}${c}`), reason: null, partialWhy: scriptsCappedWhy(f.subject) };
+  const runs = all.filter((g) => g.categories.some((c) => f.categories.includes(c)));
   const first = runs[0];
   if (first !== undefined && runs.every((g) => g.reason !== null)) return { ...f, reason: f.reason ?? first.reason };
   return f;

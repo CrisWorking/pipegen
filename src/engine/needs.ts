@@ -227,12 +227,19 @@ export function needWhy(id: string): string | null {
   return Object.hasOwn(WHY, id) ? (WHY[id] as string) : null;
 }
 
+/** G17-R1: the first service of each name (what `services.find` by name gave), built once per call instead of a scan per lookup. */
+function serviceByName(p: RepoProfile): Map<string, Service> {
+  const m = new Map<string, Service>();
+  for (const s of p.services) if (!m.has(s.name)) m.set(s.name, s);
+  return m;
+}
+
 /** Whether a check of this category blocks, for a service (by name). Categories outside the table: true. */
-function checkBlocking(category: string, service: string | null | undefined, p: RepoProfile): boolean {
+function checkBlocking(category: string, service: string | null | undefined, byName: ReadonlyMap<string, Service>): boolean {
   const rule = CHECKS.find((c) => c.category === category);
   if (rule === undefined) return true;
   if (typeof rule.blocking === 'boolean') return rule.blocking;
-  const s = p.services.find((x) => x.name === service);
+  const s = typeof service === 'string' ? byName.get(service) : undefined;
   return s !== undefined && rule.blocking(s);
 }
 
@@ -278,9 +285,10 @@ function planChecks(p: RepoProfile, caps: Capabilities): { needs: Need[]; skippe
   const needs: Need[] = [];
   const skipped: SkippedCheck[] = [];
   const seen = new Set<string>();
+  const byName = serviceByName(p);
   const skip = (category: NeedCategory, why: string, service?: string) => skipped.push({ category, ...(service === undefined ? {} : { service }), why });
   const add = (rule: CheckRule, layer: Layer, service?: string) => {
-    const blocking = typeof rule.blocking === 'boolean' ? rule.blocking : (() => { const s = p.services.find((x) => x.name === service); return s !== undefined && rule.blocking(s); })();
+    const blocking = typeof rule.blocking === 'boolean' ? rule.blocking : (() => { const s = service === undefined ? undefined : byName.get(service); return s !== undefined && rule.blocking(s); })();
     const n = makeNeed(layer, rule.category, service, blocking);
     if (seen.has(needKey(n))) return;
     seen.add(needKey(n));
@@ -308,7 +316,8 @@ function planChecks(p: RepoProfile, caps: Capabilities): { needs: Need[]; skippe
       if (why === null && targets !== null) {
         for (const t of targets) for (const l of rule.layers) add(rule, l, t);
         // A service that isn't a deploy target gets its own skip, so every service is accounted for.
-        if (!targets.includes(undefined)) for (const s of p.services) if (!targets.includes(s.name)) skip(rule.category, "this service isn't deployed, so there is no release job to lock down", s.name);
+        const targetSet = new Set(targets); // G17-R1: one set, not a scan per service
+        if (!targetSet.has(undefined)) for (const s of p.services) if (!targetSet.has(s.name)) skip(rule.category, "this service isn't deployed, so there is no release job to lock down", s.name);
       } else skip(rule.category, why ?? 'no deploy or publish job to lock down');
     }
   }
@@ -448,7 +457,8 @@ export function floorNeeds(p: RepoProfile, caps: Capabilities): Need[] {
 
   const targets = mainDeployTargets(p);
   /** Whether a deploy target builds an image: a runnable service (repo-wide: any runnable service). */
-  const targetRuns = (t: string | undefined) => (t === undefined ? runnable.length > 0 : runnable.includes(t));
+  const runnableSet = new Set(runnable); // G17-R1: one set, not a scan per deploy target
+  const targetRuns = (t: string | undefined) => (t === undefined ? runnable.length > 0 : runnableSet.has(t));
   if (targets !== null) {
     const mode = signingMode(p, caps);
     for (const s of targets) {
@@ -596,6 +606,8 @@ export interface AddedNeedContext {
   readonly skipped: readonly SkippedCheck[];
   readonly runnable: ReadonlySet<string>;
   readonly deployNeedTargets: ReadonlySet<string | undefined>;
+  /** G17-R1: the first service of each name, for the blocking lookup (one map, not a scan per addition). */
+  readonly serviceByName: ReadonlyMap<string, Service>;
 }
 
 /** The context of acceptAddedNeed for this repo: the floor, the skipped checks, the runnable services and deploy targets. */
@@ -609,6 +621,7 @@ export function addedNeedContext(p: RepoProfile, caps: Capabilities, knownValues
     skipped: skippedChecks(p, caps),
     runnable: new Set(p.services.filter(isRunnable).map((s) => s.name)),
     deployNeedTargets: new Set(floor.filter((n) => n.layer === 'deploy').map((n) => n.service)),
+    serviceByName: serviceByName(p),
   };
 }
 
@@ -656,7 +669,7 @@ export function acceptAddedNeed(a: AddedNeed, ctx: AddedNeedContext): { ok: true
     need: {
       id: a.id, layer: a.layer, category: a.category, ...(a.service === null ? {} : { service: a.service }),
       why: cleanAiText(a.why) || needWhy(a.id) || '',
-      blocking: FLOOR.has(a.category) || (checkBlocking(a.category, a.service, ctx.p) && a.blocking), // a floor-category check never runs as warn-only
+      blocking: FLOOR.has(a.category) || (checkBlocking(a.category, a.service, ctx.serviceByName) && a.blocking), // a floor-category check never runs as warn-only
       floor: false,
     },
   };

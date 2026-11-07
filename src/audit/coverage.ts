@@ -139,7 +139,7 @@
 import { regexSafe } from '../read/limits.js';
 import { SUPPORTED_STACKS, unsupportedStackWhy } from '../read/support.js';
 import { MAX_WORKFLOWS, WORKFLOW_FILE } from '../read/workflows.js';
-import type { Capabilities, ExistingWorkflow, Need, RepoProfile } from '../types.js';
+import type { Capabilities, ExistingWorkflow, Need, RepoProfile, Service } from '../types.js';
 import { safeText } from '../util/safe-text.js';
 import { coverageMinimumRow, frameworkAdjust, publishingCoverage, updateConfigCoverage, versionAdjust } from './config-checks.js';
 import { DEPLOY_VERIFY_WHY, Dirs, Firsts, GATE_WHY, Scope, ciCoverage, firstPartialHit, hookCoverage, type Decide } from './coverage/decide.js';
@@ -315,11 +315,23 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
  * lockfile, none, a language pipegen can't place) is partial.
  */
 const LICENCE_INSTALL_WHY = "The Trivy licence scan reads licences by itself only from npm's package-lock.json: from yarn, pnpm, bun, requirements files or go.mod only once the packages are installed, and from poetry.lock, Pipfile.lock or uv.lock not at all. pipegen doesn't check for an install step, so a clean run may have checked nothing.";
+/** G17-R1: the services of each name, in profile order (the first is what `find` gave; all of them what `filter` gave). */
+function servicesByName(p: RepoProfile): Map<string, Service[]> {
+  const m = new Map<string, Service[]>();
+  for (const s of p.services) {
+    const list = m.get(s.name);
+    if (list === undefined) m.set(s.name, [s]);
+    else list.push(s);
+  }
+  return m;
+}
+
 /** DoD G11 / P50 I1: a Trivy licence scan is covered only over npm package-lock.json services; otherwise partial. */
 function licenceInstall(rows: Coverage[], p: RepoProfile): Coverage[] {
+  const byName = servicesByName(p); // G17-R1: one pass over the services, not one per row
   return rows.map((r) => {
     if (r.need.category !== 'licences' || r.status !== 'covered' || r.by !== 'trivy-license') return r;
-    const scope = r.need.service === undefined ? p.services : p.services.filter((s) => s.name === r.need.service);
+    const scope = r.need.service === undefined ? p.services : (byName.get(r.need.service) ?? []);
     return scope.length > 0 && scope.every((s) => s.packageManager === 'npm') ? r : { ...r, status: 'partial', why: LICENCE_INSTALL_WHY };
   });
 }
@@ -336,8 +348,9 @@ const STACK_CATEGORIES: ReadonlySet<string> = new Set(['unit-tests', 'full-tests
  * found, so they stay; checks that don't depend on the stack (secrets, images, the deploy checks) are answered as usual.
  */
 function unsupportedStack(rows: Coverage[], p: RepoProfile): Coverage[] {
+  const byName = servicesByName(p); // G17-R1: one pass over the services, not one per row
   return rows.map((r) => {
-    const s = r.need.service === undefined ? undefined : p.services.find((x) => x.name === r.need.service);
+    const s = r.need.service === undefined ? undefined : byName.get(r.need.service)?.[0];
     if (s === undefined || SUPPORTED_STACKS.includes(s.language) || r.status !== 'missing' || !STACK_CATEGORIES.has(r.need.category)) return r;
     return { need: r.need, status: 'unknown', why: unsupportedStackWhy(s.language) };
   });
