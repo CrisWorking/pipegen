@@ -189,6 +189,14 @@ const EXPR = '\u0000';
 const MAX_EXPR_DEPTH = 16;
 const isWordChar = (c: number): boolean => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95;
 const wordAt = (s: string, i: number, w: string): boolean => s.startsWith(w, i) && (i === 0 || !isWordChar(s.charCodeAt(i - 1))) && !isWordChar(s.charCodeAt(i + w.length));
+/** F1: `case` opens a case command only at command position (first word of the span, or after `;`, `&`, `|`, `(`); `echo case` is a plain word. */
+function atCommandStart(line: string, j: number): boolean {
+  let k = j - 1;
+  while (k >= 0 && (line.charCodeAt(k) === 32 || line.charCodeAt(k) === 9)) k--;
+  if (k < 0) return true;
+  const p = line.charCodeAt(k);
+  return p === 40 || p === 59 || p === 38 || p === 124;
+}
 /**
  * G17 row 73 (b, c): the matching `)` of each `(` of a (bounded) line, or -1. One pass with a stack; inside a `( … )` that has an open
  * `case` (until its `esac`), a `)` with no `(` of its own is a case pattern, not the end of the span.
@@ -209,7 +217,7 @@ function parenMatches(line: string): Int32Array {
       if (top.cases > 0) continue;
       stack.pop();
       match[top.pos] = j;
-    } else if (c === 99 && stack.length > 0 && wordAt(line, j, 'case')) (stack[stack.length - 1] as { cases: number }).cases++;
+    } else if (c === 99 && stack.length > 0 && wordAt(line, j, 'case') && atCommandStart(line, j)) (stack[stack.length - 1] as { cases: number }).cases++;
     else if (c === 101 && stack.length > 0 && wordAt(line, j, 'esac')) { const top = stack[stack.length - 1] as { cases: number }; if (top.cases > 0) top.cases--; }
   }
   return match;
@@ -347,6 +355,17 @@ function addBuild(fileDir: string, b: { context?: unknown; dockerfile?: unknown 
   if (df !== undefined) out.add(df);
 }
 
+/** F3: the line without a `#` or `//` comment that starts outside a double-quoted string. */
+function stripHclComment(line: string): string {
+  let q = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line.charCodeAt(i);
+    if (c === 92 && q) i++;
+    else if (c === 34) q = !q;
+    else if (!q && (c === 35 || (c === 47 && line.charCodeAt(i + 1) === 47))) return line.slice(0, i);
+  }
+  return line;
+}
 /**
  * GJ-R3 (H1 b): the build contexts (and container files) of a bake file's `target` blocks (`context = "…"`, `dockerfile = "…"`), read as
  * text. G17 row 67 (N6): a one-line `target "x" { context = "…" }` counts, and `${NAME}` takes a `variable "NAME" { default = "…" }`.
@@ -370,7 +389,7 @@ export function bakeBuildRefs(file: string, text: string, out: Set<string>): voi
     const head = /^[ \t]*(\w+)[ \t]+"/.exec(line);
     if (head !== null) { flush(); if (head[1] === 'target') target = {}; }
     if (target === null) continue;
-    for (const kv of line.matchAll(/\b(context|dockerfile)[ \t]*=[ \t]*"([^"]*)"/g)) target[kv[1] as 'context' | 'dockerfile'] = kv[2] as string;
+    for (const kv of stripHclComment(line).matchAll(/\b(context|dockerfile)[ \t]*=[ \t]*"([^"]*)"/g)) target[kv[1] as 'context' | 'dockerfile'] = kv[2] as string;
   }
   flush();
 }

@@ -88,6 +88,11 @@ describe('G17 row 67 (N6): compose merge keys and variables, compose-<x> names, 
     expect(webHint(await read(ws({ 'docker-compose-prod.yml': 'services:\n  web:\n    build: ./apps/web\n' })))).toContain('apps/web');
     expect(webHint(await read(ws({ 'compose_dev.yaml': 'services:\n  web:\n    build: ./apps/web\n' })))).toContain('apps/web');
   });
+  it('a commented-out context or dockerfile after the real one is ignored', () => {
+    expect(bake('target "web" {\n  context = "apps/web"\n  # context = "apps/old"\n  // dockerfile = "old/Dockerfile"\n}\n')).toEqual(['apps/web']);
+    expect(bake('target "web" {\n  context = "apps/web" # context = "apps/old"\n}\n')).toEqual(['apps/web']);
+    expect(bake('target "web" {\n  context = "apps/#web"\n}\n')).toEqual(['apps/#web']);
+  });
   it('a one-line bake target and bake variables', () => {
     expect(bake('target "web" { context = "apps/web" dockerfile = "Dockerfile.ci" }\n')).toEqual(['apps/web', 'apps/web/Dockerfile.ci']);
     expect(bake('variable "CTX" {\n  default = "apps/web"\n}\ntarget "web" {\n  context = "${CTX}"\n}\n')).toEqual(['apps/web']);
@@ -107,6 +112,19 @@ describe('G17 row 68: a long continued build chain of --build-arg lines is kept'
     const lines = ['docker build \\', ...Array.from({ length: 60 }, (_, i) => `  --build-arg ARG_${i}=${'v'.repeat(70)} \\`), '  -f apps/web/Dockerfile.ci \\', '  apps/web'];
     expect(lines.join('\n').length).toBeGreaterThan(4096);
     expect(refs(lines.join('\n'))).toEqual(['apps/web', 'apps/web/Dockerfile.ci']);
+  });
+  it('the other noise flags (label, annotation, secret) are left out of a long chain too, in both spellings', () => {
+    const chain = (...mid: string[]) => ['docker build \\', ...mid.map((m) => `  ${m} \\`), '  -f apps/web/Dockerfile.ci \\', '  apps/web'].join('\n');
+    const S = '--sec' + 'ret'; // built at runtime so the file holds no secret-looking text
+    for (const m of ['--label v=1.0', '--label=v=1.0', '--annotation "a=b c"', '--annotation=a=b', `${S} id=x,src=/tmp/s`, `${S}=id=x`, `--label a=1 --annotation b=2 ${S} id=c --build-arg D=4`]) {
+      expect(refs(chain(...Array.from({ length: 60 }, () => m)))).toEqual(['apps/web', 'apps/web/Dockerfile.ci']);
+    }
+    expect(refs(chain('--build-arg A=1 -f x/Dockerfile'))).toContain('x/Dockerfile');
+  });
+  it('a plain word `case` inside $( ) does not swallow the closing paren', () => {
+    const r = refs('docker build -f a/Dockerfile.x a --label v=$(echo case)');
+    expect(r).toEqual(['a', 'a/Dockerfile.x']);
+    expect(r.some((x) => x.includes('case)'))).toBe(false);
   });
   it('a chain over the budget for other reasons is still dropped whole (the budget holds)', () => {
     expect(workflowBuildRefs([`docker build \\\n${'  -t x \\\n'.repeat(1000)}  apps/web`]).size).toBe(0);
