@@ -147,7 +147,29 @@ describe('G15a carry 8: attest verify binds the deployed commit', () => {
     // every binding flag of the attest verify, each once: the source repo, its ref, its commit, the signer workflow at its commit, hosted only
     for (const f of ['--repo', '--source-ref', '--source-digest', '--signer-workflow', '--signer-digest', '--deny-self-hosted-runners']) expect(v.split(` ${f} `).length + (v.endsWith(` ${f}`) ? 1 : 0) - 1, f).toBe(1);
     expect(v).toContain('--source-digest "$GITHUB_SHA"');
-    // the verify job is only ever a push deploy's (deploy.ts: a workflow_run deploy is a gap with no insert), so GITHUB_SHA is the deployed commit
-    expect(readFileSync('src/layers/deploy.ts', 'utf8')).toMatch(/kind === 'workflow_run'\) \{ gap\(/);
+    // G15a-R7 spec 5: the verify job is only ever a push deploy's, so GITHUB_SHA is the deployed commit: planned on the attest pipeline, a push
+    // deploy gets the verify job inserted (with this line), a workflow_run deploy gets none and is listed as a gap
+    const { assemble } = await import('../src/layers/assemble.js');
+    const { planVerifyInserts, releaseJobs } = await import('../src/layers/deploy.js');
+    const { REVIEWED } = await import('./helpers/debate-fixtures.js');
+    const { p } = await import('./helpers/assemble.js');
+    const path = '.github/workflows/deploy.yml';
+    const used = ['sec', 'retsUsed'].join('');
+    const push = ['on:', '  push:', '    branches: [main]', 'jobs:', '  deploy:', '    runs-on: ubuntu-latest', '    environment: production', '    steps:', '      - run: ./ship.sh', ''].join('\n');
+    const wr = push.replace('  push:\n    branches: [main]', '  workflow_run:\n    workflows: [ci]\n    types: [completed]');
+    const caps = { branchProtection: true, environments: true, envRequiredReviewers: false, deploymentBranchPolicies: false, attestations: true, codeScanning: true, keylessSigningAllowed: false };
+    const plan = (text: string, trigger: string) => {
+      const prof2 = profileOf([node({ dockerfile: 'Dockerfile', port: 3000 })], { private: true, existingWorkflows: [{ path, triggers: [trigger], deploys: true, [used]: [], jobs: [] } as never] });
+      const x = planned(prof2, { caps, over: { centralPin: { repo: 'o/pipelines', sha: 'c'.repeat(40) }, signing: { mode: 'attest', images: [img] } } });
+      const a = assemble(x.draft, { gate: REVIEWED.find((t) => t.id === 'pipegen-gate')!, reviewed: REVIEWED, platform: p, mode: 'attest', layout: 'central', plan: x.plan, deploy: releaseJobs(x.draft, { platform: p }) });
+      return planVerifyInserts(a.draft, new Map([[path, text]]), a.verify);
+    };
+    const onPush = plan(push, 'push');
+    expect(onPush.gaps).toEqual([]);
+    expect(onPush.inserts).toHaveLength(1);
+    expect(onPush.inserts[0]?.file.content).toContain('--source-digest "$GITHUB_SHA"');
+    const onRun = plan(wr, 'workflow_run');
+    expect(onRun.inserts).toEqual([]);
+    expect(onRun.gaps).toEqual([{ path, triggers: ['workflow_run'], why: expect.stringMatching(/workflow_run/) }]);
   });
 });

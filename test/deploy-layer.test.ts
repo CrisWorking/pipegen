@@ -16,7 +16,8 @@ import { deployGateOf } from '../src/audit/coverage/deploy-gate.js';
 import { floorNeeds } from '../src/engine/needs.js';
 import { RenderError } from '../src/engine/render-error.js';
 import { renderVerifySteps } from '../src/engine/signing.js';
-import { assemble, judgeAssembled, verifyPermissions, verifyTail, type AssembledFiles } from '../src/layers/assemble.js';
+import { assemble, judgeAssembled, keylessVerifyNote, verifyPermissions, verifyTail, type AssembledFiles } from '../src/layers/assemble.js';
+import { EGRESS_DOMAIN_SETS, KEYLESS_VERIFY_SETS } from '../src/engine/egress.js';
 import {
   deployTriggers, environmentPlan, generateCosignKeys, insertVerify, isMemoryFolder, MEMORY_DIR, planVerifyInserts, releaseJobs, renewVerifyJob, verifyJobYaml, type VerifyPlan,
 } from '../src/layers/deploy.js';
@@ -1095,14 +1096,23 @@ describe('G7-R2 3-6: what the notes and messages say', () => {
     expect(world('keyless').v.preview.join('\n')).not.toMatch(/push only for some paths/);
     expect(String(renderHeadCheckStep('main').run)).toContain('if that commit starts a deploy; otherwise push again or re-run all jobs on the newest commit');
   });
-  it('G7-R2 6: the Sigstore note names no internal task and is keyed on the hosts the verify job may reach', () => {
-    // G15a: the note is keyed on the verify job's own egress step, never on a set's name, and says nothing about a later release
-    const src = readFileSync('src/layers/assemble.ts', 'utf8');
-    expect(src).not.toMatch(/SIGSTORE_SET = 'sigstore'/);
-    expect(src).toMatch(/SIGSTORE_HOSTS\.some\(\(h\) => !egressHostsOf\(verify as Job\)\.has\(h\)\)/);
-    const note = /addNote\(notes, '(Your deploys stop[^']*)'\)/.exec(src)?.[1] as string;
-    expect(note).toBeDefined();
-    expect(note).not.toMatch(/\bG\d+\b|before release|adds them/);
+  it('G7-R2 6: the Sigstore note names no internal task and fires exactly when the verify job can not reach a host of the keyless verify set', () => {
+    // G15a-R7 spec 4: keyed on the verify job's own egress step and the hosts of the set (never a copied list), checked by behaviour
+    const w = world('keyless');
+    const verify = verifyOf(w);
+    expect(keylessVerifyNote(w.a.draft, verify)).toBeNull();
+    expect(w.a.notes.join('\n')).not.toMatch(/Your deploys stop/);
+    const hosts = KEYLESS_VERIFY_SETS.flatMap((x) => EGRESS_DOMAIN_SETS[x]);
+    expect(hosts.length).toBeGreaterThan(0);
+    for (const h of hosts) {
+      const cut: Job = { ...verify, steps: verify.steps.map((s, i) => (i === 0 ? { ...s, with: { ...s.with, 'allowed-domains': String(s.with?.['allowed-domains']).split('\n').filter((x) => x !== h).join('\n') } } : s)) };
+      const note = keylessVerifyNote(w.a.draft, cut);
+      expect(note, h).toMatch(/^Your deploys stop: pipegen checks a keyless signature with Sigstore/);
+      expect(note, h).not.toMatch(/\bG\d+\b|before release|adds them/);
+    }
+    // only keyless: a key-env verify job reaches no Sigstore host and gets no note
+    const ke = world('key-env');
+    expect(keylessVerifyNote(ke.a.draft, verifyOf(ke))).toBeNull();
   });
 });
 
