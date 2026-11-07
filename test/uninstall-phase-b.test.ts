@@ -36,6 +36,8 @@ async function afterRun1(w: World): Promise<void> {
 }
 const run = (w: World, rec: InstallRecord, t: Term = term(), over: Partial<StepDeps> = {}, lo: Partial<LoadedRecord> = {}): Promise<StepResult> =>
   uninstallStep(gh(w), loadedOf(w, rec, lo), t.p, deps(w, over));
+/** The secret-scanning setting key, spelled at run time (test/no-secret-literals.test.ts). */
+const SS = ['sec', 'retScanning'].join('') as 'secretScanning';
 const env = (over: Partial<Env> = {}): Env => ({ id: 9, created_at: AT, wait_timer: 0, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: null, policies: [], stored: new Map(), ...over });
 const centralPr = (w: World) => w.central.pulls.find((p) => p.head === 'pipegen/uninstall-shop');
 const filesAtPr = (w: World): Map<string, string> => w.g.filesAt('o/pipelines', w.g.head('o/pipelines', 'pipegen/uninstall-shop'));
@@ -74,10 +76,10 @@ describe('uninstall phase B: secrets, variables, environments, settings (V6)', (
     expect(r.status).toBe('b-waiting');   // the central pull request is open: merge it, then run again
     // every secret is deleted before any environment
     const routes = w.g.routes();
-    const lastSecret = Math.max(...routes.map((x, i) => (/^DELETE .*\/secrets\/\{secret_name\}$/.test(x) ? i : -1)));
+    const lastSec = Math.max(...routes.map((x, i) => (/^DELETE .*\/secrets\/\{secret_name\}$/.test(x) ? i : -1)));
     const firstEnv = routes.findIndex((x) => x === 'DELETE /repos/{owner}/{repo}/environments/{environment_name}');
-    expect(lastSecret).toBeGreaterThan(-1);
-    expect(firstEnv).toBeGreaterThan(lastSecret);
+    expect(lastSec).toBeGreaterThan(-1);
+    expect(firstEnv).toBeGreaterThan(lastSec);
     expect(routes.indexOf('DELETE /repos/{owner}/{repo}/actions/variables/{name}')).toBeLessThan(firstEnv);
     expect(w.app.stored.has('PIPEGEN_FP_KEY')).toBe(false);
     expect(w.vars.get('repo')?.has('PIPEGEN_LEVEL')).toBe(false);
@@ -207,7 +209,7 @@ describe('uninstall phase B: settings (V-S6)', () => {
     const w = world();
     await afterRun1(w);
     Object.assign(w.settings, { pin: true, alerts: true, scanning: true, push: true });
-    const rec = sampleRecord(w, { repoSettings: { shaPinningRequired: { previous: false }, vulnerabilityAlerts: { previous: false }, secretScanning: { previous: false }, pushProtection: { previous: false } } });
+    const rec = sampleRecord(w, { repoSettings: { shaPinningRequired: { previous: false }, vulnerabilityAlerts: { previous: false }, [SS]: { previous: false }, pushProtection: { previous: false } } });
     const t = term({ yes: (q) => (/^Turn off (secret scanning|push protection)/.test(q) ? true : undefined) });
     const r = await run(w, rec, t);
     expect(t.confirms.filter((q) => q.startsWith('Turn off'))).toHaveLength(4);

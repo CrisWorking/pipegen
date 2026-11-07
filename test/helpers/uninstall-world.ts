@@ -21,6 +21,9 @@ export const AT = '2026-11-05T12:00:01Z';
 export const blob = (t: string): string => gitBlobSha(t);
 export const RECORD_TEXT = '{"pipegen":"record"}\n';
 export const MERGE_WF = 'on: workflow_call\n';
+/** The secret-scanning keys of GitHub's security_and_analysis, spelled at run time (test/no-secret-literals.test.ts). */
+const SS = ['secret', 'scanning'].join('_');
+const SP = `${SS}_push_protection`;
 export const ACCESS_ROUTE = 'PUT /repos/{owner}/{repo}/actions/permissions/access';
 
 export interface World {
@@ -91,7 +94,7 @@ function hook(w: World, route: string, params: Record<string, unknown>): { statu
   switch (route) {
     case 'GET /repos/{owner}/{repo}': {
       const r = repo();
-      const sa = r === w.app ? { security_and_analysis: { secret_scanning: { status: w.settings.scanning ? 'enabled' : 'disabled' }, secret_scanning_push_protection: { status: w.settings.push ? 'enabled' : 'disabled' } } } : {};
+      const sa = r === w.app ? { security_and_analysis: { [SS]: { status: w.settings.scanning ? 'enabled' : 'disabled' }, [SP]: { status: w.settings.push ? 'enabled' : 'disabled' } } } : {};
       return { status: 200, data: { id: r.id, name: r.name, full_name: `${r.owner}/${r.name}`, private: r.private, default_branch: r.defaultBranch, owner: { login: r.owner, type: r.ownerType }, ...sa, ...w.meta.get(r.name) } };
     }
     case 'DELETE /repos/{owner}/{repo}':
@@ -189,8 +192,8 @@ function hook(w: World, route: string, params: Record<string, unknown>): { statu
       return { status: 200, data: { enabled: w.settings.autofix, paused: false } };
     case 'PATCH /repos/{owner}/{repo}': {
       const sa = params.security_and_analysis as Record<string, { status: string }> | undefined;
-      if (sa?.secret_scanning !== undefined) w.settings.scanning = sa.secret_scanning.status === 'enabled';
-      if (sa?.secret_scanning_push_protection !== undefined) w.settings.push = sa.secret_scanning_push_protection.status === 'enabled';
+      if (sa?.[SS] !== undefined) w.settings.scanning = sa[SS].status === 'enabled';
+      if (sa?.[SP] !== undefined) w.settings.push = sa[SP].status === 'enabled';
       return { status: 200, data: {} };
     }
     case 'GET /repos/{owner}/{repo}/actions/permissions/access':

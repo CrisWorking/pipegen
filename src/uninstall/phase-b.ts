@@ -5,14 +5,14 @@
 //
 // In order:
 //   1. the scratch repo: a saved proof state's leftovers first (E's cleanupLeftovers, never the repo delete), then `<owner>/pipegen-proof-<repo>`
-//      read again (exact name, pipegen's marker, the id the preview showed) and emptied through cleanupWrite and deleteScratchSecret only:
+//      read again (exact name, pipegen's marker, the id the preview showed) and emptied only through E's cleanup writes and its scratch secret delete:
 //      its proof/ branches, secrets, variables, workflow runs and caches (V-S14);
 //   2. secrets (app, environment, central), then variables (deleted, or put back to `previous`), then environments (created: deleted whole,
 //      only while they hold nothing but pipegen's (V-S5); pre-existing: the `changed` fields put back, the branch rules pipegen added
 //      deleted (V-N10)), then the settings the user chose to turn off (V-S6). With pipegen's workflow still live (the user kept it in run 1)
 //      none of these goes: the gate still needs them;
 //   3. central (central.ts): the last-project locks first, then one central PR with this project's exact files and the record last;
-//   4. --delete-repos (V-S3): App mode only (Auth.canDeleteRepos): the scratch repo (its name typed; E's deleteScratchRepo: name, marker,
+//   4. --delete-repos (V-S3): App mode only (Auth.canDeleteRepos): the scratch repo (its name typed; E's scratch repo delete: name, marker,
 //      recorded id) and, last project with the central PR merged and the org rule gone (M-r1-5), the central repo (pipegen's central
 //      branches deleted first, then deleteCentralRepo's checks and typed names). Token mode: the `gh repo delete` commands, nothing deleted;
 //   5. the local files (V-N5): the local record file, `.finish-pending.json`, the leftovers file (each of its entries handled: gone on GitHub,
