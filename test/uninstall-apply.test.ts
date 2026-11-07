@@ -1067,10 +1067,14 @@ describe('uninstall apply: fix round 1 (V5-R1)', () => {
         try { make(); seen[k] = 'made'; } catch (e) { seen[k] = (e as Error).constructor.name; }
       }
       try { takeApi(plans()[0] as UninstallPlan, 'B'); seen.again = 'made'; } catch (e) { seen.again = (e as Error).constructor.name; }
+      // N1: the phase can't be rewritten, so the B api still refuses run 1's writes
+      try { (api as unknown as { phase: string }).phase = 'A'; } catch { /* a refused write is fine too */ }
+      seen.phase = api.phase;
+      try { await api.deleteIfPipegens({ kind: 'ruleset', entry: rs() }); seen.afterWrite = 'sent'; } catch (e) { seen.afterWrite = (e as Error).constructor.name; }
       return { status: 'b-done', phase: 'B', done: [], failed: [], skipped: [], manual: [], lines: [] };
     };
     expect((await run(w, rec, term(), { phaseB: fn })).status).toBe('b-done');
-    expect(seen).toEqual({ hasApi: false, ctor: 'UninstallRefusal', import: 'UninstallRefusal', guessed: 'UninstallRefusal', again: 'UninstallError' });
+    expect(seen).toEqual({ hasApi: false, ctor: 'UninstallRefusal', import: 'UninstallRefusal', guessed: 'UninstallRefusal', again: 'UninstallError', phase: 'B', afterWrite: 'UninstallRefusal' });
     expect(w.app.rulesets.has(41)).toBe(true);
     expect(writes(w)).toEqual([]);
   });
@@ -1191,6 +1195,15 @@ describe('uninstall apply: fix round 1 (V5-R1)', () => {
     expect(again.phase).toBe('A');
     expect(b2.got).toEqual([]);
     expect(m.w.out.join('\n')).toMatch(/\.github\/workflows\/deploy\.yml[^]*first run again/);
+    // N3: a saved kept list naming a live workflow that is NOT in the record (it holds the verify job) is not trusted: run 1 again
+    h.plans.length = 0;
+    const w3 = world({ 'README.md': 'my app\n', '.github/workflows/deploy.yml': 'jobs:\n  pipegen-verify:\n    runs-on: x\n' });
+    const rec3 = sampleRecord(w3, { files: [{ repo: 'app', path: '.github/workflows/pipegen.yml', part: 'pipeline', shas: [blob('name: pipegen\n')] }] });
+    (await openProgress(w3)).save({ phase: 'A-done', anchors: ANCHORS(), keptWorkflows: ['.github/workflows/deploy.yml'], done: [], leftovers: [] });
+    const b3 = phaseB();
+    const forged = await run(w3, rec3, term(), { phaseB: b3.fn });
+    expect(forged.phase).toBe('A');
+    expect(b3.got).toEqual([]);
   });
 
   it('apply: an uninstall PR merged into another branch than the default → stop with a manual step', async () => {

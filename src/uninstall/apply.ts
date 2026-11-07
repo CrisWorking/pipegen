@@ -156,15 +156,19 @@ const B_KINDS: ReadonlySet<string> = new Set(['secret', 'variable', 'environment
  * settings and the central PR and branches. Anything else is refused before anything is read or sent.
  */
 export class PhaseApi {
-  readonly phase: UninstallPhase;
+  readonly #phase: UninstallPhase;
   readonly #api: UninstallApi;
 
   constructor(guard: object, api: UninstallApi, phase: UninstallPhase) {
     if (guard !== PHASE_API_GUARD) throw new UninstallRefusal('an uninstall api bound to a phase is made only from the confirmed plan of this run.');
     if (phase !== 'A' && phase !== 'B') throw new UninstallRefusal('an uninstall api is bound to phase A or B.');
     this.#api = api;
-    this.phase = phase;
+    this.#phase = phase;
+    Object.freeze(this);
   }
+
+  /** Read-only: a runner can't turn its phase-B api into a phase-A one. */
+  get phase(): UninstallPhase { return this.#phase; }
 
   get clock(): RateClock { return this.#api.clock; }
 
