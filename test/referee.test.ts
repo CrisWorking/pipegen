@@ -181,7 +181,8 @@ describe('referee: the renderer and the referee agree', () => {
     const watchAct: RenderedStep = { name: 'watch', uses: WATCHER.step.action?.uses as string, with: { mode: 'watcher' } };
     const [checkout] = prelude();
     const co = checkout as RenderedStep;
-    jobs['code-scanning'] = job([download(), renderPlatformStep('upload-sarif', p, { sarif_file: sarif, category: 'pipegen-sast' })], { permissions: { contents: 'read', 'security-events': 'write', actions: 'read' } });
+    // (G15a-R7 sec 1: the upload needs the job whose scrub wrote the file)
+    jobs['code-scanning'] = job([download(), renderPlatformStep('upload-sarif', p, { sarif_file: sarif, category: 'pipegen-sast' })], { permissions: { contents: 'read', 'security-events': 'write', actions: 'read' }, needs: ['sast--app'] });
     jobs['baseline-check'] = job([download(), gateAct('baseline-check')], { permissions: { contents: 'read', actions: 'read' } });
     // (G15a: the attest sign job holds only the digest downloads, pipegen's digest step and actions/attest with that step's output)
     jobs.sign = job([
