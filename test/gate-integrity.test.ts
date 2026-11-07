@@ -164,13 +164,14 @@ describe("codeowners: GitHub's documented glob examples (rule, path, owned?)", (
   });
   it('matching is bounded: many ** segments against a long path finish quickly', async () => {
     const path = Array.from({ length: 200 }, () => 'a').join('/');
-    // G17-R1: ratio, not a wall-clock budget: twice the ** segments is about twice the time (a backtracking matcher grows far faster)
+    // G17-R1/R2: ratio, not a wall-clock budget: 4 times the ** segments is about 4 times the time, 16 if quadratic in them.
+    // Only the segment count is guarded here; growth in the path length is the G15b gate item (review G17G F7).
     await expectScaling('many ** segments', (size) => {
-      const rules = codeOwners(`${Array.from({ length: size === 'small' ? 15 : 30 }, () => '**').join('/')}/z @o\n`);
+      const rules = codeOwners(`${Array.from({ length: size === 'small' ? 8 : 32 }, () => '**').join('/')}/z @o\n`);
       const t = performance.now();
       ownersOf(rules, path);
       return performance.now() - t;
-    }, 6);
+    }, 9);
   });
 });
 

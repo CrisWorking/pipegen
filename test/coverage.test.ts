@@ -7,6 +7,8 @@ import { readPrecommit, readWorkflows } from '../src/read/workflows.js';
 import type { Capabilities, ExistingWorkflow, Layer, RepoProfile, Service } from '../src/types.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 import { expectScaling } from './helpers/scaling.js';
+import { dedupeFound } from '../src/audit/coverage/scripts.js';
+import type { Found } from '../src/audit/coverage/types.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
 
 // Ruling P33: a never-listed action (trivy-action, zizmor-action, …) is partial whatever its inputs. Older tests use
@@ -1148,6 +1150,36 @@ describe('mapCoverage (Task 5, item 1: own scripts by name and content)', () => 
     const over = await at(2_100);
     for (const s of ['d1', 'd2']) expect(row(over, 'push', 'unit-tests', s)).toMatchObject({ status: 'unknown', why: expect.stringContaining('more results than pipegen keeps') });
   }, 60_000);
+
+  it('own scripts (adversarial): G17-R2: past the results cap the step keeps its own finds (a secret scan stays covered)', async () => {
+    const dir = makeTempDir();
+    const runs = (from: number) => Array.from({ length: 1_200 }, (_, i) => `(cd d${from + i} && vitest run)`).join(' ; ');
+    pkg(dir, { a: runs(0), b: runs(1_200) });
+    ci(dir, run('npx gitleaks detect --source . && npm run a && npm run b'));
+    const rows = await coverage(dir, { services: [svc('d1'), svc('d2')] });
+    expect(row(rows, 'push', 'secrets').status).toBe('covered');
+    for (const s of ['d1', 'd2']) expect(row(rows, 'push', 'unit-tests', s)).toMatchObject({ status: 'unknown', why: expect.stringContaining('more results than pipegen keeps') });
+  }, 60_000);
+
+  it('own scripts (adversarial): G17-R2: a capped script is unknown for every service, not only its own folder', async () => {
+    const at = async (n: number) => {
+      const dir = makeTempDir();
+      pkg(dir, { s0: Array.from({ length: n }, (_, i) => `(cd ../../services/d${i} && vitest run)`).join(' ; ') }, 'apps/web/package.json');
+      ci(dir, '      - run: npm run s0\n        working-directory: apps/web\n');
+      return coverage(dir, { services: [svc('apps/web'), svc('services/d1')] });
+    };
+    expect(row(await at(50), 'push', 'unit-tests', 'd1').status).not.toBe('unknown');
+    const over = await at(2_100);
+    for (const s of ['web', 'd1']) expect(row(over, 'push', 'unit-tests', s).status).toBe('unknown');
+  }, 60_000);
+
+  it('own scripts: G17-R2: removing repeats tells apart finds that differ only in a Set field', () => {
+    const base = { categories: ['lint'], by: 'pre-commit', subject: 'x', dir: '.', reason: null } as const;
+    const a = { ...base, hookSkip: { ids: new Set(['ruff-check']) } } as unknown as Found;
+    const b = { ...base, hookSkip: { ids: new Set(['ruff-format']) } } as unknown as Found;
+    const a2 = { ...base, hookSkip: { ids: new Set(['ruff-check']) } } as unknown as Found;
+    expect(dedupeFound([a, b, a2])).toEqual([a, b]);
+  });
 
   it('own scripts (adversarial): G17-R1: past the script cap, a call to a script not counted by name is unknown, not missing', async () => {
     const dir = makeTempDir();

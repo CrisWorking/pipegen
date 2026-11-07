@@ -824,7 +824,7 @@ describe('GJ-R-sec1: workflowBuildRefs reads hostile workflow text within the re
     ];
     // G17: a ratio, not a wall-clock budget: ten times the text costs about ten times the time, a backtracking pattern about a hundred
     const inputs = { small: hostile(10_000), big: hostile(100_000) };
-    await expectScaling('hostile workflow text', (size) => { const t0 = performance.now(); for (const h of inputs[size]) workflowBuildRefs([h]); return performance.now() - t0; }, 40);
+    await expectScaling('hostile workflow text', (size) => { const t0 = performance.now(); for (let r = 0; r < 200; r++) for (const h of inputs[size]) workflowBuildRefs([h]); return performance.now() - t0; }, 40);
     // values past the per-line budget are dropped, never parsed
     expect(workflowBuildRefs([`context: ${'/'.repeat(100_000)}`]).size).toBe(0);
     // the real forms still count
@@ -1104,8 +1104,12 @@ describe('GJ-R4 (review GJ-r3 N1-N5, N7): continued build lines, a container ove
     const notes2: string[] = [];
     const q = await read(ws(heavy), notes2);
     // G17: a ratio, not a wall-clock budget: ten times the comment text costs about ten times the time
+    // G17-R2 (F6): readProject's fixed cost (about 70 ms) is measured on the same tree with empty comments and subtracted, so the
+    // ratio sees the compose/bake reading itself; a floor of 5 ms for the small size means about 0.2 s of extra work fails
     const trees = { small: ws(heavyOf(99_000)), big: ws(heavy) };
-    await expectScaling('compose and bake files', async (size) => { const t0 = performance.now(); await read(trees[size], []); return performance.now() - t0; }, 40);
+    const base = ws(heavyOf(0));
+    const timeRead = async (t: typeof base) => { const t0 = performance.now(); await read(t, []); return performance.now() - t0; };
+    await expectScaling('compose and bake files', async (size) => Math.max(0, (await timeRead(trees[size])) - (await timeRead(base))), 40, 3, 5);
     expect(notes2.join('\n')).toMatch(/Skipped c\/compose\.yaml: the compose and bake files pipegen reads for image builds are over 2 MB together\./);
     expect((q.services.find((s) => s.name === 'web') as Service).containerHint).toBeUndefined();
   });
@@ -1192,10 +1196,11 @@ describe('GJ-R5 (review GJ-r4 R1, H1): code next to a suffixed container file is
     expect([...workflowBuildRefs(['docker build $(pwd)/x -t y apps/api'])]).toEqual(['apps/api']);
   });
   it('H1: expression blanking is bounded (deep nesting, unclosed spans, long runs finish fast and drop what they cover)', async () => {
-    // G17: a ratio, not a wall-clock budget: ten times the text costs about ten times the time
+    // G17: a ratio, not a wall-clock budget: ten times the text costs about ten times the time. G17-R2 (F5): each size runs its
+    // inputs 200 times, so the per-line budget's near-zero time can't hide a quadratic
     const hostile = (n: number) => ['$('.repeat(n), '${{'.repeat(Math.floor(n * 13 / 15)), `docker build ${'$('.repeat(Math.floor(n / 15))} apps/x`, `docker build \${{ ${'|'.repeat(Math.floor(n * 8 / 3))}`];
     const inputs = { small: hostile(150), big: hostile(1500) };
-    await expectScaling('expression blanking', (size) => { const t0 = performance.now(); for (const h of inputs[size]) workflowBuildRefs([h]); return performance.now() - t0; }, 40);
+    await expectScaling('expression blanking', (size) => { const t0 = performance.now(); for (let r = 0; r < 200; r++) for (const h of inputs[size]) workflowBuildRefs([h]); return performance.now() - t0; }, 40);
     expect([...workflowBuildRefs([`docker build -t x:${'$('.repeat(40)}${')'.repeat(40)} apps/x`])]).toEqual([]);
   });
 
