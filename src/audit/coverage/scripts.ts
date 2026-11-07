@@ -152,6 +152,8 @@ export async function resolveScripts(ctx: Ctx, found: Found[]): Promise<Found[]>
   };
   for (const f0 of found) {
     if (over && followed(f0)) {
+      // G17-R3 (N1): a build is a real find of its own (image-build), kept as on the normal path; only what it runs is capped
+      if (f0.dockerBuild !== undefined || f0.composeBuild !== undefined) out.push(f0);
       out.push(resultsCapped(f0));
       continue;
     }
@@ -208,7 +210,7 @@ export async function resolveScripts(ctx: Ctx, found: Found[]): Promise<Found[]>
     if (f.dir === null) continue;
     const names = expandScripts(ctx, f.dir, [f.script], true, await packageScripts(ctx, f.dir));
     if (names === 'capped') { // fix round 4 (N8): never covered, never missing
-      out.push({ categories: UNKNOWN_SCRIPT_CATEGORIES, by: f.by, subject: f.subject, dir: f.dir, reason: null, partialWhy: globCappedWhy(f.subject) });
+      out.push({ categories: UNKNOWN_SCRIPT_CATEGORIES, by: f.by, subject: f.subject, dir: null, reason: null, partialWhy: globCappedWhy(f.subject) }); // G17-R3 (I1): hidden runs may be anywhere
       continue;
     }
     for (const name of names) {
