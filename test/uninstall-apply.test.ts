@@ -264,7 +264,15 @@ describe('uninstall apply, phase A (V5)', () => {
       environments: [{ name: 'pipegen-signing', created: true, changed: [], branchPolicyIds: [], githubCreatedAt: AT }],
     });
     const base = w.g.head('o/shop');
+    // the progress file is saved before the first write (a hard stop from there on is resumed as run 1)
+    let atFirstWrite: unknown = 'no write';
+    w.g.hooks.unshift((call) => {
+      if (call.route.startsWith('GET ') || atFirstWrite !== 'no write') return undefined;
+      atFirstWrite = hasProgress(w) ? progressOf(w).phase : 'none';
+      return undefined;
+    });
     const r = await run(w, rec);
+    expect(atFirstWrite).toBe('A');
     expect(r.status).toBe('a-done');
     expect(r.phase).toBe('A');
     expect(r.pr).toEqual({ number: 1, url: 'https://github.com/o/shop/pull/1' });
