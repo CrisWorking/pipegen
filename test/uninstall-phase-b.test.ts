@@ -3,7 +3,7 @@
 // settings the user chose, then the central pull request (this project's exact files, the record last), the repo deletes (--delete-repos,
 // App mode only) and the local files, only when nothing is left over. GitHub is a fake; prompts are fakes; no network.
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, posix, relative, sep } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { localFinishPendingPath, localRecordPath, recordPath } from '../src/deliver/record.js';
 import type { InstallRecord } from '../src/types.js';
@@ -363,19 +363,91 @@ describe('uninstall phase B: the phase-bound api and the source rules (V5-R1 car
   });
 
   it('apply: new UninstallApi only in plan.ts; planUninstall, confirmPlan, takeApi and deleteCentralRepo are called only in apply.ts', () => {
-    const dir = join(import.meta.dirname, '..', 'src', 'uninstall');
-    const strip = (s: string): string => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '').replace(/'(?:[^'\\\n]|\\.)*'/g, "''").replace(/`(?:[^`\\]|\\.)*`/g, '``');
-    for (const f of readdirSync(dir).filter((x) => x.endsWith('.ts'))) {
-      const code = strip(readFileSync(join(dir, f), 'utf8'));
-      if (f !== 'plan.ts' && f !== 'target.ts') expect(code, f).not.toMatch(/\bnew\s+UninstallApi\s*\(/);
-      if (f !== 'apply.ts') {
-        // a definition is not a call: `function x(` and `export async function x(` are taken out first
-        const calls = code.replace(/\bfunction\s+(?:planUninstall|confirmPlan|takeApi|deleteCentralRepo)\s*\(/g, '');
-        expect(calls, f).not.toMatch(/\b(?:planUninstall|confirmPlan|takeApi|deleteCentralRepo)\s*\(/);
-      }
+    // V6-R1 (sec M6): an import-based allow-list over all of src/, so an alias, Reflect.construct, .call or ?.() can't get round it. target.ts
+    // itself is allowed one construction: deleteCentralRepo makes the typed-name-only api it deletes the repo with (V3; spec M7).
+    const root = join(import.meta.dirname, '..');
+    const found: string[] = [];
+    for (const f of srcFiles(join(root, 'src'))) found.push(...entryImportProblems(relative(root, f).split(sep).join('/'), readFileSync(f, 'utf8')));
+    expect(found).toEqual([]);
+    // the scan's own must-catch examples (in a file of src/uninstall that is not allowed them)
+    const forms: Record<string, string> = {
+      paren: "import { UninstallApi } from './target.js'; const a = new (UninstallApi)(gh, app);",
+      alias: "import { UninstallApi as U } from './target.js'; const a = new U(gh, app);",
+      reflect: "import { UninstallApi } from './target.js'; Reflect.construct(UninstallApi, [gh, app]);",
+      optcall: "import { deleteCentralRepo } from './target.js'; await deleteCentralRepo?.(gh, c, rec, io);",
+      dotcall: "import { deleteCentralRepo } from './target.js'; await deleteCentralRepo.call(null, gh, c, rec, io);",
+      aliasCall: "import {\n  deleteCentralRepo as d,\n} from './target.js'; await d(gh, c, rec, io);",
+      namespace: "import * as t from './target.js'; new t.UninstallApi(gh, app);",
+      dynamic: "const t = await import('./target.js');",
+      dynamicExpr: "const t = await import(name);",
+      require: "const t = require('./plan.js');",
+      reexport: "export { takeApi } from './apply.js';",
+      reexportAll: "export * from './target.js';",
+      fromCli: "import { planUninstall } from '../uninstall/plan.js';",
+      scratch: "import { deleteScratchSecret } from '../proof/target.js';",
+      cleanup: "import { cleanupLeftovers as c } from '../proof/cleanup.js';",
+    };
+    for (const [name, code] of Object.entries(forms)) {
+      const file = name === 'fromCli' || name === 'scratch' || name === 'cleanup' ? 'src/cli/uninstall.ts' : 'src/uninstall/central.ts';
+      expect(entryImportProblems(file, code).length, name).toBeGreaterThan(0);
     }
-    // the scan sees the forms it is for
-    expect(strip('const a = new UninstallApi(gh, app);')).toMatch(/\bnew\s+UninstallApi\s*\(/);
-    expect(strip('// new UninstallApi(gh)\nconst s = \'new UninstallApi(\';')).not.toMatch(/\bnew\s+UninstallApi\s*\(/);
+    // what is allowed stays allowed
+    expect(entryImportProblems('src/uninstall/plan.ts', "import { UninstallApi } from './target.js'; new UninstallApi(gh, app);")).toEqual([]);
+    expect(entryImportProblems('src/uninstall/apply.ts', "import { planUninstall } from './plan.js';\nimport { deleteCentralRepo, type UninstallApi } from './target.js';")).toEqual([]);
+    expect(entryImportProblems('src/uninstall/central.ts', "import { UninstallRefusal, type UninstallApi } from './target.js';\nimport type { PhaseApi } from './apply.js';")).toEqual([]);
   });
 });
+
+/** Every .ts file under `dir`. */
+function srcFiles(dir: string): string[] {
+  const out: string[] = [];
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    if (e.isDirectory()) out.push(...srcFiles(join(dir, e.name)));
+    else if (e.name.endsWith('.ts')) out.push(join(dir, e.name));
+  }
+  return out;
+}
+/** The uninstall modules whose entry points are guarded (paths from the repo root). */
+const GUARDED = ['src/uninstall/target.ts', 'src/uninstall/plan.ts', 'src/uninstall/apply.ts'];
+/** Value names, and the only files that may import them. */
+const ENTRY_ALLOWED: Readonly<Record<string, (file: string) => boolean>> = {
+  UninstallApi: (f) => f === 'src/uninstall/plan.ts',
+  planUninstall: (f) => f === 'src/uninstall/apply.ts', confirmPlan: (f) => f === 'src/uninstall/apply.ts',
+  takeApi: (f) => f === 'src/uninstall/apply.ts', deleteCentralRepo: (f) => f === 'src/uninstall/apply.ts',
+  // E's scratch writers: E's own modules, E's cleanup command, and uninstall's phase-bound api
+  cleanupWrite: (f) => f.startsWith('src/proof/') || f === 'src/cli/cleanup.ts' || f === 'src/uninstall/apply.ts',
+  deleteScratchSecret: (f) => f.startsWith('src/proof/') || f === 'src/cli/cleanup.ts' || f === 'src/uninstall/apply.ts',
+  deleteScratchRepo: (f) => f.startsWith('src/proof/') || f === 'src/cli/cleanup.ts' || f === 'src/uninstall/apply.ts',
+  cleanupLeftovers: (f) => f.startsWith('src/proof/') || f === 'src/cli/cleanup.ts' || f === 'src/uninstall/apply.ts',
+};
+/** `spec` as imported from `file`, as a path from the repo root (.ts), or null for a package. */
+function resolveSpec(file: string, spec: string): string | null {
+  if (!spec.startsWith('.')) return null;
+  return posix.normalize(posix.join(posix.dirname(file), spec)).replace(/\.js$/, '.ts');
+}
+/** What the allow-list finds wrong in one file of src/ (`file` from the repo root). */
+function entryImportProblems(file: string, src: string): string[] {
+  const out: string[] = [];
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`])\/\/.*$/gm, '$1');
+  const guarded = (spec: string): boolean => { const r = resolveSpec(file, spec); return r !== null && GUARDED.includes(r) && r !== file; };
+  // static imports and re-exports, one clause each (over several lines too)
+  for (const m of code.matchAll(/\b(import|export)\s+(type\s+)?([^;'"]*?)\s*from\s*['"]([^'"]+)['"]/g)) {
+    const [, kw, typeOnly, clause = '', spec = ''] = m;
+    if (typeOnly !== undefined) continue;
+    const braces = /\{([^}]*)\}/.exec(clause);
+    const rest = clause.replace(/\{[^}]*\}/, '').replace(/,/g, ' ').trim();
+    if (guarded(spec) && (rest !== '' || kw === 'export')) { out.push(`${kw === 'export' ? 're-export' : 'default or namespace import'} of ${spec} in ${file}`); continue; }
+    const names = (braces?.[1] ?? '').split(',').map((x) => x.trim()).filter((x) => x !== '' && !x.startsWith('type ')).map((x) => x.split(/\s+as\s+/)[0]?.trim() ?? '');
+    for (const n of names) {
+      const ok = ENTRY_ALLOWED[n];
+      if (ok !== undefined && !ok(file)) out.push(`${n} imported in ${file}`);
+    }
+  }
+  // dynamic imports and require: only a plain string, never one of the guarded modules
+  for (const m of code.matchAll(/\b(import|require)\s*\(\s*(['"])([^'"]+)\2\s*\)/g)) if (guarded(m[3] ?? '')) out.push(`a dynamic ${m[1]} of ${m[3]} in ${file}`);
+  const noStrings = code.replace(/'(?:[^'\\\n]|\\.)*'/g, "''").replace(/"(?:[^"\\\n]|\\.)*"/g, "''").replace(/`(?:[^`\\]|\\.)*`/g, "''");
+  if (/\b(?:import|require)\s*\(\s*(?!''\s*\))/.test(noStrings)) out.push(`a dynamic import or require of something that is not a plain string in ${file}`);
+  // import x = require(...)
+  if (/\bimport\s+\w+\s*=\s*require\b/.test(code)) out.push(`an import = require in ${file}`);
+  return out;
+}
