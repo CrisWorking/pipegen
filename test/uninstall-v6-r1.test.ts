@@ -80,7 +80,7 @@ describe('V6-R1: token mode prints gh repo delete only after the gates App mode 
     mergePr(q2, q2.central, BR);
     const r2 = await run(q2, rec2, term(), { deleteRepos: true, canDeleteRepos: false });
     expect(r2.lines.join('\n')).not.toMatch(central);   // the preview names the command only with its conditions
-    expect(r2.manual.some((m) => /pipegen-required--shop/.test(m.why))).toBe(true);
+    expect([...r2.manual, ...r2.failed].some((m) => /pipegen-required--shop/.test(m.why))).toBe(true);
 
     // Q3: the run that opens the central PR: not merged yet, so no command
     const q3 = world();

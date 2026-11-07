@@ -323,7 +323,7 @@ describe('uninstall central: --delete-repos (V-S3, V-B5)', () => {
     mergePr(w, w.central, prBranch(w));
     const r2 = await run(w, rec, term({ yes: () => true }), { deleteRepos: true, canDeleteRepos: true });
     expect(w.deleted).not.toContain('o/pipelines');
-    expect([...r2.skipped, ...r2.manual].some((m) => /pipelines/.test(m.what) && /pipegen-required--shop/.test(m.why))).toBe(true);
+    expect([...r2.skipped, ...r2.manual, ...r2.failed].some((m) => /pipelines/.test(m.what) && /pipegen-required--shop/.test(m.why))).toBe(true);
   });
 });
 

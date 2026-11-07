@@ -251,10 +251,10 @@ export class PhaseApi {
    * The central repo delete (deleteCentralRepo's every check, the typed numbers and `pipelines` typed at this run's terminal). The caller
    * decides the token may delete repos (App mode) and that the central PR removing the record merged; sendRepoDelete is reached only here.
    */
-  async removeCentralRepo(rec: InstallRecord, knownHeads: Readonly<Record<string, string>>): Promise<CentralDeleteResult> {
+  async removeCentralRepo(rec: InstallRecord, knownHeads: Readonly<Record<string, string>>, beforeDelete?: () => void): Promise<CentralDeleteResult> {
     this.#only('B', 'the central repo delete');
     const api = this.#api;
-    return deleteCentralRepo(api.gh, api.central, rec, { askName: (expected, question) => api.ask(expected, question), clock: api.clock, knownHeads });
+    return deleteCentralRepo(api.gh, api.central, rec, { askName: (expected, question) => api.ask(expected, question), clock: api.clock, knownHeads, ...(beforeDelete === undefined ? {} : { beforeDelete }) });
   }
   /** V6-R1 sec I1: deleteCentralRepo's checks, read only (token mode: whether pipegen may tell the user to delete it); nothing asked or sent. */
   async checkCentralRepo(rec: InstallRecord, knownHeads: Readonly<Record<string, string>>): Promise<CentralDeleteResult> {

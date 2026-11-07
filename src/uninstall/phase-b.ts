@@ -63,6 +63,8 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
   const prior = ctx.progress.state;
   // V6-R1 sec M1: the head pipegen set the central uninstall branch to in an earlier run 2 (read before this run saves over the file)
   let centralHead = prior?.phase === 'B' ? prior.centralUninstallHead : undefined;
+  // V6-R3 sec M1: set right before pipegen's own repo DELETE of central (a later run that finds central gone can finish)
+  let deleteSent = prior?.phase === 'B' ? prior.centralDeleteSent : undefined;
 
   // V-S9: the record as the preview read it (or this project's central PR that removed it, merged), before anything is sent
   await recheck();
@@ -73,6 +75,7 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
       ...(prior?.prNumber === undefined ? {} : { prNumber: prior.prNumber, ...(prior.prUrl === undefined ? {} : { prUrl: prior.prUrl }) }),
       ...(prior?.unfinished === true ? { unfinished: true as const } : {}),
       ...(centralHead === undefined ? {} : { centralUninstallHead: centralHead }),
+      ...(deleteSent === undefined ? {} : { centralDeleteSent: deleteSent }),
       done: [...r.done], leftovers: [...r.failed, ...r.manual.map((m) => ({ what: m.what, why: m.why, ...(m.step === undefined ? {} : { manual: m.step }) }))],
     });
   };
@@ -442,20 +445,22 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
     const c = central as CentralOutcome | null;
     if (c === null) { r.failed.push({ what, why: 'not done: the central part of this run did not finish', manual: 'Run `pipegen uninstall --delete-repos` again.' }); return; }
     if (!c.last) { r.skipped.push({ what, why: `${c.lastWhy}, so pipegen keeps it` }); return; }
-    if (c.orgRule !== null) { r.skipped.push({ what, why: `${c.orgRule}, so pipegen keeps ${d.repo}` }); r.manual.push({ what, why: c.orgRule, step: 'Delete the org rule in the organisation\'s settings (Rulesets), then run `pipegen uninstall --delete-repos` again.' }); return; }
     if (!c.merged) {
       const url = c.pr === undefined ? '' : ` #${c.pr.number} (${show(c.pr.url, 300)})`;
       r.manual.push({ what, why: 'the central pull request that removes the install record is not merged yet, so the repo stays for now', step: `Merge the central pull request${url}, then run \`pipegen uninstall --delete-repos\` again.` });
       return;
     }
+    // V6-R3 sec M2: the advice is to change something and come back, so the local files stay (r.failed) and the re-run can load
+    if (c.orgRule !== null) { r.failed.push({ what, why: `${c.orgRule}, so pipegen keeps ${d.repo} for now`, manual: 'Delete the org rule in the organisation\'s settings (Rulesets), then run `pipegen uninstall --delete-repos` again.' }); return; }
     // hook-1, V6-R2 sec M3 (both modes): the heads pipegen recorded for its own central branches (the central uninstall branch it set)
     const known: Record<string, string> = centralHead === undefined ? {} : { [uninstallBranch({ owner: appRef.owner, repo: appRef.repo, repoId: plan.app.repoId }, 'central')]: centralHead };
     /** V6-R2 sec I1: a refusal never advises `gh repo delete`; one a later run may not meet keeps the local files (r.failed). */
     const refused = (res: CentralDeleteResult): void => {
       const why = show(res.why ?? 'pipegen\'s checks did not pass', 400);
-      if (res.retry === true) { r.failed.push({ what, why, manual: 'Run `pipegen uninstall --delete-repos` again.' }); return; }
+      if (res.retry === true) { r.failed.push({ what, why, manual: res.step ?? 'Run `pipegen uninstall --delete-repos` again.' }); return; }
       r.skipped.push({ what, why });
-      r.manual.push({ what, why, step: 'Check it on GitHub; pipegen doesn\'t tell you to delete it while it holds that.' });
+      // spec M3 (V6-R3): this run removes the record, so no later run can come back to it
+      r.manual.push({ what, why, step: res.step ?? `Check it on GitHub; pipegen doesn't tell you to delete it while it holds that, and it can't delete it for you after this run (the install record goes with this run): what to do with ${d.repo} is yours to decide.` });
     };
     if (tokenMode) {
       let res: CentralDeleteResult;
@@ -474,13 +479,19 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
     }
     // V6-R1 sec M2: pipegen's own central branches go with the repo, inside deleteCentralRepo (named in its question): never before it
     let res;
-    try { res = await api.removeCentralRepo(rec, known); } catch (e) {
+    const sent = (): void => { deleteSent = rec.central?.repoId ?? loaded.centralRepoId; save(); };
+    try { res = await api.removeCentralRepo(rec, known, sent); } catch (e) {
       hardStop(e);
       r.failed.push({ what, why: reasonOf(e), manual: 'Run `pipegen uninstall --delete-repos` again.' });
       return;
     }
+    if (!res.deleted && res.sent !== true && deleteSent !== undefined) { deleteSent = undefined; save(); }   // GitHub refused it: no marker
     if (res.deleted) {
       r.done.push(`${what}: deleted`);
+      // V6-R3 sec M1: what was left inside central went with it (GitHub answered 404 after the DELETE)
+      const inRepo = new Set(c.inRepo ?? []);
+      for (const f of r.failed.filter((x) => inRepo.has(x.what))) r.done.push(`${f.what}: went with the repo`);
+      r.failed = r.failed.filter((x) => !inRepo.has(x.what));
       for (const u of res.unchecked ?? []) r.manual.push({ what, why: `deleted without pipegen reading ${show(u, 200)}`, step: 'Nothing to do now; the token could not show them before the delete.' });
     } else if (res.command !== undefined) {
       // every check passed and the user declined `pipelines`: the command is theirs to run

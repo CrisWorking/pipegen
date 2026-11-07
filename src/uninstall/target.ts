@@ -1103,6 +1103,10 @@ export interface CentralDeleteResult {
    * Anything else is a refusal about what the repo holds: no command, and the why says what.
    */
   retry?: true;
+  /** V6-R3: the step for the user when it is not the caller's usual one (an own branch to delete, a DELETE GitHub refused for good). */
+  step?: string;
+  /** V6-R3 sec M1: the DELETE was sent and GitHub accepted it, but pipegen could not confirm the repo is gone. */
+  sent?: true;
 }
 /** The README GitHub's `auto_init` writes for the repo pipegen creates (`# pipelines` and its description): nothing of the user's. */
 const AUTO_README = (desc: string): Set<string> => new Set([
@@ -1129,7 +1133,7 @@ const listed = (xs: readonly unknown[]): string => `${xs.slice(0, MAX_LISTED).ma
  * never deleted before it, so a declined or refused delete keeps them). `dryRun` (V6-R1 sec I1, token mode): the same checks, read only;
  * `{ deleted: false, ready: true, prs, unchecked }` when they pass, nothing asked and nothing sent.
  */
-export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: InstallRecord, io: { askName: AskName; clock?: RateClock; prAuthor?: string; dryRun?: true; knownHeads?: Readonly<Record<string, string>> }): Promise<CentralDeleteResult> {
+export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: InstallRecord, io: { askName: AskName; clock?: RateClock; prAuthor?: string; dryRun?: true; knownHeads?: Readonly<Record<string, string>>; beforeDelete?: () => void }): Promise<CentralDeleteResult> {
   const owner = rec?.app?.owner;
   if (central?.repo !== CENTRAL_REPO || typeof owner !== 'string' || central.owner !== owner) refuse(`${show(`${central?.owner}/${central?.repo}`)} is not the central repo of ${show(String(owner))}.`);
   const c = rec.central;
@@ -1137,8 +1141,8 @@ export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: Inst
   const full = `${owner}/${CENTRAL_REPO}`;
   const command = `gh repo delete ${full}`;
   const notDeleted = (why: string, kind: 'content' | 'retry' | 'declined' = 'content'): CentralDeleteResult => ({ deleted: false, why, ...(kind === 'declined' ? { command } : {}), ...(kind === 'retry' ? { retry: true as const } : {}) });
-  /** Set when a read of the check fails (not an answer about what the repo holds): that refusal is a `retry`. */
-  let unreadable = false;
+  /** Set when a read of the check fails, or the user is asked to change something first (V6-R3 sec M2): that refusal is a `retry`. */
+  let retryable = false;
   if (c === undefined || c.createdByPipegen !== true || !posId(c.repoId)) return notDeleted(`pipegen has no record of creating ${full}, so it doesn't delete it`);
   const repoId = c.repoId;
   const cr = { ...api.central };
@@ -1149,7 +1153,7 @@ export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: Inst
     try { return { data: (await api.read(route, { ...cr, ...params })).data }; } catch (e) {
       if (e instanceof UninstallRefusal) throw e;
       hardStop(e);
-      unreadable = true;
+      retryable = true;
       return { why: `pipegen couldn't read ${what} of ${full}` };
     }
   };
@@ -1161,7 +1165,7 @@ export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: Inst
       hardStop(e);
       const s = statusOf(e);
       if (s === 403 || s === 404) { unread.push(`its ${label} secrets`); return null; }
-      unreadable = true;
+      retryable = true;
       return `pipegen couldn't read the ${label} secrets of ${full}, so it doesn't delete it`;
     }
     const list = isObj(d) && Array.isArray(d.secrets) ? d.secrets : null;
@@ -1177,7 +1181,7 @@ export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: Inst
         hardStop(e);
         const st = statusOf(e);
         if (st === 403 || st === 404) { unread.push(`its ${label}`); continue; }
-        unreadable = true;
+        retryable = true;
         return `pipegen couldn't read the ${label} of ${full}, so it doesn't delete it`;
       }
       if (!Array.isArray(d)) return `GitHub's list of the ${label} of ${full} could not be read, so pipegen doesn't delete it`;
@@ -1257,8 +1261,9 @@ export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: Inst
     if (d.description !== helperDescription('central')) return { why: `${full} doesn't carry pipegen's marker (its description), so pipegen doesn't delete it` };
     if (d.id !== repoId) return { why: `${full} is not the repo pipegen created (its id differs from the one recorded), so pipegen doesn't delete it` };
     if (d.forks_count !== 0) return { why: `${full} has forks (or GitHub doesn't say), and they belong to whoever made them, so pipegen doesn't delete it` };
-    if (d.has_wiki !== false) return { why: `${full} has its wiki turned on, and pipegen can't see whether it holds pages: check the wiki, turn it off in the repo's settings, then run pipegen again (or delete the repo yourself)` };
-    if (d.has_discussions !== false) return { why: `${full} has Discussions turned on (or GitHub doesn't say), and they would go with the repo: check them, turn Discussions off in the repo's settings, then run pipegen again (or delete the repo yourself)` };
+    // V6-R3 sec M2: these ask the user to change something, then come back: a `retry` (the caller keeps its local files), never delete advice
+    if (d.has_wiki !== false) { retryable = true; return { why: `${full} has its wiki turned on, and pipegen can't see whether it holds pages: check the wiki, turn it off in the repo's settings, then run pipegen again` }; }
+    if (d.has_discussions !== false) { retryable = true; return { why: `${full} has Discussions turned on (or GitHub doesn't say), and they would go with the repo: check them, turn Discussions off in the repo's settings, then run pipegen again` }; }
     if (typeof d.default_branch !== 'string') return { why: `GitHub doesn't say which is the default branch of ${full}` };
     const def = d.default_branch;
     const br = await get('GET /repos/{owner}/{repo}/branches', { per_page: 100 }, 'the branches');
@@ -1275,11 +1280,11 @@ export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: Inst
     } catch (e) {
       hardStop(e);
       const s = statusOf(e);
-      if (s !== 404 && s !== 409) { unreadable = true; return { why: `pipegen couldn't read the branch ${show(def, 100)} of ${full}` }; }   // 404 / 409: no commit yet
+      if (s !== 404 && s !== 409) { retryable = true; return { why: `pipegen couldn't read the branch ${show(def, 100)} of ${full}` }; }   // 404 / 409: no commit yet
     }
     if (head !== null) {
       let entries: Map<string, TreeEntry>;
-      try { entries = (await readTree(gh, cr, head, api.clock)).entries; } catch (e) { hardStop(e); unreadable = true; return { why: `pipegen couldn't read the files of ${full}` }; }
+      try { entries = (await readTree(gh, cr, head, api.clock)).entries; } catch (e) { hardStop(e); retryable = true; return { why: `pipegen couldn't read the files of ${full}` }; }
       const records = [...entries.keys()].filter((p) => p.startsWith('installs/'));
       if (records.length > 0) return { why: `${full} still holds an install record (${listed(records)}), so pipegen doesn't delete it` };
       const readme = AUTO_README(helperDescription('central'));
@@ -1299,15 +1304,21 @@ export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: Inst
     return why === null ? { head, unread, prs, own: own.sort() } : { why };
   };
 
-  unreadable = false;
+  retryable = false;
   const first = await check();
-  if ('why' in first) return notDeleted(first.why, unreadable ? 'retry' : 'content');
+  if ('why' in first) return notDeleted(first.why, retryable ? 'retry' : 'content');
   // hook-1 (V6-R1), V6-R2 sec M3 (both modes): pipegen's own branches go with the repo; each must be at a head pipegen recorded
   // (`knownHeads`), else it may hold a teammate's commit: refused before anything is asked
   const own = first.own.map((x) => { const i = x.lastIndexOf('@'); return { branch: x.slice(0, i), sha: x.slice(i + 1) }; });
   const foreignHeads = own.filter((b) => io.knownHeads?.[b.branch] !== b.sha);
   if (foreignHeads.length > 0) {
-    return { ...notDeleted(`pipegen's own branch ${listed(foreignHeads.map((b) => b.branch))} of ${full} is not at a commit pipegen recorded (it may hold someone's work), and it would go with the repo, so pipegen doesn't delete it or tell you to: look at it, keep what you need, delete the branch, then run pipegen again`, 'retry'), ...(io.dryRun === true ? { ready: false } : {}), own };
+    // spec M2 (V6-R3): the step names each branch and how to delete it
+    const delSteps = foreignHeads.map((b) => `gh api -X DELETE repos/${full}/git/refs/heads/${b.branch}`).join(' and ');
+    return {
+      ...notDeleted(`pipegen's own branch ${listed(foreignHeads.map((b) => b.branch))} of ${full} is not at a commit pipegen recorded (it may hold someone's work), and it would go with the repo, so pipegen doesn't delete it or tell you to`, 'retry'),
+      step: `Look at ${listed(foreignHeads.map((b) => b.branch))} in ${full}, keep what you need, delete it (${delSteps}), then run \`pipegen uninstall --delete-repos\` again.`,
+      ...(io.dryRun === true ? { ready: false } : {}), own,
+    };
   }
   if (io.dryRun === true) {
     return { deleted: false, ready: true, command, ...(own.length > 0 ? { own } : {}), ...(first.prs.length > 0 ? { prs: first.prs } : {}), ...(first.unread.length > 0 ? { unchecked: first.unread.map((x) => `${x} of ${full}`) } : {}) };
@@ -1330,17 +1341,22 @@ export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: Inst
   if (again.unread.some((x) => !first.unread.includes(x))) return notDeleted(`pipegen could read less of ${full} than when it asked, so it doesn't delete it; run pipegen again`, 'retry');
   if (again.prs.some((n) => !first.prs.includes(n))) return notDeleted(`${full} got a new pull request while pipegen asked, so it doesn't delete it; run pipegen again`, 'retry');
   if (again.own.join('\n') !== first.own.join('\n')) return notDeleted(`a branch of pipegen's in ${full} moved while pipegen asked, so it doesn't delete it; run pipegen again`, 'retry');
+  io.beforeDelete?.();
   try { await api.sendRepoDelete(REPO_DELETE_GUARD, api.central); } catch (e) {
     if (e instanceof UninstallRefusal) throw e;
     hardStop(e);
     const s = statusOf(e);
+    // V6-R3 spec I1: only a server error (5xx) or no answer may pass on a later run; a 4xx (the token can't delete it) won't
+    if (s !== undefined && s < 500) {
+      return { ...notDeleted(`GitHub refused to delete ${full} (HTTP ${s}): this token can't delete it`), step: `pipegen checked ${full} holds nothing but its own. Delete it yourself in its Settings (General → Danger Zone) if you want it gone; pipegen can't delete it for you after this run.` };
+    }
     return notDeleted(`GitHub refused to delete ${full}${s === undefined ? '' : ` (HTTP ${s})`}`, 'retry');
   }
   try { await api.read('GET /repos/{owner}/{repo}', { ...cr }); } catch (e) {
     hardStop(e);
     const s = statusOf(e);
     if (s === 404) return first.unread.length > 0 ? { deleted: true, unchecked: first.unread.map((x) => `${x} of ${full} (not read before the delete)`) } : { deleted: true };
-    return notDeleted(`pipegen could not confirm that ${full} is gone after the delete (GitHub answered ${s === undefined ? 'nothing' : `HTTP ${s}`}); check it`, 'retry');
+    return { ...notDeleted(`pipegen could not confirm that ${full} is gone after the delete (GitHub answered ${s === undefined ? 'nothing' : `HTTP ${s}`}); check it`, 'retry'), sent: true };
   }
-  return notDeleted(`GitHub still shows ${full} after the delete`, 'retry');
+  return { ...notDeleted(`GitHub still shows ${full} after the delete`, 'retry'), sent: true };
 }

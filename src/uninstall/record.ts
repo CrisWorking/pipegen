@@ -12,6 +12,7 @@
 // for a typed trust or a marker that isn't a match, and then the plan asks for a typed name before every API delete and restore (a typed
 // trust has no hash anchor, and the created_at values it keeps were never shown). A created entry that doesn't hold exactly one of
 // githubCreatedAt / unconfirmed counts as unconfirmed. Typed names come only from the user's terminal (askTypedName).
+import { unlinkSync } from 'node:fs';
 import type { Octokit } from '@octokit/rest';
 import { PromptCancelledError, type Prompter } from '../cli/io.js';
 import { isRateStop, type RateClock } from '../engine/github-rate.js';
@@ -20,14 +21,14 @@ import { SETUP_BRANCH } from '../deliver/deliver.js';
 import { gitBlobSha } from '../create/guard.js';
 import { DeliverError, ghRead, readBlobText, readHead, readRepo, statusOf, type RepoRef } from '../deliver/git-data.js';
 import {
-  canonicalRecordJson, centralOf, centralUpdateBranch, localRecordPath, MAX_RECORD_BYTES, parseRecord, readLocalRecord, readRecord, RecordError,
+  canonicalRecordJson, centralOf, centralUpdateBranch, localFinishPendingPath, localRecordPath, MAX_RECORD_BYTES, parseRecord, readLocalLeftovers, readLocalRecord, readRecord, RecordError,
   recordHash, recordMarkerOf, recordPath, type LocalRecordDeps, type ReadRecordResult,
 } from '../deliver/record.js';
 import { centralProjectName } from '../engine/central-path.js';
 import { confirmView, TYPED_VIEW_FIELDS, trustedPrevious } from '../deliver/trust.js';
 import type { InstallRecord } from '../types.js';
 import { safeText } from '../util/safe-text.js';
-import { UninstallError } from './errors.js';
+import { UninstallError, UninstallFinished } from './errors.js';
 import { ProgressFile } from './progress.js';
 
 /** The app repo as GitHub reports it now (readRepo), never as the record says. */
@@ -213,13 +214,18 @@ async function fromRun2Blob(
   if (st === null || st.phase !== 'B') return null;
   const branch = `pipegen/uninstall-${centralProjectName(app.repo)}`;
   const prs = await ghRead(gh, 'GET /repos/{owner}/{repo}/pulls', central, { head: `${central.owner}:${branch}`, state: 'closed', per_page: 100 }, clock);
-  const merged = (Array.isArray(prs) ? prs.filter(isObj) : [])
-    // V6-R2 sec M1: this uninstall's PR only: its head the one pipegen set the branch to (the progress file); an earlier cycle's doesn't count
-    .filter((p) => headIs(p, branch, c.id) && isObj(p.base) && p.base.ref === c.defaultBranch && typeof p.merged_at === 'string' && p.merged_at !== ''
-      && st.centralUninstallHead !== undefined && isObj(p.head) && p.head.sha === st.centralUninstallHead)
-    .map((p) => p.number).filter((n): n is number => typeof n === 'number' && Number.isSafeInteger(n) && n > 0).sort((x, y) => y - x);
-  if (merged.length === 0) return null;
+  const numbers = (xs: Record<string, unknown>[]): number[] => xs.map((p) => p.number).filter((n): n is number => typeof n === 'number' && Number.isSafeInteger(n) && n > 0).sort((x, y) => y - x);
+  const candidates = (Array.isArray(prs) ? prs.filter(isObj) : [])
+    .filter((p) => headIs(p, branch, c.id) && isObj(p.base) && p.base.ref === c.defaultBranch && typeof p.merged_at === 'string' && p.merged_at !== '');
+  // V6-R2 sec M1: this uninstall's PR only: its head the one pipegen set the branch to (the progress file); an earlier cycle's doesn't count
+  const merged = numbers(candidates.filter((p) => st.centralUninstallHead !== undefined && isObj(p.head) && p.head.sha === st.centralUninstallHead));
   const centralName = show(`${central.owner}/${central.repo}`);
+  if (merged.length === 0) {
+    const other = numbers(candidates);
+    if (other.length === 0) return null;
+    // V6-R3 (sec info): say why, and which local files to move away once the user finished by hand
+    throw new UninstallError(`The install record of ${show(`${app.owner}/${app.repo}`)} is gone from ${centralName}, and the merged central uninstall pull request #${other[0]} is not at the commit pipegen set (someone changed its branch before it merged, or it is from an earlier uninstall), so pipegen can't tell it is the one this uninstall opened and removes nothing more. Check ${centralName} and finish by hand, then move away ${localRecordPath(app, deps.local ?? {})} and ${progress.path}. Nothing was changed.`);
+  }
   const stop = (why: string): never => {
     throw new UninstallError(`The install record of ${show(`${app.owner}/${app.repo}`)} is gone from ${centralName} (your central uninstall pull request #${merged[0]} merged), and ${why}, so pipegen removes nothing more. Finish the steps it listed by hand. Nothing was changed.`);
   };
@@ -263,6 +269,32 @@ async function fromRun2Blob(
   };
 }
 
+/**
+ * V6-R3 sec M1: central answers 404 (the app repo of the same owner was just read, so the owner is there) and the progress file says
+ * pipegen itself sent the DELETE of `<owner>/pipelines` in run 2: the uninstall is finished. The local record file, `.finish-pending.json`
+ * and the progress file are removed, and UninstallFinished says so. A leftovers file that still lists something keeps them all (a stop
+ * naming it). Not this case: returns, and the usual stop follows.
+ */
+async function finishedAfterCentralDelete(app: RepoRef, uapp: UninstallApp, central: RepoRef, deps: UninstallDeps): Promise<void> {
+  const progress = await ProgressFile.open(app, uapp.repoId, deps.local ?? {});
+  const st = progress.state;
+  if (st === null || st.phase !== 'B' || st.centralDeleteSent === undefined) return;
+  const full = show(`${central.owner}/${central.repo}`);
+  const leftovers = await readLocalLeftovers(app, deps.local ?? {}).catch(() => null);
+  const lf = localRecordPath(app, deps.local ?? {}).replace(/\.json$/, '.leftovers.json');
+  if (leftovers === null || leftovers.length > 0) {
+    throw new UninstallError(`pipegen deleted ${full} in its last run (GitHub now answers 404 for it), but its leftovers file ${lf} still lists something (or can't be read). Handle each entry by hand, then remove ${lf}, ${localRecordPath(app, deps.local ?? {})} and ${progress.path}. Nothing was changed.`);
+  }
+  const gone: string[] = [];
+  for (const p of [localRecordPath(app, deps.local ?? {}), localFinishPendingPath(app, deps.local ?? {}), lf]) {
+    try { unlinkSync(p); gone.push(p); } catch (e) {
+      if ((e as { code?: unknown } | null)?.code !== 'ENOENT') throw new UninstallError(`pipegen deleted ${full} in its last run, but it couldn't remove ${p}: remove it by hand, and ${progress.path} too.`, { cause: e });
+    }
+  }
+  progress.remove();
+  throw new UninstallFinished(`pipegen deleted ${full} in its last run (GitHub now answers 404 for it), so the uninstall of ${show(`${app.owner}/${app.repo}`)} is finished. pipegen removed its local files${gone.length > 0 ? ` (${gone.map((g) => show(g, 300)).join(', ')})` : ''} and ${progress.path}.`);
+}
+
 /** trustedPrevious's note, without the clause meant for deliver (uninstall writes no new record). */
 const uninstallNote = (n: string): string => n.replace(/: it writes a new record, and treats every existing file and secret as not its own\./, '.');
 
@@ -300,7 +332,10 @@ async function load(gh: Octokit, app: RepoRef, deps: UninstallDeps): Promise<Loa
   const central = centralOf(app);
   const centralName = show(`${central.owner}/${central.repo}`);
   const c = await readRepo(gh, central, clock);
-  if (c === null) throw new UninstallError(`${none} (pipegen can't see ${centralName}, where it keeps its install records.)`);
+  if (c === null) {
+    await finishedAfterCentralDelete(app, uapp, central, deps);
+    throw new UninstallError(`${none} (pipegen can't see ${centralName}, where it keeps its install records.)`);
+  }
   if (!c.private) throw new UninstallError(`${centralName} is public; pipegen keeps install records only in a private one, so it won't act on a record there. Nothing was changed.`);
 
   // 4. an open central pull request on pipegen/update-<name> can still change the record: stop before anything is asked

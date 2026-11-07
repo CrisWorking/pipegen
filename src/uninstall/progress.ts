@@ -36,6 +36,8 @@ export interface UninstallProgress {
   uninstallHead?: string;
   /** The commit pipegen last set the central `pipegen/uninstall-<name>` to (V6-R1 sec M1): run 2 moves it only while it still points there. */
   centralUninstallHead?: string;
+  /** V6-R3 sec M1: GitHub's id of `<owner>/pipelines`, saved right before pipegen sent its repo DELETE (cleared when GitHub refused it). */
+  centralDeleteSent?: number;
   /** Run 1 needed no pull request and these workflows of pipegen's stay because the user kept them (V5-R1 sec M4): the next run's check
    *  for a live pipegen workflow passes them over (the run-2 preview still warns). */
   keptWorkflows?: string[];
@@ -56,6 +58,7 @@ const PROGRESS = z.strictObject({
   unfinished: z.literal(true).optional(),
   uninstallHead: SHA.optional(),
   centralUninstallHead: SHA.optional(),
+  centralDeleteSent: z.number().int().positive().optional(),
   keptWorkflows: z.array(z.string().max(300).regex(/^\.github\/workflows\/[^/]+\.ya?ml$/)).max(200).optional(),
   done: z.array(TEXT).max(2000), leftovers: z.array(ITEM).max(2000), updatedAt: z.string().max(40),
 });
@@ -106,6 +109,7 @@ export class ProgressFile {
       ...(p.unfinished === true ? { unfinished: true } : {}),
       ...(p.uninstallHead === undefined ? {} : { uninstallHead: p.uninstallHead }),
       ...(p.centralUninstallHead === undefined ? {} : { centralUninstallHead: p.centralUninstallHead }),
+      ...(p.centralDeleteSent === undefined ? {} : { centralDeleteSent: p.centralDeleteSent }),
       ...(p.keptWorkflows === undefined || p.keptWorkflows.length === 0 ? {} : { keptWorkflows: [...p.keptWorkflows] }),
       done: p.done.slice(-2000).map(text),
       leftovers: p.leftovers.slice(-2000).map((x) => ({ what: text(x.what), why: text(x.why), ...(x.manual === undefined ? {} : { manual: text(x.manual) }) })),
