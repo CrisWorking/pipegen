@@ -34,6 +34,13 @@ export interface UninstallProgress {
   unfinished?: true;
   /** The commit pipegen last set `pipegen/uninstall` to (V5-R1 sec M2): a re-run moves the branch only while it still points there. */
   uninstallHead?: string;
+  /** The commit pipegen last set the central `pipegen/uninstall-<name>` to (V6-R1 sec M1): run 2 moves it only while it still points there. */
+  centralUninstallHead?: string;
+  /**
+   * V6-R3 sec M1, hook-3: pipegen's repo DELETE of `<owner>/pipelines` (GitHub's id), for the local record file whose hash it names:
+   * `confirmed: false` right before the request, `true` once GitHub accepted it (2xx); cleared on every other way out of that step.
+   */
+  centralDeleteSent?: { repoId: number; recordHash: string; confirmed: boolean };
   /** Run 1 needed no pull request and these workflows of pipegen's stay because the user kept them (V5-R1 sec M4): the next run's check
    *  for a live pipegen workflow passes them over (the run-2 preview still warns). */
   keptWorkflows?: string[];
@@ -53,6 +60,8 @@ const PROGRESS = z.strictObject({
   prNumber: z.number().int().positive().optional(), prUrl: z.string().max(300).regex(/^https:\/\/[^\s]*$/).optional(),
   unfinished: z.literal(true).optional(),
   uninstallHead: SHA.optional(),
+  centralUninstallHead: SHA.optional(),
+  centralDeleteSent: z.strictObject({ repoId: z.number().int().positive(), recordHash: z.string().regex(/^[0-9a-f]{64}$/), confirmed: z.boolean() }).optional(),
   keptWorkflows: z.array(z.string().max(300).regex(/^\.github\/workflows\/[^/]+\.ya?ml$/)).max(200).optional(),
   done: z.array(TEXT).max(2000), leftovers: z.array(ITEM).max(2000), updatedAt: z.string().max(40),
 });
@@ -102,6 +111,8 @@ export class ProgressFile {
       ...(p.prNumber === undefined ? {} : { prNumber: p.prNumber }), ...(p.prUrl === undefined || p.prUrl === '' ? {} : { prUrl: p.prUrl }),
       ...(p.unfinished === true ? { unfinished: true } : {}),
       ...(p.uninstallHead === undefined ? {} : { uninstallHead: p.uninstallHead }),
+      ...(p.centralUninstallHead === undefined ? {} : { centralUninstallHead: p.centralUninstallHead }),
+      ...(p.centralDeleteSent === undefined ? {} : { centralDeleteSent: { ...p.centralDeleteSent } }),
       ...(p.keptWorkflows === undefined || p.keptWorkflows.length === 0 ? {} : { keptWorkflows: [...p.keptWorkflows] }),
       done: p.done.slice(-2000).map(text),
       leftovers: p.leftovers.slice(-2000).map((x) => ({ what: text(x.what), why: text(x.why), ...(x.manual === undefined ? {} : { manual: text(x.manual) }) })),

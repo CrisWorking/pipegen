@@ -25,6 +25,9 @@
 //   the uninstall PR must target the default branch. The phase runner gets the plan without its api, and only takeApi makes a PhaseApi.
 //   pipegen/setup stays while a PR into it is open; pipegen/uninstall moves only while it points where pipegen set it (saved in the progress
 //   file); a run 1 with no PR remembers the workflows the user kept, so the next run goes on to run 2 (with the warning) instead of run 1.
+// - V6: run 2's runner is phase-b.ts's applyPhaseB. The phase-B api adds its own routes: a typed name at apply time (the central ruleset
+//   with no creation date; a repo delete), the central repo delete (deleteCentralRepo, called here only), and the scratch repo's cleanup
+//   writes (E's cleanupWrite, deleteScratchSecret, deleteScratchRepo and cleanupLeftovers, called here only).
 import { randomBytes } from 'node:crypto';
 import type { Octokit } from '@octokit/rest';
 import { PromptCancelledError, type Prompter } from '../cli/io.js';
@@ -36,17 +39,19 @@ import { isRateStop, type RateClock } from '../engine/github-rate.js';
 import { CALLER_WORKFLOW, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PUSH_WORKFLOW } from '../engine/job-rules.js';
 import { clockOf, GitHubAccessError } from '../github/client.js';
 import { VERIFY_JOB_ID } from '../layers/assemble.js';
+import { cleanupLeftovers, type CleanupResult } from '../proof/cleanup.js';
 import { StateError, StateStore, type StateDeps } from '../proof/state.js';
-import { ProofStopError } from '../proof/target.js';
+import { cleanupWrite, deleteScratchRepo, deleteScratchSecret, ProofStopError, type CleanupOp, type GuardedRepo, type RepoDeleteResult } from '../proof/target.js';
 import type { InstallRecord, RecordApiRequest } from '../types.js';
 import { interrupting, onInterrupt } from '../util/exit-hooks.js';
 import { safeText } from '../util/safe-text.js';
 import { UninstallError } from './errors.js';
+import { applyPhaseB } from './phase-b.js';
 import { planUninstall, previewUninstall, type PlanDeps, type UninstallPhase, type UninstallPlan } from './plan.js';
 import { ProgressFile, type ProgressItem } from './progress.js';
 import type { LoadedRecord } from './record.js';
 import {
-  UninstallRefusal, type DeleteOutcome, type EnvForm, type Owned, type TypedName, type UninstallApi, type Where,
+  deleteCentralRepo, UninstallRefusal, type CentralDeleteResult, type Confirmable, type DeleteOutcome, type EnvForm, type Owned, type TypedName, type UninstallApi, type Where,
 } from './target.js';
 
 type EnvEntry = InstallRecord['environments'][number];
@@ -68,8 +73,14 @@ export interface StepResult {
   /** The final message (names only). */
   lines: string[];
 }
-/** What phase B gets besides its confirmed plan and its phase-bound api (V6). */
-export interface PhaseBContext { progress: ProgressFile; workflowsLive: boolean; out: (line: string) => void; deps: StepDeps }
+/**
+ * What phase B gets besides its confirmed plan and its phase-bound api (V6): the loaded (trusted) record the plan was made from, the
+ * terminal (the record's yes, typed names at apply time), and the app's lease store (a saved proof state; cleanupLeftovers).
+ */
+export interface PhaseBContext {
+  progress: ProgressFile; workflowsLive: boolean; out: (line: string) => void; deps: StepDeps;
+  loaded: LoadedRecord; io: Prompter | undefined; store: StateStore;
+}
 /** A confirmed plan as a phase runner gets it: without its unbound `api` (V5-R1 I2); every write goes through the PhaseApi beside it. */
 export type PhasePlan = Omit<UninstallPlan, 'api'>;
 export type PhaseBRunner = (gh: Octokit, plan: PhasePlan, api: PhaseApi, ctx: PhaseBContext) => Promise<StepResult>;
@@ -78,7 +89,7 @@ export interface StepDeps extends PlanDeps {
   out?: (line: string) => void;
   /** The lease's state folder (tests). */
   state?: StateDeps;
-  /** Phase B (V6). Absent: run 2 stops, saying so. */
+  /** Phase B (V6). Absent: phase-b.ts's applyPhaseB. */
   phaseB?: PhaseBRunner;
 }
 
@@ -227,6 +238,52 @@ export class PhaseApi {
     this.#only('B', 'a settings write');
     return this.#api.write(route, params, opts);
   }
+
+  // ---------- phase B's own routes (V6, V5-R1 carry) ----------
+
+  /** A typed name at apply time for an object the plan couldn't ask about (the central ruleset with no creation date): its token. */
+  async confirm(c: Confirmable): Promise<TypedName | null> {
+    this.#only('B', 'a typed name at apply time');
+    if (String(c?.kind) !== 'central-ruleset') throw new UninstallRefusal('run 2 asks a typed name at apply time only for the central ruleset; the plan asked the others.');
+    return this.#api.confirm(c);
+  }
+  /**
+   * The central repo delete (deleteCentralRepo's every check, the typed numbers and `pipelines` typed at this run's terminal). The caller
+   * decides the token may delete repos (App mode) and that the central PR removing the record merged; sendRepoDelete is reached only here.
+   */
+  async removeCentralRepo(rec: InstallRecord, knownHeads: Readonly<Record<string, string>>, marker?: { beforeDelete: () => void; deleteAccepted: () => void }): Promise<CentralDeleteResult> {
+    this.#only('B', 'the central repo delete');
+    const api = this.#api;
+    return deleteCentralRepo(api.gh, api.central, rec, { askName: (expected, question) => api.ask(expected, question), clock: api.clock, knownHeads, ...(marker ?? {}) });
+  }
+  /** V6-R1 sec I1: deleteCentralRepo's checks, read only (token mode: whether pipegen may tell the user to delete it); nothing asked or sent. */
+  async checkCentralRepo(rec: InstallRecord, knownHeads: Readonly<Record<string, string>>): Promise<CentralDeleteResult> {
+    this.#only('B', 'the central repo check');
+    const api = this.#api;
+    return deleteCentralRepo(api.gh, api.central, rec, { askName: async () => { throw new UninstallRefusal('the central repo check asks nothing.'); }, clock: api.clock, dryRun: true, knownHeads });
+  }
+  /** One of E's cleanup writes on the scratch repo (cleanupWrite: its own guard and op list). */
+  async scratchCleanup(r: GuardedRepo, op: CleanupOp): Promise<{ status: number; data: unknown }> {
+    this.#only('B', 'the scratch repo cleanup');
+    return cleanupWrite(this.#api.gh, r, op, this.#api.clock);
+  }
+  /** One repo secret of the scratch repo, deleted through E's deleteScratchSecret. */
+  async scratchSecretDelete(r: GuardedRepo, name: string): Promise<void> {
+    this.#only('B', 'the scratch repo cleanup');
+    return deleteScratchSecret(this.#api.gh, r, name, this.#api.clock);
+  }
+  /** The scratch repo delete: its exact name typed at this run's terminal first, then E's deleteScratchRepo (name, marker, recorded id). */
+  async scratchRepoDelete(r: GuardedRepo, recordedId: number | undefined): Promise<RepoDeleteResult> {
+    this.#only('B', 'the scratch repo delete');
+    const typed = await this.#api.ask(r.repo, `Delete the repo ${show(r.fullName, 140)} (pipegen's scratch repo, id ${String(recordedId)})? Its history, runs and everything else in it go with it, and GitHub can't undo it.`);
+    if (!typed) return { deleted: false, why: `the name typed was not ${r.repo}` };
+    return deleteScratchRepo(this.#api.gh, r, recordedId, this.#api.clock);
+  }
+  /** What a saved proof state left (E's cleanupLeftovers); the scratch repo is never deleted there (that needs its typed name). */
+  async proofLeftovers(store: StateStore, io: Parameters<typeof cleanupLeftovers>[2]['io']): Promise<CleanupResult> {
+    this.#only('B', 'the proof cleanup');
+    return cleanupLeftovers(this.#api.gh, store, { canDeleteRepo: false, io });
+  }
 }
 
 // ---------- the dispatcher ----------
@@ -245,7 +302,7 @@ export async function uninstallStep(gh: Octokit, loaded: LoadedRecord, io: Promp
   const lease = await takeLease(app, deps.state);
   try {
     const progress = await ProgressFile.open(app, loaded.app.repoId, deps.local ?? {});
-    const ctx: Ctx = { gh, loaded, io, deps, planDeps, out, clock, progress };
+    const ctx: Ctx = { gh, loaded, io, deps, planDeps, out, clock, progress, store: lease };
     const p = progress.state;
     if (p === null || p.phase === 'A') return await runA(ctx);
     // I1: past run 1, the file counts only for the record it was made for (phase A never writes the record; phase B removes it last)
@@ -303,7 +360,7 @@ export async function uninstallStep(gh: Octokit, loaded: LoadedRecord, io: Promp
 
 interface Ctx {
   gh: Octokit; loaded: LoadedRecord; io: Prompter | undefined; deps: StepDeps; planDeps: PlanDeps; out: (line: string) => void; clock: RateClock;
-  progress: ProgressFile;
+  progress: ProgressFile; store: StateStore;
 }
 
 /** Run 1: plan A, preview, one yes, phase A (again on a moved default branch); an unfinished install goes on to run 2 in the same process. */
@@ -328,10 +385,7 @@ async function runA(c: Ctx): Promise<StepResult> {
 
 /** Run 2: a fresh phase-B plan (never run 1's answers or tokens), its preview and one yes, then phase B (V6). */
 async function runB(c: Ctx, live: boolean): Promise<StepResult> {
-  if (c.deps.phaseB === undefined) {
-    return result('stopped', null, ['The second run of pipegen uninstall (secrets, variables, environments, settings, central) is not in this version yet. Nothing more was changed.']);
-  }
-  const plan = await planUninstall(c.gh, c.loaded, c.io, { ...c.planDeps, phase: 'B' });
+  const plan = await planUninstall(c.gh, c.loaded, c.io, { ...c.planDeps, phase: 'B', proofState: c.store.state !== null });
   if (live) plan.warnings.push(LIVE_WARNING);
   if (!(await confirmPlan(plan, c.io, c.deps))) return declined(plan.phase);
   return dispatch(c, plan, live);
@@ -341,7 +395,8 @@ async function runB(c: Ctx, live: boolean): Promise<StepResult> {
 async function dispatch(c: Ctx, plan: UninstallPlan, live: boolean): Promise<StepResult> {
   if (plan.phase === 'A') return applyPhaseA(c.gh, plan, c.progress, { out: c.out, clock: c.clock });
   const taken = takeApi(plan, 'B');
-  return (c.deps.phaseB as PhaseBRunner)(c.gh, taken.plan, taken.api, { progress: c.progress, workflowsLive: live, out: c.out, deps: c.deps });
+  const runner: PhaseBRunner = c.deps.phaseB ?? applyPhaseB;
+  return runner(c.gh, taken.plan, taken.api, { progress: c.progress, workflowsLive: live, out: c.out, deps: c.deps, loaded: c.loaded, io: c.io, store: c.store });
 }
 
 // ---------- phase A ----------
