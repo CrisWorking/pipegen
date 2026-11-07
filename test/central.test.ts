@@ -180,7 +180,7 @@ describe('G3: central shared files (Plan G Task 1)', () => {
       }
     }
     // the inline keyless job passes the referee as a deploy job of pipegen.yml
-    const file = workflow({ ...jobsOf(pub), [SIGN_JOB_ID]: { ...j, if: DEPLOY_PUSH_IF, needs: ['gate'] } }, { on: DEPLOY_ON });
+    const file = workflow({ ...jobsOf(pub), [SIGN_JOB_ID]: { ...j, if: DEPLOY_PUSH_IF, needs: ['gate', 'image-publish'] } }, { on: DEPLOY_ON });
     expect(show(await judge([file], pub))).toBe('');
     // and a private repository never signs keyless (a public log): the mode is not the chosen one
     expect(() => signJob({ ...pub, profile: { ...pub.profile, private: true } }, 'keyless', deps)).toThrow(RenderError);
@@ -338,7 +338,7 @@ describe('G3 fix round 1 (G3-R2)', () => {
     // keyless (public): the OIDC token yes, attestations write no, an attest step no
     const pub = draftOf({ profile: imageProf, capabilities: { ...CAPS_BASE, keylessSigningAllowed: true }, signing: { mode: 'keyless', images: [IMG] } });
     const j = signJob(pub, 'keyless', deps);
-    const inline = (over: Obj, steps: Obj[] = j.steps as Obj[]) => workflow({ ...jobsOf(pub), [SIGN_JOB_ID]: { ...j, steps, if: DEPLOY_PUSH_IF, needs: ['gate'], ...over } }, { on: DEPLOY_ON });
+    const inline = (over: Obj, steps: Obj[] = j.steps as Obj[]) => workflow({ ...jobsOf(pub), [SIGN_JOB_ID]: { ...j, steps, if: DEPLOY_PUSH_IF, needs: ['gate', 'image-publish'], ...over } }, { on: DEPLOY_ON });
     expect(show(await judge([inline({})], pub))).toBe('');
     const kla = await judge([inline({ permissions: { ...j.permissions, attestations: 'write' } }, [...(j.steps as Obj[]), attestStep()])], pub);
     expect(kla.issues.some((i) => /attestations: write/.test(i.message)) && kla.issues.some((i) => /attest mode/.test(i.message)), show(kla)).toBe(true);

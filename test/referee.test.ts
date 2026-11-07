@@ -189,7 +189,7 @@ describe('referee: the renderer and the referee agree', () => {
       download(),
       ...attestSteps(p),
     // (v0.2 Plan G G2-R-sec2: a sign job that writes to the registry is a deploy job of the default-push pipegen.yml)
-    ], { permissions: { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' }, environment: 'pipegen-signing', if: DEPLOY_PUSH_IF, needs: ['gate'] });
+    ], { permissions: { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' }, environment: 'pipegen-signing', if: DEPLOY_PUSH_IF, needs: ['gate', 'image-publish'] });
     // (G7: pipegen-verify's shape is the deploy layer's whole verify job, the find-run step, the head check, the digest and the signature check
     // of the draft's mode; this draft's attest mode can not be verified until G15, so test/deploy-layer.test.ts holds that job to the referee)
     jobs.watch = job([co, watchAct], { permissions: { contents: 'read', issues: 'write', actions: 'read' } });

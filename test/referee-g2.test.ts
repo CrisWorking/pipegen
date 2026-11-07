@@ -718,7 +718,7 @@ describe('G2-R-sec2 (controller ruling): the sign job is held to the default-pus
     const SIGN = './.github/workflows/sign.yml';
     // allowed: reached only from a deploy caller of pipegen.yml; or the sign job itself a deploy job of pipegen.yml
     expect(show(await runWith([signFile({ sign: signJob() }), deployCaller(d, SIGN)], d))).toBe('');
-    const inline = workflow({ ...jobsOf(d), sign: signJob({ if: DEPLOY_PUSH_IF, needs: ['gate'] }) }, { on: DEPLOY_ON_SIGN });
+    const inline = workflow({ ...jobsOf(d), sign: signJob({ if: DEPLOY_PUSH_IF, needs: ['gate', 'image-publish'] }) }, { on: DEPLOY_ON_SIGN });
     expect(show(await runWith([inline], d))).toBe('');
     const cases: [string, CreatedFile[]][] = [
       ['a called file nobody judged calls', [signFile({ sign: signJob() })]],

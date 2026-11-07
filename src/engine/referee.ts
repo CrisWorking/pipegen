@@ -1230,8 +1230,10 @@ function judgeJob(fc: FileCtx, id: string, j: unknown): void {
     bad('permissions', `${where} must run in the environment ${SIGNING_ENVIRONMENT} (only deploys from the default branch pass it).`);
   }
   // G15a-R8 sec m4: the sign job (the app's caller, or the inline keyless job) needs image-publish, else both start together after the gate and
-  // the image is pushed while the sign job finds no digest yet (the called job in the central file needs nothing: its caller does)
-  if (id === 'sign' && fc.file.repo !== 'central' && !needsList(j.needs).includes('image-publish')) bad('permissions', `${where}: the sign job must need image-publish, so it signs the digest the publish job uploaded and never runs beside it.`);
+  // the image is pushed while the sign job finds no digest yet. The called sign job (a file started only by workflow_call, as the central sign
+  // workflow) needs nothing in its own file: its caller does
+  const calledOnly = fc.js.on === 'workflow_call' || (isObj(fc.js.on) && Object.keys(fc.js.on).length > 0 && Object.keys(fc.js.on).every((k) => k === 'workflow_call'));
+  if (id === 'sign' && !calledOnly && !needsList(j.needs).includes('image-publish')) bad('template', `${where}: the sign job must need image-publish, so it signs the digest the publish job uploaded and never runs beside it.`);
   if (signing && !SIGNING_JOBS.has(id)) bad('permissions', `${where} runs in ${SIGNING_ENVIRONMENT} (in any spelling), whose secrets only the sign and pipegen-verify jobs may get.`);
   else if (signing && envName !== SIGNING_ENVIRONMENT) bad('permissions', `${where} must name the environment exactly ${SIGNING_ENVIRONMENT}.`);
   if (caller) return;
