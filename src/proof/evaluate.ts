@@ -715,7 +715,7 @@ function pipelineMain(
  */
 function zapAndNuclei(sheet: Sheet, jobList: readonly JobListEntry[]): void {
   for (const e of jobList) {
-    if (e.tool !== undefined && /^zap/.test(e.tool)) sheet.note('pipeline', `${st(e.job, 80)} (ZAP) has no planted item, so it is not shown to catch anything; ${e.blocking ? 'the draft keeps it a blocking check' : 'the draft does not make it a blocking check'}`);
+    if (e.tool !== undefined && /^zap/.test(e.tool)) sheet.note('pipeline', `${st(e.job, 80)} (ZAP) has no planted item, so it is not shown to catch anything; ${e.blocking ? 'the draft keeps it a blocking check (whether the gate lets a ZAP result block a merge depends on its ZAP rule)' : 'the draft does not make it a blocking check'}`);
   }
 }
 

@@ -461,7 +461,7 @@ describe('planted', () => {
     const items = PLANTED_ITEMS.filter((i) => i.category !== 'image-scan');   // this draft has no image scan (G0-R1 m1)
     const r = await evaluate(d, both(d), ctxOf({ plantedItems: items }));
     expect(need(r, 'pipeline', 'dast')).toBeUndefined();
-    expect(part(r, 'pipeline')?.detail).toMatch(/\(ZAP\) has no planted item[^;]*not shown to catch anything; the draft keeps it a blocking check/);
+    expect(part(r, 'pipeline')?.detail).toMatch(/\(ZAP\) has no planted item[^;]*not shown to catch anything; the draft keeps it a blocking check \(whether the gate lets a ZAP result block a merge depends on its ZAP rule\)/);
     expect(part(r, 'pipeline')?.detail).not.toMatch(/warn only/);
     expect(part(r, 'pipeline')?.status).toBe('proven');
     expect(r.ok).toBe(true);
