@@ -365,7 +365,8 @@ export function publishedImageServices(p: RepoProfile, caps: Capabilities): stri
   if (targets === null) return [];
   const noImage = noImageServices(p, caps);
   const root = (path: string): boolean => path === '.' || path === '' || path === './';
-  return p.services.filter((s) => targets.includes(s.name) && !noImage.has(s.name) && typeof s.dockerfile === 'string' && s.dockerfile !== '' && root(s.path)).map((s) => s.name).sort();
+  const targetSet = new Set(targets); // G17-R2 (F10): one set, not a scan per service
+  return p.services.filter((s) => targetSet.has(s.name) && !noImage.has(s.name) && typeof s.dockerfile === 'string' && s.dockerfile !== '' && root(s.path)).map((s) => s.name).sort();
 }
 
 /**

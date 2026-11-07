@@ -37,7 +37,7 @@ import { K8S_FOLDERS } from '../read/quality.js';
 import { COVERAGE_LIMITS, type Coverage } from './coverage.js';
 import { buildShortDoc } from './render-short.js';
 import {
-  buildsNoImage, isBuiltInNeed, isOwnCommand, needLabel, SECRET_CHECK, type AuditAi, type GitHubFact, type AuditReport, type LocalAudit, type WouldAddRow, type WouldAddTool,
+  noImageCheck, isBuiltInNeed, isOwnCommand, needLabel, SECRET_CHECK, type AuditAi, type GitHubFact, type AuditReport, type LocalAudit, type WouldAddRow, type WouldAddTool,
 } from './model.js';
 
 export interface RenderOptions {
@@ -221,7 +221,7 @@ export function ctxFor(target: OutputTarget, opts: RenderOptions, mergeLock: boo
   return {
     target,
     mergeLock,
-    noImage: (need) => buildsNoImage(need, { services }),
+    noImage: noImageCheck({ services }), // G17-R2 (F10): services indexed once
     v: (s, max = OUTPUT_CAP.name) => clean(s, { target, max }),
     own: (s, max = OUTPUT_CAP.text) => clean(s, { target, max, redact: false }),
     // Markdown: safeMarkdown puts U+200B and a backslash before the $, so GitHub math can't start

@@ -320,9 +320,25 @@ export function needLabel(id: string, opts: { noImage?: boolean } = {}): string 
  * The same split floorNeeds makes when it targets signing at the runnable services first (src/engine/needs.ts).
  */
 export function buildsNoImage(need: Pick<Need, 'service'>, p: Pick<RepoProfile, 'services'>): boolean {
-  if (need.service === undefined) return !p.services.some(isRunnable);
-  const s = p.services.find((x) => x.name === need.service);
-  return s !== undefined && !isRunnable(s);
+  return noImageCheck(p)(need);
+}
+
+/** G17-R2 (F10): the first service of each name (what `services.find` by name gave), built once per call. */
+export function firstServiceByName<S extends { name: string }>(services: readonly S[]): Map<string, S> {
+  const m = new Map<string, S>();
+  for (const s of services) if (!m.has(s.name)) m.set(s.name, s);
+  return m;
+}
+
+/** G17-R2 (F10): buildsNoImage for many needs of one profile: the services are indexed once, not scanned per need. */
+export function noImageCheck(p: Pick<RepoProfile, 'services'>): (need: Pick<Need, 'service'>) => boolean {
+  const byName = firstServiceByName(p.services);
+  const anyRuns = p.services.some(isRunnable);
+  return (need) => {
+    if (need.service === undefined) return !anyRuns;
+    const s = byName.get(need.service);
+    return s !== undefined && !isRunnable(s);
+  };
 }
 
 const ROW_NOTE = {
@@ -721,7 +737,7 @@ async function coverageOf(
 ): Promise<Coverage[]> {
   try {
     // Plan P Task 3 (PS16): the capabilities too, so an action this repo can't use is never read as covered
-    return await mapCoverage(p, needs, dir, { skippedWorkflows, noImage: (need) => buildsNoImage(need, p), capabilities, ...(branchGuess === undefined ? {} : { branchGuess }) });
+    return await mapCoverage(p, needs, dir, { skippedWorkflows, noImage: noImageCheck(p), capabilities, ...(branchGuess === undefined ? {} : { branchGuess }) });
   } catch (e) {
     const why = e instanceof Error ? e.message.split('\n')[0] : 'unknown error';
     notes.add(`pipegen couldn't load its list of tool signatures, so it can't tell which checks your workflows already run (${why}).`);
@@ -731,10 +747,11 @@ async function coverageOf(
 
 function wouldAddRows(p: RepoProfile, coverage: Coverage[], deps: AuditDeps, caps: Capabilities): WouldAddRow[] {
   const rows: WouldAddRow[] = [];
+  const byName = firstServiceByName(p.services); // G17-R2 (F10)
   for (const c of coverage) {
     if (c.status === 'covered') continue;
     const need = c.need;
-    const service = need.service === undefined ? undefined : p.services.find((s) => s.name === need.service);
+    const service = need.service === undefined ? undefined : byName.get(need.service);
     // S27: a service without tests gets starter tests; its own `test` script (npm's default "no test specified") is
     // then not offered as the tool, so the row's tool and note agree (fix round 1, M2).
     const starter = (need.category === 'unit-tests' || need.category === 'full-tests') && service !== undefined && !service.hasTests;
@@ -1199,8 +1216,8 @@ async function checkConsent(dir: string, deps: AiSuggestDeps): Promise<CountingS
 }
 
 /** The service's own test/lint script would run for this need (S27: a service without tests has none for tests). */
-function hasProjectScript(need: Need, p: RepoProfile): boolean {
-  const service = need.service === undefined ? undefined : p.services.find((s) => s.name === need.service);
+function hasProjectScript(need: Need, byName: ReadonlyMap<string, Service>): boolean {
+  const service = need.service === undefined ? undefined : byName.get(need.service);
   if (service === undefined) return false;
   if ((need.category === 'unit-tests' || need.category === 'full-tests') && !service.hasTests) return false;
   return projectScriptFor(need, service) !== null;
@@ -1316,7 +1333,8 @@ export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSugg
     return done();
   }
   // Extra needs have no coverage row: they count as not covered.
-  const search = [...r.coverage.filter((c) => c.status !== 'covered').map((c) => c.need), ...extraNeeds].filter((n) => !hasProjectScript(n, r.profile));
+  const profileServices = firstServiceByName(r.profile.services); // G17-R2 (F10)
+  const search = [...r.coverage.filter((c) => c.status !== 'covered').map((c) => c.need), ...extraNeeds].filter((n) => !hasProjectScript(n, profileServices));
   if (search.length === 0) return done();
   // A discovery call that doesn't fit the cap is refused by the meter (AiError 'cost-cap'); discovery then asks the AI
   // nothing more, gives one note, and goes on with search results only.
