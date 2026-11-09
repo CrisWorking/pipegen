@@ -40,7 +40,7 @@ import { COVERAGE_MINIMUMS } from '../engine/tool-flags.js';
 import { LANGUAGE_FOLDERS, SEMGREP_RULE_FOLDERS, TUNING_OPTIONS, tuningEnums } from '../engine/tuning.js';
 import { safeMarkdown, safeText } from '../util/safe-text.js';
 import {
-  NEED_CATEGORIES, type AiProvider, type AiRequest, type AiUsage, type Candidate, type Capabilities, type Need, type PipelineDraft, type RepoProfile,
+  NEED_CATEGORIES, type AiProvider, type AiRequest, type AiUsage, type Candidate, type Capabilities, type Layer, type Need, type PipelineDraft, type RepoProfile,
   type ReviewedCandidate, type ReviewedTool, type StepChoices, type StepSpec, type TuningPicks,
 } from '../types.js';
 import { cleanForDoc } from './clean.js';
@@ -118,7 +118,8 @@ export interface ByCode { key: string; needId: string; service?: string; kind: B
  * `no-repo-tool` (G4b): a repo built-in is meant to cover it (a Node service's type-check), but the repository has none pipegen can run
  * (repoToolProblem says why, in plain words).
  */
-export interface Uncovered { key: string; needId: string; service?: string; blocking: boolean; reason: 'none-offered' | 'no-reviewed-tool' | 'no-repo-tool' }
+/** `layers`: the pair's layers (NeedRef.layers), so a skipped part matched by layer (--skip deploy) covers it (G14fix-R1). */
+export interface Uncovered { key: string; needId: string; service?: string; layers: Layer[]; blocking: boolean; reason: 'none-offered' | 'no-reviewed-tool' | 'no-repo-tool' }
 
 /** What the builder needs besides the needs and the AI (ruling B2; `caps` for the profile summary, see the F2 report). */
 export interface BuilderDeps {
@@ -400,6 +401,7 @@ function offersFor(ref: NeedRef, cands: readonly Candidate[], p: RepoProfile, de
 
 const categoryOf = (id: string): string | undefined => (Object.hasOwn(NEED_ID_CATEGORY, id) ? (NEED_ID_CATEGORY as Readonly<Record<string, string>>)[id] : undefined);
 const where = (ref: NeedRef) => ({ key: ref.key, needId: ref.id, ...(ref.service === undefined ? {} : { service: ref.service }) });
+const whereUncovered = (ref: NeedRef) => ({ ...where(ref), layers: [...ref.layers] });
 
 /** What deciding the offered tools needs (the judge passes only these, ruling B2). */
 export type OfferDeps = Pick<BuilderDeps, 'reviewed' | 'knownValues'>;
@@ -431,16 +433,16 @@ export function keyOffers(needs: readonly Need[], candidates: ReadonlyMap<string
     if (svc && projectScriptFor(ref.needs[0] as Need, svc) !== null) { byCode('project-script'); continue; }
     // G4b: the repo's own tool (DECISIONS #95) decides before any reviewed entry; one it can not run is uncovered, never another tool
     if (svc && repoToolFor(ref.needs[0] as Need, svc) !== null) { byCode('repo-tool'); continue; }
-    if (svc && repoToolProblem(ref.needs[0] as Need, svc) !== null) { result.uncovered.push({ ...where(ref), blocking: ref.blocking, reason: 'no-repo-tool' }); continue; }
+    if (svc && repoToolProblem(ref.needs[0] as Need, svc) !== null) { result.uncovered.push({ ...whereUncovered(ref), blocking: ref.blocking, reason: 'no-repo-tool' }); continue; }
     if (!deps.reviewed.some((t) => toolCoversNeed(t.categories, ref.id))) {
-      if (ref.blocking) result.uncovered.push({ ...where(ref), blocking: true, reason: 'no-reviewed-tool' });
+      if (ref.blocking) result.uncovered.push({ ...whereUncovered(ref), blocking: true, reason: 'no-reviewed-tool' });
       else byCode('no-reviewed-tool');
       continue;
     }
     let offers = offersFor(ref, candidates.get(ref.key) ?? [], p, deps, kv);
     // GJ-R1 (review sec M1): workflow lint without its main tool zizmor offered is uncovered (pipegen stops), never poutine in its place
     if (category === 'workflow-lint' && !offers.some((o) => o.entry.id === WORKFLOW_LINT_TOOL)) offers = [];
-    if (offers.length === 0) { result.uncovered.push({ ...where(ref), blocking: ref.blocking, reason: 'none-offered' }); continue; }
+    if (offers.length === 0) { result.uncovered.push({ ...whereUncovered(ref), blocking: ref.blocking, reason: 'none-offered' }); continue; }
     result.offers.set(ref.key, offers);
     (ref.offered ? result.aiKeys : result.codeKeys).push(ref.key);
   }
