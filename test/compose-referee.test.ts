@@ -198,7 +198,12 @@ describe('referee: the password name in an edited user workflow', () => {
     return { path: '.github/workflows/deploy.yml', content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: 'test', repo: 'app', inserted: { original, jobs: ['app-start'], needs: [] } };
   };
   it('the recognised runtime-env step in an added job passes; the name in an added unrecognised step is an injection; the user\'s own text is not judged', async () => {
-    expect(show(await run([inserted(userWf(), [...prelude(), RT, UP])], dU))).toBe('');
+    // G17A-R1 sec I1: pipegen inserts only pipegen-verify into a user's workflow, so this mark is refused as a template issue; the D4 count of
+    // the added job is what this test judges (no injection)
+    const r0 = await run([inserted(userWf(), [...prelude(), RT, UP])], dU);
+    expect(has(r0, 'injection'), show(r0)).toBe(false);
+    expect(r0.issues.some((i) => i.check === 'template' && /inserts exactly one job, pipegen-verify/.test(i.message)), show(r0)).toBe(true);
+    expect(r0.issues.every((i) => i.check === 'template'), show(r0)).toBe(true);
     const r = await run([inserted(userWf(), [...prelude(), RT, { name: 'x', run: `echo "$${DBPW}"`, shell: 'bash' }])], dU);
     expect(has(r, 'injection'), show(r)).toBe(true);
     // the user's own step may spell it (pipegen does not judge the user's text); the added job is clean
