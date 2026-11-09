@@ -331,12 +331,13 @@ describe('G11 finish: print, rotate, the signing key', () => {
     expect(text).toMatch(/gh variable set PIPEGEN_BLOCK_FROM --repo o\/r --body 2026-11-13/);
     expect(text).toMatch(/cosign generate-key-pair/);
     expect(text).toMatch(/gh secret set PIPEGEN_COSIGN_KEY --env pipegen-signing --repo o\/r < /);
-    expect(text).toMatch(new RegExp(`gh secret set ${PW_NAME} --env pipegen-signing --repo o/r < `));
+    expect(text).toMatch(new RegExp(`\\| gh secret set ${PW_NAME} --env pipegen-signing --repo o/r$`, 'm'));   // G17 row 45: from COSIGN_PASSWORD
     expect(s.lines.join('\n')).toContain('gh api --method POST /repos/o/r/rulesets');
     // no value of any kind: no key was made, cosign never ran, no key or password text anywhere
     expect(s.resolves).toEqual([]);
     expect(s.execs).toEqual([]);
-    expect(`${text}\n${s.lines.join('\n')}`).not.toMatch(new RegExp(['ENCRYPTED', ['COSIGN', 'PASS' + 'WORD='].join('_')].join('|')));
+    // G17 row 45: COSIGN_PASSWORD is set only from a command substitution (random bytes), never a value
+    expect(`${text}\n${s.lines.join('\n')}`).not.toMatch(new RegExp(['ENCRYPTED', `${['COSIGN', 'PASS' + 'WORD='].join('_')}(?!"\\$\\(head -c 32 /dev/urandom)`].join('|')));
   });
 
   it('finish --print: running finish afterwards applies nothing twice and updates the record', async () => {
@@ -1443,6 +1444,9 @@ describe('G11 exception round 3 (G11-R3)', () => {
     const s = await seed({ org: true });
     await finish(s.g.octokit(), app, {}, s.deps());
     expect((await recordOn(s)).orgRuleset?.pinnedSha).toMatch(/^[0-9a-f]{40}$/);
+    // G17 row 41: a live pin that still holds pipegen's required workflow is kept (and then recorded); one that doesn't is re-pinned, which
+    // a typed run can't show it made
+    (orgWf(s)[0] as B).sha = s.pin;
     await typedRun(s);
     expect((await recordOn(s)).orgRuleset).toBeUndefined();
     expect((await vfy(s)).drift).toEqual([]);
@@ -1458,7 +1462,9 @@ describe('G11 exception round 3 (G11-R3)', () => {
   it('verify: the unrecorded org rule stays checked after a later normal run (R2-1: O6b)', async () => {
     const s = await seed({ org: true });
     await finish(s.g.octokit(), app, {}, s.deps());
+    (orgWf(s)[0] as B).sha = s.pin;   // G17 row 41: a pin finish can't keep (see O6)
     await typedRun(s);
+    (orgWf(s)[0] as B).sha = s.pin;
     await finish(s.g.octokit(), app, {}, s.deps());
     try { s.g.merge('o/pipelines', 'pipegen/update-r'); } catch { /* recorded directly */ }
     expect((await recordOn(s)).orgRuleset).toBeUndefined();
@@ -1715,5 +1721,186 @@ describe('G13-R2b: protected paths in the record (m7, m1)', () => {
     const res = await v(s);
     expect(res.drift.length).toBeGreaterThan(0);
     expect(res.drift[0]?.what).toBe('install record');
+  });
+});
+
+describe('G17 group D: finish and verify (rows 40-46)', () => {
+  const app = { owner: 'o', repo: 'r' };
+  const vfy = (s: Seed) => verify(s.g.octokit(), app, { local: { home: s.home, env: {} }, clock: clock() });
+  type B = Record<string, any>;
+  const orgRs = (s: Seed) => [...s.g.orgRulesets.values()][0] as { id: number; body: B; created_at: string };
+  const orgWf = (s: Seed): B[] => (orgRs(s).body.rules as B[])[0]?.parameters.workflows as B[];
+  const ORG = 'the org required workflow rule (pipegen-required--r)';
+  const REQ = centralWorkflowFile('r', 'required');
+  const MERGE_PATH = centralWorkflowFile('r', 'merge');
+  const CALLER = '.github/workflows/pipegen.yml';
+  const mergeCentral = (s: Seed) => { try { s.g.merge('o/pipelines', 'pipegen/update-r'); } catch { /* recorded directly */ } };
+  const latest = async (s: Seed) => { try { const r = await recordOn(s, 'pipegen/update-r'); if (r) return r; } catch { /* none */ } return recordOn(s); };
+  const orgDrift = async (s: Seed) => (await vfy(s)).drift.filter((d) => d.what === ORG);
+  const central = (s: Seed, path: string, sha = s.g.head('o/pipelines')) => s.g.filesAt('o/pipelines', sha).get(path) as string;
+
+  it('finish: a re-run keeps the org rule\'s live pin while that commit is on the central default branch and holds pipegen\'s required workflow (row 41, R2-3)', async () => {
+    const s = await seed({ org: true });
+    await finish(s.g.octokit(), app, {}, s.deps());
+    const pinned = orgWf(s)[0]?.sha as string;
+    expect((await recordOn(s)).orgRuleset?.pinnedSha).toBe(pinned);
+    expect(s.g.head('o/pipelines')).not.toBe(pinned);   // the record commit moved the central head
+    const from = s.g.calls.length;
+    const res = await finish(s.g.octokit(), app, {}, s.deps());
+    expect(orgWf(s)[0]?.sha).toBe(pinned);
+    expect(s.g.calls.slice(from).filter((c) => c.route === 'PUT /orgs/{org}/rulesets/{ruleset_id}')).toEqual([]);
+    expect(res.applied.join('\n')).toMatch(/the org required workflow \(ruleset pipegen-required--r, pinned to [0-9a-f]{12}\) \(already in place\)/);
+    expect((await latest(s)).orgRuleset?.pinnedSha).toBe(pinned);
+    // the re-run's record waits in the central pull request: verify reports the record hash, but no org rule drift
+    expect(await orgDrift(s)).toEqual([]);
+    mergeCentral(s);
+    expect((await vfy(s)).drift).toEqual([]);
+    // a live pin whose commit doesn't hold pipegen's required workflow (here: before it was written) is not kept: re-pinned to the head
+    orgWf(s)[0]!.sha = s.pin;
+    let head = s.g.head('o/pipelines');
+    await finish(s.g.octokit(), app, {}, s.deps());
+    expect(orgWf(s)[0]?.sha).toBe(head);
+    expect((await latest(s)).orgRuleset?.pinnedSha).toBe(head);
+    mergeCentral(s);
+    // a live pin off the central default branch is not kept either
+    const off = orgWf(s)[0]?.sha as string;
+    s.g.hooks.push((c) => (c.route === 'GET /repos/{owner}/{repo}/compare/{basehead}' && String(c.params.basehead).endsWith(`...${off}`) ? { status: 200, data: { status: 'diverged', files: [] } } : undefined));
+    head = s.g.head('o/pipelines');
+    await finish(s.g.octokit(), app, {}, s.deps());
+    expect(orgWf(s)[0]?.sha).toBe(head);
+  });
+
+  it('finish: a ruleset whose created_at GitHub writes another way (…03Z, …03.000Z) is the same ruleset: no false "can\'t show it made it" (row 42)', async () => {
+    const s = await seed({ org: true });
+    await finish(s.g.octokit(), app, {}, s.deps());
+    const r = await recordOn(s);
+    const orgWas = r.orgRuleset?.githubCreatedAt as string;
+    const gateWas = r.rulesets.find((x) => x.name === 'pipegen')?.githubCreatedAt as string;
+    expect(orgWas).toMatch(/\.000Z$/);
+    expect(gateWas).toMatch(/\.000Z$/);
+    // the same instants, written without the milliseconds; each live rule differs a little, so finish updates it by id
+    const rs = orgRs(s);
+    rs.created_at = orgWas.replace('.000Z', 'Z');
+    rs.body.enforcement = 'evaluate';
+    const gate = [...s.g.repo('o/r').rulesets.values()].find((b) => b.name === 'pipegen') as B;
+    gate.created_at = gateWas.replace('.000Z', 'Z');
+    gate.enforcement = 'evaluate';
+    const res = await finish(s.g.octokit(), app, {}, s.deps());
+    expect(res.notes.join('\n')).not.toMatch(/can't show it made it/);
+    expect(res.applied.join('\n')).toMatch(/ruleset pipegen\b/);
+    const after = await latest(s);
+    expect(after.orgRuleset).toMatchObject({ id: rs.id, githubCreatedAt: orgWas });
+    expect(after.rulesets.find((x) => x.name === 'pipegen')).toMatchObject({ githubCreatedAt: gateWas });
+  });
+
+  it('finish --rotate-key: a stored key whose created_at GitHub writes another way is still pipegen\'s own: created, never "overwritten" (row 43)', async () => {
+    const s = await seed({ keyEnv: true, recordOver: (r) => {
+      for (const k of (r as unknown as Record<string, { githubCreatedAt?: string }[]>)[LIST] ?? []) if (k.githubCreatedAt !== undefined) k.githubCreatedAt = k.githubCreatedAt.replace('.000Z', 'Z');
+    } });
+    const before = ((await recordOn(s)) as unknown as Record<string, { githubCreatedAt?: string }[]>)[LIST] ?? [];
+    expect(before.length).toBe(2);
+    expect(before.every((k) => /T\d\d:\d\d:\d\dZ$/.test(k.githubCreatedAt ?? ''))).toBe(true);
+    await finish(s.g.octokit(), app, { rotateKey: true }, s.deps());
+    const keys = ((await latest(s)) as unknown as Record<string, { name: string; scope: string; created: boolean; overwritten?: true }[]>)[LIST]?.filter((k) => k.scope === 'env:pipegen-signing') ?? [];
+    expect(keys.map((k) => k.name).sort()).toEqual(['PIPEGEN_COSIGN_KEY', PW_NAME].sort());
+    for (const k of keys) expect(k, k.name).toMatchObject({ created: true });
+    for (const k of keys) expect(k, k.name).not.toHaveProperty('overwritten');
+  });
+
+  it('finish: the record\'s planned is the plan finish applied, never a weaker plan planted in the record; verify holds the live locks to it (row 44)', async () => {
+    const weaken = (b: B | undefined) => {
+      const pr = (b?.rules as B[]).find((x) => x.type === 'pull_request') as B;
+      pr.parameters.required_approving_review_count = 0;
+      pr.parameters.require_code_owner_review = false;
+      pr.parameters.require_last_push_approval = false;
+    };
+    const s = await seed({ org: true, plannedOver: (p) => { weaken(p.rulesets?.reviews?.body as B); weaken(p.centralRuleset?.body as B); } });
+    await finish(s.g.octokit(), app, {}, s.deps());
+    const r = await recordOn(s);
+    const live = [...s.g.repo('o/r').rulesets.values()].find((b) => b.name === 'pipegen-reviews') as B;
+    const livePr = (live.rules as B[]).find((x) => x.type === 'pull_request')?.parameters as B;
+    expect(livePr.required_approving_review_count).toBeGreaterThan(0);
+    const recPr = ((r.planned.rulesets?.reviews?.body.rules as B[]).find((x) => x.type === 'pull_request') as B).parameters;
+    expect(recPr).toEqual(livePr);
+    expect(r.planned.centralRuleset?.body).toEqual(s.locks.centralRuleset?.body);
+    expect(r.planned.rulesets?.gate.body).toEqual(s.locks.rulesets?.gate.body);
+    expect((await vfy(s)).drift).toEqual([]);
+    // the live lock weakened to the planted values: drift (the planted plan is no baseline)
+    livePr.required_approving_review_count = 0;
+    livePr.require_code_owner_review = false;
+    const d = (await vfy(s)).drift.filter((x) => x.what === 'ruleset pipegen-reviews');
+    expect(d.map((x) => x.expected).join('\n')).toMatch(/code-owner review/);
+    expect(d.map((x) => x.expected).join('\n')).toMatch(/approving review/);
+  });
+
+  it('finish --print: the key pair commands start in a memory folder and pass the password through COSIGN_PASSWORD, never a file (row 45, sec M5)', async () => {
+    const s = await seed({ keyEnv: true });
+    const res = await finish(s.g.octokit(), app, { print: true, rotateKey: true }, s.deps());
+    const cmds = res.commands ?? [];
+    const at = (re: RegExp) => cmds.findIndex((c) => re.test(c));
+    expect(at(/^cd "\$\(mktemp -d -p \/dev\/shm\)"$/)).toBeGreaterThanOrEqual(0);
+    expect(at(/^cd "\$\(mktemp -d -p \/dev\/shm\)"$/)).toBeLessThan(at(/^cosign generate-key-pair/));
+    expect(at(/COSIGN_PASSWORD/)).toBeLessThan(at(/^cosign generate-key-pair/));
+    const text = cmds.join('\n');
+    expect(text).not.toMatch(/\.password\b/);
+    expect(text).toMatch(new RegExp(`^printf '%s' "\\$COSIGN_PASSWORD" \\| gh secret set ${PW_NAME} --env pipegen-signing --repo o/r$`, 'm'));
+    expect(text).toMatch(/^unset COSIGN_PASSWORD/m);
+    expect(s.execs).toEqual([]);
+  });
+
+  it('verify: after update re-pinned the app, the org rule\'s stale pin is named plainly; finish then re-pins it to the commit holding the new required workflow (row 46)', async () => {
+    const s = await seed({ org: true });
+    await finish(s.g.octokit(), app, {}, s.deps());
+    expect((await vfy(s)).drift).toEqual([]);
+    const p0 = orgWf(s)[0]?.sha as string;
+    // what `pipegen update` leaves once its pull requests are merged: a new central merge file (c1), the app calling it, the required
+    // workflow calling it, the record at c1
+    const merge2 = MERGE.replace('run: "true"', 'run: "echo v2"');
+    const c1 = s.g.commitOn('o/pipelines', 'main', { [MERGE_PATH]: merge2 }, 'update the merge workflow');
+    const caller2 = (s.g.filesAt('o/r', s.g.head('o/r')).get(CALLER) as string).replace(s.pin, c1);
+    s.g.commitOn('o/r', 'main', { [CALLER]: caller2 }, 'update the app');
+    const req1 = central(s, REQ);
+    const req2 = req1.replace(s.pin, c1);
+    expect(req2).not.toBe(req1);
+    s.g.commitOn('o/pipelines', 'main', { [REQ]: req2 }, 'update the required workflow');
+    const r = await recordOn(s);
+    const add = (f: InstallRecord['files'][number], text: string) => ({ ...f, shas: [...f.shas, gitBlobSha(text)] });
+    const next: InstallRecord = { ...r, centralSha: c1, files: r.files.map((f) => (f.path === REQ ? add(f, req2) : f.path === MERGE_PATH ? add(f, merge2) : f.path === CALLER ? add(f, caller2) : f)) };
+    await writeRecord(s.g.octokit(), { record: next, setupPr: s.pr, via: 'direct', files: [], base: s.g.head('o/pipelines'), clock: clock(), now: () => new Date('2026-11-08T12:00:00Z'), local: { home: s.home, env: {} } });
+    mergeCentral(s);
+    const v = await vfy(s);
+    expect(v.drift.filter((d) => d.what !== ORG)).toEqual([]);
+    expect(v.drift).toContainEqual({ what: ORG, expected: `the required workflow at the pinned commit ${p0} calling the merge workflow at the app's central commit ${c1}`, actual: `it calls it at ${s.pin} (a stale pin)` });
+    expect(v.notes.join('\n')).toMatch(/npx pipegen finish/);
+    // finish re-pins the rule to the central commit that holds the new required workflow
+    await finish(s.g.octokit(), app, {}, s.deps());
+    const p1 = orgWf(s)[0]?.sha as string;
+    expect(p1).not.toBe(p0);
+    expect(central(s, REQ, p1)).toBe(req2);
+    expect((await latest(s)).orgRuleset?.pinnedSha).toBe(p1);
+    mergeCentral(s);
+    expect((await vfy(s)).drift).toEqual([]);
+  });
+
+  it('verify: with no recorded pin, the required workflow at the commit the live rule names must be one pipegen wrote (row 40, R2-2)', async () => {
+    const s = await seed({ org: true });
+    // a same-name org rule found and updated: finish can't show it made it, so it records no pin (O8)
+    const body = structuredClone((await recordOn(s)).planned.orgRequiredWorkflow?.rule.body) as B;
+    body.enforcement = 'disabled';
+    s.g.orgRulesets.set(4242, { id: 4242, org: 'o', body: { ...body }, created_at: '2026-01-01T00:00:00Z' } as never);
+    await finish(s.g.octokit(), app, {}, s.deps());
+    expect((await recordOn(s)).orgRuleset).toBeUndefined();
+    expect(await orgDrift(s)).toEqual([]);
+    const good = orgWf(s)[0]?.sha as string;
+    // an older default-branch commit, before pipegen wrote the required workflow
+    orgWf(s)[0]!.sha = s.pin;
+    expect(await orgDrift(s)).toContainEqual({ what: ORG, expected: `${REQ} at ${s.pin} as pipegen wrote it`, actual: null });
+    // a default-branch commit whose required workflow is not one pipegen wrote
+    const other = 'name: not pipegen\non: { pull_request: null }\njobs: {}\n';
+    const c = s.g.commitOn('o/pipelines', 'main', { [REQ]: other }, 'someone else');
+    orgWf(s)[0]!.sha = c;
+    expect(await orgDrift(s)).toContainEqual({ what: ORG, expected: `${REQ} at ${c} as pipegen wrote it`, actual: gitBlobSha(other) });
+    orgWf(s)[0]!.sha = good;
+    expect(await orgDrift(s)).toEqual([]);
   });
 });

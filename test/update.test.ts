@@ -802,3 +802,121 @@ describe('G12 exception round (G12-R3)', () => {
     expect(appFile(w, '.github/workflows/deploy.yml', UPDATE_BRANCH)).toBe(deploy);   // not written
   });
 });
+
+describe('G17 group D: update (rows 46-51)', () => {
+  const C_REQ = '.github/workflows/r--required.yml';
+  const reqText = (c: string): string => `# pipegen: the org required workflow of r\nname: pipegen required\non: { pull_request: null }\npermissions: {}\njobs:\n  pipegen-required:\n    name: pipegen required\n    uses: o/pipelines/.github/workflows/r--merge.yml@${c}\n    permissions:\n      contents: read\n`;
+  const mergeCentral = (w: World): string => {
+    const branch = centralUpdateBranch('r');
+    const files: Record<string, string> = {};
+    for (const p of [C_MERGE, C_REQ, recordPath('r')]) { const t = centralFile(w, p, branch); if (t !== undefined && t !== centralFile(w, p)) files[p] = t; }
+    return w.g.commitOn('o/pipelines', 'main', files, 'merge the central pull request');
+  };
+
+  it('update: the re-pin run also moves the org required workflow to the new central commit (central pull request) and says to run finish (row 46)', async () => {
+    const w = await privateWorld();
+    w.g.commitOn('o/pipelines', 'main', { [C_REQ]: reqText(w.c0) }, 'the required workflow');
+    await vouch(w, { ...w.record, files: [...w.record.files, { repo: 'central', path: C_REQ, part: 'pipeline', shas: [gitBlobSha(reqText(w.c0))] }] });
+    const r1 = await update(w.g.octokit(), app, deps(w));
+    expect(r1.done).toBe(true);
+    expect(centralFile(w, C_REQ, centralUpdateBranch('r'))).toBe(reqText(w.c0));   // run 1: only the gate pin of the merge workflow moves
+    const merged = mergeCentral(w);
+    const r2 = await update(w.g.octokit(), app, deps(w));
+    expect(r2.done).toBe(true);
+    // the app pins the merged commit; the required workflow, which the org rule runs, calls the merge workflow at that same commit
+    expect(appFile(w, PIPEGEN_YML, UPDATE_BRANCH)).toBe(privateCaller(merged));
+    expect(centralFile(w, C_REQ, centralUpdateBranch('r'))).toBe(reqText(merged));
+    expect(centralFile(w, C_REQ)).toBe(reqText(w.c0));
+    expect(r2.centralPrUrl).toBeDefined();
+    expect(r2.preview).toMatch(/r--required\.yml/);
+    expect(r2.notes.join(' ')).toMatch(/org required workflow.*npx pipegen finish/s);
+    const rec = (await readRecord(w.g.octokit(), { owner: 'o', repo: 'pipelines' }, 'r', { branch: centralUpdateBranch('r') }))?.record as InstallRecord;
+    expect(rec.centralSha).toBe(merged);
+    expect(rec.files.find((f) => f.path === C_REQ)?.shas).toEqual([gitBlobSha(reqText(w.c0)), gitBlobSha(reqText(merged))]);
+    // a record that lists no required workflow (no org rule): nothing central moves on the re-pin run
+    const v = await privateWorld();
+    await update(v.g.octokit(), app, deps(v));
+    mergeCentral(v);
+    const before = v.g.head('o/pipelines', centralUpdateBranch('r'));
+    const r3 = await update(v.g.octokit(), app, deps(v));
+    expect(r3.centralPrUrl).toBeUndefined();
+    expect(r3.notes.join(' ')).not.toMatch(/npx pipegen finish/);
+    expect(v.g.head('o/pipelines', centralUpdateBranch('r'))).toBe(before);
+  });
+
+  it('update: a warn-first "make blocking" issue is named, with how to switch the check by hand (row 47, open question 7)', async () => {
+    const key = 'warn-first-sast-2026-11-20';
+    const body = `<!-- pipegen:key=${key} -->\n## The \`sast\` check can block now\n`;
+    const p = promptOf(issue(body), 'app');
+    expect(p).toMatchObject({ why: expect.stringMatching(/make the sast check blocking/) });
+    const why = (p as { why: string }).why;
+    expect(why).toMatch(/can't switch a check to blocking yet/);
+    expect(why).toMatch(/by hand/);
+    expect(why).toContain('"warnFirst"');
+    expect(why).toContain('warn-first');
+    const w = await publicWorld();
+    w.issues.app = [issue(body)];
+    const res = await update(w.g.octokit(), app, deps(w));
+    expect(res.preview).toMatch(/#\d+ ignored: .*make the sast check blocking/);
+    // a key with another shape is still only "not an update issue"
+    expect((promptOf(issue('<!-- pipegen:key=warn-ending-2026-11-20 -->\nx'), 'app') as { why: string }).why).toMatch(/not an update issue/);
+  });
+
+  it('update: the newer-gate line says which pipegen to use; a refused re-pin gives the way on that fits its cause; held lines name an action (row 49)', async () => {
+    const w = await publicWorld({ written: gateFile(OTHER, '0.9.0') });
+    const res = await update(w.g.octokit(), app, deps(w));
+    expect(res.notes.join(' ')).toMatch(/a newer pipegen wrote this \(gate v0\.9\.0; this pipegen pins gate v0\.2\.3\).*pins gate v0\.9\.0 or newer/);
+    // the app calls its central workflows at two commits: the M1 text (a merged central file) is not the way on
+    const v = await privateWorld();
+    await update(v.g.octokit(), app, deps(v));
+    mergeCentral(v);
+    const two = `${privateCaller(v.c0)}  push:\n    uses: o/pipelines/.github/workflows/r--push.yml@${'c'.repeat(40)}\n`;
+    v.g.commitOn('o/r', 'main', { [PIPEGEN_YML]: two }, 'two commits');
+    await vouch(v, { ...(await readRecord(v.g.octokit(), { owner: 'o', repo: 'pipelines' }, 'r', { branch: centralUpdateBranch('r') }))?.record as InstallRecord, files: [{ repo: 'app', path: PIPEGEN_YML, part: 'pipeline', shas: [gitBlobSha(two)] }, ...v.record.files.filter((f) => f.repo === 'central')] });
+    const r2 = await update(v.g.octokit(), app, deps(v));
+    const said = r2.notes.join(' ');
+    expect(said).toMatch(/more than one central commit/);
+    expect(said).not.toMatch(/Bring the central file back/);
+    expect(said).toMatch(/one central commit.*then run `pipegen update` again/);
+    // m3's held lines (an owner pin elsewhere; a value pipegen can't update) each say what to do
+    const written = gateFile(NEW, NEW_V);
+    for (const current of [written.replace(`gate@${NEW} # gate-v${NEW_V}`, `gate@${OTHER} # gate-v${NEW_V}`), written.replace(`uses: crisworking/pipegen/gate@${NEW} # gate-v${NEW_V}`, `uses: "crisworking/pipegen/gate@${OTHER}" # gate-v${NEW_V}`)]) {
+      const x = await publicWorld({ written, current });
+      const r = await update(x.g.octokit(), app, deps(x));
+      expect(r.notes.join(' ')).toMatch(/pipegen didn't change it\. .*(by hand|pipegen's form).*then run `pipegen update` again/);
+    }
+  });
+
+  it('update: in a merge run, a gate line of the owner\'s own edit left on its old pin is said, held, and closes no issue (row 50)', async () => {
+    const written = gateFile(OLD, OLD_V);
+    const current = `${written}\n  mine:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: crisworking/pipegen/gate@${OLD} # gate-v${OLD_V}\n        with:\n          mode: gate\n`;
+    const w = await publicWorld({ written, current });
+    const prompt = issue(updateBody(NEW_V));
+    w.issues.app = [prompt];
+    const res = await update(w.g.octokit(), app, deps(w));
+    expect(res.done).toBe(true);
+    const out = appFile(w, PIPEGEN_YML, UPDATE_BRANCH) as string;
+    expect(out.split(`gate@${NEW} # gate-v${NEW_V}`).length - 1).toBe(2);   // pipegen's two lines
+    expect(out).toContain(`gate@${OLD} # gate-v${OLD_V}`);                  // the owner's own line: never changed by pipegen
+    expect(res.notes.join(' ')).toMatch(/pipegen\.yml: a gate line of your own edit stays on its pin.*by hand/);
+    const body = prsOf(w, 'o/r')[0]?.body ?? '';
+    expect(body).toMatch(/Left on its old pin on purpose.*a gate line of your own edit/s);
+    expect(body).not.toContain(`Closes #${prompt.number as number}`);
+  });
+
+  it('update: a superseded update issue is listed as superseded, not refused; a central issue is closed by the app-only pull request (row 51)', async () => {
+    const w = await publicWorld();
+    const old = issue(`<!-- pipegen:key=update-0.2.1 -->\n> Superseded by #999: pipegen gate v${NEW_V} is out.\n## pipegen gate v0.2.1 is available\n`);
+    const central = issue(updateBody(NEW_V));
+    w.issues.app = [old];
+    w.issues.central = [central];
+    const res = await update(w.g.octokit(), app, deps(w));
+    expect(res.refused.map((r) => r.issue)).not.toContain(old.number);
+    expect(res.ignored).toContainEqual({ issue: old.number, in: 'app', why: expect.stringMatching(/superseded by #999/) });
+    expect(res.preview).not.toMatch(new RegExp(`#${old.number as number} refused`));
+    expect(res.centralPrUrl).toBeUndefined();
+    const body = prsOf(w, 'o/r')[0]?.body ?? '';
+    expect(body).toContain(`Closes o/pipelines#${central.number as number}`);
+    expect(body).not.toContain(`Closes #${old.number as number}`);
+  });
+});
