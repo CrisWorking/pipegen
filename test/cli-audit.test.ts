@@ -269,7 +269,7 @@ describe('pipegen audit (brief)', () => {
     expect(r.err).toContain("pipegen can't see o/r: it's private or doesn't exist. If it's private, pipegen needs read access to o/r.");
     expect(r.err).toContain('fine-grained token for this one repo');
     for (const row of permissionsTable('read')) expect(r.err).toContain(row.permission);
-    expect(r.err).toContain('GitHub App');
+    expect(r.err).not.toContain('GitHub App');   // #127: v0.2 has no App login to offer
     expect(r.err).toContain('pipegen refuses broad classic tokens');
     expect(r.all).not.toMatch(/gh auth login/);
     // with a token that can't see the repo: the same read-only steps

@@ -306,7 +306,10 @@ async function finishedAfterCentralDelete(gh: Octokit, app: RepoRef, uapp: Unins
   }
   // V6-R4 M1: what the last run left besides central itself is named here: the progress file that held it goes now
   const centralWhat = `repo ${central.owner}/${central.repo}`;
-  const left = (st?.leftovers ?? []).filter((x) => x.what !== centralWhat);
+  // V7 fold 2 (V6 r5 info): what lived inside the deleted central repo went with it: its files, locks, pull request and branches are not
+  // "still yours to do" (each is named `central ...` or ends `of`/`in <owner>/pipelines`)
+  const inCentral = (what: string): boolean => what === centralWhat || what.startsWith('central ') || what.endsWith(` of ${full}`) || what.endsWith(` in ${full}`);
+  const left = (st?.leftovers ?? []).filter((x) => !inCentral(x.what));
   progress.remove();
   const still = left.length === 0 ? '' : `\nStill yours to do (pipegen can't come back to them: the install record is gone):\n${left.slice(0, 50).map((x) => `  - ${show(x.what, 200)}: ${show(x.why, 300)}${x.manual === undefined ? '' : `\n    ${show(x.manual, 300)}`}`).join('\n')}${left.length > 50 ? `\n  - and ${left.length - 50} more` : ''}`;
   throw new UninstallFinished(`pipegen deleted ${full} in its last run (GitHub now answers 404 for it), so the uninstall of ${show(`${app.owner}/${app.repo}`)} is finished. pipegen removed its local files${gone.length > 0 ? ` (${gone.map((g) => show(g, 300)).join(', ')})` : ''} and ${progress.path}.${still}`);

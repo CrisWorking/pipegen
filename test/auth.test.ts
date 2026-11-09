@@ -106,7 +106,7 @@ describe('permissionsTable', () => {
 });
 
 describe('getAuth', () => {
-  it(title(AU, 'classic token with repo scope refused without allowBroad, message explains the fine-grained/app option'), async () => {
+  it(title(AU, 'classic token with repo scope refused without allowBroad, message explains the fine-grained option (v0.2: no App, DECISIONS #127)'), async () => {
     for (const cred of [classicCred(), oauthCred(), 'a1'.repeat(20)]) {
       for (const mode of ['read', 'write'] as const) {
         const { deps: d, calls } = deps(cred);
@@ -115,7 +115,7 @@ describe('getAuth', () => {
         const msg = (e as Error).message;
         expect(msg).toMatch(/classic/i);
         expect(msg).toMatch(/fine-grained token/);
-        expect(msg).toMatch(/GitHub App/);
+        expect(msg).not.toMatch(/GitHub App/);   // #127: v0.2 has no App login to offer
         expect(msg).toMatch(/--allow-broad-token/);
         expect(allText(e)).not.toContain(cred);
         expect(calls).toEqual([]);

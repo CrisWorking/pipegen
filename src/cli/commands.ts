@@ -15,6 +15,7 @@ import { readOrigin } from '../read/project.js';
 import type { StateStore } from '../proof/state.js';
 import { CENTRAL_REPO } from '../proof/target.js';
 import type { RepoRef } from '../deliver/git-data.js';
+import type { Auth } from '../types.js';
 import { safeText } from '../util/safe-text.js';
 import { tokenLogin } from './inspect.js';
 import type { CliIO } from './io.js';
@@ -30,7 +31,7 @@ export const interactiveRun = (io: Pick<CliIO, 'interactive' | 'env'>): boolean 
 export interface CommandGitHub { gh: Octokit; login: string | null; local?: LocalRecordDeps; clock?: RateClock; lease: StateStore | undefined }
 
 /** The folder's origin repo, a token for it and its central repo (least privilege: `write` for finish and update, `read` for verify). */
-export async function connect(io: CliIO, dir: string, o: { allowBroad: boolean; mode: 'read' | 'write' }): Promise<{ app: RepoRef; g: CommandGitHub; token: string | null }> {
+export async function connect(io: CliIO, dir: string, o: { allowBroad: boolean; mode: 'read' | 'write' }): Promise<{ app: RepoRef; g: CommandGitHub; token: string | null; canDeleteRepos: boolean; kind: Auth['kind'] }> {
   const app = await readOrigin(dir);
   const clock: RateClock = { budget: newRateBudget() };
   const auth = await getAuth({ owner: app.owner, repos: [app.repo, CENTRAL_REPO], allowBroad: o.allowBroad, mode: o.mode }, { env: io.env, ...(io.fetch === undefined ? {} : { fetch: io.fetch }), clock });
@@ -38,7 +39,8 @@ export async function connect(io: CliIO, dir: string, o: { allowBroad: boolean; 
   const notes: string[] = [];
   const login = await tokenLogin(gh, auth, clock, notes);
   for (const n of notes) io.err(n);
-  return { app, token: auth.token, g: { gh, login, clock, local: { env: io.env }, lease: undefined } };
+  // V7 fold 1: what the auth layer computed, copied as it is (never inferred): uninstall's --delete-repos acts only on canDeleteRepos
+  return { app, token: auth.token, canDeleteRepos: auth.canDeleteRepos, kind: auth.kind, g: { gh, login, clock, local: { env: io.env }, lease: undefined } };
 }
 
 const show = (s: string, n = 300): string => safeText(s, n);

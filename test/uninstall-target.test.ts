@@ -198,12 +198,15 @@ describe('V3 target: routes', () => {
 
     // the source scan (a lint beside the run-time allow-list): no other file of src/uninstall sends a GitHub write
     const dir = join(import.meta.dirname, '..', 'src', 'uninstall');
-    const files = readdirSync(dir).filter((x) => x.endsWith('.ts'));
+    // V7 (V6-R3 M3): every code file, whatever its extension (a .mts or .js file was never read), and src/cli/uninstall.ts (V7's file) too
+    const files = readdirSync(dir).filter((x) => /\.(?:[cm]?[jt]s|[jt]sx)$/.test(x));
     expect(files).toContain('target.ts');
+    expect(readdirSync(dir).filter((x) => !files.includes(x))).toEqual([]);
     for (const f of files) {
       const src = readFileSync(join(dir, f), 'utf8');
       expect(scanProblems(f, src), f).toEqual([]);
     }
+    expect(scanProblems('uninstall.ts', readFileSync(join(dir, '..', 'cli', 'uninstall.ts'), 'utf8')), 'src/cli/uninstall.ts').toEqual([]);
     // the scan itself catches the obvious ways around the guard
     for (const bad of [
       'await gh.request(\'DELETE /repos/{owner}/{repo}\', p);', 'await octokit.rest.repos.delete(p);', 'import { ghWrite } from \'../deliver/git-data.js\';',

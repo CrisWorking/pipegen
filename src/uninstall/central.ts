@@ -319,7 +319,7 @@ export async function runCentral(o: {
   const text = [
     `pipegen uninstall: this pull request removes ${show(`${app.owner}/${app.repo}`, 140)} from ${full}.`, '', ...body.slice(0, 300), '',
     ...(lp.last && !o.live ? [`This was the last project in ${full}, so pipegen took its central locks off. Merge it only while no other project uses ${full}; if one joined since, close this pull request and run \`pipegen uninstall\` again.`, ''] : []),
-    'After you merge it, run `pipegen uninstall` again to finish (and, with --delete-repos, to delete the repos pipegen made).',
+    'After you merge it, run `pipegen uninstall` again to finish (and, with --delete-repos, to print the `gh repo delete` commands for the repos pipegen made).',
   ].join('\n');
   const pr = await api.openUninstallPr('central', { base: now.defaultBranch, title: `pipegen: uninstall ${show(rec.name, 100)}`, body: text });
   report.done(`central pull request #${pr.number} in ${full}: ${pr.opened ? 'opened' : 'updated'}`);

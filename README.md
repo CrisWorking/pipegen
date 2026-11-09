@@ -75,7 +75,7 @@ It protects four stages: **pre-commit → push → merge → deploy**.
 
 ## Permissions and cost (honest numbers before you start)
 
-- **Access:** a GitHub App or fine-grained token limited to the repos involved. Broad classic tokens are refused by default.
+- **Access:** in v0.2 you use a **fine-grained token** limited to the repos involved (set as `GITHUB_TOKEN`). Broad classic tokens are refused by default. pipegen prints the `gh repo create <owner>/pipelines --private` and `gh repo create <owner>/pipegen-proof-<repo> --private` commands for you to run, empties the scratch repo after the proof instead of deleting it, and `pipegen uninstall --delete-repos` prints the `gh repo delete` commands. pipegen's own GitHub App login (which makes and deletes these repos itself) is planned next.
   `pipegen audit` only reads: on a private repo, give the token just Metadata: read, Pull requests: read, Actions: read
   and Code scanning alerts: read (optional; without it pipegen can't confirm code scanning). A public repo works without a token.
   The full run (`pipegen run`, then `finish`, `verify` and `update`) needs, on the app repo and the private helper repos: Metadata: read,
@@ -145,6 +145,32 @@ Later versions add the full job (one PR), then `finish` (after you merge: merge 
 (read-only: checks nobody weakened the pipeline files) and `uninstall`. Their exact commands will be shown here when
 they exist. No pipegen command, these included, is safe to run before the first release, because the npm name isn't
 published yet.
+
+## Uninstall (v0.2)
+
+> Like every command here: not safe to run before the first release (the npm name isn't published yet).
+
+```bash
+npx pipegen uninstall                  # first run, then (after you merge its pull request) the second run
+npx pipegen uninstall --delete-repos   # the second run also prints the gh repo delete commands for the repos pipegen made (v0.2: it deletes none)
+```
+
+`pipegen uninstall` needs a terminal. It shows what it will do, asks **one** yes, and asks you to type a name before it deletes anything it can't be sure is pipegen's. With no terminal (CI, a pipe) it stops before it reads or sends anything. No flag or environment variable answers these questions.
+
+**Two runs, and why.** The first run opens a pull request (`pipegen/uninstall`) that takes pipegen out of your app, closes pipegen's own open pull requests and removes the merge locks (the branch rules and the organisation rule; classic branch protection is put back as it was). You merge that pull request. The second run starts only when GitHub says it is merged: it removes the secrets, variables, environments and settings pipegen added, empties the proof's scratch repo, and opens a pull request in your central `pipelines` repo that removes this project's files (the install record last). Two runs because the uninstall pull request deletes `pipegen.yml`, so the required `pipegen / gate` check can never report on it; deploys may still need the secrets until it is merged; and the install record is the only list of what pipegen made, so it goes last. Run `pipegen uninstall` again after each merge. If a run is cut short, run it again: it goes on from what it saved.
+
+**What it removes.** Only what the install record lists as created by pipegen **and** what GitHub shows with the same id and creation time as recorded. Anything else is kept and listed ("not the one pipegen created"). Files you took over (`adopted`) are kept unless you say yes; secrets named `PIPEGEN_...` that pipegen created are removed directly, a secret with your own name only after you type it; a secret pipegen overwrote is never deleted. Environments that existed before get their previous settings back.
+
+**Exit codes.** `0`: the run did what it set out to (first run done, waiting for you to merge, the uninstall is finished). `1`: you said no. `2`: it stopped, a step failed, or it finished with something left for you (a kept item, a manual step; the final message lists each). `4`: pipegen stopped before reading the repo because of the folder it was started in (see safe mode above).
+
+**`--delete-repos`.** In v0.2 (a fine-grained token) pipegen deletes no repo: it prints the `gh repo delete` commands, for the scratch repo and for the central repo only when yours is the last project, the central pull request is merged and the repo holds nothing but pipegen's files. pipegen prints a delete command only after those checks, and never after a refusal. pipegen's own GitHub App login (which makes and deletes these repos itself) is planned next. With it, `--delete-repos` will use the repo-deletion right the App has (Administration: write) and delete them after you type their names. A pull request branch `pipegen/update-<name>` left on the central repo withholds the command (pipegen records no head for it, so it can't tell it from a teammate's work): delete that branch yourself, then run again.
+
+**Permissions.** The same write permissions as `pipegen run` on the app repo and the helper repos. For an organisation: Administration (read and write) is optional, for removing the organisation rule that made pipegen's required workflow run (without it pipegen tells you to remove the rule by hand), and Members: read is optional too (it checks that you own the organisation). `--delete-repos` needs no extra permission in v0.2 (it only prints commands; you run `gh repo delete` with your own login).
+
+**Known limits.**
+- A `<name>--required.yml` that pipegen keeps because the organisation rule still requires it leaves the second run unfinished until you remove the organisation rule; remove the rule, then the file, then run again.
+- pipegen doesn't pass a corporate proxy through (neither `HTTPS_PROXY` nor `NO_PROXY`, for git or for the GitHub API), so the proof, and the commands that talk to GitHub, don't work behind a mandatory proxy in v0.2.
+- v0.2 installs no pipegen GitHub App (it uses your fine-grained token), so there is no App to remove. When you are done, delete the token on GitHub (Settings → Developer settings → Fine-grained personal access tokens) or take the repos out of its access. The final message of the second run says this too. Once the App login exists (planned next), the same message will tell you how to remove the App by hand.
 
 ## Install safely, and check what you installed
 

@@ -9,8 +9,9 @@
 // - An App installed on "All repositories" is refused like a classic token, unless --allow-broad-token (T25). Which
 //   repos an App may touch comes from the installation's own repo list, never from GET /repos (a public repo answers
 //   200 to anyone).
-// - Where the token comes from: the App login (AuthDeps.appLogin) when there is one, else GITHUB_TOKEN. v0.1 ships
-//   no login command, so the App path is an interface only (see AppLoginStore / refreshAppToken). GH_TOKEN,
+// - Where the token comes from: the App login (AuthDeps.appLogin) when there is one, else GITHUB_TOKEN. v0.2 ships
+//   no App login (DECISIONS #127: fine-grained tokens only; the App login is planned next, as Plan L), so the App path
+//   is an interface only (see AppLoginStore / refreshAppToken) and nothing in v0.2 passes an appLogin. GH_TOKEN,
 //   GH_ENTERPRISE_TOKEN, GH_HOST and GITHUB_API_URL are never read.
 // - Repo creation (S9): only the App may create and delete pipegen's helper repos (a repo it creates joins the
 //   installation at once). A fine-grained token can create a repo too, but then can't reach it (404), so in token
@@ -112,7 +113,7 @@ const anonymousClients = new WeakSet<Octokit>();
 export const isAnonymousClient = (gh: Octokit): boolean => anonymousClients.has(gh);
 /** A 401 on a client that sent a token: that token was rejected. */
 const rejectedOn = (gh: Octokit, e: unknown) => isRejected(e) && !anonymousClients.has(gh);
-const tokenRejected = () => new GitHubAccessError('GitHub rejected the token (HTTP 401): it is wrong, expired or revoked. Make a new one, or log in again.', { status: 401 });
+const tokenRejected = () => new GitHubAccessError('GitHub rejected the token (HTTP 401): it is wrong, expired or revoked. Make a new fine-grained token and set it as GITHUB_TOKEN.', { status: 401 });
 export { tokenRejected as githubTokenRejected };
 
 // Defence in depth: owner and repo are checked here too, before they go into any API path.
@@ -361,13 +362,13 @@ const FG_PAGE = 'GitHub → Settings → Developer settings → Personal access 
 
 /**
  * How to give pipegen read access to one repo (spike S1): a fine-grained token for that repo only, with the read-only
- * permissions, or pipegen's GitHub App. Never `gh auth login` (its token reaches every repo of the account).
+ * permissions (v0.2; pipegen's GitHub App login is planned next). Never `gh auth login` (its token reaches every repo of the account).
  */
 export function readAccessSteps(owner: string, repo: string): string {
   const perms = permissionsTable('read').map((p) => p.permission).join(', ');
   return `pipegen needs read access to ${repoName(owner, repo)}. Create a fine-grained token for this one repo (${FG_PAGE}; `
     + `Repository access: Only select repositories → ${safeText(repo, 100)}) with ${perms}, and set it as GITHUB_TOKEN `
-    + '(or install the pipegen GitHub App on this repo). pipegen refuses broad classic tokens.';
+    + '. pipegen refuses broad classic tokens.';
 }
 
 /**
@@ -398,10 +399,10 @@ function writeSetup(owner: string, repos: string[]): string {
 }
 
 const CLASSIC_REFUSED = 'pipegen won\'t use this token: it is a classic token, which reaches every repo you have. '
-  + 'Use a fine-grained token limited to the repos pipegen works on, or pipegen\'s GitHub App installed on "Only select repositories". '
+  + 'Use a fine-grained token limited to the repos pipegen works on. '
   + 'To use the classic token anyway, run again with --allow-broad-token.';
-const INSTALLATION_WRITE = 'The Actions GITHUB_TOKEN is only accepted for read-only audit. To change a repo, use pipegen\'s GitHub App '
-  + 'or a fine-grained token limited to the repos pipegen works on.';
+const INSTALLATION_WRITE = 'The Actions GITHUB_TOKEN is only accepted for read-only audit. To change a repo, use '
+  + 'a fine-grained token limited to the repos pipegen works on.';
 const ALL_REPOS = 'pipegen won\'t use this GitHub App login: the App is installed on "All repositories", so it reaches every repo of '
   + 'the account. Change the installation to "Only select repositories" (GitHub → Settings → Applications → Installed GitHub Apps → '
   + 'Configure), or run again with --allow-broad-token.';
@@ -409,7 +410,7 @@ const SCOPE_UNCONFIRMED = 'pipegen couldn\'t confirm which repos its GitHub App 
   + 'and won\'t use it. Check the installation is on "Only select repositories" (GitHub → Settings → Applications → Installed GitHub Apps → '
   + 'Configure) and try again, or run again with --allow-broad-token.';
 const UNKNOWN_TOKEN = 'pipegen doesn\'t recognise this kind of GitHub token. Use a fine-grained token (it starts with github_pat_) '
-  + 'limited to the repos pipegen works on, or pipegen\'s GitHub App.';
+  + 'limited to the repos pipegen works on.';
 
 // ---------- the App login (interface only in v0.1) ----------
 
@@ -561,7 +562,7 @@ export async function getAuth(opts: AuthOpts & { mode: 'read' | 'write' }, deps:
   try {
     appTok = deps.appLogin ? await deps.appLogin() : null;
   } catch {
-    throw new GitHubAccessError('pipegen couldn\'t read its GitHub App login. Log in again, or set GITHUB_TOKEN to a fine-grained token.');
+    throw new GitHubAccessError('pipegen couldn\'t read its GitHub App login (v0.2 has none). Set GITHUB_TOKEN to a fine-grained token.');
   }
   if (appTok !== null && appTok.trim() !== '') {
     token = appTok.trim();
@@ -652,7 +653,7 @@ export async function readGitHubContext(
     if (rejectedOn(gh, e)) throw tokenRejected();
     const { status } = failure(e);
     if (status === 404 || status === 403) {
-      throw new GitHubAccessError(`pipegen can't see ${repoName(owner, repo)} with this token (${said(e)}). Check the repo name and that the token (or the App installation) includes this repo.`, { status });
+      throw new GitHubAccessError(`pipegen can't see ${repoName(owner, repo)} with this token (${said(e)}). Check the repo name and that the token includes this repo.`, { status });
     }
     throw new GitHubAccessError(`pipegen couldn't read ${repoName(owner, repo)} from GitHub (${said(e)}).`, { status });
   }
@@ -712,7 +713,7 @@ export async function probePermissions(gh: Octokit, owner: string, repos: string
   // G13 (S12): the optional organisation rows are never required, so never checked here
   const rows = rowsFor(mode).filter((p) => (opts.kind === 'app' || !p.appOnly) && p.org !== true);
   const access = (repo: string) => `Access to ${repoName(owner, repo)}`;
-  const NO_ACCESS = 'pipegen can\'t reach this repo with this token: it doesn\'t exist yet, or it isn\'t in the token\'s (or the App installation\'s) repository list.';
+  const NO_ACCESS = 'pipegen can\'t reach this repo with this token: it doesn\'t exist yet, or it isn\'t in the token\'s repository list.';
   const done = () => ({ missing, unchecked: unchecked.filter((u) => !missing.some((m) => m.permission === u.permission)) });
 
   if (opts.kind === 'app') {
