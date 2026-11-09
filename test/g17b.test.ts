@@ -45,13 +45,20 @@ describe('G17 row 13: the compose-path DAST app containers drop every capability
   const prof = profileOf([node({ dockerfile: 'Dockerfile', port: 3000, scripts: ['test', 'lint', 'start'], dependsOn: [PG] })]);
   const text = composeText(prof, loadBaseImages()) as string;
 
-  it('compose: every app service has cap_drop ALL and no-new-privileges; the dependency containers keep their own (their entrypoints switch users)', () => {
+  it('compose: every app service has cap_drop ALL and no-new-privileges; the dependency containers keep their capabilities (their entrypoints switch users) but gain no privilege (G17B-R1 sec M2)', () => {
     const app = blockOf(text, 'app-app');
     expect(app).toContain('    cap_drop:\n      - "ALL"');
     expect(app).toContain('    security_opt:\n      - "no-new-privileges:true"');
     const db = blockOf(text, 'postgres');
-    expect(db).not.toMatch(/cap_drop|security_opt/);
+    expect(db).not.toMatch(/cap_drop/);
+    expect(db).toContain('    security_opt:\n      - "no-new-privileges:true"');
     expect(text.match(/cap_drop:/g)?.length).toBe(1);
+    expect(text.match(/no-new-privileges:true/g)?.length).toBe(2);
+  });
+
+  it('threat model: T54 says the compose start builds the app image inside the DAST run job (a second build of the Dockerfile, not the scanned archive)', () => {
+    const r = readFileSync('docs/threat-model.md', 'utf8').split('\n').find((l) => l.startsWith('| T54 |')) as string;
+    expect(r).toMatch(/compose start builds the app's image inside the DAST run job/);
   });
 
   it('assemble: the DAST run job starts the hardened compose file; the old text without the drop is not pipegen\'s file, so no job starts it', async () => {
@@ -107,13 +114,18 @@ describe('G17 row 15: dastStartOf reads the build-push id from the shared table'
   });
 });
 
-describe('G17 row 16: T52 names the Bullfrog egress step in the key-env sign job', () => {
-  it('threat model: T52 no longer says no third-party action runs in the key-env sign job; it names Bullfrog and what it can reach', () => {
-    const row = readFileSync('docs/threat-model.md', 'utf8').split('\n').find((l) => l.startsWith('| T52 |')) as string;
-    expect(row).toBeDefined();
-    expect(row).not.toContain('no repo code and no third-party action (the referee\'s sign-job allowlist)');
-    expect(row).toMatch(/Bullfrog/);
-    expect(row).toMatch(/one third-party action/);
+describe('G17 row 16 (+ G17B-R1 spec M1): T52 names every reviewed action of the sign jobs', () => {
+  const row = (): string => readFileSync('docs/threat-model.md', 'utf8').split('\n').find((l) => l.startsWith('| T52 |')) as string;
+  it('threat model: T52 names Bullfrog and the pinned download-artifact in the key-env sign job, and claims no sign job runs no third-party action', () => {
+    const r = row();
+    expect(r).toBeDefined();
+    expect(r).toMatch(/Bullfrog/);
+    expect(r).toMatch(/two reviewed actions run in that job: the pinned Bullfrog egress step[^|]*and the pinned download-artifact/);
+    expect(r).not.toMatch(/no third-party action/);
+    expect(r).not.toMatch(/one third-party action/);
+    // the keyless and attest sign jobs: the actions they do run are named
+    expect(r).toMatch(/keyless sign job[^|]*download-artifact/);
+    expect(r).toMatch(/attest sign job[^|]*download-artifact and actions\/attest/);
   });
 });
 
@@ -155,6 +167,10 @@ describe('G17 row 17: the tsc lockfile check refuses only the copies the shim ca
     const r = runs(fixture({ [`node_modules/typescript/node_modules/${native}`]: old }));
     expect(r.status).toBe(1);
     expect(r.err).toMatch(new RegExp(`a nested copy node_modules/typescript/node_modules/${native.replace('/', '\\/')} inside typescript; the tsc shim would run that copy instead of the one pipegen checks`));
+    // G17B-R1 sec M3: a copy under typescript/lib/node_modules is on the shim's path too (it resolves from lib): refused from the lockfile
+    const lib = runs(fixture({ [`node_modules/typescript/lib/node_modules/${native}`]: old }));
+    expect(lib.status).toBe(1);
+    expect(lib.err).toMatch(new RegExp(`a nested copy node_modules/typescript/lib/node_modules/${native.replace('/', '\\/')} inside typescript`));
     // a top-level entry of the prefix is still checked (registry tarball, sha512, typescript's own version)
     expect(runs(fixture({ [`node_modules/@typescript/typescript-plan9-arm`]: old })).err).toMatch(/is not the registry tarball with a sha512 integrity/);
   });
@@ -223,14 +239,35 @@ describe('G17 row 19: scope (reported): a service with no Dockerfile of its own 
   });
 });
 
-describe('G17 row 21 (open question 13): one image name when the repository and the service share it', () => {
-  it('publishedImageRepo: the service name alone when it equals the repository name; <repo>-<service> otherwise', () => {
-    expect(publishedImageRepo('acme', 'acme-shop', 'acme-shop')).toBe('ghcr.io/acme/acme-shop');
-    expect(publishedImageRepo('Acme', 'Acme-Shop', 'acme-shop')).toBe('ghcr.io/acme/acme-shop');
-    expect(publishedImageRepo('acme', 'acme-shop', 'Acme Shop')).toBe('ghcr.io/acme/acme-shop');
+describe('G17 row 21 reverted (G17B-R1 sec I1, open question 13 closed as won\'t fix): always <repo>-<service>', () => {
+  it('publishedImageRepo: the double name keeps pipegen\'s package apart from the repository\'s own ghcr.io/<owner>/<repo>, and across repositories', () => {
+    expect(publishedImageRepo('acme', 'acme-shop', 'acme-shop')).toBe('ghcr.io/acme/acme-shop-acme-shop');
+    expect(publishedImageRepo('Acme', 'Acme-Shop', 'acme-shop')).toBe('ghcr.io/acme/acme-shop-acme-shop');
     expect(publishedImageRepo('acme', 'acme-shop', 'web')).toBe('ghcr.io/acme/acme-shop-web');
-    expect(publishedImageRepo('acme', 'shop', 'app')).toBe('ghcr.io/acme/shop-app');
-    // no other service of that repository can take the short name: every other name keeps the `<repo>-` prefix
-    expect(publishedImageRepo('acme', 'acme-shop', 'shop')).toBe('ghcr.io/acme/acme-shop-shop');
+    // the reviewer's P5 pair: two repositories of one owner never share a package name
+    expect(publishedImageRepo('acme', 'acme-shop', 'acme-shop')).not.toBe(publishedImageRepo('acme', 'acme', 'shop'));
+    expect(publishedImageRepo('acme', 'acme', 'shop')).toBe('ghcr.io/acme/acme-shop');
+  });
+});
+
+describe('G17B-R1 sec M1: the ZAP API answers only 127.0.0.1 in every ZAP form pipegen renders', () => {
+  const BIND = '-config api.addrs.addr.name=127.0.0.1 -config api.addrs.addr.regex=false';
+  const zapLines = (jobs: Job[]): string[] => jobs.flatMap((j) => j.steps).flatMap((st) => (st.run ?? '').split('\n')).filter((l) => /docker create .*"\$PIPEGEN_IMAGE" (?:zap-baseline\.py|zap\.sh)\b/.test(l));
+  it('render: zap-baseline passes the bind inside its -z options; the nightly AF zap.sh passes it as its own words', async () => {
+    const a = assemble(planned(profileOf([web()]), { over: SKIP_DEPLOY }));
+    const lines = zapLines([...Object.values(a.merge), ...Object.values(a.nightly)] as Job[]);
+    const base = lines.filter((l) => / zap-baseline\.py /.test(l));
+    const af = lines.filter((l) => / zap\.sh /.test(l));
+    expect(base.length, 'the baseline scan').toBeGreaterThan(0);
+    expect(af.length, 'the nightly AF scan').toBeGreaterThan(0);
+    for (const l of base) expect(l).toContain(` -z '-silent ${BIND}'`);
+    for (const l of af) expect(l).toMatch(new RegExp(` -cmd -silent ${BIND.replace(/[.]/g, '\\.')}(?: |$)`));
+    // the rendered steps are the referee's too: the assembled pipeline still passes it
+    expect(shown(await judge(files(a), a.draft))).toBe('');
+  });
+
+  it('threat model: T54 says the ZAP API answers only 127.0.0.1, so the scanned app can not drive it', () => {
+    const r = readFileSync('docs/threat-model.md', 'utf8').split('\n').find((l) => l.startsWith('| T54 |')) as string;
+    expect(r).toMatch(/ZAP API answers only 127\.0\.0\.1/);
   });
 });
