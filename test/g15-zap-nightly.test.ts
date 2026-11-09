@@ -95,7 +95,8 @@ describe('G15a round 6: the reviewed ZAP AF entry and its render', () => {
     expect(text).toMatch(/--cap-drop ALL/);
     expect(text).toContain(`-e ${ZAP_ACTIVE_TARGET_ENV}="$PIPEGEN_ARG_0"`);
     expect(run?.env?.PIPEGEN_ARG_0).toBe(URL);
-    expect(text).toContain(`"$PIPEGEN_IMAGE" ${ZAP_ACTIVE_COMMAND.join(' ')} > /dev/null`);
+    // G17B-R1 sec M1: the API answers only 127.0.0.1
+    expect(text).toContain(`"$PIPEGEN_IMAGE" ${ZAP_ACTIVE_COMMAND.join(' ')} -config api.addrs.addr.name=127.0.0.1 -config api.addrs.addr.regex=false > /dev/null`);
     expect(text).toContain('chmod 0777 "$work"');
     // the URL is never a word of the command
     expect(text).not.toContain(URL);

@@ -13,7 +13,7 @@ const svc = (over: Partial<Service> = {}): Service => ({
 });
 const ctx = (over: Partial<DockerfileCtx> = {}): DockerfileCtx => ({ port: 3000, baseImages: loadBaseImages(), buildsInside: false, scripts: ['start', 'build'], ...over });
 const problems = (t: string, over: Partial<DockerfileCtx> = {}): string[] => dockerfileProblems(t, svc(), ctx(over));
-const SINGLE = [`FROM ${REF}`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --omit=dev --ignore-scripts', 'COPY . .', 'EXPOSE 3000', 'USER node', 'CMD ["node", "index.js"]', ''].join('\n');
+const SINGLE = [`FROM ${REF}`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'COPY . .', 'EXPOSE 3000', 'USER node', 'CMD ["node", "index.js"]', ''].join('\n');
 const swap = (t: string, a: string, b: string): string => { expect(t).toContain(a); return t.replace(a, b); };
 const withLine = (line: string): string => swap(SINGLE, 'COPY . .', `COPY . .\n${line}`);
 const refused = (t: string, re: RegExp = /.+/, over: Partial<DockerfileCtx> = {}): void => {
@@ -90,8 +90,8 @@ describe('B2: paths stay in the app folder', () => {
 describe('B3: exec-form RUN is exactly one command', () => {
   it('an && element is refused, as is its escaped spelling; one command passes', () => {
     for (const run of [
-      'RUN ["mkdir", "-p", "x", "&&", "chown", "node:node", "x"]', 'RUN ["chown", "node:node", "x", "\\u0026\\u0026", "npm", "run", "start"]', 'RUN ["npm", "ci", "--ignore-scripts", "&&", "npm", "run", "build"]',
-      'RUN ["&&"]', 'RUN ["&&", "npm", "ci", "--ignore-scripts"]', 'RUN ["npm", "ci", "--ignore-scripts", "&&"]', 'RUN ["npm", "ci", "--ignore-scripts", "\\u0026&"]',
+      'RUN ["mkdir", "-p", "x", "&&", "chown", "node:node", "x"]', 'RUN ["chown", "node:node", "x", "\\u0026\\u0026", "npm", "run", "start"]', 'RUN ["npm", "ci", "--ignore-scripts", "--git=/usr/bin/git", "&&", "npm", "run", "build"]',
+      'RUN ["&&"]', 'RUN ["&&", "npm", "ci", "--ignore-scripts", "--git=/usr/bin/git"]', 'RUN ["npm", "ci", "--ignore-scripts", "--git=/usr/bin/git", "&&"]', 'RUN ["npm", "ci", "--ignore-scripts", "--git=/usr/bin/git", "\\u0026&"]',
     ]) refused(swap(SINGLE, 'COPY . .', `${run}`), /RUN/);
     expect(problems(withLine('RUN ["mkdir", "-p", "x"]'))).toEqual([]);
     expect(problems(withLine('RUN ["npm", "run", "build"]'))).toEqual([]);

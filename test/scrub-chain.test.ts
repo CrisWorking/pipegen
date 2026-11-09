@@ -8,6 +8,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync
 import { join } from 'node:path';
 import { Document } from 'yaml';
 import { describe, expect, it } from 'vitest';
+import { ARCHIVE_TOOL_IDS } from '../src/engine/image-handoff.js';
 import { resultArtifactName } from '../src/engine/artifact-names.js';
 import { checkJobOrder, isKnownHarmless, isScrubStep } from '../src/engine/job-rules.js';
 import { JOB_STEP_POLICY, referee, type Linters, type RefereeReport } from '../src/engine/referee.js';
@@ -626,7 +627,8 @@ describe('the renderer and the referee agree: a full scanner job per findings to
     const ctxN: RenderContext = { ...ctx, profile: { ...prof, services: [svc, ...Array.from({ length: 12 }, (_, i) => ({ ...svc, name: `app${i + 2}` }))] } };
     const perNeed = new Map<string, number>();
     // G4-R1: the DAST tools run in their own key-free run job and are scrubbed in another (test/jobs-dast.test.ts), never one job
-    for (const t of reviewedList().filter((e) => RAW_FORMATS.includes(e.step.output.format) && !e.categories.includes('dast'))) {
+    // G17B-R1 round 2 (R0 carry 2): the image scanners read only the PR's own image archive, never the registry form (test/referee-g2.test.ts)
+    for (const t of reviewedList().filter((e) => RAW_FORMATS.includes(e.step.output.format) && !e.categories.includes('dast') && !ARCHIVE_TOOL_IDS.has(e.id))) {
       const nth = (perNeed.get(needFor(t)) ?? 0) + 1;
       perNeed.set(needFor(t), nth);
       const spec = specFor(t, { needId: needFor(t), service: nth === 1 ? 'app' : `app${nth}` });
@@ -635,7 +637,7 @@ describe('the renderer and the referee agree: a full scanner job per findings to
       specs.push(spec);
       jobs[`t-${t.id}`] = job(dedupeJobSteps([...harden, ...built.steps], { scans: scansFor([...harden, ...built.steps]) }));
     }
-    expect(specs.map((s) => s.tool.id)).toEqual(expect.arrayContaining(['gitleaks', 'betterleaks', 'semgrep', 'osv-scanner', 'trivy-config', 'trivy-image', 'trivy-licence', 'hadolint', 'kube-linter', 'semgrep']));
+    expect(specs.map((s) => s.tool.id)).toEqual(expect.arrayContaining(['gitleaks', 'betterleaks', 'semgrep', 'osv-scanner', 'trivy-config', 'trivy-licence', 'hadolint', 'kube-linter', 'semgrep']));
     // without the harden step too (the job shape of Plan G's scanner jobs differs by the egress policy)
     const plain: Record<string, Job> = {};
     for (const s of specs) plain[`u-${s.tool.id}`] = job(dedupeJobSteps(scannerSteps(s, ctxN).steps, { scans: scansFor(scannerSteps(s, ctxN).steps) }));

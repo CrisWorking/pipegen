@@ -62,14 +62,14 @@ import { dockerfilesOf } from '../engine/created-judges/compose.js';
 import { egressSetsForTool, renderEgressStep, SHARED_CDN_SETS, type EgressSet } from '../engine/egress.js';
 import { gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES, resultFormat } from '../engine/gate-job-list.js';
 import { SKIPPED_PART_NEEDS } from '../engine/gate-inputs.js';
-import { ARCHIVE_TOOL_IDS, renderImageArchiveScan, renderImageBuild } from '../engine/image-handoff.js';
-import { dastStartOf, nightlyDastSpec, NIGHTLY_DAST_TOOL, renderDastRun, renderDastScrub, zapActiveNotRunNote, zapActiveSpec, ZAP_ACTIVE_JOB_MINUTES, ZAP_ACTIVE_LANE, ZAP_ACTIVE_TOOL, type DastStart } from '../engine/dast-handoff.js';
+import { ARCHIVE_TOOL_IDS, imageProfile, renderImageArchiveScan, renderImageBuild } from '../engine/image-handoff.js';
+import { DAST_SECRETS_REASON, dastStartOf, nightlyDastSpec, NIGHTLY_DAST_TOOL, renderDastRun, renderDastScrub, zapActiveNotRunNote, zapActiveSpec, ZAP_ACTIVE_JOB_MINUTES, ZAP_ACTIVE_LANE, ZAP_ACTIVE_TOOL, type DastStart } from '../engine/dast-handoff.js';
 import {
   BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, dastRunJobId, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, IMAGE_BUILD_NEED, imageBuildJobId, isReviewed,
   isScrubStep, jobOutputsFor, CODE_SCANNING_JOB, DAST_UPLOAD_JOB, dastLaneOf, dastNightlyCategory, dastResultArtifact, type DastLane, HISTORY_UPLOAD_JOB, SECRETS_HISTORY_CATEGORY, SECRETS_HISTORY_JOB, NIGHTLY_CONCURRENCY, NIGHTLY_IF, NO_SCANS, SCORECARD_IF, SCORECARD_JOB, ZIZMOR_ONLINE_JOB, renderRangeFetchStep, type RenderedStep, type ScanFact,
 } from '../engine/job-rules.js';
 import { NEED_ID_CATEGORY, SCHEDULED_CATEGORIES } from '../engine/need-ids.js';
-import { MINIMUM_CATEGORIES, NO_HOOKS_CI_MANAGERS, NO_IMAGE_CATEGORIES, noImageServices, riskyTriggersOf, WORKFLOW_LINT_EXTRA, WORKFLOW_LINT_TOOL, workflowLintTools } from '../engine/needs.js';
+import { MINIMUM_CATEGORIES, NO_HOOKS_CI_MANAGERS, NO_IMAGE_CATEGORIES, noImageServices, publishedImageServices, riskyTriggersOf, WORKFLOW_LINT_EXTRA, WORKFLOW_LINT_TOOL, workflowLintTools } from '../engine/needs.js';
 import { parseImageRef } from '../engine/names.js';
 import { PLATFORM_ACTION_IDS, type PlatformActions } from '../engine/pin.js';
 import { APP_RUNNING_CATEGORIES, renderStarterTestRun } from '../engine/render-cli.js';
@@ -256,7 +256,8 @@ const installSets = (steps: readonly RenderedStep[], svc: Service | undefined): 
 interface Ctx {
   draft: PipelineDraft; deps: JobsDeps; byId: Map<string, ReviewedTool>; gate: ReviewedTool; notes: string[];
   /** the runtime env and the images of the compose file pipegen computes, when the draft holds exactly that file (D4) */
-  compose: { env: ReturnType<typeof planCompose>['env']; images: EgressSet[] } | null;
+  /** pipegen's compose file: its runtime env, its images' registries, and what compose up's build of the app images reaches (G17B-R2 sec M2). */
+  compose: { env: ReturnType<typeof planCompose>['env']; images: EgressSet[]; builds: EgressSet[] } | null;
 }
 
 function toolOf(c: Pick<Ctx, 'byId'>, id: string): ReviewedTool {
@@ -277,6 +278,13 @@ const blocks = (draft: PipelineDraft, needId: string, service: string | undefine
   return m.length === 0 || m.some((n) => n.blocking !== false);
 };
 const serviceNamed = (draft: PipelineDraft, name: string | undefined): Service | undefined => (name === undefined ? undefined : draft.profile.services.find((s) => s.name === name));
+
+/** G17B-R1 spec I2: the next step after an image stop, fixed text by the service's facts (no repo text). */
+function imageNextStep(svc: Service | undefined): string {
+  if (svc !== undefined && (svc.dockerfile ?? '') === '') return 'add a Dockerfile to the service\'s folder, or let pipegen create one, then run `npx pipegen run` again.';
+  if (svc !== undefined && !(svc.path === '.' || svc.path === '' || svc.path === './')) return 'pipegen v0.2 builds an image from the repository root only; move the service\'s Dockerfile and build context to the root, or wait for a later version, then run `npx pipegen run` again.';
+  return 'fix what the reason above names, then run `npx pipegen run` again.';
+}
 
 /** A check job (findings or job status) for one need key on one layer. */
 function checkJob(c: Ctx, need: Need, specs: readonly StepSpec[], range: boolean): Job {
@@ -329,7 +337,7 @@ function checkJob(c: Ctx, need: Need, specs: readonly StepSpec[], range: boolean
     const at = steps.findIndex((s) => s.run !== undefined || (s.uses !== undefined && !/^pipegen-(?:checkout|setup-node-\d{1,3}|setup-python)$/.test(s.id ?? '') && s.id !== undefined));
     const cut = at < 0 ? steps.length : at;
     steps = [...steps.slice(0, cut), renderRuntimeEnv(c.compose.env), renderComposeUp(), ...steps.slice(cut)];
-    sets.push('dockerhub', ...c.compose.images);
+    sets.push('dockerhub', ...c.compose.images, ...c.compose.builds);
   }
   sets.push(...installSets(steps, svc));
   const egress = egressStepFor(sets, { userSecret, dockerNetworks: compose, job: id });
@@ -342,7 +350,7 @@ function imageBuildJob(c: Ctx, spec: StepSpec): Job {
   const id = imageBuildJobId(service);
   const buildPush = c.deps.platform['build-push'];
   if (buildPush?.id !== PLATFORM_ACTION_IDS['build-push'] || buildPush.candidate.id !== spec.tool.id) return fail(`The image build of ${show(service)} is not the reviewed build-push step.`);
-  const built = renderImageBuild(spec, buildPush, c.deps.platform, { profile: c.draft.profile, blocking: true });
+  const built = renderImageBuild(spec, buildPush, c.deps.platform, { profile: imageProfile(c.draft.profile, c.draft.created), blocking: true });
   const prelude = renderJobPrelude({}, c.deps.platform).steps;
   // the Dockerfile's own base images and package installs (live checklist: the build's network under Bullfrog)
   const egress = egressStepFor(['dockerhub', 'ghcr', ...packageSets([serviceNamed(c.draft, service)])], { userSecret: (spec.secrets ?? []).length > 0, dockerNetworks: true, job: id });
@@ -376,8 +384,9 @@ function dastJobs(c: Ctx, spec: StepSpec, start: DastStart, blocking: boolean = 
   const runId = dastRunJobId(service, dastLaneOf(spec.needId));
   const checkout = start.kind === 'compose' ? renderJobPrelude({}, c.deps.platform).steps : [];
   const r = renderDastRun(spec, t, c.deps.platform, c.draft, start, { blocking, checkout });
-  // the containers and the scanner's own hosts; the app's container is reached over the Docker networks (published on 127.0.0.1)
-  const sets: EgressSet[] = [...egressSetsForTool(t), 'dockerhub', ...(start.kind === 'compose' && c.compose !== null ? c.compose.images : [])];
+  // the containers and the scanner's own hosts; the app's container is reached over the Docker networks (published on 127.0.0.1); the compose
+  // start builds the app images, so it reaches their base and package registries too (G17B-R2 sec M2)
+  const sets: EgressSet[] = [...egressSetsForTool(t), 'dockerhub', ...(start.kind === 'compose' && c.compose !== null ? [...c.compose.images, ...c.compose.builds] : [])];
   const runEgress = egressStepFor(sets, { userSecret: false, dockerNetworks: true, job: runId });
   const run = job(dedupeJobSteps([runEgress, ...r.steps], { id: runId, scans: NO_SCANS }), r.needs.length > 0 ? { needs: r.needs } : {});
   const sc = renderDastScrub(spec, t, c.deps.platform, c.draft, c.gate, start.url);
@@ -525,7 +534,14 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
   let compose: Ctx['compose'] = null;
   if (composeFile !== undefined) {
     const cp = planCompose(draft.profile, list, dockerfilesOf(draft.created));
-    if (cp.text !== null && cp.text === composeFile.content) compose = { env: cp.env, images: list.map((b) => imageSet(`${b.image}:${b.tag}@${b.digest}`)) };
+    if (cp.text !== null && cp.text === composeFile.content) {
+      // G17B-R2 (sec M2): compose up builds every app image of the file (no --no-build), so the job reaches what their image builds reach
+      const apps = cp.apps.map((a) => draft.profile.services.find((x) => x.name === a.service));
+      // L1 (sec r4): ghcr only for an app built from the repository's own Dockerfile (its FROM may name ghcr.io); pipegen's created Dockerfiles and the compose images are Docker Hub only
+      const made = new Set(dockerfilesOf(draft.created));
+      const ownDockerfile = cp.apps.some((a) => !made.has(a.context === '.' ? 'Dockerfile' : `${a.context.replace(/^\.\//, '')}/Dockerfile`));
+      compose = { env: cp.env, images: list.map((b) => imageSet(`${b.image}:${b.tag}@${b.digest}`)), builds: [...(ownDockerfile ? ['ghcr' as const] : []), ...packageSets(apps)] };
+    }
     else addNote(notes, 'The draft\'s docker-compose.pipegen.yml is not the file pipegen computes, so no job starts it.');
   }
   // the PyPI publish step (S31) and the scans of an image no job builds, and osv without a lockfile (G12), are left out before the render
@@ -536,16 +552,36 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
   }
   const c: Ctx = { draft, deps, byId, gate, notes, compose };
   const builds = new Map<string, Job>();
+  const unbuilt = new Map<string, string>();
   for (const s of draft.steps) {
     if (leaveOut.has(s) || s.needId !== IMAGE_BUILD_NEED || s.tool.id !== PLATFORM_ACTION_IDS['build-push'] || s.service === undefined) continue;
     if (!draft.needs.some((n) => n.layer === 'merge' && n.id === IMAGE_BUILD_NEED && n.service === s.service)) continue;
     try { builds.set(s.service, imageBuildJob(c, s)); } catch (e) {
       if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e;
-      addNote(notes, `The image of ${show(s.service)} is not built or scanned yet: ${safeText(e.message, 200)}`);
+      unbuilt.set(s.service, e.message);
       leaveOut.add(s);
     }
   }
-  for (const s of draft.steps) if (ARCHIVE_TOOL_IDS.has(s.tool.id) && (s.service === undefined || !builds.has(s.service))) leaveOut.add(s);
+  const noBuild = new Set<string | undefined>();
+  for (const s of draft.steps) {
+    if (!ARCHIVE_TOOL_IDS.has(s.tool.id) || (s.service !== undefined && builds.has(s.service))) continue;
+    leaveOut.add(s);
+    noBuild.add(s.service);
+  }
+  // G17 row 19 (open question 9): a blocking check of an image that is not built (its build can not render, or no build step builds it): the
+  // build itself, or a scan of its archive, stops. The PR's own image is the only one pipegen scans, so no registry image stands in, and the
+  // check is never left out. A non-blocking one leaves with a note. The stop waits until after the DAST starts below, so a DAST check that
+  // can not start keeps its own reason (and its --type tip). G17B-R0/R1 round 2: a Dockerfile pipegen creates in this draft is the service's
+  // (imageProfile), and a service with no Dockerfile at all (none created) stops too (risk 1); each stop says the next step (spec I2).
+  let imageStop: string | null = null;
+  const imgSvc = (name: string | undefined): Service | undefined => (name === undefined ? undefined : imageProfile(draft.profile, draft.created).services.find((x) => x.name === name));
+  for (const service of new Set<string | undefined>([...unbuilt.keys(), ...noBuild])) {
+    const why = (service === undefined ? undefined : unbuilt.get(service)) ?? 'no image-build step of pipegen builds it';
+    const lost = draft.needs.filter((n) => n.layer === 'merge' && n.service === service && draft.steps.some((st) => st.needId === n.id && st.service === service && leaveOut.has(st)) && draft.steps.every((st) => st.needId !== n.id || st.service !== service || leaveOut.has(st)));
+    const blocking = lost.find((n) => blocks(draft, n.id, n.service));
+    if (blocking !== undefined && imageStop === null) imageStop = `The blocking check ${where(blocking)} can not run: its image is not built (${safeText(why, 200)}). pipegen never scans another image in its place, makes it warn-only or leaves it out. Next step: ${imageNextStep(imgSvc(service))}`;
+    if (service !== undefined && unbuilt.has(service)) addNote(notes, `The image of ${show(service)} is not built or scanned yet: ${safeText(why, 200)}`);
+  }
   // the needs whose every step was left out go too (a findings check with nothing readable is no check of the gate's list)
   const keep = draft.steps.filter((s) => !leaveOut.has(s));
   const gone = new Set<Need>();
@@ -567,6 +603,8 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
   const noStart = new Set<Need>();
   for (const s of draft.steps) {
     if (categoryOf(s.needId) !== 'dast' || s.service === undefined || !draft.needs.some((n) => n.layer === 'merge' && n.id === s.needId && n.service === s.service)) continue;
+    // G17 row 14: refused here with a plain reason, blocking or not (the referee refuses it too); never left out quietly
+    if ((s.secrets ?? []).length > 0) fail(`The DAST check ${where(s)} names secrets (${s.secrets?.map(show).join(', ')}). ${DAST_SECRETS_REASON}`);
     const st = dastStartOf(draft, s.service, list);
     if (!('problem' in st)) { starts.set(s, st); continue; }
     // GJ-R3 (O3): an unsure type is a server by rule; the user may say it is a static site
@@ -577,6 +615,7 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     for (const n of draft.needs) if (n.id === s.needId && n.service === s.service) noStart.add(n);
   }
   if (noStart.size > 0) { draft = narrowed(draft, noStart); c.draft = draft; }
+  if (imageStop !== null) fail(imageStop);
 
   // 3. the layers
   const push: Record<string, Job> = {};
@@ -788,6 +827,15 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     const cat = categoryOf(n.id) ?? n.category;
     if (n.layer === 'deploy' && (cat === 'signing' || cat === 'attestation') && n.service !== undefined && noImage.has(n.service)) addNote(notes, reportOnlyNote(n.service));
   }
+  // G17B-R2 (design call): a deploy target that builds an image pipegen does not publish (a Dockerfile pipegen created, or one outside the
+  // root) gets no publish, sign or verify of its image; PIPEGEN.md's Not set up lines point to this note
+  if (!draft.skipped.some((s) => s.part === 'deploy')) {
+    const published = new Set(publishedImageServices(draft.profile, draft.capabilities));
+    for (const n of draft.needs) {
+      const cat = categoryOf(n.id) ?? n.category;
+      if (n.layer === 'deploy' && SIGN_VERIFY_CATEGORIES.has(cat) && n.service !== undefined && !noImage.has(n.service) && !published.has(n.service)) addNote(notes, unpublishedNote(n.service));
+    }
+  }
   if (draft.signing !== undefined && draft.signing !== null && Array.isArray(draft.signing.images)) {
     // GJ-R1 (sec M3): by slug; an image of no profile service is refused, one of a no-image service is report-only
     const images = draft.signing.images.filter((i) => {
@@ -866,6 +914,11 @@ export const RELEASE_ONLY_NOTES: ReadonlyMap<string, string> = new Map([
 
 /** GJ: the note (and the PIPEGEN.md line, G9) of a signing or attestation need on a service that builds no image. */
 const reportOnlyNote = (service: string): string => `The service ${show(service)} builds no image, so its signing is report-only: pipegen signs nothing for it (sign its deployed files with cosign sign-blob yourself if you need it).`;
+
+/** G17B-R2: the deploy-layer needs about the published image: its signature, its attestation and the check before a deploy. */
+const SIGN_VERIFY_CATEGORIES: ReadonlySet<string> = new Set(['signing', 'attestation', 'deploy-verify']);
+/** G17B-R2 (design call): the note of a service whose image pipegen builds but does not publish (so it signs and verifies nothing of it). */
+const unpublishedNote = (service: string): string => `pipegen does not publish the image of the service ${show(service)}, so it signs nothing for it and the verify job checks no image of it: pipegen v0.2 publishes only the image of a service at the repository root built from a Dockerfile of the repository's own (not one pipegen created).`;
 
 /** The draft without these needs, and without the steps no remaining need runs (a step is per need key, every layer). */
 function narrowed(draft: PipelineDraft, drop: ReadonlySet<Need>): PipelineDraft {

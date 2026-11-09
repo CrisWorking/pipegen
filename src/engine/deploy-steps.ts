@@ -33,7 +33,12 @@ export const imageDigestArtifact = (service: string): string => resultArtifactNa
 /** The tag image-publish pushes (the digest, never the tag, is what is signed, verified and handed to the deploy). */
 export const PUBLISH_TAG = 'pipegen';
 
-/** The image repository pipegen publishes a service's image to (no tag, no digest): `ghcr.io/<owner>/<repo>-<service slug>`, lower case. */
+/**
+ * The image repository pipegen publishes a service's image to (no tag, no digest): `ghcr.io/<owner>/<repo>-<service slug>`, lower case, always.
+ * G17B-R1 (sec I1; open question 13 closed as won't fix): the double name (`acme-shop-acme-shop`) stays, because `ghcr.io/<owner>/<repo>` is
+ * the package a repository's own release workflow pushes to (pipegen never writes into a package it did not make), and the short form would
+ * collide across repositories (acme/acme-shop "acme-shop" and acme/acme "shop").
+ */
 const IMAGE_REPO_RE = /^ghcr\.io(?:\/[a-z0-9]+(?:[._-][a-z0-9]+)*){2}$/;
 export function publishedImageRepo(owner: string, repo: string, service: string): string {
   let s: string;

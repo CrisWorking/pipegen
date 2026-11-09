@@ -75,6 +75,27 @@ export const APP_RUNNING_CATEGORIES: ReadonlySet<string> = new Set(['coverage', 
 const RESERVED_ENV = /^(?:HOME|PATH|RUNNER_TEMP|TMPDIR|BASH_ENV|ENV|PIPEGEN_(?:CONFIG|TUNED_CONFIG|IMAGE|DL_.*|NPM_EXPECT|REQUIREMENTS|RULES_(?:REMOTE|COMMIT|TREE_WANT)|ARG_\d+))$/;
 
 
+/**
+ * G17B-R1 sec M1: ZAP's API, which the pinned image starts keyless (`api.disablekey=true`) on 0.0.0.0 with every client address allowed
+ * (zap_common.py create_start_options), answers only 127.0.0.1. ZAP runs on the runner's network (`--network host`), so without this the
+ * scanned app could reach it over its bridge gateway and drive it (delete every alert, switch the scanners off, run scripts in ZAP's JVM).
+ * ZAP's own client is local and keeps working (checked live against the pinned image). Rendered here, not in the reviewed entry, whose flag
+ * table is bundled into the gate (gate/dist stays byte-identical).
+ */
+export const ZAP_API_LOOPBACK: readonly string[] = Object.freeze(['-config', 'api.addrs.addr.name=127.0.0.1', '-config', 'api.addrs.addr.regex=false']);
+
+/** Adds ZAP_API_LOOPBACK to a ZAP command (in place): inside zap-baseline.py's `-z` options, or as zap.sh's own words. Null, or why not. */
+function bindZapApi(exe: string | undefined, words: string[]): string | null {
+  if (exe === 'zap-baseline.py') {
+    const at = words.indexOf('-z');
+    if (at < 0 || words[at + 1] !== '-silent' || words.indexOf('-z', at + 1) >= 0) return 'the ZAP baseline command has no single -z -silent to bind its API to 127.0.0.1 in.';
+    words[at + 1] = q(['-silent', ...ZAP_API_LOOPBACK].join(' '));
+    return null;
+  }
+  if (exe === 'zap.sh') { words.push(...ZAP_API_LOOPBACK); return null; }
+  return exe !== undefined && /zap/i.test(exe) ? 'pipegen binds the API of zap-baseline.py and zap.sh only, so it runs no other ZAP command.' : null;
+}
+
 /** A reviewed constant as a shell word: bare when plain, else single-quoted (`'` becomes `'\''`). `${{` and NUL are refused. */
 function q(s: string): string {
   if (s.includes(EXPR)) return refuse('A reviewed command holds an expression (${{), which Actions would evaluate; pipegen refuses it.');
@@ -491,6 +512,10 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   }
   const tuned = tuningEffects(spec, tool, ctx);
   const built = buildWords(tool, spec, pol, config, configPath, slots, tuned, envSlots);
+  if (kind === 'docker') {
+    const why = bindZapApi(exe, built.main);
+    if (why !== null) return refuse(`${show(tool.id)}: ${why}`);
+  }
   const tplEnv = templateEnv(tool, hooks);
 
   const env: Record<string, string> = { ...tplEnv, ...built.env };
@@ -1282,7 +1307,9 @@ function repoTool(tool: string): (typeof REPO_TOOLS)[string] {
  * - from the `native` major on: every `<scope>/<base>-*` entry of the lockfile is a registry tarball with a sha512 at the package's own
  *   version; the one for this runner (`<base>-${process.platform}-${process.arch}`, the name the shim builds) is installed the same way,
  *   with no nested copy the shim would find first, Node's own resolution from the shim's folder lands on it, and the binary the shim runs
- *   (`<exe>`) is a regular file inside it.
+ *   (`<exe>`) is a regular file inside it. G17 row 17: a lockfile copy under another package or a workspace folder is never on the shim's
+ *   resolution path, so it is not judged; only a copy directly inside the package's own node_modules, or its lib folder's (the shim resolves
+ *   from lib; G17B-R1 sec M3), is refused.
  * The version is read when the job runs, never written into the step, so a lockfile bump keeps working. Every value comes from REPO_TOOLS.
  */
 export function repoToolCheckJs(tool: string): string {
@@ -1326,10 +1353,12 @@ export function repoToolCheckJs(tool: string): string {
     '  const prefix = nat.scope + "/" + nat.base + "-";',
     '  const want = prefix + process.platform + "-" + process.arch;',
     '  if (!/^@[a-z0-9-]+\\/[a-z0-9-]+-[a-z0-9]+-[a-z0-9]+$/.test(want)) fail("the native package name " + want + " is not a plain name");',
+    '  const inside = "node_modules/" + name + "/", insideLib = inside + "lib/";',
     '  for (const k of Object.keys(lock.packages)) {',
     '    const i = k.lastIndexOf("node_modules/" + prefix);',
     '    if (i < 0) continue;',
-    '    if (i !== 0) fail("package-lock.json has a nested copy " + k + "; the tsc shim would run instead of the one pipegen checks");',
+    '    if ((i === inside.length && k.startsWith(inside)) || (i === insideLib.length && k.startsWith(insideLib))) fail("package-lock.json has a nested copy " + k + " inside " + name + "; the tsc shim would run that copy instead of the one pipegen checks");',
+    '    if (i !== 0) continue;',
     '    const e = entry(k.slice("node_modules/".length));',
     '    if (e.version !== p.version) fail(k.slice("node_modules/".length) + " is not at " + name + "\'s own version " + p.version);',
     '  }',

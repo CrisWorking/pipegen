@@ -4,7 +4,7 @@ COPY package.json package-lock.json ./
 RUN npm ci \
 # hidden
 
-  --omit=dev --ignore-scripts
+  --omit=dev --ignore-scripts --git=/usr/bin/git
 COPY . .
 EXPOSE 3000
 USER node

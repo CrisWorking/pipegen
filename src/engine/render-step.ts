@@ -882,13 +882,20 @@ export const PROOF_OVERRIDE_PATH = '$RUNNER_TEMP/pipegen-proof/docker-compose.pi
  * only sets each app service's `image:` to the one app-start built with `docker build --network host`, and `--no-build`, so compose
  * never builds on the bridge network (where Bullfrog blocks the package registries, spike S8). Without it the step is unchanged.
  */
+/**
+ * G17B-R1 round 2 (risk 4, R0 concern 3), G17B-R2 (sec M2, spec I3): when compose up fails, one fixed message (no container log or repo text).
+ * It names no cause (a failing database or a failed build fails the same way): docker's own error stays above it in the log, and the
+ * capability limit is said as a possible cause only. It points to no file, so it holds in the proof run too (no PIPEGEN.md there yet).
+ */
+export const COMPOSE_UP_FAILED = '|| { echo "::error::pipegen: the containers did not start (see docker\'s error above). If the app image needs a Linux capability or a privilege gain (a root entrypoint that switches users or changes file owners), it can not start: pipegen starts the app containers with neither (cap_drop ALL, no-new-privileges), so run the app as a non-root user."; exit 1; }';
+
 export function renderComposeUp(opts: { proofOverride?: true } = {}): RenderedStep {
   if (opts.proofOverride === true) {
     return bashStep('pipegen: start the services with docker compose (proof images, no build)',
-      `set -euo pipefail\ndocker compose --env-file /dev/null -f docker-compose.pipegen.yml -f "${PROOF_OVERRIDE_PATH}" up -d --wait --no-build`, `repocode-${sha16('compose-up-proof')}`);
+      `set -euo pipefail\ndocker compose --env-file /dev/null -f docker-compose.pipegen.yml -f "${PROOF_OVERRIDE_PATH}" up -d --wait --no-build ${COMPOSE_UP_FAILED}`, `repocode-${sha16('compose-up-proof')}`);
   }
   if (opts.proofOverride !== undefined) throw new RenderError('proofOverride is true or absent.');
-  return bashStep('pipegen: start the services with docker compose', 'set -euo pipefail\ndocker compose --env-file /dev/null -f docker-compose.pipegen.yml up -d --wait', `repocode-${sha16('compose-up')}`);
+  return bashStep('pipegen: start the services with docker compose', `set -euo pipefail\ndocker compose --env-file /dev/null -f docker-compose.pipegen.yml up -d --wait ${COMPOSE_UP_FAILED}`, `repocode-${sha16('compose-up')}`);
 }
 
 /** Put on every job that feeds the gate, builds, signs or verifies (Plan G): no cache of any kind. */

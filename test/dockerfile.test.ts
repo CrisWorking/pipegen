@@ -29,11 +29,11 @@ const profile = (services: Service[] = [svc()], over: Partial<RepoProfile> = {})
 const facts = (extra: string[] = [], dir = 'api'): { repoPaths: Set<string> } => ({ repoPaths: new Set([`${dir}/package.json`, `${dir}/package-lock.json`, `${dir}/index.js`, ...extra]) });
 
 const SINGLE = (ref = REF24, port = 3000): string => [
-  `FROM ${ref}`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --omit=dev --ignore-scripts', 'COPY . .',
+  `FROM ${ref}`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'COPY . .',
   'ENV NODE_ENV=production', `EXPOSE ${port}`, 'USER node', 'CMD ["npm", "start"]', '',
 ].join('\n');
 const MULTI = (ref = REF24, port = 3000): string => [
-  `FROM ${ref} AS build`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts', 'COPY . .', 'RUN npm run build',
+  `FROM ${ref} AS build`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts --git=/usr/bin/git', 'COPY . .', 'RUN npm run build',
   `FROM ${ref}`, 'WORKDIR /app', 'ENV NODE_ENV=production', 'COPY --from=build --chown=node:node /app/node_modules ./node_modules',
   'COPY --from=build --chown=node:node /app/dist ./dist', `EXPOSE ${port}`, 'USER node', 'CMD ["node", "dist/index.js"]', '',
 ].join('\n');
@@ -89,7 +89,7 @@ describe('createDockerfile: what is written', () => {
   it('dockerfile: FROM only a base-image id, written by pipegen; AI tag text ignored', async () => {
     // the AI writes whatever FROM it likes; pipegen writes the list reference of the Node id it chose from runtimeVersion
     const hostile = [
-      'FROM node:22-alpine AS build', 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts', 'RUN npm run build',
+      'FROM node:22-alpine AS build', 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts --git=/usr/bin/git', 'RUN npm run build',
       'FROM --platform=$BUILDPLATFORM evil.example/node:latest@sha256:' + '0'.repeat(64), 'WORKDIR /app', 'COPY --from=build /app/dist ./dist', 'EXPOSE 3000', 'USER node', 'CMD ["node", "dist/index.js"]', '',
     ].join('\n');
     const s = svc({ scripts: ['start', 'build'] });
@@ -105,7 +105,7 @@ describe('createDockerfile: what is written', () => {
     const o22 = await make([ans(SINGLE('node:24'))], s22, facts(), profile([s22])).run();
     expect(o22.files[0]?.content).toContain(`FROM ${REF22}\n`);
     // a stage that starts from an earlier stage keeps its alias
-    const chain = [`FROM node:1 AS base`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts', 'USER node', 'FROM base AS run', 'WORKDIR /app', 'EXPOSE 3000', 'CMD ["npm", "start"]', ''].join('\n');
+    const chain = [`FROM node:1 AS base`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts --git=/usr/bin/git', 'USER node', 'FROM base AS run', 'WORKDIR /app', 'EXPOSE 3000', 'CMD ["npm", "start"]', ''].join('\n');
     const o = await make([ans(chain)]).run();
     expect(o.files[0]?.content.split('\n').filter((l) => /^from /i.test(l))).toEqual([`FROM ${REF24} AS base`, 'FROM base AS run']);
     // a stage name in another letter case is not the stage: pipegen's FROM replaces it
@@ -114,9 +114,9 @@ describe('createDockerfile: what is written', () => {
   });
 
   it('a FROM written across continuation lines is replaced whole', async () => {
-    const spread = ['FROM --platform=linux/amd64 \\', '  node:22-alpine \\', '# a comment', '  AS build', 'WORKDIR /app', 'RUN npm ci --ignore-scripts', 'FROM \\', 'node:22', 'WORKDIR /app', 'EXPOSE 3000', 'USER node', ''].join('\n');
+    const spread = ['FROM --platform=linux/amd64 \\', '  node:22-alpine \\', '# a comment', '  AS build', 'WORKDIR /app', 'RUN npm ci --ignore-scripts --git=/usr/bin/git', 'FROM \\', 'node:22', 'WORKDIR /app', 'EXPOSE 3000', 'USER node', ''].join('\n');
     const out = await make([ans(spread)]).run();
-    expect(out.files[0]?.content).toBe([`FROM ${REF24} AS build`, 'WORKDIR /app', 'RUN npm ci --ignore-scripts', `FROM ${REF24}`, 'WORKDIR /app', 'EXPOSE 3000', 'USER node', ''].join('\n'));
+    expect(out.files[0]?.content).toBe([`FROM ${REF24} AS build`, 'WORKDIR /app', 'RUN npm ci --ignore-scripts --git=/usr/bin/git', `FROM ${REF24}`, 'WORKDIR /app', 'EXPOSE 3000', 'USER node', ''].join('\n'));
   });
 
   it('the prompt carries the exact FROM lines, no repo text but the scanned bundle, and a strict schema', async () => {
@@ -127,7 +127,7 @@ describe('createDockerfile: what is written', () => {
     expect(req.system).toBe(DOCKERFILE_SYSTEM);
     expect(req.user).toContain(`FROM ${REF24} AS build`);
     expect(req.user).toContain(`\nFROM ${REF24}\n`);
-    expect(req.user).toContain('npm ci --ignore-scripts');
+    expect(req.user).toContain('npm ci --ignore-scripts --git=/usr/bin/git');
     expect(req.schemaName).toBe('dockerfile');
     expect(strictProblems(req.jsonSchema)).toEqual([]);
     expect(Object.keys((req.jsonSchema as { properties: object }).properties).sort()).toEqual(['dockerfile', 'port', 'reasoning']);
@@ -223,7 +223,7 @@ describe('createDockerfile: violations, one retry with the list, then a throw', 
       expect(m.ai.calls).toHaveLength(2);
     }
     // an extra stage from an unlisted image is rewritten to the list image, so what is written never names it
-    const extra = [`FROM evil.example/img:1 AS tool`, 'WORKDIR /app', 'RUN npm ci --ignore-scripts', SINGLE().replace('COPY . .', 'COPY --from=tool /x /x')].join('\n');
+    const extra = [`FROM evil.example/img:1 AS tool`, 'WORKDIR /app', 'RUN npm ci --ignore-scripts --git=/usr/bin/git', SINGLE().replace('COPY . .', 'COPY --from=tool /x /x')].join('\n');
     const out = await make([ans(extra)]).run();
     expect(out.files[0]?.content).not.toMatch(/evil/);
     expect(out.files[0]?.content.split('\n').filter((l) => /^from /i.test(l))).toEqual([`FROM ${REF24} AS tool`, `FROM ${REF24}`]);

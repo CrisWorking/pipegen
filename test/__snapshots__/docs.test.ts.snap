@@ -134,18 +134,18 @@ A check marked "Blocks a pull request" blocks only after you run \`npx pipegen f
 
 ### Deploy layer
 
-Runs on a push to the default branch: it builds, signs and checks the images that are deployed.
+Runs on a push to the default branch. pipegen publishes no image here, so it builds and signs nothing: it checks that the gate passed for the commit and that the head is the one the gate checked.
 
 - Publishing, service "shop-api", no tool listed (see the notes below). Publishes a package with a short-lived token instead of a stored one. Fails the run.
-- Image signing, service "shop-api", no tool listed (see the notes below). Signs the published image so a deploy can check where it came from. Fails the run.
+- Image signing, service "shop-api", no tool listed (see the notes below). Signs the published image so a deploy can check where it came from. Not set up: pipegen publishes no image of this service, so it signs and verifies nothing for it (see Signing and the notes below).
 
 ### Limits of these checks
 
 - The type-check follows your own tsconfig.json. The repo's tsconfig decides what tsc checks and how strictly, and a pull request can edit it (\`exclude\`, \`skipLibCheck\`, \`extends\`, a \`ts-nocheck\` comment). pipegen refuses only the plain no-op layouts: no file selected, \`noCheck\`, and a missing or linked tsconfig.json. It is not a protected path.
 - The raw result of the running app scan travels unscrubbed between the job that runs the app and the job that reads the result. It holds only what an app without secrets answered. A hostile app can always answer a scanner cleanly.
 - The running app scan has no earlier scan to compare with, so its findings warn on the pull request that installs pipegen and count as new after it.
+- The running app scan talks to ZAP through its API, which answers only 127.0.0.1, so the scanned app can not reach it.
 - Image findings have no base yet: there is no earlier scan of the base commit to compare with, so image findings warn on the pull request that installs pipegen and block on every other.
-- The scanned image is not the published image. The scan covers the build of the pull request head; the publish job builds again at the merge commit, so a moving base image tag can make them differ.
 - The licence scan reads lockfiles only.
 - The code scan runs Semgrep with a pinned copy of the semgrep-rules repository. Those rules have their own licence (the Semgrep Rules License v1.0). It lets you use them to check your own code, but not to sell them or offer them as a service. Read it before you use the rules anywhere else.
 - Publishing uses a trusted publisher, so no token is stored. Set it up once: on npmjs.com open the package settings and add a trusted publisher for GitHub Actions with this repository and the publish workflow file name; on PyPI open the project, then Publishing, and add a trusted publisher with the same details. The publish job needs npm 11.5.1 or newer and Node 22.14.0 or newer, and it is the only job that gets the \`id-token\` permission.
@@ -203,8 +203,6 @@ Images are signed with a cosign key. \`npx pipegen finish\` makes the key pair a
 Signing covers images only. A service that builds no image has report-only signing: pipegen signs nothing for it, and the notes in The four layers name each one.
 
 ## Deploys
-
-Deploy with the verified image digest (the verify job output \`digest\`). A signature only protects a deploy that uses that digest, so deploy by digest, not by tag.
 
 ### Unprotected deploys
 
@@ -416,7 +414,7 @@ A check marked "Blocks a pull request" blocks only after you run \`npx pipegen f
 
 ### Deploy layer
 
-Runs on a push to the default branch: it builds, signs and checks the images that are deployed.
+Runs on a push to the default branch. pipegen publishes no image here, so it builds and signs nothing: it checks that the gate passed for the commit and that the head is the one the gate checked.
 
 No check of this layer is set up here.
 
@@ -470,8 +468,6 @@ pipegen signs nothing in this setup.
 Signing covers images only. A service that builds no image has report-only signing: pipegen signs nothing for it, and the notes in The four layers name each one.
 
 ## Deploys
-
-Deploy with the verified image digest (the verify job output \`digest\`). A signature only protects a deploy that uses that digest, so deploy by digest, not by tag.
 
 ### Unprotected deploys
 

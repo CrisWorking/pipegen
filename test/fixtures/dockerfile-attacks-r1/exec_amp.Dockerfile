@@ -4,6 +4,6 @@ COPY package.json package-lock.json ./
 RUN mkdir -p /app
 COPY . .
 EXPOSE 3000
-RUN ["mkdir", "-p", "x", "&&", "npm", "ci", "--ignore-scripts"]
+RUN ["mkdir", "-p", "x", "&&", "npm", "ci", "--ignore-scripts", "--git=/usr/bin/git"]
 USER node
 CMD ["node", "index.js"]

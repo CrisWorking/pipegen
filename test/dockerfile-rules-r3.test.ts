@@ -11,9 +11,9 @@ const REF = baseImageRef('node-24-bookworm-slim');
 const svc = (): Service => ({ name: 'api', path: 'api', language: 'node', packageManager: 'npm', hasTests: true, envVars: [], dependsOn: [], scripts: ['start', 'build'], frameworks: [], quality: emptyServiceQuality() });
 const ctx = (over: Partial<DockerfileCtx> = {}): DockerfileCtx => ({ port: 3000, baseImages: loadBaseImages(), buildsInside: false, scripts: ['start', 'build'], ...over });
 const problems = (t: string, over: Partial<DockerfileCtx> = {}): string[] => dockerfileProblems(t, svc(), ctx(over));
-const SINGLE = [`FROM ${REF}`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --omit=dev --ignore-scripts', 'COPY . .', 'EXPOSE 3000', 'USER node', 'CMD ["node", "index.js"]', ''].join('\n');
+const SINGLE = [`FROM ${REF}`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'COPY . .', 'EXPOSE 3000', 'USER node', 'CMD ["node", "index.js"]', ''].join('\n');
 const MULTI = [
-  `FROM ${REF} AS build`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts', 'COPY . .', 'RUN npm run build',
+  `FROM ${REF} AS build`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts --git=/usr/bin/git', 'COPY . .', 'RUN npm run build',
   `FROM ${REF}`, 'WORKDIR /app', 'COPY --from=build --chown=node:node /app/dist ./dist', 'EXPOSE 3000', 'USER node', 'CMD ["node", "dist/index.js"]', '',
 ].join('\n');
 const swap = (t: string, a: string, b: string): string => { expect(t).toContain(a); return t.replace(a, b); };
@@ -63,7 +63,7 @@ describe('X1: WORKDIR right after every FROM', () => {
     // comments and blank lines between FROM and WORKDIR are not instructions
     expect(problems(swap(SINGLE, `FROM ${REF}\n`, `FROM ${REF}\n\n# note\n`))).toEqual([]);
     // a stage that starts from an earlier stage also pins its own directory
-    const alias = (wd: boolean): string => [`FROM ${REF} AS base`, 'WORKDIR /app', 'RUN npm ci --ignore-scripts', 'USER node', 'FROM base', ...(wd ? ['WORKDIR /app'] : []), 'EXPOSE 3000', ''].join('\n');
+    const alias = (wd: boolean): string => [`FROM ${REF} AS base`, 'WORKDIR /app', 'RUN npm ci --ignore-scripts --git=/usr/bin/git', 'USER node', 'FROM base', ...(wd ? ['WORKDIR /app'] : []), 'EXPOSE 3000', ''].join('\n');
     expect(problems(alias(true))).toEqual([]);
     refused(alias(false), /WORKDIR/);
     // a stage that ends right after its FROM

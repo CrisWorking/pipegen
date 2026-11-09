@@ -22,7 +22,7 @@ import { centralProjectName } from '../engine/central-path.js';
 import { CALLER_WORKFLOW, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PUSH_WORKFLOW } from '../engine/job-rules.js';
 import { pipegenDocProblems } from '../engine/created-judges/pipegen-doc.js';
 import { BOOTSTRAP_PROOFS_NOTE } from '../engine/reviewed.js';
-import { floorNeeds, MINIMUM_CATEGORIES, WORKFLOW_LINT_TOOL } from '../engine/needs.js';
+import { floorNeeds, MINIMUM_CATEGORIES, publishedImageServices, WORKFLOW_LINT_TOOL } from '../engine/needs.js';
 import { dastStartOf, NIGHTLY_DAST_TOOL, ZAP_ACTIVE_TOOL } from '../engine/dast-handoff.js';
 import { codeSecurityAvailable } from '../github/availability.js';
 import { describeTuning } from '../engine/tuning.js';
@@ -131,8 +131,18 @@ const LAYER_TEXT: Readonly<Record<(typeof LAYERS)[number], string>> = Object.fre
   'pre-commit': 'Runs on your machine before each commit.',
   push: 'Runs on a push to a branch that has no open pull request.',
   merge: `Runs on every pull request and decides whether it can merge. The gate (the check \`${GATE_CHECK_NAME}\`) reads every result.`,
-  deploy: 'Runs on a push to the default branch: it builds, signs and checks the images that are deployed.',
+  deploy: 'Runs on a push to the default branch.',
 });
+/** N2 (sec r4): what the deploy layer does, per service, from what pipegen publishes and signs here. */
+function deployText(draft: PipelineDraft): string {
+  const base = LAYER_TEXT.deploy;
+  const published = publishedHere(draft).length > 0;
+  const signs = draft.signing !== undefined && draft.signing !== null;
+  const gateOnly = 'it checks that the gate passed for the commit and that the head is the one the gate checked';
+  if (!published) return `${base} pipegen publishes no image here, so it builds and signs nothing: ${gateOnly}.`;
+  if (!signs) return `${base} For each service whose image pipegen publishes it builds and checks that image, and signs nothing in this setup; for every other service ${gateOnly}.`;
+  return `${base} For each service whose image pipegen publishes it builds, signs and checks that image; for every other service ${gateOnly}.`;
+}
 /** G17 row 57: when the merge lines' "Blocks a pull request" starts to hold. */
 const AFTER_FINISH = 'A check marked "Blocks a pull request" blocks only after you run `npx pipegen finish`, which turns on the merge locks. Until then a failed gate shows on the pull request but does not stop the merge.';
 /** Label and plain reason for every need category. */
@@ -357,7 +367,9 @@ function planSection(d: Doc, draft: PipelineDraft, data: DocData): void {
   d.p('This section comes first so that no limit is hidden.');
   d.li(`This repository is ${p.private ? 'private' : 'public'}. Your GitHub plan: ${planWord(p.plan)}.`);
   d.li(c.branchProtection ? `Branch rules: available, so the check \`${GATE_CHECK_NAME}\` can be required before a pull request merges.` : `Branch rules: not available on this plan, so GitHub can not require the check \`${GATE_CHECK_NAME}\` or a review before a merge. The gate still runs and reports, but nothing forces it.`);
-  d.li(c.environments ? 'Environments: available. The environment `pipegen-signing` holds the signing key and limits the verify step to the default branch.' : 'Environments: not available on this plan, so there is no `pipegen-signing` environment: the verify job runs without one, and the default-branch limit can not be enforced there.');
+  const keyMode = draft.signing?.mode === 'key-env';
+  const noKey = draft.signing === undefined || draft.signing === null ? 'pipegen signs nothing in this setup' : draft.signing.mode === 'keyless' ? 'keyless signing uses no key of yours' : 'attestations use no key of yours';
+  d.li(c.environments ? (keyMode ? 'Environments: available. The environment `pipegen-signing` holds the signing key and limits the verify step to the default branch.' : `Environments: available. The environment \`pipegen-signing\` limits the verify step to the default branch; it holds no signing key here (${noKey}).`) : 'Environments: not available on this plan, so there is no `pipegen-signing` environment: the verify job runs without one, and the default-branch limit can not be enforced there.');
   d.li(c.envRequiredReviewers ? 'Required reviewers on an environment: available.' : 'Required reviewers on an environment: not available, so a deploy does not wait for a person.');
   d.li(c.deploymentBranchPolicies ? 'Deployment branch policies: available, so only the default branch can use the signing environment.' : 'Deployment branch policies: not confirmed, so pipegen does not store a signing key in key mode.');
   d.li(c.attestations ? 'Build attestations: available.' : 'Build attestations: not available on this plan.');
@@ -485,6 +497,16 @@ const soft = (text: string, f: Facts): string => (f.gateRequired ? text : text
   .replace(/\bblock\b/g, 'fail the gate').replace(/\bblocking\b/g, 'required'));
 const FOR_INFO = 'Runs for information; the gate does not use it.';
 const NOTHING_RUNS = 'Not set up: no tool was chosen for it, so nothing runs (see the notes below).';
+/** G17B-R2 (design call): the deploy-layer needs about the published image, and their mode when pipegen publishes or signs none. */
+const SIGN_VERIFY_CATEGORIES: ReadonlySet<string> = new Set(['signing', 'attestation', 'deploy-verify']);
+const UNPUBLISHED = 'Not set up: pipegen publishes no image of this service, so it signs and verifies nothing for it (see Signing and the notes below).';
+const UNPUBLISHED_VERIFY = 'Not set up for an image: pipegen publishes no image of this service, so there is no signature to check; the verify job still checks that the gate passed and that the head is the one the gate checked (see Signing and the notes below).';
+const UNSIGNED = 'Not set up: pipegen signs nothing in this setup, so no deploy is checked against a signature (see Signing).';
+/** The services whose image pipegen publishes (the image-publish job, releaseJobs): none when the deploy part is skipped. */
+function publishedHere(draft: PipelineDraft): string[] {
+  if (Array.isArray(draft.skipped) && draft.skipped.some((x) => x?.part === 'deploy')) return [];
+  try { return publishedImageServices(draft.profile, draft.capabilities); } catch { return []; }
+}
 
 /** The mode line of one check, from facts the builder derived (the gate's job list, the hook file, the lock), never from the need's flags alone. */
 function modeOf(draft: PipelineDraft, reviewed: readonly ReviewedTool[], f: Facts, n: Need): string {
@@ -506,6 +528,11 @@ function modeOf(draft: PipelineDraft, reviewed: readonly ReviewedTool[], f: Fact
     return n.blocking ? 'Blocks the commit.' : 'Warns only.';
   }
   if (cat === 'hooks-ci' && !f.hookConfig) return 'Not set up: there is no hook config for it to run.';
+  // G17B-R2 (design call): no publish job for the service, no signature and no verified image; a published image with no signing plan, no signature
+  if (layer === 'deploy' && SIGN_VERIFY_CATEGORIES.has(cat)) {
+    if (n.service === undefined || !publishedHere(draft).includes(n.service)) return cat === 'deploy-verify' ? UNPUBLISHED_VERIFY : UNPUBLISHED;
+    if (draft.signing === undefined || draft.signing === null) return UNSIGNED;
+  }
   if (layer !== 'merge') {
     const only = warnOnlyWhy(draft, n);
     return only !== null ? `Warns only: ${only}.` : !n.blocking ? 'Warns only.' : 'Fails the run.';
@@ -539,7 +566,7 @@ function layersSection(d: Doc, draft: PipelineDraft, data: DocData, reviewed: re
   for (const layer of LAYERS) {
     const needs = draft.needs.filter((n) => n.layer === layer);
     d.h(3, `${layer === 'pre-commit' ? 'Pre-commit' : layer === 'push' ? 'Push' : layer === 'merge' ? 'Merge' : 'Deploy'} layer`);
-    d.p(LAYER_TEXT[layer]);
+    d.p(layer === 'deploy' ? deployText(draft) : LAYER_TEXT[layer]);
     // G17 row 57: "Blocks a pull request" holds only once finish has turned the merge locks on (none is on before the setup pull request merges)
     if (layer === 'merge' && facts.gateRequired) d.p(AFTER_FINISH);
     if (needs.length === 0) { d.p('No check of this layer is set up here.'); continue; }
@@ -569,6 +596,9 @@ function buildNotes(data: DocData): string[] {
   return all.filter((n, i) => all.indexOf(n) === i && !isAiNote(n) && !(gj && n === HUSKY_NO_CI_NOTE));
 }
 
+/** Whether the draft holds pipegen's compose file (the app starts from it in the test and DAST jobs). */
+const hasComposeFile = (draft: PipelineDraft): boolean => Array.isArray(draft.created) && draft.created.some((f) => f !== null && typeof f === 'object' && f.repo === 'app' && f.path === 'docker-compose.pipegen.yml');
+
 function limitsSection(d: Doc, draft: PipelineDraft): void {
   const has = (c: string): boolean => hasCat(draft, c);
   d.h(3, 'Limits of these checks');
@@ -576,10 +606,16 @@ function limitsSection(d: Doc, draft: PipelineDraft): void {
   if (has('dast')) {
     d.li('The raw result of the running app scan travels unscrubbed between the job that runs the app and the job that reads the result. It holds only what an app without secrets answered. A hostile app can always answer a scanner cleanly.');
     d.li('The running app scan has no earlier scan to compare with, so its findings warn on the pull request that installs pipegen and count as new after it.');
+    // G17B-R1 (sec M1, M2): the ZAP API bind; the second build when pipegen's compose file starts the app
+    d.li('The running app scan talks to ZAP through its API, which answers only 127.0.0.1, so the scanned app can not reach it.');
+    if (hasComposeFile(draft)) d.li('With pipegen\'s compose file, the running app scan builds the app\'s image itself, in its own job: a second build of the same Dockerfile. The image scan reads the other build.');
   }
+  // G17B-R0 concern 3: the hardening of pipegen's compose file, said where people read it (compose up's fixed failure message points here)
+  if (hasComposeFile(draft)) d.li('The app containers in pipegen\'s compose file run with no Linux capability and no privilege gain, and the database and queue containers with no privilege gain. An app image that needs a capability (a root entrypoint that switches users or changes file owners) does not start: run the app as a non-root user.');
   if (has('image-scan') || has('image-build')) {
     d.li('Image findings have no base yet: there is no earlier scan of the base commit to compare with, so image findings warn on the pull request that installs pipegen and block on every other.');
-    d.li('The scanned image is not the published image. The scan covers the build of the pull request head; the publish job builds again at the merge commit, so a moving base image tag can make them differ.');
+    // G17B-R2: only when there is a publish job
+    if (publishedHere(draft).length > 0) d.li('The scanned image is not the published image. The scan covers the build of the pull request head; the publish job builds again at the merge commit, so a moving base image tag can make them differ.');
   }
   if (has('licences')) d.li('The licence scan reads lockfiles only.');
   if (has('sast')) d.li('The code scan runs Semgrep with a pinned copy of the semgrep-rules repository. Those rules have their own licence (the Semgrep Rules License v1.0). It lets you use them to check your own code, but not to sell them or offer them as a service. Read it before you use the rules anywhere else.');
@@ -720,7 +756,8 @@ function deploysSection(d: Doc, draft: PipelineDraft, data: DocData): void {
     d.p('These deploy workflows got the verify job, and their deploy jobs wait for it:');
     for (const f of edited) d.li(q(f.path, 160));
   }
-  d.p('Deploy with the verified image digest (the verify job output `digest`). A signature only protects a deploy that uses that digest, so deploy by digest, not by tag.');
+  // G17B-R2: the verify job has a digest output only when pipegen publishes an image
+  if (publishedHere(draft).length > 0) d.p('Deploy with the verified image digest (the verify job output `digest`). A signature only protects a deploy that uses that digest, so deploy by digest, not by tag.');
   d.h(3, 'Unprotected deploys');
   for (const g of data.deployGaps) d.li(`${q(g.path, 160)} (triggers: ${g.triggers.length === 0 ? 'unknown' : g.triggers.map((t) => fit(t, 40)).join(', ')}): ${fit(g.why)}`);
   // derived here, so the byte-equal recompute covers it: a deploy workflow of the repository that is neither edited nor listed as a gap is never read as protected

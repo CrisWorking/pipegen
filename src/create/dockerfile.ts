@@ -227,7 +227,7 @@ export async function createDockerfile(svc: Service, _profile: RepoProfile, bund
   const notes = [`The AI explained the Dockerfile for ${show(svc)}: ${formatAiText(got.answer.reasoning, 300)}`];
   if (knownPort === null) notes.push(`pipegen did not find the port of ${show(svc)} in the code, so the Dockerfile exposes port ${got.port}, which the AI chose; check that it is right.`);
   const files: CreatedFile[] = [
-    { path: at('Dockerfile'), content: got.text, part: 'docker', repo: 'app', reason: `The service ${show(svc)} has no Dockerfile. This one builds from pipegen's reviewed base image, installs with npm ci --ignore-scripts and runs as a non-root user.` },
+    { path: at('Dockerfile'), content: got.text, part: 'docker', repo: 'app', reason: `The service ${show(svc)} has no Dockerfile. This one builds from pipegen's reviewed base image, installs with npm ci --ignore-scripts --git=/usr/bin/git and runs as a non-root user.` },
     { path: at('.dockerignore'), content: dockerignoreText(svc, builds), part: 'docker', repo: 'app', reason: 'Keeps .git, .env files, keys, .npmrc and node_modules out of the image build context.' },
   ];
   return { files, notes, usage };

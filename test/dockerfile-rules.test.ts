@@ -19,11 +19,11 @@ const kv = (name: string, value: string): string => fake.assign(name, value);
 const apiName = 'API_' + 'KEY';
 
 const SINGLE = [
-  `FROM ${REF}`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --omit=dev --ignore-scripts', 'COPY . .',
+  `FROM ${REF}`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'COPY . .',
   'ENV NODE_ENV=production', 'EXPOSE 3000', 'USER node', 'CMD ["node", "index.js"]', '',
 ].join('\n');
 const MULTI = [
-  `FROM ${REF} AS build`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts', 'COPY . .', 'RUN npm run build',
+  `FROM ${REF} AS build`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts --git=/usr/bin/git', 'COPY . .', 'RUN npm run build',
   `FROM ${REF}`, 'WORKDIR /app', 'ENV NODE_ENV=production', 'COPY --from=build --chown=node:node /app/node_modules ./node_modules',
   'COPY --from=build --chown=node:node /app/dist ./dist', 'EXPOSE 3000', 'USER node', 'CMD ["node", "dist/index.js"]', '',
 ].join('\n');
@@ -139,9 +139,9 @@ describe('dockerfile rules: supply chain', () => {
     refused(swap(SINGLE, `FROM ${REF}`, `FROM ${REF} X build`), /FROM/);
     // stage names match in exact case (fix round 1, m5): see dockerfile-rules-r1.test.ts
     // a stage may start from an earlier stage; a stage alias that shadows an image name only ever names the stage
-    expect(problems([`FROM ${REF} AS node`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts', 'RUN npm run build', 'FROM node', 'WORKDIR /app', 'EXPOSE 3000', 'USER node', 'CMD ["node", "x.js"]', ''].join('\n'), { buildsInside: false })).toEqual([]);
-    refused([`FROM ${REF} AS node`, 'RUN npm ci --ignore-scripts', 'FROM node:24', 'EXPOSE 3000', 'USER node', ''].join('\n'), /FROM/);   // `node:24` is not the stage `node`
-    refused([`FROM ${REF} AS node`, 'RUN npm ci --ignore-scripts', 'FROM nodejs', 'EXPOSE 3000', 'USER node', ''].join('\n'), /FROM/);
+    expect(problems([`FROM ${REF} AS node`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts --git=/usr/bin/git', 'RUN npm run build', 'FROM node', 'WORKDIR /app', 'EXPOSE 3000', 'USER node', 'CMD ["node", "x.js"]', ''].join('\n'), { buildsInside: false })).toEqual([]);
+    refused([`FROM ${REF} AS node`, 'RUN npm ci --ignore-scripts --git=/usr/bin/git', 'FROM node:24', 'EXPOSE 3000', 'USER node', ''].join('\n'), /FROM/);   // `node:24` is not the stage `node`
+    refused([`FROM ${REF} AS node`, 'RUN npm ci --ignore-scripts --git=/usr/bin/git', 'FROM nodejs', 'EXPOSE 3000', 'USER node', ''].join('\n'), /FROM/);
     refused([`FROM later`, `FROM ${REF} AS later`, 'EXPOSE 3000', 'USER node', ''].join('\n'), /FROM/);   // an alias counts only after its FROM
     refused([`FROM ${REF} AS a`, `FROM ${REF} AS A`, 'EXPOSE 3000', 'USER node', ''].join('\n'), /alias|duplicate|stage name/i);
     refused(swap(SINGLE, `FROM ${REF}`, `FROM ${REF} AS scratch`), /alias|FROM/i);
@@ -162,10 +162,10 @@ describe('dockerfile rules: supply chain', () => {
     for (const line of ['SHELL ["/bin/sh", "-c"]', 'VOLUME /data', 'VOLUME ["/data"]', 'STOPSIGNAL SIGKILL', 'MAINTAINER me', 'ADD x y', 'ONBUILD RUN x', 'FOO bar', 'RUN', 'COPY', 'WORKDIR', 'run-it x', 'ＡＤＤ x y', 'ADD\u00a0x y', 'ARG', 'ENV', 'USER', '1', '"', '--from=x']) {
       refused(swap(SINGLE, 'COPY . .', line), /instruction|ADD|ONBUILD|RUN|COPY|WORKDIR|ARG|ENV|USER|character/i);
     }
-    for (const line of ['LABEL version=1.0', 'ARG PORT=3000', 'RUN --mount=type=cache,target=/root/.npm npm ci --ignore-scripts']) {
+    for (const line of ['LABEL version=1.0', 'ARG PORT=3000', 'RUN --mount=type=cache,target=/root/.npm npm ci --ignore-scripts --git=/usr/bin/git']) {
       expect(problems(swap(SINGLE, 'COPY . .', `COPY . .\n${line}`)), line).toEqual([]);
     }
-    for (const line of ['RUN --mount=type=bind,from=evil,target=/x true', 'RUN --mount=type=cache,target=/x,from=evil npm ci --ignore-scripts', 'RUN --mount=type=cache,target=/x,source=/etc true', 'RUN --mount=type=cache,target=/x,bogus=1 true', 'RUN --mount=type=secret,id=x true', 'RUN --network=host npm run build', 'RUN --security=insecure true', 'RUN --device=x true', 'COPY --parents . .', 'HEALTHCHECK --evil=1 CMD x', 'HEALTHCHECK CMD']) {
+    for (const line of ['RUN --mount=type=bind,from=evil,target=/x true', 'RUN --mount=type=cache,target=/x,from=evil npm ci --ignore-scripts --git=/usr/bin/git', 'RUN --mount=type=cache,target=/x,source=/etc true', 'RUN --mount=type=cache,target=/x,bogus=1 true', 'RUN --mount=type=secret,id=x true', 'RUN --network=host npm run build', 'RUN --security=insecure true', 'RUN --device=x true', 'COPY --parents . .', 'HEALTHCHECK --evil=1 CMD x', 'HEALTHCHECK CMD']) {
       refused(swap(SINGLE, 'COPY . .', `COPY . .\n${line}`), /.+/);
     }
   });
@@ -178,8 +178,8 @@ describe('dockerfile rules: users, secrets, ports, installs', () => {
     refused(swap(MULTI, 'EXPOSE 3000\nUSER node', 'EXPOSE 3000'), /USER/);
     refused(swap(MULTI, 'RUN npm run build\n', 'RUN npm run build\nUSER node\n').replace('\nUSER node\nCMD', '\nCMD'), /USER/);
     // a final stage that starts from an earlier stage inherits that stage's user
-    expect(problems([`FROM ${REF} AS base`, 'WORKDIR /app', 'RUN npm ci --ignore-scripts', 'USER node', 'FROM base', 'WORKDIR /app', 'EXPOSE 3000', ''].join('\n'))).toEqual([]);
-    refused([`FROM ${REF} AS base`, 'RUN npm ci --ignore-scripts', 'FROM base', 'EXPOSE 3000', ''].join('\n'), /USER/);
+    expect(problems([`FROM ${REF} AS base`, 'WORKDIR /app', 'RUN npm ci --ignore-scripts --git=/usr/bin/git', 'USER node', 'FROM base', 'WORKDIR /app', 'EXPOSE 3000', ''].join('\n'))).toEqual([]);
+    refused([`FROM ${REF} AS base`, 'RUN npm ci --ignore-scripts --git=/usr/bin/git', 'FROM base', 'EXPOSE 3000', ''].join('\n'), /USER/);
   });
 
   it('dockerfile: USER root / 0 / 0:0 last → violation', () => {
@@ -243,9 +243,9 @@ describe('dockerfile rules: users, secrets, ports, installs', () => {
   });
 
   it('install commands: npm ci is required; only npm services get a Dockerfile (the RUN grammar itself is in dockerfile-rules-r1.test.ts)', () => {
-    refused(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts\n', 'RUN npm run build\n'), /npm ci/);   // no install at all
-    expect(problems(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts', 'RUN ["npm", "ci", "--ignore-scripts"]'))).toEqual([]);
-    refused(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts', 'RUN ["npm", "ci"]'), /RUN/);
+    refused(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git\n', 'RUN npm run build\n'), /npm ci/);   // no install at all
+    expect(problems(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'RUN ["npm", "ci", "--ignore-scripts", "--git=/usr/bin/git"]'))).toEqual([]);
+    refused(swap(SINGLE, 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'RUN ["npm", "ci"]'), /RUN/);
     for (const pm of ['pnpm', 'yarn', 'bun', 'poetry', 'uv', 'pip'] as const) expect(dockerfileProblems(SINGLE, svc({ packageManager: pm }), ctx()).join(), pm).toMatch(/npm/);
     expect(dockerfileProblems(SINGLE, svc({ language: 'python' }), ctx()).join()).toMatch(/Node|node/);
   });

@@ -15,12 +15,12 @@ import type { PipelineDraft, ReviewedTool, RuntimeEnv, StepSpec } from '../types
 import { slug } from './artifact-names.js';
 import { loadBaseImages, type BaseImage } from './base-images.js';
 import { dockerfilesOf } from './created-judges/compose.js';
-import { imageBuildTag, renderImageCheckStep } from './image-handoff.js';
+import { imageBuildTag, imageProfile, renderImageCheckStep } from './image-handoff.js';
 import {
   DAST_HANDOFF_STEP_ID, DAST_RAW_SHA_ENV, DAST_RAW_SHA_OUTPUT, dastAppStepId, dastCheckStepId, dastLaneOf, dastRawArtifact, dastRawShaRef, dastResultArtifact, ZAP_ACTIVE_LANE, type DastLane,
   IMAGE_ARCHIVE_FILE, imageArchiveArtifact, imageBuildJobId, IMAGE_BUILD_NEED, stepOutputForm, type RenderedStep, type ScanFact,
 } from './job-rules.js';
-import type { PlatformActions } from './pin.js';
+import { PLATFORM_ACTION_IDS, type PlatformActions } from './pin.js';
 import { pipegenScriptStep } from './pipegen-script.js';
 import { RenderError } from './render-error.js';
 import { renderComposeUp, renderPlatformStep, renderRuntimeEnv, renderScrub, renderStep, renderUpload, scrubbedPath, type RenderResult } from './render-step.js';
@@ -68,6 +68,9 @@ export function zapActiveSpec(spec: StepSpec, af: ReviewedTool): StepSpec {
 /** The render context options of a DAST spec's lane: the AF lane renders as pipegen's own nightly scan (a nightly-only entry needs it). */
 const laneCtx = (lane: DastLane): { nightly?: true } => (lane === ZAP_ACTIVE_LANE ? { nightly: true } : {});
 
+/** Why a DAST step may name no secret (G17 row 14): the assembler's refusal and the renderer's. */
+export const DAST_SECRETS_REASON = 'A DAST check runs the app with no secret: the scanner and the app it starts in a container get none, so pipegen never passes one to it.';
+
 /** Where the app runs for the DAST check of one service: pipegen's compose file, or the image archive; the port it is published on. */
 export type DastStart = { kind: 'compose'; port: number; url: string; env: RuntimeEnv } | { kind: 'archive'; port: number; url: string };
 
@@ -87,8 +90,10 @@ export function dastStartOf(draft: PipelineDraft, service: string, baseImages: r
     const app = plan.apps.find((a) => a.service === service);
     if (plan.text !== null && plan.text === file.content && app !== undefined && validPort(app.port)) return { kind: 'compose', port: app.port, url: `http://127.0.0.1:${app.port}`, env: plan.env };
   }
-  const build = draft.steps.find((s) => s.needId === IMAGE_BUILD_NEED && s.service === service && s.tool.id === 'docker-build-push-action');
-  if (build === undefined || (svc.dockerfile ?? '') === '') return { problem: 'it has no container image pipegen builds (a Dockerfile it builds, or pipegen\'s compose file), and pipegen starts the app for a scan in a container only' };
+  const build = draft.steps.find((s) => s.needId === IMAGE_BUILD_NEED && s.service === service && s.tool.id === PLATFORM_ACTION_IDS['build-push']);
+  // G17B-R0: a Dockerfile pipegen creates in this draft counts (imageProfile, the image build's own source)
+  const dockerfile = imageProfile(draft.profile, draft.created).services.find((s) => s.name === service)?.dockerfile;
+  if (build === undefined || (dockerfile ?? '') === '') return { problem: 'it has no container image pipegen builds (a Dockerfile it builds, or pipegen\'s compose file), and pipegen starts the app for a scan in a container only' };
   if (!validPort(svc.port)) return { problem: 'pipegen found no port the app listens on, so there is nothing to scan' };
   return { kind: 'archive', port: svc.port, url: `http://127.0.0.1:${svc.port}` };
 }
@@ -168,6 +173,8 @@ export function renderDastCheckStep(service: string, file: string, lane: DastLan
 export function renderDastRun(spec: StepSpec, tool: ReviewedTool, platform: PlatformActions, draft: PipelineDraft, start: DastStart, opts: { blocking: boolean; checkout: readonly RenderedStep[] }): { steps: RenderedStep[]; outputs: Record<string, string>; needs: string[]; scan: RenderedStep[] } {
   const service = spec.service;
   if (service === undefined) throw new RenderError('A DAST check belongs to one service.');
+  // G17 row 14: the run job holds no secret (dastRunTailAt refuses one); refused here first, whatever the tool's categories say
+  if (Array.isArray(spec.secrets) && spec.secrets.length > 0) throw new RenderError(DAST_SECRETS_REASON);
   const lane = dastLaneOf(spec.needId);
   const r = renderStep(spec, tool, platform, { profile: draft.profile, targets: { url: start.url }, blocking: opts.blocking, ...laneCtx(lane) });
   const raw = rawOf(r, service, lane);
