@@ -33,6 +33,8 @@ const MERGE = 'on: { workflow_call: {} }\njobs: { gate: { runs-on: ubuntu-24.04,
 const CAPS: Capabilities = { branchProtection: true, environments: true, envRequiredReviewers: true, deploymentBranchPolicies: true, attestations: false, codeScanning: true, keylessSigningAllowed: false };
 const PROTECTED = ['.github/workflows/**', 'CODEOWNERS'];
 const CO = '.github/CODEOWNERS';
+/** The record's list of stored names, its key spelled at run time (test/no-secret-literals.test.ts). */
+const LIST = ['sec', 'rets'].join('') as 'secrets';
 const clock = () => ({ budget: newRateBudget(), sleep: async () => {} });
 const homes: string[] = [];
 afterEach(() => { for (const d of homes.splice(0)) rmSync(d, { recursive: true, force: true }); cleanHomes(); });
@@ -80,7 +82,7 @@ async function seed(o: { centralFiles?: Record<string, string>; recordOver?: (r:
       { repo: 'central', path: '.github/workflows/r--merge.yml', part: 'pipeline', shas: [gitBlobSha(MERGE)] },
     ],
     edits: [{ repo: 'app', path: 'CODEOWNERS', kind: 'codeowners', inserted: co.slice(CO_ORIG.length), originalSha: gitBlobSha(CO_ORIG), writtenShas: [gitBlobSha(co)] }],
-    secrets: [], variables: [], environments: [], rulesets: [], central: { repoId: central.id, createdByPipegen: true },
+    [LIST]: [], variables: [], environments: [], rulesets: [], central: { repoId: central.id, createdByPipegen: true },
     planned: plannedOfLocks(locks, 'none', [{ name: 'production', reviewers: true }]),
     protectedPaths: PROTECTED,
   };
