@@ -26,7 +26,7 @@ import { entry, profile, reviewedList, service, specFor } from './helpers/render
 /** G17 row 1b: the helper's pipegen.yml, with the workflow concurrency the two app callers carry (a called file never does). */
 function workflow(jobs: Record<string, Job>, top: Record<string, unknown> = {}): CreatedFile {
   const on = top.on;
-  const called = (typeof on === 'object' && on !== null && Object.hasOwn(on, 'workflow_call')) || on === 'workflow_call';
+  const called = ['workflow_call', 'schedule'].some((t) => on === t || (typeof on === 'object' && on !== null && Object.hasOwn(on, t)));
   return stepsWorkflow(jobs, called ? top : { concurrency: { ...WORKFLOW_CONCURRENCY }, ...top });
 }
 const OIDC = ['id', 'token'].join('-');

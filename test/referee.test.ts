@@ -86,7 +86,7 @@ function workflowText(jobs: Record<string, Job>, top: Record<string, unknown> = 
   const plain = Object.fromEntries(Object.entries(jobs).map(([id, j]) => [id, Object.fromEntries(Object.entries(j).filter(([k]) => k !== 'steps'))]));
   // G17 row 1b: pipegen.yml carries the workflow concurrency (a called workflow never does; wf drops it for another path)
   const on = top.on ?? { pull_request: null };
-  const called = typeof on === 'object' && on !== null && Object.hasOwn(on, 'workflow_call');
+  const called = ['workflow_call', 'schedule'].some((t) => on === t || (typeof on === 'object' && on !== null && Object.hasOwn(on, t)));
   doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, ...(called ? {} : { concurrency: { ...WORKFLOW_CONCURRENCY } }), ...top, jobs: plain });
   for (const [id, j] of Object.entries(jobs)) {
     if (!Array.isArray(j.steps)) continue;

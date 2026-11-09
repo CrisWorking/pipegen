@@ -1,4 +1,5 @@
 // Plan C, C0b fix round 2: every attack of review-C0b-r1.md as a regression test (task-C0b-fix-round-2.md).
+import { WORKFLOW_CONCURRENCY } from '../src/engine/job-rules.js';   // G17 row 1b: pipegen.yml carries the workflow concurrency
 import { Document } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { resultArtifactName } from '../src/engine/artifact-names.js';
@@ -51,7 +52,7 @@ const job = (steps: RenderedStep[], over: Job = {}): Job => ({ 'runs-on': 'ubunt
 function workflow(jobs: Record<string, Job>, raw = false): CreatedFile {
   const doc = new Document();
   const plain = Object.fromEntries(Object.entries(jobs).map(([id, j]) => [id, Object.fromEntries(Object.entries(j).filter(([k]) => k !== 'steps'))]));
-  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, jobs: plain });
+  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, concurrency: { ...WORKFLOW_CONCURRENCY }, jobs: plain });
   for (const [id, j] of Object.entries(jobs)) {
     const steps = j.steps as RenderedStep[];
     doc.setIn(['jobs', id, 'steps'], raw ? doc.createNode(withEgress(steps).map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(withEgress(steps)));
@@ -108,7 +109,9 @@ function jobs(baseRef: BaseRef = 'pull-request-base'): Record<string, Job> {
 }
 function wfOn(on: unknown, jobsIn: Record<string, Job>, raw = false): CreatedFile {
   const f = workflow(jobsIn, raw);
-  return { ...f, content: f.content.replace(/^on:\n  pull_request: null\n/m, `on: ${JSON.stringify(on)}\n`) };
+  // G17 row 1b: the workflow concurrency is pipegen.yml's; a file moved to another trigger set drops it
+  const content = on === 'pull_request' ? f.content : f.content.replace(/^concurrency:\n(?: {2}.*\n)+/m, '');
+  return { ...f, content: content.replace(/^on:\n  pull_request: null\n/m, `on: ${JSON.stringify(on)}\n`) };
 }
 const gs = (j: Record<string, Job>): RenderedStep => (j.gate?.steps as RenderedStep[])[0] as RenderedStep;
 const withGate = (j: Record<string, Job>, steps: RenderedStep[], over: Job = {}): Record<string, Job> => ({ ...j, gate: { ...(j.gate as Job), steps, ...over } });
@@ -179,7 +182,10 @@ describe('finding 3: an artifact has one upload per workflow file (ruling 3)', (
   it('X4: an honest pull_request file and merge_group file, each a complete pipeline, pass with 0 issues', async () => {
     const f1 = workflow(jobs());
     const f2 = wfAt(wfOn({ merge_group: null }, mqJobs(), true), '.github/workflows/pipegen-mq.yml');
-    expect(show(await run([f1, f2], d))).toBe('');
+    // G17 row 5 (open question 4): a merge_group file is outside the B2 layout, so its gate is its one issue; the same artifact names in
+    // the two files are not (ruling 3)
+    const r = await run([f1, f2], d);
+    expect(r.issues.length === 1 && r.issues[0]?.file === '.github/workflows/pipegen-mq.yml' && r.issues[0].check === 'not-gate-readable' && /outside pipegen's layout/.test(r.issues[0].message), show(r)).toBe(true);
   });
   it('two uploads of one name in one file are still refused (A13), the same name in two files is not', async () => {
     const j = jobs();

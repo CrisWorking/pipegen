@@ -3,6 +3,7 @@
 // checkJobOrder know the stage step as the harmless pinned-gate kind `stage`, allowed only in a secrets job and before its scan.
 // The ignore-file delete block of C1b fix round 2 is gone (ignore files are staged under neutral names like everything else); a belt
 // in the run step refuses a stage folder that holds a file of those names. Written first (strict test-first).
+import { WORKFLOW_CONCURRENCY } from '../src/engine/job-rules.js';   // G17 row 1b: pipegen.yml carries the workflow concurrency
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -49,7 +50,7 @@ const job = (steps: RenderedStep[], over: Job = {}): Job => ({ 'runs-on': 'ubunt
 function workflow(jobs: Record<string, Job>, raw = false): CreatedFile {
   const doc = new Document();
   const plain = Object.fromEntries(Object.entries(jobs).map(([id, j]) => [id, Object.fromEntries(Object.entries(j).filter(([k]) => k !== 'steps'))]));
-  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, jobs: plain });
+  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, concurrency: { ...WORKFLOW_CONCURRENCY }, jobs: plain });
   for (const [id, j] of Object.entries(jobs)) {
     const steps = j.steps as RenderedStep[];
     doc.setIn(['jobs', id, 'steps'], raw ? doc.createNode(withEgress(steps).map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(withEgress(steps)));

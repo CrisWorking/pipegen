@@ -1,6 +1,7 @@
 // Plan C, sub-task C0a: the scan → scrub → upload chain in Plan B's engine (rulings B1 and B2 of the pre-flight scan).
 // Written first (strict test-first). Raw results go to `pipegen-raw` and are never uploadable; the gate action in `scrub`
 // mode rebuilds them into `pipegen-out/<artifact>/`; a findings exit code of a tool is not a failed step.
+import { WORKFLOW_CONCURRENCY } from '../src/engine/job-rules.js';   // G17 row 1b: pipegen.yml carries the workflow concurrency
 import { createHash } from 'node:crypto';
 import { NO_SCANS } from '../src/engine/job-rules.js';
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
@@ -55,7 +56,7 @@ const job = (steps: RenderedStep[], over: Job = {}): Job => ({ 'runs-on': 'ubunt
 function workflow(jobs: Record<string, Job>, raw = false): CreatedFile {
   const doc = new Document();
   const plain = Object.fromEntries(Object.entries(jobs).map(([id, j]) => [id, Object.fromEntries(Object.entries(j).filter(([k]) => k !== 'steps'))]));
-  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, jobs: plain });
+  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, concurrency: { ...WORKFLOW_CONCURRENCY }, jobs: plain });
   for (const [id, j] of Object.entries(jobs)) {
     const steps = j.steps as RenderedStep[];
     doc.setIn(['jobs', id, 'steps'], raw ? doc.createNode(withEgress(steps).map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(withEgress(steps)));
@@ -638,7 +639,8 @@ describe('the renderer and the referee agree: a full scanner job per findings to
     // without the harden step too (the job shape of Plan G's scanner jobs differs by the egress policy)
     const plain: Record<string, Job> = {};
     for (const s of specs) plain[`u-${s.tool.id}`] = job(dedupeJobSteps(scannerSteps(s, ctxN).steps, { scans: scansFor(scannerSteps(s, ctxN).steps) }));
-    const r = await run([workflow(jobs), workflow(plain)].map((f, i) => ({ ...f, path: `.github/workflows/pipegen-${i}.yml` })), { ...draftOf(specs), profile: ctxN.profile });
+    // (G17 row 1b: the workflow concurrency belongs to pipegen.yml only; these two files are other workflows)
+    const r = await run([workflow(jobs), workflow(plain)].map((f, i) => ({ ...f, path: `.github/workflows/pipegen-${i}.yml`, content: f.content.replace(/^concurrency:\n(?: {2}.*\n)+/m, '') })), { ...draftOf(specs), profile: ctxN.profile });
     expect(show(r)).toBe('');
   });
 });

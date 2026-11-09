@@ -64,7 +64,7 @@ const VERIFY_PERMS = { contents: 'read', actions: 'read', packages: 'read', atte
 const CONC = { concurrency: { ...WORKFLOW_CONCURRENCY } };
 const callerTop = (top: Record<string, unknown>): Record<string, unknown> => {
   const on = top.on;
-  const called = (typeof on === 'object' && on !== null && Object.hasOwn(on, 'workflow_call')) || on === 'workflow_call';
+  const called = ['workflow_call', 'schedule'].some((t) => on === t || (typeof on === 'object' && on !== null && Object.hasOwn(on, t)));
   return called ? top : { ...CONC, ...top };
 };
 const gateFile = (top: Record<string, unknown> = {}, extra: Record<string, Job> = {}): CreatedFile => workflow({ ...jobsOf(d), ...extra }, callerTop(top));

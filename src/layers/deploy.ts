@@ -433,6 +433,80 @@ function calledHeadChecks(draft: PipelineDraft, texts: ReadonlyMap<string, strin
   }
 }
 
+/** G17 row 4 (sec r3 M3): the reason of a job when the detector names no job of the workflow and the job has no STRONG reason of its own. */
+export const COULD_NOT_TELL = 'pipegen could not tell which job deploys, so every job waits';
+
+/** Which jobs of a user's push deploy workflow wait for pipegen-verify, and how (deployGating). */
+export interface DeployGating {
+  /** the jobs the deploy detector names (none: every job waits) */
+  found: string[];
+  /** why each STRONG job waits (with the head check; the workflow-level gap rules apply to it) */
+  strong: Map<string, string>;
+  /** why each WEAK job may deploy (its runner or vars, or COULD_NOT_TELL) */
+  weak: Map<string, string>;
+  /** WEAK jobs whose own if: defeats needs: left out, with a note */
+  weakOut: string[];
+  /** gated jobs that wait with needs only (no head check) */
+  needsOnly: string[];
+  /** every job that waits for pipegen-verify, in the file's order */
+  deployJobs: string[];
+  /** jobs that do not wait (no reason of either kind) */
+  left: string[];
+}
+
+/**
+ * G17 rows 2-4 (probe R9; sec r3 M2, M3): the one derivation of what pipegen's verify insert gates in a user's deploy workflow, from its
+ * parsed text and the default branch. planVerifyInserts builds the insert from it and the referee (judgeEdited) re-derives it from the mark's
+ * original, so a mark never decides which jobs wait, which wait without the head check, or whether the workflow is a gap.
+ * - a gap: triggers other than one push (workflow_run, or anything else), a push beyond the default branch, or a top level that would reach
+ *   pipegen's job; then the per-job gap rules for STRONG jobs (an if: that defeats needs, a step if: that runs after a failure, no contents read);
+ * - S15 per job (src/engine/deploy-gating.ts): STRONG jobs wait with the head check; WEAK jobs wait (head check only when they can take it) or
+ *   are left out when their own if: defeats needs. When the detector names no job, each job keeps its own STRONG reason, and a job without one
+ *   waits as COULD_NOT_TELL: like a WEAK job (needs, and the head check when it can take it), except that its own if: defeating needs still
+ *   makes the workflow a gap (every job waits, so none may run past the check).
+ */
+export function deployGating(js: Obj, defaultBranch: string): DeployGating | { gap: string } {
+  const triggers = triggersOf(js.on);
+  if (triggers === null) return { gap: 'its triggers can not be read; write `on:` as a name, a list or a map of events' };
+  const kind = deployTriggers({ triggers });
+  if (kind === 'workflow_run') return { gap: 'it deploys after another workflow run (workflow_run), which runs with full rights on what that run produced, so pipegen adds no check to it; to have the check, deploy from a push to the default branch' };
+  if (kind === 'other') return { gap: `it is started by ${triggers.filter((t) => t !== 'push').map((t) => safeText(t, 40)).join(', ') || 'no push'}, not only by a push, so pipegen adds no check to it; to have the check, start it only on a push to the default branch` };
+  const branch = pushBranchProblem(js.on, defaultBranch);
+  if (branch !== null) return { gap: branch };
+  const top = userTopProblem(js);
+  if (top !== null) return { gap: `pipegen can not add its job: ${top}` };
+  const jobs = isObj(js.jobs) ? js.jobs : {};
+  const ids = Object.keys(jobs);
+  const found = ids.filter((id) => jobDeploys(jobs[id]));
+  const strong = new Map<string, string>();
+  const weak = new Map<string, string>();
+  for (const id of ids) {
+    const sr = strongReason(jobs[id], js.permissions);
+    if (sr !== null) { strong.set(id, sr); continue; }
+    const wr = found.length === 0 ? COULD_NOT_TELL : weakReason(jobs[id]);
+    if (wr !== null) weak.set(id, wr);
+  }
+  const why = (id: string): string => `${show(id)} (${strong.get(id) ?? weak.get(id) ?? ''})`;
+  const strongIds = [...strong.keys()];
+  const jobIf = (id: string): boolean => gatedIfAllowed(isObj(jobs[id]) ? (jobs[id] as Obj).if : undefined);
+  // a COULD_NOT_TELL job whose own if: defeats needs makes the workflow a gap, as a STRONG one does
+  const ungated = ids.filter((id) => (strong.has(id) || weak.get(id) === COULD_NOT_TELL) && !jobIf(id));
+  if (ungated.length > 0) return { gap: `its job ${ungated.map(why).join(', ')} has an if: that could run it even when pipegen's check fails (always(), failure(), or a top-level ||); change it to success() && <your condition>` };
+  // G7-R-sec1: a later step whose if: can run when an earlier step failed (always(), failure(), cancelled(), a top-level ||) would still
+  // deploy after pipegen's head check failed, so such a job is not protected: the workflow is a gap
+  const stepIfs = strongIds.filter((id) => !callsWorkflow(jobs[id]) && !stepsGated(jobs[id]));
+  if (stepIfs.length > 0) return { gap: `a step of its job ${stepIfs.map(why).join(', ')} has an if: that could run it after pipegen's head check failed (always(), failure(), cancelled(), or a top-level ||); change it to success() && <your condition>` };
+  const noContents = strongIds.filter((id) => !callsWorkflow(jobs[id]) && !readsContents(jobs[id], js.permissions));
+  if (noContents.length > 0) return { gap: `its job ${noContents.map(why).join(', ')} sets permissions without contents: read, which pipegen's head check in that job needs to read the branch; add contents: read to that job's permissions` };
+  // G7-R3 1: a WEAK job whose own if: defeats needs is left out (said so); else it waits, with the head check only when it can take it
+  const weakOut = [...weak.keys()].filter((id) => !jobIf(id));
+  const weakIn = [...weak.keys()].filter((id) => !weakOut.includes(id));
+  const needsOnly = weakIn.filter((id) => !(plainUbuntu(jobs[id]) && stepsGated(jobs[id]) && readsContents(jobs[id], js.permissions)));
+  const deployJobs = ids.filter((id) => strong.has(id) || weakIn.includes(id));
+  const left = ids.filter((id) => !strong.has(id) && !weak.has(id));
+  return { found, strong, weak, weakOut, needsOnly, deployJobs, left };
+}
+
 /**
  * The verify inserts of a draft's deploy workflows (see the file header). `texts`: each workflow's text as read (path → text); `verify`: the
  * verify job (assemble's AssembledFiles.verify; null when the deploy part is skipped, and then nothing is inserted and nothing is a gap).
@@ -455,47 +529,14 @@ export function planVerifyInserts(draft: PipelineDraft, texts: ReadonlyMap<strin
     const js = parsed.parsed.js;
     const triggers = triggersOf(js.on);
     if (triggers === null) { gap('its triggers can not be read; write `on:` as a name, a list or a map of events'); continue; }
-    const kind = deployTriggers({ triggers });
-    if (kind === 'workflow_run') { gap('it deploys after another workflow run (workflow_run), which runs with full rights on what that run produced, so pipegen adds no check to it; to have the check, deploy from a push to the default branch', triggers); continue; }
-    if (kind === 'other' && triggers.length === 1 && triggers[0] === 'workflow_call') {
+    if (deployTriggers({ triggers }) === 'other' && triggers.length === 1 && triggers[0] === 'workflow_call') {
       deferred.set(wf.path, { triggers, why: 'it is started by workflow_call, not only by a push, so pipegen adds no check to it; to have the check, start it only on a push to the default branch, or call it from a deploy job pipegen protects' });
       continue;
     }
-    if (kind === 'other') { gap(`it is started by ${triggers.filter((t) => t !== 'push').map((t) => safeText(t, 40)).join(', ') || 'no push'}, not only by a push, so pipegen adds no check to it; to have the check, start it only on a push to the default branch`, triggers); continue; }
-    const branch = pushBranchProblem(js.on, def);
-    if (branch !== null) { gap(branch, triggers); continue; }
-    const top = userTopProblem(js);
-    if (top !== null) { gap(`pipegen can not add its job: ${top}`, triggers); continue; }
+    const g = deployGating(js, def);
+    if ('gap' in g) { gap(g.gap, triggers); continue; }
     const jobs = isObj(js.jobs) ? js.jobs : {};
-    const ids = Object.keys(jobs);
-    // S15, G7-R1 sec I2, G7-R3: why each job waits (src/engine/deploy-gating.ts). When the detector tells no job apart, every job waits (a
-    // STRONG reason: pipegen could not tell). The workflow-level gap rules apply to STRONG jobs only; a WEAK job (only its runner or vars)
-    // never makes the workflow a gap
-    const found = ids.filter((id) => jobDeploys(jobs[id]));
-    const strong = new Map<string, string>();
-    const weak = new Map<string, string>();
-    for (const id of ids) {
-      const sr = found.length === 0 ? 'pipegen could not tell which job deploys, so every job waits' : strongReason(jobs[id], js.permissions);
-      if (sr !== null) { strong.set(id, sr); continue; }
-      const wr = weakReason(jobs[id]);
-      if (wr !== null) weak.set(id, wr);
-    }
-    const why = (id: string): string => `${show(id)} (${strong.get(id) ?? weak.get(id) ?? ''})`;
-    const strongIds = [...strong.keys()];
-    const ungated = strongIds.filter((id) => !gatedIfAllowed(isObj(jobs[id]) ? (jobs[id] as Obj).if : undefined));
-    if (ungated.length > 0) { gap(`its job ${ungated.map(why).join(', ')} has an if: that could run it even when pipegen's check fails (always(), failure(), or a top-level ||); change it to success() && <your condition>`, triggers); continue; }
-    // G7-R-sec1: a later step whose if: can run when an earlier step failed (always(), failure(), cancelled(), a top-level ||) would still
-    // deploy after pipegen's head check failed, so such a job is not protected: the workflow is a gap
-    const stepIfs = strongIds.filter((id) => !callsWorkflow(jobs[id]) && !stepsGated(jobs[id]));
-    if (stepIfs.length > 0) { gap(`a step of its job ${stepIfs.map(why).join(', ')} has an if: that could run it after pipegen's head check failed (always(), failure(), cancelled(), or a top-level ||); change it to success() && <your condition>`, triggers); continue; }
-    const noContents = strongIds.filter((id) => !callsWorkflow(jobs[id]) && !readsContents(jobs[id], js.permissions));
-    if (noContents.length > 0) { gap(`its job ${noContents.map(why).join(', ')} sets permissions without contents: read, which pipegen's head check in that job needs to read the branch; add contents: read to that job's permissions`, triggers); continue; }
-    // G7-R3 1: a WEAK job whose own if: defeats needs is left out (said so); else it waits, with the head check only when it can take it
-    const weakOut = [...weak.keys()].filter((id) => !gatedIfAllowed(isObj(jobs[id]) ? (jobs[id] as Obj).if : undefined));
-    const weakIn = [...weak.keys()].filter((id) => !weakOut.includes(id));
-    const needsOnly = weakIn.filter((id) => !(plainUbuntu(jobs[id]) && stepsGated(jobs[id]) && readsContents(jobs[id], js.permissions)));
-    const deployJobs = ids.filter((id) => strong.has(id) || weakIn.includes(id));
-    const left = ids.filter((id) => !strong.has(id) && !weak.has(id));
+    const { found, strong, weak, weakOut, needsOnly, deployJobs, left } = g;
     let edit: ReturnType<typeof insertVerify>;
     try { edit = insertVerify(text, deployJobs, verify, needsOnly); } catch (e) {
       if (!(e instanceof EditRefused || e instanceof RenderError)) throw e;

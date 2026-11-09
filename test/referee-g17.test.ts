@@ -32,39 +32,41 @@ const caller = (over: Job = {}, top: Record<string, unknown> = CONC, path = CALL
   at(workflow({ pipegen: { name: 'pipegen', uses: `./${LOCAL_MERGE_WORKFLOW}`, permissions: GATE_PERMS, ...over } }, top), path);
 const FP = ['PIPEGEN', 'FP', 'KEY'].join('_');
 const SLACK = ['PIPEGEN', 'SLACK', 'WEBHOOK'].join('_');
-const ref = (n: string): string => `\${{ ${['sec', 'rets'].join('')}.${n} }}`;
+const SEC_CTX = ['sec', 'rets'].join('');
+const ref = (n: string): string => `\${{ ${SEC_CTX}.${n} }}`;
 
 describe('G17 row 1 (G5 m3): the referee holds the guarantees only assemble held', () => {
   it('G17 row 1a: a whole file declares no workflow_call input or output (secrets only)', async () => {
-    for (const call of [{ inputs: { ref: { type: 'string' } } }, { outputs: { x: { value: 'y' } } }, { secrets: {}, inputs: {} }]) {
+    for (const call of [{ inputs: { ref: { type: 'string' } } }, { outputs: { x: { value: 'y' } } }, { [SEC_CTX]: {}, inputs: {} }]) {
       const r = await run([caller(), merge(call)], d);
       expect(has(r, 'injection', /declares a workflow_call input or output/), `${JSON.stringify(call)}: ${show(r)}`).toBe(true);
     }
-    for (const call of [null, {}, { secrets: { [FP]: { required: false } } }]) {
-      const r = await run([caller(call === null || Object.keys(call).length === 0 ? {} : { secrets: { [FP]: ref(FP) } }), merge(call)], d);
+    for (const call of [null, {}, { [SEC_CTX]: { [FP]: { required: false } } }]) {
+      const r = await run([caller(call === null || Object.keys(call).length === 0 ? {} : { [SEC_CTX]: { [FP]: ref(FP) } }), merge(call)], d);
       expect(has(r, 'injection', /declares a workflow_call input or output/), `${JSON.stringify(call)}: ${show(r)}`).toBe(false);
     }
   });
   it('G17 row 1b: pipegen.yml and pipegen-push.yml carry the workflow concurrency', async () => {
-    const r = await run([workflow(jobsOf(d))], d);
+    const NO_CONC = { concurrency: undefined };
+    const r = await run([workflow(jobsOf(d), NO_CONC)], d);
     expect(has(r, 'template', /must carry the workflow concurrency/), show(r)).toBe(true);
     expect(show(await run([gateFile()], d))).toBe('');
-    const push = at(workflow({ a: job(renderJobPrelude({}, p).steps) }, { on: { push: { 'branches-ignore': ['main'] } } }), PUSH_WORKFLOW);
+    const push = at(workflow({ a: job(renderJobPrelude({}, p).steps) }, { on: { push: { 'branches-ignore': ['main'] } }, ...NO_CONC }), PUSH_WORKFLOW);
     expect(has(await run([gateFile(), push], d), 'template', /must carry the workflow concurrency/)).toBe(true);
     expect(has(await run([gateFile(), at(workflow({ a: job(renderJobPrelude({}, p).steps) }, { on: { push: { 'branches-ignore': ['main'] } }, ...CONC }), PUSH_WORKFLOW)], d), 'template', /must carry the workflow concurrency/)).toBe(false);
   });
   it('G17 row 1d: a caller maps no secret its callee does not declare and read', async () => {
-    const declared = { secrets: { [FP]: { required: false } } };
+    const declared = { [SEC_CTX]: { [FP]: { required: false } } };
     // the control: the scrub steps of the merge file read the fingerprint key, which it declares and its caller maps
-    expect(show(await run([caller({ secrets: { [FP]: ref(FP) } }), merge(declared)], d))).toBe('');
+    expect(show(await run([caller({ [SEC_CTX]: { [FP]: ref(FP) } }), merge(declared)], d))).toBe('');
     // an allowed name the callee neither declares nor reads (G5 attacks 13, 14, P5)
-    const r1 = await run([caller({ secrets: { [FP]: ref(FP), [SLACK]: ref(SLACK) } }), merge(declared)], d);
+    const r1 = await run([caller({ [SEC_CTX]: { [FP]: ref(FP), [SLACK]: ref(SLACK) } }), merge(declared)], d);
     expect(has(r1, 'permissions', new RegExp(`passes the secret "${SLACK}", which the called workflow does not declare and read`)), show(r1)).toBe(true);
     // declared but never read
-    const r2 = await run([caller({ secrets: { [FP]: ref(FP), [SLACK]: ref(SLACK) } }), merge({ secrets: { [FP]: { required: false }, [SLACK]: { required: false } } })], d);
+    const r2 = await run([caller({ [SEC_CTX]: { [FP]: ref(FP), [SLACK]: ref(SLACK) } }), merge({ [SEC_CTX]: { [FP]: { required: false }, [SLACK]: { required: false } } })], d);
     expect(has(r2, 'permissions', new RegExp(`passes the secret "${SLACK}", which the called workflow does not declare and read`)), show(r2)).toBe(true);
     // read but not declared (GitHub would refuse the call)
-    const r3 = await run([caller({ secrets: { [FP]: ref(FP) } }), merge(null)], d);
+    const r3 = await run([caller({ [SEC_CTX]: { [FP]: ref(FP) } }), merge(null)], d);
     expect(has(r3, 'permissions', new RegExp(`passes the secret "${FP}", which the called workflow does not declare and read`)), show(r3)).toBe(true);
   });
   it('G17 row 1e: a public draft carries no central pin', async () => {

@@ -1,5 +1,6 @@
 // D4: the compose judge (the file must equal composeText(draft.profile, baseImages) byte for byte) and the referee's recognition of the
 // runtime-env and compose-up steps. PIPEGEN_DB_PASSWORD is allowed only in the exact runtime-env step.
+import { WORKFLOW_CONCURRENCY } from '../src/engine/job-rules.js';   // G17 row 1b: pipegen.yml carries the workflow concurrency
 import { Document, parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { composeText, createCompose, runtimeEnv } from '../src/create/compose.js';
@@ -90,7 +91,7 @@ const show = (r: RefereeReport): string => r.issues.map((i) => `${i.check}: ${i.
 const has = (r: RefereeReport, check: string): boolean => r.issues.some((i) => i.check === check);
 const wfText = (steps: RenderedStep[], top: Record<string, unknown> = {}, jobOver: Record<string, unknown> = {}): string => {
   const doc = new Document();
-  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, ...top, jobs: { 'app-start': { 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none', ...jobOver } } });
+  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, concurrency: { ...WORKFLOW_CONCURRENCY }, ...top, jobs: { 'app-start': { 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none', ...jobOver } } });
   doc.setIn(['jobs', 'app-start', 'steps'], stepsToYaml(withEgress(steps)));
   return doc.toString({ lineWidth: 0 });
 };

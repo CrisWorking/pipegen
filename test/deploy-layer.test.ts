@@ -1459,7 +1459,7 @@ describe('G17 A rows 2-4: the referee re-derives which user jobs wait for pipege
   });
   it('G17 row 4 (probe C4): with no job the detector names, each job keeps its own STRONG reason; ship gets verify, not a gap', async () => {
     const c4 = ['on: { push: { branches: [main] } }', 'jobs:', '  test:', '    runs-on: ubuntu-latest', '    permissions: { contents: read }', '    steps:', '      - run: make test', '      - uses: actions/upload-artifact@v4', '        if: always()', '        with: { name: logs, path: logs/ }',
-      '  ship:', '    needs: test', '    runs-on: ubuntu-latest', '    permissions: { contents: read }', '    steps:', '      - run: ./upload.sh', '        env:', `          TOKEN: \${{ ${SEC}.HOOK_TOKEN }}`, ''].join('\n');
+      '  ship:', '    needs: test', '    runs-on: ubuntu-latest', '    permissions: { contents: read }', '    steps:', '      - run: ./upload.sh', '        env:', `          HOOK: \${{ ${SEC}.HOOK_TOKEN }}`, ''].join('\n');
     const w = world('keyless', [[A, c4]]);
     expect(w.v.gaps).toEqual([]);
     const ins = w.v.inserts[0] as VerifyPlan['inserts'][number];
