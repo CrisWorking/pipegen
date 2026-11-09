@@ -121,11 +121,71 @@ describe('G17 row 7 (G9 carry 13): a per-service floor check never drops out whi
     expect(r.demoted).toContain(`${SEC}--web`);
     expect(has(r, 'not-gate-readable', new RegExp(`floor check "${SEC}" for "web" writes nothing the gate can read, while another check of "${SEC}" is in the gate's list`)), show(r)).toBe(true);
   });
-  it('G17 row 7: a floor check demoted with no other check of its need stays a note (B7)', async () => {
+  // G17A-R1 sec I3: the gate builds its floor from its job list (gate/src/settings.ts floorNeeds), which holds no demoted check, so a floor
+  // findings check demoted alone is never reported missing (only secrets is always in the floor): refused like the per-service case
+  it('G17A-R1 sec I3: a floor check demoted with no other check of its need is refused too (the gate floors only what its job list holds)', async () => {
     const needs = draftOf().needs.filter((n) => n.id !== SEC);
     const { dr, files } = withWeb(needs, specs().filter((s) => s.needId !== SEC));
     const r = await go(files, dr);
     expect(r.demoted).toContain(`${SEC}--web`);
-    expect(has(r, 'not-gate-readable', /floor check/), show(r)).toBe(false);
+    expect(has(r, 'not-gate-readable', new RegExp(`floor check "${SEC}" for "web" writes nothing the gate can read`)), show(r)).toBe(true);
+  });
+  it('G17A-R1 sec I3 (probe "row7 alone"): sast demoted alone (one service, semgrep writing JUnit) is refused', async () => {
+    const sgList = (): ReviewedTool[] => reviewedList().map((t) => (t.id === 'semgrep' ? { ...t, step: { ...t.step, output: { ...t.step.output, format: 'junit' as const } } } : t));
+    const sg = sgList().find((t) => t.id === 'semgrep') as ReviewedTool;
+    const webSpec = specFor(sg, { needId: 'sast', service: 'web' });
+    const base = draftOf();
+    const dr = draftOf({ needs: [...base.needs.filter((n) => n.id !== 'sast'), needOf('sast', 'web')], steps: [...specs().filter((s) => s.needId !== 'sast'), webSpec] });
+    const jobs = { ...jobsOf(dr), 'sast--web': job([...renderJobPrelude({}, p).steps, ...renderStep(webSpec, sg, p, { profile: dr.profile }).steps]) };
+    const r = await referee([workflow(jobs, CONC)], dr, p, sgList(), { actionlint: async () => '/stub', zizmor: async () => '/stub' }, 'tok', { runLinters: async () => [] });
+    expect(r.demoted).toContain('sast--web');
+    expect(has(r, 'not-gate-readable', /floor check "sast" for "web" writes nothing the gate can read/), show(r)).toBe(true);
+  });
+  // G17A-R1 sec M1 (the row 7 survivor): the rule is the floor's only; a non-floor findings check demoted for one service is B7's note
+  it('G17 row 7: a non-floor findings check demoted for one service while another service keeps it in the gate\'s list stays a note (B7)', async () => {
+    const iacList = (): ReviewedTool[] => reviewedList().map((t) => (t.id === 'trivy-config' ? { ...t, step: { ...t.step, output: { ...t.step.output, format: 'junit' as const } } } : t));
+    const tc = iacList().find((t) => t.id === 'trivy-config') as ReviewedTool;
+    const kl = iacList().find((t) => t.id === 'kube-linter') as ReviewedTool;
+    const webSpec = specFor(tc, { needId: 'iac', service: 'web' });
+    const appSpec = specFor(kl, { needId: 'iac', service: 'app' });
+    const nf = (svc: string) => ({ ...needOf('iac', svc), floor: false });
+    const base = draftOf();
+    const dr = draftOf({ profile: { ...base.profile, repoFiles: { ...base.profile.repoFiles, kubernetes: true } }, needs: [...base.needs, nf('app'), nf('web')], steps: [...specs(), appSpec, webSpec] });
+    const jobs = { ...jobsOf(dr), 'iac--web': job([...renderJobPrelude({}, p).steps, ...renderStep(webSpec, tc, p, { profile: dr.profile }).steps]) };
+    const r = await referee([workflow(jobs, CONC)], dr, p, iacList(), { actionlint: async () => '/stub', zizmor: async () => '/stub' }, 'tok', { runLinters: async () => [] });
+    expect(r.demoted, show(r)).toContain('iac--web');
+    expect(r.demoted, show(r)).not.toContain('iac--app');
+    expect(show(r)).not.toMatch(/floor check/);
+  });
+});
+
+describe('G17A-R1 sec N1, spec M4: a callee reads a mapped secret only in an expression, by its exact name', () => {
+  const SLACK_DECLARED = { [SEC_CTX]: { [FP]: { required: false }, [SLACK]: { required: false } } };
+  /** The local merge file with one more job whose last step runs `text` (written into the YAML as is: the renderer takes no expression). */
+  const mergeWith = (call: unknown, text: string): CreatedFile => {
+    const f = at(workflow({ ...jobsOf(d), note: job([...renderJobPrelude({}, p).steps, { name: 'notify', run: 'echo NOTE_TEXT' }]) }, { on: { workflow_call: call } }), LOCAL_MERGE_WORKFLOW);
+    expect(f.content.split('NOTE_TEXT').length).toBe(2);
+    return { ...f, content: f.content.replace('NOTE_TEXT', text) };
+  };
+  const expr = (inner: string): string => `\${{ ${inner} }}`;
+  const passes = caller({ [SEC_CTX]: { [FP]: ref(FP), [SLACK]: ref(SLACK) } });
+  const unread = new RegExp(`passes the secret "${SLACK}", which the called workflow does not declare and read`);
+  it('G17A-R1 sec N1: secrets.NAME outside ${{ }} (a step name, run text) reads nothing', async () => {
+    const named = await run([passes, mergeWith(SLACK_DECLARED, `notify with ${SEC_CTX}.${SLACK}`)], d);
+    expect(has(named, 'permissions', unread), show(named)).toBe(true);
+    const read = await run([passes, mergeWith(SLACK_DECLARED, ref(SLACK))], d);
+    expect(has(read, 'permissions', unread), show(read)).toBe(false);
+  });
+  it('G17A-R1 spec M4: the bracket form and any spelling of the context read the name; the name itself matches exactly, as declared', async () => {
+    const bracket = await run([passes, mergeWith(SLACK_DECLARED, expr(`${SEC_CTX}['${SLACK}']`))], d);
+    expect(has(bracket, 'permissions', unread), show(bracket)).toBe(false);
+    const upper = await run([passes, mergeWith(SLACK_DECLARED, expr(`${SEC_CTX.toUpperCase()}.${SLACK}`))], d);
+    expect(has(upper, 'permissions', unread), show(upper)).toBe(false);
+    // declaresSecret and readsSecret agree: the name is compared exactly in both (a name read in another case is not the declared one)
+    const lowerRead = await run([passes, mergeWith(SLACK_DECLARED, ref(SLACK.toLowerCase()))], d);
+    expect(has(lowerRead, 'permissions', unread), show(lowerRead)).toBe(true);
+    const lowerDeclared = { [SEC_CTX]: { [FP]: { required: false }, [SLACK.toLowerCase()]: { required: false } } };
+    const r = await run([passes, mergeWith(lowerDeclared, ref(SLACK))], d);
+    expect(has(r, 'permissions', unread), show(r)).toBe(true);
   });
 });

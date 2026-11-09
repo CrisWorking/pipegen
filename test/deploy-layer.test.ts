@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isMap, parse, parseDocument, type YAMLMap, type YAMLSeq } from 'yaml';
 import { describe, expect, it } from 'vitest';
+import { renderJobPrelude, stepsToYaml } from '../src/engine/render-step.js';
 import { DIGEST_STEP_ID, FIND_RUN_STEP_ID, HEAD_CHECK_STEP_ID, imageDigestArtifact, PUBLISH_DIGEST_STEP_ID, renderDigestStep, renderHeadCheckStep } from '../src/engine/deploy-steps.js';
 import { checkExpressions, isFindRunStep, isKnownHarmless } from '../src/engine/job-rules.js';
 import { githubHosted } from '../src/engine/deploy-gating.js';
@@ -17,7 +18,7 @@ import { floorNeeds } from '../src/engine/needs.js';
 import { RenderError } from '../src/engine/render-error.js';
 import { renderVerifySteps } from '../src/engine/signing.js';
 import { assemble, judgeAssembled, keylessVerifyNote, verifyPermissions, verifyTail, type AssembledFiles } from '../src/layers/assemble.js';
-import { EGRESS_DOMAIN_SETS, KEYLESS_VERIFY_SETS } from '../src/engine/egress.js';
+import { EGRESS_DOMAIN_SETS, KEYLESS_VERIFY_SETS, renderEgressStep } from '../src/engine/egress.js';
 import {
   deployTriggers, environmentPlan, generateCosignKeys, insertVerify, isMemoryFolder, MEMORY_DIR, planVerifyInserts, releaseJobs, renewVerifyJob, verifyJobYaml, type VerifyPlan,
 } from '../src/layers/deploy.js';
@@ -117,7 +118,9 @@ function world(kind: Kind, wfs: [string, string][] = [[A, DEPLOY_A]], over: { pr
   const texts = new Map(wfs);
   return { draft: x.draft, plan: x.plan, a, v: planVerifyInserts(a.draft, texts, a.verify), texts };
 }
-const judge = (w: World, extra: CreatedFile[] = w.v.inserts.map((i) => i.file)) => judgeAssembled(w.a, { ...JD, extra });
+// G17A-R1 sec M2: the referee gets the workflow texts the plan was built from (run.ts passes BuildFacts.texts), so it re-derives the called-file head checks
+const judge = (w: World, extra: CreatedFile[] = w.v.inserts.map((i) => i.file), texts: ReadonlyMap<string, string> | undefined = w.texts) =>
+  judgeAssembled(w.a, { ...JD, extra, refereeDeps: { ...JD.refereeDeps, ...(texts === undefined ? {} : { workflowTexts: texts }) } });
 const verifyOf = (w: World): Job => w.a.verify as Job;
 const step = (j: Job, id: string): Obj => j.steps.find((s) => s.id === id) as Obj;
 const insertedJob = (text: string): Obj => (parse(text) as Obj).jobs['pipegen-verify'] as Obj;
@@ -1496,5 +1499,84 @@ describe('G17 A rows 2-4: the referee re-derives which user jobs wait for pipege
     const forged: CreatedFile = { ...(ok.v.inserts[0] as VerifyPlan['inserts'][number]).file, content: e.text, inserted: e.inserted };
     const r = await judge(ok, [forged]);
     expect(r.issues.some((i) => /pipegen adds no pipegen-verify job to this workflow: a step of its job "deploy" \(it has an environment\) has an if:/.test(i.message)), shown(r)).toBe(true);
+  });
+});
+
+// ---------- G17A-R1 (sec I1, I2, M2): the referee judges the file and the batch, never the mark ----------
+describe('G17A-R1: the referee judges the edited file and the batch, never the mark', () => {
+  const SEC = ['sec', 'rets'].join('');
+  const ROW2 = ['on: { push: { branches: [main] } }', 'jobs:', '  stage:', '    runs-on: ubuntu-latest', '    environment: staging', '    steps:', '      - run: ./stage.sh',
+    '  prod:', '    runs-on: ubuntu-latest', '    permissions: { contents: read }', '    steps:', '      - run: ./prod.sh', '        env:', `          KEY: \${{ ${SEC}.PROD_KEY }}`, ''].join('\n');
+  /** A harmless job (egress and prelude steps, contents read), added to `text` under `id`. */
+  const withJob = (text: string, id: string): string => {
+    const doc = parseDocument(text);
+    doc.setIn(['jobs', id], doc.createNode({ 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none', 'timeout-minutes': 5 }));
+    doc.setIn(['jobs', id, 'steps'], stepsToYaml([renderEgressStep([], { dockerNetworks: false }), ...renderJobPrelude({}, p).steps]));
+    return doc.toString({ lineWidth: 0 });
+  };
+  it('G17A-R1 sec I1 (probe P1): a mark that inserts a job other than pipegen-verify, or one beside it, is refused', async () => {
+    const w = world('keyless', [[A, DEPLOY_A]]);
+    expect(shown(await judge(w))).toBe('');
+    const ins = w.v.inserts[0] as VerifyPlan['inserts'][number];
+    // P1: the original plus one harmless job, marked as the only insert: nothing waits for any check
+    const noop: CreatedFile = { ...ins.file, content: withJob(DEPLOY_A, 'noop'), inserted: { original: DEPLOY_A, jobs: ['noop'], needs: [] } };
+    const r1 = await judge(w, [noop]);
+    expect(r1.issues.some((i) => /inserts exactly one job, pipegen-verify/.test(i.message)), shown(r1)).toBe(true);
+    // the verify insert with an extra job beside pipegen-verify
+    const extra: CreatedFile = { ...ins.file, content: withJob(ins.text, 'noop'), inserted: { ...ins.inserted, jobs: ['pipegen-verify', 'noop'] } };
+    const r2 = await judge(w, [extra]);
+    expect(r2.issues.some((i) => /inserts exactly one job, pipegen-verify/.test(i.message)), shown(r2)).toBe(true);
+  });
+  it('G17A-R1 sec I2 (probe P2): a gated job the file does not make wait is refused, whatever the mark says; added is exactly pipegen-verify', async () => {
+    const w = world('keyless', [[A, ROW2]]);
+    const ins = w.v.inserts[0] as VerifyPlan['inserts'][number];
+    expect(ins.inserted.needs.map((n) => n.job)).toEqual(['stage', 'prod']);
+    expect(shown(await judge(w))).toBe('');
+    // P2: prod's added need line removed from the file (its head check kept), the mark keeps prod with added: []
+    const lines = ins.text.split('\n');
+    const prodAt = lines.findIndex((l) => l === '  prod:');
+    const needAt = lines.findIndex((l, i) => i > prodAt && /^\s+needs: \[pipegen-verify\]$/.test(l));
+    expect(needAt).toBeGreaterThan(prodAt);
+    const text = [...lines.slice(0, needAt), ...lines.slice(needAt + 1)].join('\n');
+    expect(((parse(text) as Obj).jobs as Obj).prod).not.toHaveProperty('needs');
+    const mark = { ...ins.inserted, needs: ins.inserted.needs.map((n) => (n.job === 'prod' ? { job: 'prod', added: [] } : n)) };
+    const r = await judge(w, [{ ...ins.file, content: text, inserted: mark }]);
+    expect(r.issues.some((i) => /"prod" must wait for pipegen-verify \(it uses a secret\)/.test(i.message)), shown(r)).toBe(true);
+    // added other than exactly ['pipegen-verify'] (here twice): the mark says what pipegen added, and it adds that one need only
+    const twice = { ...ins.inserted, needs: ins.inserted.needs.map((n) => (n.job === 'prod' ? { job: 'prod', added: ['pipegen-verify', 'pipegen-verify'] } : n)) };
+    const r2 = await judge(w, [{ ...ins.file, inserted: twice }]);
+    expect(r2.issues.some((i) => /adds exactly the need pipegen-verify to "prod"/.test(i.message)), shown(r2)).toBe(true);
+  });
+  it('G17A-R1 sec M2: a called workflow the layer starts with the head check must be edited in the same batch, naming this caller', async () => {
+    const w = calledWorld(CALLER_A, CALLED_A);
+    const caller = insertAt(w, A)?.file as CreatedFile;
+    const called = insertAt(w, SHIP)?.file as CreatedFile;
+    expect(called).toBeDefined();
+    expect(shown(await judge(w, [caller, called]))).toBe('');
+    // the called file's edit dropped from the batch: the caller still waits, but no head check runs in the called deploy
+    const r = await judge(w, [caller]);
+    expect(r.issues.some((i) => /"ship" calls \.github\/workflows\/ship\.yml, whose jobs pipegen starts with its head check, and the batch holds no such edit of it naming this workflow/.test(i.message)), shown(r)).toBe(true);
+    // without the workflow texts the referee can not tell: refused unless the edit is there (fails closed)
+    const blind = await judge(w, [caller], undefined);
+    expect(blind.issues.some((i) => /pipegen can not tell whether \.github\/workflows\/ship\.yml takes its head check/.test(i.message)), shown(blind)).toBe(true);
+    expect(shown(await judge(w, [caller, called], undefined))).toBe('');
+    // shape B (one job, four-space indentation): the same rule
+    const b = calledWorld(CALLER_B, CALLED_B);
+    expect(shown(await judge(b))).toBe('');
+    const rb = await judge(b, [insertAt(b, A)?.file as CreatedFile]);
+    expect(rb.issues.some((i) => /"release" calls \.github\/workflows\/ship\.yml, whose jobs pipegen starts with its head check/.test(i.message)), shown(rb)).toBe(true);
+  });
+  it('G17A-R1 sec M2: no false refusal when the called workflow can not take the head check (another, ungated workflow calls it; more than workflow_call)', async () => {
+    const LINT = '.github/workflows/lint.yml';
+    const lint = 'on: pull_request\njobs:\n  check:\n    uses: ./.github/workflows/ship.yml\n';
+    const w = world('keyless', [[A, CALLER_A], [SHIP, CALLED_A]], { profile: { existingWorkflows: [wfOf(A), wfOf(SHIP), { ...wfOf(LINT), deploys: false }] } });
+    const texts = new Map([[A, CALLER_A], [SHIP, CALLED_A], [LINT, lint]]);
+    const v = planVerifyInserts(w.a.draft, texts, w.a.verify);
+    expect(v.inserts.map((i) => i.path)).toEqual([A]);
+    expect(shown(await judge(w, v.inserts.map((i) => i.file), texts))).toBe('');
+    const dispatch = CALLED_A.replace('  workflow_call:', '  workflow_call:\n  workflow_dispatch:');
+    const u = calledWorld(CALLER_A, dispatch);
+    expect(insertAt(u, SHIP)).toBeUndefined();
+    expect(shown(await judge(u))).toBe('');
   });
 });
