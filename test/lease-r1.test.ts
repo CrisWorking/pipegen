@@ -1,7 +1,7 @@
 // v0.2 Plan G G-LEASE-R1 (fix round 1 of the lease carry, Plan V V5 security M5): the app lease without the state file (spec I1), kept
 // while a stop is under way (sec M1), a stale takeover that checks it is still the holder (sec L1), the stop's way out for a reused
 // process id (sec L2), and cleanupLeftovers deciding from the store whether it took the lease (sec I1).
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -11,7 +11,27 @@ import { StateError, StateStore } from '../src/proof/state.js';
 import { quietIo } from './helpers/scratch-secrets.js';
 
 // the stop gate is the test's (a real signal would end the test process)
-const h = vi.hoisted(() => ({ stop: { now: false } }));
+const h = vi.hoisted(() => ({ stop: { now: false }, writeFault: null as null | (() => void), linkFault: null as null | (() => void), readFault: null as null | (() => void) }));
+// r2-I3: a fault in the lease write (the test's), run before the write fails
+vi.mock('node:fs', async (orig) => {
+  const real = await orig<typeof import('node:fs')>();
+  return { ...real, default: real, writeSync: (...a: Parameters<typeof real.writeSync>) => {
+    const f = h.writeFault;
+    if (f !== null) { h.writeFault = null; f(); throw Object.assign(new Error('EIO: i/o error, write'), { code: 'EIO' }); }
+    return (real.writeSync as (...x: unknown[]) => number)(...a);
+  },
+  // r2-L1: what happens after this taker's link failed on a lease (linkFault), and after a read of the lease found none (readFault)
+  linkSync: (...a: Parameters<typeof real.linkSync>) => {
+    try { real.linkSync(...a); } catch (e) { const f = h.linkFault; h.linkFault = null; if (f !== null) f(); throw e; }
+  },
+  openSync: (...a: Parameters<typeof real.openSync>) => {
+    try { return real.openSync(...a); } catch (e) {
+      const f = h.readFault;
+      if (f !== null && String(a[0]).endsWith('lease.json') && (e as { code?: string }).code === 'ENOENT') { h.readFault = null; f(); }
+      throw e;
+    }
+  } };
+});
 vi.mock('../src/util/exit-hooks.js', async (orig) => ({
   ...(await orig<typeof import('../src/util/exit-hooks.js')>()),
   interrupting: () => h.stop.now,
@@ -25,6 +45,7 @@ const homes: string[] = [];
 const home = (): string => { const d = mkdtempSync(join(tmpdir(), 'pg-lease-r1-')); homes.push(d); return d; };
 afterEach(() => {
   h.stop.now = false;
+  h.writeFault = null; h.linkFault = null; h.readFault = null;
   for (const d of homes.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 /** An Octokit that records every request and answers none (no network). */
@@ -142,19 +163,47 @@ describe('G-LEASE-R1: a stale-lease takeover checks it is still the holder (sec 
     expect(existsSync(file)).toBe(false);   // B's own hook dropped it (B's lease, token-checked)
   });
 
-  it('lease: a stale takeover with no rival holds the lease after its check; a fresh take does not wait', async () => {
+  it('lease: every take (a fresh one too) holds the lease only after its check; a stale takeover with no rival holds it', async () => {
     const d = home();
     const st = { home: d, env: {} };
     let settles = 0;
     const a = await StateStore.openForLease(APP, { ...st, leaseSettle: () => { settles++; } });
     a.acquireLease('a', 'finish');
-    expect(settles).toBe(0);
+    expect(settles).toBe(1);
     a.releaseLease();
     writeFileSync(join(a.dir, 'lease.json'), JSON.stringify({ pid: deadPid(), host: hostname(), runId: 'old', [TK]: 'deadbeef' }), { mode: 0o600 });
     a.acquireLease('a', 'finish');
-    expect(settles).toBe(1);
+    expect(settles).toBe(2);
     expect(a.holdsLease()).toBe(true);
     a.releaseLease();
+  });
+
+  it('lease (r2-L1): a fresh take whose lease another taker replaced before the check stops', async () => {
+    const d = home();
+    const st = { home: d, env: {} };
+    // X judged an older stale lease dead and unlinks H's fresh one while H waits before its check
+    const x = await StateStore.openForLease(APP, { ...st, alive: () => false, leaseSettle: () => {} });
+    const hh = await StateStore.openForLease(APP, { ...st, leaseSettle: () => { x.acquireLease('x', 'uninstall'); } });
+    expect(() => { hh.acquireLease('h', 'finish'); }).toThrow(/at the same time/);
+    expect(hh.holdsLease()).toBe(false);
+    expect(x.holdsLease()).toBe(true);
+    x.releaseLease();
+  });
+
+  it('lease (r2-L1): a lease that appears after a first read found none is not unlinked', async () => {
+    const d = home();
+    const st = { home: d, env: {} };
+    const p0 = await StateStore.openForLease(APP, { ...st, leaseSettle: () => {} });
+    p0.acquireLease('p', 'run');
+    const live = await StateStore.openForLease(APP, { ...st, leaseSettle: () => {} });
+    // this taker's link fails on p's lease; p gives it back before the taker reads (it reads none); a live pipegen takes it before the re-read
+    h.linkFault = () => { p0.releaseLease(); h.readFault = () => { live.acquireLease('live', 'uninstall'); }; };
+    const t = await StateStore.openForLease(APP, { ...st, leaseSettle: () => {} });
+    expect(() => { t.acquireLease('t', 'finish'); }).toThrow(/`pipegen uninstall`/);
+    expect(t.holdsLease()).toBe(false);
+    expect(live.holdsLease()).toBe(true);
+    expect(leaseOf(live.dir).command).toBe('uninstall');
+    live.releaseLease();
   });
 
   it('lease: a stale lease replaced between the read and the unlink is not unlinked', async () => {
@@ -171,6 +220,47 @@ describe('G-LEASE-R1: a stale-lease takeover checks it is still the holder (sec 
     expect(live.holdsLease()).toBe(true);
     expect(leaseOf(s0.dir).command).toBe('uninstall');
     live.releaseLease();
+  });
+});
+
+describe('G-LEASE r2: the lease-only store and the whole lease write (r2-I2, r2-I3)', () => {
+  it('state (r2-I2): a store opened for the lease only refuses every state write; open() still writes', async () => {
+    const d = home();
+    const st = { home: d, env: {} };
+    const s = await StateStore.open(APP, st);
+    s.begin(RUN, { ...APP, private: true, ownerType: 'User', defaultBranch: 'main' }, { cap: 10, aiCap: null });
+    const before = readFileSync(s.path, 'utf8');
+    const l = await StateStore.openForLease(APP, st);
+    expect(l.state).toBeNull();
+    expect(() => l.begin('20261109-090000-abc124', { ...APP, private: true, ownerType: 'User', defaultBranch: 'main' }, { cap: 10, aiCap: null })).toThrow(/for the lease only/);
+    expect(() => { l.setStage('planned'); }).toThrow();
+    expect(readFileSync(s.path, 'utf8')).toBe(before);
+    s.setStage('planned');
+    expect(readFileSync(s.path, 'utf8')).not.toBe(before);
+  });
+
+  it('lease (r2-I3): a failed lease write removes nothing by the lease path (another pipegen\'s lease there stays); no temp file is left', async () => {
+    const d = home();
+    const st = { home: d, env: {} };
+    const s0 = await StateStore.openForLease(APP, st);
+    const file = join(s0.dir, 'lease.json');
+    const c = await StateStore.openForLease(APP, { ...st, leaseSettle: () => {} });
+    // while this take writes, a racing takeover clears the path and C takes the lease; then this write fails
+    h.writeFault = () => { c.acquireLease('c', 'uninstall'); };
+    const a = await StateStore.openForLease(APP, { ...st, leaseSettle: () => {} });
+    expect(() => { a.acquireLease('a', 'finish'); }).toThrow(StateError);
+    expect(c.holdsLease()).toBe(true);
+    expect(leaseOf(s0.dir).command).toBe('uninstall');
+    expect(readdirSync(s0.dir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
+    c.releaseLease();
+    expect(existsSync(file)).toBe(false);
+    // a take after a failed write works (nothing half-written is left to read as an unreadable lease)
+    h.writeFault = () => {};
+    expect(() => { a.acquireLease('a', 'finish'); }).toThrow(StateError);
+    expect(existsSync(file)).toBe(false);
+    a.acquireLease('a', 'finish');
+    expect(leaseOf(s0.dir).command).toBe('finish');
+    a.releaseLease();
   });
 });
 

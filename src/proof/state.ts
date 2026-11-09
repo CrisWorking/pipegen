@@ -21,7 +21,7 @@
 // next to the state; another live process's lease is a stop; a dead one's (this host) is taken over; one from another host, or
 // one that can't be read, is a stop naming the file (never taken over). Two machines are not covered (a
 // recorded residual: the scratch repo's key state is shared per repo id inside one process only, E4).
-import { closeSync, constants, fstatSync, fsyncSync, openSync, readSync, renameSync, unlinkSync, writeSync } from 'node:fs';
+import { closeSync, constants, fstatSync, fsyncSync, linkSync, openSync, readSync, renameSync, unlinkSync, writeSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { basename, isAbsolute, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -47,7 +47,7 @@ export const STATE_VERSION = 1;
 export const MAX_STATE_BYTES = 16 * 1024 * 1024;
 const STATE_FILE = 'state.json';
 const LEASE_FILE = 'lease.json';
-/** G-LEASE-R1 (sec L1): how long a stale-lease takeover waits before it checks that the lease it wrote is still there. */
+/** G-LEASE-R1 (sec L1), r2-L1: how long every take of the lease waits before it checks that the lease it wrote is still there. */
 export const LEASE_SETTLE_MS = 75;
 /** The commands that take the app's lease (Plan V M5): a stop names the one holding it. */
 export const LEASE_COMMANDS = ['run', 'resume', 'cleanup', 'uninstall', 'finish', 'update'] as const;
@@ -285,8 +285,8 @@ export interface StateDeps {
   /** For tests: whether a process is alive (default process.kill(pid, 0)). */
   alive?: (pid: number) => boolean;
   /**
-   * For tests: the pause after a stale lease was taken over, before the lease is read again to check it is still this process's
-   * (G-LEASE-R1, sec L1). Default: LEASE_SETTLE_MS, slept synchronously.
+   * For tests: the pause after every take of the lease, before it is read again to check it is still this process's (G-LEASE-R1 sec L1,
+   * r2-L1). Default: LEASE_SETTLE_MS, slept synchronously.
    */
   leaseSettle?: () => void;
 }
@@ -320,6 +320,8 @@ export class StateStore {
   #lease: { token: string; off: () => void } | null = null;
   /** The app repo the store was opened for (`owner/repo`), for messages. */
   #app = '';
+  /** G-LEASE r2-I2: opened for the lease only (openForLease): every state write is refused. */
+  #leaseOnly = false;
 
   private constructor(dir: string, deps: StateDeps) {
     this.dir = dir;
@@ -329,15 +331,21 @@ export class StateStore {
 
   /** Prepares `<cache>/pipegen/<owner>__<repo>` (0700, trusted chain) and loads the saved state, if any. */
   static async open(app: Pick<ProofApp, 'owner' | 'repo'>, deps: StateDeps = {}): Promise<StateStore> {
+    const store = await StateStore.#prepare(app, deps, 'keep its proof state');
+    store.#state = store.load();
+    return store;
+  }
+
+  /** G-LEASE r2-I2: the one folder preparation of open() and openForLease() (the user, the cache base, the trusted chain). */
+  static async #prepare(app: Pick<ProofApp, 'owner' | 'repo'>, deps: StateDeps, what: string): Promise<StateStore> {
     const uid = deps.uid ?? process.getuid?.();
-    if (uid === undefined) throw new StateError('pipegen could not tell which user it runs as, so it will not keep its proof state.');
+    if (uid === undefined) throw new StateError(`pipegen could not tell which user it runs as, so it will not ${what}.`);
     const env = deps.env ?? process.env;
     const xdg = env.XDG_CACHE_HOME;
     const base = xdg !== undefined && isAbsolute(xdg) ? xdg : join(deps.home ?? homedir(), '.cache');
     const dir = await prepareTrustedDir(base, ['pipegen', stateFolderName(app)], false, uid, KIND);
     const store = new StateStore(dir, { ...deps, uid });
     store.#app = `${app.owner}/${app.repo}`;
-    store.#state = store.load();
     return store;
   }
 
@@ -346,14 +354,9 @@ export class StateStore {
    * never use it, so a state file they can't trust doesn't stop them. The store holds no state (state is null); use it only for the lease.
    */
   static async openForLease(app: Pick<ProofApp, 'owner' | 'repo'>, deps: StateDeps = {}): Promise<StateStore> {
-    const uid = deps.uid ?? process.getuid?.();
-    if (uid === undefined) throw new StateError('pipegen could not tell which user it runs as, so it will not take the repo\'s lease.');
-    const env = deps.env ?? process.env;
-    const xdg = env.XDG_CACHE_HOME;
-    const base = xdg !== undefined && isAbsolute(xdg) ? xdg : join(deps.home ?? homedir(), '.cache');
-    const dir = await prepareTrustedDir(base, ['pipegen', stateFolderName(app)], false, uid, KIND);
-    const store = new StateStore(dir, { ...deps, uid });
-    store.#app = `${app.owner}/${app.repo}`;
+    const store = await StateStore.#prepare(app, deps, 'take the repo\'s lease');
+    // G-LEASE r2-I2: it never loaded the saved state, so it must never replace it (begin() would skip the unsettled-proof stop)
+    store.#leaseOnly = true;
     return store;
   }
 
@@ -638,6 +641,7 @@ export class StateStore {
 
   /** Writes `s` (secret check, temp file 0600 exclusive no-follow, fsync, rename). Throws StateError; nothing is written then. */
   #write(s: RunState): void {
+    if (this.#leaseOnly) throw new StateError('pipegen opened this state folder for the lease only; it writes no proof state through it.');
     s.updatedAt = new Date((this.#deps.now ?? Date.now)()).toISOString();
     const json = `${JSON.stringify(s, null, 1)}\n`;
     const why = secretProblem(json, this.#deps.vault, this.#deps.tokens ?? []);
@@ -672,25 +676,27 @@ export class StateStore {
     const token = randomBytes(8).toString('hex');
     const body = JSON.stringify({ pid: process.pid, host: hostname(), runId, token, at: new Date((this.#deps.now ?? Date.now)()).toISOString(), ...(command === undefined ? {} : { command }) });
     const file = join(this.dir, LEASE_FILE);
-    let tookOver = false;
     for (let tries = 0; tries < 2; tries++) {
-      let created = false;
+      // G-LEASE r2-I3: the lease is written whole to a temp file first, then linked into place (atomic, EEXIST when there is one), so no
+      // other pipegen ever sees a half-written lease, and a failed write never removes anything by the lease's path
+      const tmp = join(this.dir, `.${LEASE_FILE}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`);
+      let linked = false;
       try {
-        const fd = openSync(file, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-        created = true;
+        const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
         try { writeSync(fd, body); fsyncSync(fd); } finally { closeSync(fd); }
+        linkSync(tmp, file);
+        linked = true;
       } catch (e) {
-        if (created) { try { unlinkSync(file); } catch { /* gone */ } throw new StateError(`pipegen couldn't take the lease ${file}.`, { cause: e }); }
         if ((e as { code?: unknown } | null)?.code !== 'EEXIST') throw new StateError(`pipegen couldn't take the lease ${file}.`, { cause: e });
+      } finally {
+        try { unlinkSync(tmp); } catch { /* gone */ }
       }
-      if (created) {
-        // G-LEASE-R1 (sec L1): another pipegen that judged the same stale lease dead may unlink this fresh one and write its own. After a
-        // takeover, wait a moment and read the lease again: only the last writer goes on, the other stops here
-        if (tookOver) {
-          (this.#deps.leaseSettle ?? sleepSettle)();
-          if (this.#readLease(file)?.token !== token) {
-            throw new ProofStopError(`Another pipegen took the lease ${file} at the same time. Wait for it to finish, then run pipegen again.`);
-          }
+      if (linked) {
+        // G-LEASE-R1 (sec L1), r2-L1: another pipegen that judged a stale lease dead may unlink this one and write its own, whether this take
+        // was a takeover or a fresh one. After every take, wait a moment and read the lease again: only the last writer goes on
+        (this.#deps.leaseSettle ?? sleepSettle)();
+        if (this.#readLease(file)?.token !== token) {
+          throw new ProofStopError(`Another pipegen took the lease ${file} at the same time. Wait for it to finish, then run pipegen again.`);
         }
         this.#lease = { token, off: onExit(() => this.#dropLease(token)) };
         return;
@@ -711,10 +717,10 @@ export class StateStore {
         throw new ProofStopError(`The lease ${file} was taken on another machine (${safeText(held.host, 80)}); pipegen won't share the scratch repo with it. Remove that file only if no pipegen runs there.`);
       }
       // G-LEASE-R1 (sec L1): unlink only the lease judged stale (read it again: another pipegen may have just replaced it)
+      // r2-L1: also when the first read found no lease (it was given back, then another pipegen took it)
       const again = this.#readLease(file);
-      if (again !== null && held !== null && again.token !== held.token) continue;
+      if (again !== null && again.token !== held?.token) continue;
       try { unlinkSync(file); } catch { /* raced: try once more */ }
-      tookOver = true;
     }
     throw new ProofStopError(`Another pipegen took the lease ${file} at the same time. Run pipegen again.`);
   }
