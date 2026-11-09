@@ -201,7 +201,9 @@ describe('V6b (G17C m4): the central CODEOWNERS pipegen created is deleted whole
     const r = await run(w, rec);
     expect(filesAtPr(w).get('.github/CODEOWNERS')).toBe(OWNER_ADDS);
     expect(w.g.calls.some((c) => c.route === 'POST /repos/{owner}/{repo}/git/commits' && /CODEOWNERS/.test(String((c.params as { message?: unknown }).message)))).toBe(false);
-    expect(r.manual.some((m) => /CODEOWNERS/.test(m.what))).toBe(true);
+    // central.ts itself makes it the owner's step (never a delete the target guard has to refuse: nothing failed)
+    expect(r.manual.some((m) => /CODEOWNERS/.test(m.what) && /doesn't prove every version of this file pipegen created/.test(m.why))).toBe(true);
+    expect(r.failed.filter((f) => /CODEOWNERS/.test(`${f.what} ${f.why}`))).toEqual([]);
   });
 
   it('V6b m4: no bases (an older record) or bases that skip a write: kept, manual, even when the file is exactly pipegen\'s last write', async () => {
@@ -212,7 +214,8 @@ describe('V6b (G17C m4): the central CODEOWNERS pipegen created is deleted whole
       await afterRun1(w);
       const r = await run(w, rec);
       expect(filesAtPr(w).get('.github/CODEOWNERS'), JSON.stringify(bases)).toBe(OWNERS_INS);
-      expect(r.manual.some((m) => /CODEOWNERS/.test(m.what)), JSON.stringify(bases)).toBe(true);
+      expect(r.manual.some((m) => /CODEOWNERS/.test(m.what) && /doesn't prove every version of this file pipegen created/.test(m.why)), JSON.stringify(bases)).toBe(true);
+      expect(r.failed.filter((f) => /CODEOWNERS/.test(`${f.what} ${f.why}`)), JSON.stringify(bases)).toEqual([]);
     }
   });
 
