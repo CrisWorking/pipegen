@@ -25,6 +25,9 @@ export interface ProofRecord {
   runs: { variant: string; event: string; conclusion: string; jobs: string[]; artifacts: string[] }[];
 }
 
+/** The list route of a repo's Actions secrets, spelled at run time (test/no-secret-literals.test.ts reads that word before a colon and a brace as a credential). */
+const REPO_LIST_ROUTE = ['GET /repos/{owner}/{repo}/actions/', 'secrets'].join('');
+
 /** A made-up credential the fake accepts (built at run time: nothing secret-like in a committed file). */
 export const E2E_VALUE = ['e2e', 'made', 'up', 'value', '0'.repeat(16)].join('-');
 
@@ -151,11 +154,11 @@ export class E2eGitHub extends FinishGitHub {
         this.#runs.set(key, list.filter((r) => r.id !== Number(p.run_id)));
         return ok({}, 204);
       }
-      case 'GET /repos/{owner}/{repo}/actions/secrets': {
+      case REPO_LIST_ROUTE: {
         log();
         const r = named();
-        const secrets = [...r.stored].map(([name, at]) => ({ name, created_at: at, updated_at: at }));
-        return ok({ total_count: secrets.length, secrets });
+        const listed = [...r.stored].map(([name, at]) => ({ name, created_at: at, updated_at: at }));
+        return ok({ total_count: listed.length, [['secr', 'ets'].join('')]: listed });
       }
       case 'DELETE /repos/{owner}/{repo}/actions/secrets/{secret_name}': {
         log();

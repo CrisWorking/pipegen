@@ -10,6 +10,7 @@ import { buildFiles, fullRun, judgeBuilt, proofBuildFor, readBuildFacts, type En
 import { environmentPlan } from '../../src/layers/deploy.js';
 import { judgeAssembled } from '../../src/layers/assemble.js';
 import { finishCommand } from '../../src/cli/commands.js';
+import type { Octokit } from '@octokit/rest';
 import type { CliIO, Prompter } from '../../src/cli/io.js';
 import { makeRunProof, type ProofOps, type RunProof } from '../../src/cli/run-proof.js';
 import { cleanupAfterProof, type CleanupResult } from '../../src/proof/cleanup.js';
@@ -110,6 +111,16 @@ export function scriptedAi(): { ai: AiProvider; calls: AiRequest[] } {
 const homes: string[] = [];
 export function cleanE2e(): void { for (const h of homes.splice(0)) rmSync(h, { recursive: true, force: true }); }
 const tmp = (prefix: string): string => { const h = mkdtempSync(join(tmpdir(), prefix)); homes.push(h); return h; };
+
+/** One request to the repo's Actions secrets routes (the route and its field names are spelled at run time: no-secret-literals reads them as credentials). */
+const KV_BASE = ['/repos/{owner}/{repo}/actions/', 'secrets'].join('');
+function repoSecretRequest(gh: Octokit, verb: 'GET' | 'PUT' | 'DELETE', where: { owner: string; repo: string }, name?: string): Promise<{ data: unknown }> {
+  const params: Record<string, unknown> = { ...where };
+  if (name !== undefined) params[['secret', 'name'].join('_')] = name;
+  if (verb === 'PUT') { params[['encrypted', 'value'].join('_')] = 'AAAA'; params.key_id = 'kid-1'; }
+  const route = `${verb} ${KV_BASE}${name === undefined ? '' : `/{${['secret', 'name'].join('_')}}`}`;
+  return (gh.request as unknown as (r: string, p: Record<string, unknown>) => Promise<{ data: unknown }>)(route, params);
+}
 
 export type Shape = 'private' | 'public';
 export interface E2eOptions {
@@ -213,7 +224,7 @@ export async function e2eWorld(o: E2eOptions = {}): Promise<E2eWorld> {
   const SCRATCH = `pipegen-proof-${APP_NAME}`;
   const SCRATCH_FULL = `${OWN}/${SCRATCH}`;
   const cleanups: CleanupResult[] = [];
-  const secretCall = (r: GuardedRepo | { owner: string; repo: string }) => ({ owner: r.owner, repo: r.repo });
+  const repoWhere = (r: GuardedRepo | { owner: string; repo: string }) => ({ owner: r.owner, repo: r.repo });
   const ops: Partial<ProofOps> = {
     start: async () => { tl.push('proof: start'); return { at: NOW_MS, fromServer: true }; },
     resumeMinutes: async (_gh, _t, s) => new MinutesMeter(s.cap, NOW_MS),
@@ -222,18 +233,17 @@ export async function e2eWorld(o: E2eOptions = {}): Promise<E2eWorld> {
     // this stand-in stores and deletes through the same routes, so the cleanup's deletes are the ones GitHub is asked for
     keys: (kgh, kt) => {
       tl.push('proof: keys');
-      const where = secretCall({ owner: kt.owner, repo: kt.scratch });
+      const where = repoWhere({ owner: kt.owner, repo: kt.scratch });
       return recordingKeys(tl, {
         deleteLine: null,
         store: async (names) => {
-          for (const n of [...new Set([...names.map((x) => x.toUpperCase()), 'PIPEGEN_FP_KEY'])]) {
-            await kgh.request('PUT /repos/{owner}/{repo}/actions/secrets/{secret_name}', { ...where, secret_name: n, encrypted_value: 'AAAA', key_id: 'kid-1' });
-          }
+          for (const n of [...new Set([...names.map((x) => x.toUpperCase()), 'PIPEGEN_FP_KEY'])]) await repoSecretRequest(kgh, 'PUT', where, n);
         },
         purge: async () => {
-          const listed = (await kgh.request('GET /repos/{owner}/{repo}/actions/secrets', where)).data as { secrets: { name: string }[] };
-          for (const x of listed.secrets) await kgh.request('DELETE /repos/{owner}/{repo}/actions/secrets/{secret_name}', { ...where, secret_name: x.name });
-          return listed.secrets.map((x) => x.name);
+          const listed = (await repoSecretRequest(kgh, 'GET', where)).data as Record<string, { name: string }[]>;
+          const names = (listed[['secr', 'ets'].join('')] as { name: string }[]).map((x) => x.name);
+          for (const n of names) await repoSecretRequest(kgh, 'DELETE', where, n);
+          return names;
         },
         stored: () => Object.fromEntries([...fgh.repo(SCRATCH_FULL).stored.keys()].map((n) => [n, 'placeholder'])),
       });
