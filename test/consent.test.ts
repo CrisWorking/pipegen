@@ -276,6 +276,19 @@ describe('consentText (full)', () => {
   });
 });
 
+describe('G-SIGN1-R1: the signing environment line', () => {
+  it('consent: G-SIGN1-R1 says pipegen creates pipegen-signing before the proof only when asked to', () => {
+    const p = profile();
+    const est = fullEst(p, claude);
+    const text = (signingEnv?: boolean) => consentText(p, claude, est, bundle, permissionsTable('write', { appCreatesRepos: false }), repos(p, [true, true]), 'full', { appCreatesRepos: false, ...gitleaksFacts(), ...(signingEnv === undefined ? {} : { signingEnv }) });
+    const on = text(true);
+    expect(on).toMatch(/pipegen creates the environment pipegen-signing \(usable from the default branch only\) in acme\/shop before the proof/);
+    expect(on).toMatch(/deletes it again if the run stops before the setup pull request/);
+    expect(text(false)).not.toMatch(/pipegen-signing/);
+    expect(text()).not.toMatch(/pipegen-signing/);
+  });
+});
+
 describe('consentText (audit-ai, ruling B2)', () => {
   it('consent: audit-ai mode (B2) → files, provider, refusal note, audit AI cost + cap, read-only permissions; no Actions minutes, no repos', () => {
     const { est, text } = audit();

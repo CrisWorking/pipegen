@@ -50,6 +50,8 @@ const WRITE_ROUTES: ReadonlySet<string> = new Set([
   'PATCH /repos/{owner}/{repo}/pulls/{pull_number}',
   'PUT /repos/{owner}/{repo}/environments/{environment_name}',
   'POST /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies',
+  // ruling G-SIGN1-R1: only dropRunSigningEnvironment (deliver.ts), for the pipegen-signing environment the same run made
+  'DELETE /repos/{owner}/{repo}/environments/{environment_name}',
 ]);
 const READ_RE = /^GET \/repos\/\{owner\}\/\{repo\}(?:\/[A-Za-z0-9_{}/.-]*)?$/;
 

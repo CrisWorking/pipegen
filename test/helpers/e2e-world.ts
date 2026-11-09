@@ -201,7 +201,7 @@ export async function e2eWorld(o: E2eOptions = {}): Promise<E2eWorld> {
       asked.push(msg);
       if (/Is this right/.test(msg)) return true;
       if (/more than the/.test(msg)) return true;
-      if (/Create the setup pull request|pull request/i.test(msg) && !/consent|send/i.test(msg)) { tl.push('preview: confirmed'); return o.answers?.preview ?? true; }
+      if (/Create the setup pull request|pull request/i.test(msg) && !/consent|send|Go ahead\?$/i.test(msg)) { tl.push('preview: confirmed'); return o.answers?.preview ?? true; }
       return true;
     },
     select: async (msg) => { asked.push(msg); throw new Error(`no select: ${msg.slice(0, 60)}`); },

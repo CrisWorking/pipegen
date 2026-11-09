@@ -58,6 +58,11 @@ export interface AuditConsentFacts {
 export interface FullConsentFacts extends AuditConsentFacts {
   /** Auth.canCreateRepos: pipegen's own GitHub App login creates and deletes the helper repos (#87); false = token mode. */
   appCreatesRepos: boolean;
+  /**
+   * Ruling G-SIGN1-R1: this run will make the pipegen-signing environment before the proof (firstRunSigning's path can run: a private
+   * repo whose images would be signed with a key pair, no such environment proven yet, a memory folder for the pair). Shown only then.
+   */
+  signingEnv?: boolean;
 }
 
 const MAX_TOP_FOLDERS = 10;
@@ -151,6 +156,12 @@ function reposSection(p: RepoProfile, repos: HelperRepo[], app: boolean): string
     lines.push(`${INDENT}With a token, pipegen never creates or deletes repos${scratch === undefined ? '.' : `; after the proof it empties the scratch repo ${full(scratch.name)}.`}`);
   }
   return lines;
+}
+
+/** Ruling G-SIGN1-R1: the GitHub write the first private run makes before the proof (its own signing environment). */
+function signingEnvSection(p: RepoProfile): string[] {
+  return ['Signing environment',
+    `${INDENT}This private repo's images are signed with a key pair kept in an environment only the default branch can use. pipegen creates the environment pipegen-signing (usable from the default branch only) in ${shownName(`${p.owner}/${p.repo}`, 200)} before the proof, right after this yes, and reads it back; it deletes it again if the run stops before the setup pull request.`];
 }
 
 function minutesSection(p: RepoProfile, est: Estimates): string[] {
@@ -276,6 +287,7 @@ function screenFor(p: RepoProfile, provider: AiProvider, est: Estimates | AuditA
       filesSection(p, bundle, facts.secretScanner),
       providerSection(provider, place),
       reposSection(p, repos, app),
+      (facts as FullConsentFacts).signingEnv === true ? signingEnvSection(p) : [],
       minutesSection(p, e),
       costSection('AI cost (estimate)', e.aiCostUsd, e.aiCostCapUsd, place),
       basisSection('How these estimates were made', e.basis),

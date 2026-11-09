@@ -273,6 +273,9 @@ describe('e2e', () => {
     expect(w.fgh.unrouted).toEqual([]);
     expect(w.io.errs.join('\n')).toMatch(/pipegen made the environment pipegen-signing \(default branch only\) and read it back, so this run signs/);
     expect(w.io.errs.join('\n')).not.toMatch(/Signing is off/);
+    // G-SIGN1-R1: the consent screen named the write before the yes
+    expect(w.io.asked.find((q) => /Go ahead\?/.test(q))).toMatch(/pipegen creates the environment pipegen-signing \(usable from the default branch only\)/);
+    expect(w.io.errs.join('\n')).not.toMatch(/deleted the environment/);
 
     // the environment: made once (the PUT and its one rule), before any proof push and before the setup PR; read back after its rule
     const calls = w.fgh.calls;
@@ -307,5 +310,19 @@ describe('e2e', () => {
     expect(sign).toMatch(/^\s+environment: pipegen-signing$/m);
     expect(sign).toMatch(/cosign" sign --yes --key env:\/\/PIPEGEN_COSIGN_KEY/);
     expect(sign).toMatch(/PIPEGEN_COSIGN_KEY: "\$\{\{ secrets\.PIPEGEN_COSIGN_KEY \}\}"/);
+  }, 240_000);
+
+  // Ruling G-SIGN1-R1: a run that made its own signing environment and stops before delivery (here: "no" at the preview) deletes it again,
+  // and takes it off the local leftovers file; the seeded run's consent screen has no such line (the environment is proven there)
+  it('e2e: G-SIGN1-R1 a no at the preview deletes the signing environment the run made', async () => {
+    const { w, code } = await scenario('private-signing-fresh-no', { signing: true, signingEnv: false, answers: { preview: false } });
+    expect(code, w.io.errs.join('\n')).toBe(1);
+    expect(w.fgh.calls.some((c) => c.route === 'POST /repos/{owner}/{repo}/pulls')).toBe(false);
+    expect(w.fgh.repo(APP).envs.has(SIGNING_ENV)).toBe(false);
+    const del = w.fgh.calls.filter((c) => c.route === 'DELETE /repos/{owner}/{repo}/environments/{environment_name}');
+    expect(del.map((c) => c.params.environment_name)).toEqual([SIGNING_ENV]);
+    expect(w.io.errs.join('\n')).toMatch(/pipegen deleted the environment pipegen-signing it made earlier in this run/);
+    const seeded = await PRIVATE();
+    expect(seeded.w.io.asked.find((q) => /Go ahead\?/.test(q))).not.toMatch(/pipegen creates the environment pipegen-signing/);
   }, 240_000);
 });

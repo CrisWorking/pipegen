@@ -50,7 +50,7 @@ import { safeText } from '../util/safe-text.js';
 import {
   commitFiles, compareStatus, DeliverError, ghRead, ghWrite, isoAt, openOrUpdatePr, readHead, readRepo, readTree, refusedMove, sameInstant, setBranch, statusOf, type RepoRef, type TreeEntry,
 } from './git-data.js';
-import { addLocalLeftovers, centralPrBase, centralUpdateBranch, localRecordPath, ownWholeFile, protectedPathsForRecord, RecordError, writeRecord, type Leftover, type LocalRecordDeps, type RecordedEdit } from './record.js';
+import { addLocalLeftovers, centralPrBase, dropLocalLeftovers, localLeftoversPath, centralUpdateBranch, localRecordPath, ownWholeFile, protectedPathsForRecord, RecordError, writeRecord, type Leftover, type LocalRecordDeps, type RecordedEdit } from './record.js';
 import { trustedPrevious, UNREADABLE_RUN_WAY_ON } from './trust.js';
 
 export { DeliverError };
@@ -565,6 +565,30 @@ export async function makeRunSigningEnvironment(gh: Octokit, app: RepoRef, defau
     throw new DeliverError(`pipegen made the environment ${SIGNING_ENVIRONMENT} in ${show(`${app.owner}/${app.repo}`)} but couldn't list it in the local leftovers file (${why}), so it stops here. Remove the environment by hand, or run \`npx pipegen run\` again.`, { cause: e, leftovers: [`environment ${SIGNING_ENVIRONMENT}`] });
   }
   return { env };
+}
+
+/**
+ * Ruling G-SIGN1-R1: a run that made its own environment (makeRunSigningEnvironment) and stops before delivery deletes it again, as the
+ * proof's keys are cleaned up. Only the environment this run made: its GitHub created_at must still be `env`'s (another one is never
+ * deleted). Gone already, or deleted: its entry leaves the local leftovers file (`dropped`). Anything else keeps the environment and its
+ * leftovers entry, and `left` says why and names the file.
+ */
+export async function dropRunSigningEnvironment(gh: Octokit, app: RepoRef, env: EnvEntry, x: { clock?: RateClock; local?: LocalRecordDeps; now: Date }): Promise<{ dropped: true } | { left: string }> {
+  const clock = x.clock ?? clockOf(gh);
+  const file = localLeftoversPath(app, x.local ?? {});
+  const left = (why: string): { left: string } => ({ left: `${why}; it stays listed in ${file}` });
+  const ours = (l: Leftover): boolean => l.kind === 'environment' && l.name === SIGNING_ENVIRONMENT && l.repo.toLowerCase() === `${app.owner}/${app.repo}`.toLowerCase() && l.scope === undefined;
+  if (env.name !== SIGNING_ENVIRONMENT || !env.created || env.githubCreatedAt === undefined) return left('it is not an environment this run made');
+  let cur: EnvRead | null;
+  try { cur = await readEnv(gh, app, clock); } catch (e) { return left(e instanceof DeliverError ? `pipegen couldn't read it` : 'an error'); }
+  if (cur !== null) {
+    if (!sameInstant(env.githubCreatedAt, cur.createdAt)) return left('it is not the one this run made (GitHub gives another created_at), so pipegen keeps it');
+    try { await ghWrite(gh, 'DELETE /repos/{owner}/{repo}/environments/{environment_name}', app, { environment_name: SIGNING_ENVIRONMENT }, clock); } catch (e) {
+      if (statusOf(e) !== 404) return left(statusOf(e) === undefined ? 'an error' : `HTTP ${statusOf(e)}`);
+    }
+  }
+  await dropLocalLeftovers(app, ours, x.now, x.local ?? {}).catch(() => undefined);
+  return { dropped: true };
 }
 
 // ---------- secrets (steps 3-4) ----------

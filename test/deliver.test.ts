@@ -13,7 +13,7 @@ import { centralProjectName } from '../src/engine/central-path.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { pubKeySha256 } from '../src/engine/signing.js';
 import { PromptCancelledError, type Prompter } from '../src/cli/io.js';
-import { deliver, deliverCentral, makeRunSigningEnvironment, PART_ORDER, planDelivery, previewText, SETUP_BRANCH, type DeliveryInput, type DeliverDeps, type SigningKey } from '../src/deliver/deliver.js';
+import { deliver, deliverCentral, dropRunSigningEnvironment, makeRunSigningEnvironment, PART_ORDER, planDelivery, previewText, SETUP_BRANCH, type DeliveryInput, type DeliverDeps, type SigningKey } from '../src/deliver/deliver.js';
 import { DeliverError, ghRead, ghWrite } from '../src/deliver/git-data.js';
 import { confirmView, TYPED_VIEW_FIELDS } from '../src/deliver/trust.js';
 import { InstallRecordSchema, readRecord, recordFileText, recordHash, recordMarker, recordPath, writeLocalRecord, writeRecord } from '../src/deliver/record.js';
@@ -686,6 +686,50 @@ describe('G10 delivery: secrets and settings before the merge', () => {
     expect(e).toBeInstanceOf(DeliverError);
     expect((e as DeliverError).message).toMatch(/pipegen-signing/);
     expect((e as DeliverError).leftovers).toEqual(['environment pipegen-signing']);
+  });
+
+  it('dropRunSigningEnvironment: deletes the environment this run made and takes it off the leftovers file (G-SIGN1-R1)', async () => {
+    const x = (w: World) => ({ clock: { budget: newRateBudget(), sleep: async () => {} }, local: { home: w.home, env: {} }, now: new Date('2026-11-05T12:00:00Z') });
+    const file = (w: World) => join(w.home, '.config', 'pipegen', 'records', 'o__r.leftovers.json');
+    const w = world();
+    // another leftover of the same app stays in the file
+    await recordMod.addLocalLeftovers({ owner: 'o', repo: 'r' }, [{ kind: 'branch', name: SETUP_BRANCH, repo: 'o/r' }], new Date('2026-11-05T11:00:00Z'), { home: w.home, env: {} });
+    const made = await makeRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, 'main', x(w));
+    if (!('env' in made)) throw new Error('expected the environment');
+    expect(await dropRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, made.env, x(w))).toEqual({ dropped: true });
+    expect(w.g.repo('o/r').envs.has('pipegen-signing')).toBe(false);
+    expect(w.g.calls.filter((c) => c.route === 'DELETE /repos/{owner}/{repo}/environments/{environment_name}').map((c) => c.params.environment_name)).toEqual(['pipegen-signing']);
+    expect((JSON.parse(readFileSync(file(w), 'utf8')) as { items: { kind: string }[] }).items).toEqual([{ kind: 'branch', name: SETUP_BRANCH, repo: 'o/r' }]);
+    // already gone: nothing to delete, the entry goes
+    const w2 = world();
+    const m2 = await makeRunSigningEnvironment(w2.g.octokit(), { owner: 'o', repo: 'r' }, 'main', x(w2));
+    if (!('env' in m2)) throw new Error('expected the environment');
+    w2.g.repo('o/r').envs.delete('pipegen-signing');
+    expect(await dropRunSigningEnvironment(w2.g.octokit(), { owner: 'o', repo: 'r' }, m2.env, x(w2))).toEqual({ dropped: true });
+    expect(w2.g.calls.some((c) => c.route.startsWith('DELETE '))).toBe(false);
+    expect((JSON.parse(readFileSync(file(w2), 'utf8')) as { items: unknown[] }).items).toEqual([]);
+  });
+
+  it('dropRunSigningEnvironment: a refused delete, or an environment that is not the one this run made, keeps it and its leftovers entry, and says where (G-SIGN1-R1)', async () => {
+    const x = (w: World) => ({ clock: { budget: newRateBudget(), sleep: async () => {} }, local: { home: w.home, env: {} }, now: new Date('2026-11-05T12:00:00Z') });
+    const file = (w: World) => join(w.home, '.config', 'pipegen', 'records', 'o__r.leftovers.json');
+    const w = world();
+    const made = await makeRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, 'main', x(w));
+    if (!('env' in made)) throw new Error('expected the environment');
+    w.g.hooks.push((c) => (c.route === 'DELETE /repos/{owner}/{repo}/environments/{environment_name}' ? { status: 403, data: { message: 'nope' } } : undefined));
+    const out = await dropRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, made.env, x(w));
+    expect(out).toEqual({ left: expect.stringMatching(/HTTP 403.*o__r\.leftovers\.json/) });
+    expect(w.g.repo('o/r').envs.has('pipegen-signing')).toBe(true);
+    expect((JSON.parse(readFileSync(file(w), 'utf8')) as { items: { name: string }[] }).items.map((i) => i.name)).toEqual(['pipegen-signing']);
+    // someone replaced it (another created_at): never deleted
+    const w2 = world();
+    const m2 = await makeRunSigningEnvironment(w2.g.octokit(), { owner: 'o', repo: 'r' }, 'main', x(w2));
+    if (!('env' in m2)) throw new Error('expected the environment');
+    (w2.g.repo('o/r').envs.get('pipegen-signing') as { created_at: string }).created_at = '2026-11-05T13:00:00Z';
+    const o2 = await dropRunSigningEnvironment(w2.g.octokit(), { owner: 'o', repo: 'r' }, m2.env, x(w2));
+    expect(o2).toEqual({ left: expect.stringMatching(/not the one this run made.*o__r\.leftovers\.json/) });
+    expect(w2.g.calls.some((c) => c.route.startsWith('DELETE '))).toBe(false);
+    expect(w2.g.repo('o/r').envs.has('pipegen-signing')).toBe(true);
   });
 
   it('deliver: G-SIGN1 the environment the run made before assembly is recorded as made by pipegen, not as one that was there', async () => {

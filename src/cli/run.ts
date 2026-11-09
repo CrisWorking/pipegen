@@ -41,7 +41,7 @@ import { debate as runDebate, type DebateResult } from '../debate/debate.js';
 import { needKeyOf } from '../debate/need-ref.js';
 import { decideTests } from '../debate/tests.js';
 import type { StarterDeps } from '../create/tests.js';
-import { deliver, deliverCentral, DeliverError, makeRunSigningEnvironment, planDelivery, previewText, readCentralFileList, type DeliverResult, type DeliveryInput, type SigningKey, type CentralPr, type CentralResult } from '../deliver/deliver.js';
+import { deliver, deliverCentral, DeliverError, dropRunSigningEnvironment, makeRunSigningEnvironment, planDelivery, previewText, readCentralFileList, type DeliverResult, type DeliveryInput, type SigningKey, type CentralPr, type CentralResult } from '../deliver/deliver.js';
 import { pipegenDoc } from '../deliver/docs.js';
 import { coFacts, type CoFacts } from '../deliver/finish.js';
 import { readBlobText, readHead, readRepo, readTree } from '../deliver/git-data.js';
@@ -74,7 +74,7 @@ import { armProofCleanup, type ProofMeters } from '../proof/cleanup.js';
 import { makeFixGuard, makeFixReferee } from '../proof/fix.js';
 import { COMPAT_PREFIX, HARNESS_PATH } from '../proof/harness.js';
 import { isPlantedPath } from '../debate/planted.js';
-import type { InterruptContext } from '../util/exit-hooks.js';
+import { onInterrupt, type InterruptContext } from '../util/exit-hooks.js';
 import { makeCleanupOnly, makeRunProof, type ProofBuild, type ProofInput, type ProofReturn, type RunProof } from './run-proof.js';
 import { keyOffers, type Choice } from '../debate/builder.js';
 import { restoreAiSpend } from '../proof/cleanup.js';
@@ -237,7 +237,8 @@ export interface RunStages {
   /** G13-R1 (sec I1): after the yes, the pinned scanner the consent named over exactly the counted files; refuses when it can't. */
   scan(dir: string, consent: ConsentToken, knownValues: string[], agreed: Agreed): Promise<CodeBundle>;
   activity(f: GitHubFacts, p: RepoProfile): Promise<Activity>;
-  consent(f: GitHubFacts, p: RepoProfile, ai: ReturnType<typeof makeProvider>, est: Estimates, bundle: CodeBundle, auth: Auth, extra: string[]): Promise<ConsentToken | null>;
+  /** `opts.signingEnv` (ruling G-SIGN1-R1): the screen says pipegen creates pipegen-signing before the proof (only when that path can run). */
+  consent(f: GitHubFacts, p: RepoProfile, ai: ReturnType<typeof makeProvider>, est: Estimates, bundle: CodeBundle, auth: Auth, extra: string[], opts?: { signingEnv: boolean }): Promise<ConsentToken | null>;
   /** G13-R2 4 (sec m3): `guard` is the run's known-value check (the vault and the key vault, read live) and its tokens: never written. */
   state(p: RepoProfile, guard: { vault: KnownValueCheck; tokens: readonly string[] }): Promise<StateStore>;
   /** Carry 58 (ruling G13-R0 12): a public app's gate, at its pinned commit, can be read. */
@@ -263,6 +264,8 @@ export interface RunStages {
   signingKey(): Promise<SigningKey>;
   /** Ruling G-SIGN1: makeRunSigningEnvironment (the run's own pipegen-signing, made new and read back), or why signing is off. */
   signingEnv(f: GitHubFacts, p: RepoProfile): Promise<{ env: SigningEnvEntry } | { off: string }>;
+  /** Ruling G-SIGN1-R1: dropRunSigningEnvironment (the run stops before delivery: the environment it made is deleted), or why it stays. */
+  dropSigningEnv(f: GitHubFacts, p: RepoProfile, env: SigningEnvEntry): Promise<{ dropped: true } | { left: string }>;
   deliver(f: GitHubFacts, p: RepoProfile, input: DeliveryInput, vault: SecretVault, io: CliIO, signingKey?: () => Promise<SigningKey>): Promise<DeliverResult>;
   /** The setup PR: merged, closed (unmerged) or still open. */
   prState(f: GitHubFacts, p: RepoProfile, pr: number): Promise<'merged' | 'closed' | 'open'>;
@@ -293,6 +296,8 @@ export interface RunDeps {
   resume?: boolean;
   /** G14: the cleanup of a resumed run whose proof passed but whose cleanup didn't finish (default makeCleanupOnly()). */
   cleanupOnly?: ReturnType<typeof makeCleanupOnly>;
+  /** Ruling G-SIGN1-R1: arms the deletion of the run's own signing environment on an interrupt; returns the disarm (default onInterrupt). */
+  armSigningEnv?: (cleanup: () => Promise<void>) => () => void;
   /** sec M4: whether the memory folder is one (default isMemoryFolder). */
   isMemory?: (dir: string) => boolean;
   /** sec I1: the pinned secret scanner (default ensurePinnedBinary with the pins). */
@@ -318,6 +323,9 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
   let keyVault: SecretVault | null = null;
   let store: StateStore | null = null;
   let disarm: (() => void) | null = null;
+  // ruling G-SIGN1-R1: the deletion of the signing environment this run made, until delivery takes it (and its interrupt disarm)
+  let dropEnv: (() => Promise<void>) | null = null;
+  let disarmEnv: (() => void) | null = null;
   /** The services a workflow, compose or bake file builds an image from (containerHint): carry 13's way past. */
   let hinted: readonly { name: string; containerHint?: string }[] = [];
   try {
@@ -332,6 +340,12 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     if (e instanceof AssembleError) for (const t of dastWayPast(e.message, hinted)) err(t);
     return 1;
   } finally {
+    // ruling G-SIGN1-R1: a run that stops before delivery (any exit path) deletes the environment it made
+    const drop = dropEnv as (() => Promise<void>) | null;
+    dropEnv = null;
+    try { (disarmEnv as (() => void) | null)?.(); } catch { /* the hook only deletes what this run made */ }
+    disarmEnv = null;
+    if (drop !== null) await drop().catch(() => undefined);
     (vault as SecretVault | null)?.wipe();
     (keyVault as SecretVault | null)?.wipe();
     try { (disarm as (() => void) | null)?.(); } catch { /* the state file keeps what was done */ }
@@ -421,7 +435,8 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     let scannerName: 'gitleaks' | 'betterleaks' = chooseSecretScanner(io.env);
     let agreedMinutes = est.monthlyMinutes;
     if (counted !== undefined) {
-      const consent = await st.consent(facts, p, provider, est, counted, auth, extra);
+      // ruling G-SIGN1-R1: the screen names the signing environment the run creates before the proof, only when that path can run
+      const consent = await st.consent(facts, p, provider, est, counted, auth, extra, { signingEnv: firstRunSigningCan(p, facts.caps) && hasMemory() });
       if (consent === null) { err('No consent: nothing was created, nothing was sent to an AI and no secret was asked for. exit code 1.'); return 1; }
       scannerName = (consent as { terms?: { secretScanner?: { name: 'gitleaks' | 'betterleaks' } } }).terms?.secretScanner?.name ?? scannerName;
       // the secret scan of the counted files only; a finding stops the run before anything is sent to an AI
@@ -498,6 +513,18 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
       if (first.env !== undefined) {
         facts = { ...facts, caps: first.caps };
         runSigningEnv = first.env;
+        // ruling G-SIGN1-R1: from here until delivery takes it, a stop (any exit path, or an interrupt) deletes it again
+        const made = first.env;
+        let ran = false;
+        const once = async (): Promise<void> => {
+          if (ran) return;
+          ran = true;
+          const r = await st.dropSigningEnv(facts, p, made).catch(() => ({ left: 'an error' }));
+          if ('dropped' in r) err(SIGNING_ENV_DELETED);
+          else err(`pipegen couldn't delete the environment ${SIGNING_ENVIRONMENT} it made earlier in this run (${safeText(r.left, 600)}). Remove it by hand in the repository settings.`);
+        };
+        dropEnv = once;
+        disarmEnv = (deps.armSigningEnv ?? defaultArmSigningEnv)(once);
         keyEnvApplies = signingMode(p, facts.caps) === 'key-env' && publishedImageServices(p, facts.caps).length > 0;
       }
       // 9-10
@@ -683,6 +710,8 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     // 19. deliver (key-env: the key pair made in memory, carry 16 and 28)
     const keyEnv = built.assembled.draft.signing?.mode === 'key-env';
     const key = pair;
+    // ruling G-SIGN1-R1: delivery takes the run's signing environment from here (the record or its leftovers name it)
+    try { (disarmEnv as (() => void) | null)?.(); } finally { disarmEnv = null; dropEnv = null; }
     const res = await st.deliver(facts, p, input, vault, io, keyEnv && key !== undefined ? async () => key : undefined);
     store.setStage('delivered');
     // carry 19 (spec I4): everything delivery says
@@ -730,6 +759,21 @@ type SigningEnvEntry = InstallRecord['environments'][number];
 export const NO_MEMORY_SIGNING_OFF = `Signing is off (mode none): this repository's images would be signed with a key pair, which pipegen makes only in memory (${MEMORY_DIR}), and this machine has no such folder, so pipegen made no signing environment. Run pipegen on Linux (WSL or a Linux container works too) to sign.`;
 export const RUN_SIGNS_NOTE = `pipegen made the environment ${SIGNING_ENVIRONMENT} (default branch only) and read it back, so this run signs its images with a key pair (key-env).`;
 
+/** Ruling G-SIGN1-R1: the deletion notice of a run that stopped before delivery. */
+export const SIGNING_ENV_DELETED = `pipegen deleted the environment ${SIGNING_ENVIRONMENT} it made earlier in this run: nothing was delivered.`;
+/** Ruling G-SIGN1-R1: the production arm (an interrupt hook, like the proof's keys). */
+export const defaultArmSigningEnv = (cleanup: () => Promise<void>): (() => void) => onInterrupt(async () => { await cleanup(); });
+
+/**
+ * Whether firstRunSigning would make the run's own environment (the memory folder aside): a private repo with environments, the rule not
+ * proven yet, and key-env with a published image once it is (attestations, no image, a public repo: never).
+ */
+export function firstRunSigningCan(p: RepoProfile, caps: Capabilities): boolean {
+  if (!p.private || !caps.environments || caps.deploymentBranchPolicies) return false;
+  const proven: Capabilities = { ...caps, deploymentBranchPolicies: true };
+  return signingMode(p, proven) === 'key-env' && publishedImageServices(p, proven).length > 0;
+}
+
 /**
  * Ruling G-SIGN1 (G16 review F6): the first run on a private repo signs when the plan allows. Asked only when key-env is what the proven
  * rule would give (a private repo, environments, no attestations, a published image) and the probe could not prove the rule (no
@@ -738,9 +782,8 @@ export const RUN_SIGNS_NOTE = `pipegen made the environment ${SIGNING_ENVIRONMEN
  * probed (signing mode none) with the reason in `notes`; nothing claims signing that the read-back didn't prove.
  */
 export async function firstRunSigning(p: RepoProfile, caps: Capabilities, make: () => Promise<{ env: SigningEnvEntry } | { off: string }>, memory: () => boolean): Promise<{ caps: Capabilities; env?: SigningEnvEntry; notes: string[] }> {
-  if (!p.private || !caps.environments || caps.deploymentBranchPolicies) return { caps, notes: [] };
+  if (!firstRunSigningCan(p, caps)) return { caps, notes: [] };
   const proven: Capabilities = { ...caps, deploymentBranchPolicies: true };
-  if (signingMode(p, proven) !== 'key-env' || publishedImageServices(p, proven).length === 0) return { caps, notes: [] };
   if (!memory()) return { caps, notes: [NO_MEMORY_SIGNING_OFF] };
   const made = await make();
   if ('off' in made) return { caps, notes: [`Signing is off (mode none): ${made.off}`] };
@@ -1093,12 +1136,12 @@ function realStages(io: CliIO, deps: RunDeps): RunStages {
     provider: () => makeProvider({ env: io.env, fetch: io.fetch, log: (l) => { io.err(l); } }),
     bundle: (dir, knownValues) => bundleCode(dir, { knownValues }),
     activity: (f, p) => activity30d(f.gh, p, f.clock),
-    async consent(f, p, ai, est, bundle, auth, extra) {
+    async consent(f, p, ai, est, bundle, auth, extra, opts) {
       const scanner = chooseSecretScanner(io.env);
       const repos = [];
       for (const name of [CENTRAL_REPO, `pipegen-proof-${p.repo}`]) repos.push({ name, exists: (await readRepo(f.gh, { owner: p.owner, repo: name }, f.clock).catch(() => null)) !== null });
       // sec I1: the counting summary (an upper bound); the pinned scanner runs only after the yes (the scan stage)
-      const screen = consentScreen(p, ai, est, countingSummary(bundle), permissionsTable('write', { appCreatesRepos: auth.canCreateRepos }), repos, 'full', { appCreatesRepos: auth.canCreateRepos, secretScanner: { name: scanner, version: loadPinnedBinaries()[scanner].version } });
+      const screen = consentScreen(p, ai, est, countingSummary(bundle), permissionsTable('write', { appCreatesRepos: auth.canCreateRepos }), repos, 'full', { appCreatesRepos: auth.canCreateRepos, secretScanner: { name: scanner, version: loadPinnedBinaries()[scanner].version }, signingEnv: opts?.signingEnv === true });
       for (const l of extra) io.err(l);
       return askConsent(io.prompt, screen, (s) => { io.err(s); });
     },
@@ -1164,6 +1207,7 @@ function realStages(io: CliIO, deps: RunDeps): RunStages {
     deliverCentral: (f, p, files, io2, pr) => deliverCentral(f.gh, p, files, { clock: f.clock, local, io: io2.prompt, interactive, ...(pr === undefined ? {} : { pr }) }),
     readCentralFileList: (f, p) => readCentralFileList(f.gh, p, f.clock),
     preview: (input) => previewText(planDelivery(input)),
+    dropSigningEnv: (f, p, env) => dropRunSigningEnvironment(f.gh, { owner: p.owner, repo: p.repo }, env, { clock: f.clock, local, now: new Date((deps.now ?? Date.now)()) }),
     signingEnv: (f, p) => makeRunSigningEnvironment(f.gh, { owner: p.owner, repo: p.repo }, p.defaultBranch, { clock: f.clock, local, now: new Date((deps.now ?? Date.now)()) }),
     async signingKey() {
       // carry 28: the one in-memory key maker (finish uses it too)

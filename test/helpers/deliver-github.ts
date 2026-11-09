@@ -287,6 +287,10 @@ export class FakeGitHub {
         repo.envs.set(p.environment_name, e);
         return ok(this.#envView(p.environment_name, e));
       }
+      case 'DELETE /repos/{owner}/{repo}/environments/{environment_name}': {
+        if (!repo.envs.delete(p.environment_name)) fail(404);
+        return ok(undefined, 204);
+      }
       case 'GET /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies': {
         const e = this.#env(repo, p.environment_name);
         return ok({ total_count: e.policies.length, branch_policies: e.policies.map((x) => ({ ...x })) });
