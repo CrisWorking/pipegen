@@ -77,12 +77,18 @@ export function codeownersFile(original: string, block: string): string {
 /**
  * The second edit form (a re-run): `inserted` is the old block the install record says pipegen wrote (EditKind 'codeowners'); it is replaced
  * in place by the new block and every other byte stays. Returns null if `inserted` is not in the original exactly once, or does not start a line.
+ * G17 row 23: the record of a first run holds what codeownersFile added, the separator before the block included (`\n`, or `\n\n` after an
+ * original with no final newline). That separator (at most two newlines, nothing else) is pipegen's and is kept in front of the new block;
+ * the block itself must start a line.
  */
 export function codeownersReplace(original: string, inserted: string, block: string): string | null {
-  const i = inserted === '' ? -1 : original.indexOf(inserted);
+  const sep = /^\n{0,2}/.exec(inserted)?.[0] ?? '';
+  if (inserted.length === sep.length || inserted[sep.length] === '\n') return null;   // no block, or more newlines than pipegen puts before one
+  const i = original.indexOf(inserted);
   if (i < 0 || original.indexOf(inserted, i + 1) >= 0) return null;
-  if (i > 0 && original[i - 1] !== '\n') return null;   // the block starts a line; mid-line, the user's text before it would be read as part of a rule
-  return `${original.slice(0, i)}${block}${original.slice(i + inserted.length)}`;
+  const at = i + sep.length;
+  if (at > 0 && original[at - 1] !== '\n') return null;   // the block starts a line; mid-line, the user's text before it would be read as part of a rule
+  return `${original.slice(0, at)}${block}${original.slice(i + inserted.length)}`;
 }
 
 /** The user's rules (outside pipegen's own old block) whose pattern is also a line of `block`: the block overrides them, so a note should list them. */
@@ -220,8 +226,8 @@ export function secretsHookRun(version: string | null): string {
 export function hookFileMode(path: string): '100755' | null {
   return path === HOOK_FILES.husky ? '100755' : null;
 }
-/** The shebang of a new husky script (G6, carry m5). */
-const HUSKY_SHEBANG = '#!/usr/bin/env sh\n';
+/** The shebang of a new husky script (G6, carry m5); the uninstall revert reads the same constant (G17 row 25). */
+export const HUSKY_SHEBANG = '#!/usr/bin/env sh\n';
 /** One hook pipegen appends: its id (`pipegen-<tool>`) and its command line. */
 export interface HookCommand { id: string; run: string }
 const HOOK_RUN_RE = /^[A-Za-z0-9 ._@=:/-]{1,300}$/;

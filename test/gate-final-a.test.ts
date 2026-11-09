@@ -1,6 +1,7 @@
 // Plan C final-review fix round A (final-fix-A.md), written first (strict test-first).
 // Ruling 1 (Important 1): one helper, gateStepInputs(draft), builds every input of the gate step in mode gate; renderGateStep and the referee
 // both use it, and the referee requires the file's gate step `with` to equal it exactly (no missing input, no extra input, no other value).
+import { WORKFLOW_CONCURRENCY } from '../src/engine/job-rules.js';   // G17 row 1b: pipegen.yml carries the workflow concurrency
 import { Document } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { gateJobList, GateJobListError, resultFormat, type JobListEntry } from '../src/engine/gate-job-list.js';
@@ -54,7 +55,7 @@ const job = (steps: RenderedStep[], over: Job = {}): Job => ({ 'runs-on': 'ubunt
 function workflow(jobs: Record<string, Job>): CreatedFile {
   const doc = new Document();
   const plain = Object.fromEntries(Object.entries(jobs).map(([id, j]) => [id, Object.fromEntries(Object.entries(j).filter(([k]) => k !== 'steps'))]));
-  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, jobs: plain });
+  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, concurrency: { ...WORKFLOW_CONCURRENCY }, jobs: plain });
   for (const [id, j] of Object.entries(jobs)) {
     const steps = j.steps as RenderedStep[];
     doc.setIn(['jobs', id, 'steps'], id === 'gate' ? doc.createNode(withEgress(steps).map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(withEgress(steps)));

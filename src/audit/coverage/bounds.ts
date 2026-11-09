@@ -38,6 +38,8 @@ export const MAX_PACKAGE_FILES = 50; // distinct package.json files read for scr
 export const MAX_SCRIPT_FILES = 100;
 export const MAX_SCRIPTS = 1_000;    // distinct (dir, script) pairs worked out (fix round 3: was 200, with a depth limit of 4)
 export const MAX_SCRIPT_TARGETS = 200;
+/** G17-R1: entries one script call's result list may hold (after removing repeats); more makes that call unknown. */
+export const MAX_SCRIPT_RESULTS = 2_000;
 
 /**
  * Fix round 4 (N8): bounds on npm-run-all / concurrently script globs. A call names at most MAX_SCRIPT_PATTERNS of them

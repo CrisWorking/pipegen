@@ -744,7 +744,7 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
       const call = scriptCall(name, args);
       if (call === null) return;
       if (call.capped) { // fix round 4 (N8): more patterns than pipegen reads, or one it can't: never covered, never missing
-        add({ categories: UNKNOWN_SCRIPT_CATEGORIES, by: `your own \`${name}\``, subject: `Your own \`${name}\``, dir: cwd, reason: null, partialWhy: globCappedWhy(`your own \`${name}\``) });
+        add({ categories: UNKNOWN_SCRIPT_CATEGORIES, by: `your own \`${name}\``, subject: `Your own \`${name}\``, dir: null, reason: null, partialWhy: globCappedWhy(`your own \`${name}\``) }); // G17-R3 (I1)
         return;
       }
       if (call.unknown) return;

@@ -18,6 +18,7 @@ import { CLEAN, gitleaksAt, makeStub, scanWith } from './helpers/gitleaks-stub.j
 import { fake } from './helpers/secret-repo.js';
 import { cleanupRepos, makeRepo, makeTempDir, writeIn } from './helpers/make-repo.js';
 import { strictProblems } from './helpers/strict-schema.js';
+import { expectScaling } from './helpers/scaling.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
 
 // ---------- builders ----------
@@ -135,6 +136,22 @@ describe('needs schema', () => {
     for (const c of NEED_CATEGORIES) expect(NEED_ID_CATEGORY[c]).toBe(c);
     expect(NEED_ID_CATEGORY['migration-check']).toBe('full-tests');
   });
+});
+
+describe('floorNeeds scaling (G17-R1)', () => {
+  it('per-service lookups use a map: 8 times the services is about 8 times the time, not 64', async () => {
+    const many = (n: number) => profile({ monorepo: 'npm-workspaces', services: Array.from({ length: n }, (_, i) => web({ name: `s${i}`, path: `apps/s${i}` })) });
+    let needs: Need[] = [];
+    await expectScaling('floorNeeds services', (size) => {
+      const p = many(size === 'small' ? 2_000 : 16_000);
+      const t = performance.now();
+      const r = floorNeeds(p, PUBLIC);
+      const ms = performance.now() - t;
+      if (size === 'big') needs = r;
+      return ms;
+    }, 16);
+    expect(find(needs, 'push', 'unit-tests', 's15999').length).toBe(1);
+  }, 120_000);
 });
 
 describe('isRunnable', () => {

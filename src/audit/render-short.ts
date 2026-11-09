@@ -15,7 +15,7 @@ import type { NeedCategory } from '../types.js';
 import { num, plural } from '../util/format.js';
 import { OUTPUT_CAP } from '../util/safe-output.js';
 import type { Coverage } from './coverage.js';
-import { buildsNoImage, creditNotes, isOwnCommand, LIMIT, needLabel, type AuditReport } from './model.js';
+import { noImageCheck, creditNotes, isOwnCommand, LIMIT, needLabel, type AuditReport } from './model.js';
 import {
   aiCostText, andList, commitLine, isSerious, layerViews, typeText, verdictOf, wrap, type Doc, type RenderCtx,
 } from './render.js';
@@ -60,7 +60,8 @@ interface Gap extends GapLine { partial: boolean; serious: boolean; floor: boole
  * hook that shares its name with its CI twin (the secret scan) says "before each commit", so no two lines read alike.
  */
 function labelsOf(r: AuditReport): (cov: Coverage) => string {
-  const base = (cov: Coverage) => needLabel(cov.need.id, { noImage: buildsNoImage(cov.need, r.profile) }) ?? cov.need.id;
+  const noImage = noImageCheck(r.profile); // G17-R2 (F10): services indexed once
+  const base = (cov: Coverage) => needLabel(cov.need.id, { noImage: noImage(cov.need) }) ?? cov.need.id;
   const ci = new Set(r.coverage.filter((x) => groupOf(x) === 'ci').map(base));
   return (cov) => (groupOf(cov) === 'hook' && ci.has(base(cov)) ? `${base(cov)} before each commit` : base(cov));
 }

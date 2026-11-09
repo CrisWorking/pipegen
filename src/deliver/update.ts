@@ -884,7 +884,9 @@ export async function update(gh: Octokit, app: RepoRef, deps: UpdateDeps): Promi
     throw new UpdateError(`This machine has no local record file for ${show(`${app.owner}/${app.repo}`, 140)}, so pipegen can't check its install record. Run \`npx pipegen run\` in this repo first (it re-checks the full setup), then run update again.`);
   }
   if (trusted.record === null) {
-    throw new UpdateError(`pipegen found no install record for ${show(`${app.owner}/${app.repo}`, 140)} that it trusts, so it changes nothing: update touches only the files the record lists.${notes.length > 0 ? ` ${notes.join(' ')}` : ''}`);
+    // G17C-R1 (F6, m2): an unreadable local record file gets update's own way on
+    const wayOn = trusted.why === 'unreadable' ? ' Remove or fix that local record file, run `npx pipegen run` in this repo (it re-checks the full setup), then run update again.' : '';
+    throw new UpdateError(`pipegen found no install record for ${show(`${app.owner}/${app.repo}`, 140)} that it trusts, so it changes nothing: update touches only the files the record lists.${notes.length > 0 ? ` ${notes.join(' ')}` : ''}${wayOn}`);
   }
   const record = trusted.record;
   // G12-R1 C1: a record trusted by typing is a view (edits, plans and settings dropped); update never writes it back as the record

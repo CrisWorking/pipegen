@@ -8,7 +8,7 @@ import * as childProcess from 'node:child_process';
 import { bundleCode, COUNTING_ONLY_NOTE, EXCLUDED_PATTERNS, redact } from '../src/ai/redact.js';
 import { ignoreBudgetNote } from '../src/read/gitignore.js';
 import { mapCoverage } from '../src/audit/coverage.js';
-import { buildAudit, buildsNoImage, CURRENT_MILESTONE, needLabel, type AuditDeps, type AuditReport } from '../src/audit/model.js';
+import { buildAudit, buildsNoImage, CURRENT_MILESTONE, noImageCheck, needLabel, type AuditDeps, type AuditReport } from '../src/audit/model.js';
 import { renderJson, renderMarkdown, renderTerminal } from '../src/audit/render.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { floorNeeds, jobCategories, STATIC_SKIP } from '../src/engine/needs.js';
@@ -17,6 +17,7 @@ import { readProject } from '../src/read/project.js';
 import { skippedWorkflowCount } from '../src/read/workflows.js';
 import { DEFAULT_MODEL, type Capabilities, type RepoProfile, type ReviewedTool, type Service } from '../src/types.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
+import { expectScaling } from './helpers/scaling.js';
 import { fake } from './helpers/secret-repo.js';
 
 vi.mock('node:child_process', async (importOriginal) => {
@@ -1313,4 +1314,39 @@ describe('buildAudit: a static site gets no image, DAST or Dockerfile checks (Pl
       }
     }
   });
+});
+
+describe('per-row service lookups (G17-R2 F10)', () => {
+  const need = (service: string) => ({ id: 'sast', layer: 'merge' as const, category: 'sast' as const, service, why: 'x', blocking: true, floor: true });
+  const servicesOf = (n: number) => Array.from({ length: n }, (_, i) => ({ name: `s${i}`, language: 'python', scripts: [], frameworks: [] })) as unknown as RepoProfile['services'];
+  it('applyDefaultSetup: 8 times the services is about 8 times the time, not 64', async () => {
+    const { applyDefaultSetup } = await import('../src/audit/github-signals.js');
+    let last: { status: string }[] = [];
+    await expectScaling('applyDefaultSetup services', (size) => {
+      const n = size === 'small' ? 2_000 : 16_000;
+      const services = servicesOf(n);
+      const rows = services.map((s) => ({ need: need(s.name), status: 'missing' as const, why: 'x' }));
+      const t = performance.now();
+      const r = applyDefaultSetup(rows, { state: 'on', languages: ['python'], source: 'workflow' }, { services, defaultBranch: 'main' });
+      const ms = performance.now() - t;
+      if (size === 'big') last = r;
+      return ms;
+    }, 16);
+    expect(last.every((r) => r.status === 'partial')).toBe(true);
+  }, 120_000);
+  it('noImageCheck: one lookup table per profile, same answers as buildsNoImage', async () => {
+    let answers: boolean[] = [];
+    await expectScaling('noImageCheck services', (size) => {
+      const services = servicesOf(size === 'small' ? 2_000 : 16_000);
+      const t = performance.now();
+      const check = noImageCheck({ services });
+      const r = services.map((s) => check(need(s.name)));
+      const ms = performance.now() - t;
+      if (size === 'big') answers = r;
+      return ms;
+    }, 16);
+    expect(answers.every((a) => a)).toBe(true);
+    const services = servicesOf(3);
+    for (const n of [need('s1'), need('nope'), { service: undefined }]) expect(noImageCheck({ services })(n)).toBe(buildsNoImage(n, { services }));
+  }, 120_000);
 });

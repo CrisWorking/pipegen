@@ -165,7 +165,7 @@ describe('V2: the revert engine', () => {
     const dep = 'version: 2\nupdates:\n  - package-ecosystem: "npm"\n    directory: "/"\n    schedule:\n      interval: "daily"\n';
     const draft ={ profile: { private: true }, centralPin: { repo: 'acme/pipelines' } } as unknown as PipelineDraft;
     const de = textEdit('dependabot', '.github/dependabot.yml', dep, `${dep}${dependabotEntryText(draft)}`);
-    expect(textOf(revertEdit(de, cur(`# mine\n${dep}${dependabotEntryText(draft)}`), blob))).toBe(`# mine\n${dep}`);
+    expect(textOf(revertEdit(de, cur(`# mine\n${dep}${dependabotEntryText(draft)}`), blob, { appOwner: 'acme' }))).toBe(`# mine\n${dep}`);   // G17C-R1: the private form needs the app owner
   });
 
   it("plan: edit not in pipegen's builder form → manual review, never removed", () => {
@@ -472,5 +472,41 @@ describe('V2: the revert engine', () => {
     expect(revertEdit(he, cur(`${husky}\n${hb}bar\n`), blob)).toMatchObject({ kind: 'manual', remove: hb });   // a blank line between: still the same command
     const plain = textEdit('hooks', '.husky/pre-commit', '#!/usr/bin/env sh\nfoo\n', `#!/usr/bin/env sh\nfoo\n${hb}`);
     expect(textOf(revertEdit(plain, cur(`#!/usr/bin/env sh\nfoo\n${hb}bar\n`), blob))).toBe('#!/usr/bin/env sh\nfoo\nbar\n');
+  });
+});
+
+// ---------- G17 group C ----------
+
+describe('G17C rows 24, 25: the Dependabot private form names the app owner\'s pipelines repo; one husky shebang', () => {
+  const dep = 'version: 2\nupdates:\n  - package-ecosystem: "npm"\n    directory: "/"\n    schedule:\n      interval: "daily"\n';
+  const priv = (repo: string): PipelineDraft => ({ profile: { private: true }, centralPin: { repo } }) as unknown as PipelineDraft;
+  it('row 24: the private entry is pipegen\'s only for <app owner>/pipelines; another central repo name is manual', () => {
+    for (const [repo, ctx, want] of [
+      ['acme/pipelines', { appOwner: 'acme' }, 'strip'], ['Acme/pipelines', { appOwner: 'acme' }, 'strip'],
+      ['evil/pipelines', { appOwner: 'acme' }, 'manual'], ['acme/other', { appOwner: 'acme' }, 'manual'],
+      // G17C-R1 (F2, m3): without the app owner the private form is never pipegen's (only the public form is)
+      ['acme/other', {}, 'manual'], ['acme/pipelines', {}, 'manual'], ['acme/pipelines', { defaultBranch: 'main' }, 'manual'], ['acme/pipelines', { appOwner: '' }, 'manual'],
+    ] as const) {
+      const de = textEdit('dependabot', '.github/dependabot.yml', dep, `${dep}${dependabotEntryText(priv(repo))}`);
+      expect(kind(revertEdit(de, cur(`# mine\n${dep}${dependabotEntryText(priv(repo))}`), blob, ctx as never)), `${repo} ${JSON.stringify(ctx)}`).toBe(want);
+    }
+  });
+  it('G17C-R1 (F2, m3): through revertEdits, the private entry of evil/pipelines is kept for manual review; acme/pipelines is stripped', () => {
+    const one = (repo: string, ctx: { defaultBranch?: string; appOwner?: string }): string => {
+      const de = textEdit('dependabot', '.github/dependabot.yml', dep, `${dep}${dependabotEntryText(priv(repo))}`);
+      const [r] = revertEdits([de], () => cur(`# mine\n${dep}${dependabotEntryText(priv(repo))}`), blob, ctx);
+      return kind((r as { result: RevertResult }).result);
+    };
+    expect(one('evil/pipelines', { defaultBranch: 'main', appOwner: 'acme' })).toBe('manual');
+    expect(one('acme/pipelines', { defaultBranch: 'main', appOwner: 'acme' })).toBe('strip');
+    expect(one('acme/pipelines', { defaultBranch: 'main' })).toBe('manual');
+  });
+  it('row 25: revert.ts reads the husky shebang from created-builders.ts (no copy of its own)', async () => {
+    const { readFileSync } = await import('node:fs');
+    const cb = await import('../src/engine/created-builders.js');
+    expect((cb as unknown as { HUSKY_SHEBANG?: string }).HUSKY_SHEBANG).toBe('#!/usr/bin/env sh\n');
+    const src = readFileSync(new URL('../src/uninstall/revert.ts', import.meta.url), 'utf8');
+    expect(src).not.toMatch(/const HUSKY_SHEBANG\s*=/);
+    expect(src).toMatch(/\bHUSKY_SHEBANG\b.*from '\.\.\/engine\/created-builders\.js'|import \{[^}]*\bHUSKY_SHEBANG\b[^}]*\} from '\.\.\/engine\/created-builders\.js'/s);
   });
 });

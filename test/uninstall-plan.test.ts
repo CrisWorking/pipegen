@@ -921,7 +921,7 @@ describe('uninstall plan: reads, terminal and preview (V4)', () => {
     // once, the app's edits in record order, the LIVE default branch (renamed since install: main → trunk)
     expect(revertCalls).toHaveLength(1);
     expect(revertCalls[0]?.edits).toEqual([co]);
-    expect(revertCalls[0]?.ctx).toEqual({ defaultBranch: 'trunk' });
+    expect(revertCalls[0]?.ctx).toEqual({ defaultBranch: 'trunk', appOwner: 'o' });   // G17C-R1 (F2, m3): the app owner binds the private Dependabot entry
     expect(u.reverts.map((r) => r.edit)).toEqual([co]);
     const p = previewUninstall(u);
     expect(p).toMatch(/default branch was renamed/);

@@ -17,6 +17,7 @@ import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import type { Octokit } from '@octokit/rest';
 import { z } from 'zod';
+import { validDate } from '../../gate/src/date.js';
 import type { GuardInstallRecord } from '../create/guard.js';
 import { centralProjectName } from '../engine/central-path.js';
 import type { RateClock } from '../engine/github-rate.js';
@@ -43,7 +44,8 @@ export class RecordError extends Error {
 const SHA = z.string().regex(/^[0-9a-f]{40}$/);
 const SHA256 = z.string().regex(/^[0-9a-f]{64}$/);
 const ISO = z.string().regex(ISO_RE);
-const DAY = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+// G17 row 34: a real calendar day (the gate's one date definition), never year 0000 or a day the calendar doesn't have
+const DAY = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine((d) => validDate(d) === d, 'not a real calendar date');
 const TEXT = z.string().max(500);
 const PATH = z.string().max(400).refine((p) => createdPathProblem(p) === null, 'not a plain repository path');
 const SECRET_NAME = z.string().regex(/^[A-Z_][A-Z0-9_]{0,127}$/);
@@ -57,6 +59,11 @@ const ID = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const PART = z.enum(['pipeline', 'precommit', 'docker', 'compose', 'tests', 'test-migration', 'codeowners', 'deploy-verify', 'docs']);
 const REPO_KIND = z.enum(['app', 'central']);
 const SHAS = z.array(SHA).max(200);
+/**
+ * G17 row 22: the blob each write started from, one per `writtenShas` entry in the same order (null: the file wasn't there). Absent in an
+ * older record; shorter than `writtenShas` when a write recorded none (`pipegen update`). Only editWritesChained reads it.
+ */
+const BASES = z.array(SHA.nullable()).max(200);
 /** Keys that could reach an object's prototype: refused in every free-form record (fix round 1, m1), never silently dropped. */
 const PROTO_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
 const KEY = z.string().max(200).refine((k) => !PROTO_KEYS.has(k), 'a key that names an object prototype');
@@ -99,9 +106,9 @@ const ENV_SETTINGS = z.strictObject({
 const oneOfAt = (x: { githubCreatedAt?: string; unconfirmed?: true }): boolean => (x.githubCreatedAt === undefined) !== (x.unconfirmed === undefined);
 const ENV_KEYS = ['wait_timer', 'prevent_self_review', 'reviewers', 'can_admins_bypass', 'deployment_branch_policy', 'branch_policies'] as const;
 const OWNER_EDITED = { ownerEdited: z.literal(true).optional() };
-const EDIT_BASE = { path: PATH, originalSha: SHA, writtenShas: SHAS, ...OWNER_EDITED };
+const EDIT_BASE = { path: PATH, originalSha: SHA, writtenShas: SHAS, baseShas: BASES.optional(), ...OWNER_EDITED };
 const EDIT = z.discriminatedUnion('kind', [
-  z.strictObject({ repo: REPO_KIND, path: PATH, kind: z.enum(['codeowners', 'hooks', 'dependabot']), inserted: z.string().max(256 * 1024), originalSha: SHA.nullable(), writtenShas: SHAS, ...OWNER_EDITED }),
+  z.strictObject({ repo: REPO_KIND, path: PATH, kind: z.enum(['codeowners', 'hooks', 'dependabot']), inserted: z.string().max(256 * 1024), originalSha: SHA.nullable(), writtenShas: SHAS, baseShas: BASES.optional(), ...OWNER_EDITED }),
   // G13 (G7-R1, G7-R2 carries): headCheck = the user's jobs pipegen started with its head check; a called workflow (jobs empty) holds only those
   z.strictObject({ repo: z.literal('app'), ...EDIT_BASE, kind: z.literal('verify-job'), jobs: z.array(z.string().max(100)).max(50), needs: z.array(z.strictObject({ job: z.string().max(100), added: z.array(z.string().max(100)).max(50) })).max(200), headCheck: z.array(z.string().max(100)).min(1).max(50).optional() })
     .refine((e) => e.jobs.length > 0 || (e.headCheck?.length ?? 0) > 0, 'a verify-job edit records a job pipegen inserted or a head check'),
@@ -161,6 +168,8 @@ export const InstallRecordSchema = z.strictObject({
   once(r.variables, (x: { name: string; scope: string }) => `${x.scope}:${x.name}`, 'variables');
   once(r.environments, (x: { name: string }) => x.name.toLowerCase(), 'environments');
   once(r.rulesets, (x: { kind: string }) => x.kind, 'rulesets');
+  // G17 row 22: never more bases than writes (a base names the write at its own index)
+  r.edits.forEach((e, n) => { if (((e as RecordedEdit).baseShas?.length ?? 0) > e.writtenShas.length) ctx.addIssue({ code: 'custom', path: ['edits', n, 'baseShas'], message: 'more bases than writes' }); });
   // G11: the public key text and its hash go together
   if (r.cosignPub !== undefined && (r.cosignPubSha256 === undefined || createHash('sha256').update(r.cosignPub, 'utf8').digest('hex') !== r.cosignPubSha256)) ctx.addIssue({ code: 'custom', path: ['cosignPub'], message: 'not the key cosignPubSha256 names' });
 }) satisfies z.ZodType<InstallRecord>;
@@ -262,6 +271,24 @@ export function recordMarkerOf(body: string | null | undefined): string | null {
   if (typeof body !== 'string') return null;
   const last = body.replace(/\s+$/, '').split('\n').at(-1) ?? '';
   return MARKER_LINE_RE.exec(last.trim())?.[1] ?? null;
+}
+
+// ---------- the writes of an edit (G17 row 22) ----------
+
+/** An edit as the record holds it: InstallEdit plus the base blob of each write (see BASES). */
+export type RecordedEdit = InstallRecord['edits'][number] & { baseShas?: (string | null)[] };
+
+/**
+ * Whether every write of `e` is proven to have started from the one before it: one base per written sha, the first base the original
+ * (`originalSha`, null for a new file), each later base the sha written just before, and no owner merge (ownerEdited). Then the file at
+ * the last written sha is exactly the original plus pipegen's writes, with no owner bytes between them, and uninstall may restore the
+ * original after several writes (Plan V V2 I1/I2). Anything else, an older record without bases included: false (nothing proven).
+ */
+export function editWritesChained(e: RecordedEdit): boolean {
+  const w = e.writtenShas;
+  const b = e.baseShas;
+  if (e.ownerEdited === true || !Array.isArray(w) || !Array.isArray(b) || w.length === 0 || b.length !== w.length) return false;
+  return b.every((base, n) => base === (n === 0 ? e.originalSha : w[n - 1]));
 }
 
 // ---------- the guard's view ----------

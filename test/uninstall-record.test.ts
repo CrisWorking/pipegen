@@ -1,7 +1,7 @@
 // v0.2 Plan V V1 (rulings V-B1, V-B6, V-S1, V-S2, V-S13, V-N2, V-N4, V-N13, V-N14): uninstall loads the install record through the one
 // trust order (trustedPrevious), never through a second parser or the setup PR body's marker. An untrusted record stops; a typed trust
 // grants only confirmView's view; the app facts come from GitHub; an open central pull request that can change the record stops.
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Octokit } from '@octokit/rest';
@@ -305,6 +305,19 @@ describe('uninstall: load and trust the install record (V1)', () => {
     // spec M1 (V1-R1): trustedPrevious's note without its deliver clause (uninstall writes no new record)
     expect(e.message).toMatch(/doesn't match the hash in this machine's local record file, so pipegen claims nothing from it\./);
     expect(e.message).not.toMatch(/writes a new record/);
+    expect(w.asked).toEqual([]);
+    expect(writes(w)).toEqual([]);
+  });
+
+  it('record: G17C-R1 (F6, m2): a local record file that is a folder → stop naming the file and `npx pipegen uninstall`, never "another record\'s hash"', async () => {
+    const w = world();
+    putRecord(w, recordFileText(sampleRecord(w.appId)));
+    mkdirSync(localRecordPath(APP, local(w)), { recursive: true });
+    const e = await stops(loadUninstallRecord(gh(w), APP, { local: local(w), io: io(w, 'o/r'), interactive: true }), /no install record for o\/r that it trusts/);
+    expect(e.message).toContain(localRecordPath(APP, local(w)));
+    expect(e.message).toMatch(/can't be read/);
+    expect(e.message).toContain('npx pipegen uninstall');
+    expect(e.message).not.toMatch(/another record's hash|npx pipegen run/);
     expect(w.asked).toEqual([]);
     expect(writes(w)).toEqual([]);
   });

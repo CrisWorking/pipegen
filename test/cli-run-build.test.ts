@@ -9,14 +9,15 @@ import type { Octokit } from '@octokit/rest';
 // the real referee, watched: the fix loop's referee must judge AssembledFiles.draft, never the input draft (carry 25)
 vi.mock(import('../src/engine/referee.js'), async (orig) => { const m = await orig(); return { ...m, referee: vi.fn(m.referee) }; });
 import { referee as watchedReferee } from '../src/engine/referee.js';
-import { buildFiles, judgeBuilt, proofBuildFor, readBuildFacts, readRegular, runCreators, workflowTexts, type BuildInput, type BuildFacts } from '../src/cli/run.js';
+import { buildFiles, insertedBlock, judgeBuilt, proofBuildFor, readBuildFacts, readRegular, runCreators, workflowTexts, type BuildInput, type BuildFacts } from '../src/cli/run.js';
 import { strictNeeds, warnFirstFor } from '../src/cli/run-parts.js';
 import { judgeAssembled } from '../src/layers/assemble.js';
 import { ADVISORY_TOOLS } from '../src/debate/builder.js';
 import { docShapeProblem, pipegenDoc } from '../src/deliver/docs.js';
 import { deliver, planDelivery, previewText, type DeliveryInput } from '../src/deliver/deliver.js';
 import { InstallRecordSchema, protectedPathsOfRecord, readRecord, recordHash } from '../src/deliver/record.js';
-import { codeownersProtectedPaths } from '../src/engine/created-builders.js';
+import { codeownersBlock, codeownersProtectedPaths, codeownersReplace } from '../src/engine/created-builders.js';
+import { gitBlobSha } from '../src/create/guard.js';
 import { FakeGitHub } from './helpers/deliver-github.js';
 import { repoFiles, root } from './helpers/repo-files.js';
 import { SecretVault } from '../src/create/secrets.js';
@@ -392,3 +393,151 @@ describe('G14: the fix loop\'s build, referee and guard; AI-written files to the
   });
 });
 
+
+// ---------- G17 group C ----------
+
+describe('G17C row 23: a re-run on a CODEOWNERS pipegen edited before (the record form deliver writes)', () => {
+  for (const userCo of ['* @someone', '* @someone\n', '']) {
+    it(`build: the second run replaces pipegen's block in place and passes the referee (original ${JSON.stringify(userCo)})`, async () => {
+      const i = input(false);
+      const co0 = { path: userCo === '' ? null : 'CODEOWNERS', text: userCo, isSymlink: false, block: null, inserted: null };
+      const f1 = await buildFiles(i, { ...FACTS, appCo: co0 });
+      const delivered = f1.locks.codeowners?.file.content as string;
+      expect(delivered.startsWith(userCo)).toBe(true);
+      // the record's insert, as deliver writes it on a first run: the file minus the original (with the separator pipegen added)
+      const co1 = { path: f1.locks.codeowners?.file.path as string, text: delivered, isSymlink: false, block: null };
+      const prev = { files: [], edits: [{ repo: 'app', kind: 'codeowners', path: co1.path, inserted: delivered.slice(userCo.length), originalSha: null, writtenShas: [] }] } as unknown as InstallRecord;
+      const facts = { ...FACTS, appCo: { ...co1, inserted: insertedBlock(prev, 'app', co1) } };
+      expect(facts.appCo.inserted).toBe(delivered.slice(userCo.length));
+      // a second run with another owner list: the block is replaced in place, the user's text and pipegen's separator stay
+      const i2 = { ...input(false), prev, owners: ['@bob', '@alice'] };
+      // the second run reads the CODEOWNERS file the first one wrote
+      i2.draft = { ...i2.draft, profile: { ...i2.draft.profile, repoFiles: { ...i2.draft.profile.repoFiles, codeowners: co1.path } }, codeOwners: { owners: ['@bob', '@alice'], writers: 2 } };
+      const f2 = await buildFiles(i2, facts);
+      const again = f2.locks.codeowners?.file.content as string;
+      expect(again).toContain('@bob @alice');
+      expect(again.startsWith(userCo)).toBe(true);
+      expect(again.slice(userCo.length).replace(/^\n*/, '').startsWith('# pipegen:begin\n')).toBe(true);
+      expect(again.slice(userCo.length).match(/^\n*/)?.[0]).toBe(delivered.slice(userCo.length).match(/^\n*/)?.[0]);
+      const judged = await judgeBuilt(i2, f2, facts, { linters: judgeDeps.linters, judge: noLinters });
+      expect(judged.report.issues.map((x) => `${x.file}: ${x.message}`)).toEqual([]);
+    });
+  }
+
+  it('builders: codeownersReplace keeps the separator a recorded insert starts with; a block mid-line is still refused', () => {
+    const b1 = codeownersBlock(['a.yml'], ['@o']);
+    const b2 = codeownersBlock(['a.yml'], ['@p']);
+    expect(codeownersReplace(`* @x\n\n${b1}`, `\n\n${b1}`, b2)).toBe(`* @x\n\n${b2}`);
+    expect(codeownersReplace(`* @x\n${b1}`, `\n${b1}`, b2)).toBe(`* @x\n${b2}`);
+    expect(codeownersReplace(`* @x\n${b1}`, b1, b2)).toBe(`* @x\n${b2}`);
+    // not a separator of newlines only, or more than pipegen ever adds: refused
+    expect(codeownersReplace(`* @x\n\n\n${b1}`, `\n\n\n${b1}`, b2)).toBeNull();
+    expect(codeownersReplace(`* @x ${b1}`, ` ${b1}`, b2)).toBeNull();
+    expect(codeownersReplace(`* @x${b1}`, b1, b2)).toBeNull();
+  });
+});
+
+describe('G17C row 29: a later run that rewrites a file an earlier run adopted says so (preview and PIPEGEN.md)', () => {
+  it('build: an adopted file whose text this run changes is named in adoptedNotes and doc.notes; an adopted file left as it is, or a created one, is not', async () => {
+    const i = input(false);
+    const first = await buildFiles(i, FACTS);
+    const target = first.files.find((f) => f.repo === 'app' && f.path !== 'PIPEGEN.md' && f.edited === undefined && f.inserted === undefined) as { path: string; part: string; content: string };
+    const other = first.files.find((f) => f.repo === 'app' && f.path !== 'PIPEGEN.md' && f.path !== target.path && f.edited === undefined && f.inserted === undefined) as { path: string; part: string; content: string };
+    const prev = {
+      edits: [], files: [
+        { repo: 'app', path: target.path, part: target.part, shas: [gitBlobSha('the text that was there\n')], adopted: true },
+        { repo: 'app', path: other.path, part: other.part, shas: [gitBlobSha(other.content)], adopted: true },
+      ],
+    } as unknown as BuildInput['prev'];
+    const b = await buildFiles({ ...i, prev }, FACTS);
+    const adoptedOf = (x: object): string[] => (x as { adoptedNotes?: string[] }).adoptedNotes ?? [];
+    const notes = adoptedOf(b);
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toContain(target.path);
+    // G17C-R1 (F5): the note claims only what the record says (pipegen's own file merged through its central PR may be adopted too)
+    expect(notes[0]).toMatch(/the install record lists it as adopted/);
+    expect(notes[0]).not.toMatch(/before pipegen/);
+    expect(b.assembled.draft.doc?.notes ?? []).toEqual(expect.arrayContaining([notes[0]]));
+    // created (not adopted): no note
+    const created = { edits: [], files: [{ repo: 'app', path: target.path, part: target.part, shas: [gitBlobSha('old\n')] }] } as unknown as BuildInput['prev'];
+    expect(adoptedOf(await buildFiles({ ...i, prev: created }, FACTS))).toEqual([]);
+    expect(adoptedOf(first)).toEqual([]);
+  });
+});
+
+describe('G17C row 36: no deliver or run message says the bare "run pipegen again"', () => {
+  it('source: deliver.ts and run.ts name the command (`npx pipegen run`) wherever they tell the user to run pipegen again', () => {
+    const bad: string[] = [];
+    for (const f of ['src/deliver/deliver.ts', 'src/cli/run.ts']) {
+      readFileSync(join(root, f), 'utf8').split('\n').forEach((line, n) => {
+        const t = line.trim();
+        if (t.startsWith('//') || t.startsWith('*') || t.startsWith('/*')) return;
+        if (/run pipegen again/i.test(line)) bad.push(`${f}:${n + 1}`);
+      });
+    }
+    expect(bad).toEqual([]);
+  });
+});
+
+// ---------- G17A-R2 spec I-1: the run's referee gets the workflow texts the verify plan was built from ----------
+describe('G17A-R2: judgeBuilt and the fix loop pass the workflow texts to the referee (sec M2 wiring)', () => {
+  const DEPLOY = '.github/workflows/deploy.yml';
+  const SHIP = '.github/workflows/ship.yml';
+  const LINT = '.github/workflows/lint.yml';
+  const CALLER = 'on:\n  push:\n    branches: [main]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n    steps:\n      - run: npm run build\n  ship:\n    needs: build\n    uses: ./.github/workflows/ship.yml\n';
+  const CALLED = 'on:\n  workflow_call:\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    environment: production\n    steps:\n      - run: ./ship.sh\n';
+  const LINTWF = 'on: pull_request\njobs:\n  check:\n    uses: ./.github/workflows/ship.yml\n';
+  const wf = (path: string, triggers: string[], deploys: boolean) => ({ path, triggers, deploys, [['secrets', 'Used'].join('')]: [], jobs: [] });
+  /** A repository whose gated deploy calls ship.yml, which an ungated pull_request workflow calls too: pipegen leaves ship.yml alone (a gap). */
+  const withCalls = (): { i: BuildInput; facts: BuildFacts } => {
+    const i0 = input(false);
+    const profile = { ...i0.draft.profile, existingWorkflows: [wf(DEPLOY, ['push'], true), wf(SHIP, ['workflow_call'], true), wf(LINT, ['pull_request'], false)] } as unknown as PipelineDraft['profile'];
+    const i = { ...i0, draft: { ...i0.draft, profile } };
+    const facts = { ...FACTS, centralFiles: [], texts: new Map([[DEPLOY, CALLER], [SHIP, CALLED], [LINT, LINTWF]]) } as unknown as BuildFacts;
+    return { i, facts };
+  };
+  it('G17A-R2 spec I-1: judgeBuilt hands facts.texts to its judge as refereeDeps.workflowTexts', async () => {
+    const { i, facts } = withCalls();
+    const files = await buildFiles(i, facts);
+    let seen: unknown;
+    await judgeBuilt(i, files, facts, { linters: judgeDeps.linters, judge: (async (_a: unknown, o: { refereeDeps?: { workflowTexts?: unknown } }) => { seen = o.refereeDeps?.workflowTexts; return { ok: true, issues: [], notes: [], demoted: [] }; }) as never, guard: (async () => ({ ok: [], refused: [], notes: [] })) as never });
+    expect(seen).toBe(facts.texts);
+  });
+  it('G17A-R2 spec I-1: a gated local call whose called file pipegen leaves alone gets no false refusal (judgeBuilt and the fix loop)', async () => {
+    const { i, facts } = withCalls();
+    const files = await buildFiles(i, facts);
+    expect(files.verify.inserts.map((x) => x.path)).toEqual([DEPLOY]);
+    expect(files.verify.gaps.map((g) => g.path)).toEqual([SHIP]);
+    const judged = await judgeBuilt(i, files, facts, { linters: judgeDeps.linters, judge: noLinters });
+    expect(judged.report.issues.map((x) => `${x.file}: ${x.message}`)).toEqual([]);
+    const pb = proofBuildFor(i, facts, undefined, { linters: judgeDeps.linters, guard: async (fs) => ({ ok: [...fs], refused: [], notes: [] }), runLinters: async () => [] });
+    const report = await pb.referee(i.draft);
+    expect(report.issues.map((x) => `${x.file}: ${x.message}`)).toEqual([]);
+  });
+});
+
+// ---------- G17A-R3 r3-I1: --skip deploy on a repository with a deploy workflow is no false stop ----------
+describe('G17A-R3: --skip deploy lists each deploy workflow as a gap, through the real build path', () => {
+  const DEPLOY = '.github/workflows/deploy.yml';
+  const PLAIN = 'on:\n  push:\n    branches: [main]\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    environment: production\n    steps:\n      - run: ./ship.sh\n';
+  const wf = (path: string, triggers: string[], deploys: boolean) => ({ path, triggers, deploys, [['secrets', 'Used'].join('')]: [], jobs: [] });
+  for (const priv of [false, true]) {
+    it(`G17A-R3 r3-I1: --skip deploy with a push deploy workflow: no issue from judgeBuilt or the fix loop; PIPEGEN.md lists it as unprotected (${priv ? 'private' : 'public'})`, async () => {
+      const i0 = input(priv);
+      const profile = { ...i0.draft.profile, existingWorkflows: [wf(DEPLOY, ['push'], true)] } as unknown as PipelineDraft['profile'];
+      const i = { ...i0, draft: { ...i0.draft, profile, skipped: [...i0.draft.skipped, { part: 'deploy', reason: 'the user skipped it' }] } } as unknown as BuildInput;
+      const facts = { ...FACTS, centralFiles: [], texts: new Map([[DEPLOY, PLAIN]]) } as unknown as BuildFacts;
+      const files = await buildFiles(i, facts);
+      expect(files.verify.inserts).toEqual([]);
+      expect(files.verify.gaps.map((g) => [g.path, g.why])).toEqual([[DEPLOY, expect.stringMatching(/you skipped the deploy part \(--skip deploy\)/)]]);
+      expect(files.assembled.draft.doc?.deployGaps.map((g) => g.path)).toEqual([DEPLOY]);
+      const md = files.doc.content;
+      expect(md).toMatch(/deploy\.yml.*you skipped the deploy part/);
+      const judged = await judgeBuilt(i, files, facts, { linters: judgeDeps.linters, judge: noLinters });
+      expect(judged.report.issues.map((x) => `${x.file}: ${x.message}`)).toEqual([]);
+      const pb = proofBuildFor(i, facts, undefined, { linters: judgeDeps.linters, guard: async (fs) => ({ ok: [...fs], refused: [], notes: [] }), runLinters: async () => [] });
+      const report = await pb.referee(i.draft);
+      expect(report.issues.map((x) => `${x.file}: ${x.message}`)).toEqual([]);
+    });
+  }
+});

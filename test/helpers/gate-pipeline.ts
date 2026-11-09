@@ -3,7 +3,7 @@
 // edited gate step (or an edited env) can hold what the emitter itself refuses; the referee must refuse it too.
 import { Document } from 'yaml';
 import { gateJobList, resultFormat, type JobListEntry } from '../../src/engine/gate-job-list.js';
-import { jobOutputsFor, NO_SCANS, type ScanFact } from '../../src/engine/job-rules.js';
+import { jobOutputsFor, NO_SCANS, WORKFLOW_CONCURRENCY, type ScanFact } from '../../src/engine/job-rules.js';
 import { NEED_ID_CATEGORY } from '../../src/engine/need-ids.js';
 import { referee, type Linters, type RefereeReport } from '../../src/engine/referee.js';
 import {
@@ -45,7 +45,11 @@ export const job = (steps: RenderedStep[], over: Job = {}): Job => ({ 'runs-on':
 export function workflow(jobs: Record<string, Job>, top: Record<string, unknown> = {}): CreatedFile {
   const doc = new Document();
   const plain = Object.fromEntries(Object.entries(jobs).map(([id, j]) => [id, Object.fromEntries(Object.entries(j).filter(([k]) => k !== 'steps'))]));
-  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, ...top, jobs: plain });
+  // G17 row 1b: the file is pipegen.yml, which carries the workflow concurrency (a called workflow never does; pass concurrency: undefined to drop it)
+  const on = top.on;
+  // (never in a called or a scheduled file: a test may move this file to the merge, central or nightly path)
+  const called = ['workflow_call', 'schedule'].some((t) => on === t || (typeof on === 'object' && on !== null && Object.hasOwn(on, t)));
+  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, ...(called ? {} : { concurrency: { ...WORKFLOW_CONCURRENCY } }), ...top, jobs: plain });
   for (const [id, j] of Object.entries(jobs)) {
     const steps = j.steps as RenderedStep[];
     doc.setIn(['jobs', id, 'steps'], id === 'gate' ? doc.createNode(steps.map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(steps));

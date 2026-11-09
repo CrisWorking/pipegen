@@ -311,8 +311,10 @@ class Judge {
 
 // ---------- the evaluation ----------
 
-/** The checks another part reports (category → the --skip part name that switches that part off). */
-const OWNER_PART: Readonly<Record<string, { part: Part; skip: string }>> = Object.freeze({
+/** The checks another part reports (category → that part, and the --skip part name that switches the category off: one table, G17 row 79). */
+const OWNER_PART: Readonly<Record<string, { part?: Part; skip: string }>> = Object.freeze({
+  // image-scan has no other part that reports it (its scanner job is judged by the pipeline), but --skip docker still switches it off
+  'image-scan': { skip: 'docker' },
   'image-build': { part: 'docker', skip: 'docker' }, hooks: { part: 'precommit', skip: 'precommit' }, 'hooks-ci': { part: 'precommit', skip: 'precommit' },
   'unit-tests': { part: 'tests', skip: 'tests' }, 'full-tests': { part: 'tests', skip: 'tests' }, coverage: { part: 'tests', skip: 'tests' }, 'deploy-verify': { part: 'deploy-verify', skip: 'deploy' },
 });
@@ -368,7 +370,7 @@ async function evaluateInner(draft: PipelineDraft, runs: readonly VariantRuns[],
     if (FINDINGS_CATEGORIES.has(cat)) scannerJobs.set(inFolderNeed(n), n.id);
     // a job another part reports is that part's, unless the user skipped the part (then nobody else would see it fail)
     const owner = OWNER_PART[cat];
-    if (owner !== undefined && !skipped.has(owner.skip)) ownedJobs.set(inFolderNeed(n), owner.part);
+    if (owner?.part !== undefined && !skipped.has(owner.skip)) ownedJobs.set(inFolderNeed(n), owner.part);
   }
   // a part covers a floor need: the pipeline always; tests only when the draft has a unit-tests or full-tests need (m2)
   const floorOf = (part: Part): boolean => part === 'pipeline' || (part === 'tests' && needsTests(draft));
@@ -707,11 +709,13 @@ function pipelineMain(
 
 /**
  * Plan G G0 fix round 1 (ruling G0-R1, I1; F-3, Plan F S18): DAST on ZAP has no planted item and its report format has no real -J
- * fixture yet. Like nuclei it stays blocking and is shown as a note: never warn-only, never a not-proven need (draft.notProven).
+ * fixture yet. The note is shown for the job either way and says only what the draft says: a blocking need stays blocking in the draft (never
+ * warn-only, never a not-proven need, draft.notProven); a non-blocking one is not called blocking. It makes no claim about how the gate judges
+ * ZAP's report (that depends on ZAP_JSON_VERIFIED), so it is true whatever that flag is.
  */
 function zapAndNuclei(sheet: Sheet, jobList: readonly JobListEntry[]): void {
   for (const e of jobList) {
-    if (e.tool !== undefined && /^zap/.test(e.tool)) sheet.note('pipeline', `${st(e.job, 80)} (ZAP) has no planted item and its report format is not yet proven (no -J fixture), so it is not shown to catch anything; it stays blocking`);
+    if (e.tool !== undefined && /^zap/.test(e.tool)) sheet.note('pipeline', `${st(e.job, 80)} (ZAP) has no planted item, so it is not shown to catch anything; ${e.blocking ? 'the draft keeps it a blocking check (whether the gate lets a ZAP result block a merge depends on its ZAP rule)' : 'the draft does not make it a blocking check'}`);
   }
 }
 
@@ -760,8 +764,6 @@ function compat(main: VariantRuns, layers: Layers, ctx: EvalContext, sheet: Shee
 // ---------- the planted variant ----------
 
 const normFile = (s: string): string => s.replace(/[^\x20-\x7e]/g, '');
-/** The --skip part that switches off the check of a category (G0-R1 m1): a planted item of a skipped part is not expected. */
-const SKIP_PART_OF: Readonly<Record<string, string>> = Object.freeze({ 'image-build': 'docker', 'image-scan': 'docker', hooks: 'precommit', 'hooks-ci': 'precommit', 'unit-tests': 'tests', 'full-tests': 'tests', coverage: 'tests', 'deploy-verify': 'deploy' });
 function plantedChecks(
   draft: PipelineDraft, planted: VariantRuns, layers: Layers, ctx: EvalContext, sheet: Sheet, jobList: readonly JobListEntry[],
   scannerJobs: ReadonlyMap<string, string>, refusedIn: RefusedIn, refusedNote: (needId: string, hits: readonly Hit[]) => void,
@@ -830,7 +832,7 @@ function plantedChecks(
   for (const i of items) {
     const k = keyOf(i);
     if (k === undefined || byJob.has(k) || refusedJobs.has(k)) continue;
-    const part = Object.hasOwn(SKIP_PART_OF, i.category) ? SKIP_PART_OF[i.category] : undefined;
+    const part = Object.hasOwn(OWNER_PART, i.category) ? OWNER_PART[i.category]?.skip : undefined;   // G0-R1 m1: the --skip part that switches the category off
     if (part !== undefined && userSkipped.has(part)) continue;
     sheet.fail('pipeline', `no scanner of the pipeline ran for the planted ${st(i.item, 120)}, so nothing is shown to catch it`, undefined, gateRun.handle.url);
   }
@@ -885,7 +887,7 @@ function plantedChecks(
   }
   // dast with nuclei: deferred (S23); like any blocking scanner without an item, it stays blocking and is shown (F-3)
   for (const e of jobList) if (e.tool === 'nuclei' && !items.some((i) => keyOf(i) === e.job || i.category === e.category)) {
-    sheet.note('pipeline', `${st(e.job, 80)} (nuclei) has no planted item yet (deferred), so it is not shown to catch anything; it stays blocking`);
+    sheet.note('pipeline', `${st(e.job, 80)} (nuclei) has no planted item yet (deferred), so it is not shown to catch anything; ${e.blocking ? 'it stays blocking' : 'the draft does not make it a blocking check'}`);
   }
 }
 

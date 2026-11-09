@@ -5,6 +5,7 @@ import { keyOffers, specFor } from '../../src/debate/builder.js';
 import { floorNeeds } from '../../src/engine/needs.js';
 import { referee, type RefereeReport } from '../../src/engine/referee.js';
 import { stepsToYaml } from '../../src/engine/render-step.js';
+import { CALLER_WORKFLOW, PUSH_WORKFLOW, WORKFLOW_CONCURRENCY } from '../../src/engine/job-rules.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../../src/read/quality.js';
 import { assembleJobs, type AssembledJobs, type Job, type JobsPlan } from '../../src/layers/jobs.js';
 import type { Capabilities, CreatedFile, Need, NotProven, PipelineDraft, RepoProfile, Service, StepSpec } from '../../src/types.js';
@@ -57,7 +58,9 @@ export const assemble = (x: { draft: PipelineDraft; plan: JobsPlan }, mode: Para
 /** A workflow file of these jobs (the simplest layout: G5 writes the real callers). */
 export function wf(jobs: Record<string, Job | Obj>, path: string, on: unknown): CreatedFile {
   const doc = new Document();
-  doc.contents = doc.createNode({ name: 'pipegen', on, permissions: {}, jobs: Object.fromEntries(Object.entries(jobs).map(([k, j]) => { const { steps: _s, ...rest } = j as Obj; return [k, rest]; })) });
+  // G17 row 1b: pipegen.yml and pipegen-push.yml carry the workflow concurrency, as assemble writes them
+  const conc = path === CALLER_WORKFLOW || path === PUSH_WORKFLOW ? { concurrency: { ...WORKFLOW_CONCURRENCY } } : {};
+  doc.contents = doc.createNode({ name: 'pipegen', on, permissions: {}, ...conc, jobs: Object.fromEntries(Object.entries(jobs).map(([k, j]) => { const { steps: _s, ...rest } = j as Obj; return [k, rest]; })) });
   for (const [k, j] of Object.entries(jobs)) doc.setIn(['jobs', k, 'steps'], stepsToYaml((j as Job).steps));
   return { path, content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: 't', repo: 'app' };
 }

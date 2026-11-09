@@ -26,21 +26,21 @@ import { ConsentToken, CountingSummary, countingSummary, isSpent, spend } from '
 import { ollamaHostOf } from '../ai/ollama.js';
 import { AiSpendMeter, meteredProvider } from '../ai/spend-meter.js';
 import { mapCoverage } from '../audit/coverage.js';
-import { buildsNoImage } from '../audit/model.js';
+import { noImageCheck } from '../audit/model.js';
 import { readWorkflows, skippedWorkflowCount } from '../read/workflows.js';
 import { readOrigin, readProject } from '../read/project.js';
 import { applyTypeOverrides, type TypeOverride } from '../read/project-type.js';
 import { supportLevel } from '../read/support.js';
 import { createCompose } from '../create/compose.js';
 import { createDockerfile } from '../create/dockerfile.js';
-import { guardCreatedFiles, type BaseTree, type GuardInstallRecord } from '../create/guard.js';
+import { gitBlobSha, guardCreatedFiles, type BaseTree, type GuardInstallRecord } from '../create/guard.js';
 import { loadReviewedClosure } from '../create/reviewed-closure.js';
 import { askSecrets, coveredNames, generateFpKey, secretRequests, SecretVault } from '../create/secrets.js';
 import { debate as runDebate, type DebateResult } from '../debate/debate.js';
 import { needKeyOf } from '../debate/need-ref.js';
 import { decideTests } from '../debate/tests.js';
 import type { StarterDeps } from '../create/tests.js';
-import { deliver, deliverCentral, DeliverError, planDelivery, previewText, readCentralFileList, type DeliverResult, type DeliveryInput, type SigningKey, type CentralResult } from '../deliver/deliver.js';
+import { deliver, deliverCentral, DeliverError, planDelivery, previewText, readCentralFileList, type DeliverResult, type DeliveryInput, type SigningKey, type CentralPr, type CentralResult } from '../deliver/deliver.js';
 import { pipegenDoc } from '../deliver/docs.js';
 import { coFacts, type CoFacts } from '../deliver/finish.js';
 import { readBlobText, readHead, readRepo, readTree } from '../deliver/git-data.js';
@@ -49,7 +49,7 @@ import { discover } from '../engine/discover.js';
 import { resolvePin } from '../engine/pin.js';
 import { openMemory } from '../engine/memory.js';
 import type { LocalRecordDeps } from '../deliver/record.js';
-import { trustedPrevious } from '../deliver/trust.js';
+import { trustedPrevious, UNREADABLE_RUN_WAY_ON } from '../deliver/trust.js';
 import { codeownersProtectedPaths } from '../engine/created-builders.js';
 import { newRateBudget, type RateClock } from '../engine/github-rate.js';
 import { ensureLinters, ensurePinnedBinary, loadPinnedBinaries } from '../engine/linters.js';
@@ -91,7 +91,7 @@ import { askConsent, consentScreen } from './consent.js';
 import { tokenLogin } from './inspect.js';
 import { finishCommand, interactiveRun } from './commands.js';
 export { interactiveRun };
-import type { CliIO } from './io.js';
+import type { CliIO, Prompter } from './io.js';
 import {
   assembledJobs, consentJobs, docFor, draftFromDebate, isAiNote, parseStrictness, pickOwners, proofAssembler, prWaitMinutes,
   signingFor, strictNeeds, warnFirstFor, type Strictness,
@@ -132,7 +132,7 @@ export const UNPINNED = '0'.repeat(40);
 export const V02_OWNER = 'CrisWorking';
 export const NOT_IN_SCOPE = (owner: string): string => `pipegen v0.2 sets up repositories owned by ${V02_OWNER} only, and this folder's origin is owned by ${safeText(owner, 100)}; nothing was read from GitHub or changed. exit code 1.`;
 /** G13-R1 (sec I1): the pinned scanner found a secret in the files consent counted. */
-export const SECRET_FOUND = 'pipegen stopped: the secret scan found what looks like a secret in the files it would send to the AI, so nothing was sent and nothing was created. Remove it (or add the file to .gitignore), then run pipegen again. exit code 2.';
+export const SECRET_FOUND = 'pipegen stopped: the secret scan found what looks like a secret in the files it would send to the AI, so nothing was sent and nothing was created. Remove it (or add the file to .gitignore), then run `npx pipegen run` again. exit code 2.';
 /** G13-R1 (sec M4): key-env makes its key pair only in a memory folder. */
 export const NO_MEMORY_FOLDER = `pipegen stopped before anything was spent: this repository's images are signed with a key pair, which pipegen makes only in memory (${MEMORY_DIR}), and this machine has no such folder. Run pipegen on Linux (WSL or a Linux container works too). exit code 2.`;
 /** Plan l. 507-508 (stage 20). */
@@ -197,6 +197,11 @@ export interface Built {
   envNotes: string[];
   /** G13-R2 7: hooks already in place that the trusted install record does not hold (uninstall would leave them); also in doc.notes, shown at the preview. */
   hookNotes: string[];
+  /**
+   * G17 row 29 (G10-r2 P3): files an earlier run adopted (they were in the repository, identical to pipegen's text) that this run rewrites;
+   * also in doc.notes, shown at the preview. Absent: none.
+   */
+  adoptedNotes?: string[];
   /** The files judged besides AssembledFiles (PIPEGEN.md, the inserted verify jobs, CODEOWNERS, the org required workflow): judgeAssembled's `extra`. */
   extra: CreatedFile[];
   /** G14: the same build for another draft, with the fix loop's referee and guard over it (the real stage sets it; absent: the proof refuses). */
@@ -251,7 +256,8 @@ export interface RunStages {
   trusted(f: GitHubFacts, p: RepoProfile, io: CliIO): Promise<{ record: InstallRecord | null; notes: string[] }>;
   /** previewText(planDelivery(input)): what the one confirmation shows. */
   preview(input: DeliveryInput): string;
-  deliverCentral(f: GitHubFacts, p: RepoProfile, files: readonly CreatedFile[], io: CliIO): Promise<CentralResult>;
+  /** `pr` (G17C-R1, F5): the central pull request an earlier run opened, from the run state. */
+  deliverCentral(f: GitHubFacts, p: RepoProfile, files: readonly CreatedFile[], io: CliIO, pr?: CentralPr): Promise<CentralResult>;
   readCentralFileList(f: GitHubFacts, p: RepoProfile): Promise<string[]>;
   signingKey(): Promise<SigningKey>;
   deliver(f: GitHubFacts, p: RepoProfile, input: DeliveryInput, vault: SecretVault, io: CliIO, signingKey?: () => Promise<SigningKey>): Promise<DeliverResult>;
@@ -398,7 +404,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     // (checkProofRepos: create, Actions access, default branch) runs inside the proof, where a throw is cleaned up
     const missing = await st.helperRepos(facts, p).catch(() => null);
     if (missing !== null && missing.length > 0 && !(auth.kind === 'app' && auth.canCreateRepos)) {
-      err(['Create these private repos, then run pipegen again:', ...createCommands(p.owner, missing).map((c) => `  ${c}`)].join('\n'));
+      err(['Create these private repos, then run `npx pipegen run` again:', ...createCommands(p.owner, missing).map((c) => `  ${c}`)].join('\n'));
       err('pipegen stopped before anything was spent: the helper repositories above must exist first. exit code 2.');
       return 2;
     }
@@ -608,11 +614,16 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     // 18. two-step delivery (carries 14, 15): deliverCentral (the central files of the last judged build), the re-pin, the central file list
     // once, assemble and judge again
     let centralFileList: string[] | undefined;
+    let centralCommitted: string | undefined;
     if (p.private) {
       const centralFiles = built.files.filter((f) => f.repo === 'central' && !f.path.endsWith('--required.yml') && /^\.github\/workflows\/[^/]+--[^/]+\.ya?ml$/.test(f.path));
-      const c = await st.deliverCentral(facts, p, centralFiles, io);
-      if (c.kind === 'central-pr') { out(safeText(c.message, 600)); err('exit code 2: merge the central pull request, then run pipegen again.'); return 2; }
+      const c = await st.deliverCentral(facts, p, centralFiles, io, saved.centralPr);
+      // G17C-R1 (F5): the PR and pipegen's commit on it are kept, so the next run can prove its merge put pipegen's files there
+      if (c.kind === 'central-pr' && c.pr !== undefined) store.centralPrOpened(c.pr.number, c.pr.commit);
+      if (c.kind === 'central-pr') { out(safeText(c.message, 600)); err('exit code 2: merge the central pull request, then run `npx pipegen run` again.'); return 2; }
       for (const d of c.done) out(`done: ${safeText(d, 200)}`);
+      // G17 row 28: only the commit deliverCentral made in this run (or, G17C-R1, the merge of pipegen's own central PR) proves pipegen added a new central file
+      if (c.committed === true) centralCommitted = c.sha;
       draft = { ...draft, centralPin: { repo: `${p.owner}/${CENTRAL_REPO}`, sha: c.sha } };
       centralFileList = await st.readCentralFileList(facts, p);
       built = await st.build(inputs(draft, centralFileList));
@@ -639,6 +650,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
       protectedPaths: codeownersProtectedPaths(built.assembled.draft, reviewed), environments: built.environments,
       proofRepos: proofReposFor(repos, saved),
       ...(centralFileList === undefined ? {} : { centralFileList }),
+      ...(centralCommitted === undefined ? {} : { centralCommitted }),
     };
     if (built.assembled.draft.centralPin?.sha === UNPINNED) throw new Error('pipegen would deliver a draft with no central commit pinned; nothing was delivered.');
     const note = bootstrapProofsNote(io.env);
@@ -647,6 +659,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
       // spec I7: what the environment plan couldn't do (an approval with no environment to put it on), said before the yes
       ...(built.envNotes.length === 0 ? [] : ['', ...built.envNotes.map((n) => safeText(n, 600))]),
       ...(built.hookNotes.length === 0 ? [] : ['', ...built.hookNotes.map((n) => safeText(n, 600))]),
+      ...((built.adoptedNotes ?? []).length === 0 ? [] : ['', ...(built.adoptedNotes ?? []).map((n) => safeText(n, 600))]),
       '', `A pull request waits about ${built.minutes.prWait} minutes at most for the checks; about ${est2.monthlyMinutes} Actions minutes a month.`,
     ].join('\n');
     if (!(await ask(`${preview}\n\nOpen the setup pull request with these changes?`))) { err('Nothing was delivered: you said no. The secrets you typed were wiped. exit code 1.'); return 1; }
@@ -695,8 +708,9 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
  * Carries 16 and 24: what deliver records of the helper repos: the central repo pipegen created (with GitHub's id) and the Actions access
  * level it changed there (checkProofRepos), the scratch repo pipegen created (the state file's id).
  */
-export function proofReposFor(repos: Pick<ProofRepos, 'created' | 'createdIds' | 'actionsAccess'>, saved: { scratchRepoId?: number; actionsAccessPrevious?: string; centralCreated?: boolean }): NonNullable<DeliveryInput['proofRepos']> {
-  const id = repos.createdIds?.[CENTRAL_REPO];
+export function proofReposFor(repos: Pick<ProofRepos, 'created' | 'createdIds' | 'actionsAccess'>, saved: { scratchRepoId?: number; actionsAccessPrevious?: string; centralCreated?: boolean; centralRepoId?: number }): NonNullable<DeliveryInput['proofRepos']> {
+  // G17 row 27: this run's id of the repo it created, else the one the state saved when an earlier (interrupted) run of it created the repo
+  const id = repos.createdIds?.[CENTRAL_REPO] ?? (saved.centralCreated === true ? saved.centralRepoId : undefined);
   // sec M3: the level saved the moment it changed (an earlier, interrupted run's included) wins over this run's read
   const previous = saved.actionsAccessPrevious ?? repos.actionsAccess?.previous;
   return {
@@ -706,6 +720,17 @@ export function proofReposFor(repos: Pick<ProofRepos, 'created' | 'createdIds' |
     },
     scratch: { ...(saved.scratchRepoId === undefined ? {} : { repoId: saved.scratchRepoId }), createdByPipegen: saved.scratchRepoId !== undefined },
   };
+}
+
+/** The run's trust step (the stage `trusted`): the earlier record pipegen builds on, with its notes and (G17C-R1, F6/m2) the run's own way on. */
+export async function trustedForRun(f: Pick<GitHubFacts, 'gh' | 'clock'>, p: { owner: string; repo: string }, local: LocalRecordDeps, prompt: Prompter, interactive: boolean): Promise<{ record: InstallRecord | null; notes: string[] }> {
+  const notes: string[] = [];
+  const central = { owner: p.owner, repo: CENTRAL_REPO };
+  const c = await readRepo(f.gh, central, f.clock);
+  if (c === null) return { record: null, notes };
+  const t = await trustedPrevious(f.gh, { owner: p.owner, repo: p.repo }, central, c.defaultBranch, null, local, f.clock, notes, { io: prompt, interactive });
+  if (t.why === 'unreadable') notes.push(UNREADABLE_RUN_WAY_ON);
+  return { record: t.record, notes };
 }
 
 /** The pinned scanner, downloaded and checked against its pin; the version from the same pins table (the audit's defaultSecretScanner). */
@@ -760,10 +785,13 @@ const sameFiles = (a: readonly CreatedFile[], b: readonly CreatedFile[]): boolea
 };
 
 /** sec I5: only the scratch repo (pipegen-proof-<repo>) is the state's scratch repo; the central repo checkProofRepos also creates is not. */
-export const onCreatedFor = (store: Pick<StateStore, 'scratchCreated' | 'update'>, repo: string) => (name: string, id: number): void => {
+export const onCreatedFor = (store: Pick<StateStore, 'scratchCreated' | 'update'> & Partial<Pick<StateStore, 'centralCreatedWith'>>, repo: string) => (name: string, id: number): void => {
   if (name === `pipegen-proof-${repo}`) store.scratchCreated(id);
-  // G14-R1 (spec M1): a resume's delivery record still says pipegen made the central repo
-  if (name === CENTRAL_REPO) store.update((n) => { n.centralCreated = true; });
+  // G14-R1 (spec M1): a resume's delivery record still says pipegen made the central repo; G17 row 27: with GitHub's id of it
+  if (name === CENTRAL_REPO) {
+    if (store.centralCreatedWith !== undefined && Number.isSafeInteger(id) && id > 0) store.centralCreatedWith(id);
+    else store.update((n) => { n.centralCreated = true; });
+  }
 };
 
 /** sec M4: the key-env pair's secret parts (the password and each line of the private key's body) as known values. */
@@ -906,13 +934,21 @@ export async function buildFiles(i: BuildInput, f: Pick<BuildFacts, 'texts' | 'a
       files: a0.files,
     });
   const prWait = prWaitMinutes(jobs.merge);
+  // G17 row 29 (G10-r2 P3): a whole file an earlier run adopted whose text this run changes is said in PIPEGEN.md and at the preview
+  const lockFiles = [locks.codeowners?.file, locks.centralCodeowners?.file, locks.orgRequiredWorkflow?.file].filter((x): x is CreatedFile => x !== undefined);
+  const adoptedNotes = [...new Set([...a0.draft.created, ...a0.files, ...inserted, ...lockFiles].filter((x) => x.edited === undefined && x.inserted === undefined).flatMap((x) => {
+    const was = i.prev?.files.find((r) => r.repo === x.repo && r.path === x.path);
+    if (was?.adopted !== true || was.shas.includes(gitBlobSha(x.content))) return [];
+    // G17C-R1 (F5): only what the record says (an earlier run found the file identical to pipegen's text and couldn't prove pipegen wrote it)
+    return [`pipegen rewrites ${x.path}${x.repo === 'central' ? ` in ${CENTRAL_REPO}` : ''}: the install record lists it as adopted, not created (an earlier run found it identical to pipegen's text and couldn't prove pipegen wrote it), and this run changes it. Uninstall still asks before it deletes it.`];
+  }))];
   // spec I7: what the environment plan can't do lands in doc.notes (and the preview) before the judge
   const env = await envPlan(a0.draft.requireDeployApproval, verify.inserts.map((x) => x.path));
   const envNotes = [...new Set(env.notes)];
   // carries 31-34: the doc is filled before the judge
   const doc = docFor({
     transcript: i.transcript, verify, locks: { notes: locks.notes, gateRequired: locks.rulesets !== undefined || locks.classic !== undefined }, precommit,
-    jobs: { notes: jobs.notes, uncoveredMinimum: jobs.uncoveredMinimum }, assembledNotes: [...a0.notes, ...envNotes, ...hookNotes], testNotes: i.testNotes, credits: i.credits ?? [],
+    jobs: { notes: jobs.notes, uncoveredMinimum: jobs.uncoveredMinimum }, assembledNotes: [...a0.notes, ...envNotes, ...hookNotes, ...adoptedNotes], testNotes: i.testNotes, credits: i.credits ?? [],
     estimates: i.est, prWaitMinutes: prWait, strictness: i.strictness,
   });
   const finalDraft: PipelineDraft = { ...a0.draft, doc };
@@ -923,7 +959,7 @@ export async function buildFiles(i: BuildInput, f: Pick<BuildFacts, 'texts' | 'a
   const extra = [pipegenMd, ...inserted, ...(locks.codeowners === undefined ? [] : [locks.codeowners.file]), ...(locks.centralCodeowners === undefined ? [] : [locks.centralCodeowners.file]), ...(locks.orgRequiredWorkflow === undefined ? [] : [locks.orgRequiredWorkflow.file])];
   return {
     assembled, verify, locks, precommit, doc: pipegenMd, extra, files: [...finalDraft.created, ...a0.files, ...extra],
-    environments: env.envs.map((e) => ({ name: e.name, reviewers: e.reviewers })), envNotes, hookNotes,
+    environments: env.envs.map((e) => ({ name: e.name, reviewers: e.reviewers })), envNotes, hookNotes, adoptedNotes,
     minutes: { jobs: assembledJobs(jobs, a0.draft.needs, p), prWait },
   };
 }
@@ -1081,15 +1117,8 @@ function realStages(io: CliIO, deps: RunDeps): RunStages {
       const files = await buildFiles(i, facts, envPlan);
       return { ...files, ...(await judgeBuilt(i, files, facts)), proof: proofBuildFor(i, facts, envPlan) };
     },
-    async trusted(f, p, io2) {
-      const notes: string[] = [];
-      const central = { owner: p.owner, repo: CENTRAL_REPO };
-      const c = await readRepo(f.gh, central, f.clock);
-      if (c === null) return { record: null, notes };
-      const t = await trustedPrevious(f.gh, { owner: p.owner, repo: p.repo }, central, c.defaultBranch, null, local, f.clock, notes, { io: io2.prompt, interactive });
-      return { record: t.record, notes };
-    },
-    deliverCentral: (f, p, files, io2) => deliverCentral(f.gh, p, files, { clock: f.clock, local, io: io2.prompt, interactive }),
+    trusted: (f, p, io2) => trustedForRun(f, p, local, io2.prompt, interactive),
+    deliverCentral: (f, p, files, io2, pr) => deliverCentral(f.gh, p, files, { clock: f.clock, local, io: io2.prompt, interactive, ...(pr === undefined ? {} : { pr }) }),
     readCentralFileList: (f, p) => readCentralFileList(f.gh, p, f.clock),
     preview: (input) => previewText(planDelivery(input)),
     async signingKey() {
@@ -1110,10 +1139,11 @@ function realStages(io: CliIO, deps: RunDeps): RunStages {
  * The referee (seven arguments, against AssembledFiles.draft: carries 11, 50) and the guard on the same batch (carry 51). Never
  * isolatedTestJob (carry 54). The guard's refusals and the referee's issues both stop the run.
  */
-export async function judgeBuilt(i: BuildInput, files: Pick<Built, 'assembled' | 'files' | 'verify' | 'extra'>, facts: Pick<BuildFacts, 'appCo' | 'centralCo' | 'pipegenDoc' | 'serviceTypes' | 'baseTree' | 'centralFiles'>, deps: { linters?: () => ReturnType<typeof ensureLinters>; judge?: typeof judgeAssembled; guard?: typeof guardCreatedFiles } = {}): Promise<{ report: RefereeReport; guardProblems: string[] }> {
+export async function judgeBuilt(i: BuildInput, files: Pick<Built, 'assembled' | 'files' | 'verify' | 'extra'>, facts: Pick<BuildFacts, 'appCo' | 'centralCo' | 'pipegenDoc' | 'serviceTypes' | 'baseTree' | 'centralFiles' | 'texts'>, deps: { linters?: () => ReturnType<typeof ensureLinters>; judge?: typeof judgeAssembled; guard?: typeof guardCreatedFiles } = {}): Promise<{ report: RefereeReport; guardProblems: string[] }> {
   const report = await (deps.judge ?? judgeAssembled)(files.assembled, {
     platform: i.platform, reviewed: i.reviewed, linters: (deps.linters ?? ensureLinters)(), ghToken: i.auth.token ?? '',
-    refereeDeps: { vault: i.vault, createdInputs: createdInputsFor(i, facts) }, extra: files.extra,
+    // G17A-R1 sec M2: the workflow texts the verify plan was built from, so the referee re-derives the called-file head checks
+    refereeDeps: { vault: i.vault, createdInputs: createdInputsFor(i, facts), workflowTexts: facts.texts }, extra: files.extra,
   });
   const g = await (deps.guard ?? guardCreatedFiles)(files.files.filter((x) => x.repo === 'app'), {
     root: i.dir, baseTree: facts.baseTree, installRecord: guardRecord(i.prev), profile: files.assembled.draft.profile, repo: 'app',
@@ -1137,7 +1167,7 @@ export function proofBuildFor(i: BuildInput, facts: BuildFacts, envPlan: EnvPlan
   const judge = makeFixReferee({
     assemble: async (d) => { const b = await rebuild(d); return { files: b.files, draft: b.assembled.draft }; },
     platform: i.platform, reviewed: i.reviewed, linters: (deps.linters ?? ensureLinters)(), ghToken: i.auth.token ?? null,
-    deps: { vault: i.vault, createdInputs: createdInputsFor(i, facts), ...(deps.runLinters === undefined ? {} : { runLinters: deps.runLinters }) },
+    deps: { vault: i.vault, createdInputs: createdInputsFor(i, facts), workflowTexts: facts.texts, ...(deps.runLinters === undefined ? {} : { runLinters: deps.runLinters }) },
   });
   const ctx = { root: i.dir, baseTree: facts.baseTree, installRecord: guardRecord(i.prev), repo: 'app' as const, closure: loadReviewedClosure(i.reviewed), vault: i.vault };
   const guard = deps.guard ?? guardCreatedFiles;
@@ -1160,7 +1190,7 @@ export async function auditCredits(p: RepoProfile, draft: Pick<PipelineDraft, 'c
   // buildsNoImage, the capabilities; no branchGuess (the GitHub context is read, so the branch is known)
   const readerNotes: string[] = [];
   await readWorkflows(dir, undefined, readerNotes);
-  const rows = await map(p, floorNeeds(p, draft.capabilities), dir, { skippedWorkflows: skippedWorkflowCount(readerNotes), noImage: (need) => buildsNoImage(need, p), capabilities: draft.capabilities });
+  const rows = await map(p, floorNeeds(p, draft.capabilities), dir, { skippedWorkflows: skippedWorkflowCount(readerNotes), noImage: noImageCheck(p), capabilities: draft.capabilities });
   const out: { text: string; kind: 'push-default' | 'hooks-ci' | 'signing' | 'deploy-gate' }[] = [];
   for (const r of rows) if (r.credit !== undefined && r.creditKind !== undefined && !out.some((o) => o.text === r.credit)) out.push({ text: r.credit, kind: r.creditKind });
   return out;

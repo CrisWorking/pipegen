@@ -9,13 +9,15 @@ export interface ScalingResult { small: number; big: number; ratio: number }
 
 /**
  * `timed(size)` does the work for one size and returns its milliseconds (setup outside the timed part). The test fails when
- * big/small exceeds `maxRatio` in every attempt.
+ * big/small exceeds `maxRatio` in every attempt. A small run faster than `minBaselineMs` counts as that long, so timer noise on
+ * a near-instant baseline cannot inflate the ratio.
  */
 export async function expectScaling(
   label: string,
   timed: (size: 'small' | 'big') => number | Promise<number>,
   maxRatio: number,
   attempts = 3,
+  minBaselineMs = 2,
 ): Promise<ScalingResult[]> {
   const seen: ScalingResult[] = [];
   for (let a = 0; a < attempts; a++) {
@@ -25,7 +27,7 @@ export async function expectScaling(
       small = Math.min(small, await timed('small'));
       big = Math.min(big, await timed('big'));
     }
-    const r = { small: Math.round(small), big: Math.round(big), ratio: big / Math.max(small, 1) };
+    const r = { small: Math.round(small), big: Math.round(big), ratio: big / Math.max(small, minBaselineMs) };
     seen.push(r);
     if (process.env.SCALING_LOG) process.stderr.write(`${label}: ${r.big}/${r.small} ms = ${r.ratio.toFixed(2)} (max ${maxRatio})\n`);
     if (r.ratio <= maxRatio) return seen;

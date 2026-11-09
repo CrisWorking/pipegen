@@ -190,7 +190,9 @@ function judgeBody(repo: 'app' | 'central') {
     if (MARKER_RE.test(original)) {
       // a re-run: allowed only when the install record owns the old block, found exactly once and whole; it is replaced in place
       const ins = facts?.inserted;
-      const replaced = typeof ins === 'string' && ins.startsWith(`${CODEOWNERS_BEGIN}\n`) && ins.endsWith(`${CODEOWNERS_END}\n`) ? codeownersReplace(original, ins, block) : null;
+      // G17 row 23: the recorded insert may start with the separator codeownersFile put before the block (at most two newlines)
+      const own = typeof ins === 'string' ? ins.replace(/^\n{0,2}/, '') : '';
+      const replaced = typeof ins === 'string' && own.startsWith(`${CODEOWNERS_BEGIN}\n`) && own.endsWith(`${CODEOWNERS_END}\n`) ? codeownersReplace(original, ins, block) : null;
       if (typeof ins !== 'string' || replaced === null || MARKER_RE.test(original.replace(ins, ''))) return ['the original CODEOWNERS already holds a pipegen:begin or pipegen:end marker that the install record does not own as one whole block; a second block would be ambiguous'];
       expected = replaced;
       // G8-R2 m3: the central re-run is checked against the central repo's own file list, which must be given (never a shorter list)

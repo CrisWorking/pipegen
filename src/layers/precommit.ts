@@ -18,7 +18,8 @@ import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { gitBlobSha } from '../create/guard.js';
 import { existingSecretsHook } from '../audit/hook-credit.js';
-import { HOOK_FILES, HOOKS_MARKER, hookBlock, hookCommands, hookFile, SECRETS_HOOK_ID, type HookCommand, type HookManager } from '../engine/created-builders.js';
+import { HOOK_FILES, HOOKS_MARKER, hookBlock, hookCommands, hookDataProblem, hookFile, huskyAppendProblem, SECRETS_HOOK_ID, type HookCommand, type HookManager } from '../engine/created-builders.js';
+import { parseYaml } from '../engine/yaml-parse.js';
 import { readTextLimitedWithReason } from '../read/limits.js';
 import type { CreatedFile, InstallEdit, PipelineDraft, ReviewedTool } from '../types.js';
 
@@ -70,6 +71,33 @@ async function readOriginal(dir: string, path: string): Promise<{ text: string }
   const r = await readTextLimitedWithReason(full, dir);
   if ('text' in r) return r;
   return { note: r.skipped === 'link' ? `${path} is a symbolic link (or sits under one); pipegen never reads or writes through one, so it adds no hook there` : `pipegen could not read ${path} as a plain text file, so it adds no hook there` };
+}
+
+/**
+ * G17 row 63 (progress l. 411): why a hook file that holds pipegen's block once would not run it, or null. The same checks the write path makes
+ * (hookFile), on the file as it is: `before` and `after` are the text around the block. husky: the text before the block passes the append check
+ * (no exit or exec, no continued last line, ...); pre-commit and lefthook: the whole file parses strictly as one document, pre-commit's
+ * `default_stages` include the commit stage, and, for the block this version writes, the file reads as the rest plus exactly pipegen's hooks.
+ */
+function inPlaceProblem(manager: HookManager, original: string, before: string, after: string, commands: readonly HookCommand[] | null): string | null {
+  if (/[\r\t]/.test(original)) return 'it uses CRLF line ends or tabs';
+  if (manager === 'husky') {
+    const lines = before.split('\n').filter((l) => l.trim() !== '');
+    if (/\\\s*$/.test(lines[lines.length - 1] ?? '')) return 'its line before pipegen\'s block continues onto the next';
+    return before.trim() === '' || /^#![^\n]*\n?$/.test(before) ? null : huskyAppendProblem(before);
+  }
+  const r = parseYaml(original, 'strict');
+  if ('problems' in r) return `it does not parse strictly: ${r.problems.join('; ')}`;
+  if (manager === 'pre-commit') {
+    const ds = (r.parsed.js as Record<string, unknown>).default_stages;
+    if (ds !== undefined && !(Array.isArray(ds) && ds.some((x) => x === 'pre-commit' || x === 'commit'))) return 'its `default_stages` leave out the commit stage, so pipegen\'s hooks would not run at commit';
+  }
+  if (commands !== null) {
+    const rest = before + after;
+    const p = hookDataProblem(manager, manager === 'pre-commit' && /^repos:[ ]*\n?$/.test(rest) ? '' : rest, original, commands);
+    if (p !== null) return p;
+  }
+  return null;
 }
 
 /** Whether another file of the same manager exists (pre-commit and lefthook read other names too; pipegen appends only to its one name). */
@@ -132,8 +160,15 @@ export async function precommitFiles(draft: PipelineDraft, reviewed: readonly Re
       const before = recorded.filter((r) => r.path === path).map((r) => r.inserted);
       const block = [...now, ...before].find(once);
       if (block === undefined) return none(`The ${path} file holds a pipegen hooks marker, but what follows it is not pipegen's block as pipegen writes it (changed, commented out, partial or there twice), so pipegen counts these hooks as not set up and adds nothing. Remove pipegen's lines from ${path} and run \`npx pipegen run\` again to have them written.`);
+      // G17 row 63: the block is there, but would it run? The write path's checks again, on the file as it is
+      const current = now.includes(block);
+      const [head, tail] = original.split(block) as [string, string];
+      const why = inPlaceProblem(manager, original, head, tail, current ? commands : null);
+      if (why !== null) return none(`The ${path} file holds pipegen's hooks block, but pipegen's hooks there would not run as written (${why}), so pipegen counts these hooks as not set up and adds nothing. Fix ${path}, or remove pipegen's lines from it and run \`npx pipegen run\` again to have them written.`);
       const runs = commands.map((c) => c.run).filter((r) => block.includes(r));
-      return { files: [], edits: [], setupCommand: SETUP_COMMANDS[manager], notes: [...notes, built.note], inPlace: [{ path, runs }] };
+      // the note says which block matched: the one this version writes, or the older one the install record holds
+      const note = current ? built.note : `${path} holds pipegen's hooks as an earlier version of pipegen wrote them (the install record lists that block), so pipegen counts them as set up and adds nothing; they may differ from the hooks this version would write. Remove pipegen's lines from ${path} and run \`npx pipegen run\` again to get this version's hooks.`;
+      return { files: [], edits: [], setupCommand: SETUP_COMMANDS[manager], notes: [...notes, note], inPlace: [{ path, runs }] };
     }
     return none(built.note);
   }

@@ -487,3 +487,53 @@ describe('G13-R2: a hook file counts as in place only with pipegen\'s exact bloc
     }
   });
 });
+
+describe('G17 row 63: a hook file in place passes the same checks as a write (progress l. 411)', () => {
+  /** The file the first run writes for `manager` over `original`, and the block it inserted. */
+  const firstRun = async (manager: 'pre-commit' | 'lefthook' | 'husky', original: string): Promise<{ written: string; inserted: string }> => {
+    const first = await precommitFiles(hookDraft(manager), reviewedList(), repo({ [HOOK_FILES[manager]]: original }));
+    const e = first.edits[0];
+    return { written: first.files[0]?.content as string, inserted: e?.kind === 'hooks' ? e.inserted : '' };
+  };
+  it('precommit: in place is refused when `default_stages` leave out the commit stage, when husky exits before the block, or when the YAML is not strict', async () => {
+    const { written: pc } = await firstRun('pre-commit', PRE_COMMIT);
+    const { written: lh } = await firstRun('lefthook', LEFTHOOK);
+    const { written: hk } = await firstRun('husky', HUSKY);
+    const cases: [string, 'pre-commit' | 'lefthook' | 'husky', string, RegExp][] = [
+      ['pre-commit default_stages push', 'pre-commit', `default_stages: [pre-push]\n${pc}`, /default_stages/],
+      ['husky exit before the block', 'husky', `exit 0\n${hk}`, /exit or exec/],
+      ['husky last line continues into the block', 'husky', hk.replace(HUSKY, 'npm test \\\n'), /continues onto the next|quote|exit|not pipegen/],
+      ['lefthook duplicate key', 'lefthook', `commit-msg:\n  commands: {}\n${lh}`, /strict/],
+      ['pre-commit duplicate key', 'pre-commit', `repos: []\n${pc}`, /strict/],
+    ];
+    for (const [name, manager, text, re] of cases) {
+      const r = await precommitFiles(hookDraft(manager), reviewedList(), repo({ [HOOK_FILES[manager]]: text }));
+      expect(r.inPlace, name).toBeUndefined();
+      expect(r.files, name).toEqual([]);
+      expect(r.setupCommand, name).toBe('');
+      expect(r.notes.join('\n'), name).toMatch(re);
+      expect(r.notes.join('\n'), name).toMatch(/counts these hooks as not set up/);
+    }
+    // the same files without the defect stay in place
+    for (const [manager, text] of [['pre-commit', pc], ['lefthook', lh], ['husky', hk]] as const) {
+      const r = await precommitFiles(hookDraft(manager), reviewedList(), repo({ [HOOK_FILES[manager]]: text }));
+      expect(r.inPlace?.length, manager).toBe(1);
+    }
+  });
+
+  it('precommit: the note says which block matched, the one this version writes or the older one the install record holds', async () => {
+    for (const manager of ['pre-commit', 'lefthook', 'husky'] as const) {
+      const original = { 'pre-commit': PRE_COMMIT, lefthook: LEFTHOOK, husky: HUSKY }[manager];
+      const path = HOOK_FILES[manager];
+      const { written, inserted } = await firstRun(manager, original);
+      const now = await precommitFiles(hookDraft(manager), reviewedList(), repo({ [path]: written }));
+      expect(now.notes.join('\n'), manager).toMatch(/already holds pipegen's hooks, so pipegen adds them no second time/);
+      expect(now.notes.join('\n'), manager).not.toMatch(/earlier version of pipegen/);
+      const olderIns = inserted.replace(/pipegen:hooks/, 'pipegen:hooks (older)');
+      const older = await precommitFiles(hookDraft(manager), reviewedList(), repo({ [path]: written.replace(inserted, olderIns) }), [{ path, inserted: olderIns }]);
+      expect(older.inPlace?.length, manager).toBe(1);
+      expect(older.notes.join('\n'), manager).toMatch(new RegExp(`${path.replace(/\./g, '\\.')} holds pipegen's hooks as an earlier version of pipegen wrote them`));
+      expect(older.notes.join('\n'), manager).not.toMatch(/adds them no second time/);
+    }
+  });
+});

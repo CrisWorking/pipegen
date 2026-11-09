@@ -1,5 +1,6 @@
 // v0.2 Plan D, D0a: every created file is judged or refused (preflight B1, S1, S11). The registry of created-file kinds,
 // the CF-1 path rule and the `edited` marker.
+import { WORKFLOW_CONCURRENCY } from '../src/engine/job-rules.js';   // G17 row 1b: pipegen.yml carries the workflow concurrency
 import { describe, expect, it } from 'vitest';
 import { referee, type Linters } from '../src/engine/referee.js';
 import { createdPathProblem } from '../src/engine/job-rules.js';
@@ -215,7 +216,7 @@ describe('parity: what the engine produces today still passes', () => {
   const wfText = (): string => {
     const steps = [...renderJobPrelude({ fetchDepth: '1' }, p).steps, ...renderStep(gl, entry('gitleaks'), p, rctx).steps];
     const doc = new Document();
-    doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, jobs: { j: { 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none' } } });
+    doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, concurrency: { ...WORKFLOW_CONCURRENCY }, jobs: { j: { 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none' } } });
     doc.setIn(['jobs', 'j', 'steps'], stepsToYaml(steps));
     return doc.toString({ lineWidth: 0 });
   };

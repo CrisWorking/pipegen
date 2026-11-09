@@ -1,5 +1,6 @@
 // D4: the compose judge (the file must equal composeText(draft.profile, baseImages) byte for byte) and the referee's recognition of the
 // runtime-env and compose-up steps. PIPEGEN_DB_PASSWORD is allowed only in the exact runtime-env step.
+import { WORKFLOW_CONCURRENCY } from '../src/engine/job-rules.js';   // G17 row 1b: pipegen.yml carries the workflow concurrency
 import { Document, parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { composeText, createCompose, runtimeEnv } from '../src/create/compose.js';
@@ -90,7 +91,7 @@ const show = (r: RefereeReport): string => r.issues.map((i) => `${i.check}: ${i.
 const has = (r: RefereeReport, check: string): boolean => r.issues.some((i) => i.check === check);
 const wfText = (steps: RenderedStep[], top: Record<string, unknown> = {}, jobOver: Record<string, unknown> = {}): string => {
   const doc = new Document();
-  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, ...top, jobs: { 'app-start': { 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none', ...jobOver } } });
+  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, concurrency: { ...WORKFLOW_CONCURRENCY }, ...top, jobs: { 'app-start': { 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none', ...jobOver } } });
   doc.setIn(['jobs', 'app-start', 'steps'], stepsToYaml(withEgress(steps)));
   return doc.toString({ lineWidth: 0 });
 };
@@ -197,7 +198,15 @@ describe('referee: the password name in an edited user workflow', () => {
     return { path: '.github/workflows/deploy.yml', content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: 'test', repo: 'app', inserted: { original, jobs: ['app-start'], needs: [] } };
   };
   it('the recognised runtime-env step in an added job passes; the name in an added unrecognised step is an injection; the user\'s own text is not judged', async () => {
-    expect(show(await run([inserted(userWf(), [...prelude(), RT, UP])], dU))).toBe('');
+    // G17A-R1 sec I1: pipegen inserts only pipegen-verify into a user's workflow, so this mark is refused as a template issue; the D4 count of
+    // the added job is what this test judges (no injection)
+    const r0 = await run([inserted(userWf(), [...prelude(), RT, UP])], dU);
+    expect(has(r0, 'injection'), show(r0)).toBe(false);
+    // G17A-R2 spec M-1: exactly these two issues, so a third one on the recognised step is noticed
+    expect(r0.issues.map((i) => `${i.check}: ${i.message}`)).toEqual([
+      'template: An edit of a user\'s deploy workflow inserts exactly one job, pipegen-verify; this mark lists "app-start".',
+      'template: pipegen adds no pipegen-verify job to this workflow: pipegen\'s reader found no deploy in it.',
+    ]);
     const r = await run([inserted(userWf(), [...prelude(), RT, { name: 'x', run: `echo "$${DBPW}"`, shell: 'bash' }])], dU);
     expect(has(r, 'injection'), show(r)).toBe(true);
     // the user's own step may spell it (pipegen does not judge the user's text); the added job is clean
