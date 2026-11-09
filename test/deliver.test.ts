@@ -714,6 +714,12 @@ describe('G10 delivery: secrets and settings before the merge', () => {
     if (!('env' in m3)) throw new Error('expected the environment');
     await firstRun(w3, { signingEnv: { ...m3.env, githubCreatedAt: '2020-01-01T00:00:00Z' } }, { signingKey: async () => SIGNING }, {}, signing);
     expect((await record(w3))?.environments[0]).toMatchObject({ name: 'pipegen-signing', created: false });
+    // an entry that doesn't say pipegen made it is not the run's own: the environment reads as there before (its settings kept for uninstall)
+    const w4 = world();
+    const m4 = await makeRunSigningEnvironment(w4.g.octokit(), { owner: 'o', repo: 'r' }, 'main', { clock: { budget: newRateBudget(), sleep: async () => {} }, local: { home: w4.home, env: {} }, now: new Date('2026-11-05T12:00:00Z') });
+    if (!('env' in m4)) throw new Error('expected the environment');
+    await firstRun(w4, { signingEnv: { ...m4.env, created: false } }, { signingKey: async () => SIGNING }, {}, signing);
+    expect((await record(w4))?.environments[0]).toMatchObject({ name: 'pipegen-signing', created: false, previous: expect.any(Object) });
   });
 
   it('preview: G-SIGN1 an environment made earlier in this run is said so; the key is still created now', () => {
