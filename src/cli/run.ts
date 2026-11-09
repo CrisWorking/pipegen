@@ -427,7 +427,9 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     assertBootstrapAllowed(io.env);
     // G13-R1 (sec M4): key-env makes its key pair only in memory; a host without a memory folder is refused before anything costs money
     const hasMemory = (): boolean => (deps.isMemory ?? isMemoryFolder)(MEMORY_DIR);
-    let keyEnvApplies = signingMode(p, facts.caps) === 'key-env' && publishedImageServices(p, facts.caps).length > 0;
+    // G17-F1 (sec M1): with the deploy part skipped nothing is signed (assembly drops the signing plan), so no key pair, no memory folder,
+    // no signing environment and no "this run signs" note
+    let keyEnvApplies = keyEnvFor(p, facts.caps, skipped);
     if (keyEnvApplies && !hasMemory()) { err(NO_MEMORY_FOLDER); return 2; }
     // 8, read only (ruling G14-R0 1): helper repos this token can't create are named before anything costs money. The writing check
     // (checkProofRepos: create, Actions access, default branch) runs inside the proof, where a throw is cleaned up
@@ -448,7 +450,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     let agreedSigningEnv = false;
     if (counted !== undefined) {
       // ruling G-SIGN1-R1: the screen names the signing environment the run creates before the proof, only when that path can run
-      const consent = await st.consent(facts, p, provider, est, counted, auth, extra, { signingEnv: firstRunSigningCan(p, facts.caps) && hasMemory() });
+      const consent = await st.consent(facts, p, provider, est, counted, auth, extra, { signingEnv: firstRunSigningCan(p, facts.caps, skipped) && hasMemory() });
       if (consent === null) { err('No consent: nothing was created, nothing was sent to an AI and no secret was asked for. exit code 1.'); return 1; }
       scannerName = (consent as { terms?: { secretScanner?: { name: 'gitleaks' | 'betterleaks' } } }).terms?.secretScanner?.name ?? scannerName;
       agreedSigningEnv = (consent as { terms?: { signingEnv?: unknown } }).terms?.signingEnv === true;
@@ -525,7 +527,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
       // ruling G-SIGN1: the first run on a private repo signs when the plan allows. After the yes (a GitHub write) and before the needs, the
       // debate, assembly and the referee: the run's own pipegen-signing, made new and read back with the default-branch rule, and only
       // then the signing mode re-derived from the proven capabilities. Anything else stays unsigned, with the reason said (fail closed)
-      const first = await firstRunSigning(p, facts.caps, () => st.signingEnv(facts, p), hasMemory, agreedSigningEnv);
+      const first = await firstRunSigning(p, facts.caps, () => st.signingEnv(facts, p), hasMemory, agreedSigningEnv, skipped);
       for (const n of first.notes) err(n);
       if (first.env !== undefined) {
         facts = { ...facts, caps: first.caps };
@@ -548,7 +550,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
           disarmEnv = (deps.armSigningEnv ?? defaultArmSigningEnv)(once, { label: SIGNING_ENV_HOOK_LABEL, deadlineMs: SIGNING_ENV_HOOK_DEADLINE_MS, record: (item) => { runStore.record(item); } });
         };
         armEnvHook();
-        keyEnvApplies = signingMode(p, facts.caps) === 'key-env' && publishedImageServices(p, facts.caps).length > 0;
+        keyEnvApplies = keyEnvFor(p, facts.caps, skipped);
       }
       // 9-10
       const needsPlan = await st.needs(p, facts.caps, bundle as CodeBundle, ai, facts.writers.length, knownValues);
@@ -595,7 +597,8 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
           rememberKey(keyVault, pair);
         }
       }
-      const signing = signingFor(p, facts.caps, pubSha);
+      // G17-F1 (sec M1): a skipped deploy part signs nothing (assembly would drop the plan anyway; a key-env plan here would have no key)
+      const signing = deploySkipped(skipped) ? undefined : signingFor(p, facts.caps, pubSha);
       if (signing !== undefined) draft.signing = signing;
     }
     const known = knownChecks(vault, keyVault);
@@ -802,11 +805,19 @@ export const STOP_AT_HAND_OFF = 'pipegen stopped: a stop began before the delive
 /** G-SIGN1-R2 sec N1: the path could run, but the consent the user answered didn't name the signing environment. */
 export const NOT_AGREED_SIGNING_OFF = `Signing is off (mode none): the consent screen you answered didn't say pipegen creates the environment ${SIGNING_ENVIRONMENT}, so it makes none.`;
 
+/** G17-F1 (sec M1): the deploy part is skipped (`--skip deploy`): no image is published or signed (jobs.ts drops the signing plan). */
+export const deploySkipped = (skipped: PipelineDraft['skipped']): boolean => skipped.some((x) => x.part === 'deploy');
+/** Whether this run signs with a key pair it makes (key-env with a published image, the deploy part not skipped). */
+export function keyEnvFor(p: RepoProfile, caps: Capabilities, skipped: PipelineDraft['skipped']): boolean {
+  return !deploySkipped(skipped) && signingMode(p, caps) === 'key-env' && publishedImageServices(p, caps).length > 0;
+}
+
 /**
  * Whether firstRunSigning would make the run's own environment (the memory folder aside): a private repo with environments, the rule not
  * proven yet, and key-env with a published image once it is (attestations, no image, a public repo: never).
  */
-export function firstRunSigningCan(p: RepoProfile, caps: Capabilities): boolean {
+export function firstRunSigningCan(p: RepoProfile, caps: Capabilities, skipped: PipelineDraft['skipped']): boolean {
+  if (deploySkipped(skipped)) return false;   // G17-F1 (sec M1): nothing is signed with the deploy part skipped
   if (!p.private || !caps.environments || caps.deploymentBranchPolicies) return false;
   const proven: Capabilities = { ...caps, deploymentBranchPolicies: true };
   return signingMode(p, proven) === 'key-env' && publishedImageServices(p, proven).length > 0;
@@ -819,8 +830,8 @@ export function firstRunSigningCan(p: RepoProfile, caps: Capabilities): boolean 
  * fresh environment of that name with its branch rule turns deploymentBranchPolicies on. Fail closed: any other answer keeps `caps` as
  * probed (signing mode none) with the reason in `notes`; nothing claims signing that the read-back didn't prove.
  */
-export async function firstRunSigning(p: RepoProfile, caps: Capabilities, make: () => Promise<{ env: SigningEnvEntry } | { off: string }>, memory: () => boolean, agreed: boolean): Promise<{ caps: Capabilities; env?: SigningEnvEntry; notes: string[] }> {
-  if (!firstRunSigningCan(p, caps)) return { caps, notes: [] };
+export async function firstRunSigning(p: RepoProfile, caps: Capabilities, make: () => Promise<{ env: SigningEnvEntry } | { off: string }>, memory: () => boolean, agreed: boolean, skipped: PipelineDraft['skipped']): Promise<{ caps: Capabilities; env?: SigningEnvEntry; notes: string[] }> {
+  if (!firstRunSigningCan(p, caps, skipped)) return { caps, notes: [] };
   const proven: Capabilities = { ...caps, deploymentBranchPolicies: true };
   if (!memory()) return { caps, notes: [NO_MEMORY_SIGNING_OFF] };
   // G-SIGN1-R2 (sec N1): only when the consent the user answered named the environment

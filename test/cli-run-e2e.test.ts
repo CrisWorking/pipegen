@@ -325,4 +325,36 @@ describe('e2e', () => {
     const seeded = await PRIVATE();
     expect(seeded.w.io.asked.find((q) => /Go ahead\?/.test(q))).not.toMatch(/pipegen creates the environment pipegen-signing/);
   }, 240_000);
+
+  // G17-F1 (sec M1): `--skip deploy` signs nothing (assembly drops the signing plan), so the run makes no signing environment, says
+  // nothing about signing with a key pair, asks no consent for it, makes no key pair, and needs no memory folder
+  it('e2e: G17-F1 --skip deploy on a first private run makes no signing environment, prints no "this run signs" note and asks no consent for it', async () => {
+    const w = await e2eWorld({ signing: true, signingEnv: false, skip: 'tests,deploy' });
+    let keys = 0;
+    const key = w.stages.signingKey as NonNullable<typeof w.stages.signingKey>;
+    w.stages.signingKey = async () => { keys++; return key(); };
+    const code = await w.run();
+    expect(code, w.io.errs.join('\n')).toBe(0);
+    const envWrites = w.fgh.calls.filter((c) => isWrite(c) && c.route.includes('/environments/'));
+    expect(envWrites.map((c) => c.route)).toEqual([]);
+    expect(w.fgh.repo(APP).envs.has(SIGNING_ENV)).toBe(false);
+    const errs = w.io.errs.join('\n');
+    expect(errs).not.toMatch(/pipegen made the environment pipegen-signing/);
+    expect(errs).not.toMatch(/deleted the environment pipegen-signing/);
+    expect(errs).not.toMatch(/Signing is off/);
+    expect(w.io.asked.find((q) => /Go ahead\?/.test(q))).not.toMatch(/pipegen creates the environment pipegen-signing/);
+    expect(keys).toBe(0);
+  }, 240_000);
+
+  it('e2e: G17-F1 --skip deploy on a repo with a proven signing environment and no memory folder is not stopped for the memory folder', async () => {
+    const w = await e2eWorld({ signing: true, skip: 'tests,deploy' });
+    w.deps.isMemory = () => false;
+    let keys = 0;
+    const key = w.stages.signingKey as NonNullable<typeof w.stages.signingKey>;
+    w.stages.signingKey = async () => { keys++; return key(); };
+    const code = await w.run();
+    expect(w.io.errs.join('\n')).not.toMatch(/no such folder/);
+    expect(code, w.io.errs.join('\n')).toBe(0);
+    expect(keys).toBe(0);
+  }, 240_000);
 });
