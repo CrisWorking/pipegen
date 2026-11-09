@@ -653,7 +653,7 @@ export async function readGitHubContext(
     if (rejectedOn(gh, e)) throw tokenRejected();
     const { status } = failure(e);
     if (status === 404 || status === 403) {
-      throw new GitHubAccessError(`pipegen can't see ${repoName(owner, repo)} with this token (${said(e)}). Check the repo name and that the token (or the App installation) includes this repo.`, { status });
+      throw new GitHubAccessError(`pipegen can't see ${repoName(owner, repo)} with this token (${said(e)}). Check the repo name and that the token includes this repo.`, { status });
     }
     throw new GitHubAccessError(`pipegen couldn't read ${repoName(owner, repo)} from GitHub (${said(e)}).`, { status });
   }
@@ -713,7 +713,7 @@ export async function probePermissions(gh: Octokit, owner: string, repos: string
   // G13 (S12): the optional organisation rows are never required, so never checked here
   const rows = rowsFor(mode).filter((p) => (opts.kind === 'app' || !p.appOnly) && p.org !== true);
   const access = (repo: string) => `Access to ${repoName(owner, repo)}`;
-  const NO_ACCESS = 'pipegen can\'t reach this repo with this token: it doesn\'t exist yet, or it isn\'t in the token\'s (or the App installation\'s) repository list.';
+  const NO_ACCESS = 'pipegen can\'t reach this repo with this token: it doesn\'t exist yet, or it isn\'t in the token\'s repository list.';
   const done = () => ({ missing, unchecked: unchecked.filter((u) => !missing.some((m) => m.permission === u.permission)) });
 
   if (opts.kind === 'app') {

@@ -152,7 +152,7 @@ published yet.
 
 ```bash
 npx pipegen uninstall                  # first run, then (after you merge its pull request) the second run
-npx pipegen uninstall --delete-repos   # the second run also deletes the repos pipegen made
+npx pipegen uninstall --delete-repos   # the second run also prints the gh repo delete commands for the repos pipegen made (v0.2: it deletes none)
 ```
 
 `pipegen uninstall` needs a terminal. It shows what it will do, asks **one** yes, and asks you to type a name before it deletes anything it can't be sure is pipegen's. With no terminal (CI, a pipe) it stops before it reads or sends anything. No flag or environment variable answers these questions.

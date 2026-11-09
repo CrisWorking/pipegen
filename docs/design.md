@@ -194,7 +194,7 @@ The builder ("developer") picks among **reviewed tools** for blocking needs, and
 
 **Uninstall is two runs of the same command (phase A, phase B).** Run 1 (phase A) shows the preview, asks one yes, opens the app PR `pipegen/uninstall`, closes pipegen's own open PRs and removes the merge locks (the rulesets and the organisation rule; classic branch protection is put back to what it was, never deleted). You merge that PR. Run 2 (phase B) starts only after GitHub says the uninstall PR is merged: it removes the secrets, variables, environments and settings pipegen added, empties the scratch repo and opens the central PR that removes this project's files (the install record last; the central locks too when this is the last project). Why two runs: the uninstall PR deletes `pipegen.yml`, so the required `pipegen / gate` can never report on it, and the locks must come off first; deleting secrets and environments before the merge would break deploys that still hold `pipegen-verify`; and removing the install record first would lose the only list of what pipegen made.
 
-`--delete-repos` deletes the scratch repo, and the central repo if no project is left, each after its name is typed and every check has passed.
+In v0.2, `--delete-repos` prints the `gh repo delete` commands for the scratch repo, and for the central repo if no project is left, once every check has passed; pipegen deletes no repo with a fine-grained token.
 
 In v0.2, `--delete-repos` prints the `gh repo delete` commands (a fine-grained token never deletes repos). Planned next, with pipegen's own GitHub App login: `--delete-repos` will use the repo-deletion right the App already has (Administration: write).
 

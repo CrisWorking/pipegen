@@ -31,6 +31,16 @@ describe('V7 scan: the G-forms the V6-R3 review found', () => {
     for (const [name, file, code] of forms) expect(problems(file, code).length, name).toBeGreaterThan(0);
   });
 
+  it('scan: E\'s writers imported by a file that is not allowed them are caught (I2)', () => {
+    for (const w of ['cleanupWrite', 'deleteScratchRepo', 'cleanupLeftovers', ['deleteScratch', 'Secret'].join('')]) {
+      const from = w === 'cleanupLeftovers' ? '../proof/cleanup.js' : '../proof/target.js';
+      for (const file of ['src/cli/zz.ts', 'src/cli/main.ts', 'src/deliver/zz.ts', 'src/uninstall/central.ts', 'src/cli/uninstall.ts']) {
+        expect(problems(file, `import { ${w} } from '${from}';\nawait ${w}(a, b);`).length, `${w} in ${file}`).toBeGreaterThan(0);
+      }
+      expect(problems('src/cli/cleanup.ts', `import { ${w} } from '${from}';\nawait ${w}(a, b);`), `${w} in cleanup.ts`).toEqual([]);
+    }
+  });
+
   it('scan: a guarded binding stays allowed as a call or new target in its allowed files', () => {
     expect(problems('src/uninstall/apply.ts', "import { deleteCentralRepo, takeApi } from './target.js';\nimport { planUninstall, type UninstallPlan } from './plan.js';\nexport async function f(gh: never, p: UninstallPlan) { const a = await planUninstall(gh, p); takeApi(p, 'A'); return deleteCentralRepo?.(gh); }")).toEqual([]);
     expect(problems('src/uninstall/plan.ts', "import { UninstallApi } from './target.js';\nexport const f = (gh: never, app: never): UninstallApi => new UninstallApi(gh, app);")).toEqual([]);

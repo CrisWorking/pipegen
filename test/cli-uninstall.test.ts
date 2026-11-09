@@ -418,6 +418,16 @@ describe('V7 fold 3 (DECISIONS #127): v0.2 uses a fine-grained token; the App is
     const t5 = read('docs/threat-model.md').split('\n').find((l) => l.startsWith('| T5 |')) as string;
     expect(t5).toMatch(/v0\.2 uses a \*\*fine-grained token\*\*/);
     expect(t5).toMatch(PLANNED);
+    // fold 4: every --delete-repos line says v0.2 prints the commands (it never says pipegen deletes the repos), in README, design and the central PR body
+    for (const [f, text] of [['README.md', read('README.md')], ['docs/design.md', read('docs/design.md')]] as const) {
+      for (const l of text.split('\n').filter((x) => /--delete-repos/.test(x) && /\bdeletes?\b/.test(x))) {
+        expect(/print|planned|deletes no|delete no|deletes none|never deletes/i.test(l), `${f}: ${l.slice(0, 140)}`).toBe(true);
+      }
+    }
+    expect(read('README.md')).toMatch(/--delete-repos\s+# the second run also prints the gh repo delete commands/);
+    expect(read('docs/design.md')).toMatch(/In v0\.2, `--delete-repos` prints the `gh repo delete` commands for the scratch repo/);
+    expect(read('src/uninstall/central.ts')).toMatch(/with --delete-repos, to print the `gh repo delete` commands/);
+    expect(read('src/github/client.ts')).not.toMatch(/App installation\\?'?s? ?\)|\(or the App installation/);
     expect(read('docs/smoke-test.md')).not.toMatch(/created by the App or by hand|pipegen's GitHub App login works/);
   });
 
