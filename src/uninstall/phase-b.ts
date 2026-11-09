@@ -300,8 +300,9 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
         if (isRateStop(e) || e instanceof GitHubAccessError || statusOf(e) === 401) throw e;
         r.failed.push({ what, why: reasonOf(e), manual: 'Run `pipegen cleanup`.' });
       } finally {
-        // cleanupLeftovers gives the app's lease back when it ends: uninstall takes it again for the rest of its run
-        ctx.store.acquireLease(`uninstall-${randomBytes(6).toString('hex')}`);
+        // Plan V M5: cleanupLeftovers keeps a lease its caller holds (no gap for another pipegen); this is a no-op then, and takes it
+        // again only if something gave it back
+        ctx.store.acquireLease(`uninstall-${randomBytes(6).toString('hex')}`, 'uninstall');
       }
     }
     const sc = plan.scratch;

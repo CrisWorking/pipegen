@@ -744,7 +744,7 @@ async function liveWorkflow(gh: Octokit, loaded: LoadedRecord, clock: RateClock,
 async function takeLease(app: RepoRef, deps: StateDeps | undefined): Promise<StateStore> {
   try {
     const store = await StateStore.open(app, deps ?? {});
-    store.acquireLease(`uninstall-${randomBytes(6).toString('hex')}`);
+    store.acquireLease(`uninstall-${randomBytes(6).toString('hex')}`, 'uninstall');
     return store;
   } catch (e) {
     if (e instanceof ProofStopError || e instanceof StateError) throw new UninstallError(`${(e as Error).message} Nothing was changed.`, { cause: e });

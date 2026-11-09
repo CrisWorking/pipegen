@@ -3,7 +3,7 @@
 // runs a child node process (the child is bundled from test/fixtures/e8-sigint-child.ts with esbuild). No network.
 import { spawn } from 'node:child_process';
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { build } from 'esbuild';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -327,6 +327,24 @@ describe('E8 state file', () => {
     writeFileSync(leaseFile, JSON.stringify(Object.fromEntries([['pid', 1], ['host', 'other-host'], ['runId', RUN], ['token', 'x']])), { mode: 0o600 });
     const d = await open(h, { alive: () => false });
     expect(() => d.acquireLease(RUN)).toThrow(/another machine/);
+  });
+
+  it('state: the lease names the command holding it (Plan V M5); an unknown command name in the file is never shown; holdsLeaseFor', async () => {
+    const h = home();
+    const a = await open(h);
+    a.acquireLease(RUN, 'uninstall');
+    const leaseFile = join(a.dir, 'lease.json');
+    expect(JSON.parse(readFileSync(leaseFile, 'utf8')).command).toBe('uninstall');
+    expect(a.holdsLeaseFor(app())).toBe(true);
+    expect(a.holdsLeaseFor({ owner: 'CrisWorking', repo: 'other' })).toBe(false);
+    const b = await open(h);
+    expect(b.holdsLeaseFor(app())).toBe(false);
+    expect(() => b.acquireLease(RUN, 'finish')).toThrow(/^Another pipegen \(`pipegen uninstall`, process \d+\) is working on /);
+    a.releaseLease();
+    expect(a.holdsLeaseFor(app())).toBe(false);
+    // a lease file naming a command pipegen doesn't have (edited, say): the stop names the process only
+    writeFileSync(leaseFile, JSON.stringify(Object.fromEntries([['pid', process.pid], ['host', hostname()], ['runId', RUN], ['token', 'x'], ['command', 'rm -rf \u001b[2J']])), { mode: 0o600 });
+    expect(() => b.acquireLease(RUN, 'finish')).toThrow(/^Another pipegen \(process \d+\) is working on /);
   });
 
   it('state: a new run keeps the scratch repo\'s created id until it is deleted; saveState checks the schema', async () => {

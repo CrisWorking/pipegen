@@ -50,6 +50,8 @@ import { safeText } from '../util/safe-text.js';
 import {
   commitFiles, compareStatus, DeliverError, ghRead, ghWrite, isoAt, openOrUpdatePr, readHead, readRepo, readTree, refusedMove, sameInstant, setBranch, statusOf, type RepoRef, type TreeEntry,
 } from './git-data.js';
+import { holdAppLease, isLeaseStop, stateDepsOf, type ReleaseLease } from '../proof/lease.js';
+import type { StateStore } from '../proof/state.js';
 import { addLocalLeftovers, centralPrBase, dropLocalLeftovers, localLeftoversPath, readLocalLeftovers, centralUpdateBranch, localRecordPath, ownWholeFile, protectedPathsForRecord, RecordError, writeRecord, type Leftover, type LocalRecordDeps, type RecordedEdit } from './record.js';
 import { trustedPrevious, UNREADABLE_RUN_WAY_ON } from './trust.js';
 
@@ -359,7 +361,17 @@ async function holds(gh: Octokit, c: RepoRef, branch: string, sha: string, files
  * opens/updates the central pull request and stops (S26). `files`: the central workflows to pin (never the required workflow, which names
  * this commit). Only this project's own central files are accepted.
  */
-export async function deliverCentral(gh: Octokit, p: RepoProfile, files: readonly CreatedFile[], deps: { clock?: RateClock; local?: LocalRecordDeps; io?: Prompter; interactive?: boolean; pr?: CentralPr } = {}): Promise<CentralResult> {
+export async function deliverCentral(gh: Octokit, p: RepoProfile, files: readonly CreatedFile[], deps: { clock?: RateClock; local?: LocalRecordDeps; io?: Prompter; interactive?: boolean; pr?: CentralPr; lease?: StateStore } = {}): Promise<CentralResult> {
+  // Plan V M5: the app's lease (run passes its own down), before the first GitHub call
+  const release = await deliverLease(p, deps);
+  try {
+    return await deliverCentralHeld(gh, p, files, deps);
+  } finally {
+    release();
+  }
+}
+
+async function deliverCentralHeld(gh: Octokit, p: RepoProfile, files: readonly CreatedFile[], deps: { clock?: RateClock; local?: LocalRecordDeps; io?: Prompter; interactive?: boolean; pr?: CentralPr }): Promise<CentralResult> {
   const clock = deps.clock ?? clockOf(gh);
   if (p.private !== true) throw new DeliverError('A public repository has no central workflows.');
   const own = `.github/workflows/${centralProjectName(p.repo)}--`;
@@ -849,6 +861,8 @@ export interface DeliverDeps {
   pipegenVersion?: string;
   /** G10-R-sec6: an interactive run (a terminal, no --yes, not CI) may ask the user to confirm an earlier record this machine can't check. */
   interactive?: boolean;
+  /** Plan V M5: the app's lease run already holds: deliver takes no second one, and leaves it held. */
+  lease?: StateStore;
 }
 export interface DeliverResult {
   prUrl: string; prNumber: number; centralSha: string | null; recordHash: string; centralPrUrl?: string;
@@ -951,7 +965,30 @@ export function prBody(d: DeliveryPlan, commits: readonly { part: Part; files: C
  * Steps 2-7 (see the header). `p` is the app (the draft's profile). Throws DeliverError (a plain reason) and writes nothing when a check
  * fails before the first write. The vault is wiped at the end, whatever happened.
  */
+/**
+ * Plan V M5: the app's lease for a delivery. run holds it from its start and passes it down (`lease`), so it is not taken twice (that
+ * would stop on run's own process) and stays held after; a delivery without one takes it. Another pipegen holding it → a stop before
+ * anything is read or sent.
+ */
+async function deliverLease(p: Pick<RepoProfile, 'owner' | 'repo'>, deps: { local?: LocalRecordDeps; lease?: StateStore }): Promise<ReleaseLease> {
+  try {
+    return await holdAppLease({ owner: p.owner, repo: p.repo }, 'run', { held: deps.lease, state: stateDepsOf(deps.local) });
+  } catch (e) {
+    if (isLeaseStop(e)) throw new DeliverError(`${e.message} Nothing was delivered.`, { cause: e });
+    throw e;
+  }
+}
+
 export async function deliver(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vault: SecretVault, deps: DeliverDeps): Promise<DeliverResult> {
+  const release = await deliverLease(p, deps);
+  try {
+    return await deliverHeld(gh, p, d, vault, deps);
+  } finally {
+    release();
+  }
+}
+
+async function deliverHeld(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vault: SecretVault, deps: DeliverDeps): Promise<DeliverResult> {
   try {
     const clock = deps.clock ?? clockOf(gh);
     const now = deps.now?.() ?? new Date();

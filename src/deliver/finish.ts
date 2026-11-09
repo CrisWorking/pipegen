@@ -58,6 +58,8 @@ import { generateCosignKeys } from '../layers/deploy.js';
 import type { CosignExec, CosignResolver } from './cosign-keys.js';
 import { ensureSigningEnvironment, plannedOfLocks, readEnv, SETUP_BRANCH } from './deliver.js';
 import { compareStatus, DeliverError, isoAt, readBlobText, readHead, readRepo, readTree, statusOf, type RepoRef, type TreeEntry } from './git-data.js';
+import { holdAppLease, isLeaseStop, stateDepsOf, type ReleaseLease } from '../proof/lease.js';
+import type { StateStore } from '../proof/state.js';
 import { centralOf, centralUpdateBranch, localFinishPendingPath, protectedPathsOfRecord, readFinishPending, readLocalRecord, RecordError, writeFinishPending, writeRecord, type FinishPending, type LocalRecordDeps } from './record.js';
 import { classicPutForm, holdsWanted, isObj, PLANNED_ROUTES, refusedAsUnavailable, SettingsApi } from './settings-api.js';
 import { trustedPrevious } from './trust.js';
@@ -105,6 +107,8 @@ export interface FinishDeps {
   keyBase?: string;
   /** Test seam: whether a folder is a memory folder (default: the statfs check, isMemoryFolder). */
   isMemory?: (dir: string) => boolean;
+  /** Plan V M5: the app's lease the caller already holds (run): finish takes no second one, and leaves it held. */
+  lease?: StateStore;
 }
 export interface FinishResult {
   applied: string[]; skipped: { what: string; why: string }[]; notes: string[];
@@ -933,7 +937,27 @@ function plannedRouteProblem(p: InstallPlanned): string | null {
  * `pipegen finish` for the app `app` (see the header). Throws FinishError, with nothing applied, when the record can't be trusted, the
  * setup pull request isn't merged, or the locks can't be planned again.
  */
+/**
+ * Plan V M5: finish holds the app's lease for its whole run (the same lease as run, cleanup and uninstall), taken before its first GitHub
+ * call: another pipegen working on this repo on this machine (an uninstall's phase A, an update) is a stop, nothing read or applied. run
+ * passes its own lease down (`deps.lease`). Given back on every exit path.
+ */
 export async function finish(gh: Octokit, app: RepoRef, opts: FinishOpts, deps: FinishDeps): Promise<FinishResult> {
+  let release: ReleaseLease;
+  try {
+    release = await holdAppLease(app, 'finish', { held: deps.lease, state: stateDepsOf(deps.local) });
+  } catch (e) {
+    if (isLeaseStop(e)) throw new FinishError(`${e.message} Nothing was applied.`, { cause: e });
+    throw e;
+  }
+  try {
+    return await finishHeld(gh, app, opts, deps);
+  } finally {
+    release();
+  }
+}
+
+async function finishHeld(gh: Octokit, app: RepoRef, opts: FinishOpts, deps: FinishDeps): Promise<FinishResult> {
   const clock = deps.clock ?? clockOf(gh);
   const notes: string[] = [];
   const stop = (e: unknown): never => {

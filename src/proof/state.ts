@@ -23,7 +23,7 @@
 // recorded residual: the scratch repo's key state is shared per repo id inside one process only, E4).
 import { closeSync, constants, fstatSync, fsyncSync, openSync, readSync, renameSync, unlinkSync, writeSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { basename, isAbsolute, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
 import type { KnownValueCheck, PipelineDraft } from '../types.js';
@@ -47,6 +47,9 @@ export const STATE_VERSION = 1;
 export const MAX_STATE_BYTES = 16 * 1024 * 1024;
 const STATE_FILE = 'state.json';
 const LEASE_FILE = 'lease.json';
+/** The commands that take the app's lease (Plan V M5): a stop names the one holding it. */
+export const LEASE_COMMANDS = ['run', 'resume', 'cleanup', 'uninstall', 'finish', 'update'] as const;
+export type LeaseCommand = (typeof LEASE_COMMANDS)[number];
 
 /** A problem with the state file or a refused write. The message never holds a value. */
 export class StateError extends Error {
@@ -633,10 +636,10 @@ export class StateStore {
    * Takes the lease of this app repo for this process (S20): a stop when another live pipegen process holds it on this
    * machine; a lease left by a process that is gone is taken over. Released by releaseLease() or when the process exits.
    */
-  acquireLease(runId: string): void {
+  acquireLease(runId: string, command?: LeaseCommand): void {
     if (this.#lease !== null) return;
     const token = randomBytes(8).toString('hex');
-    const body = JSON.stringify({ pid: process.pid, host: hostname(), runId, token, at: new Date((this.#deps.now ?? Date.now)()).toISOString() });
+    const body = JSON.stringify({ pid: process.pid, host: hostname(), runId, token, at: new Date((this.#deps.now ?? Date.now)()).toISOString(), ...(command === undefined ? {} : { command }) });
     const file = join(this.dir, LEASE_FILE);
     for (let tries = 0; tries < 2; tries++) {
       try {
@@ -650,7 +653,9 @@ export class StateStore {
       const held = this.#readLease(file);
       if (held !== null && held.host === hostname() && this.#alive(held.pid)) {
         const which = this.#state === null ? 'this repo' : `${this.#state.app.owner}/${this.#state.app.repo}`;
-        throw new ProofStopError(`Another pipegen (process ${held.pid}) is working on ${which} on this machine. Wait for it to finish, or stop it, then run pipegen again.`);
+        // Plan V M5: the message names the command that holds the lease (a lease written before then names none)
+        const who = held.command === undefined ? `process ${held.pid}` : `\`pipegen ${held.command}\`, process ${held.pid}`;
+        throw new ProofStopError(`Another pipegen (${who}) is working on ${which} on this machine. Wait for it to finish, or stop it, then run pipegen again.`);
       }
       // an unreadable lease (review M-2): never taken over (it can't be shown to be this machine's, or dead), a stop naming it
       if (held !== null && held.host === '') {
@@ -674,7 +679,7 @@ export class StateStore {
     }
   }
 
-  #readLease(file: string): { pid: number; host: string; token: string } | null {
+  #readLease(file: string): { pid: number; host: string; token: string; command?: LeaseCommand } | null {
     let fd: number;
     try {
       fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -684,9 +689,11 @@ export class StateStore {
     try {
       const buf = Buffer.alloc(4096);
       const n = readSync(fd, buf, 0, buf.length, 0);
-      const d = JSON.parse(buf.subarray(0, n).toString('utf8')) as { pid?: unknown; host?: unknown; token?: unknown };
+      const d = JSON.parse(buf.subarray(0, n).toString('utf8')) as { pid?: unknown; host?: unknown; token?: unknown; command?: unknown };
       if (typeof d.pid !== 'number' || !Number.isSafeInteger(d.pid) || d.pid <= 0 || typeof d.host !== 'string' || typeof d.token !== 'string') return { pid: 0, host: '', token: '' };
-      return { pid: d.pid, host: d.host, token: d.token };
+      // only a known command name is shown (the file is the user's own, but its text never reaches the terminal unchecked)
+      const command = (LEASE_COMMANDS as readonly unknown[]).includes(d.command) ? d.command as LeaseCommand : undefined;
+      return { pid: d.pid, host: d.host, token: d.token, ...(command === undefined ? {} : { command }) };
     } catch {
       return { pid: 0, host: '', token: '' };   // unreadable (a crash while it was written, or edited): acquireLease stops on it
     } finally {
@@ -698,6 +705,16 @@ export class StateStore {
     const file = join(this.dir, LEASE_FILE);
     const held = this.#readLease(file);
     if (held !== null && held.token === token) try { unlinkSync(file); } catch { /* gone */ }
+  }
+
+  /** Whether this store holds the lease (this process took it and has not given it back) of the app repo `app`. */
+  holdsLeaseFor(app: Pick<ProofApp, 'owner' | 'repo'>): boolean {
+    if (this.#lease === null) return false;
+    try {
+      return basename(this.dir) === stateFolderName(app);
+    } catch {
+      return false;
+    }
   }
 
   /** Gives the lease back (only this process's own). */

@@ -331,6 +331,23 @@ describe('E8 fix round 1: minors', () => {
     expect(e.w.g.calls.length).toBe(before);
   });
 
+  it('cleanup: a lease the caller already holds (uninstall\'s run 2) stays held after cleanupLeftovers (Plan V M5: no gap); one it took is given back', async () => {
+    const e = await setup();
+    const store2 = await StateStore.open(app(), { home: e.h, env: {} });
+    store2.acquireLease('uninstall-x', 'uninstall');
+    await cleanupLeftovers(e.w.g.gh, store2, { canDeleteRepo: false, clock: instant, io: quietIo });
+    expect(store2.holdsLeaseFor(app())).toBe(true);
+    const probe = await StateStore.open(app(), { home: e.h, env: {} });
+    expect(() => { probe.acquireLease('probe', 'finish'); }).toThrow(/Another pipegen \(`pipegen uninstall`, process \d+\)/);
+    store2.releaseLease();
+    // a cleanup that took the lease itself gives it back
+    const store3 = await StateStore.open(app(), { home: e.h, env: {} });
+    await cleanupLeftovers(e.w.g.gh, store3, { canDeleteRepo: false, clock: instant, io: quietIo });
+    expect(store3.holdsLeaseFor(app())).toBe(false);
+    probe.acquireLease('after', 'finish');
+    probe.releaseLease();
+  });
+
   it('state: an unreadable lease is a stop naming the file, never taken over (M-2)', async () => {
     const e = await setup();
     writeFileSync(join(e.store.dir, 'lease.json'), 'not json', { mode: 0o600 });

@@ -749,7 +749,10 @@ export function restoreAiSpend(meter: AiSpendMeter, s: Pick<RunState, 'aiCostUsd
 export async function cleanupLeftovers(gh: Octokit, store: StateStore, opts: { canDeleteRepo: boolean; clock?: PollClock; cancelWaitMs?: number; settleMs?: number; io: Pick<CliIO, 'prompt' | 'out' | 'err'> }): Promise<CleanupResult> {
   const st = store.state;
   if (st === null) throw new StateError('There is no saved proof state.');
-  store.acquireLease(st.runId);
+  // Plan V M5: a lease the caller already holds (uninstall's run 2) stays held after: giving it back would leave a gap in which another
+  // pipegen (finish, update) could take it in the middle of the caller's run
+  const took = !store.holdsLeaseFor(st.app);
+  store.acquireLease(st.runId, 'cleanup');
   try {
     const t = proofTarget(st.app, { runId: st.runId });
     const keys = new ScratchKeys(gh, t, new SecretVault(), { io: opts.io, leftover: () => {} });
@@ -758,6 +761,6 @@ export async function cleanupLeftovers(gh: Octokit, store: StateStore, opts: { c
       ...(opts.clock === undefined ? {} : { clock: opts.clock }), ...(opts.cancelWaitMs === undefined ? {} : { cancelWaitMs: opts.cancelWaitMs }),
     });
   } finally {
-    store.releaseLease();
+    if (took) store.releaseLease();
   }
 }

@@ -313,13 +313,13 @@ export async function e2eWorld(o: E2eOptions = {}): Promise<E2eWorld> {
     activity: async () => ({ pushes: 12, prs: 6, capped: false }),
     proofRepos: async () => { tl.push('proof: helper repos checked'); return { ready: true, target: {} as never, repos: [], created: [] }; },
     signingKey: async () => ({ key: cosignKey('SIGSTORE', envelope({}, 'ZTJl')), ['pass' + 'word']: KEY_PW, pub: cosignPub(41) } as never),
-    finish: async (f, p, io2) => {
+    finish: async (f, p, io2, lease) => {
       tl.push('finish: start');
       const probe: FinishProbe = async () => ({ plan: fgh.plan as never, caps: f.caps, centralBranchProtection: f.caps.branchProtection, workflowPins: { tagPinned: 0, unchecked: false } });
       const shm = join(home, 'shm');
       mkdirSync(shm, { recursive: true });
       let n = 0;
-      return finishCommand(io2, { owner: p.owner, repo: p.repo }, {}, { gh: f.gh, login: f.login, local: { home, env: {} }, clock: f.clock }, ((g, app, opts, d) => finish(g, app, opts, {
+      return finishCommand(io2, { owner: p.owner, repo: p.repo }, {}, { gh: f.gh, login: f.login, local: { home, env: {} }, clock: f.clock, lease }, ((g, app, opts, d) => finish(g, app, opts, {
         ...d, probe, keyBase: shm, isMemory: (x: string) => x === shm, cosignBin: async () => '/opt/cosign-e2e',
         exec: async (_bin, args) => {
           const prefix = args[args.indexOf('--output-key-prefix') + 1] as string;

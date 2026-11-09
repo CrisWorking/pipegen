@@ -37,6 +37,8 @@ import { CENTRAL_REPO } from '../proof/target.js';
 import { FLOOR_NEEDS, type InstallRecord, type RecordRepo, type ReviewedTool } from '../types.js';
 import { safeMarkdown, safeText } from '../util/safe-text.js';
 import { commitFiles, DeliverError, ghRead, statusOf, openOrUpdatePr, readBlobText, readHead, readRepo, readTree, setBranch, type RepoRef, type TreeEntry } from './git-data.js';
+import { holdAppLease, isLeaseStop, stateDepsOf, type ReleaseLease } from '../proof/lease.js';
+import type { StateStore } from '../proof/state.js';
 import { centralOf, centralUpdateBranch, localRecordPath, readLocalRecord, RecordError, recordWriteReached, writeRecord, type LocalRecordDeps } from './record.js';
 import { trustedPrevious } from './trust.js';
 
@@ -106,6 +108,8 @@ export interface UpdateDeps {
   /** Only an interactive run may ask the record trust question (trust.ts). */
   interactive?: boolean;
   local?: LocalRecordDeps; clock?: RateClock; now?: () => Date;
+  /** Plan V M5: the app's lease the caller already holds: update takes no second one, and leaves it held. */
+  lease?: StateStore;
 }
 export interface UpdateResult {
   /** Whether pull requests were opened or updated. */
@@ -870,7 +874,26 @@ async function setupPrNumber(gh: Octokit, app: RepoRef, local: number | undefine
  * `pipegen update` for the app `app` (see the header): trust the record, read the prompts, derive, show everything, ask once, then open the
  * pull requests and write the record. Throws UpdateError (nothing written) without a trusted record or a reviewed gate pin.
  */
+/**
+ * Plan V M5: update holds the app's lease for its whole run (the same lease as run, cleanup, uninstall and finish), taken before its
+ * first GitHub call: another pipegen working on this repo on this machine is a stop, nothing read or changed. Given back on every exit path.
+ */
 export async function update(gh: Octokit, app: RepoRef, deps: UpdateDeps): Promise<UpdateResult> {
+  let release: ReleaseLease;
+  try {
+    release = await holdAppLease(app, 'update', { held: deps.lease, state: stateDepsOf(deps.local) });
+  } catch (e) {
+    if (isLeaseStop(e)) throw new UpdateError(`${e.message} Nothing was changed.`, { cause: e });
+    throw e;
+  }
+  try {
+    return await updateHeld(gh, app, deps);
+  } finally {
+    release();
+  }
+}
+
+async function updateHeld(gh: Octokit, app: RepoRef, deps: UpdateDeps): Promise<UpdateResult> {
   const clock = deps.clock ?? clockOf(gh);
   const gate = reviewedGatePin(deps.reviewed);
   const appSt = await repoState(gh, app, clock);

@@ -37,6 +37,7 @@ import { estimate, needKeyCount } from '../src/estimate/estimate.js';
 import { AssembleError } from '../src/layers/jobs.js';
 import { DeliverError } from '../src/deliver/git-data.js';
 import { pubKeySha256 } from '../src/engine/signing.js';
+import { holdAppLease } from '../src/proof/lease.js';
 import { StateStore } from '../src/proof/state.js';
 import type { CreatedFile, InstallRecord, Need, PipelineDraft, RepoProfile } from '../src/types.js';
 import { fake } from './helpers/secret-repo.js';
@@ -225,6 +226,31 @@ describe('G13: the run, in order', () => {
     expect(store.load()?.proofOk).toBe(true);
     expect(i.errs[0]).toBe(SCOPE_LINE);
     expect(i.lines.join('\n')).toContain('delivery note');
+  });
+
+  it('run: passes its own app lease down to deliverCentral, deliver and finish: no second lease, no self-deadlock (Plan V M5)', async () => {
+    const w = world();
+    const app = { owner: OWN, repo: 'r' };
+    const st = { home: w.home, env: {} };
+    const seen: Record<string, boolean> = {};
+    const check = async (name: string, lease: StateStore): Promise<void> => {
+      seen[name] = lease.holdsLeaseFor(app);
+      // the lease run passes down is accepted, not taken again, and stays held after
+      (await holdAppLease(app, 'finish', { held: lease, state: st }))();
+      expect(lease.holdsLeaseFor(app)).toBe(true);
+      // a second lease taken in this process while run holds it would stop on run's own process: why run passes its own down
+      await expect(holdAppLease(app, 'finish', { state: st })).rejects.toThrow(/Another pipegen \(`pipegen run`, process \d+\)/);
+    };
+    const { deliverCentral: dc, deliver: dl, finish: fi } = w.stages as Required<Pick<RunStages, 'deliverCentral' | 'deliver' | 'finish'>>;
+    w.stages.deliverCentral = async (f, p, files, i2, pr, lease) => { await check('deliverCentral', lease); return dc(f, p, files, i2, pr, lease); };
+    w.stages.deliver = async (f, p, input, v, i2, key, lease) => { await check('deliver', lease); return dl(f, p, input, v, i2, key, lease); };
+    w.stages.finish = async (f, p, i2, lease) => { await check('finish', lease); return fi(f, p, i2, lease); };
+    expect(await run(w)).toBe(0);
+    expect(seen).toEqual({ deliverCentral: true, deliver: true, finish: true });
+    // given back when run ends
+    const after = await StateStore.open(app, st);
+    after.acquireLease('after', 'finish');
+    after.releaseLease();
   });
 
   it('run: remote read before auth, auth before readProject', async () => {
