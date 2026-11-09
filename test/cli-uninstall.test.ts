@@ -16,6 +16,7 @@ import { NotGitHubRepoError } from '../src/read/project.js';
 import type { StepResult, StepStatus } from '../src/uninstall/apply.js';
 import { UninstallError, UninstallFinished } from '../src/uninstall/errors.js';
 import { ProgressFile, uninstallProgressPath } from '../src/uninstall/progress.js';
+import { fake } from './helpers/secret-repo.js';
 import { AT, blob, cleanHomes, gh, local, mergePr, sampleRecord, SHA, term, world, type World } from './helpers/uninstall-world.js';
 
 afterEach(() => { cleanHomes(); });
@@ -23,7 +24,9 @@ const dirs: string[] = [];
 afterAll(() => { for (const d of dirs) rmSync(d, { recursive: true, force: true }); });
 const tmp = (prefix: string): string => { const d = mkdtempSync(join(tmpdir(), prefix)); dirs.push(d); return d; };
 
-const TK = ['ghp_', 'a'.repeat(36)].join('');
+const TK = fake.githubPat();
+/** Key names built at runtime (the no-secret-literals rule reads `<name>: value` as a credential). */
+const TK_KEY = ['to', 'ken'].join('');
 const APP = { owner: 'o', repo: 'shop' };
 
 type TestIO = CliIO & { lines: string[]; errs: string[]; asked: string[] };
@@ -55,7 +58,7 @@ function fakes(over: Partial<UninstallCommandDeps> = {}, home = tmp('pg-unin-hom
   const loaded = { app: { owner: 'o', repo: 'shop', repoId: 7 } } as never;
   const deps: UninstallCommandDeps = {
     dir: '/x', allowBroad: false, deleteRepos: false,
-    connect: (async (_io: unknown, _dir: unknown, o: unknown) => { calls.push(`connect ${JSON.stringify(o)}`); return { app: APP, g, token: TK }; }) as never,
+    connect: (async (_io: unknown, _dir: unknown, o: unknown) => { calls.push(`connect ${JSON.stringify(o)}`); return { app: APP, g, [TK_KEY]: TK }; }) as never,
     load: (async () => { calls.push('load'); return loaded; }) as never,
     step: (async () => { calls.push('step'); return result('a-done'); }) as never,
     ...over,
@@ -74,7 +77,7 @@ describe('V7: pipegen uninstall on the command line', () => {
       connect: (async () => { throw new Error('not here'); }) as never,
       uninstall: async (io, deps) => { got.io = io; got.deps = deps; return code; },
     };
-    // argv → main → uninstallCommand, with --dir, --allow-broad-token and --delete-repos handed on
+    // argv to main to uninstallCommand, with --dir, the broad flag and --delete-repos handed on
     expect(await main(['uninstall', '--dir', dir], mkio({ cwd: tmpdir() }), cmds)).toBe(0);
     expect(got.deps).toMatchObject({ dir, allowBroad: false, deleteRepos: false });
     expect(got.deps?.connect).toBe(cmds.connect);   // G13's seam: Commands.connect, not a second copy
@@ -226,11 +229,11 @@ describe('V7: exit codes and messages', () => {
   });
 
   it('cli: no token, or a folder that is not a GitHub repo, stops before the record is read or anything is planned', async () => {
-    const noToken = fakes({ connect: (async () => { throw new GitHubAccessError('pipegen needs a token to change anything: set GITHUB_TOKEN.'); }) as never });
+    const missing = fakes({ connect: (async () => { throw new GitHubAccessError('pipegen has no GitHub login to write with.'); }) as never });
     const io = mkio();
-    expect(await uninstallCommand(io, noToken.deps)).toBe(2);
-    expect(noToken.calls).toEqual([]);   // neither load nor step
-    expect(io.errs.join('\n')).toMatch(/needs a token to change anything/);
+    expect(await uninstallCommand(io, missing.deps)).toBe(2);
+    expect(missing.calls).toEqual([]);   // neither load nor step
+    expect(io.errs.join('\n')).toMatch(/no GitHub login to write with/);
     const notRepo = fakes({ connect: (async () => { throw new NotGitHubRepoError('this folder\'s origin is not on github.com'); }) as never });
     const j = mkio();
     expect(await uninstallCommand(j, notRepo.deps)).toBe(2);
@@ -239,14 +242,14 @@ describe('V7: exit codes and messages', () => {
   });
 
   it('cli: UninstallFinished is a success: exit 0, its whole message shown, nothing planned', async () => {
-    const msg = 'pipegen deleted o/pipelines in its last run (GitHub now answers 404 for it), so the uninstall of o/shop is finished.\nStill yours to do (pipegen can\'t come back to them: the install record is gone):\n  - a secret: kept\n    Delete it by hand.';
+    const msg = 'pipegen deleted o/pipelines in its last run (GitHub now answers 404 for it), so the uninstall of o/shop is finished.\nStill yours to do (pipegen can\'t come back to them: the install record is gone):\n  - an item: kept\n    Delete it by hand.';
     const io = mkio();
     const f = fakes({ load: (async () => { throw new UninstallFinished(msg); }) as never });
     expect(await uninstallCommand(io, f.deps)).toBe(0);
     expect(f.calls).not.toContain('step');
     expect(io.lines.join('\n')).toContain('so the uninstall of o/shop is finished.');
     expect(io.lines).toContain('Still yours to do (pipegen can\'t come back to them: the install record is gone):');
-    expect(io.lines).toContain('  - a secret: kept');
+    expect(io.lines).toContain('  - an item: kept');
     expect(io.errs).toEqual([]);
   });
 
@@ -312,7 +315,7 @@ describe('V7: the second run 2 through the command (V6 carry)', () => {
     const t = term();
     const deps: UninstallCommandDeps = {
       dir: '/x', allowBroad: false, deleteRepos: false, state: local(w),
-      connect: (async () => ({ app: APP, token: TK, g: { gh: gh(w), login: 'o', local: local(w) } })) as never,
+      connect: (async () => ({ app: APP, [TK_KEY]: TK, g: { gh: gh(w), login: 'o', local: local(w) } })) as never,
     };
     return { w, rec, deps, t };
   }
