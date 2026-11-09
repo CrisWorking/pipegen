@@ -120,8 +120,10 @@ function world(kind: Kind, wfs: [string, string][] = [[A, DEPLOY_A]], over: { pr
 }
 // G17A-R1 sec M2: the referee gets the workflow texts the plan was built from (run.ts passes BuildFacts.texts), so it re-derives the called-file
 // head checks; null: none given
-const judge = (w: World, extra: CreatedFile[] = w.v.inserts.map((i) => i.file), texts: ReadonlyMap<string, string> | null = w.texts) =>
-  judgeAssembled(w.a, { ...JD, extra, refereeDeps: { ...JD.refereeDeps, ...(texts === null ? {} : { workflowTexts: texts }) } });
+// G17A-R2 sec r2-M1: the draft carries the plan's gaps in doc.deployGaps, as buildFiles fills them (`gaps`: another list, for a forged doc)
+const DOC_OF = (gaps: VerifyPlan['gaps']): NonNullable<PipelineDraft['doc']> => ({ transcript: [], deployGaps: gaps.map((g) => ({ path: g.path, triggers: [...g.triggers], why: g.why })), lockNotes: [], estimates: { monthlyMinutes: 0, includedMinutes: null }, setupCommand: '', testNotes: [], uncoveredMinimum: [], notes: [] }) as unknown as NonNullable<PipelineDraft['doc']>;
+const judge = (w: World, extra: CreatedFile[] = w.v.inserts.map((i) => i.file), texts: ReadonlyMap<string, string> | null = w.texts, gaps: VerifyPlan['gaps'] = w.v.gaps) =>
+  judgeAssembled({ ...w.a, draft: { ...w.a.draft, doc: DOC_OF(gaps) } }, { ...JD, extra, refereeDeps: { ...JD.refereeDeps, ...(texts === null ? {} : { workflowTexts: texts }) } });
 const verifyOf = (w: World): Job => w.a.verify as Job;
 const step = (j: Job, id: string): Obj => j.steps.find((s) => s.id === id) as Obj;
 const insertedJob = (text: string): Obj => (parse(text) as Obj).jobs['pipegen-verify'] as Obj;
@@ -1590,5 +1592,43 @@ describe('G17A-R1: the referee judges the edited file and the batch, never the m
     const u = calledWorld(CALLER_A, dispatch);
     expect(insertAt(u, SHIP)).toBeUndefined();
     expect(shown(await judge(u))).toBe('');
+  });
+});
+
+// ---------- G17A-R2 (sec r2-M1, r2-N1): every deploy workflow the layer gates is edited or a listed gap; an edit's original is the text read ----------
+describe('G17A-R2: the referee binds the batch to the plan\'s inputs', () => {
+  const CALLER_B2 = 'on:\n  push:\n    branches: [main]\njobs:\n  release:\n    uses: ./.github/workflows/ship.yml\n';
+  const notHandled = (path: string): RegExp => new RegExp(`The deploy workflow ${path.replace(/[./]/g, '\\$&')} is neither edited by pipegen in this batch nor listed as a gap`);
+  it('G17A-R2 sec r2-M1: two gated callers of one called file; the second caller\'s insert and the called edit dropped → refused', async () => {
+    const two = world('keyless', [[A, CALLER_A], [B, CALLER_B2], [SHIP, CALLED_A]]);
+    expect(two.v.inserts.map((i) => i.path).sort()).toEqual([A, B, SHIP].sort());
+    expect(shown(await judge(two))).toBe('');
+    const r = await judge(two, [insertAt(two, A)?.file as CreatedFile]);
+    expect(r.issues.some((i) => notHandled(B).test(i.message)), shown(r)).toBe(true);
+    expect(r.issues.some((i) => notHandled(SHIP).test(i.message)), shown(r)).toBe(true);
+  });
+  it('G17A-R2 sec r2-M1: a single caller\'s insert and its called edit both dropped → refused; listed as gaps → accepted', async () => {
+    const w = calledWorld(CALLER_A, CALLED_A);
+    const r = await judge(w, []);
+    expect(r.issues.some((i) => notHandled(A).test(i.message)), shown(r)).toBe(true);
+    expect(r.issues.some((i) => notHandled(SHIP).test(i.message)), shown(r)).toBe(true);
+    // a plain deploy whose insert is dropped is refused too, unless the doc lists it as a gap (PIPEGEN.md then says it is unprotected)
+    const plain = world('keyless', [[A, DEPLOY_A]]);
+    expect((await judge(plain, [])).issues.some((i) => notHandled(A).test(i.message))).toBe(true);
+    expect(shown(await judge(plain, [], plain.texts, [{ path: A, triggers: ['push'], why: 'listed' }]))).toBe('');
+    // the gaps pipegen itself lists (a workflow_run deploy) are accepted
+    const wr = world('keyless', [[A, DEPLOY_A.replace(/on:[\s\S]*?jobs:/, 'on:\n  workflow_run:\n    workflows: [ci]\n    types: [completed]\njobs:')]]);
+    expect(wr.v.inserts).toEqual([]);
+    expect(wr.v.gaps.map((g) => g.path)).toEqual([A]);
+    expect(shown(await judge(wr))).toBe('');
+  });
+  it('G17A-R2 sec r2-N1: with the texts given, every edit\'s original is the text pipegen read', async () => {
+    const w = calledWorld(CALLER_A, CALLED_A);
+    expect(shown(await judge(w))).toBe('');
+    const other = CALLER_A.replace('npm run build', 'npm run build:all');
+    const r = await judge(w, undefined, new Map([[A, other], [SHIP, CALLED_A]]));
+    expect(r.issues.some((i) => new RegExp(`The edit's original of ${A.replace(/[./]/g, '\\$&')} is not the text pipegen read`).test(i.message)), shown(r)).toBe(true);
+    const r2 = await judge(w, undefined, new Map([[A, CALLER_A]]));
+    expect(r2.issues.some((i) => new RegExp(`The edit's original of ${SHIP.replace(/[./]/g, '\\$&')} is not the text pipegen read`).test(i.message)), shown(r2)).toBe(true);
   });
 });

@@ -202,8 +202,11 @@ describe('referee: the password name in an edited user workflow', () => {
     // the added job is what this test judges (no injection)
     const r0 = await run([inserted(userWf(), [...prelude(), RT, UP])], dU);
     expect(has(r0, 'injection'), show(r0)).toBe(false);
-    expect(r0.issues.some((i) => i.check === 'template' && /inserts exactly one job, pipegen-verify/.test(i.message)), show(r0)).toBe(true);
-    expect(r0.issues.every((i) => i.check === 'template'), show(r0)).toBe(true);
+    // G17A-R2 spec M-1: exactly these two issues, so a third one on the recognised step is noticed
+    expect(r0.issues.map((i) => `${i.check}: ${i.message}`)).toEqual([
+      'template: An edit of a user\'s deploy workflow inserts exactly one job, pipegen-verify; this mark lists "app-start".',
+      'template: pipegen adds no pipegen-verify job to this workflow: pipegen\'s reader found no deploy in it.',
+    ]);
     const r = await run([inserted(userWf(), [...prelude(), RT, { name: 'x', run: `echo "$${DBPW}"`, shell: 'bash' }])], dU);
     expect(has(r, 'injection'), show(r)).toBe(true);
     // the user's own step may spell it (pipegen does not judge the user's text); the added job is clean

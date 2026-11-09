@@ -4,7 +4,8 @@
 import { describe, expect, it } from 'vitest';
 import { Document } from 'yaml';
 import { CALLER_WORKFLOW, LOCAL_MERGE_WORKFLOW, PUSH_WORKFLOW, WORKFLOW_CONCURRENCY } from '../src/engine/job-rules.js';
-import { referee, type RefereeReport } from '../src/engine/referee.js';
+import { referee, VERIFY_JOB, type RefereeReport } from '../src/engine/referee.js';
+import { VERIFY_JOB_ID } from '../src/layers/assemble.js';
 import { renderJobPrelude, renderStep, stepsToYaml, type RenderedStep } from '../src/engine/render-step.js';
 import type { CreatedFile, PipelineDraft, ReviewedTool } from '../src/types.js';
 import { draftOf, GATE, job, jobsOf, needOf, p, prof, run, show, specs, workflow as stepsWorkflow, type Job } from './helpers/gate-pipeline.js';
@@ -187,5 +188,11 @@ describe('G17A-R1 sec N1, spec M4: a callee reads a mapped secret only in an exp
     const lowerDeclared = { [SEC_CTX]: { [FP]: { required: false }, [SLACK.toLowerCase()]: { required: false } } };
     const r = await run([passes, mergeWith(lowerDeclared, ref(SLACK))], d);
     expect(has(r, 'permissions', unread), show(r)).toBe(true);
+  });
+});
+
+describe('G17A-R2 spec M-2: the referee\'s verify job id is assemble\'s', () => {
+  it('G17A-R2: the referee\'s VERIFY_JOB is assemble\'s VERIFY_JOB_ID', () => {
+    expect(VERIFY_JOB).toBe(VERIFY_JOB_ID);
   });
 });

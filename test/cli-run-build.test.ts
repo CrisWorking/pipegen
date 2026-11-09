@@ -392,3 +392,40 @@ describe('G14: the fix loop\'s build, referee and guard; AI-written files to the
   });
 });
 
+
+// ---------- G17A-R2 spec I-1: the run's referee gets the workflow texts the verify plan was built from ----------
+describe('G17A-R2: judgeBuilt and the fix loop pass the workflow texts to the referee (sec M2 wiring)', () => {
+  const DEPLOY = '.github/workflows/deploy.yml';
+  const SHIP = '.github/workflows/ship.yml';
+  const LINT = '.github/workflows/lint.yml';
+  const CALLER = 'on:\n  push:\n    branches: [main]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n    steps:\n      - run: npm run build\n  ship:\n    needs: build\n    uses: ./.github/workflows/ship.yml\n';
+  const CALLED = 'on:\n  workflow_call:\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    environment: production\n    steps:\n      - run: ./ship.sh\n';
+  const LINTWF = 'on: pull_request\njobs:\n  check:\n    uses: ./.github/workflows/ship.yml\n';
+  const wf = (path: string, triggers: string[], deploys: boolean) => ({ path, triggers, deploys, [['secrets', 'Used'].join('')]: [], jobs: [] });
+  /** A repository whose gated deploy calls ship.yml, which an ungated pull_request workflow calls too: pipegen leaves ship.yml alone (a gap). */
+  const withCalls = (): { i: BuildInput; facts: BuildFacts } => {
+    const i0 = input(false);
+    const profile = { ...i0.draft.profile, existingWorkflows: [wf(DEPLOY, ['push'], true), wf(SHIP, ['workflow_call'], true), wf(LINT, ['pull_request'], false)] } as unknown as PipelineDraft['profile'];
+    const i = { ...i0, draft: { ...i0.draft, profile } };
+    const facts = { ...FACTS, centralFiles: [], texts: new Map([[DEPLOY, CALLER], [SHIP, CALLED], [LINT, LINTWF]]) } as unknown as BuildFacts;
+    return { i, facts };
+  };
+  it('G17A-R2 spec I-1: judgeBuilt hands facts.texts to its judge as refereeDeps.workflowTexts', async () => {
+    const { i, facts } = withCalls();
+    const files = await buildFiles(i, facts);
+    let seen: unknown;
+    await judgeBuilt(i, files, facts, { linters: judgeDeps.linters, judge: (async (_a: unknown, o: { refereeDeps?: { workflowTexts?: unknown } }) => { seen = o.refereeDeps?.workflowTexts; return { ok: true, issues: [], notes: [], demoted: [] }; }) as never, guard: (async () => ({ ok: [], refused: [], notes: [] })) as never });
+    expect(seen).toBe(facts.texts);
+  });
+  it('G17A-R2 spec I-1: a gated local call whose called file pipegen leaves alone gets no false refusal (judgeBuilt and the fix loop)', async () => {
+    const { i, facts } = withCalls();
+    const files = await buildFiles(i, facts);
+    expect(files.verify.inserts.map((x) => x.path)).toEqual([DEPLOY]);
+    expect(files.verify.gaps.map((g) => g.path)).toEqual([SHIP]);
+    const judged = await judgeBuilt(i, files, facts, { linters: judgeDeps.linters, judge: noLinters });
+    expect(judged.report.issues.map((x) => `${x.file}: ${x.message}`)).toEqual([]);
+    const pb = proofBuildFor(i, facts, undefined, { linters: judgeDeps.linters, guard: async (fs) => ({ ok: [...fs], refused: [], notes: [] }), runLinters: async () => [] });
+    const report = await pb.referee(i.draft);
+    expect(report.issues.map((x) => `${x.file}: ${x.message}`)).toEqual([]);
+  });
+});
