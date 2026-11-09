@@ -1,5 +1,6 @@
 // v0.2 Plan G G14: the production proof (src/cli/run-proof.ts) with recording fakes for GitHub, and the real fix loop, dispute decision
 // and state store; plus its wiring into `pipegen run` and `pipegen resume` (src/cli/run.ts, src/cli/main.ts).
+import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
@@ -1219,15 +1220,34 @@ describe('G14fix: a private app through the real proof harness', () => {
   it('run: a private app\'s proof builds its files with the real harness (no ops.appFiles) and gives it the central sha the setup pushed', async () => {
     const w = await proofWorld({ private: true });
     delete (w.ops as { appFiles?: unknown }).appFiles;
+    // the real harness reads HEAD's workflows for the compat copies: a real (empty) git repo
+    const dir = mkdtempSync(join(tmpdir(), 'pg-g14fix-'));
+    execFileSync('git', ['init', '-q', '-b', 'main', dir]);
+    execFileSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'i']);
+    w.input.dir = dir;
     const shas: (string | undefined)[] = [];
     const asm = w.input.assembleFor;
-    w.input.assembleFor = async (d) => { const a = await asm(d); return async (mode, sha) => { shas.push(sha); return a(mode, sha); }; };
+    w.input.assembleFor = async (d) => { const a = await asm(d); return async (mode, sha) => { shas.push(sha); return (await a(mode, sha)).filter((f) => f.repo === 'central'); }; };
+    // (the world's stand-in app workflows break the real proof rules; the real harness is the app workflow under test)
     const r = await w.run();
-    expect(r.stopped ?? '').not.toContain('no proof central sha');
+    expect(r.stopped ?? '').toBe('');
     expect(r.ok).toBe(true);
     // the harness and the app's files are only ever built for the central commit the setup pushed
     expect(shas.filter((s) => s !== undefined && s !== 'c'.repeat(40))).toEqual([]);
     const harness = w.pushed.find((x) => x.variant === 'setup')?.files.find((f) => f.path === HARNESS_PATH) as { content?: unknown } | undefined;
     expect(String(harness?.content)).toContain('c'.repeat(40));
+  });
+
+  it('run: a private app whose workflows built for the central sha read another secret than the scratch keys were made for stops, cleaned up', async () => {
+    const w = await proofWorld({ private: true });
+    const appFiles = w.ops.appFiles as NonNullable<typeof w.ops.appFiles>;
+    w.ops.appFiles = (d, deps) => {
+      const real = appFiles(d, deps);
+      return { last: real.last, appFiles: async (sha) => [...await real.appFiles(sha), { repo: 'app', path: '.github/workflows/extra.yml', content: 'on: [push]\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: echo ${{ secrets.OTHER_ONE }}\n', part: 'pipeline', reason: 'r' }] };
+    };
+    const r = await w.run();
+    expect(r.ok).toBe(false);
+    expect(r.stopped).toContain('other secrets than the ones the scratch keys were made for');
+    expect(w.tl.some((x) => x.startsWith('cleanup:'))).toBe(true);
   });
 });
