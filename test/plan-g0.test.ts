@@ -501,7 +501,7 @@ describe('G0 fix round 1 (ruling G0-R1)', () => {
     expect(r.parts.filter((p) => p.needId === 'dast')).toEqual([]);
     const pipe = r.parts.find((p) => p.part === 'pipeline' && p.needId === undefined);
     expect(pipe?.status).toBe('proven');
-    expect(pipe?.detail).toMatch(/dast--api \(ZAP\) has no planted item and its report format is not yet proven \(no -J fixture\), so it is not shown to catch anything; it stays blocking/);
+    expect(pipe?.detail).toMatch(/dast--api \(ZAP\) has no planted item, so it is not shown to catch anything; the draft keeps it a blocking check \(whether the gate lets a ZAP result block a merge depends on its ZAP rule\)/);
     expect(pipe?.detail).not.toMatch(/warn only/);
     // blocking like any scanner: its result artifact on the main pull request is required
     const m = greenMain(d);
@@ -509,6 +509,49 @@ describe('G0 fix round 1 (ruling G0-R1)', () => {
     const missing = await evaluate(d, [m, plantedRuns(d)], ctxOf());
     expect(missing.parts.some((p) => p.status === 'failed' && p.needId === 'dast')).toBe(true);
     expect(missing.ok).toBe(false);
+  });
+
+  it('row 78: the ZAP and nuclei notes say "it stays blocking" only for a blocking job, and the ZAP wording does not depend on ZAP_JSON_VERIFIED', async () => {
+    const { evaluate } = await import('../src/proof/evaluate.js');
+    const { ctxOf: ctx0, greenMain, needOf, plantedRuns, spec, PLANTED_ITEMS } = await import('./helpers/proof-eval.js');
+    for (const [tool, label] of [['zap-baseline', 'ZAP'], ['nuclei', 'nuclei']] as const) {
+      const mk = (blocking: boolean) => draftOf({
+        needs: [needOf('secrets', { floor: true }), needOf('sast', { service: 'api', floor: true }), needOf('deps', { service: 'api', floor: true }), needOf('unit-tests', { service: 'api', floor: true }), needOf('dast', { service: 'api', blocking }), needOf('gate', { floor: true })],
+        steps: [spec('gitleaks', 'secrets'), spec('semgrep', 'sast', 'api'), spec('osv-scanner', 'deps', 'api'), spec(tool, 'dast', 'api')],
+      });
+      const detail = async (d: ReturnType<typeof mk>) => {
+        const r = await evaluate(d, [greenMain(d), plantedRuns(d)], ctx0({ plantedItems: PLANTED_ITEMS.filter((i) => i.category !== 'image-scan') }));
+        return r.parts.find((p) => p.part === 'pipeline' && p.needId === undefined)?.detail ?? '';
+      };
+      const keeps = label === 'ZAP' ? 'the draft keeps it a blocking check (whether the gate lets a ZAP result block a merge depends on its ZAP rule)' : 'it stays blocking';
+      const on = await detail(mk(true));
+      expect(on).toContain(`dast--api (${label}) has no planted item`);
+      expect(on).toContain(keeps);
+      expect(on).not.toMatch(/no -J fixture|not yet proven/);
+      const off = await detail(mk(false));
+      // a non-blocking need: the job may not be listed at all, but if it is, it is never called blocking
+      expect(off).not.toContain(keeps);
+      expect(off).toContain(`dast--api (${label}) has no planted item`);   // the note is emitted, positively
+      if (label === 'ZAP') expect(off).toContain('the draft does not make it a blocking check');
+      expect(off).not.toMatch(new RegExp(`dast--api \\(${label}\\)[^;]*;[^.]*stays blocking`));
+    }
+  });
+
+  it('row 79: one table decides which --skip part switches a category off: an image-scan skip maps through OWNER_PART with no part', async () => {
+    const { evaluate } = await import('../src/proof/evaluate.js');
+    const { ctxOf, greenMain, needOf, plantedRuns, spec, PLANTED_ITEMS } = await import('./helpers/proof-eval.js');
+    const noImage = draftOf({
+      needs: [needOf('secrets', { floor: true }), needOf('sast', { service: 'api', floor: true }), needOf('deps', { service: 'api', floor: true }), needOf('gate', { floor: true })],
+      steps: [spec('gitleaks', 'secrets'), spec('semgrep', 'sast', 'api'), spec('osv-scanner', 'deps', 'api')],
+    });
+    const run = async (d: typeof noImage) => (await evaluate(d, [greenMain(d), plantedRuns(d)], ctxOf({ plantedItems: PLANTED_ITEMS, harnessJobs: ['egress-check', 'verify-lookup'] }))).parts.find((p) => p.part === 'pipeline' && p.needId === undefined);
+    // without the skip the image item is expected and missed; with --skip docker it is not expected at all
+    expect((await run(noImage))?.detail).toMatch(/no scanner of the pipeline ran for the planted vulnerable base image/);
+    const skipped = await run({ ...noImage, skipped: [{ part: 'docker' as const, reason: 'no images' }] });
+    expect(skipped?.detail ?? '').not.toMatch(/vulnerable base image/);
+    expect(skipped?.status).toBe('proven');
+    // extra: the second table is gone from the source
+    expect(readFileSync(join(ROOT, 'src/proof/evaluate.ts'), 'utf8')).not.toMatch(/SKIP_PART_OF/);
   });
 
   it('I2: a cap stop after a fix saves the AI-fixed draft as a failed verdict; the resume starts from it', async () => {
