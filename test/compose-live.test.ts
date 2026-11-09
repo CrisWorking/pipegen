@@ -34,11 +34,14 @@ describe('compose (live)', () => {
     expect(r.status, r.stderr).toBe(0);
     // both ./api and ./github.com/acme/api must resolve to local folders, never a remote Git context
     for (const ctxDir of ['api', 'github.com/acme/api']) expect(r.stdout).toContain(JSON.stringify(join(work, ctxDir)).slice(1, -1));
-    const cfg = JSON.parse(r.stdout) as { services: Record<string, { ports?: { host_ip?: string }[]; privileged?: boolean; volumes?: unknown[] }> };
-    for (const s of Object.values(cfg.services)) {
+    const cfg = JSON.parse(r.stdout) as { services: Record<string, { ports?: { host_ip?: string }[]; privileged?: boolean; volumes?: unknown[]; cap_drop?: string[]; security_opt?: string[] }> };
+    for (const [key, s] of Object.entries(cfg.services)) {
       expect(s.privileged).toBeUndefined();
       expect(s.volumes ?? []).toEqual([]);
       for (const port of s.ports ?? []) expect(port.host_ip).toBe('127.0.0.1');
+      // G17 row 13: docker reads the app containers' hardening as written (every capability dropped, no privilege gain)
+      if (key.startsWith('app-')) { expect(s.cap_drop, key).toEqual(['ALL']); expect(s.security_opt, key).toEqual(['no-new-privileges:true']); }
     }
+    expect(Object.keys(cfg.services).filter((k) => k.startsWith('app-')).length).toBe(2);
   });
 });

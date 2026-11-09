@@ -5,6 +5,7 @@
 //   - a fixed table (compose-tables.ts: keys, images ids, ports, healthchecks, the `pipegen` literals, the ${NAME} references);
 //   - a validated repo value: `slug(service name)` for the key, the plain service folder for `build.context`, a port integer 1..65535, and env var
 //     names that pass NAME_RE, are not dangerous and are in the ENV_TABLE.
+// Every app container drops every capability and gains no privilege (G17 row 13): it runs repo code (CI tests, the DAST compose start).
 // The YAML is written by hand in a fixed key order with double-quoted strings (no YAML library stringify), so the text is byte-stable.
 //
 // Not proven (no file, a note): an unknown dependency kind, no runnable service, two services whose keys collide or that want one port, a dependency
@@ -280,7 +281,10 @@ function emit(kinds: readonly DepKey[], refs: ReadonlyMap<DepKey, string>, apps:
   for (const a of apps) {
     out.push(`  ${a.key}:`, '    build:', `      context: ${q(a.context)}`, '      dockerfile: "Dockerfile"');
     if (a.env.length > 0) { out.push('    environment:'); for (const n of a.env) out.push(`      ${n}: ${q('${' + APP_PREFIX + n + ':?}')}`); }
-    out.push('    ports:', `      - ${q(`127.0.0.1:${a.port}:${a.port}`)}`, '    depends_on:');
+    out.push('    ports:', `      - ${q(`127.0.0.1:${a.port}:${a.port}`)}`);
+    // G17 row 13: the app runs repo code, so it gets no capability and no privilege gain (as the DAST archive start, dast-handoff.ts); the
+    // dependency containers keep their image's defaults (their entrypoints switch users), and run no repo code
+    out.push('    cap_drop:', `      - ${q('ALL')}`, '    security_opt:', `      - ${q('no-new-privileges:true')}`, '    depends_on:');
     for (const k of DEP_KEYS) if (a.deps.includes(k)) out.push(`      ${k}:`, '        condition: service_healthy');
   }
   return `${out.join('\n')}\n`;

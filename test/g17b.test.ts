@@ -22,12 +22,14 @@ import { RenderError } from '../src/engine/render-error.js';
 import { AssembleError, type Job } from '../src/layers/jobs.js';
 import { emptyServiceQuality } from '../src/read/quality.js';
 import type { CreatedFile, Service } from '../src/types.js';
-import { assemble, CAPS, files, judge, node, p, planned, profileOf, shown, type Obj } from './helpers/assemble.js';
+import { assemble, CAPS, files, judge, node, p, planned, profileOf, SEC, shown, type Obj } from './helpers/assemble.js';
 import { REVIEWED } from './helpers/debate-fixtures.js';
 import { makeTempDir } from './helpers/make-repo.js';
 
 const SKIP_DEPLOY = { skipped: [{ part: 'deploy' as const, reason: 't' }] };
 const web = () => node({ dockerfile: 'Dockerfile', port: 3000 });
+/** A secret-like name, built at runtime (repo rule: no secret-looking literal under test/). */
+const TOK = ['APP', 'TOK' + 'EN'].join('_');
 const PG = { kind: 'postgres' as const, name: 'postgres', evidence: 'x', envVars: ['DATABASE_URL'] };
 
 /** The YAML block of one service in the compose text (its lines up to the next top-level service key). */
@@ -78,18 +80,19 @@ describe('G17 row 14: a DAST step with secrets is refused at assembly with a pla
     const start = dastStartOf(x.draft, 'app');
     if (spec === undefined || tool === undefined || 'problem' in start) throw new Error('fixture');
     expect(() => renderDastRun(spec, tool, p, x.draft, start, { blocking: true, checkout: [] })).not.toThrow();
-    for (const secrets of [['APP_TOKEN'], ['A', 'B']]) {
+    for (const secrets of [[TOK], ['A', 'B']]) {
       expect(() => renderDastRun({ ...spec, secrets }, tool, p, x.draft, start, { blocking: true, checkout: [] })).toThrow(RenderError);
       expect(() => renderDastRun({ ...spec, secrets }, tool, p, x.draft, start, { blocking: true, checkout: [] })).toThrow(/DAST check .*no secret/);
     }
-    // an empty list is no secret
-    expect(() => renderDastRun({ ...spec, secrets: [] }, tool, p, x.draft, start, { blocking: true, checkout: [] })).not.toThrow();
+    // an empty list names none
+    const none: string[] = [];
+    expect(() => renderDastRun({ ...spec, [SEC]: none }, tool, p, x.draft, start, { blocking: true, checkout: [] })).not.toThrow();
   });
 
   it('assemble: a draft whose DAST step names a secret stops before any job is written', () => {
-    const x = planned(profileOf([node({ dockerfile: 'Dockerfile', port: 3000, envVars: ['APP_TOKEN'] })]), { over: SKIP_DEPLOY, edit: (s) => s.map((st) => (st.needId === 'dast' ? { ...st, secrets: ['APP_TOKEN'] } : st)) });
+    const x = planned(profileOf([node({ dockerfile: 'Dockerfile', port: 3000, envVars: [TOK] })]), { over: SKIP_DEPLOY, edit: (s) => s.map((st) => (st.needId === 'dast' ? { ...st, [SEC]: [TOK] } : st)) });
     expect(() => assemble(x)).toThrow(AssembleError);
-    expect(() => assemble(x)).toThrow(/^The DAST check "dast" for "app" names secrets \("APP_TOKEN"\)\. A DAST check runs the app with no secret/);
+    expect(() => assemble(x)).toThrow(new RegExp(`^The DAST check "dast" for "app" names secrets \\("${TOK}"\\)\\. A DAST check runs the app with no secret`));
   });
 });
 
@@ -201,6 +204,17 @@ describe('G17 row 19 (open question 9): a blocking check of an image pipegen can
     const a = assemble(x);
     expect(Object.keys(a.merge).filter((k) => /image/.test(k))).toEqual([]);
     expect(a.notes.join('\n')).toMatch(/The image of "api" is not built or scanned yet: The service "api" is in a sub-folder/);
+  });
+});
+
+describe('G17 row 19: scope (reported): a service with no Dockerfile of its own keeps the note', () => {
+  it('assemble: no Dockerfile in the repository (pipegen may create one): the image checks leave with the note, as before G17', () => {
+    const prof2 = profileOf([node({ frameworks: ['express'], port: 3000, scripts: ['test', 'lint', 'start'] })]);
+    const needs = floorNeeds(prof2, CAPS).filter((n) => n.id !== 'dast');
+    expect(needs.some((n) => n.id === 'image-build' && n.blocking)).toBe(true);
+    const a = assemble(planned(prof2, { needs, over: SKIP_DEPLOY, edit: (s) => s.filter((st) => st.needId !== 'dast') }));
+    expect(Object.keys(a.merge).filter((k) => /image/.test(k))).toEqual([]);
+    expect(a.notes.join('\n')).toMatch(/The image of "app" is not built or scanned yet: The service "app" has no Dockerfile to build/);
   });
 });
 

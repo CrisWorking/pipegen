@@ -64,9 +64,9 @@ export const PROJECT_FILES: Record<string, string> = {
 };
 
 /** A Dockerfile the scripted AI writes (pipegen owns the FROM). */
-const DOCKERFILE = ['FROM node:22', 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --omit=dev --ignore-scripts', 'COPY . .', 'ENV NODE_ENV=production', 'EXPOSE 3000', 'USER node', 'CMD ["npm", "start"]', ''].join('\n');
+const DOCKERFILE = ['FROM node:22', 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'COPY . .', 'ENV NODE_ENV=production', 'EXPOSE 3000', 'USER node', 'CMD ["npm", "start"]', ''].join('\n');
 /** The app's own Dockerfile in the signing shape (a published image is what key-env signs). */
-export const OWN_DOCKERFILE = ['FROM node:22', 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --omit=dev --ignore-scripts', 'COPY . .', 'USER node', 'EXPOSE 3000', 'CMD ["npm", "start"]', ''].join('\n');
+export const OWN_DOCKERFILE = ['FROM node:22', 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'COPY . .', 'USER node', 'EXPOSE 3000', 'CMD ["npm", "start"]', ''].join('\n');
 const STARTER_TEST = "const test = require('node:test');\nconst assert = require('node:assert');\ntest('the order total adds up', () => {\n  assert.strictEqual(2 + 3, 5);\n  assert.ok(String(1 + 1).length === 1);\n});\n";
 
 /** The builder's answer: for every key it was asked about, the first tool offered (the schema's choice and tuning slots left empty). */

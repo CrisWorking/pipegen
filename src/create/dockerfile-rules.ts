@@ -10,7 +10,7 @@
 //   - every FROM is an exact reference of pipegen's reviewed base-image list (or an earlier stage alias), so no image, tag or `# syntax=`
 //     frontend the AI names ever runs; `COPY --from=` names only an earlier alias;
 //   - RUN, CMD, ENTRYPOINT and HEALTHCHECK are a strict ALLOWLIST (fix round 1, ruling R1), not a denylist: RUN is only ` && `-joined plain words
-//     from a short list of commands (npm ci --ignore-scripts, npm run <script of the service>, npm prune --omit=dev, npm cache clean --force,
+//     from a short list of commands (npm ci --ignore-scripts --git=/usr/bin/git, npm run <script of the service>, npm prune --omit=dev, npm cache clean --force,
 //     mkdir -p, chown node:node), CMD is one of three exec forms, ENTRYPOINT and HEALTHCHECK are refused. So a download, an interpreter, a pipe,
 //     a variable or a substitution can not be written at all, and --ignore-scripts is mandatory (there is no retry without it);
 //   - every USER is node, node:node, 1000 or 1000:1000 (R2), and the final stage has one; no secret-named ARG/ENV with a value, no secret-shaped
@@ -220,7 +220,9 @@ function ENV_ALLOWED(name: string, port: number): { value?: string; oneOf?: stri
 const WORD_RE = /^[A-Za-z0-9._/@=:,+-]+$/;
 const PATH_RE = /^[A-Za-z0-9._/-]+$/;
 const SCRIPT_RE = /^[A-Za-z0-9][A-Za-z0-9:._-]*$/;
-const NPM_CI_FLAGS = new Set(['--ignore-scripts', '--omit=dev', '--omit=optional', '--no-audit', '--no-fund']);
+/** G17 row 18: npm's own git program, fixed on the command line (it wins over a repo .npmrc and an npm_config_git ENV), like pipegen's CI installs. */
+export const NPM_CI_GIT = '--git=/usr/bin/git';
+const NPM_CI_FLAGS = new Set(['--ignore-scripts', NPM_CI_GIT, '--omit=dev', '--omit=optional', '--no-audit', '--no-fund']);
 /** A plain path: no `..` segment, no leading dash. */
 const plainPath = (p: string): boolean => PATH_RE.test(p) && !p.startsWith('-') && !p.split('/').includes('..');
 /** A path pipegen may create or chown: plain and relative (the app folder is the working directory), or `/app` and plain paths below it. */
@@ -244,8 +246,9 @@ function runCommandProblem(words: readonly string[], ctx: DockerfileCtx, counts:
     if (c.length === 0) return 'an empty command (&& must join two commands)';
     if (a === 'npm' && b === 'ci') {
       const seen = new Set<string>();
-      for (const f of more) { if (!NPM_CI_FLAGS.has(f) || seen.has(f)) return `npm ci may only have --ignore-scripts and, once each, --omit=dev, --omit=optional, --no-audit, --no-fund (not ${q(f)})`; seen.add(f); }
+      for (const f of more) { if (!NPM_CI_FLAGS.has(f) || seen.has(f)) return `npm ci may only have --ignore-scripts, ${NPM_CI_GIT} and, once each, --omit=dev, --omit=optional, --no-audit, --no-fund (not ${q(f)})`; seen.add(f); }
       if (!seen.has('--ignore-scripts')) return 'npm ci needs --ignore-scripts (install scripts of the dependencies would run in CI)';
+      if (!seen.has(NPM_CI_GIT)) return `npm ci needs ${NPM_CI_GIT} (a repository .npmrc or an npm_config_git ENV could name another program to run as git)`;
       counts.npmCi++;
     } else if (a === 'npm' && b === 'run') {
       if (more.length !== 1 || !SCRIPT_RE.test(more[0] as string) || !ctx.scripts.includes(more[0] as string)) return `npm run needs exactly one script name that is a script of this service (not ${q(more.join(' '))})`;
@@ -253,7 +256,7 @@ function runCommandProblem(words: readonly string[], ctx: DockerfileCtx, counts:
       const args = [b, ...more].filter((x): x is string => x !== undefined);
       const rest = args[0] === '-R' ? args.slice(1) : args;
       if (!(rest.length === 2 && rest[0] === 'node:node' && appPath(rest[1] as string))) return 'chown is only allowed as chown [-R] node:node <relative path or a path under /app>';
-    } else return `${q(c.join(' '))} is not one of the commands pipegen allows (npm ci --ignore-scripts, npm run <script>, npm prune --omit=dev, npm cache clean --force, mkdir -p <path>, chown [-R] node:node <path>)`;
+    } else return `${q(c.join(' '))} is not one of the commands pipegen allows (npm ci --ignore-scripts --git=/usr/bin/git, npm run <script>, npm prune --omit=dev, npm cache clean --force, mkdir -p <path>, chown [-R] node:node <path>)`;
   }
   return '';
 }

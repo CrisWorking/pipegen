@@ -1282,7 +1282,8 @@ function repoTool(tool: string): (typeof REPO_TOOLS)[string] {
  * - from the `native` major on: every `<scope>/<base>-*` entry of the lockfile is a registry tarball with a sha512 at the package's own
  *   version; the one for this runner (`<base>-${process.platform}-${process.arch}`, the name the shim builds) is installed the same way,
  *   with no nested copy the shim would find first, Node's own resolution from the shim's folder lands on it, and the binary the shim runs
- *   (`<exe>`) is a regular file inside it.
+ *   (`<exe>`) is a regular file inside it. G17 row 17: a lockfile copy under another package or a workspace folder is never on the shim's
+ *   resolution path, so it is not judged; only a copy directly inside the package's own node_modules is refused.
  * The version is read when the job runs, never written into the step, so a lockfile bump keeps working. Every value comes from REPO_TOOLS.
  */
 export function repoToolCheckJs(tool: string): string {
@@ -1326,10 +1327,12 @@ export function repoToolCheckJs(tool: string): string {
     '  const prefix = nat.scope + "/" + nat.base + "-";',
     '  const want = prefix + process.platform + "-" + process.arch;',
     '  if (!/^@[a-z0-9-]+\\/[a-z0-9-]+-[a-z0-9]+-[a-z0-9]+$/.test(want)) fail("the native package name " + want + " is not a plain name");',
+    '  const inside = "node_modules/" + name + "/";',
     '  for (const k of Object.keys(lock.packages)) {',
     '    const i = k.lastIndexOf("node_modules/" + prefix);',
     '    if (i < 0) continue;',
-    '    if (i !== 0) fail("package-lock.json has a nested copy " + k + "; the tsc shim would run instead of the one pipegen checks");',
+    '    if (i === inside.length && k.startsWith(inside)) fail("package-lock.json has a nested copy " + k + " inside " + name + "; the tsc shim would run that copy instead of the one pipegen checks");',
+    '    if (i !== 0) continue;',
     '    const e = entry(k.slice("node_modules/".length));',
     '    if (e.version !== p.version) fail(k.slice("node_modules/".length) + " is not at " + name + "\'s own version " + p.version);',
     '  }',

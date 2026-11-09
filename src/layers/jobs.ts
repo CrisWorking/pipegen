@@ -63,7 +63,7 @@ import { egressSetsForTool, renderEgressStep, SHARED_CDN_SETS, type EgressSet } 
 import { gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES, resultFormat } from '../engine/gate-job-list.js';
 import { SKIPPED_PART_NEEDS } from '../engine/gate-inputs.js';
 import { ARCHIVE_TOOL_IDS, renderImageArchiveScan, renderImageBuild } from '../engine/image-handoff.js';
-import { dastStartOf, nightlyDastSpec, NIGHTLY_DAST_TOOL, renderDastRun, renderDastScrub, zapActiveNotRunNote, zapActiveSpec, ZAP_ACTIVE_JOB_MINUTES, ZAP_ACTIVE_LANE, ZAP_ACTIVE_TOOL, type DastStart } from '../engine/dast-handoff.js';
+import { DAST_SECRETS_REASON, dastStartOf, nightlyDastSpec, NIGHTLY_DAST_TOOL, renderDastRun, renderDastScrub, zapActiveNotRunNote, zapActiveSpec, ZAP_ACTIVE_JOB_MINUTES, ZAP_ACTIVE_LANE, ZAP_ACTIVE_TOOL, type DastStart } from '../engine/dast-handoff.js';
 import {
   BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, dastRunJobId, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, IMAGE_BUILD_NEED, imageBuildJobId, isReviewed,
   isScrubStep, jobOutputsFor, CODE_SCANNING_JOB, DAST_UPLOAD_JOB, dastLaneOf, dastNightlyCategory, dastResultArtifact, type DastLane, HISTORY_UPLOAD_JOB, SECRETS_HISTORY_CATEGORY, SECRETS_HISTORY_JOB, NIGHTLY_CONCURRENCY, NIGHTLY_IF, NO_SCANS, SCORECARD_IF, SCORECARD_JOB, ZIZMOR_ONLINE_JOB, renderRangeFetchStep, type RenderedStep, type ScanFact,
@@ -536,16 +536,40 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
   }
   const c: Ctx = { draft, deps, byId, gate, notes, compose };
   const builds = new Map<string, Job>();
+  const unbuilt = new Map<string, string>();
   for (const s of draft.steps) {
     if (leaveOut.has(s) || s.needId !== IMAGE_BUILD_NEED || s.tool.id !== PLATFORM_ACTION_IDS['build-push'] || s.service === undefined) continue;
     if (!draft.needs.some((n) => n.layer === 'merge' && n.id === IMAGE_BUILD_NEED && n.service === s.service)) continue;
     try { builds.set(s.service, imageBuildJob(c, s)); } catch (e) {
       if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e;
-      addNote(notes, `The image of ${show(s.service)} is not built or scanned yet: ${safeText(e.message, 200)}`);
+      unbuilt.set(s.service, e.message);
       leaveOut.add(s);
     }
   }
-  for (const s of draft.steps) if (ARCHIVE_TOOL_IDS.has(s.tool.id) && (s.service === undefined || !builds.has(s.service))) leaveOut.add(s);
+  const noBuild = new Set<string | undefined>();
+  for (const s of draft.steps) {
+    if (!ARCHIVE_TOOL_IDS.has(s.tool.id) || (s.service !== undefined && builds.has(s.service))) continue;
+    leaveOut.add(s);
+    noBuild.add(s.service);
+  }
+  // G17 row 19 (open question 9): a blocking check of an image that is not built (its build can not render, or no build step builds it): the
+  // build itself, or a scan of its archive, stops. The PR's own image is the only one pipegen scans, so no registry image stands in, and the
+  // check is never left out. A non-blocking one leaves with a note. The stop waits until after the DAST starts below, so a DAST check that
+  // can not start keeps its own reason (and its --type tip). Scope (reported to the controller): only a service with a Dockerfile of its own;
+  // a service whose Dockerfile pipegen creates in this run has no profile Dockerfile, so its image build never renders in v0.2 and keeps the
+  // note (stopping there would stop every run that creates a Dockerfile).
+  let imageStop: string | null = null;
+  for (const service of new Set<string | undefined>([...unbuilt.keys(), ...noBuild])) {
+    if ((serviceNamed(draft, service)?.dockerfile ?? '') === '') {
+      if (service !== undefined && unbuilt.has(service)) addNote(notes, `The image of ${show(service)} is not built or scanned yet: ${safeText(unbuilt.get(service) as string, 200)}`);
+      continue;
+    }
+    const why = (service === undefined ? undefined : unbuilt.get(service)) ?? 'no image-build step of pipegen builds it';
+    const lost = draft.needs.filter((n) => n.layer === 'merge' && n.service === service && draft.steps.some((st) => st.needId === n.id && st.service === service && leaveOut.has(st)) && draft.steps.every((st) => st.needId !== n.id || st.service !== service || leaveOut.has(st)));
+    const blocking = lost.find((n) => blocks(draft, n.id, n.service));
+    if (blocking !== undefined && imageStop === null) imageStop = `The blocking check ${where(blocking)} can not run: its image is not built (${safeText(why, 200)}). pipegen never scans another image in its place, makes it warn-only or leaves it out.`;
+    if (service !== undefined && unbuilt.has(service)) addNote(notes, `The image of ${show(service)} is not built or scanned yet: ${safeText(why, 200)}`);
+  }
   // the needs whose every step was left out go too (a findings check with nothing readable is no check of the gate's list)
   const keep = draft.steps.filter((s) => !leaveOut.has(s));
   const gone = new Set<Need>();
@@ -567,6 +591,8 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
   const noStart = new Set<Need>();
   for (const s of draft.steps) {
     if (categoryOf(s.needId) !== 'dast' || s.service === undefined || !draft.needs.some((n) => n.layer === 'merge' && n.id === s.needId && n.service === s.service)) continue;
+    // G17 row 14: refused here with a plain reason, blocking or not (the referee refuses it too); never left out quietly
+    if ((s.secrets ?? []).length > 0) fail(`The DAST check ${where(s)} names secrets (${s.secrets?.map(show).join(', ')}). ${DAST_SECRETS_REASON}`);
     const st = dastStartOf(draft, s.service, list);
     if (!('problem' in st)) { starts.set(s, st); continue; }
     // GJ-R3 (O3): an unsure type is a server by rule; the user may say it is a static site
@@ -577,6 +603,7 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     for (const n of draft.needs) if (n.id === s.needId && n.service === s.service) noStart.add(n);
   }
   if (noStart.size > 0) { draft = narrowed(draft, noStart); c.draft = draft; }
+  if (imageStop !== null) fail(imageStop);
 
   // 3. the layers
   const push: Record<string, Job> = {};

@@ -15,9 +15,9 @@ const mkDraft = (services: Service[] = [svc()]): PipelineDraft => ({
   profile: profile(services), capabilities: { branchProtection: true, environments: false, envRequiredReviewers: false, deploymentBranchPolicies: false, attestations: true, codeScanning: true, keylessSigningAllowed: true },
   needs: [], steps: [], created: [], notProven: [], testDecisions: [], layersSkipped: [], scoreboard: [], requireDeployApproval: false, skipped: [], suggestions: [],
 });
-const SINGLE = [`FROM ${REF}`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --omit=dev --ignore-scripts', 'COPY . .', 'ENV NODE_ENV=production', 'EXPOSE 3000', 'USER node', 'CMD ["npm", "start"]', ''].join('\n');
+const SINGLE = [`FROM ${REF}`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'COPY . .', 'ENV NODE_ENV=production', 'EXPOSE 3000', 'USER node', 'CMD ["npm", "start"]', ''].join('\n');
 const MULTI = [
-  `FROM ${REF} AS build`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts', 'COPY . .', 'RUN npm run build',
+  `FROM ${REF} AS build`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts --git=/usr/bin/git', 'COPY . .', 'RUN npm run build',
   `FROM ${REF}`, 'WORKDIR /app', 'COPY --from=build /app/dist ./dist', 'EXPOSE 3000', 'USER node', 'CMD ["node", "dist/index.js"]', '',
 ].join('\n');
 const file = (path: string, content: string, over: Partial<CreatedFile> = {}): CreatedFile => ({ path, content, part: 'docker', reason: 'test', repo: 'app', ...over });

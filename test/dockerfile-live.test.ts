@@ -34,12 +34,12 @@ const usage = (input: number, output: number): AiUsage => Object.fromEntries([['
 const ai = (dockerfile: string): AiProvider => ({ name: 'claude', model: DEFAULT_MODEL, complete: async () => ({ data: { dockerfile, port: 3000, reasoning: 'ok' }, usage: usage(1, 1) }) });
 
 const SINGLE = [
-  'FROM node:24', 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --omit=dev --ignore-scripts', 'COPY . .', 'ENV NODE_ENV=production', 'EXPOSE 3000', 'USER node', 'CMD ["npm", "start"]', '',
+  'FROM node:24', 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'COPY . .', 'ENV NODE_ENV=production', 'EXPOSE 3000', 'USER node', 'CMD ["npm", "start"]', '',
 ].join('\n');
 const MULTI = [
-  'FROM node:24 AS build', 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts', 'COPY . .', 'RUN npm run build',
+  'FROM node:24 AS build', 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts --git=/usr/bin/git', 'COPY . .', 'RUN npm run build',
   'FROM node:24', 'WORKDIR /app', 'ENV NODE_ENV=production', 'COPY --from=build --chown=node:node /app/package.json /app/package-lock.json ./',
-  'RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force', 'COPY --from=build --chown=node:node /app/dist ./dist', 'EXPOSE 3000', 'USER node',
+  'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git && npm cache clean --force', 'COPY --from=build --chown=node:node /app/dist ./dist', 'EXPOSE 3000', 'USER node',
 ].join('\n');
 
 describe.skipIf(!live)('live: hadolint 2.15.1 under pipegen\'s pinned config', () => {

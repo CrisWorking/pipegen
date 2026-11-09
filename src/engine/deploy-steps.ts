@@ -33,12 +33,17 @@ export const imageDigestArtifact = (service: string): string => resultArtifactNa
 /** The tag image-publish pushes (the digest, never the tag, is what is signed, verified and handed to the deploy). */
 export const PUBLISH_TAG = 'pipegen';
 
-/** The image repository pipegen publishes a service's image to (no tag, no digest): `ghcr.io/<owner>/<repo>-<service slug>`, lower case. */
+/**
+ * The image repository pipegen publishes a service's image to (no tag, no digest): `ghcr.io/<owner>/<repo>-<service slug>`, lower case; just
+ * `ghcr.io/<owner>/<repo>` when the service slug is the repository name (G17 row 21, open question 13: no `acme-shop-acme-shop`). No other
+ * service of that repository can take the short name (every other name keeps the `<repo>-` prefix and a non-empty slug after it).
+ */
 const IMAGE_REPO_RE = /^ghcr\.io(?:\/[a-z0-9]+(?:[._-][a-z0-9]+)*){2}$/;
 export function publishedImageRepo(owner: string, repo: string, service: string): string {
   let s: string;
   try { s = slug(service); } catch { throw new RenderError('A published image belongs to a service with letters or digits in its name.'); }
-  const r = `ghcr.io/${String(owner).toLowerCase()}/${String(repo).toLowerCase()}-${s}`;
+  const name = String(repo).toLowerCase();
+  const r = `ghcr.io/${String(owner).toLowerCase()}/${name === s ? name : `${name}-${s}`}`;
   if (!IMAGE_REPO_RE.test(r) || r.length > 255) throw new RenderError(`The image repository ${show(r)} is not a plain ghcr.io repository (lower-case letters and digits, single . _ or - between them).`);
   return r;
 }

@@ -50,6 +50,8 @@ describe('compose: services', () => {
       build: { context: './api', dockerfile: 'Dockerfile' },
       environment: { DATABASE_URL: '${PIPEGEN_APP_DATABASE_URL:?}' },
       ports: ['127.0.0.1:3000:3000'],
+      cap_drop: ['ALL'],   // G17 row 13: the app runs repo code with no capability and no privilege gain
+      security_opt: ['no-new-privileges:true'],
       depends_on: { postgres: { condition: 'service_healthy' } },
     });
     // the root service builds in '.'
@@ -98,10 +100,13 @@ describe('compose: services', () => {
   it('only the allowed keys: no privileged, cap_add, volumes, network_mode, pid, ipc, devices, extends, include, env_file, secrets, configs, profiles, x-*, command, entrypoint, user, labels', () => {
     const d = doc(prof([api({ dependsOn: ALL })]));
     expect(Object.keys(d)).toEqual(['services']);
-    const ALLOWED = new Set(['image', 'build', 'environment', 'ports', 'healthcheck', 'depends_on']);
+    const ALLOWED = new Set(['image', 'build', 'environment', 'ports', 'healthcheck', 'depends_on', 'cap_drop', 'security_opt']);
     for (const [name, s] of Object.entries<any>(d.services)) {
       for (const k of Object.keys(s)) expect(ALLOWED.has(k), `${name}.${k}`).toBe(true);
-      if (name.startsWith('app-')) expect(Object.keys(s).sort()).toEqual(['build', 'depends_on', 'ports']);   // no env names in this profile
+      if (name.startsWith('app-')) expect(Object.keys(s).sort()).toEqual(['build', 'cap_drop', 'depends_on', 'ports', 'security_opt']);   // no env names in this profile
+      // G17 row 13: only the app containers drop capabilities, and only these exact values (a drop, never an add)
+      if (name.startsWith('app-')) expect([s.cap_drop, s.security_opt]).toEqual([['ALL'], ['no-new-privileges:true']]);
+      else expect(s.cap_drop ?? s.security_opt).toBeUndefined();
     }
     for (const bad of ['privileged', 'cap_add', 'volumes', 'network_mode', 'pid', 'ipc', 'devices', 'extends', 'include', 'env_file', 'secrets', 'configs', 'profiles', 'x-', 'command', 'entrypoint', 'user:', 'labels']) expect(text(prof([api({ dependsOn: ALL })]))).not.toContain(bad);
   });
@@ -159,7 +164,7 @@ describe('compose: the exact text (golden)', () => {
       '  rabbitmq:', `    image: "${r('rabbitmq-4-management')}"`, '    environment:', '      RABBITMQ_DEFAULT_USER: "pipegen"', `      RABBITMQ_DEFAULT_PASS: "${pw}"`,
       '    ports:', '      - "127.0.0.1:5672:5672"', '    healthcheck:', '      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]', '      interval: "10s"', '      timeout: "10s"', '      retries: 30', '      start_period: "30s"',
       '  app-api:', '    build:', '      context: "./api"', '      dockerfile: "Dockerfile"', '    environment:', '      AMQP_URL: "${PIPEGEN_APP_AMQP_URL:?}"', '      DATABASE_URL: "${PIPEGEN_APP_DATABASE_URL:?}"', '      MONGODB_URI: "${PIPEGEN_APP_MONGODB_URI:?}"', '      REDIS_URL: "${PIPEGEN_APP_REDIS_URL:?}"',
-      '    ports:', '      - "127.0.0.1:3000:3000"', '    depends_on:',
+      '    ports:', '      - "127.0.0.1:3000:3000"', '    cap_drop:', '      - "ALL"', '    security_opt:', '      - "no-new-privileges:true"', '    depends_on:',
       '      postgres:', '        condition: service_healthy', '      mysql:', '        condition: service_healthy', '      redis:', '        condition: service_healthy', '      mongodb:', '        condition: service_healthy', '      rabbitmq:', '        condition: service_healthy',
       '',
     ].join('\n');

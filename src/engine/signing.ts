@@ -47,9 +47,9 @@ export const COSIGN_ID = 'cosign';
 export const GH_ID = 'gh';
 const COSIGN_REPO = 'sigstore/cosign';
 const GH_REPO = 'cli/cli';
-/** GitHub's OIDC issuer: the only issuer a keyless signature is accepted from. */
 /** The one registry the sign step logs in to (G3-R3): the workflow token never goes to another registry. */
 export const SIGN_REGISTRY = 'ghcr.io';
+/** GitHub's OIDC issuer: the only issuer a keyless signature is accepted from. */
 export const GITHUB_OIDC_ISSUER = 'https://token.actions.githubusercontent.com';
 /** The keyless sign job lives in the app's caller workflow (ruling B2: the deploy jobs of pipegen.yml), so its certificate names that file. */
 export const KEYLESS_SIGN_WORKFLOW = '.github/workflows/pipegen.yml';
