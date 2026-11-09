@@ -62,7 +62,7 @@ import { dockerfilesOf } from '../engine/created-judges/compose.js';
 import { egressSetsForTool, renderEgressStep, SHARED_CDN_SETS, type EgressSet } from '../engine/egress.js';
 import { gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES, resultFormat } from '../engine/gate-job-list.js';
 import { SKIPPED_PART_NEEDS } from '../engine/gate-inputs.js';
-import { ARCHIVE_TOOL_IDS, renderImageArchiveScan, renderImageBuild } from '../engine/image-handoff.js';
+import { ARCHIVE_TOOL_IDS, imageProfile, renderImageArchiveScan, renderImageBuild } from '../engine/image-handoff.js';
 import { DAST_SECRETS_REASON, dastStartOf, nightlyDastSpec, NIGHTLY_DAST_TOOL, renderDastRun, renderDastScrub, zapActiveNotRunNote, zapActiveSpec, ZAP_ACTIVE_JOB_MINUTES, ZAP_ACTIVE_LANE, ZAP_ACTIVE_TOOL, type DastStart } from '../engine/dast-handoff.js';
 import {
   BASE_ALWAYS_CATEGORIES, BASELINE_CHECK_JOB, dastRunJobId, BASELINE_MISSING_ALWAYS_IF, BASELINE_MISSING_IF, IMAGE_BUILD_NEED, imageBuildJobId, isReviewed,
@@ -278,6 +278,13 @@ const blocks = (draft: PipelineDraft, needId: string, service: string | undefine
 };
 const serviceNamed = (draft: PipelineDraft, name: string | undefined): Service | undefined => (name === undefined ? undefined : draft.profile.services.find((s) => s.name === name));
 
+/** G17B-R1 spec I2: the next step after an image stop, fixed text by the service's facts (no repo text). */
+function imageNextStep(svc: Service | undefined): string {
+  if (svc !== undefined && (svc.dockerfile ?? '') === '') return 'add a Dockerfile to the service\'s folder, or let pipegen create one, then run `npx pipegen run` again.';
+  if (svc !== undefined && !(svc.path === '.' || svc.path === '' || svc.path === './')) return 'pipegen v0.2 builds an image from the repository root only; move the service\'s Dockerfile and build context to the root, or wait for a later version, then run `npx pipegen run` again.';
+  return 'fix what the reason above names, then run `npx pipegen run` again.';
+}
+
 /** A check job (findings or job status) for one need key on one layer. */
 function checkJob(c: Ctx, need: Need, specs: readonly StepSpec[], range: boolean): Job {
   const id = jobIdFor(need.id, need.service);
@@ -342,7 +349,7 @@ function imageBuildJob(c: Ctx, spec: StepSpec): Job {
   const id = imageBuildJobId(service);
   const buildPush = c.deps.platform['build-push'];
   if (buildPush?.id !== PLATFORM_ACTION_IDS['build-push'] || buildPush.candidate.id !== spec.tool.id) return fail(`The image build of ${show(service)} is not the reviewed build-push step.`);
-  const built = renderImageBuild(spec, buildPush, c.deps.platform, { profile: c.draft.profile, blocking: true });
+  const built = renderImageBuild(spec, buildPush, c.deps.platform, { profile: imageProfile(c.draft.profile, c.draft.created), blocking: true });
   const prelude = renderJobPrelude({}, c.deps.platform).steps;
   // the Dockerfile's own base images and package installs (live checklist: the build's network under Bullfrog)
   const egress = egressStepFor(['dockerhub', 'ghcr', ...packageSets([serviceNamed(c.draft, service)])], { userSecret: (spec.secrets ?? []).length > 0, dockerNetworks: true, job: id });
@@ -555,19 +562,15 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
   // G17 row 19 (open question 9): a blocking check of an image that is not built (its build can not render, or no build step builds it): the
   // build itself, or a scan of its archive, stops. The PR's own image is the only one pipegen scans, so no registry image stands in, and the
   // check is never left out. A non-blocking one leaves with a note. The stop waits until after the DAST starts below, so a DAST check that
-  // can not start keeps its own reason (and its --type tip). Scope (reported to the controller): only a service with a Dockerfile of its own;
-  // a service whose Dockerfile pipegen creates in this run has no profile Dockerfile, so its image build never renders in v0.2 and keeps the
-  // note (stopping there would stop every run that creates a Dockerfile).
+  // can not start keeps its own reason (and its --type tip). G17B-R0/R1 round 2: a Dockerfile pipegen creates in this draft is the service's
+  // (imageProfile), and a service with no Dockerfile at all (none created) stops too (risk 1); each stop says the next step (spec I2).
   let imageStop: string | null = null;
+  const imgSvc = (name: string | undefined): Service | undefined => (name === undefined ? undefined : imageProfile(draft.profile, draft.created).services.find((x) => x.name === name));
   for (const service of new Set<string | undefined>([...unbuilt.keys(), ...noBuild])) {
-    if ((serviceNamed(draft, service)?.dockerfile ?? '') === '') {
-      if (service !== undefined && unbuilt.has(service)) addNote(notes, `The image of ${show(service)} is not built or scanned yet: ${safeText(unbuilt.get(service) as string, 200)}`);
-      continue;
-    }
     const why = (service === undefined ? undefined : unbuilt.get(service)) ?? 'no image-build step of pipegen builds it';
     const lost = draft.needs.filter((n) => n.layer === 'merge' && n.service === service && draft.steps.some((st) => st.needId === n.id && st.service === service && leaveOut.has(st)) && draft.steps.every((st) => st.needId !== n.id || st.service !== service || leaveOut.has(st)));
     const blocking = lost.find((n) => blocks(draft, n.id, n.service));
-    if (blocking !== undefined && imageStop === null) imageStop = `The blocking check ${where(blocking)} can not run: its image is not built (${safeText(why, 200)}). pipegen never scans another image in its place, makes it warn-only or leaves it out.`;
+    if (blocking !== undefined && imageStop === null) imageStop = `The blocking check ${where(blocking)} can not run: its image is not built (${safeText(why, 200)}). pipegen never scans another image in its place, makes it warn-only or leaves it out. Next step: ${imageNextStep(imgSvc(service))}`;
     if (service !== undefined && unbuilt.has(service)) addNote(notes, `The image of ${show(service)} is not built or scanned yet: ${safeText(why, 200)}`);
   }
   // the needs whose every step was left out go too (a findings check with nothing readable is no check of the gate's list)

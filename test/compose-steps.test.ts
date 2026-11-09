@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 import { findSecretLike } from '../src/ai/redact-core.js';
 import { runtimeEnv } from '../src/create/compose.js';
 import { checkExpressions, isKnownHarmless } from '../src/engine/job-rules.js';
-import { renderComposeUp, renderRuntimeEnv, RenderError } from '../src/engine/render-step.js';
+import { COMPOSE_UP_FAILED, renderComposeUp, renderRuntimeEnv, RenderError } from '../src/engine/render-step.js';
 import { REPO_CODE_STEP_ID_RE } from '../src/engine/tool-flags.js';
 import type { RuntimeEnv } from '../src/types.js';
 import { DBPW, PW_FIELD, runtimeOf } from './helpers/dbpw.js';
@@ -141,7 +141,8 @@ describe('renderComposeUp', () => {
   it('--env-file /dev/null -f docker-compose.pipegen.yml up -d --wait, a repo-code (repocode-) step', () => {
     const s = renderComposeUp();
     expect(s.id).toMatch(REPO_CODE_STEP_ID_RE);
-    expect(s.run).toBe('set -euo pipefail\ndocker compose --env-file /dev/null -f docker-compose.pipegen.yml up -d --wait');
+    // G17B-R1 round 2 (risk 4): a failed start ends with one fixed pipegen message (COMPOSE_UP_FAILED), no container log text
+    expect(s.run).toBe(`set -euo pipefail\ndocker compose --env-file /dev/null -f docker-compose.pipegen.yml up -d --wait ${COMPOSE_UP_FAILED}`);
     expect(s.shell).toBe('bash');
     expect(s.uses).toBeUndefined();
     expect(s.env).toEqual({ BASH_ENV: '', ENV: '' });

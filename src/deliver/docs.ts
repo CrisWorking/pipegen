@@ -569,6 +569,9 @@ function buildNotes(data: DocData): string[] {
   return all.filter((n, i) => all.indexOf(n) === i && !isAiNote(n) && !(gj && n === HUSKY_NO_CI_NOTE));
 }
 
+/** Whether the draft holds pipegen's compose file (the app starts from it in the test and DAST jobs). */
+const hasComposeFile = (draft: PipelineDraft): boolean => Array.isArray(draft.created) && draft.created.some((f) => f !== null && typeof f === 'object' && f.repo === 'app' && f.path === 'docker-compose.pipegen.yml');
+
 function limitsSection(d: Doc, draft: PipelineDraft): void {
   const has = (c: string): boolean => hasCat(draft, c);
   d.h(3, 'Limits of these checks');
@@ -576,7 +579,12 @@ function limitsSection(d: Doc, draft: PipelineDraft): void {
   if (has('dast')) {
     d.li('The raw result of the running app scan travels unscrubbed between the job that runs the app and the job that reads the result. It holds only what an app without secrets answered. A hostile app can always answer a scanner cleanly.');
     d.li('The running app scan has no earlier scan to compare with, so its findings warn on the pull request that installs pipegen and count as new after it.');
+    // G17B-R1 (sec M1, M2): the ZAP API bind; the second build when pipegen's compose file starts the app
+    d.li('The running app scan talks to ZAP through its API, which answers only 127.0.0.1, so the scanned app can not reach it.');
+    if (hasComposeFile(draft)) d.li('With pipegen\'s compose file, the running app scan builds the app\'s image itself, in its own job: a second build of the same Dockerfile. The image scan reads the other build.');
   }
+  // G17B-R0 concern 3: the hardening of pipegen's compose file, said where people read it (compose up's fixed failure message points here)
+  if (hasComposeFile(draft)) d.li('The app containers in pipegen\'s compose file run with no Linux capability and no privilege gain, and the database and queue containers with no privilege gain. An app image that needs a capability (a root entrypoint that switches users or changes file owners) does not start: run the app as a non-root user.');
   if (has('image-scan') || has('image-build')) {
     d.li('Image findings have no base yet: there is no earlier scan of the base commit to compare with, so image findings warn on the pull request that installs pipegen and block on every other.');
     d.li('The scanned image is not the published image. The scan covers the build of the pull request head; the publish job builds again at the merge commit, so a moving base image tag can make them differ.');

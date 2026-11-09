@@ -63,7 +63,7 @@ import { NO_IMAGE_CATEGORIES, noImageServices, publishedImageServices, WORKFLOW_
 import { FIND_RUN_STEP_ID, PUBLISH_TAG, publishedImageRepo, renderDigestStep, renderHeadCheckStep, renderPublishDigestStep } from './deploy-steps.js';
 import { callsWorkflow, strongReason } from './deploy-gating.js';
 import { calledHeadCheckEdit, deployGating, INSERT_REFUSED_GAP, isDeployWorkflow, localCallOf, SKIP_DEPLOY_GAP } from '../layers/deploy.js';
-import { ARCHIVE_TOOL_IDS, imageBuildTag, renderImageArchiveScan, renderImageBuild } from './image-handoff.js';
+import { ARCHIVE_TOOL_IDS, imageBuildTag, imageProfile, renderImageArchiveScan, renderImageBuild } from './image-handoff.js';
 import { dastStartOf, nightlyDastSpec, NIGHTLY_DAST_TOOL, renderDastRun, renderDastScrub, zapActiveSpec, ZAP_ACTIVE_LANE, ZAP_ACTIVE_TOOL } from './dast-handoff.js';
 import { ATTEST_VERIFY_SETS, KEYLESS_VERIFY_SETS, SHARED_CDN_SETS } from './egress.js';
 import { EGRESS_DOMAIN_SETS, GITHUB_ATTEST_SET, SIGSTORE_SET } from './egress-sets.js';
@@ -491,11 +491,13 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
   const hasNeed = (spec: unknown): boolean => isObj(spec) && draft.needs.some((n) => n.id === spec.needId && n.service === spec.service);
   /** G2 (B6): the services whose image build the draft holds and pipegen can render (their archive is what the image scanners read) */
   const imageBuilds = new Set<string>();
+  // G17B-R0 (row 19): the image renderers read the profile with the Dockerfiles the draft creates (imageProfile, the assembler's source)
+  const imgProfile = imageProfile(draft.profile, draft.created);
   for (const spec of draft.steps) {
     const t = isObj(spec) && isObj(spec.tool) && typeof spec.tool.id === 'string' ? byId.get(spec.tool.id) : undefined;
     if (!hasNeed(spec)) continue;
     if (t?.id !== BUILD_PUSH_ID || !isReviewed(spec.tool) || !sameCandidate(spec.tool, t.candidate) || spec.needId !== IMAGE_BUILD_NEED || typeof spec.service !== 'string') continue;
-    try { renderImageBuild(spec, t, platform, { profile: draft.profile }); imageBuilds.add(spec.service); } catch (e) { if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e; }
+    try { renderImageBuild(spec, t, platform, { profile: imgProfile }); imageBuilds.add(spec.service); } catch (e) { if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e; }
   }
   // G2-R1 I1: a spec blocks when ANY need of its id and service blocks, whatever the layer and order (the gate reads the merge-layer need;
   // a non-blocking copy on another layer must never let a narrowing value through). No such need: blocking (fail closed).
@@ -569,7 +571,7 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
       // G2 (B6): an image build for a service: its archive step, in that service's image-build job only (the build itself is judged by its binding)
       if (t.id === BUILD_PUSH_ID && spec.needId === IMAGE_BUILD_NEED && typeof spec.service === 'string') {
         try {
-          const archive = renderImageBuild(spec, t, platform, { profile: draft.profile }).steps.filter((x) => x.id === IMAGE_ARCHIVE_STEP_ID);
+          const archive = renderImageBuild(spec, t, platform, { profile: imgProfile }).steps.filter((x) => x.id === IMAGE_ARCHIVE_STEP_ID);
           record(`${IMAGE_ARCHIVE_SOURCE}:${slug(spec.service)}`, [archive, archive], false, true, false, undefined, undefined);
         } catch (e) {
           if (!(e instanceof RenderError || e instanceof ArtifactNameError)) throw e;
@@ -583,6 +585,12 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
     // registry form (it could scan any image by digest, leaving the PR's own unscanned) and no base twin (there is no base build yet)
     if (ARCHIVE_TOOLS.has(t.id) && typeof spec.service === 'string' && imageBuilds.has(spec.service)) {
       for (const n of spec.secrets ?? []) ex.declared.add(n);
+      return;
+    }
+    // G17B-R1 round 2 (R0 carry 2): an image scanner reads only the PR's own image, as its archive. With no image build of that service in
+    // the draft there is no archive, and the registry form would scan some other image (a published one, or any digest), so no step is it
+    if (ARCHIVE_TOOLS.has(t.id)) {
+      notes.push(`The image scan ${show(spec.needId)} (${t.id}) reads only the archive of the pull request's own image, and the draft builds no image for ${show(String(spec.service ?? '(no service)'))}, so no step may claim to be it.`);
       return;
     }
     // G4-R1 (design A): a DAST check runs in its own key-free run job (dast-run--<svc>, the app in containers only) and is scrubbed in the
@@ -634,7 +642,7 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
     if (t === undefined || !hasNeed(spec) || !ARCHIVE_TOOLS.has(t.id) || !isReviewed(spec.tool) || !sameCandidate(spec.tool, t.candidate) || typeof spec.service !== 'string' || !imageBuilds.has(spec.service)) return;
     try {
       const blocking = blockingOf(spec.needId, spec.service);
-      const r = renderImageArchiveScan(spec, t, platform, { profile: draft.profile, blocking });
+      const r = renderImageArchiveScan(spec, t, platform, { profile: imgProfile, blocking });
       const check = r.steps.filter((x) => x.id === imageCheckStepId(spec.service as string));
       const scan = r.steps.filter((x) => x.run !== undefined && !check.includes(x));
       const need = keyOf(spec.needId, spec.service);
@@ -1636,7 +1644,8 @@ function judgeImageHandoff(fc: FileCtx, id: string, where: string, j: Obj, judge
       return;
     }
     if (buildSlug === null) { bad('template', `${at}: build-push runs only in an image-build--<service> job (no push) or image-publish, so a build is always bound to one service.`); return; }
-    const svc = serviceBySlug(fc.draft, buildSlug);
+    // G17B-R0: the Dockerfile pipegen creates for a service that has none counts as its Dockerfile (imageProfile, the renderers' source)
+    const svc = serviceBySlug({ ...fc.draft, profile: imageProfile(fc.draft.profile, fc.draft.created) }, buildSlug);
     if (svc === undefined) { bad('template', `${at}: the job ${show(id)} is the image build of no service of this repository.`); return; }
     if (!isRootPath(svc.path)) bad('template', `${at}: the service ${show(svc.name)} is in a sub-folder, but the build context is the repository root, so pipegen can not build its image yet.`);
     if (svc.dockerfile === undefined || svc.dockerfile === '' || w.file !== svc.dockerfile) bad('template', `${at}: an image build builds the Dockerfile of the service ${show(svc.name)} (${show(svc.dockerfile ?? '(none)')}), not ${show(String(w.file ?? '(none)'))}.`);

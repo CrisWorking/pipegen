@@ -15,7 +15,7 @@ import type { PipelineDraft, ReviewedTool, RuntimeEnv, StepSpec } from '../types
 import { slug } from './artifact-names.js';
 import { loadBaseImages, type BaseImage } from './base-images.js';
 import { dockerfilesOf } from './created-judges/compose.js';
-import { imageBuildTag, renderImageCheckStep } from './image-handoff.js';
+import { imageBuildTag, imageProfile, renderImageCheckStep } from './image-handoff.js';
 import {
   DAST_HANDOFF_STEP_ID, DAST_RAW_SHA_ENV, DAST_RAW_SHA_OUTPUT, dastAppStepId, dastCheckStepId, dastLaneOf, dastRawArtifact, dastRawShaRef, dastResultArtifact, ZAP_ACTIVE_LANE, type DastLane,
   IMAGE_ARCHIVE_FILE, imageArchiveArtifact, imageBuildJobId, IMAGE_BUILD_NEED, stepOutputForm, type RenderedStep, type ScanFact,
@@ -91,7 +91,9 @@ export function dastStartOf(draft: PipelineDraft, service: string, baseImages: r
     if (plan.text !== null && plan.text === file.content && app !== undefined && validPort(app.port)) return { kind: 'compose', port: app.port, url: `http://127.0.0.1:${app.port}`, env: plan.env };
   }
   const build = draft.steps.find((s) => s.needId === IMAGE_BUILD_NEED && s.service === service && s.tool.id === PLATFORM_ACTION_IDS['build-push']);
-  if (build === undefined || (svc.dockerfile ?? '') === '') return { problem: 'it has no container image pipegen builds (a Dockerfile it builds, or pipegen\'s compose file), and pipegen starts the app for a scan in a container only' };
+  // G17B-R0: a Dockerfile pipegen creates in this draft counts (imageProfile, the image build's own source)
+  const dockerfile = imageProfile(draft.profile, draft.created).services.find((s) => s.name === service)?.dockerfile;
+  if (build === undefined || (dockerfile ?? '') === '') return { problem: 'it has no container image pipegen builds (a Dockerfile it builds, or pipegen\'s compose file), and pipegen starts the app for a scan in a container only' };
   if (!validPort(svc.port)) return { problem: 'pipegen found no port the app listens on, so there is nothing to scan' };
   return { kind: 'archive', port: svc.port, url: `http://127.0.0.1:${svc.port}` };
 }

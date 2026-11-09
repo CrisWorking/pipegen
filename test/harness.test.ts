@@ -13,7 +13,7 @@ import { EGRESS_DOMAIN_SETS, renderEgressCheckStep, renderEgressStep } from '../
 import { PLATFORM_ACTION_IDS } from '../src/engine/pin.js';
 import { RenderError } from '../src/engine/render-error.js';
 import { releaseInstallStep, renderStarterTestRun } from '../src/engine/render-cli.js';
-import { PROOF_OVERRIDE_PATH, renderComposeUp, renderFindRunStep, renderRuntimeEnv, stepsToYaml } from '../src/engine/render-step.js';
+import { COMPOSE_UP_FAILED, PROOF_OVERRIDE_PATH, renderComposeUp, renderFindRunStep, renderRuntimeEnv, stepsToYaml } from '../src/engine/render-step.js';
 import { parseYaml } from '../src/engine/yaml-parse.js';
 import { compatCopies, harnessWorkflow, HARNESS_PATH, PROOF_SIGNING_MODE, proofAppFiles, proofOverrideText, type HarnessOptions } from '../src/proof/harness.js';
 import { isCompatCopy } from '../src/proof/workflow-check.js';
@@ -427,7 +427,7 @@ describe('harness: tests-repeat (S6, D7-R7)', () => {
     expect(() => releaseInstallStep(reviewed.find((t) => t.id === 'semgrep')!, 'x')).toThrow(RenderError);
     expect(() => releaseInstallStep(reviewed.find((t) => t.id === 'cosign')!, 'Bad Name')).toThrow(RenderError);
     // the default compose-up is unchanged (Plan G's referee recognises it exactly)
-    expect(renderComposeUp().run).toBe('set -euo pipefail\ndocker compose --env-file /dev/null -f docker-compose.pipegen.yml up -d --wait');
+    expect(renderComposeUp().run).toBe(`set -euo pipefail\ndocker compose --env-file /dev/null -f docker-compose.pipegen.yml up -d --wait ${COMPOSE_UP_FAILED}`);
     expect(() => renderComposeUp({ proofOverride: false as unknown as true })).toThrow(RenderError);
   });
 

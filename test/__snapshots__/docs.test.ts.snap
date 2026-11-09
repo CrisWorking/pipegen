@@ -144,6 +144,7 @@ Runs on a push to the default branch: it builds, signs and checks the images tha
 - The type-check follows your own tsconfig.json. The repo's tsconfig decides what tsc checks and how strictly, and a pull request can edit it (\`exclude\`, \`skipLibCheck\`, \`extends\`, a \`ts-nocheck\` comment). pipegen refuses only the plain no-op layouts: no file selected, \`noCheck\`, and a missing or linked tsconfig.json. It is not a protected path.
 - The raw result of the running app scan travels unscrubbed between the job that runs the app and the job that reads the result. It holds only what an app without secrets answered. A hostile app can always answer a scanner cleanly.
 - The running app scan has no earlier scan to compare with, so its findings warn on the pull request that installs pipegen and count as new after it.
+- The running app scan talks to ZAP through its API, which answers only 127.0.0.1, so the scanned app can not reach it.
 - Image findings have no base yet: there is no earlier scan of the base commit to compare with, so image findings warn on the pull request that installs pipegen and block on every other.
 - The scanned image is not the published image. The scan covers the build of the pull request head; the publish job builds again at the merge commit, so a moving base image tag can make them differ.
 - The licence scan reads lockfiles only.

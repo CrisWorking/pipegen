@@ -16,11 +16,31 @@ import type { PlatformActions } from './pin.js';
 import { pipegenScriptStep } from './pipegen-script.js';
 import { RenderError, show } from './render-error.js';
 import { renderPlatformStep, renderStep, type RenderContext, type RenderResult } from './render-step.js';
-import type { ReviewedTool, StepSpec } from '../types.js';
+import type { CreatedFile, RepoProfile, ReviewedTool, StepSpec } from '../types.js';
 
 export { imageArchiveArtifact, IMAGE_ARCHIVE_FILE, IMAGE_SHA_OUTPUT };
 
 /** The local tag the build gives the image and the archive step saves (never pushed: no registry, so no one else's image can answer to it). */
+/**
+ * G17B-R0 (row 19): the profile the image renderers read. A service with no Dockerfile of its own gets the one pipegen creates in the same
+ * draft at its folder (`<folder>/Dockerfile`, part docker, app repository; the referee's Dockerfile judge holds its text), so its image build,
+ * its image scans and its DAST archive start render from it. Shared by the assembler, the DAST start and the referee: one source.
+ */
+export function imageProfile(profile: RepoProfile, created: readonly CreatedFile[] | undefined): RepoProfile {
+  const made = new Set((Array.isArray(created) ? created : []).filter((f) => f !== null && typeof f === 'object' && f.repo === 'app' && f.part === 'docker' && typeof f.path === 'string' && /(?:^|\/)Dockerfile$/.test(f.path)).map((f) => f.path));
+  if (made.size === 0) return profile;
+  let changed = false;
+  const services = profile.services.map((svc) => {
+    if ((svc.dockerfile ?? '') !== '' || typeof svc.path !== 'string') return svc;
+    const dir = svc.path === '.' ? '' : svc.path.replace(/^\.\//, '').replace(/\/+$/, '');
+    const at = dir === '' ? 'Dockerfile' : `${dir}/Dockerfile`;
+    if (!made.has(at)) return svc;
+    changed = true;
+    return { ...svc, dockerfile: at };
+  });
+  return changed ? { ...profile, services } : profile;
+}
+
 export const imageBuildTag = (service: string): string => `pipegen-image/${slug(service)}:build`;
 /** The archive in the job's runner temp, as a shell word (the run steps name it; never an env value, which Actions would not expand). */
 const archivePath = (service: string): string => `$RUNNER_TEMP/pipegen-out/${imageArchiveArtifact(service)}/${IMAGE_ARCHIVE_FILE}`;

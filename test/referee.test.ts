@@ -5,6 +5,7 @@ import { centralWorkflowPath } from '../src/engine/central-path.js';
 import { Document, parseDocument } from 'yaml';
 import { CALLER_WORKFLOW, defaultPushTrigger, DEPLOY_PUSH_IF, NO_SCANS, PUSH_WORKFLOW, WORKFLOW_CONCURRENCY } from '../src/engine/job-rules.js';
 import { describe, expect, it } from 'vitest';
+import { ARCHIVE_TOOL_IDS } from '../src/engine/image-handoff.js';
 import { JOB_PERMISSIONS, JOB_STEP_POLICY, pipegenLines, referee, type Linters, type RefereeDeps, type RefereeIssue, type RefereeReport } from '../src/engine/referee.js';
 import { gateJobList, jobIdFor } from '../src/engine/gate-job-list.js';
 import { attestDigestRef, jobOutputsFor } from '../src/engine/job-rules.js';
@@ -152,10 +153,13 @@ describe('referee: the renderer and the referee agree', () => {
       if (t.categories.includes('platform') && !t.categories.includes('image-build')) continue;   // the platform actions are rendered below, by their helpers
       // G4-R1: a DAST tool runs in its own key-free run job, scrubbed in another (test/jobs-dast.test.ts holds that pair to the referee)
       if (t.categories.includes('dast')) continue;
+      // G17B-R1 round 2 (R0 carry 2): an image scanner reads only the archive of the PR's own image; its registry form is no step of pipegen's
+      // (test/referee-g2.test.ts holds the archive form to the referee, and the refusal of the registry form)
+      if (ARCHIVE_TOOL_IDS.has(t.id)) continue;
       const nth = (perNeed.get(needFor(t)) ?? 0) + 1;
       perNeed.set(needFor(t), nth);
       // D9: a tool that runs the service's test command (c8) runs in a service that has a test script
-      // (v0.2 Plan G G2-R1 I2: the image build gets a service of its own, so the registry-form image scans of app stay this test's subject)
+      // (v0.2 Plan G G2-R1 I2: the image build gets a service of its own)
       const spec = specFor(t, { needId: needFor(t), service: t.id === 'docker-build-push-action' ? 'app13' : ARGV_POLICIES[t.id]?.testCommand === true ? 'script-app' : nth === 1 ? 'app' : `app${nth}` });
       let steps: RenderedStep[];
       try {
@@ -242,8 +246,9 @@ describe('referee: the renderer and the referee agree', () => {
     // (registry is a job service and skipped above with the platform entries)
     // (G15a: gh, like cosign, is run only by its own verify step in pipegen-verify, signing.ts)
     expect(refused.sort()).toEqual(['cosign', 'gh', 'gosec', 'pypi-publish', 'schemathesis', 'scorecard-action', 'bandit', 'coverage-py', 'creosote', 'mypy', 'vulture'].sort());
-    // (G4-R1: the two DAST tools are judged in their two-job form in test/jobs-dast.test.ts, not here)
-    expect(specs.length).toBeGreaterThan(28);
+    // (G4-R1: the two DAST tools are judged in their two-job form in test/jobs-dast.test.ts, not here; G17B-R1 round 2: the two image
+    // scanners in their archive form in test/referee-g2.test.ts)
+    expect(specs.length).toBeGreaterThan(26);
   });
 });
 

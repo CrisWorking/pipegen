@@ -391,21 +391,24 @@ describe('G2: the image hand-off (B6)', () => {
       const steps = [...renderJobPrelude({ baseRef: true }, p).steps, ...b.steps];
       return job(steps, { outputs: jobOutputsFor(steps), permissions: { contents: 'read', actions: 'read' } });
     };
-    // control: a base twin of another image (built from the base commit) is judged by shape as before
+    // G17B-R1 round 2 (R0 carry 2): this draft builds no image, so the registry form of the scan (head and twin) is no step of pipegen's at
+    // all: every case below is refused before the twin compare (which stays as a second net); the control is refused the same way now
+    const registryNote = (r: { notes: string[] }): boolean => r.notes.some((n) => /reads only the archive of the pull request's own image, and the draft builds no image for "app"/.test(n));
     const ok = await runWith([workflow({ 'image-scan--app': head(X), 'base-scan': base(Y) })], d);
-    expect(ok.issues.some((i) => /base twin/.test(i.message)), show(ok)).toBe(false);
-    // the same image on both sides: every head finding would look old (a wrong pass), so it is refused
+    expect(ok.ok, show(ok)).toBe(false);
+    expect(registryNote(ok), show(ok)).toBe(true);
+    // the same image on both sides: refused
     const same = await runWith([workflow({ 'image-scan--app': head(X), 'base-scan': base(X) })], d);
-    expect(has(same, 'not-gate-readable', /base twin/), show(same)).toBe(true);
+    expect(same.ok, show(same)).toBe(false);
     // the same, with the twin in another file of the same pipeline
     const split = await runWith([workflow({ 'image-scan--app': head(X) }), { ...workflow({ 'base-scan': base(X) }), path: '.github/workflows/pipegen-merge.yml' }], d);
-    expect(has(split, 'not-gate-readable', /base twin/), show(split)).toBe(true);
+    expect(split.ok, show(split)).toBe(false);
     // G2-R-sec 3: compared on the parsed reference and the digest, not the text: another spelling of the same image, or another name with
     // the same digest, is the same input
     const D1 = `sha256:${'1'.repeat(64)}`;
     for (const [h, b] of [[`docker.io/library/nginx@${D1}`, `nginx@${D1}`], [`nginx@${D1}`, `index.docker.io/library/nginx@${D1}`], [`library/nginx@${D1}`, `docker.io/library/nginx@${D1}`], [X, `ghcr.io/o/other@${D1}`], [X, `docker.io/library/nginx@${D1}`]] as const) {
       const r = await runWith([workflow({ 'image-scan--app': head(h), 'base-scan': base(b) })], d);
-      expect(has(r, 'not-gate-readable', /base twin/), `${h} / ${b}: ${show(r)}`).toBe(true);
+      expect(r.ok, `${h} / ${b}: ${show(r)}`).toBe(false);
     }
     // a tag with the digest, or upper case: not a form pipegen writes, so the twin is no step of pipegen's at all
     for (const b of [`ghcr.io/o/r-app:v1@${D1}`, `GHCR.IO/o/r-app@${D1}`, `ghcr.io/O/r-app@${D1}`]) {
@@ -416,7 +419,7 @@ describe('G2: the image hand-off (B6)', () => {
     }
     // a base twin with no head step of its check, or next to a head that reads the PR's image archive: nothing to compare, refused
     const alone = await runWith([workflow({ 'base-scan': base(Y) })], d);
-    expect(has(alone, 'not-gate-readable', /base twin/), show(alone)).toBe(true);
+    expect(alone.ok, show(alone)).toBe(false);
     const ad0 = imageDraft();
     const withArchive = await runWith([imageFile({ 'image-build--app': buildJob(ad0), 'image-scan--app': scanJob(ad0), 'base-scan': base(Y) })], ad0);
     // (G2-R1 I2: with the image build in the draft no base twin of that scan is pipegen's step at all)
