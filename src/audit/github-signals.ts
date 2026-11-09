@@ -31,10 +31,12 @@ const LANGUAGE_NAME: Readonly<Record<Language, string>> = {
 /** Code-scan rows after GitHub's CodeQL default setup (see the header). Rows other than a missing code scan are kept. */
 export function applyDefaultSetup(rows: readonly Coverage[], setup: DefaultSetup, p: Pick<RepoProfile, 'services' | 'defaultBranch'>): Coverage[] {
   if (setup.state === 'off') return [...rows];
+  const byName = new Map<string, RepoProfile['services'][number]>(); // G17-R2 (F10): the first of each name, as `find` gave
+  for (const s of p.services) if (!byName.has(s.name)) byName.set(s.name, s);
   return rows.map((r) => {
     if (r.need.category !== 'sast' || r.status !== 'missing') return r;
     if (setup.state === 'unknown') return { need: r.need, status: 'unknown', why: setup.why };
-    const service = r.need.service === undefined ? undefined : p.services.find((s) => s.name === r.need.service);
+    const service = r.need.service === undefined ? undefined : byName.get(r.need.service);
     const scanned = setup.languages === null ? null : setup.languages.join(', ');
     // P57 (M5): CodeQL has no PHP (or unnamed-language) analysis, whatever languages default setup lists
     if (service !== undefined && CODEQL_LANGUAGES[service.language].length === 0) {

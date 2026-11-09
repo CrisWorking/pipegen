@@ -26,7 +26,7 @@ import { ConsentToken, CountingSummary, countingSummary, isSpent, spend } from '
 import { ollamaHostOf } from '../ai/ollama.js';
 import { AiSpendMeter, meteredProvider } from '../ai/spend-meter.js';
 import { mapCoverage } from '../audit/coverage.js';
-import { buildsNoImage } from '../audit/model.js';
+import { noImageCheck } from '../audit/model.js';
 import { readWorkflows, skippedWorkflowCount } from '../read/workflows.js';
 import { readOrigin, readProject } from '../read/project.js';
 import { applyTypeOverrides, type TypeOverride } from '../read/project-type.js';
@@ -1160,7 +1160,7 @@ export async function auditCredits(p: RepoProfile, draft: Pick<PipelineDraft, 'c
   // buildsNoImage, the capabilities; no branchGuess (the GitHub context is read, so the branch is known)
   const readerNotes: string[] = [];
   await readWorkflows(dir, undefined, readerNotes);
-  const rows = await map(p, floorNeeds(p, draft.capabilities), dir, { skippedWorkflows: skippedWorkflowCount(readerNotes), noImage: (need) => buildsNoImage(need, p), capabilities: draft.capabilities });
+  const rows = await map(p, floorNeeds(p, draft.capabilities), dir, { skippedWorkflows: skippedWorkflowCount(readerNotes), noImage: noImageCheck(p), capabilities: draft.capabilities });
   const out: { text: string; kind: 'push-default' | 'hooks-ci' | 'signing' | 'deploy-gate' }[] = [];
   for (const r of rows) if (r.credit !== undefined && r.creditKind !== undefined && !out.some((o) => o.text === r.credit)) out.push({ text: r.credit, kind: r.creditKind });
   return out;

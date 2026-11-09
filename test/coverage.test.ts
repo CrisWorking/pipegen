@@ -7,6 +7,8 @@ import { readPrecommit, readWorkflows } from '../src/read/workflows.js';
 import type { Capabilities, ExistingWorkflow, Layer, RepoProfile, Service } from '../src/types.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 import { expectScaling } from './helpers/scaling.js';
+import { dedupeFound } from '../src/audit/coverage/scripts.js';
+import type { Found } from '../src/audit/coverage/types.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
 
 // Ruling P33: a never-listed action (trivy-action, zizmor-action, …) is partial whatever its inputs. Older tests use
@@ -625,17 +627,25 @@ describe('mapCoverage (fix round 1)', () => {
     expect(r).toMatchObject({ status: 'unknown', why: "The workflows are too large to read in full, so pipegen can't tell." });
   });
 
-  it('coverage: M5 hostile 4 KB lines across a 1 MB workflow finish quickly (linear scan)', async () => {
+  it('coverage: M5 hostile 4 KB lines across a 1 MB workflow scan in linear time', async () => {
     const kinds = ['cd a && ', 'npm ', '|| ', 'docker run -v x ', 'sudo env A=1 ', '$(', 'trivy ', '"\'', 'set +e; '];
     const lines = kinds.map((k) => k.repeat(Math.floor(3900 / k.length)));
-    const body = Array.from({ length: 240 }, (_, i) => `          ${lines[i % lines.length]}`).join('\n');
-    const dir = makeTempDir();
-    wf(dir, 'ci.yml', `${both}jobs:\n  j:\n    runs-on: x\n    if: ${'('.repeat(3000)}always()${')'.repeat(3000)}\n    steps:\n      - run: |\n${body}\n`);
-    const p = await profileOf(dir);
-    expect(p.existingWorkflows).toHaveLength(1); // under the 1 MB read limit, so it really is scanned
-    const t = performance.now();
-    await mapCoverage(p, floorNeeds(p, caps), dir);
-    expect(performance.now() - t).toBeLessThan(5000);
+    const repoOf = async (n: number, parens: number) => {
+      const body = Array.from({ length: n }, (_, i) => `          ${lines[i % lines.length]}`).join('\n');
+      const dir = makeTempDir();
+      wf(dir, 'ci.yml', `${both}jobs:\n  j:\n    runs-on: x\n    if: ${'('.repeat(parens)}always()${')'.repeat(parens)}\n    steps:\n      - run: |\n${body}\n`);
+      const p = await profileOf(dir);
+      expect(p.existingWorkflows).toHaveLength(1); // under the 1 MB read limit, so it really is scanned
+      return { dir, p };
+    };
+    const repos = { small: await repoOf(60, 750), big: await repoOf(240, 3000) };
+    // 4 times the lines and nesting: a linear scan takes about 4 times as long, a quadratic one about 16 times
+    await expectScaling('hostile lines scan', async (size) => {
+      const { dir, p } = repos[size];
+      const t = performance.now();
+      await mapCoverage(p, floorNeeds(p, caps), dir);
+      return performance.now() - t;
+    }, 9);
   });
 });
 
@@ -875,15 +885,19 @@ describe('mapCoverage (fix round 4)', () => {
   });
 
   it('coverage: round 4: a 30,000-key with: map is read in linear time', async () => {
-    const dir = makeTempDir();
-    wf(dir, 'ci.yml', trivy(["exit-code: '1'", ...spellings(30_000).map((k) => `${k}: 1`)]));
-    const t = performance.now();
-    const p = await profileOf(dir, runnable);
-    expect(p.existingWorkflows).toHaveLength(1); // under the 1 MB read limit, so it really is read
-    const r = row(await mapCoverage(p, floorNeeds(p, caps), dir), 'merge', 'image-scan', 'app');
-    const ms = performance.now() - t;
-    expect(r.status).toBe('partial');
-    expect(ms).toBeLessThan(5000);
+    // read and mapped at 7,500 and at 30,000 keys: 4 times the keys is about 4 times the time when linear, 16 when quadratic
+    const readAt = async (n: number) => {
+      const dir = makeTempDir();
+      wf(dir, 'ci.yml', trivy(["exit-code: '1'", ...spellings(n).map((k) => `${k}: 1`)]));
+      const t = performance.now();
+      const p = await profileOf(dir, runnable);
+      expect(p.existingWorkflows).toHaveLength(1); // under the 1 MB read limit, so it really is read
+      const r = row(await mapCoverage(p, floorNeeds(p, caps), dir), 'merge', 'image-scan', 'app');
+      const ms = performance.now() - t;
+      expect(r.status).toBe('partial');
+      return ms;
+    };
+    await expectScaling('30,000-key with: map', (size) => readAt(size === 'small' ? 7_500 : 30_000), 9);
   });
 });
 
@@ -909,11 +923,16 @@ describe('mapCoverage (fix round 5)', () => {
     return { rows, ms: performance.now() - t };
   }
 
-  it('coverage: round 5: 2,000 services and 100,000 hits in 8,000 dirs finish in under 5 s', async () => {
-    const svcs = [...services(2000), svc('other/lonely')];
-    const cmds = Array.from({ length: 100_000 }, (_, k) => inDir(`apps/s${k % 2000}/d${Math.floor(k / 2000) % 4}`));
-    const { rows, ms } = await cdCoverage(cmds, svcs);
-    expect(ms).toBeLessThan(5000);
+  it('coverage: round 5: 2,000 services and 100,000 hits in 8,000 dirs scale linearly', async () => {
+    const at = (n: number) => ({ svcs: [...services(n), svc('other/lonely')], cmds: Array.from({ length: n * 50 }, (_, k) => inDir(`apps/s${k % n}/d${Math.floor(k / n) % 4}`)) });
+    // 4 times the services and hits: linear is about 4 times the time, a pass over every service for each hit far more
+    let rows: Awaited<ReturnType<typeof cdCoverage>>['rows'] = [];
+    await expectScaling('services and hits', async (size) => {
+      const { svcs, cmds } = at(size === 'small' ? 500 : 2000);
+      const r = await cdCoverage(cmds, svcs);
+      if (size === 'big') rows = r.rows;
+      return r.ms;
+    }, 9);
     expect(row(rows, 'push', 'sast', 's0')).toMatchObject({ status: 'covered', by: 'semgrep', where: '.github/workflows/w0.yml (job j)' });
     expect(row(rows, 'merge', 'sast', 's1999')).toMatchObject({ status: 'covered', by: 'semgrep' });
     expect(row(rows, 'push', 'sast', 'lonely').status).toBe('missing'); // under the caps, a gap is still a gap
@@ -940,8 +959,10 @@ describe('mapCoverage (fix round 5)', () => {
     const under = (await run(5_000)).rows;
     expect(row(under, 'push', 'lint', 's0').status).toBe('covered');
     expect(row(under, 'push', 'lint', 's1').status).toBe('missing');
-    const { rows: over, ms } = await run(5_001);
-    expect(ms).toBeLessThan(5000);
+    const { rows: over } = await run(5_001);
+    // G17-R1: per-row service lookups go through a map built once, so 4 times the services (up to the cap) is about 4 times the
+    // time when linear, 16 when quadratic. The over-cap run above does less work than the under-cap one by design.
+    await expectScaling('services under the cap', async (size) => (await run(size === 'small' ? 1_250 : 5_000)).ms, 6);
     for (const s of ['s0', 's1', 's5000']) expect(row(over, 'push', 'lint', s)).toEqual(expect.objectContaining({ status: 'unknown', why: TOO_MANY }));
     // a run at the repo root covers every service whatever their number
     for (const s of ['s0', 's1', 's5000']) expect(row(over, 'push', 'sast', s).status).toBe('covered');
@@ -1077,17 +1098,117 @@ describe('mapCoverage (Task 5, item 1: own scripts by name and content)', () => 
   });
 
   it('own scripts (adversarial): a chain of scripts that each call the next one twice is read in linear time, capped', async () => {
+    let status = '';
+    // both chains are past the 1,000-script cap (below it the walk is 3^n, so a short chain is not a safe small size): the walk stops
+    // at the cap, so 4 times the chain must not cost much more
+    await expectScaling('script chain', async (size) => {
+      const n = size === 'small' ? 1100 : 4400;
+      const dir = makeTempDir();
+      const scripts: Record<string, string> = {};
+      for (let i = 0; i < n; i++) scripts[`s${i}`] = `npm run s${i + 1} && npm run s${i + 1} || npm run s${i + 1}`;
+      scripts[`s${n}`] = 'vitest run';
+      pkg(dir, scripts);
+      ci(dir, run('npm run s0'));
+      const started = performance.now();
+      const r = row(await coverage(dir), 'push', 'unit-tests', 'app').status;
+      const ms = performance.now() - started;
+      if (size === 'big') status = r;
+      return ms;
+    }, 9);
+    expect(status).toBe('unknown'); // G17-R1: past the script cap the row is unknown, never missing
+  });
+
+  it('own scripts (adversarial): G17-R1: a short chain that calls the next script three times keeps its lists bounded (linear, not 2^n)', async () => {
+    let status = '';
+    // below the script cap: each script's result is deduplicated, so 40 links cost about twice 20 links (2^n before the fix)
+    await expectScaling('short script chain', async (size) => {
+      const n = size === 'small' ? 20 : 40;
+      const dir = makeTempDir();
+      const scripts: Record<string, string> = {};
+      for (let i = 0; i < n; i++) scripts[`s${i}`] = `npm run s${i + 1} && npm run s${i + 1} || npm run s${i + 1}`;
+      scripts[`s${n}`] = 'vitest run';
+      pkg(dir, scripts);
+      ci(dir, run('npm run s0'));
+      const started = performance.now();
+      const r = row(await coverage(dir), 'push', 'unit-tests', 'app').status;
+      const ms = performance.now() - started;
+      if (size === 'big') status = r;
+      return ms;
+    }, 6);
+    expect(status).toBe('partial'); // the || ignores the exit code, as for a short chain
+  }, 60_000);
+
+  it('own scripts (adversarial): G17-R1: a script whose runs exceed the entry cap is unknown, never covered or missing', async () => {
+    const at = async (n: number) => {
+      const dir = makeTempDir();
+      pkg(dir, { s0: `${Array.from({ length: n }, (_, i) => `(cd d${i} && vitest run)`).join(' ; ')} ; npm run x`, x: 'jest' });
+      ci(dir, run('npm run s0'));
+      return coverage(dir, { services: [svc('d1'), svc('d2')] });
+    };
+    const under = await at(1_990);
+    expect(row(under, 'push', 'unit-tests', 'd1').status).toBe('covered');
+    const over = await at(2_100);
+    for (const s of ['d1', 'd2']) expect(row(over, 'push', 'unit-tests', s)).toMatchObject({ status: 'unknown', why: expect.stringContaining('more results than pipegen keeps') });
+  }, 60_000);
+
+  it('own scripts (adversarial): G17-R2: past the results cap the step keeps its own finds (a secret scan stays covered)', async () => {
+    const dir = makeTempDir();
+    const runs = (from: number) => Array.from({ length: 1_200 }, (_, i) => `(cd d${from + i} && vitest run)`).join(' ; ');
+    pkg(dir, { a: runs(0), b: runs(1_200) });
+    ci(dir, run('npx gitleaks detect --source . && npm run a && npm run b'));
+    const rows = await coverage(dir, { services: [svc('d1'), svc('d2')] });
+    expect(row(rows, 'push', 'secrets').status).toBe('covered');
+    for (const s of ['d1', 'd2']) expect(row(rows, 'push', 'unit-tests', s)).toMatchObject({ status: 'unknown', why: expect.stringContaining('more results than pipegen keeps') });
+  }, 60_000);
+
+  it('own scripts (adversarial): G17-R2: a capped script is unknown for every service, not only its own folder', async () => {
+    const at = async (n: number) => {
+      const dir = makeTempDir();
+      pkg(dir, { s0: Array.from({ length: n }, (_, i) => `(cd ../../services/d${i} && vitest run)`).join(' ; ') }, 'apps/web/package.json');
+      ci(dir, '      - run: npm run s0\n        working-directory: apps/web\n');
+      return coverage(dir, { services: [svc('apps/web'), svc('services/d1')] });
+    };
+    expect(row(await at(50), 'push', 'unit-tests', 'd1').status).not.toBe('unknown');
+    const over = await at(2_100);
+    for (const s of ['web', 'd1']) expect(row(over, 'push', 'unit-tests', s).status).toBe('unknown');
+  }, 60_000);
+
+  it('own scripts (adversarial): G17-R3: a docker build after the results cap still counts as the image build', async () => {
+    const dir = makeTempDir();
+    const runs = (from: number) => Array.from({ length: 1_200 }, (_, i) => `(cd d${from + i} && vitest run)`).join(' ; ');
+    pkg(dir, { a: runs(0), b: runs(1_200) });
+    writeIn(dir, 'Dockerfile', 'FROM node:24\n');
+    ci(dir, run('npm run a && npm run b && docker build -t x .'));
+    const rows = await coverage(dir, { services: [svc('.', { scripts: ['start', 'test'], frameworks: ['express'], dockerfile: 'Dockerfile' })] });
+    expect(rows.find((r) => r.need.category === 'image-build')?.status).toBe('covered');
+  }, 60_000);
+
+  it('own scripts (adversarial): G17-R3: a capped script glob is unknown for every service, not only its own folder', async () => {
     const dir = makeTempDir();
     const scripts: Record<string, string> = {};
-    for (let i = 0; i < 1000; i++) scripts[`s${i}`] = `npm run s${i + 1} && npm run s${i + 1} || npm run s${i + 1}`;
-    scripts.s1000 = 'vitest run';
-    pkg(dir, scripts);
-    ci(dir, run('npm run s0'));
-    const started = Date.now();
-    const status = row(await coverage(dir), 'push', 'unit-tests', 'app').status;
-    expect(Date.now() - started).toBeLessThan(3000);
-    expect(status).toBe('missing'); // past the script cap nothing is counted
+    for (let i = 0; i < 250; i++) scripts[`t:${i}`] = `cd ../../services/d${i} && vitest run`;
+    pkg(dir, scripts, 'apps/web/package.json');
+    ci(dir, '      - run: npx run-s "t:*"\n        working-directory: apps/web\n');
+    const rows = await coverage(dir, { services: [svc('apps/web'), svc('services/d1')] });
+    for (const s of ['web', 'd1']) expect(row(rows, 'push', 'unit-tests', s).status).toBe('unknown');
+  }, 60_000);
+
+  it('own scripts: G17-R2: removing repeats tells apart finds that differ only in a Set field', () => {
+    const base = { categories: ['lint'], by: 'pre-commit', subject: 'x', dir: '.', reason: null } as const;
+    const a = { ...base, hookSkip: { ids: new Set(['ruff-check']) } } as unknown as Found;
+    const b = { ...base, hookSkip: { ids: new Set(['ruff-format']) } } as unknown as Found;
+    const a2 = { ...base, hookSkip: { ids: new Set(['ruff-check']) } } as unknown as Found;
+    expect(dedupeFound([a, b, a2])).toEqual([a, b]);
   });
+
+  it('own scripts (adversarial): G17-R1: past the script cap, a call to a script not counted by name is unknown, not missing', async () => {
+    const dir = makeTempDir();
+    const scripts: Record<string, string> = { 'ci-tests': 'vitest run' };
+    for (let i = 0; i < 1_001; i++) scripts[`f${i}`] = 'echo hi';
+    pkg(dir, scripts);
+    ci(dir, run(`${Array.from({ length: 1_001 }, (_, i) => `npm run f${i}`).join(' && ')} && npm run ci-tests`));
+    expect(row(await coverage(dir), 'push', 'unit-tests', 'app')).toMatchObject({ status: 'unknown', why: expect.stringContaining('more package scripts than pipegen follows') });
+  }, 60_000);
 
   it('own scripts: a husky hook running an own script is read the same way', async () => {
     const dir = makeTempDir();
@@ -1794,15 +1915,26 @@ describe('mapCoverage (Task 5 fix round 3)', () => {
   const PR = (steps: string) => `on:\n  pull_request:\n${job(steps)}`;
 
   it('N6: a local composite action used 20,000 times is read once for the job gate (100 jobs × 200 uses of a 100 KB action)', async () => {
-    const dir = makeTempDir();
     const line = '    - run: echo hello world this is padding text for the composite action body\n      shell: bash\n';
-    writeIn(dir, '.github/actions/a/action.yml', `runs:\n  using: composite\n  steps:\n    - run: echo "SKIP=ruff-check" >> "$GITHUB_ENV"\n      shell: bash\n${line.repeat(Math.floor(100 * 1024 / line.length))}`);
     const stepsTxt = '      - uses: ./.github/actions/a\n'.repeat(200);
-    const jobs = Array.from({ length: 100 }, (_, i) => `  j${i}:\n    runs-on: x\n    steps:\n${stepsTxt}`).join('');
-    wf(dir, 'w.yml', `on: [pull_request]\njobs:\n${jobs}`);
-    const started = Date.now();
-    const rows = await coverage(dir);
-    expect(Date.now() - started).toBeLessThan(10_000);
+    const repoOf = (jobCount: number) => {
+      const dir = makeTempDir();
+      writeIn(dir, '.github/actions/a/action.yml', `runs:\n  using: composite\n  steps:\n    - run: echo "SKIP=ruff-check" >> "$GITHUB_ENV"\n      shell: bash\n${line.repeat(Math.floor(100 * 1024 / line.length))}`);
+      const jobs = Array.from({ length: jobCount }, (_, i) => `  j${i}:\n    runs-on: x\n    steps:\n${stepsTxt}`).join('');
+      wf(dir, 'w.yml', `on: [pull_request]\njobs:\n${jobs}`);
+      return dir;
+    };
+    // 25 against 100 jobs: if the action were read at every use, 4 times the uses would cost 4 times the reads of 100 KB;
+    // a read once per action keeps the growth in the cheap per-use work
+    let rows: Awaited<ReturnType<typeof coverage>> = [];
+    await expectScaling('composite action uses', async (size) => {
+      const dir = repoOf(size === 'small' ? 25 : 100);
+      const started = performance.now();
+      const r = await coverage(dir);
+      const ms = performance.now() - started;
+      if (size === 'big') rows = r;
+      return ms;
+    }, 9);
     expect(rows.filter((r) => r.need.layer !== 'pre-commit').every((r) => r.status !== 'covered')).toBe(true);
   }, 30_000);
 
@@ -1886,15 +2018,23 @@ describe('mapCoverage (Task 5 fix round 3)', () => {
   });
 
   it('N7: past the script cap (1,000) a by-name script is unknown, never covered', async () => {
-    const dir = makeTempDir();
-    const scripts: Record<string, string> = { test: 'npm run c0' };
-    for (let i = 0; i < 1200; i++) scripts[`c${i}`] = `npm run c${i + 1}`;
-    scripts.c1200 = 'echo';
-    pkg(dir, scripts);
-    wf(dir, 'ci.yml', PR(run('npm test')));
-    const started = Date.now();
-    const r = row(await coverage(dir), 'merge', 'unit-tests', 'app');
-    expect(Date.now() - started).toBeLessThan(5000);
+    const repoOf = (n: number) => {
+      const dir = makeTempDir();
+      const scripts: Record<string, string> = { test: 'npm run c0' };
+      for (let i = 0; i < n; i++) scripts[`c${i}`] = `npm run c${i + 1}`;
+      scripts[`c${n}`] = 'echo';
+      pkg(dir, scripts);
+      wf(dir, 'ci.yml', PR(run('npm test')));
+      return dir;
+    };
+    const r = row(await coverage(repoOf(1200)), 'merge', 'unit-tests', 'app');
+    // 300 against 1,200 scripts: the walk stops at the cap, so it must not grow faster than the chain does
+    await expectScaling('scripts past the cap', async (size) => {
+      const dir = repoOf(size === 'small' ? 300 : 1200);
+      const started = performance.now();
+      await coverage(dir);
+      return performance.now() - started;
+    }, 9);
     expect(r.status).toBe('unknown');
     expect(r.why).toBe("There are more package scripts than pipegen follows (1,000), so it can't tell what your own `npm test` runs.");
   });
@@ -1908,9 +2048,14 @@ describe('mapCoverage (Task 5 fix round 4)', () => {
   /** Keys of 200 characters, each matched in vain by the patterns below (the re-review's glob-cost shapes). */
   const longKeys = (n: number) => Object.fromEntries(Array.from({ length: n }, (_, i) => ['a'.repeat(194) + String(i).padStart(6, '0'), 'echo']));
   const timed = async (dir: string, over: Partial<RepoProfile> = {}) => {
-    const started = Date.now();
+    const started = performance.now();
     const rows = await coverage(dir, over);
-    return { rows, ms: Date.now() - started };
+    return { rows, ms: performance.now() - started };
+  };
+  /** The key count is the input that grows: 750 against 3,000 keys, so a linear glob pass takes about 4 times as long. */
+  const scaleKeys = async (label: string, repoOf: (keys: number) => string): Promise<Awaited<ReturnType<typeof timed>>> => {
+    await expectScaling(label, async (size) => (await timed(repoOf(size === 'small' ? 750 : 3000))).ms, 9);
+    return timed(repoOf(3000));
   };
 
   it('N8: `run-s "t:*"` over 5,000 scripts, only the last running jest, is unknown, never missing (no truncated list decides the row)', async () => {
@@ -1955,38 +2100,41 @@ describe('mapCoverage (Task 5 fix round 4)', () => {
     expect(row(await coverage(dir), 'merge', 'unit-tests', 'app').status).toBe('missing');
   });
 
-  it('N8: one `npm test` whose script runs 60 glob patterns over 3,000 keys takes under 2 s and is never covered', async () => {
-    const dir = makeTempDir();
+  it('N8: one `npm test` whose script runs 60 glob patterns over 3,000 keys scales with the keys and is never covered', async () => {
     const P = '*a'.repeat(120) + 'b';
-    pkg(dir, { test: 'run-s ' + Array.from({ length: 60 }, () => `"${P}"`).join(' '), ...longKeys(3000) });
-    wf(dir, 'ci.yml', PR(run('npm test')));
-    const { rows, ms } = await timed(dir);
-    expect(ms).toBeLessThan(2000);
+    const { rows } = await scaleKeys('60 glob patterns', (keys) => {
+      const dir = makeTempDir();
+      pkg(dir, { test: 'run-s ' + Array.from({ length: 60 }, () => `"${P}"`).join(' '), ...longKeys(keys) });
+      wf(dir, 'ci.yml', PR(run('npm test')));
+      return dir;
+    });
     expect(row(rows, 'merge', 'unit-tests', 'app').status).toBe('unknown');
   }, 30_000);
 
   for (const lines of [1, 5]) {
-    it(`N8: ${lines} CI line(s) of \`npx run-s\` with 60 patterns of 63 characters over 3,000 keys take under 2 s`, async () => {
-      const dir = makeTempDir();
-      pkg(dir, longKeys(3000));
+    it(`N8: ${lines} CI line(s) of \`npx run-s\` with 60 patterns of 63 characters over 3,000 keys scale with the keys`, async () => {
       const P = '*a'.repeat(31) + 'b';
       const line = 'npx run-s ' + Array.from({ length: 60 }, (_, j) => P.slice(0, 61) + String(j).padStart(2, '0')).join(' ');
-      wf(dir, 'ci.yml', PR(run(line).repeat(lines)));
-      const { rows, ms } = await timed(dir);
-      expect(ms).toBeLessThan(2000);
+      const { rows } = await scaleKeys(`${lines} CI line(s) of run-s`, (keys) => {
+        const dir = makeTempDir();
+        pkg(dir, longKeys(keys));
+        wf(dir, 'ci.yml', PR(run(line).repeat(lines)));
+        return dir;
+      });
       expect(row(rows, 'merge', 'unit-tests', 'app').status).toBe('unknown');
     }, 30_000);
   }
 
-  it('N8: glob work past the budget is capped: 60 scripts × 16 distinct 64-character globs over 3,000 64-character names take under 2 s and are unknown', async () => {
-    const dir = makeTempDir();
-    const scripts: Record<string, string> = { test: Array.from({ length: 60 }, (_, i) => `npm run g${i}`).join(' && ') };
-    for (let i = 0; i < 60; i++) scripts[`g${i}`] = 'run-p ' + Array.from({ length: 16 }, (_, j) => `"${'*a'.repeat(29)}${String(i * 16 + j).padStart(5, '0')}*"`).join(' ');
-    for (let i = 0; i < 3000; i++) scripts['a'.repeat(58) + String(i).padStart(6, '0')] = 'echo';
-    pkg(dir, scripts);
-    wf(dir, 'ci.yml', PR(run('npm test')));
-    const { rows, ms } = await timed(dir);
-    expect(ms).toBeLessThan(2000);
+  it('N8: glob work past the budget is capped: 60 scripts × 16 distinct 64-character globs over 3,000 64-character names scale with the names and are unknown', async () => {
+    const { rows } = await scaleKeys('capped glob work', (names) => {
+      const dir = makeTempDir();
+      const scripts: Record<string, string> = { test: Array.from({ length: 60 }, (_, i) => `npm run g${i}`).join(' && ') };
+      for (let i = 0; i < 60; i++) scripts[`g${i}`] = 'run-p ' + Array.from({ length: 16 }, (_, j) => `"${'*a'.repeat(29)}${String(i * 16 + j).padStart(5, '0')}*"`).join(' ');
+      for (let i = 0; i < names; i++) scripts['a'.repeat(58) + String(i).padStart(6, '0')] = 'echo';
+      pkg(dir, scripts);
+      wf(dir, 'ci.yml', PR(run('npm test')));
+      return dir;
+    });
     expect(row(rows, 'merge', 'unit-tests', 'app').status).toBe('unknown');
   }, 30_000);
 
