@@ -81,8 +81,8 @@ export async function uninstallCommand(io: CliIO, deps: UninstallCommandDeps): P
     app = c.app;
     localDeps = c.g.local ?? {};
     stage = 'load';
-    // connect doesn't say whether the token is pipegen's App (Auth.canDeleteRepos): until it does, only a connection that says so deletes repos
-    const canDeleteRepos = (c as { canDeleteRepos?: unknown }).canDeleteRepos === true;
+    // Auth.canDeleteRepos as connect copied it (App login with Administration: write, write mode); anything else is token mode: print-only
+    const canDeleteRepos = c.canDeleteRepos === true;
     // the one place the record is loaded: no preview or dry mode exists that could remove the local files through it (V6-R4)
     const loaded = await (deps.load ?? loadUninstallRecord)(c.g.gh, c.app, { io: io.prompt, interactive: true, local: localDeps, ...(c.g.clock === undefined ? {} : { clock: c.g.clock }) });
     stage = 'step';
