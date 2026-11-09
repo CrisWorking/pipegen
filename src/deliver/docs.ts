@@ -23,6 +23,7 @@ import { CALLER_WORKFLOW, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PUSH_WORKFLOW 
 import { pipegenDocProblems } from '../engine/created-judges/pipegen-doc.js';
 import { BOOTSTRAP_PROOFS_NOTE } from '../engine/reviewed.js';
 import { floorNeeds, MINIMUM_CATEGORIES, WORKFLOW_LINT_TOOL } from '../engine/needs.js';
+import { dastStartOf, NIGHTLY_DAST_TOOL, ZAP_ACTIVE_TOOL } from '../engine/dast-handoff.js';
 import { codeSecurityAvailable } from '../github/availability.js';
 import { describeTuning } from '../engine/tuning.js';
 import { HUSKY_NO_CI_NOTE, SETUP_COMMANDS } from '../layers/precommit.js';
@@ -552,7 +553,7 @@ function layersSection(d: Doc, draft: PipelineDraft, data: DocData, reviewed: re
     }
   }
   limitsSection(d, draft);
-  nightlySection(d, draft);
+  nightlySection(d, draft, reviewed);
   tuningSection(d, draft);
   d.h(3, 'Notes from the build');
   const notes = buildNotes(data);
@@ -598,13 +599,21 @@ function limitsSection(d: Doc, draft: PipelineDraft): void {
  * workflows with zizmor, Scorecard weekly when the plan holds it. None of them is on the gate's list, so none blocks. The history scan's two
  * permanent limits (render-cli.ts: the octopus check over --all, and the canary commits dated 2100-01-01) are said beside it.
  */
-function nightlySection(d: Doc, draft: PipelineDraft): void {
+function nightlySection(d: Doc, draft: PipelineDraft, reviewed: readonly ReviewedTool[]): void {
   const merge = draft.needs.filter((n) => n.layer === 'merge');
   const stepped = (n: Need, tool?: string): boolean => stepsOf(draft, n.id, n.service).some((s) => tool === undefined || s.tool.id === tool);
   const cs = codeSecurityAvailable(draft.profile, draft.capabilities);
   const history = cs && merge.some((n) => n.id === 'secrets' && n.service === undefined && stepped(n));
   const zizmor = merge.some((n) => categoryOf(n.id, n.category) === 'workflow-lint' && stepped(n, WORKFLOW_LINT_TOOL));
-  const dast = cs && merge.some((n) => categoryOf(n.id, n.category) === 'dast' && n.service !== undefined && stepped(n));
+  const dastNeeds = merge.filter((n) => categoryOf(n.id, n.category) === 'dast' && n.service !== undefined && stepped(n));
+  // G17 minors m1/m2: the nightly job runs only for a reviewed nuclei (without it the assembler writes a note, no job), and adds ZAP's active scan
+  // only for a reviewed zap-af-active; the app starts from an image build only for the archive start (pipegen's compose file builds none)
+  const hasTool = (id: string): boolean => reviewed.some((t) => t.id === id);
+  const dast = cs && dastNeeds.length > 0 && hasTool(NIGHTLY_DAST_TOOL);
+  const dastCompose = dastNeeds.some((n) => {
+    const st = dastStartOf(draft, n.service as string);
+    return 'kind' in st && st.kind === 'compose';
+  });
   const scorecard = merge.some((n) => categoryOf(n.id, n.category) === 'scorecard');
   if (!history && !zizmor && !dast && !scorecard) return;
   d.h(3, 'Nightly scans');
@@ -614,7 +623,10 @@ function nightlySection(d: Doc, draft: PipelineDraft): void {
     d.li('Another permanent limit: a commit dated after 1 January 2100 on any branch or tag makes the same job fail every night, because the scan proves it read the whole history with marker commits of that date.');
   }
   if (zizmor) d.li('Every night zizmor checks the workflows again with its online checks (it asks GitHub about the actions they use), with a read-only token. It never blocks a pull request.');
-  if (dast) d.li('Every night the running app scan runs again with nuclei and with ZAP\'s active scan, which sends attack requests to the app the nightly run starts from its own image build. The results go to code scanning and never block a pull request.');
+  if (dast) {
+    const scans = hasTool(ZAP_ACTIVE_TOOL) ? 'with nuclei and with ZAP\'s active scan, which sends attack requests to' : 'with nuclei, which sends requests to';
+    d.li(`Every night the running app scan runs again ${scans} the app the nightly run starts ${dastCompose ? 'in containers' : 'from its own image build'}. The results go to code scanning and never block a pull request.`);
+  }
   if (scorecard) d.li('Once a week (on Monday) OpenSSF Scorecard scores the repository. The result goes to code scanning and never blocks a pull request.');
 }
 
