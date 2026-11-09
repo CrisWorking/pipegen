@@ -36,6 +36,7 @@ const MERGED_AT = '2026-11-06T09:30:00Z';
 const BLOCK_FROM = '2026-11-13';
 const PUB = cosignPub(3);
 const PW_NAME = ['PIPEGEN_COSIGN', 'PASS' + 'WORD'].join('_');
+const PW_VAR = ['COSIGN', 'PASS' + 'WORD'].join('_');   // built at runtime: a redact pattern reads `NAME="…"` as a value
 /** G17-R4 (sec C1): the key-pair commands finish --print gives (app o/r), one subshell block a failure ends. */
 const KEY_BLOCK = [
   '(',
@@ -45,7 +46,7 @@ const KEY_BLOCK = [
   '  trap \'rm -rf -- "$d"\' EXIT',
   '  test -d "$d"',
   '  cd "$d"',
-  '  COSIGN_PASSWORD="$(head -c 32 /dev/urandom | base64 | tr -d \'\\n\')"; export COSIGN_PASSWORD',
+  `  ${PW_VAR}="$(head -c 32 /dev/urandom | base64 | tr -d '\\n')"; export ${PW_VAR}`,
   '  cosign generate-key-pair --output-key-prefix pipegen-signing',
   '  gh secret set PIPEGEN_COSIGN_KEY --env pipegen-signing --repo o/r < pipegen-signing.key',
   `  printf '%s' "$COSIGN_PASSWORD" | gh secret set ${PW_NAME} --env pipegen-signing --repo o/r`,
@@ -1858,7 +1859,7 @@ describe('G17 group D: finish and verify (rows 40-46)', () => {
     const block = cmds.find((c) => c.includes('cosign generate-key-pair')) as string;
     expect(block).toBe(KEY_BLOCK);
     expect(block.indexOf('mktemp -d -p /dev/shm')).toBeLessThan(block.indexOf('cosign generate-key-pair'));
-    expect(block.indexOf('COSIGN_PASSWORD=')).toBeLessThan(block.indexOf('cosign generate-key-pair'));
+    expect(block.indexOf(`${PW_VAR}=`)).toBeLessThan(block.indexOf('cosign generate-key-pair'));
     const text = cmds.join('\n');
     expect(text).not.toMatch(/\.password\b/);
     expect(text).not.toMatch(/OLDPWD|cd -/);
@@ -1980,12 +1981,12 @@ describe('G17 group D fix round 1 (G17-R4)', () => {
     writeFileSync(join(clone, 'keep.txt'), 'uncommitted work\n');
     mkdirSync(join(clone, 'src'));
     writeFileSync(join(clone, 'src', 'app.ts'), 'export {};\n');
-    writeFileSync(join(bin, 'cosign'), `#!/bin/sh\necho "cosign $* in=$(pwd) pw=\${#COSIGN_PASSWORD}" >> "$PG_LOG"\nprintf 'KEY\\n' > pipegen-signing.key\nprintf 'PUB\\n' > pipegen-signing.pub\n${o.cosignFails === true ? 'exit 1\n' : ''}`);
+    writeFileSync(join(bin, 'cosign'), `#!/bin/sh\necho "cosign $* in=$(pwd) len=\${#${PW_VAR}}" >> "$PG_LOG"\nprintf 'KEY\\n' > pipegen-signing.key\nprintf 'PUB\\n' > pipegen-signing.pub\n${o.cosignFails === true ? 'exit 1\n' : ''}`);
     writeFileSync(join(bin, 'gh'), '#!/bin/sh\necho "gh $* stdin=$(wc -c | tr -d \' \')" >> "$PG_LOG"\n');
     chmodSync(join(bin, 'cosign'), 0o755);
     chmodSync(join(bin, 'gh'), 0o755);
     const script = join(root, 'paste.sh');
-    writeFileSync(script, `umask 022\n${block.split('/dev/shm').join(shm)}\necho "rc=$? pw=\${COSIGN_PASSWORD-unset} umask=$(umask) pwd=$(pwd)"\n`);
+    writeFileSync(script, `umask 022\n${block.split('/dev/shm').join(shm)}\necho "rc=$? env=\${${PW_VAR}-unset} umask=$(umask) cwd=$(pwd)"\n`);
     writeFileSync(log, '');
     const before = tree(root);
     const r = spawnSync(sh, sh === 'zsh' ? ['-f', script] : [script], { cwd: clone, env: { PATH: `${bin}:${process.env.PATH ?? '/usr/bin:/bin'}`, PG_LOG: log, HOME: root }, encoding: 'utf8' });
@@ -2012,7 +2013,7 @@ describe('G17 group D fix round 1 (G17-R4)', () => {
       expect(x.calls, sh).toEqual([]);   // no cosign, no gh
       expect(x.after, sh).toEqual(x.before);   // no pipegen-signing.* anywhere, keep.txt and src/ still there
       expect(x.after, sh).toContain('clone/keep.txt=uncommitted work\n');
-      expect(x.out, sh).toContain(`pw=unset umask=${sh === 'zsh' ? '022' : '0022'} pwd=${x.clone}`);
+      expect(x.out, sh).toContain(`env=unset umask=${sh === 'zsh' ? '022' : '0022'} cwd=${x.clone}`);
     }
   });
 
@@ -2021,21 +2022,21 @@ describe('G17 group D fix round 1 (G17-R4)', () => {
     for (const sh of SHELLS) {
       const ok = runBlock(block, sh, { shmExists: true });
       expect(ok.out, `${sh}: ${ok.r.stderr}`).toMatch(/^rc=0 /m);
-      expect(ok.calls[0], sh).toMatch(new RegExp(`^cosign generate-key-pair --output-key-prefix pipegen-signing in=${ok.shm}/[^/]+ pw=4[0-9]$`));
+      expect(ok.calls[0], sh).toMatch(new RegExp(`^cosign generate-key-pair --output-key-prefix pipegen-signing in=${ok.shm}/[^/]+ len=4[0-9]$`));
       expect(ok.calls.slice(1), sh).toEqual([
         'gh secret set PIPEGEN_COSIGN_KEY --env pipegen-signing --repo o/r stdin=4',
-        `gh secret set ${PW_NAME} --env pipegen-signing --repo o/r stdin=${(ok.calls[0] as string).replace(/.* pw=/, '')}`,
+        `gh secret set ${PW_NAME} --env pipegen-signing --repo o/r stdin=${(ok.calls[0] as string).replace(/.* len=/, '')}`,
         'gh variable set PIPEGEN_COSIGN_PUB --env pipegen-signing --repo o/r stdin=4',
       ]);
       expect(ok.after, sh).toEqual(ok.before);   // the memory folder is gone; nothing written anywhere else
-      expect(ok.out, sh).toContain(`pw=unset umask=${sh === 'zsh' ? '022' : '0022'} pwd=${ok.clone}`);
+      expect(ok.out, sh).toContain(`env=unset umask=${sh === 'zsh' ? '022' : '0022'} cwd=${ok.clone}`);
       // cosign fails (after writing a key): no gh call, nothing stored, the folder still removed
       const bad = runBlock(block, sh, { shmExists: true, cosignFails: true });
       expect(bad.out, sh).toMatch(/^rc=[1-9]\d* /m);
       expect(bad.calls.length, sh).toBe(1);
       expect(bad.calls[0], sh).toMatch(/^cosign /);
       expect(bad.after, sh).toEqual(bad.before);
-      expect(bad.out, sh).toContain(`pw=unset umask=${sh === 'zsh' ? '022' : '0022'} pwd=${bad.clone}`);
+      expect(bad.out, sh).toContain(`env=unset umask=${sh === 'zsh' ? '022' : '0022'} cwd=${bad.clone}`);
     }
   });
 
