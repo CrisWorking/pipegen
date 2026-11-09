@@ -129,6 +129,11 @@ export interface RunState {
   centralCreated?: boolean;
   /** G17 row 27: GitHub's id of the central repo pipegen created (centralCreated): the record names it, and uninstall deletes only that id. */
   centralRepoId?: number;
+  /**
+   * G17C-R1 (F5): the central pull request pipegen opened (or updated) and the commit it put on its branch. Carried into the next run of
+   * the same app: once that PR is merged, its merge proves pipegen added the central files it holds (deliverCentral checks it on GitHub).
+   */
+  centralPr?: { number: number; commit: string };
   /** The cleanup of this run finished with nothing left behind (cleanupAfterProof). */
   cleanupDone?: boolean;
   /** What the cleanup couldn't remove (plain text, names only), for `pipegen cleanup`. */
@@ -201,6 +206,7 @@ const stateSchema = z.strictObject({
   }).optional(),
   centralCreated: z.boolean().optional(),
   centralRepoId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+  centralPr: z.strictObject({ number: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), commit: z.string().regex(/^[0-9a-f]{40}$/) }).optional(),
   cleanupDone: z.boolean().optional(),
   leftovers: z.array(text).max(1000),
   notes: z.array(text).max(1000),
@@ -388,6 +394,8 @@ export class StateStore {
       ...(old !== null && old.actionsAccessPrevious !== undefined && old.app.owner.toLowerCase() === app.owner.toLowerCase() && old.app.repo.toLowerCase() === app.repo.toLowerCase() ? { actionsAccessPrevious: old.actionsAccessPrevious } : {}),
       // G14-R2 (spec minor): pipegen made the central repo in an earlier run of this app (kept like the Actions access level)
       ...(old !== null && old.centralCreated === true && old.app.owner.toLowerCase() === app.owner.toLowerCase() && old.app.repo.toLowerCase() === app.repo.toLowerCase() ? { centralCreated: true, ...(old.centralRepoId === undefined ? {} : { centralRepoId: old.centralRepoId }) } : {}),
+      // G17C-R1 (F5): the central PR an earlier run of this app opened (merged since, it proves pipegen's central files)
+      ...(old !== null && old.centralPr !== undefined && old.app.owner.toLowerCase() === app.owner.toLowerCase() && old.app.repo.toLowerCase() === app.repo.toLowerCase() ? { centralPr: { ...old.centralPr } } : {}),
       ...(init.draft === undefined ? {} : { draft: init.draft }),
       ...(init.agreed === undefined ? {} : { agreed: structuredClone(init.agreed) }),
       leftovers: [], notes: [], updatedAt: '',
@@ -553,6 +561,12 @@ export class StateStore {
   centralCreatedWith(id: number): void {
     if (!Number.isSafeInteger(id) || id <= 0) throw new StateError('The repo id to record is not one.');
     this.update((s) => { s.centralCreated = true; s.centralRepoId = id; });
+  }
+
+  /** G17C-R1 (F5): deliverCentral opened (or updated) the central pull request `number` with pipegen's commit `commit` on its branch. */
+  centralPrOpened(number: number, commit: string): void {
+    if (!Number.isSafeInteger(number) || number <= 0 || !/^[0-9a-f]{40}$/.test(commit)) throw new StateError('The central pull request to record is not one.');
+    this.update((s) => { s.centralPr = { number, commit }; });
   }
 
   /** The id GitHub gave the scratch repo pipegen just created (checkProofRepos' onCreated). */

@@ -40,7 +40,7 @@ import { debate as runDebate, type DebateResult } from '../debate/debate.js';
 import { needKeyOf } from '../debate/need-ref.js';
 import { decideTests } from '../debate/tests.js';
 import type { StarterDeps } from '../create/tests.js';
-import { deliver, deliverCentral, DeliverError, planDelivery, previewText, readCentralFileList, type DeliverResult, type DeliveryInput, type SigningKey, type CentralResult } from '../deliver/deliver.js';
+import { deliver, deliverCentral, DeliverError, planDelivery, previewText, readCentralFileList, type DeliverResult, type DeliveryInput, type SigningKey, type CentralPr, type CentralResult } from '../deliver/deliver.js';
 import { pipegenDoc } from '../deliver/docs.js';
 import { coFacts, type CoFacts } from '../deliver/finish.js';
 import { readBlobText, readHead, readRepo, readTree } from '../deliver/git-data.js';
@@ -49,7 +49,7 @@ import { discover } from '../engine/discover.js';
 import { resolvePin } from '../engine/pin.js';
 import { openMemory } from '../engine/memory.js';
 import type { LocalRecordDeps } from '../deliver/record.js';
-import { trustedPrevious } from '../deliver/trust.js';
+import { trustedPrevious, UNREADABLE_RUN_WAY_ON } from '../deliver/trust.js';
 import { codeownersProtectedPaths } from '../engine/created-builders.js';
 import { newRateBudget, type RateClock } from '../engine/github-rate.js';
 import { ensureLinters, ensurePinnedBinary, loadPinnedBinaries } from '../engine/linters.js';
@@ -256,7 +256,8 @@ export interface RunStages {
   trusted(f: GitHubFacts, p: RepoProfile, io: CliIO): Promise<{ record: InstallRecord | null; notes: string[] }>;
   /** previewText(planDelivery(input)): what the one confirmation shows. */
   preview(input: DeliveryInput): string;
-  deliverCentral(f: GitHubFacts, p: RepoProfile, files: readonly CreatedFile[], io: CliIO): Promise<CentralResult>;
+  /** `pr` (G17C-R1, F5): the central pull request an earlier run opened, from the run state. */
+  deliverCentral(f: GitHubFacts, p: RepoProfile, files: readonly CreatedFile[], io: CliIO, pr?: CentralPr): Promise<CentralResult>;
   readCentralFileList(f: GitHubFacts, p: RepoProfile): Promise<string[]>;
   signingKey(): Promise<SigningKey>;
   deliver(f: GitHubFacts, p: RepoProfile, input: DeliveryInput, vault: SecretVault, io: CliIO, signingKey?: () => Promise<SigningKey>): Promise<DeliverResult>;
@@ -616,10 +617,12 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     let centralCommitted: string | undefined;
     if (p.private) {
       const centralFiles = built.files.filter((f) => f.repo === 'central' && !f.path.endsWith('--required.yml') && /^\.github\/workflows\/[^/]+--[^/]+\.ya?ml$/.test(f.path));
-      const c = await st.deliverCentral(facts, p, centralFiles, io);
+      const c = await st.deliverCentral(facts, p, centralFiles, io, saved.centralPr);
+      // G17C-R1 (F5): the PR and pipegen's commit on it are kept, so the next run can prove its merge put pipegen's files there
+      if (c.kind === 'central-pr' && c.pr !== undefined) store.centralPrOpened(c.pr.number, c.pr.commit);
       if (c.kind === 'central-pr') { out(safeText(c.message, 600)); err('exit code 2: merge the central pull request, then run `npx pipegen run` again.'); return 2; }
       for (const d of c.done) out(`done: ${safeText(d, 200)}`);
-      // G17 row 28: only the commit deliverCentral made in this run proves pipegen added a new central file
+      // G17 row 28: only the commit deliverCentral made in this run (or, G17C-R1, the merge of pipegen's own central PR) proves pipegen added a new central file
       if (c.committed === true) centralCommitted = c.sha;
       draft = { ...draft, centralPin: { repo: `${p.owner}/${CENTRAL_REPO}`, sha: c.sha } };
       centralFileList = await st.readCentralFileList(facts, p);
@@ -925,7 +928,8 @@ export async function buildFiles(i: BuildInput, f: Pick<BuildFacts, 'texts' | 'a
   const adoptedNotes = [...new Set([...a0.draft.created, ...a0.files, ...inserted, ...lockFiles].filter((x) => x.edited === undefined && x.inserted === undefined).flatMap((x) => {
     const was = i.prev?.files.find((r) => r.repo === x.repo && r.path === x.path);
     if (was?.adopted !== true || was.shas.includes(gitBlobSha(x.content))) return [];
-    return [`pipegen rewrites ${x.path}${x.repo === 'central' ? ` in ${CENTRAL_REPO}` : ''}: that file was in your repository before pipegen (an earlier run found it identical to pipegen's text and adopted it), and this run changes it. Uninstall still asks before it deletes it.`];
+    // G17C-R1 (F5): only what the record says (an earlier run found the file identical to pipegen's text and couldn't prove pipegen wrote it)
+    return [`pipegen rewrites ${x.path}${x.repo === 'central' ? ` in ${CENTRAL_REPO}` : ''}: the install record lists it as adopted, not created (an earlier run found it identical to pipegen's text and couldn't prove pipegen wrote it), and this run changes it. Uninstall still asks before it deletes it.`];
   }))];
   // spec I7: what the environment plan can't do lands in doc.notes (and the preview) before the judge
   const env = await envPlan(a0.draft.requireDeployApproval, verify.inserts.map((x) => x.path));
@@ -1108,9 +1112,10 @@ function realStages(io: CliIO, deps: RunDeps): RunStages {
       const c = await readRepo(f.gh, central, f.clock);
       if (c === null) return { record: null, notes };
       const t = await trustedPrevious(f.gh, { owner: p.owner, repo: p.repo }, central, c.defaultBranch, null, local, f.clock, notes, { io: io2.prompt, interactive });
+      if (t.why === 'unreadable') notes.push(UNREADABLE_RUN_WAY_ON);   // G17C-R1 (F6, m2): the run's own way on
       return { record: t.record, notes };
     },
-    deliverCentral: (f, p, files, io2) => deliverCentral(f.gh, p, files, { clock: f.clock, local, io: io2.prompt, interactive }),
+    deliverCentral: (f, p, files, io2, pr) => deliverCentral(f.gh, p, files, { clock: f.clock, local, io: io2.prompt, interactive, ...(pr === undefined ? {} : { pr }) }),
     readCentralFileList: (f, p) => readCentralFileList(f.gh, p, f.clock),
     preview: (input) => previewText(planDelivery(input)),
     async signingKey() {

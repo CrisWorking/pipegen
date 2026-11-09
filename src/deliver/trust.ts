@@ -21,13 +21,19 @@ import { safeText } from '../util/safe-text.js';
 import type { RepoRef } from './git-data.js';
 import { localRecordPath, readLocalRecord, readRecord, RecordError, writeLocalRecord, type LocalRecordDeps, type ReadRecordResult } from './record.js';
 
+/** G17C-R1 (F6, m2): deliver's way on after an unreadable local record file (the `unreadable` note names the file). */
+export const UNREADABLE_RUN_WAY_ON = 'pipegen treats every existing file and secret as not its own. Remove or fix that local record file, then run `npx pipegen run` again (pipegen then asks you to confirm the record).';
+
 export interface TrustedRecord {
   /** The record pipegen builds on, or null (it claims nothing). */
   record: InstallRecord | null;
   /** Whether any record (trusted or not, readable or not) exists on either branch: a later run then writes through a pull request. */
   exists: boolean;
-  /** Why a record that exists isn't trusted: no local record file, or one that matches neither record (N5: then removing it is the way on). */
-  why?: 'no-local' | 'mismatch';
+  /**
+   * Why a record that exists isn't trusted: no local record file, one that matches neither record (N5: then removing it is the way on), or
+   * (G17C-R1, F6/m2) one that can't be read: its note names the file only, and each command adds its own way on.
+   */
+  why?: 'no-local' | 'mismatch' | 'unreadable';
   /**
    * G11-R3 (R2-6): for a record trusted by typing, the blockFrom of the full record behind the view (the view drops it: typing never
    * vouched it). finish may only take it as an earlier date, never a later one.
@@ -162,8 +168,9 @@ export async function trustedPrevious(gh: Octokit, app: RepoRef, central: RepoRe
   if (file === 'unreadable') {
     let where = 'this machine\'s local record file';
     try { where = `this machine's local record file ${localRecordPath(app, local)}`; } catch { /* no path for this name */ }
-    notes.push(`The install record of ${safeText(`${central.owner}/${central.repo}`, 120)} can't be checked: ${where} can't be read (it is a link, a folder, or not in the form pipegen writes), so pipegen claims nothing from any install record and treats every existing file and secret as not its own. Remove that file, then run \`npx pipegen run\` again (pipegen then asks you to confirm the record).`);
-    return { record: null, exists, why: 'mismatch' };
+    // G17C-R1 (F6, m2): the note names the file and what may be wrong with it; the command that asked adds its own way on
+    notes.push(`The install record of ${safeText(`${central.owner}/${central.repo}`, 120)} can't be checked: ${where} can't be read (it is a link, a folder or not in the form pipegen writes, or the records folder it is in is one pipegen won't use), so pipegen trusts no install record.`);
+    return { record: null, exists, why: 'unreadable' };
   }
   // 1. vouched by this machine's local record file: the newest such record, the central PR branch first (it was built on the default one)
   for (const r of [onBranch, onDefault]) {

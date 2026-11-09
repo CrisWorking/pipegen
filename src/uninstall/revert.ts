@@ -43,7 +43,7 @@ export interface CurrentFile { text: string; sha: string }
 export type BlobReader = (sha: string) => string | null;
 /**
  * What the strips need besides the texts: the app's default branch, which pipegen's head check names; the app's owner, whose
- * `<owner>/pipelines` the private Dependabot entry ignores (G17 row 24: without it, only the repo name `pipelines` is bound).
+ * `<owner>/pipelines` the private Dependabot entry ignores (G17 row 24, G17C-R1: without it, the private entry is never pipegen's).
  */
 export interface RevertContext { defaultBranch?: string; appOwner?: string }
 
@@ -241,10 +241,10 @@ function dependabotFormOf(path: string, ins: string, isNew: boolean, ctx: Revert
   const ignored = /\n {6}- dependency-name: ("[^"\n]*")\n$/.exec(ins)?.[1];
   const repo = parseJson(ignored)?.replace(/\/\*$/, '');
   const drafts: PipelineDraft[] = [{ profile: { private: false } } as unknown as PipelineDraft];
-  // G17 row 24: the private form ignores the app owner's central repo only (dependabotEntry's `<owner>/pipelines`); any other name is not
-  // pipegen's entry. The owner is checked when the caller gives it (Plan V: plan.ts passes the app's owner)
+  // G17 row 24 (G17C-R1, F2/m3): the private form ignores the app owner's central repo only (dependabotEntry's `<owner>/pipelines`); any
+  // other repo is not pipegen's entry, and with no app owner given only the public form is
   const [owner, name] = (repo ?? '').split('/');
-  const bound = name === CENTRAL_REPO && (ctx.appOwner === undefined || owner?.toLowerCase() === ctx.appOwner.toLowerCase());
+  const bound = name === CENTRAL_REPO && typeof ctx.appOwner === 'string' && ctx.appOwner !== '' && owner?.toLowerCase() === ctx.appOwner.toLowerCase();
   if (repo !== undefined && bound) drafts.push({ profile: { private: true }, centralPin: { repo } } as unknown as PipelineDraft);
   for (const d of drafts) {
     let text: string;
