@@ -134,7 +134,7 @@ A check marked "Blocks a pull request" blocks only after you run \`npx pipegen f
 
 ### Deploy layer
 
-Runs on a push to the default branch: it builds, signs and checks the images that are deployed.
+Runs on a push to the default branch. pipegen publishes no image here, so it builds and signs nothing: it checks that the gate passed for the commit and that the head is the one the gate checked.
 
 - Publishing, service "shop-api", no tool listed (see the notes below). Publishes a package with a short-lived token instead of a stored one. Fails the run.
 - Image signing, service "shop-api", no tool listed (see the notes below). Signs the published image so a deploy can check where it came from. Not set up: pipegen publishes no image of this service, so it signs and verifies nothing for it (see Signing and the notes below).
@@ -414,7 +414,7 @@ A check marked "Blocks a pull request" blocks only after you run \`npx pipegen f
 
 ### Deploy layer
 
-Runs on a push to the default branch: it builds, signs and checks the images that are deployed.
+Runs on a push to the default branch. pipegen publishes no image here, so it builds and signs nothing: it checks that the gate passed for the commit and that the head is the one the gate checked.
 
 No check of this layer is set up here.
 

@@ -537,7 +537,10 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     if (cp.text !== null && cp.text === composeFile.content) {
       // G17B-R2 (sec M2): compose up builds every app image of the file (no --no-build), so the job reaches what their image builds reach
       const apps = cp.apps.map((a) => draft.profile.services.find((x) => x.name === a.service));
-      compose = { env: cp.env, images: list.map((b) => imageSet(`${b.image}:${b.tag}@${b.digest}`)), builds: ['ghcr', ...packageSets(apps)] };
+      // L1 (sec r4): ghcr only for an app built from the repository's own Dockerfile (its FROM may name ghcr.io); pipegen's created Dockerfiles and the compose images are Docker Hub only
+      const made = new Set(dockerfilesOf(draft.created));
+      const ownDockerfile = cp.apps.some((a) => !made.has(a.context === '.' ? 'Dockerfile' : `${a.context.replace(/^\.\//, '')}/Dockerfile`));
+      compose = { env: cp.env, images: list.map((b) => imageSet(`${b.image}:${b.tag}@${b.digest}`)), builds: [...(ownDockerfile ? ['ghcr' as const] : []), ...packageSets(apps)] };
     }
     else addNote(notes, 'The draft\'s docker-compose.pipegen.yml is not the file pipegen computes, so no job starts it.');
   }

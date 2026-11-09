@@ -131,8 +131,18 @@ const LAYER_TEXT: Readonly<Record<(typeof LAYERS)[number], string>> = Object.fre
   'pre-commit': 'Runs on your machine before each commit.',
   push: 'Runs on a push to a branch that has no open pull request.',
   merge: `Runs on every pull request and decides whether it can merge. The gate (the check \`${GATE_CHECK_NAME}\`) reads every result.`,
-  deploy: 'Runs on a push to the default branch: it builds, signs and checks the images that are deployed.',
+  deploy: 'Runs on a push to the default branch.',
 });
+/** N2 (sec r4): what the deploy layer does, per service, from what pipegen publishes and signs here. */
+function deployText(draft: PipelineDraft): string {
+  const base = LAYER_TEXT.deploy;
+  const published = publishedHere(draft).length > 0;
+  const signs = draft.signing !== undefined && draft.signing !== null;
+  const gateOnly = 'it checks that the gate passed for the commit and that the head is the one the gate checked';
+  if (!published) return `${base} pipegen publishes no image here, so it builds and signs nothing: ${gateOnly}.`;
+  if (!signs) return `${base} For each service whose image pipegen publishes it builds and checks that image, and signs nothing in this setup; for every other service ${gateOnly}.`;
+  return `${base} For each service whose image pipegen publishes it builds, signs and checks that image; for every other service ${gateOnly}.`;
+}
 /** G17 row 57: when the merge lines' "Blocks a pull request" starts to hold. */
 const AFTER_FINISH = 'A check marked "Blocks a pull request" blocks only after you run `npx pipegen finish`, which turns on the merge locks. Until then a failed gate shows on the pull request but does not stop the merge.';
 /** Label and plain reason for every need category. */
@@ -357,7 +367,9 @@ function planSection(d: Doc, draft: PipelineDraft, data: DocData): void {
   d.p('This section comes first so that no limit is hidden.');
   d.li(`This repository is ${p.private ? 'private' : 'public'}. Your GitHub plan: ${planWord(p.plan)}.`);
   d.li(c.branchProtection ? `Branch rules: available, so the check \`${GATE_CHECK_NAME}\` can be required before a pull request merges.` : `Branch rules: not available on this plan, so GitHub can not require the check \`${GATE_CHECK_NAME}\` or a review before a merge. The gate still runs and reports, but nothing forces it.`);
-  d.li(c.environments ? 'Environments: available. The environment `pipegen-signing` holds the signing key and limits the verify step to the default branch.' : 'Environments: not available on this plan, so there is no `pipegen-signing` environment: the verify job runs without one, and the default-branch limit can not be enforced there.');
+  const keyMode = draft.signing?.mode === 'key-env';
+  const noKey = draft.signing === undefined || draft.signing === null ? 'pipegen signs nothing in this setup' : draft.signing.mode === 'keyless' ? 'keyless signing uses no key of yours' : 'attestations use no key of yours';
+  d.li(c.environments ? (keyMode ? 'Environments: available. The environment `pipegen-signing` holds the signing key and limits the verify step to the default branch.' : `Environments: available. The environment \`pipegen-signing\` limits the verify step to the default branch; it holds no signing key here (${noKey}).`) : 'Environments: not available on this plan, so there is no `pipegen-signing` environment: the verify job runs without one, and the default-branch limit can not be enforced there.');
   d.li(c.envRequiredReviewers ? 'Required reviewers on an environment: available.' : 'Required reviewers on an environment: not available, so a deploy does not wait for a person.');
   d.li(c.deploymentBranchPolicies ? 'Deployment branch policies: available, so only the default branch can use the signing environment.' : 'Deployment branch policies: not confirmed, so pipegen does not store a signing key in key mode.');
   d.li(c.attestations ? 'Build attestations: available.' : 'Build attestations: not available on this plan.');
@@ -488,6 +500,7 @@ const NOTHING_RUNS = 'Not set up: no tool was chosen for it, so nothing runs (se
 /** G17B-R2 (design call): the deploy-layer needs about the published image, and their mode when pipegen publishes or signs none. */
 const SIGN_VERIFY_CATEGORIES: ReadonlySet<string> = new Set(['signing', 'attestation', 'deploy-verify']);
 const UNPUBLISHED = 'Not set up: pipegen publishes no image of this service, so it signs and verifies nothing for it (see Signing and the notes below).';
+const UNPUBLISHED_VERIFY = 'Not set up for an image: pipegen publishes no image of this service, so there is no signature to check; the verify job still checks that the gate passed and that the head is the one the gate checked (see Signing and the notes below).';
 const UNSIGNED = 'Not set up: pipegen signs nothing in this setup, so no deploy is checked against a signature (see Signing).';
 /** The services whose image pipegen publishes (the image-publish job, releaseJobs): none when the deploy part is skipped. */
 function publishedHere(draft: PipelineDraft): string[] {
@@ -517,7 +530,7 @@ function modeOf(draft: PipelineDraft, reviewed: readonly ReviewedTool[], f: Fact
   if (cat === 'hooks-ci' && !f.hookConfig) return 'Not set up: there is no hook config for it to run.';
   // G17B-R2 (design call): no publish job for the service, no signature and no verified image; a published image with no signing plan, no signature
   if (layer === 'deploy' && SIGN_VERIFY_CATEGORIES.has(cat)) {
-    if (n.service === undefined || !publishedHere(draft).includes(n.service)) return UNPUBLISHED;
+    if (n.service === undefined || !publishedHere(draft).includes(n.service)) return cat === 'deploy-verify' ? UNPUBLISHED_VERIFY : UNPUBLISHED;
     if (draft.signing === undefined || draft.signing === null) return UNSIGNED;
   }
   if (layer !== 'merge') {
@@ -553,7 +566,7 @@ function layersSection(d: Doc, draft: PipelineDraft, data: DocData, reviewed: re
   for (const layer of LAYERS) {
     const needs = draft.needs.filter((n) => n.layer === layer);
     d.h(3, `${layer === 'pre-commit' ? 'Pre-commit' : layer === 'push' ? 'Push' : layer === 'merge' ? 'Merge' : 'Deploy'} layer`);
-    d.p(LAYER_TEXT[layer]);
+    d.p(layer === 'deploy' ? deployText(draft) : LAYER_TEXT[layer]);
     // G17 row 57: "Blocks a pull request" holds only once finish has turned the merge locks on (none is on before the setup pull request merges)
     if (layer === 'merge' && facts.gateRequired) d.p(AFTER_FINISH);
     if (needs.length === 0) { d.p('No check of this layer is set up here.'); continue; }

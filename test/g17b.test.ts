@@ -25,7 +25,7 @@ import { RenderError } from '../src/engine/render-error.js';
 import { AssembleError, type Job } from '../src/layers/jobs.js';
 import { emptyServiceQuality } from '../src/read/quality.js';
 import type { CreatedFile, ExistingWorkflow, PipelineDoc, Service } from '../src/types.js';
-import { assemble, CAPS, domainsOf, files, judge, node, p, planned, profileOf, SEC, shown, type Obj } from './helpers/assemble.js';
+import { APP_KEY, assemble, CAPS, domainsOf, files, judge, node, p, planned, profileOf, SEC, shown, type Obj } from './helpers/assemble.js';
 import { REVIEWED } from './helpers/debate-fixtures.js';
 import { makeTempDir } from './helpers/make-repo.js';
 
@@ -367,6 +367,7 @@ describe('G17B-R2 design call: pipegen publishes and signs no image built from a
   const AGAIN = 'the publish job builds again at the merge commit';
   const NOTE = 'pipegen does not publish the image of the service "app", so it signs nothing for it and the verify job checks no image of it: pipegen v0.2 publishes only the image of a service at the repository root built from a Dockerfile of the repository\'s own (not one pipegen created).';
   const UNPUBLISHED = 'Not set up: pipegen publishes no image of this service, so it signs and verifies nothing for it (see Signing and the notes below).';
+  const UNPUBLISHED_VERIFY = 'Not set up for an image: pipegen publishes no image of this service, so there is no signature to check; the verify job still checks that the gate passed and that the head is the one the gate checked (see Signing and the notes below).';
 
   it('docs: with a created root Dockerfile, no signing or verify line says "Fails the run."; they say Not set up, the note names the service, and no digest or publish line is written', () => {
     const x = planned(profileOf([svcNoDf()], { existingWorkflows: [deployWf] }), { over: { created: created() } });
@@ -380,11 +381,31 @@ describe('G17B-R2 design call: pipegen publishes and signs no image built from a
     expect(lines.length).toBe(deployNeeds.length);
     for (const l of lines) {
       expect(l).not.toContain('Fails the run.');
-      expect(l.endsWith(UNPUBLISHED), l).toBe(true);
+      expect(l.endsWith(/^- Verify before deploy/.test(l) ? UNPUBLISHED_VERIFY : UNPUBLISHED), l).toBe(true);
     }
+    // N2: the Deploy intro claims no build or signature when no image is published
+    expect(deploy).not.toContain('builds, signs and checks');
+    expect(deploy).toContain('pipegen publishes no image here, so it builds and signs nothing: it checks that the gate passed for the commit and that the head is the one the gate checked.');
     expect(section(doc, '## The four layers')).toContain(`- ${NOTE}`);
     expect(doc).not.toContain(DIGEST);
     expect(doc).not.toContain(AGAIN);
+  });
+
+  it('docs (N2): the Deploy intro says "builds, signs and checks" only for the services pipegen publishes and signs; the capabilities line says the key sits in pipegen-signing only in key-env mode', () => {
+    const caps = (doc: string): string => doc.split('\n').find((l) => l.startsWith('- Environments:')) as string;
+    const x = planned(profileOf([web()], { existingWorkflows: [deployWf] }), { over: { signing: { mode: 'keyless', images: [{ service: 'app', repo: publishedImageRepo('o', 'r', 'app') }] } } });
+    const withEnv = { ...x.draft, capabilities: { ...x.draft.capabilities, environments: true } };
+    const keyless = pipegenDoc({ ...withEnv, doc: DOC }, REVIEWED).content;
+    expect(section(keyless, '### Deploy layer')).toContain('For each service whose image pipegen publishes it builds, signs and checks that image; for every other service it checks that the gate passed');
+    expect(caps(keyless)).toContain('holds no signing key here (keyless signing uses no key of yours)');
+    expect(caps(keyless)).not.toContain('holds the signing key');
+    const keyEnv = pipegenDoc({ ...withEnv, signing: { ...(x.draft.signing as NonNullable<typeof x.draft.signing>), mode: 'key-env' }, doc: DOC }, REVIEWED).content;
+    expect(caps(keyEnv)).toContain('holds the signing key and limits the verify step');
+    const { signing: _s, ...unsigned } = withEnv;
+    const none = pipegenDoc({ ...unsigned, doc: DOC }, REVIEWED).content;
+    expect(section(none, '### Deploy layer')).not.toContain('signs, and checks');
+    expect(section(none, '### Deploy layer')).toContain('and signs nothing in this setup');
+    expect(caps(none)).toContain('pipegen signs nothing in this setup');
   });
 
   it('docs: the control, a root service with its own Dockerfile that pipegen publishes and signs: Fails the run, the digest line and the publish line stay', () => {
@@ -424,6 +445,30 @@ describe('G17B-R2 sec M2 (the fallback): the compose start\'s second build reach
     expect(tests.length, 'a test job starts the compose file').toBeGreaterThan(0);
     for (const [id, j] of tests) for (const d of build) expect(domainsOf(j as Job), `${id}: ${d}`).toContain(d);
     expect(shown(await judge([...files(a), compose], a.draft))).toBe('');
+  });
+
+  it('assemble (L1): a created Dockerfile only: no compose job, not even the secret-holding coverage--app, gets ghcr.io or pkg-containers.githubusercontent.com', () => {
+    const prof = profileOf([node({ port: 3000, scripts: ['test', 'lint', 'start'], dependsOn: [PG], envVars: [APP_KEY] })]);
+    const df: CreatedFile = { path: 'Dockerfile', content: 'x', part: 'docker', reason: 't', repo: 'app' };
+    const compose: CreatedFile = { path: 'docker-compose.pipegen.yml', content: composeText(prof, loadBaseImages(), ['Dockerfile']) as string, part: 'compose', reason: 't', repo: 'app' };
+    const a = assemble(planned(prof, { over: { created: [df, compose], ...SKIP_DEPLOY }, edit: (s) => s.map((st) => (st.needId === 'coverage' ? { ...st, [SEC]: [APP_KEY] } : st)) }));
+    const starts = Object.entries(a.merge).filter(([, j]) => (j as Job).steps.some((st) => /docker compose .* up -d/.test(st.run ?? '')));
+    expect(starts.map(([id]) => id)).toEqual(expect.arrayContaining(['coverage--app', 'dast-run--app']));
+    for (const [id, j] of starts) {
+      expect(domainsOf(j as Job), id).not.toContain('ghcr.io');
+      expect(domainsOf(j as Job), id).not.toContain('pkg-containers.githubusercontent.com');
+      expect(domainsOf(j as Job), id).toContain('registry.npmjs.org');
+    }
+    expect(JSON.stringify(a.merge['coverage--app'])).toContain('secrets.');
+  });
+
+  it('assemble (L1): a compose app built from the repository\'s own Dockerfile keeps ghcr.io in the jobs that start the compose file', () => {
+    const prof = profileOf([node({ dockerfile: 'Dockerfile', port: 3000, scripts: ['test', 'lint', 'start'], dependsOn: [PG], envVars: [APP_KEY] })]);
+    const compose: CreatedFile = { path: 'docker-compose.pipegen.yml', content: composeText(prof, loadBaseImages()) as string, part: 'compose', reason: 't', repo: 'app' };
+    const a = assemble(planned(prof, { over: { created: [compose], ...SKIP_DEPLOY }, edit: (s) => s.map((st) => (st.needId === 'coverage' ? { ...st, [SEC]: [APP_KEY] } : st)) }));
+    for (const id of ['coverage--app', 'dast-run--app']) {
+      expect(domainsOf(a.merge[id] as Job), id).toEqual(expect.arrayContaining(['ghcr.io', 'pkg-containers.githubusercontent.com']));
+    }
   });
 
   it('docs: the fallback keeps the second-build line in PIPEGEN.md (the archive start with --no-build is a carry)', () => {
