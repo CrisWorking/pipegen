@@ -230,6 +230,31 @@ describe('V6b (G17C m4): the central CODEOWNERS pipegen created is deleted whole
     }
   });
 
+  it('V6b-R1 m1: chain holds but the owner added a line after pipegen\'s last write: manual with the take-the-block-out step, no delete', async () => {
+    const w = world();
+    const rec = lastProject(w, OWNER_ADDS, created([blobSha(OWNERS_INS)], [null]));
+    await afterRun1(w);
+    const r = await run(w, rec);
+    expect(filesAtPr(w).get('.github/CODEOWNERS')).toBe(OWNER_ADDS);
+    expect(w.g.calls.some((c) => c.route === 'POST /repos/{owner}/{repo}/git/commits' && /CODEOWNERS/.test(String((c.params as { message?: unknown }).message)))).toBe(false);
+    const m = r.manual.filter((x) => /CODEOWNERS/.test(x.what));
+    expect(m.some((x) => /changed since pipegen last wrote it/.test(x.why) && /Take pipegen's block out of/.test(x.step ?? ''))).toBe(true);
+    expect([...r.manual, ...r.failed].some((x) => /make that change by hand/.test(JSON.stringify(x)))).toBe(false);
+    expect(r.failed.filter((f) => /CODEOWNERS/.test(`${f.what} ${f.why}`))).toEqual([]);
+  });
+
+  it('V6b-R1 L1: an ownerEdited created CODEOWNERS with a perfect chain is not deleted at the uninstall level', async () => {
+    const w = world();
+    const edit = { ...created([blobSha(OWNERS_INS)], [null]), ownerEdited: true } as InstallEdit;
+    const rec = lastProject(w, OWNERS_INS, edit);
+    await afterRun1(w);
+    const r = await run(w, rec);
+    expect(filesAtPr(w).get('.github/CODEOWNERS')).toBe(OWNERS_INS);
+    expect(w.g.calls.some((c) => c.route === 'POST /repos/{owner}/{repo}/git/commits' && /CODEOWNERS/.test(String((c.params as { message?: unknown }).message)))).toBe(false);
+    expect(r.manual.some((m) => /CODEOWNERS/.test(m.what) && /doesn't prove every version/.test(m.why))).toBe(true);
+    expect(r.failed.filter((f) => /CODEOWNERS/.test(`${f.what} ${f.why}`))).toEqual([]);
+  });
+
   it('V6b m4: after the merge, a kept created CODEOWNERS is named, and --delete-repos keeps central (not every file is pipegen\'s)', async () => {
     const w = world();
     const rec = lastProject(w, OWNER_ADDS, created([blobSha(OWNERS_INS), blobSha(OWNER_ADDS)], [null, blobSha(OWNER_ADDS)]));

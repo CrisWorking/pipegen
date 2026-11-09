@@ -516,3 +516,15 @@ describe('G17C rows 24, 25: the Dependabot private form names the app owner\'s p
     expect(src).toMatch(/\bHUSKY_SHEBANG\b.*from '\.\.\/engine\/created-builders\.js'|import \{[^}]*\bHUSKY_SHEBANG\b[^}]*\} from '\.\.\/engine\/created-builders\.js'/s);
   });
 });
+
+describe('V6b-R1 (sec i1): the "created and changed since" manual leads with taking pipegen\'s part out', () => {
+  it('a created CODEOWNERS the owner changed: the text names taking the block out first, never "delete it" as the lead', () => {
+    const written = codeownersFile('', codeownersBlock(['.github/workflows/**'], ['@o']));
+    const e = textEdit('codeowners', '.github/CODEOWNERS', null, written);
+    const r = revertEdit(e, cur(`${written}docs/ @bob\n`), blob, CTX);
+    expect(r.kind).toBe('manual');
+    const why = r.kind === 'manual' ? r.why : '';
+    expect(why).toMatch(/has changed since; take pipegen's part out by hand/);
+    expect(why).not.toMatch(/; delete it,/);
+  });
+});

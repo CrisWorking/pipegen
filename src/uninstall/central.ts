@@ -386,6 +386,11 @@ export async function runCentral(o: {
       report.manual(what, 'the install record doesn\'t prove every version of this file pipegen created was pipegen\'s own write, so pipegen doesn\'t delete it (it may hold the owner\'s lines)', `Take pipegen's block out of ${co.path} in ${full} by hand, or delete the file if it holds nothing else.`);
       return;
     }
+    if (co.created && wholeFile && !edit.writtenShas.includes(e.sha)) {
+      // V6b-R1 (sec m1): the chain holds but the file changed after pipegen's last write, so it may hold the owner's lines
+      report.manual(what, 'it changed since pipegen last wrote it (it may hold the owner\'s lines), so pipegen doesn\'t delete it', `Take pipegen's block out of ${co.path} in ${full} by hand, or delete the file if it holds nothing else.`);
+      return;
+    }
     if (co.created && wholeFile) {
       if (await commit({ files: [], deletes: [co.path], message: `pipegen uninstall: remove the central CODEOWNERS pipegen created (${show(co.path, 100)})` })) body.push(`- removes ${show(co.path)} (pipegen created it)`);
       return;

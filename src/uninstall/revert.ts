@@ -103,7 +103,7 @@ function revertText(e: TextEdit, current: CurrentFile, blob: BlobReader, ctx: Re
   const same = unchanged(e, current);
   if (e.originalSha === null) {
     if (same && current.text === e.inserted) return { kind: 'delete' };
-    return manual(`${where} is a file pipegen created and it has changed since; delete it, or take pipegen's part out by hand.`, e.inserted);
+    return manual(`${where} is a file pipegen created and it has changed since; take pipegen's part out by hand (delete the file only if nothing else is left in it).`, e.inserted);
   }
   if (same) {
     const original = readBlob(blob, e.originalSha);
