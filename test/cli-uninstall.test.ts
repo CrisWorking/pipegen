@@ -1,7 +1,7 @@
 // v0.2 Plan V V7: `pipegen uninstall` on the command line (src/cli/uninstall.ts, the dispatch in src/cli/main.ts). The command checks for a terminal,
 // connects, loads the install record (loadUninstallRecord) and runs one step (uninstallStep); these tests fake each of those, and run the real
 // loader and step once, on the GitHub stand-in of the phase-B tests, for the second run 2. No network.
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Octokit } from '@octokit/rest';
@@ -263,7 +263,7 @@ describe('V7: exit codes and messages', () => {
     expect(loadArgs[2]).toMatchObject({ interactive: true, io: io.prompt, local: f.g.local });
     expect(stepArgs[1]).toEqual({ marker: 'loaded' });
     // there is no preview-only or dry path that loads the record: the command has no such option
-    const src = (await import('node:fs')).readFileSync(join(import.meta.dirname, '..', 'src', 'cli', 'uninstall.ts'), 'utf8');
+    const src = readFileSync(join(import.meta.dirname, '..', 'src', 'cli', 'uninstall.ts'), 'utf8');
     expect(src.match(/\bloadUninstallRecord\)\(/g)?.length).toBe(1);
     expect(src.replace(/\/\/.*$/gm, '').replace(/\/\*[^]*?\*\//g, '')).not.toMatch(/\b(?:dry|preview|dryRun)\b/i);
   });
@@ -343,5 +343,44 @@ describe('V7: the second run 2 through the command (V6 carry)', () => {
     expect(await uninstallCommand(io, deps)).toBe(2);
     expect(io.errs.join('\n')).toMatch(/^pipegen uninstall stopped: /m);
     expect(existsSync(uninstallProgressPath(APP, local(w)))).toBe(true);   // nothing was removed
+  });
+});
+
+describe('V7: the docs say what was built', () => {
+  const read = (rel: string): string => readFileSync(join(import.meta.dirname, '..', rel), 'utf8');
+
+  it('docs: design §14 (the repo-deletion right, the secrets line, the two runs and why), the threat model row and the V-live checklist', () => {
+    const design = read('docs/design.md');
+    const s14 = design.slice(design.indexOf('## 14. Uninstall'), design.indexOf('## 15.'));
+    expect(s14).toContain('`--delete-repos` uses the repo-deletion right the App already has (Administration: write); with a token, pipegen prints the `gh repo delete` commands.');
+    expect(s14).not.toMatch(/asked for only then/);
+    expect(s14).toContain('Secrets pipegen created are removed: `PIPEGEN_`-prefixed ones directly, the app\'s own names only after you type the name.');
+    expect(s14).not.toMatch(/Only secrets with the `PIPEGEN_` prefix/);
+    expect(s14).toMatch(/two runs of the same command \(phase A, phase B\)/);
+    expect(s14).toMatch(/Why two runs: the uninstall PR deletes `pipegen\.yml`.*`pipegen \/ gate`.*`pipegen-verify`.*install record/s);
+    const t55 = read('docs/threat-model.md').split('\n').find((l) => l.startsWith('| T55 |')) as string;
+    expect(t55).toMatch(/An edited install record turns uninstall into a delete tool/);
+    for (const part of [/GitHub's current id and `created_at` equal the recorded ones/, /path claim/, /builder forms/, /strict schema/, /typed|Names are typed/, /trustedPrevious/]) expect(t55, String(part)).toMatch(part);
+    // the V-live rows: the steps in order, every result "not run"
+    const smoke = read('docs/smoke-test.md');
+    const sec = smoke.slice(smoke.indexOf('## Uninstall (V-live)'), smoke.indexOf('## Release'));
+    const rows = sec.split('\n').filter((l) => /^\| UN-\d+ /.test(l));
+    expect(rows.length).toBeGreaterThanOrEqual(10);
+    for (const r of rows) expect(r.trimEnd().endsWith('| not run |'), r.slice(0, 30)).toBe(true);
+    expect(rows.join('\n')).toMatch(/create.*merged.*finish[^]*before[^]*phase A[^]*merge[^]*phase B[^]*after[^]*deleted by hand/is);
+  });
+
+  it('docs: the README uninstall section (permissions, the proxy limit, the App by hand, the two runs, the kept org-rule file, the update branch)', () => {
+    const readme = read('README.md');
+    const sec = readme.slice(readme.indexOf('## Uninstall (v0.2)'), readme.indexOf('## Install safely'));
+    expect(sec.length).toBeGreaterThan(500);
+    expect(sec).toMatch(/Two runs, and why/);
+    expect(sec).toMatch(/Administration \(read and write\) is optional/);
+    expect(sec).toMatch(/Members: read is optional/);
+    expect(sec).toMatch(/HTTPS_PROXY/);
+    expect(sec).toMatch(/remove it: on GitHub, open Settings/);
+    expect(sec).toMatch(/--required\.yml.*unfinished until you remove the organisation rule/s);
+    expect(sec).toMatch(/pipegen\/update-<name>.*withholds the command/s);
+    expect(sec).toMatch(/needs a terminal/);
   });
 });

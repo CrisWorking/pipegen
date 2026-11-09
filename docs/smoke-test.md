@@ -254,6 +254,24 @@ From `task-G15a-report.md` ("Live items for G16" and the items added in each rou
 | G15a-27 | on a Monday, the weekly cron runs only `scorecard` and `code-scanning`; every other nightly job is skipped (`NIGHTLY_IF`) | G15a report | not run |
 | G15a-28 | the Scorecard scrub without `fp-key` on a real run (status ok, the SARIF uploaded) | G15a report | not run |
 
+## Uninstall (V-live)
+
+Plan V's live check, after the Task 8 Step 5 list. Steps only: nobody ran them. Use a private throwaway repo of `CrisWorking` and its own `pipelines`, with the App login (so `--delete-repos` deletes) and, for UN-9, a token. Write the **before** lists first (UN-2) and the **after** lists last (UN-8); the difference must be exactly what pipegen made.
+
+| # | Check | Source | Result |
+|---|---|---|---|
+| UN-1 | create: `pipegen run` on the throwaway repo; the setup PR passes and is merged; `pipegen finish` applies the settings | Plan V V7 | not run |
+| UN-2 | the **before** lists, saved to a file: workflows and files pipegen added, secrets (repo, environments, `pipelines`, the scratch repo), variables, environments with their branch rules, rulesets (repo, org rule), classic protection, Actions settings, open PRs, the files of `pipelines` and its CODEOWNERS | Plan V V7 | not run |
+| UN-3 | `pipegen uninstall` with no terminal (piped, or `CI=1`) stops before any GitHub call and changes nothing | Plan V V7, V-S13 | not run |
+| UN-4 | first run (phase A): the preview names every file, edit and lock; one yes; the PR `pipegen/uninstall` opens; pipegen's own open PRs are closed; the rulesets, the org rule and the classic protection are gone or restored to `previous`; exit 0 with "merge it, then run again" | Plan V V7, V-B2 | not run |
+| UN-5 | merge the uninstall PR (the required gate does not block it, because the locks are off); running `pipegen uninstall` before the merge only says to merge | Plan V V7, V-B2 | not run |
+| UN-6 | second run (phase B) with `--delete-repos` and the App login: secrets (`PIPEGEN_` ones directly, an own-name one only after you type it), variables, environments, settings, the scratch repo emptied; the central PR opens; exit 0 | Plan V V7 | not run |
+| UN-7 | merge the central PR, run `pipegen uninstall --delete-repos` again: the install record is rebuilt from the saved blob (no "No install record"), the repos are deleted after their names are typed, the local files go, the final message says how to remove the App | Plan V V7, V6 carry | not run |
+| UN-8 | the **after** lists, compared with UN-2: nothing pipegen didn't create is gone, nothing pipegen created is left except what the final message lists (the kept default branch of the scratch repo, the App) | Plan V V7 | not run |
+| UN-9 | token mode: the same second run with a fine-grained token deletes no repo and prints `gh repo delete` only for a repo whose checks passed; a leftover `pipegen/update-<name>` branch on `pipelines` withholds the command until it is deleted | Plan V V7, V-S3 | not run |
+| UN-10 | an object pipegen did not create: a secret or ruleset recreated by hand after the install (same name, new id and `created_at`) is kept and listed "not the one pipegen created" | Plan V V7, V-B6 | not run |
+| UN-11 | the throwaway repo, its `pipelines` and `pipegen-proof-<repo>` are deleted by hand at the end | Plan V V7 | not run |
+
 ## Release
 
 | # | Check | Source | Result |

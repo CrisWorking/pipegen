@@ -146,6 +146,32 @@ Later versions add the full job (one PR), then `finish` (after you merge: merge 
 they exist. No pipegen command, these included, is safe to run before the first release, because the npm name isn't
 published yet.
 
+## Uninstall (v0.2)
+
+> Like every command here: not safe to run before the first release (the npm name isn't published yet).
+
+```bash
+npx pipegen uninstall                  # first run, then (after you merge its pull request) the second run
+npx pipegen uninstall --delete-repos   # the second run also deletes the repos pipegen made
+```
+
+`pipegen uninstall` needs a terminal. It shows what it will do, asks **one** yes, and asks you to type a name before it deletes anything it can't be sure is pipegen's. With no terminal (CI, a pipe) it stops before it reads or sends anything. No flag or environment variable answers these questions.
+
+**Two runs, and why.** The first run opens a pull request (`pipegen/uninstall`) that takes pipegen out of your app, closes pipegen's own open pull requests and removes the merge locks (the branch rules and the organisation rule; classic branch protection is put back as it was). You merge that pull request. The second run starts only when GitHub says it is merged: it removes the secrets, variables, environments and settings pipegen added, empties the proof's scratch repo, and opens a pull request in your central `pipelines` repo that removes this project's files (the install record last). Two runs because the uninstall pull request deletes `pipegen.yml`, so the required `pipegen / gate` check can never report on it; deploys may still need the secrets until it is merged; and the install record is the only list of what pipegen made, so it goes last. Run `pipegen uninstall` again after each merge. If a run is cut short, run it again: it goes on from what it saved.
+
+**What it removes.** Only what the install record lists as created by pipegen **and** what GitHub shows with the same id and creation time as recorded. Anything else is kept and listed ("not the one pipegen created"). Files you took over (`adopted`) are kept unless you say yes; secrets named `PIPEGEN_...` that pipegen created are removed directly, a secret with your own name only after you type it; a secret pipegen overwrote is never deleted. Environments that existed before get their previous settings back.
+
+**Exit codes.** `0`: the run did what it set out to (first run done, waiting for you to merge, the uninstall is finished). `1`: you said no. `2`: it stopped, a step failed, or it finished with something left for you (a kept item, a manual step; the final message lists each). `4`: pipegen stopped before reading the repo because of the folder it was started in (see safe mode above).
+
+**`--delete-repos`.** With the pipegen App it uses the repo-deletion right the App already has (Administration: write): the scratch repo after you type its name, and the central repo only when yours is the last project, the central pull request is merged and the repo holds nothing but pipegen's files. With a token it deletes nothing and prints the `gh repo delete` commands. pipegen prints a delete command only after the same checks, and never after a refusal. A pull request branch `pipegen/update-<name>` left on the central repo withholds the command (pipegen records no head for it, so it can't tell it from a teammate's work): delete that branch yourself, then run again.
+
+**Permissions.** The same write permissions as `pipegen run` on the app repo and the helper repos. For an organisation: Administration (read and write) is optional, for removing the organisation rule that made pipegen's required workflow run (without it pipegen tells you to remove the rule by hand), and Members: read is optional too (it checks that you own the organisation). `--delete-repos` needs the App's Administration: write on the owner.
+
+**Known limits.**
+- A `<name>--required.yml` that pipegen keeps because the organisation rule still requires it leaves the second run unfinished until you remove the organisation rule; remove the rule, then the file, then run again.
+- pipegen doesn't pass a corporate proxy through (neither `HTTPS_PROXY` nor `NO_PROXY`, for git or for the GitHub API), so the proof, and the commands that talk to GitHub, don't work behind a mandatory proxy in v0.2.
+- The pipegen GitHub App stays installed. To remove it: on GitHub, open Settings → GitHub Apps (Applications → Installed GitHub Apps for a personal account, or the organisation's settings), choose pipegen → Configure, and take the repo out of its access (or uninstall the App if no other repo uses it). The final message of the second run says this too.
+
 ## Install safely, and check what you installed
 
 pipegen is not published yet: until the first release, `npx pipegen` would run whatever package holds the name on npm,

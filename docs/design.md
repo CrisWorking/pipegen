@@ -186,15 +186,19 @@ The builder ("developer") picks among **reviewed tools** for blocking needs, and
 
 ## 14. Uninstall (v0.2)
 
-`npx pipegen uninstall`:
+`npx pipegen uninstall` (it needs a terminal: it asks for one yes, and for names typed, before it changes anything):
 - previews, then opens a PR removing everything pipegen added (it asks whether to keep the created Dockerfile/tests, which the team may want);
 - removes the rulesets, environments and secrets pipegen created (from the install record);
 - removes the project from the central repo (via PR);
 - empties the scratch repo.
 
-`--delete-repos` deletes the scratch repo, and the central repo if no project is left. That needs extra repo-deletion rights (Administration: write), asked for only then.
+**Uninstall is two runs of the same command (phase A, phase B).** Run 1 (phase A) shows the preview, asks one yes, opens the app PR `pipegen/uninstall`, closes pipegen's own open PRs and removes the merge locks (the rulesets and the organisation rule; classic branch protection is put back to what it was, never deleted). You merge that PR. Run 2 (phase B) starts only after GitHub says the uninstall PR is merged: it removes the secrets, variables, environments and settings pipegen added, empties the scratch repo and opens the central PR that removes this project's files (the install record last; the central locks too when this is the last project). Why two runs: the uninstall PR deletes `pipegen.yml`, so the required `pipegen / gate` can never report on it, and the locks must come off first; deleting secrets and environments before the merge would break deploys that still hold `pipegen-verify`; and removing the install record first would lose the only list of what pipegen made.
 
-Only what pipegen **created** is deleted. Environments that existed before pipegen get their **previous settings restored**, not deleted. Only secrets with the `PIPEGEN_` prefix that the record says pipegen created are removed.
+`--delete-repos` deletes the scratch repo, and the central repo if no project is left, each after its name is typed and every check has passed.
+
+`--delete-repos` uses the repo-deletion right the App already has (Administration: write); with a token, pipegen prints the `gh repo delete` commands.
+
+Only what pipegen **created** is deleted. Environments that existed before pipegen get their **previous settings restored**, not deleted. Secrets pipegen created are removed: `PIPEGEN_`-prefixed ones directly, the app's own names only after you type the name.
 
 ## 15. pipegen's own supply chain
 
