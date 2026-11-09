@@ -191,8 +191,8 @@ describe('G17 row 73: workflow build lines (a-e, k)', () => {
   });
   it('(b) an unbalanced $( or nesting over 16 no longer blanks the rest of the line', () => {
     expect(refs('echo $(unclosed ; docker build -f a/Dockerfile.x a')).toEqual(['a', 'a/Dockerfile.x']);
-    // nesting over 16 still blanks the rest of the line: GJ-R5's test (project-type.test.ts, group G's file) holds that; see the report
-    expect(refs(`X=${'$('.repeat(17)}y${')'.repeat(17)} ; docker build b`)).toEqual([]);
+    // merge step: nesting over 16 blanks only its own span (project-type.test.ts no longer asserts the rest of the line is lost)
+    expect(refs(`X=${'$('.repeat(17)}y${')'.repeat(17)} ; docker build b`)).toEqual(['b']);
     expect(refs(`X=${'$('.repeat(16)}y${')'.repeat(16)} ; docker build b`)).toEqual(['b']);
   });
   it('(c) a ) in a case pattern inside $( … ) does not end the span', () => {

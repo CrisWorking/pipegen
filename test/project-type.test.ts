@@ -1202,7 +1202,8 @@ describe('GJ-R5 (review GJ-r4 R1, H1): code next to a suffixed container file is
     const hostile = (n: number) => ['$('.repeat(n), '${{'.repeat(Math.floor(n * 13 / 15)), `docker build ${'$('.repeat(Math.floor(n / 15))} apps/x`, `docker build \${{ ${'|'.repeat(Math.floor(n * 8 / 3))}`];
     const inputs = { small: hostile(150), big: hostile(1500) };
     await expectScaling('expression blanking', (size) => { const t0 = performance.now(); for (let r = 0; r < 200; r++) for (const h of inputs[size]) workflowBuildRefs([h]); return performance.now() - t0; }, 40);
-    expect([...workflowBuildRefs([`docker build -t x:${'$('.repeat(40)}${')'.repeat(40)} apps/x`])]).toEqual([]);
+    // G17 row 73 (b): nesting deeper than the cap blanks only its own span, so the context after it is still read
+    expect([...workflowBuildRefs([`docker build -t x:${'$('.repeat(40)}${')'.repeat(40)} apps/x`])]).toEqual(['apps/x']);
   });
 
   it('compose read order: shallow paths first, so a root docker-compose.yml is never pushed out by the cap', async () => {

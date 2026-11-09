@@ -208,8 +208,6 @@ function parenMatches(line: string): Int32Array {
     const c = line.charCodeAt(j);
     if (c === 40) {
       stack.push({ pos: j, cases: 0 });
-      // nesting deeper than MAX_EXPR_DEPTH: the outermost open span has no usable end (-2: blank the rest of the line, as GJ-R5)
-      if (stack.length > MAX_EXPR_DEPTH) { match[(stack[0] as { pos: number }).pos] = -2; return match; }
     }
     else if (c === 41) {
       const top = stack[stack.length - 1];
@@ -229,7 +227,7 @@ const FALLBACK_RE = /\|\|[ \t]*'([^'${}]+)'[ \t]*$/;
  * space inside it never ends a build line or splits a word. A character loop, no regex over the line. GJ-R6 (Ha): the inner text of each
  * `$( … )` and backtick span (blanked the same way) goes to `inner`, to be read as a line of its own; (perf) a line with no `$` or backtick
  * is returned as it is, and the text between spans is copied by slice. G17 row 73 (b): an unclosed `$(`, `${{` or backtick blanks only
- * itself; nesting deeper than MAX_EXPR_DEPTH still blanks the rest of the line (GJ-R5). (k) `${{ x || 'apps/web' }}` stands for its quoted fallback.
+ * itself; a span nested deeper than MAX_EXPR_DEPTH is still blanked as a whole, only its inner text is not read as a line of its own (G17 row 73 b, deep half). (k) `${{ x || 'apps/web' }}` stands for its quoted fallback.
  */
 function blankExpressions(line: string, inner: string[], depth = 0): string {
   const firstDollar = line.indexOf('$');
@@ -267,7 +265,6 @@ function blankExpressions(line: string, inner: string[], depth = 0): string {
     if (line.charCodeAt(i + 1) === 40) {
       match ??= parenMatches(line);
       const j = match[i + 1] as number;
-      if (j === -2) return out + line.slice(last, i) + EXPR;
       if (j < 0) { out += line.slice(last, i) + EXPR; last = i + 2; i = next(last); continue; }
       span(i + 2, j);
       out += line.slice(last, i) + EXPR;
