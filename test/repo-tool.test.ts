@@ -428,7 +428,7 @@ describe('G4b fix round 1 (ruling G4b-R1)', () => {
       ['the binary the shim runs is a link out', { exeLink: true }, /the native binary lib\/tsc of .* is not a regular file inside its package/],
       ['no binary for the shim', { noExe: true }, /the native binary lib\/tsc of .* is not a regular file inside its package/],
       ['a nested copy the shim would load first', { nested: true }, /a nested copy .* the tsc shim would run instead/],
-      ['a nested copy in the lockfile', { nestedLock: true }, /a nested copy .* the tsc shim would run instead/],
+      ['a nested copy in the lockfile', { nestedLock: true }, /a nested copy .* inside typescript; the tsc shim would run that copy instead/],
       ['another platform\'s entry from codeload', { otherEntry: { resolved: 'https://codeload.github.com/x/y/tar.gz/abc' } }, /in package-lock\.json is not the registry tarball with a sha512 integrity/],
       ['typescript itself from codeload', { tsEntry: { resolved: 'https://codeload.github.com/microsoft/TypeScript/tar.gz/abc' } }, /^pipegen: typescript in package-lock\.json is not the registry tarball/m],
     ];
