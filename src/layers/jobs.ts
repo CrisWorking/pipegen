@@ -489,6 +489,8 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     if (!u.blocking) continue;
     const n = input.needs.filter((x) => keyOf(x) === u.key);
     if (n.length > 0 && n.every((x) => skipped(x) !== undefined)) continue;
+    // G16 F2: a skipped part's need is never an uncovered blocking need, even when the draft's needs no longer hold it (--skip tests)
+    if (n.length === 0 && input.skipped.some((s) => skippedByPart(s.part, { id: u.needId, layer: 'merge', category: categoryOf(u.needId) ?? u.needId }))) continue;
     if (lintSuggestion && isLint({ id: u.needId, category: categoryOf(u.needId) ?? u.needId })) { addNote(notes, WORKFLOW_LINT_SUGGESTION); continue; }
     if (hooksNote !== undefined && isHooksCi({ id: u.needId, category: categoryOf(u.needId) ?? u.needId })) { addNote(notes, hooksNote); continue; }
     const limit = limitOf({ id: u.needId, category: categoryOf(u.needId) ?? u.needId });
