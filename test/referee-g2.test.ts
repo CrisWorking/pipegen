@@ -9,7 +9,7 @@ import { GITHUB_ATTEST_SET, renderEgressStep } from '../src/engine/egress.js';
 import { aiChoiceNames, CODE_FILLED_CHOICES } from '../src/create/coverage.js';
 import { builderOffers } from '../src/debate/builder.js';
 import { jobIdFor } from '../src/engine/gate-job-list.js';
-import { CALLER_WORKFLOW, checkExpressions, checkJobOrder, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, PUSH_WORKFLOW, createdPathProblem, imageBuildJobId, jobOutputsProblems, NO_SCANS, SIGN_STEP_ENV, VERIFY_STEP_ENV, IMAGE_ARCHIVE_STEP_ID, IMAGE_SHA_OUTPUT, jobOutputsFor, NARROWING_CHOICES, type RenderedStep } from '../src/engine/job-rules.js';
+import { CALLER_WORKFLOW, checkExpressions, checkJobOrder, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, PUSH_WORKFLOW, createdPathProblem, imageBuildJobId, jobOutputsProblems, NO_SCANS, SIGN_STEP_ENV, VERIFY_STEP_ENV, IMAGE_ARCHIVE_STEP_ID, IMAGE_SHA_OUTPUT, jobOutputsFor, NARROWING_CHOICES, WORKFLOW_CONCURRENCY, type RenderedStep } from '../src/engine/job-rules.js';
 import { pipegenDoc } from '../src/deliver/docs.js';
 import { referee, type Linters } from '../src/engine/referee.js';
 import { imageArchiveArtifact, imageBuildTag, renderImageArchiveScan, renderImageBuild } from '../src/engine/image-handoff.js';
@@ -19,10 +19,16 @@ import { RenderError } from '../src/engine/render-error.js';
 import { BUILD_PUSH_STEP_ID, PUBLISH_TAG, publishedImageRepo, renderDigestStep, renderPublishDigestStep } from '../src/engine/deploy-steps.js';
 import { verifyTail, VERIFY_LIMIT } from './helpers/verify-tail.js';
 import type { Candidate, CreatedFile, KnownValueCheck, Need, PipelineDraft, ReviewedTool, Service, SigningPlan, StepSpec } from '../src/types.js';
-import { draftOf, GATE, imageProf, job, jobsOf, p, prof, show, workflow, type Job } from './helpers/gate-pipeline.js';
+import { draftOf, GATE, imageProf, job, jobsOf, p, prof, show, workflow as stepsWorkflow, type Job } from './helpers/gate-pipeline.js';
 import { entry, profile, reviewedList, service, specFor } from './helpers/render.js';
 
 /** Names spelled at run time (test/no-secret-literals.test.ts): the OIDC permission, the password and token env names. */
+/** G17 row 1b: the helper's pipegen.yml, with the workflow concurrency the two app callers carry (a called file never does). */
+function workflow(jobs: Record<string, Job>, top: Record<string, unknown> = {}): CreatedFile {
+  const on = top.on;
+  const called = ['workflow_call', 'schedule'].some((t) => on === t || (typeof on === 'object' && on !== null && Object.hasOwn(on, t)));
+  return stepsWorkflow(jobs, called ? top : { concurrency: { ...WORKFLOW_CONCURRENCY }, ...top });
+}
 const OIDC = ['id', 'token'].join('-');
 const PW_NAME = ['PIPEGEN_COSIGN', 'PASS' + 'WORD'].join('_');
 const GHT_NAME = ['PIPEGEN_GH', 'TOK' + 'EN'].join('_');
@@ -64,7 +70,8 @@ const MODE_SETUP: Record<SigningPlan['mode'], Partial<PipelineDraft>> = {
   attest: { profile: { ...imageProf, private: true }, capabilities: { ...draftOf().capabilities, environments: true, attestations: true } },
 };
 const signingDraft = (signing: SigningPlan, over: Partial<PipelineDraft> = {}): PipelineDraft =>
-  bare({ signing, ...MODE_SETUP[signing.mode], centralPin: { repo: 'o/pipelines', sha: 'a'.repeat(40) }, ...over });
+  // (G17 row 1e: a public repository's draft carries no central pin)
+  bare({ signing, ...MODE_SETUP[signing.mode], ...(MODE_SETUP[signing.mode].profile?.private === true ? { centralPin: { repo: 'o/pipelines', sha: 'a'.repeat(40) } } : {}), ...over });
 const KEY_ENV: SigningPlan = { mode: 'key-env', images: [IMG], cosignPubSha256: PUB_SHA };
 const KEYLESS: SigningPlan = { mode: 'keyless', images: [IMG] };
 const ATTEST: SigningPlan = { mode: 'attest', images: [IMG] };

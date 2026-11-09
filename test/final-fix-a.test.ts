@@ -1,5 +1,6 @@
 // v0.2 Plan B final-review fix round, commit A (findings 1, 2, 3, 5): the renderer and the referee agree.
 // Written first; each test fails without its fix. Probes are the final reviewer's (P2, P3, P4, P5).
+import { WORKFLOW_CONCURRENCY } from '../src/engine/job-rules.js';   // G17 row 1b: pipegen.yml carries the workflow concurrency
 import { Document } from 'yaml';
 import { NO_SCANS } from '../src/engine/job-rules.js';
 import { describe, expect, it } from 'vitest';
@@ -25,7 +26,7 @@ const p = platform();
 const draftOf = (steps: StepSpec[], needs: Need[], over: Partial<PipelineDraft> = {}): PipelineDraft => ({ profile: prof, capabilities: caps, needs, steps, created: [], notProven: [], testDecisions: [], layersSkipped: [], scoreboard: [], requireDeployApproval: false, skipped: [], suggestions: [], ...over });
 function wf(jobs: Record<string, RenderedStep[]>, raw = false): CreatedFile {
   const doc = new Document();
-  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, jobs: Object.fromEntries(Object.keys(jobs).map((id) => [id, { 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none' }])) });
+  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, concurrency: { ...WORKFLOW_CONCURRENCY }, jobs: Object.fromEntries(Object.keys(jobs).map((id) => [id, { 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none' }])) });
   for (const [id, steps] of Object.entries(jobs)) doc.setIn(['jobs', id, 'steps'], raw ? doc.createNode(withEgress(steps).map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(withEgress(steps)));
   return { path: '.github/workflows/pipegen.yml', content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: 't', repo: 'app' };
 }

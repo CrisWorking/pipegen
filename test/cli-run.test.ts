@@ -609,7 +609,7 @@ describe('G13: stages 8-15', () => {
 // ---------- the referee and the guard ----------
 
 describe('G13: one referee call and the guard on the same batch', () => {
-  const facts0 = { appCo: { path: 'CODEOWNERS', text: 'x', isSymlink: false, block: null, inserted: null }, centralCo: { path: null, text: '', isSymlink: false, block: null, inserted: null }, pipegenDoc: { baseSha: null, recordSha: 'a'.repeat(40) }, serviceTypes: { web: 'module' as const }, baseTree: { complete: true, entries: new Map() } };
+  const facts0 = { appCo: { path: 'CODEOWNERS', text: 'x', isSymlink: false, block: null, inserted: null }, centralCo: { path: null, text: '', isSymlink: false, block: null, inserted: null }, pipegenDoc: { baseSha: null, recordSha: 'a'.repeat(40) }, serviceTypes: { web: 'module' as const }, baseTree: { complete: true, entries: new Map() }, texts: new Map<string, string>() };
   const input = (vault: SecretVault, centralFiles?: string[]): BuildInput => ({ dir: '/repo', draft: {} as PipelineDraft, plan: {} as never, facts: facts(), vault, reviewed: REVIEWED, platform: { checkout: {} } as never, owners: [], strictness: 'standard', transcript: [], testNotes: [], est: {} as never, ...({ [['au', 'th'].join('')]: { kind: 'app', [TK_KEY]: TK } } as unknown as Pick<BuildInput, 'auth'>), credits: [], prev: null, ...(centralFiles === undefined ? {} : { centralFiles }) });
 
   it('run: referee gets platform, reviewed, linters and the token (also inside the fix loop)', async () => {

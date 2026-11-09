@@ -1,4 +1,5 @@
 // Plan C, C0c: the carry-forwards of review-C0b-r2.md (CF1 spec tools cover their need, CF2 listed actions bound, CF3a one fail-closed base form).
+import { WORKFLOW_CONCURRENCY } from '../src/engine/job-rules.js';   // G17 row 1b: pipegen.yml carries the workflow concurrency
 import { Document } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { resultArtifactName } from '../src/engine/artifact-names.js';
@@ -55,7 +56,7 @@ const job = (steps: RenderedStep[], over: Job = {}): Job => ({ 'runs-on': 'ubunt
 function workflow(jobs: Record<string, Job>, raw = false): CreatedFile {
   const doc = new Document();
   const plain = Object.fromEntries(Object.entries(jobs).map(([id, j]) => [id, Object.fromEntries(Object.entries(j).filter(([k]) => k !== 'steps'))]));
-  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, jobs: plain });
+  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, concurrency: { ...WORKFLOW_CONCURRENCY }, jobs: plain });
   for (const [id, j] of Object.entries(jobs)) {
     // G4-R1: the egress step every job starts with, except in the job of the egress check itself (its test judges a bullfrog-less one)
     const steps = id === 'egress' ? (j.steps as RenderedStep[]) : withEgress(j.steps as RenderedStep[]);
@@ -201,7 +202,9 @@ describe('CF3a: one event-switched base form', () => {
   }
   const wfOn = (on: unknown, j: Record<string, Job>): CreatedFile => {
     const f = workflow(j, true);
-    return { ...f, content: f.content.replace(/^on:\n  pull_request: null\n/m, `on: ${JSON.stringify(on)}\n`) };
+    // G17 row 1b: the workflow concurrency is pipegen.yml's (the pull_request layout here); a file moved to another trigger set drops it
+    const content = on === 'pull_request' ? f.content : f.content.replace(/^concurrency:\n(?: {2}.*\n)+/m, '');
+    return { ...f, content: content.replace(/^on:\n  pull_request: null\n/m, `on: ${JSON.stringify(on)}\n`) };
   };
 
   it('C5a: the base-scan job of these layouts hands the gate base-sha (the commit its base checkout checked out)', () => {
@@ -232,8 +235,11 @@ describe('CF3a: one event-switched base form', () => {
   it('it is accepted in every trigger layout, a called workflow included', async () => {
     for (const on of ['pull_request', { merge_group: null }, { push: { branches: ['main'] } }, { pull_request: null, merge_group: null, push: { branches: ['main'] } }, { pull_request: null, workflow_dispatch: null }, { workflow_call: null }]) {
       // G1-R2 I1: pipegen.yml takes only its own triggers, so the trigger layouts are shown in another workflow file
-      const r = await run([{ ...wfOn(on, jobs()), path: '.github/workflows/ci.yml' }], d);
-      expect(show(r), JSON.stringify(on)).toBe('');
+      const f = wfOn(on, jobs());
+      const r = await run([{ ...f, path: '.github/workflows/ci.yml', content: f.content.replace(/^concurrency:\n(?: {2}.*\n)+/m, '') }], d);
+      // G17 row 5 (open question 4): a file outside the B2 layout may not hold the gate, so that is its one issue; the base checkout's form
+      // itself is accepted under every trigger set (no other issue)
+      expect(r.issues.length === 1 && r.issues[0]?.check === 'not-gate-readable' && /outside pipegen's layout/.test(r.issues[0].message), `${JSON.stringify(on)}: ${show(r)}`).toBe(true);
     }
   });
   it('a called workflow with no caller in files is judged the same (no caller inference)', async () => {

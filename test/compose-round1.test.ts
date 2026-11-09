@@ -1,5 +1,6 @@
 // D4 fix round 1 (task-D4-fix-round-1.md): P6 container-network values, I1 the compose plan drives the steps, I2 ./ context, M1-M4, M6, M7.
 // The reviewer's repros are in compose-review.test.ts; these are the rulings' own cases.
+import { WORKFLOW_CONCURRENCY } from '../src/engine/job-rules.js';   // G17 row 1b: pipegen.yml carries the workflow concurrency
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -31,7 +32,7 @@ const show = (r: RefereeReport): string => r.issues.map((i) => `${i.check}: ${i.
 const has = (r: RefereeReport, c: string): boolean => r.issues.some((i) => i.check === c);
 const wf = (steps: RenderedStep[], top: Record<string, unknown> = {}, jobOver: Record<string, unknown> = {}): CreatedFile => {
   const doc = new Document();
-  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, ...top, jobs: { 'app-start': { 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none', ...jobOver } } });
+  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, concurrency: { ...WORKFLOW_CONCURRENCY }, ...top, jobs: { 'app-start': { 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none', ...jobOver } } });
   doc.setIn(['jobs', 'app-start', 'steps'], stepsToYaml(withEgress(steps)));
   return { path: '.github/workflows/pipegen.yml', content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: 't', repo: 'app' };
 };

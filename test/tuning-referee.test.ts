@@ -1,6 +1,7 @@
 // Plan B Task 6d: the referee accepts a tuned config only when it equals what the renderer produces from the same draft
 // (one source of truth: the referee re-renders every draft step, tuning included). Written AFTER the tuning code, which the referee
 // needed no change for; each tamper below is mutation-checked (a tamper must hit the env value or the script, not only the # tuning: comment).
+import { WORKFLOW_CONCURRENCY } from '../src/engine/job-rules.js';   // G17 row 1b: pipegen.yml carries the workflow concurrency
 import { Document } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { referee, type Linters, type RefereeReport } from '../src/engine/referee.js';
@@ -42,7 +43,7 @@ function job(s: StepSpec): { steps: RenderedStep[] } {
 function file(jobs: Record<string, RenderedStep[]>): CreatedFile {
   const doc = new Document();
   doc.contents = doc.createNode({
-    name: 'pipegen', on: { pull_request: null }, permissions: {},
+    name: 'pipegen', on: { pull_request: null }, permissions: {}, concurrency: { ...WORKFLOW_CONCURRENCY },
     jobs: Object.fromEntries(Object.keys(jobs).map((id) => [id, { 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none' }])),
   });
   for (const [id, steps] of Object.entries(jobs)) doc.setIn(['jobs', id, 'steps'], stepsToYaml(withEgress(steps)));
