@@ -185,7 +185,7 @@ describe('V6-R2 sec M1: a merged central PR counts only at the head pipegen set'
     x.central.rulesets.set(55, { name: CENTRAL_RULESET, source_type: 'Repository', source: 'o/pipelines', created_at: AT });
     await afterRun1(x);
     const xlr = localFile(x);
-    const edits: InstallEdit[] = [{ repo: 'central', path: '.github/CODEOWNERS', kind: 'codeowners', inserted: OWNERS_INS, originalSha: null, writtenShas: [blob(OWNERS_INS)] }];
+    const edits: InstallEdit[] = [{ repo: 'central', path: '.github/CODEOWNERS', kind: 'codeowners', inserted: OWNERS_INS, originalSha: null, writtenShas: [blob(OWNERS_INS)], baseShas: [null] } as InstallEdit /* V6b: chained from null, as deliver records it */];
     const xrec = sampleRecord(x, { central: { repoId: x.central.id, createdByPipegen: true, rulesetId: 55, rulesetCreatedAt: AT, codeowners: { path: '.github/CODEOWNERS', created: true } }, edits });
     await run(x, xrec);
     expect(x.central.rulesets.has(55)).toBe(false);

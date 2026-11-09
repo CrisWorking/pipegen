@@ -19,6 +19,11 @@ const kind = (r: RevertResult): string => r.kind;
 const textOf = (r: RevertResult): string => { if (r.kind !== 'strip' && r.kind !== 'restore') throw new Error(`expected a text, got ${JSON.stringify(r)}`); return r.text; };
 
 type TextEdit = Extract<InstallEdit, { kind: 'codeowners' | 'hooks' | 'dependabot' }>;
+/**
+ * V6b (G17C-R1): an edit as deliver records it now, with the base of each write chained from the original (editWritesChained). A first
+ * original is restored only over such a chain; an edit without bases is an older record that proves nothing.
+ */
+const based = <E extends InstallEdit>(e: E): E => ({ ...e, baseShas: e.writtenShas.map((_, n) => (n === 0 ? e.originalSha : e.writtenShas[n - 1])) }) as E;
 type VerifyEdit = Extract<InstallEdit, { kind: 'verify-job' }>;
 /** The record form of a text edit as deliver writes it: inserted = written minus the original prefix. */
 function textEdit(kind: TextEdit['kind'], path: string, original: string | null, written: string, extra: Partial<TextEdit> = {}): TextEdit {
@@ -26,7 +31,7 @@ function textEdit(kind: TextEdit['kind'], path: string, original: string | null,
   if (!written.startsWith(o)) throw new Error('test setup: written must start with the original');
   if (original !== null) put(original);
   put(written);
-  return { repo: 'app', path, kind, inserted: written.slice(o.length), originalSha: original === null ? null : gitBlobSha(original), writtenShas: [gitBlobSha(written)], ...extra };
+  return based({ repo: 'app', path, kind, inserted: written.slice(o.length), originalSha: original === null ? null : gitBlobSha(original), writtenShas: [gitBlobSha(written)], ...extra } as TextEdit);
 }
 
 const VERIFY = { 'runs-on': 'ubuntu-24.04', steps: [renderHeadCheckStep('main'), { id: 'pipegen-find', name: 'pipegen: find', run: 'echo find' }] } as unknown as Job;
@@ -37,7 +42,7 @@ function verifyEdit(original: string, gated: string[], needsOnly: string[] = [])
   put(original);
   put(r.text);
   const heads = r.inserted.headCheck ?? [];
-  return { written: r.text, edit: { repo: 'app', path: WF, kind: 'verify-job', jobs: [...r.inserted.jobs], needs: r.inserted.needs.map((n) => ({ job: n.job, added: [...n.added] })), ...(heads.length > 0 ? { headCheck: heads } : {}), originalSha: gitBlobSha(original), writtenShas: [gitBlobSha(r.text)] } };
+  return { written: r.text, edit: based({ repo: 'app', path: WF, kind: 'verify-job', jobs: [...r.inserted.jobs], needs: r.inserted.needs.map((n) => ({ job: n.job, added: [...n.added] })), ...(heads.length > 0 ? { headCheck: heads } : {}), originalSha: gitBlobSha(original), writtenShas: [gitBlobSha(r.text)] } as VerifyEdit) };
 }
 const CTX = { defaultBranch: 'main' };
 
@@ -234,8 +239,8 @@ describe('V2: the revert engine', () => {
     const lock = '{ "lockfileVersion": 3, "packages": {} }\n';
     const lockNew = '{ "lockfileVersion": 3, "packages": { "node_modules/@biomejs/biome": {} } }\n';
     for (const t of [pj, pjNew, lock, lockNew]) put(t);
-    const json: Extract<InstallEdit, { kind: 'package-json' }> = { repo: 'app', path: 'package.json', kind: 'package-json', add: { c8: '12.0.0' }, setTest: false, lock: 'package-lock.json', originalSha: gitBlobSha(pj), writtenShas: [gitBlobSha(pjNew)] };
-    const lk: Extract<InstallEdit, { kind: 'package-lock' }> = { repo: 'app', path: 'package-lock.json', kind: 'package-lock', json: 'package.json', originalSha: gitBlobSha(lock), writtenShas: [gitBlobSha(lockNew)] };
+    const json: Extract<InstallEdit, { kind: 'package-json' }> = based({ repo: 'app', path: 'package.json', kind: 'package-json', add: { c8: '12.0.0' }, setTest: false, lock: 'package-lock.json', originalSha: gitBlobSha(pj), writtenShas: [gitBlobSha(pjNew)] });
+    const lk: Extract<InstallEdit, { kind: 'package-lock' }> = based({ repo: 'app', path: 'package-lock.json', kind: 'package-lock', json: 'package.json', originalSha: gitBlobSha(lock), writtenShas: [gitBlobSha(lockNew)] });
     // both unchanged: both restored
     expect(revertPair({ edit: json, current: cur(pjNew) }, { edit: lk, current: cur(lockNew) }, blob)).toEqual({ json: { kind: 'restore', text: pj }, lock: { kind: 'restore', text: lock } });
     // either changed, or gone: both manual
@@ -294,7 +299,7 @@ describe('V2: the revert engine', () => {
     const c = insertHeadChecks(called, [WF], VERIFY);
     put(called);
     put(c.text);
-    const ce: VerifyEdit = { repo: 'app', path: '.github/workflows/ship.yml', kind: 'verify-job', jobs: [], needs: [], headCheck: c.inserted.headCheck ?? [], originalSha: gitBlobSha(called), writtenShas: [gitBlobSha(c.text)] };
+    const ce: VerifyEdit = based({ repo: 'app', path: '.github/workflows/ship.yml', kind: 'verify-job', jobs: [], needs: [], headCheck: c.inserted.headCheck ?? [], originalSha: gitBlobSha(called), writtenShas: [gitBlobSha(c.text)] });
     expect(ce.headCheck).toEqual(['ship', 'notify']);
     const cc = c.text.replace('./notify.sh', './notify.sh --loud');
     expect(textOf(revertEdit(ce, cur(cc), blob, CTX))).toBe(called.replace('./notify.sh', './notify.sh --loud'));
@@ -316,7 +321,7 @@ describe('V2: the revert engine', () => {
     const pj = '{\n  "name": "a"\n}\n';
     const pjNew = buildPackageJson(pj, { add: { c8: '12.0.0' }, setTest: false }) as string;
     put(pj); put(pjNew);
-    const json: Extract<InstallEdit, { kind: 'package-json' }> = { repo: 'app', path: 'package.json', kind: 'package-json', add: { c8: '12.0.0' }, setTest: false, originalSha: gitBlobSha(pj), writtenShas: [gitBlobSha(pjNew)] };
+    const json: Extract<InstallEdit, { kind: 'package-json' }> = based({ repo: 'app', path: 'package.json', kind: 'package-json', add: { c8: '12.0.0' }, setTest: false, originalSha: gitBlobSha(pj), writtenShas: [gitBlobSha(pjNew)] });
     expect(revertEdit(json, cur(pjNew), blob).kind).toBe('restore');
     expect(revertEdit({ ...json, ownerEdited: true }, cur(pjNew), blob).kind).toBe('manual');
   });
@@ -366,7 +371,8 @@ describe('V2: the revert engine', () => {
     const r2 = revertPair({ edit: one, current: cur(w1) }, { edit: { ...lk, writtenShas: [gitBlobSha(lw1)] }, current: cur(lw1) }, blob);
     expect([r2.json.kind, r2.lock?.kind]).toEqual(['manual', 'manual']);
     // the honest single-write pair: restored
-    const r3 = revertPair({ edit: { ...json, writtenShas: [gitBlobSha(w1)] }, current: cur(w1) }, { edit: { ...lk, writtenShas: [gitBlobSha(lw1)] }, current: cur(lw1) }, blob);
+    // V6b (G17C-R1): with the base of its one write recorded (deliver's record today)
+    const r3 = revertPair({ edit: based({ ...json, writtenShas: [gitBlobSha(w1)] }), current: cur(w1) }, { edit: based({ ...lk, writtenShas: [gitBlobSha(lw1)] }), current: cur(lw1) }, blob);
     expect(r3).toEqual({ json: { kind: 'restore', text: o1 }, lock: { kind: 'restore', text: l1 } });
     // only the package.json was written twice: both manual
     const r4 = revertPair({ edit: { ...json, writtenShas: [gitBlobSha(w2), gitBlobSha(w1)] }, current: cur(w1) }, { edit: { ...lk, writtenShas: [gitBlobSha(lw1)] }, current: cur(lw1) }, blob);
@@ -418,7 +424,7 @@ describe('V2: the revert engine', () => {
     const lock = '{ "l": 1 }\n';
     const lockNew = '{ "l": 2 }\n';
     for (const t of [pj, pjNew, lock, lockNew]) put(t);
-    const json: Extract<InstallEdit, { kind: 'package-json' }> = { repo: 'app', path: 'package.json', kind: 'package-json', add: { c8: '12.0.0' }, setTest: false, originalSha: gitBlobSha(pj), writtenShas: [gitBlobSha(pjNew)] };
+    const json: Extract<InstallEdit, { kind: 'package-json' }> = based({ repo: 'app', path: 'package.json', kind: 'package-json', add: { c8: '12.0.0' }, setTest: false, originalSha: gitBlobSha(pj), writtenShas: [gitBlobSha(pjNew)] });
     const lk: Extract<InstallEdit, { kind: 'package-lock' }> = { repo: 'app', path: 'package-lock.json', kind: 'package-lock', json: 'package.json', originalSha: gitBlobSha(lock), writtenShas: [gitBlobSha(lockNew)] };
     const r = revertEdits([json, lk], (e) => (e.path === 'package.json' ? cur(pjNew) : cur(lockNew)), blob, CTX);
     expect(r.map((x) => [x.edit.path, x.result.kind])).toEqual([['package.json', 'manual'], ['package-lock.json', 'manual']]);
@@ -508,5 +514,17 @@ describe('G17C rows 24, 25: the Dependabot private form names the app owner\'s p
     const src = readFileSync(new URL('../src/uninstall/revert.ts', import.meta.url), 'utf8');
     expect(src).not.toMatch(/const HUSKY_SHEBANG\s*=/);
     expect(src).toMatch(/\bHUSKY_SHEBANG\b.*from '\.\.\/engine\/created-builders\.js'|import \{[^}]*\bHUSKY_SHEBANG\b[^}]*\} from '\.\.\/engine\/created-builders\.js'/s);
+  });
+});
+
+describe('V6b-R1 (sec i1): the "created and changed since" manual leads with taking pipegen\'s part out', () => {
+  it('a created CODEOWNERS the owner changed: the text names taking the block out first, never "delete it" as the lead', () => {
+    const written = codeownersFile('', codeownersBlock(['.github/workflows/**'], ['@o']));
+    const e = textEdit('codeowners', '.github/CODEOWNERS', null, written);
+    const r = revertEdit(e, cur(`${written}docs/ @bob\n`), blob, CTX);
+    expect(r.kind).toBe('manual');
+    const why = r.kind === 'manual' ? r.why : '';
+    expect(why).toMatch(/has changed since; take pipegen's part out by hand/);
+    expect(why).not.toMatch(/; delete it,/);
   });
 });

@@ -40,7 +40,7 @@ import type { Octokit } from '@octokit/rest';
 import { gitBlobSha } from '../create/guard.js';
 import { readEnv, SETUP_BRANCH } from '../deliver/deliver.js';
 import { checkBranch, ghWrite, isoAt, openOrUpdatePr, readTree, setBranch, statusOf, type RepoRef, type TreeEntry } from '../deliver/git-data.js';
-import { centralUpdateBranch, recordPath } from '../deliver/record.js';
+import { centralUpdateBranch, editWritesChained, recordPath, type RecordedEdit } from '../deliver/record.js';
 import { centralFilesOf, UPDATE_BRANCH } from '../deliver/update.js';
 import { centralProjectName, centralWorkflowFile } from '../engine/central-path.js';
 import { isRateStop, withRateLimit, type RateClock } from '../engine/github-rate.js';
@@ -1033,7 +1033,8 @@ export class UninstallApi {
       for (const p of c.deletes) {
         if (CODEOWNERS_PATHS.includes(p)) {
           if (p !== edit?.path) refuse(`${show(p, 100)} is not the CODEOWNERS the record says pipegen edited.`);
-          if (edit === undefined || edit.originalSha !== null || edit.ownerEdited === true) refuse(`${show(p, 100)} was there before pipegen (or the owner edited it), so uninstall doesn't remove it.`);
+          // V6b (G17C m4): pipegen's whole file only when its writes chain from null (an older record may hold the owner's blob as a write)
+          if (edit === undefined || edit.originalSha !== null || edit.ownerEdited === true || !editWritesChained(edit as RecordedEdit)) refuse(`${show(p, 100)} was there before pipegen (or the owner edited it), so uninstall doesn't remove it.`);
         } else if (!removable.has(p)) refuse(`${show(p, 100)} is not a central file of this project, so uninstall doesn't remove it.`);
       }
     }
@@ -1292,7 +1293,8 @@ export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: Inst
         if (e.type !== 'blob' || (e.mode !== '100644' && e.mode !== '100755')) return false;
         if (path === 'README.md' && readme.has(e.sha)) return true;
         if (rec.files.some((f) => f.repo === 'central' && f.path === path && f.adopted !== true && f.ownerEdited !== true && f.shas.includes(e.sha))) return true;
-        return rec.edits.some((x) => x.repo === 'central' && x.kind === 'codeowners' && x.path === path && x.originalSha === null && x.ownerEdited !== true && x.writtenShas.includes(e.sha));
+        // V6b (G17C m4): the CODEOWNERS pipegen created counts only when its writes chain from null (never an owner blob an older record holds)
+        return rec.edits.some((x) => x.repo === 'central' && x.kind === 'codeowners' && x.path === path && x.originalSha === null && x.ownerEdited !== true && editWritesChained(x as RecordedEdit) && x.writtenShas.includes(e.sha));
       };
       const foreign = [...entries].filter(([p, e]) => !own(p, e)).map(([p]) => p);
       if (foreign.length > 0) return { why: `${full} holds files pipegen didn't write (${listed(foreign)}), so pipegen doesn't delete it` };
