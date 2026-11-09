@@ -1467,7 +1467,7 @@ describe('doc: G17 group E (rows 57-61, 65 and the G16 carry)', () => {
   it('G17 row 60: claim-shaped one-line text never renders as a nested list, a quote or a heading', () => {
     const shaped = ['- nested claim', '* star claim', '+ plus claim', '1. numbered claim', '2) numbered claim', '> quoted claim', '# heading claim', '- - twice claim', '---', '  - indented claim'];
     for (const [label, make] of SHAPES) {
-      const d = make({ scoreboard: shaped }, { notes: shaped, lockNotes: shaped, testNotes: shaped, transcript: shaped, credits: shaped.map((text) => ({ text, kind: 'other' })) } as Partial<PipelineDoc>);
+      const d = make({ scoreboard: shaped }, { notes: shaped, lockNotes: shaped, testNotes: shaped, transcript: shaped, credits: shaped.map((text) => ({ text, kind: 'hooks-ci' as const })) });
       const text = docOf(d);
       for (const l of text.split('\n').filter((x) => x.startsWith('- '))) expect(l.slice(2), `${label}: ${l}`).not.toMatch(/^\s*(?:[-*+>#]|\d{1,9}[.)])(?:\s|$)/);
       for (const w of ['nested claim', 'star claim', 'numbered claim', 'quoted claim', 'heading claim', 'twice claim', 'indented claim']) expect(text, `${label}: ${w}`).toContain(`- ${w}`);
