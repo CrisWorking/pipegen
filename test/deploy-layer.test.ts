@@ -1419,3 +1419,82 @@ describe('G13: the head check in a local called workflow (G7-R2 carry, BINDING)'
     expect(alone.v.gaps[0]?.why).toMatch(/workflow_call/);
   });
 });
+
+// ---------- G17 group A rows 2-4 (probe R9, sec r3 M2/M3): the referee re-derives the gated set and the needs-only set ----------
+describe('G17 A rows 2-4: the referee re-derives which user jobs wait for pipegen-verify, never trusting the mark', () => {
+  const SEC = ['sec', 'rets'].join('');
+  /** A forged edit of the same original: insertVerify over other jobs (a well-formed edit, a dishonest mark). */
+  const forge = (w: World, jobs: string[], needsOnly: string[] = []): CreatedFile => {
+    const ins = w.v.inserts[0] as VerifyPlan['inserts'][number];
+    const e = insertVerify(ins.inserted.original as string, jobs, w.a.verify as Job, needsOnly);
+    return { ...ins.file, content: e.text, inserted: e.inserted };
+  };
+  it('G17 row 2 (probe R9): a mark that drops a secret-holding job from needs is refused', async () => {
+    const text = ['on: { push: { branches: [main] } }', 'jobs:', '  stage:', '    runs-on: ubuntu-latest', '    environment: staging', '    steps:', '      - run: ./stage.sh',
+      '  prod:', '    runs-on: ubuntu-latest', '    permissions: { contents: read }', '    steps:', '      - run: ./prod.sh', '        env:', `          KEY: \${{ ${SEC}.PROD_KEY }}`, ''].join('\n');
+    const w = world('keyless', [[A, text]]);
+    expect(w.v.inserts[0]?.inserted.needs.map((n) => n.job)).toEqual(['stage', 'prod']);
+    expect(shown(await judge(w))).toBe('');
+    const r = await judge(w, [forge(w, ['stage'])]);
+    expect(r.issues.some((i) => /"prod" must wait for pipegen-verify \(it uses a secret\)/.test(i.message)), shown(r)).toBe(true);
+  });
+  it('G17 row 3 (probes R3, R4): a mark that moves a head-checked job to needs-only, or drops it, is refused', async () => {
+    // R3: no job the detector names; two read-only jobs on GitHub's ubuntu runner both take the head check
+    const plain = ['name: release the site', 'on:', '  push:', '    branches: [main]', 'jobs:', '  one:', '    runs-on: ubuntu-latest', '    permissions: { contents: read }', '    steps:', '      - run: make',
+      '  two:', '    needs: [one]', '    runs-on: ubuntu-latest', '    permissions: { contents: read }', '    steps:', '      - run: make upload', ''].join('\n');
+    const w = world('key-env', [[B, plain]]);
+    expect(w.v.inserts[0]?.inserted.headCheck).toEqual(['one', 'two']);
+    expect(shown(await judge(w))).toBe('');
+    const moved = await judge(w, [forge(w, ['one', 'two'], ['two'])]);
+    expect(moved.issues.some((i) => /"two" may not wait without pipegen's head check/.test(i.message)), shown(moved)).toBe(true);
+    const dropped = await judge(w, [forge(w, ['one'])]);
+    expect(dropped.issues.some((i) => /"two" must wait for pipegen-verify/.test(i.message)), shown(dropped)).toBe(true);
+    // R4: a WEAK vars job on plain GitHub ubuntu that the layer starts with the head check
+    const vars = ['on: { push: { branches: [main] } }', 'jobs:', '  test:', '    runs-on: ubuntu-latest', '    permissions: { contents: read }', '    steps:', '      - run: curl -X POST "${{ vars.HOOK_URL }}"',
+      '  deploy:', '    needs: test', '    runs-on: ubuntu-latest', '    environment: production', '    permissions: { contents: read }', '    steps:', '      - run: ./ship.sh', ''].join('\n');
+    const v = world('keyless', [[A, vars]]);
+    expect(v.v.inserts[0]?.inserted.headCheck).toEqual(['test', 'deploy']);
+    const r4 = await judge(v, [forge(v, ['test', 'deploy'], ['test'])]);
+    expect(r4.issues.some((i) => /"test" may not wait without pipegen's head check/.test(i.message)), shown(r4)).toBe(true);
+  });
+  it('G17 row 4 (probe C4): with no job the detector names, each job keeps its own STRONG reason; ship gets verify, not a gap', async () => {
+    const c4 = ['on: { push: { branches: [main] } }', 'jobs:', '  test:', '    runs-on: ubuntu-latest', '    permissions: { contents: read }', '    steps:', '      - run: make test', '      - uses: actions/upload-artifact@v4', '        if: always()', '        with: { name: logs, path: logs/ }',
+      '  ship:', '    needs: test', '    runs-on: ubuntu-latest', '    permissions: { contents: read }', '    steps:', '      - run: ./upload.sh', '        env:', `          TOKEN: \${{ ${SEC}.HOOK_TOKEN }}`, ''].join('\n');
+    const w = world('keyless', [[A, c4]]);
+    expect(w.v.gaps).toEqual([]);
+    const ins = w.v.inserts[0] as VerifyPlan['inserts'][number];
+    expect(ins.inserted.needs.map((n) => n.job)).toEqual(['test', 'ship']);
+    expect(ins.inserted.headCheck).toEqual(['ship']);
+    expect(ins.inserted.needsOnly).toEqual(['test']);
+    expect(w.v.preview[0]).toMatch(/"test", "ship" wait for it \(pipegen could not tell which job deploys, so every job waits\)/);
+    expect(shown(await judge(w))).toBe('');
+    // a could-not-tell job whose own if: defeats needs still makes the workflow a gap (as before: every job waits, so none may run past the check)
+    const g = world('keyless', [[A, c4.replace('  test:\n    runs-on', '  test:\n    if: always()\n    runs-on')]]);
+    expect(g.v.inserts).toEqual([]);
+    expect(g.v.gaps[0]?.why).toMatch(/"test" \(pipegen could not tell which job deploys, so every job waits\) has an if:/);
+  });
+  it('G17 rows 2-4: a mark that gates a job the layer leaves out, or edits a workflow the reader found no deploy in, is refused', async () => {
+    const text = ['on: { push: { branches: [main] } }', 'jobs:', '  deploy:', '    runs-on: ubuntu-latest', '    environment: production', '    steps:', '      - run: ./scripts/ship.sh',
+      '  lint:', '    runs-on: ubuntu-latest', '    permissions: { contents: read }', '    steps:', '      - run: make lint', ''].join('\n');
+    const w = world('keyless', [[A, text]]);
+    expect(w.v.inserts[0]?.inserted.needs.map((n) => n.job)).toEqual(['deploy']);
+    expect(shown(await judge(w))).toBe('');
+    const extra = await judge(w, [forge(w, ['deploy', 'lint'])]);
+    expect(extra.issues.some((i) => /The edit makes the job "lint" wait for pipegen-verify, but pipegen's deploy layer does not gate it/.test(i.message)), shown(extra)).toBe(true);
+    // the reader's deploy flag is the layer's too: a workflow it found no deploy in gets no insert
+    const prof = w.a.draft.profile;
+    const notDeploy = { ...w.a.draft, profile: { ...prof, existingWorkflows: prof.existingWorkflows.map((x) => ({ ...x, deploys: false })) } };
+    const r = await judgeAssembled({ ...w.a, draft: notDeploy }, { ...JD, extra: w.v.inserts.map((i) => i.file) });
+    expect(r.issues.some((i) => /pipegen adds no pipegen-verify job to this workflow: pipegen's reader found no deploy in it/.test(i.message)), shown(r)).toBe(true);
+  });
+  it('G17 rows 2-4: a mark on a workflow the layer makes a gap is refused', async () => {
+    const text = DEPLOY_A.replace('      - run: ./scripts/ship.sh\n', '      - run: ./scripts/ship.sh\n        if: always()\n');
+    const ok = world('keyless', [[A, DEPLOY_A]]);
+    const original = ok.v.inserts[0]?.inserted.original as string;
+    expect(original).toBe(DEPLOY_A);
+    const e = insertVerify(text, ['deploy'], ok.a.verify as Job, ['deploy']);
+    const forged: CreatedFile = { ...(ok.v.inserts[0] as VerifyPlan['inserts'][number]).file, content: e.text, inserted: e.inserted };
+    const r = await judge(ok, [forged]);
+    expect(r.issues.some((i) => /pipegen adds no pipegen-verify job to this workflow: a step of its job "deploy" \(it has an environment\) has an if:/.test(i.message)), shown(r)).toBe(true);
+  });
+});

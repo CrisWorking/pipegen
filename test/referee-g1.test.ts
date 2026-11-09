@@ -35,7 +35,7 @@ const prCheckJob = (over: Job = {}): Job => job([renderPrCheckStep()], { permiss
 function pushFile(scannerOver: Job = {}, top: Record<string, unknown> = {}, extraJobs: Record<string, Job> = {}): CreatedFile {
   const j = jobsOf(d);
   const scanner = { ...(j['sast--app'] as Job), needs: ['pr-check'], if: PR_CHECK_IF, ...scannerOver };
-  return at(workflow({ 'pr-check': prCheckJob(), 'sast--app': scanner, ...extraJobs }, { on: { push: featurePushTrigger('main') }, ...top }), PUSH_WORKFLOW);
+  return at(workflow({ 'pr-check': prCheckJob(), 'sast--app': scanner, ...extraJobs }, callerTop({ on: { push: featurePushTrigger('main') }, ...top })), PUSH_WORKFLOW);
 }
 /** A user's deploy workflow with pipegen's inserted job (the Plan B marker), under the user's own triggers. */
 function editedUser(on: string, insertedId: string, steps: RenderedStep[], perms: Record<string, string>, extra: Record<string, unknown> = {}): { f: CreatedFile; draft: PipelineDraft } {
@@ -60,7 +60,14 @@ function editedUser(on: string, insertedId: string, steps: RenderedStep[], perms
 const SEC_USED = ['secrets', 'Used'].join('');
 const envName = Object.keys(renderPrCheckStep().env ?? {})[0] as string;
 const VERIFY_PERMS = { contents: 'read', actions: 'read', packages: 'read', attestations: 'read' };
-const gateFile = (top: Record<string, unknown> = {}, extra: Record<string, Job> = {}): CreatedFile => workflow({ ...jobsOf(d), ...extra }, top);
+/** G17 row 1b: the two app callers carry the workflow concurrency (a called file never does). */
+const CONC = { concurrency: { ...WORKFLOW_CONCURRENCY } };
+const callerTop = (top: Record<string, unknown>): Record<string, unknown> => {
+  const on = top.on;
+  const called = (typeof on === 'object' && on !== null && Object.hasOwn(on, 'workflow_call')) || on === 'workflow_call';
+  return called ? top : { ...CONC, ...top };
+};
+const gateFile = (top: Record<string, unknown> = {}, extra: Record<string, Job> = {}): CreatedFile => workflow({ ...jobsOf(d), ...extra }, callerTop(top));
 
 describe('G1: the triggers of Plan G\'s layout (B1, B2, C3)', () => {
   it('referee: pull_request_review [submitted, dismissed] accepted only in pipegen.yml', async () => {
@@ -85,7 +92,7 @@ describe('G1: the triggers of Plan G\'s layout (B1, B2, C3)', () => {
     expect(defaultPushTrigger('main')).toEqual({ branches: ['main'] });
     expect(show(await run([gateFile({ on: { push: { branches: ['main'] }, pull_request: null } })], d))).toBe('');
     const trunk: PipelineDraft = { ...d, profile: { ...prof, defaultBranch: 'trunk' } };
-    expect(show(await run([workflow(jobsOf(trunk), { on: { push: { branches: ['trunk'] }, pull_request: null } })], trunk))).toBe('');
+    expect(show(await run([workflow(jobsOf(trunk), callerTop({ on: { push: { branches: ['trunk'] }, pull_request: null } }))], trunk))).toBe('');
     for (const on of [
       'push', ['push', 'pull_request'], { push: null, pull_request: null }, { push: { branches: ['main'], tags: ['*'] } }, { push: { tags: ['v*'] } },
       { push: { branches: ['main', 'dev'] } }, { push: { branches: ['ma*'] } }, { push: { branches: ['main'], paths: ['src/**'] } },
@@ -324,7 +331,7 @@ describe('G1: workflow concurrency, job conditions and job outputs (B1, G22, BP-
     expect(jobOutputsProblems('baseline-check', { found: form.found }, [{ ...bc, with: { ...bc.with, mode: 'gate' } }]).join('\n')).toMatch(/its own step/);
     // the referee: the outputs on their own jobs pass; on another job they are injection
     const bcJob = job([bc], { permissions: { contents: 'read', actions: 'read' }, outputs: { found: form.found } });
-    expect(show(await run([workflow({ ...jobsOf(d), 'baseline-check': bcJob })], d))).toBe('');
+    expect(show(await run([workflow({ ...jobsOf(d), 'baseline-check': bcJob }, CONC)], d))).toBe('');
     expect(show(await run([gateFile(), pushFile()], d))).toBe('');
     const j = jobsOf(d);
     for (const [id, key] of [['sast--app', 'has-pr'], ['gate', 'found'], ['base-scan', 'digest'], ['baseline-check', 'has-pr']] as const) {
