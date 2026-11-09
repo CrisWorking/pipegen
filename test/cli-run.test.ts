@@ -1089,8 +1089,19 @@ describe('G13: main dispatch', () => {
 // ---------- finish, verify, update: what they print ----------
 
 describe('G13: finish, verify and update print their results', () => {
-  const g = { gh: {} as Octokit, login: 'alice', local: { env: {} } };
+  const g = { gh: {} as Octokit, login: 'alice', local: { env: {} }, lease: undefined };
   const app = { owner: 'o', repo: 'r' };
+
+  it('finish and update: a lease the caller holds is passed on; none → none (they take their own) (Plan V M5)', async () => {
+    const held = await StateStore.open(app, { home: tmp('pg-lease-'), env: {} });
+    held.acquireLease('run-x', 'run');
+    const got: unknown[] = [];
+    await finishCommand(io(), app, {}, { ...g, lease: held }, (async (_g: unknown, _a: unknown, _o: unknown, d: Record<string, unknown>) => { got.push(d.lease); return { applied: [], skipped: [], notes: [] }; }) as never);
+    await updateCommand(io(), app, { ...g, lease: held }, (async (_g: unknown, _a: unknown, d: Record<string, unknown>) => { got.push(d.lease); return { done: false, preview: '', prompts: [], ignored: [], refused: [], conflicts: [], notes: [] }; }) as never);
+    await finishCommand(io(), app, {}, g, (async (_g: unknown, _a: unknown, _o: unknown, d: Record<string, unknown>) => { got.push(d.lease); return { applied: [], skipped: [], notes: [] }; }) as never);
+    expect(got).toEqual([held, held, undefined]);
+    held.releaseLease();
+  });
 
   it('finish --print: the commands, the applied and skipped steps, the record hash; exit 0', async () => {
     let deps: Record<string, unknown> = {};

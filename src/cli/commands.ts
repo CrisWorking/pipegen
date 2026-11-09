@@ -23,8 +23,11 @@ import type { CliIO } from './io.js';
 export const interactiveRun = (io: Pick<CliIO, 'interactive' | 'env'>): boolean => io.interactive === true && (io.env.CI ?? '') === '';
 
 /** What finish, verify and update need of GitHub (tests pass a fake). */
-/** `lease` (Plan V M5): the app's lease a caller already holds (run, which finishes in its own process); finish and update take it otherwise. */
-export interface CommandGitHub { gh: Octokit; login: string | null; local?: LocalRecordDeps; clock?: RateClock; lease?: StateStore }
+/**
+ * `lease` (Plan V M5): the app's lease a caller already holds (run, which finishes in its own process); undefined → finish and update take it
+ * themselves. A required key, so a caller that holds one can't leave it out by accident (that would stop on its own process).
+ */
+export interface CommandGitHub { gh: Octokit; login: string | null; local?: LocalRecordDeps; clock?: RateClock; lease: StateStore | undefined }
 
 /** The folder's origin repo, a token for it and its central repo (least privilege: `write` for finish and update, `read` for verify). */
 export async function connect(io: CliIO, dir: string, o: { allowBroad: boolean; mode: 'read' | 'write' }): Promise<{ app: RepoRef; g: CommandGitHub; token: string | null }> {
@@ -35,7 +38,7 @@ export async function connect(io: CliIO, dir: string, o: { allowBroad: boolean; 
   const notes: string[] = [];
   const login = await tokenLogin(gh, auth, clock, notes);
   for (const n of notes) io.err(n);
-  return { app, token: auth.token, g: { gh, login, clock, local: { env: io.env } } };
+  return { app, token: auth.token, g: { gh, login, clock, local: { env: io.env }, lease: undefined } };
 }
 
 const show = (s: string, n = 300): string => safeText(s, n);
