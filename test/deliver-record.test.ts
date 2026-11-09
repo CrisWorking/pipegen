@@ -11,6 +11,7 @@ import {
   canonicalRecordJson, guardRecordOf, InstallRecordSchema, MAX_RECORD_BYTES, parseRecord, readLocalRecord, recordHash, recordMarker,
   recordMarkerOf, recordPath, RecordError, withRecordMarker, writeLocalRecord,
 } from '../src/deliver/record.js';
+import * as recordMod from '../src/deliver/record.js';
 import type { InstallRecord } from '../src/types.js';
 import { cosignPub } from './helpers/cosign-keys.js';
 
@@ -163,5 +164,35 @@ describe('install record schema, fix round 1 (m1-m3)', () => {
     expect(() => parseRecord(JSON.stringify({ ...r, cosignPub: cosignPub(6), cosignPubSha256: sha }))).toThrow(RecordError);
     const odd = 'not a key';
     expect(() => parseRecord(JSON.stringify({ ...r, cosignPub: odd, cosignPubSha256: createHash('sha256').update(odd, 'utf8').digest('hex') }))).toThrow(RecordError);
+  });
+});
+
+// ---------- G17 group C ----------
+
+describe('G17C row 34: blockFrom is a real calendar date', () => {
+  it('the schema refuses year 0000 and impossible days, and keeps a real one', () => {
+    for (const d of ['0000-01-01', '2026-02-30', '2026-13-01', '2026-00-10']) expect(InstallRecordSchema.safeParse(sampleRecord({ blockFrom: d })).success, d).toBe(false);
+    for (const d of ['2026-02-28', '2028-02-29', '0001-01-01']) expect(InstallRecordSchema.safeParse(sampleRecord({ blockFrom: d })).success, d).toBe(true);
+  });
+});
+
+describe('G17C row 22: each write of an edit and the blob it started from', () => {
+  const chained = (e: unknown): boolean => (recordMod as unknown as { editWritesChained: (x: unknown) => boolean }).editWritesChained(e);
+  const edit = (over: Record<string, unknown>) => ({ repo: 'app', path: 'CODEOWNERS', kind: 'codeowners', inserted: '\n# pipegen:begin\n', originalSha: SHA('d'), writtenShas: [SHA('e')], ...over });
+  it('baseShas: one per written sha at most; null only for a file that wasn\'t there', () => {
+    expect(InstallRecordSchema.safeParse(sampleRecord({ edits: [edit({ baseShas: [SHA('d')] })] as never })).success).toBe(true);
+    expect(InstallRecordSchema.safeParse(sampleRecord({ edits: [edit({ originalSha: null, baseShas: [null] })] as never })).success).toBe(true);
+    expect(InstallRecordSchema.safeParse(sampleRecord({ edits: [edit({ baseShas: [SHA('d'), SHA('e')] })] as never })).success).toBe(false);
+    expect(InstallRecordSchema.safeParse(sampleRecord({ edits: [edit({ baseShas: ['nope'] })] as never })).success).toBe(false);
+  });
+  it('editWritesChained: the first base is the original, each later base the write before it, one base per write', () => {
+    expect(chained(edit({ baseShas: [SHA('d')] }))).toBe(true);
+    expect(chained(edit({ writtenShas: [SHA('e'), SHA('f')], baseShas: [SHA('d'), SHA('e')] }))).toBe(true);
+    expect(chained(edit({ originalSha: null, baseShas: [null] }))).toBe(true);
+    expect(chained(edit({}))).toBe(false);   // an older record: no bases, nothing proven
+    expect(chained(edit({ baseShas: [SHA('a')] }))).toBe(false);   // not from the original
+    expect(chained(edit({ writtenShas: [SHA('e'), SHA('f')], baseShas: [SHA('d'), SHA('a')] }))).toBe(false);   // an owner edit between
+    expect(chained(edit({ writtenShas: [SHA('e'), SHA('f')], baseShas: [SHA('d')] }))).toBe(false);   // a write with no base (update)
+    expect(chained(edit({ writtenShas: [SHA('e'), SHA('f')], baseShas: [SHA('d'), SHA('e')], ownerEdited: true }))).toBe(false);
   });
 });

@@ -183,6 +183,16 @@ function priorOf<T extends { githubCreatedAt?: string; previous?: unknown }>(lis
  * which the gate reads as no date (warn mode), so a day the gate refuses is never kept, recorded or set.
  */
 const realDay = (d: string): boolean => validDate(d) === d;
+/**
+ * I2 (S18: never looser), G17C-R1 (F4): the block date is the earliest of the merge day + 7 and every other day given that is a real day
+ * (the record's, the unvouched one behind a typed view, the variable's). A day the gate can't read (impossible, year 0000) never counts:
+ * the record schema refuses such a day now, and this keeps older records and the variable to the same rule.
+ */
+export function earliestBlockFrom(mergeDay: string, days: readonly (string | undefined)[]): string {
+  let out = mergeDay;
+  for (const d of days) if (d !== undefined && realDay(d) && d < out) out = d;
+  return out;
+}
 const atOf = (at: string | null): { githubCreatedAt: string } | { unconfirmed: true } => (at !== null && isoAt(at) ? { githubCreatedAt: at } : { unconfirmed: true as const });
 const pendingPath = (x: Ctx): string => localFinishPendingPath(x.app, x.deps.local ?? {});
 /** I1: the pending file saved with `change` applied, BEFORE the write it guards; a file that can't be saved: that write isn't made. */
@@ -946,7 +956,7 @@ export async function finish(gh: Octokit, app: RepoRef, opts: FinishOpts, deps: 
     const updateExists = await readHead(gh, central, update, clock) !== null;
     const trusted = await trustedPrevious(gh, app, central, centralRepo.defaultBranch, updateExists ? update : null, deps.local ?? {}, clock, notes, deps.io === undefined ? undefined : { io: deps.io, interactive: deps.interactive === true });
     if (trusted.record === null) {
-      throw new FinishError(`${trusted.exists ? `pipegen found no install record for ${show(`${app.owner}/${app.repo}`)} that it trusts` : `There is no install record for ${show(`${app.owner}/${app.repo}`)}`}, so it applies nothing: finish reads what to apply only from the record. ${trusted.exists ? 'Run finish on the machine that set it up, or interactively to confirm the record by typing the repo name.' : 'Run pipegen first.'}${notes.length > 0 ? ` ${notes.join(' ')}` : ''}`);
+      throw new FinishError(`${trusted.exists ? `pipegen found no install record for ${show(`${app.owner}/${app.repo}`)} that it trusts` : `There is no install record for ${show(`${app.owner}/${app.repo}`)}`}, so it applies nothing: finish reads what to apply only from the record. ${!trusted.exists ? 'Run pipegen first.' : trusted.why === 'unreadable' ? 'Remove or fix that local record file, then run `npx pipegen finish` again at a terminal to confirm the record by typing the repo name.' : 'Run finish on the machine that set it up, or interactively to confirm the record by typing the repo name.'}${notes.length > 0 ? ` ${notes.join(' ')}` : ''}`);
     }
     const rec = trusted.record;
     const local = await readLocalRecord(app, deps.local ?? {}).catch((e: unknown) => { if (e instanceof RecordError) return null; throw e; });
@@ -1014,15 +1024,12 @@ export async function finish(gh: Octokit, app: RepoRef, opts: FinishOpts, deps: 
     // day. Fix round 2: the variable counts for every record, typed or vouched (a re-delivery after a typed trust writes a vouched record
     // with no blockFrom; a finish that set the variable may have stopped before its record was written)
     const mergeDay = new Date(Date.parse(`${p.mergedAt.slice(0, 10)}T00:00:00Z`) + 7 * DAY_MS).toISOString().slice(0, 10);
-    blockFrom = mergeDay;
-    if (rec.blockFrom !== undefined && realDay(rec.blockFrom) && rec.blockFrom < blockFrom) blockFrom = rec.blockFrom;
     // G11-R3 (R2-6): a typed run also counts the blockFrom of the record behind the typed view (unvouched: it can only make the date earlier;
     // N3-1: only a day the gate reads as a date, so year 0000 never turns the block date off)
     const unvouched = typed ? trusted.unvouchedBlockFrom ?? '' : '';
-    if (realDay(unvouched) && unvouched < blockFrom) blockFrom = unvouched;
     const v = await api.readOr404('GET /repos/{owner}/{repo}/actions/variables/{name}', { owner: app.owner, repo: app.repo, name: BLOCK_FROM_VAR });
     const varDay = isObj(v) && typeof v.value === 'string' ? v.value : '';
-    if (realDay(varDay) && varDay < blockFrom) blockFrom = varDay;
+    blockFrom = earliestBlockFrom(mergeDay, [rec.blockFrom, unvouched, varDay]);
     if (blockFrom !== mergeDay) notes.push(`${BLOCK_FROM_VAR} stays ${blockFrom}, the earlier date: a later merge never moves the end of the warn period later.`);
     x = {
       gh, api, app, central, clock, deps, print: opts.print === true, rotate: opts.rotateKey === true,

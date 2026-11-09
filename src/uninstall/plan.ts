@@ -427,7 +427,7 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
       await readBlob(e.originalSha);
       await readBlob(e.writtenShas[e.writtenShas.length - 1]);
     }
-    u.reverts = revertEdits(toRevert, (e) => current.get(e.path) ?? null, (sha) => blobs.get(sha) ?? null, { defaultBranch: loaded.app.defaultBranch });
+    u.reverts = revertEdits(toRevert, (e) => current.get(e.path) ?? null, (sha) => blobs.get(sha) ?? null, { defaultBranch: loaded.app.defaultBranch, appOwner: loaded.app.owner });
   }
   // V-N12: a hook block the record has no entry for
   for (const path of Object.values(HOOK_FILES)) {

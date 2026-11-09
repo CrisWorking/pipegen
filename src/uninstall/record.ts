@@ -391,7 +391,10 @@ async function load(gh: Octokit, app: RepoRef, deps: UninstallDeps): Promise<Loa
       throw new UninstallError(`pipegen found no install record for ${name} on the default branch of ${centralName}: it is only on the central branch ${show(update, 120)}, which pipegen can't confirm. Merge that change (or delete the branch), then run \`npx pipegen uninstall\` again. Nothing was changed.`);
     }
     const file = localRecordPath(app, deps.local ?? {});
-    const wayOn = trusted.why === 'mismatch'
+    // G17C-R1 (F6, m2): an unreadable local record file gets uninstall's own way on (trustedPrevious's note names only the file)
+    const wayOn = trusted.why === 'unreadable'
+      ? `Remove or fix this machine's local record file ${show(file, 300)}, then run \`npx pipegen uninstall\` again at a terminal: pipegen then shows what the record claims and asks you to type the repo name.`
+      : trusted.why === 'mismatch'
       ? `This machine's local record file ${show(file, 300)} holds another record's hash. If you set pipegen up from another machine, move that file away and run \`npx pipegen uninstall\` again at a terminal: pipegen then shows what the record claims and asks you to type the repo name.`
       : confirm === undefined
         ? 'This machine has no local record file for it. Run `npx pipegen uninstall` at a terminal: pipegen then shows what the record claims and asks you to type the repo name.'

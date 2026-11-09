@@ -28,6 +28,9 @@ export function isoAt(s: unknown): s is string {
   return h < 24 && m < 60 && sec < 60;
 }
 
+/** G17 row 35: two created_at values that name the same real instant (GitHub writes `…03Z` and `…03.000Z` alike); anything unreadable: false. */
+export const sameInstant = (a: unknown, b: unknown): boolean => isoAt(a) && isoAt(b) && Date.parse(a) === Date.parse(b);
+
 export interface RepoRef { owner: string; repo: string }
 export interface TreeEntry { sha: string; mode: string; type: string }
 
