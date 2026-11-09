@@ -610,6 +610,28 @@ describe('listWriters', () => {
     expect(calls[0].url.searchParams.get('affiliation')).toBe('all');
   });
 
+  it('writers: a full page of 100 with no Link header (a proxy that strips it) is "can\'t tell": pipegen asks for the next page (G17 row 52)', async () => {
+    const user = (login: string) => ({ login, type: 'User', permissions: { pull: true, push: true, maintain: false, admin: false } });
+    const page1 = Array.from({ length: 100 }, (_, i) => user(`w${i}`));
+    // no Link header on either page: the second writer is on page 2
+    const { gh: client, calls } = gh({
+      [`GET ${API}/repos/o/r/collaborators`]: (c) => (c.url.searchParams.get('page') === '2' ? { body: [user('second')] } : { body: page1 }),
+    });
+    const got = await listWriters(client, 'o', 'r', clock());
+    expect(got).toHaveLength(101);
+    expect(got).toContain('second');
+    expect(calls).toHaveLength(2);
+    // exactly 100 writers: the extra page is empty, and that ends it
+    const two = gh({ [`GET ${API}/repos/o/r/collaborators`]: (c) => (c.url.searchParams.get('page') === '2' ? { body: [] } : { body: page1 }) });
+    expect(await listWriters(two.gh, 'o', 'r', clock())).toHaveLength(100);
+    expect(two.calls).toHaveLength(2);
+    // full pages to the cap with no Link header: pipegen can't tell it read them all, so it stops
+    const all = gh({ [`GET ${API}/repos/o/r/collaborators`]: () => ({ body: page1 }) });
+    const e = await caught(listWriters(all.gh, 'o', 'r', clock()));
+    expect(e).toBeInstanceOf(GitHubAccessError);
+    expect((e as Error).message).toMatch(/more than 5000 collaborators/);
+  });
+
   it('writers: refused call → error naming the missing permission', async () => {
     const { gh: client } = gh({ [`GET ${API}/repos/o/r/collaborators`]: refused(byPat, 'metadata=read') });
     const e = await caught(listWriters(client, 'o', 'r', clock()));

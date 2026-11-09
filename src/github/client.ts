@@ -792,6 +792,9 @@ export async function listWriters(gh: Octokit, owner: string, repo: string, cloc
   checkRepoNames(owner, [repo]);
   const writers: string[] = [];
   let more = false;
+  // G17 row 52 (G8-r2): a full page with no Link header (a proxy that strips it) can't tell whether more follow: ask for the next page; an
+  // empty or short page ends the list. A short list would plan the one-writer locks for a repo a second writer can push to.
+  let full = false;
   for (let page = 1; page <= WRITERS_PAGES; page++) {
     let data: unknown;
     try {
@@ -817,9 +820,10 @@ export async function listWriters(gh: Octokit, owner: string, repo: string, cloc
       const p = c.permissions ?? {};
       if ((p.push === true || p.maintain === true || p.admin === true) && !writers.includes(c.login)) writers.push(c.login);
     }
-    if (!more) break;
+    full = data.length >= 100;
+    if (!more && !full) break;
   }
   // G8-R3: GitHub still has pages at the cap; a short list would plan the locks as if fewer people could write, so stop instead
-  if (more) throw new GitHubAccessError(`${repoName(owner, repo)} has more than ${WRITERS_PAGES * 100} collaborators (GitHub still had more pages after ${WRITERS_PAGES}), too many for pipegen to read who can write; it can't plan who approves changes there.`);
+  if (more || full) throw new GitHubAccessError(`${repoName(owner, repo)} has more than ${WRITERS_PAGES * 100} collaborators (${more ? `GitHub still had more pages after ${WRITERS_PAGES}` : `page ${WRITERS_PAGES} was full and GitHub didn't say whether more follow`}), too many for pipegen to read who can write; it can't plan who approves changes there.`);
   return writers;
 }
