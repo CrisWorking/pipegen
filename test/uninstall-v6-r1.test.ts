@@ -403,7 +403,7 @@ describe('V6-R1: central now (sec M4, M5, spec M2, M5)', () => {
     w.central.rulesets.set(55, { name: CENTRAL_RULESET, source_type: 'Repository', source: 'o/pipelines', created_at: AT });
     w.settings.access = 'user';
     await afterRun1(w);
-    const edits: InstallEdit[] = [{ repo: 'central', path: '.github/CODEOWNERS', kind: 'codeowners', inserted: OWNERS_INS, originalSha: null, writtenShas: [blob(OWNERS_INS)] }];
+    const edits: InstallEdit[] = [{ repo: 'central', path: '.github/CODEOWNERS', kind: 'codeowners', inserted: OWNERS_INS, originalSha: null, writtenShas: [blob(OWNERS_INS)], baseShas: [null] } as InstallEdit /* V6b: chained from null, as deliver records it */];
     const rec = sampleRecord(w, { central: { repoId: w.central.id, createdByPipegen: true, rulesetId: 55, rulesetCreatedAt: AT, codeowners: { path: '.github/CODEOWNERS', created: true }, actionsAccess: { previous: 'none' } }, edits });
     const r1 = await run(w, rec);
     expect(r1.status).toBe('b-waiting');

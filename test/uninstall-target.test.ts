@@ -696,7 +696,7 @@ describe('V3 target: deleteCentralRepo', () => {
     schema: 2, pipegenVersion: '0.2.0', createdAt: AT, centralSha: SHA,
     app: { owner: OWNER, repo: 'shop', repoId: 101, defaultBranch: 'main', private: true, ownerType: 'Organization' },
     name: 'shop', serviceRoots: [], files: [{ repo: 'central', path: '.github/workflows/shop--merge.yml', part: 'pipeline', shas: [gitBlobSha('merge')] }],
-    edits: [{ repo: 'central', path: '.github/CODEOWNERS', kind: 'codeowners', inserted: 'x', originalSha: null, writtenShas: [gitBlobSha('owners')] }],
+    edits: [{ repo: 'central', path: '.github/CODEOWNERS', kind: 'codeowners', inserted: 'x', originalSha: null, writtenShas: [gitBlobSha('owners')], baseShas: [null] } as InstallRecord['edits'][number]],   // V6b: chained from null
     [LIST]: [], variables: [], environments: [], rulesets: [], central: { repoId: CENTRAL_ID, createdByPipegen: true },
     planned: { signingMode: 'none', environments: [], owners: { app: [], central: [] }, codeOwners: [] }, protectedPaths: [], ...over,
   });
@@ -734,6 +734,37 @@ describe('V3 target: deleteCentralRepo', () => {
     const out = await deleteCentralRepo(f.gh, opts.central ?? { owner: OWNER, repo: 'pipelines' }, opts.rec ?? recOf(), { askName: opts.askName ?? ask, clock: clock() });
     return { out, deletes: f.calls.filter((c) => c.route === 'DELETE /repos/{owner}/{repo}'), asked: ask.asked, calls: f.calls };
   };
+
+  it('V6b (G17C m4): the central CODEOWNERS counts as pipegen\'s file before the repo delete only when its writes chain from null', async () => {
+    const owners = gitBlobSha('owners');
+    const withEdit = (writtenShas: string[], baseShas?: (string | null)[]): InstallRecord => recOf({ edits: [{ repo: 'central', path: '.github/CODEOWNERS', kind: 'codeowners', inserted: 'x', originalSha: null, writtenShas, ...(baseShas === undefined ? {} : { baseShas }) } as InstallRecord['edits'][number]] });
+    // m4: the owner's blob held as a write (bases [null, owner]); an older record with no bases; short; broken
+    for (const rec of [withEdit([SHA, owners], [null, owners]), withEdit([owners]), withEdit([SHA, owners], [null]), withEdit([SHA, owners], [null, gitBlobSha('other')])]) {
+      const r = await run(world(), { rec });
+      expect(r.out.deleted, JSON.stringify(rec.edits)).toBe(false);
+      expect(r.out.why).toMatch(/files pipegen didn't write.*CODEOWNERS/);
+      expect(r.deletes).toEqual([]);
+    }
+    // chained from null: pipegen's
+    expect((await run(world(), { rec: withEdit([owners], [null]) })).out).toEqual({ deleted: true });
+    expect((await run(world(), { rec: withEdit([SHA, owners], [null, SHA]) })).out).toEqual({ deleted: true });
+  });
+
+  it('V6b (G17C-R1 m1): the central repo is deleted only with createdByPipegen and a recorded id equal to the live one', async () => {
+    expect((await run(world(), { rec: recOf({ central: { repoId: CENTRAL_ID, createdByPipegen: true } }) })).out).toEqual({ deleted: true });
+    for (const [central, live] of [
+      [{ repoId: CENTRAL_ID, createdByPipegen: false }, CENTRAL_ID],   // the id, but pipegen didn't create it
+      [{ createdByPipegen: true }, CENTRAL_ID],                         // created, but no id
+      [{ repoId: CENTRAL_ID + 1, createdByPipegen: true }, CENTRAL_ID], // a stale id: another repo of the same name
+      [{ repoId: CENTRAL_ID, createdByPipegen: true }, CENTRAL_ID + 1], // the same, from GitHub's side
+      [undefined, CENTRAL_ID],
+    ] as [InstallRecord['central'], number][]) {
+      const r = await run(world({ repo: { ...world().repo, id: live } }), { rec: recOf({ central }) });
+      expect(r.out.deleted, JSON.stringify([central, live])).toBe(false);
+      expect(r.deletes).toEqual([]);
+      expect(r.asked).toEqual([]);
+    }
+  });
 
   it('central: repo deleted only with no record and no file pipegen didn\'t write left', async () => {
     const ok = await run(world());
@@ -1330,7 +1361,8 @@ describe('V3 fix round 2', () => {
       if (route === 'POST /repos/{owner}/{repo}/git/commits') return { sha: sha(2) };
       return {};
     });
-    const edit = (path: string, originalSha: string | null): InstallRecord['edits'][number] => ({ repo: 'central', path, kind: 'codeowners', inserted: 'x', originalSha, writtenShas: [sha(3)] });
+    // V6b: the base of the one write recorded, as deliver does (chained from the original)
+    const edit = (path: string, originalSha: string | null): InstallRecord['edits'][number] => ({ repo: 'central', path, kind: 'codeowners', inserted: 'x', originalSha, writtenShas: [sha(3)], baseShas: [originalSha] }) as InstallRecord['edits'][number];
     const file = (path: string) => ({ path, content: '* @evil\n', mode: '100644' });
     const commit = (a: UninstallApi, files: { path: string; content: string; mode: string }[], deletes: string[], recordEdits?: InstallRecord['edits']) =>
       a.commitUninstall('central', { parent: SHA, baseTree: SHA, files, deletes, message: 'm', ...(recordEdits === undefined ? {} : { recordEdits }) });
@@ -1500,7 +1532,7 @@ describe('V3 fix round 2', () => {
         if (route === 'POST /repos/{owner}/{repo}/git/commits') return { sha: sha(2) };
         return {};
       });
-      const created: InstallRecord['edits'] = [{ repo: 'central', path: '.github/CODEOWNERS', kind: 'codeowners', inserted: 'x', originalSha: null, writtenShas: [sha(3), sha(4)] }];
+      const created: InstallRecord['edits'] = [{ repo: 'central', path: '.github/CODEOWNERS', kind: 'codeowners', inserted: 'x', originalSha: null, writtenShas: [sha(3), sha(4)], baseShas: [null, sha(3)] } as InstallRecord['edits'][number]];   // V6b: chained from null
       const entry = (s: string, over: Record<string, unknown> = {}) => ({ path: '.github/CODEOWNERS', sha: s, mode: '100644', type: 'blob', ...over });
       const del = (a: UninstallApi) => a.commitUninstall('central', { parent: SHA, baseTree: SHA, files: [], deletes: ['.github/CODEOWNERS', 'installs/shop.json'], message: 'm', recordEdits: created });
       for (const tree of [
@@ -1519,6 +1551,34 @@ describe('V3 fix round 2', () => {
       expect(await del(ok.api)).toEqual({ commit: sha(2), tree: sha(1) });
       // the parent tree once (V6's read of the central default branch, CENTRAL_HEAD, is the last-project check)
       expect(ok.calls.filter((c) => c.route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}' && c.params.tree_sha !== CENTRAL_HEAD).map((c) => c.params)).toEqual([{ owner: OWNER, repo: 'pipelines', tree_sha: SHA, recursive: '1' }]);
+    });
+
+    it('V6b (G17C m4): the central CODEOWNERS is deleted only when the record\'s writes chain from null, never over an owner blob an older record holds', async () => {
+      const sha = (n: number) => String(n).repeat(40).slice(0, 40);
+      const mk = () => api((route) => {
+        if (route === 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}') return { sha: SHA, tree: { sha: SHA } };
+        if (route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}') return { truncated: false, tree: [{ path: '.github/CODEOWNERS', sha: sha(5), mode: '100644', type: 'blob' }] };
+        if (route === 'POST /repos/{owner}/{repo}/git/trees') return { sha: sha(1) };
+        if (route === 'POST /repos/{owner}/{repo}/git/commits') return { sha: sha(2) };
+        return {};
+      });
+      const ed = (writtenShas: string[], baseShas?: (string | null)[]): InstallRecord['edits'] => [{ repo: 'central', path: '.github/CODEOWNERS', kind: 'codeowners', inserted: 'x', originalSha: null, writtenShas, ...(baseShas === undefined ? {} : { baseShas }) } as InstallRecord['edits'][number]];
+      const del = (a: UninstallApi, edits: InstallRecord['edits']) => a.commitUninstall('central', { parent: SHA, baseTree: SHA, files: [], deletes: ['.github/CODEOWNERS'], message: 'm', recordEdits: edits });
+      for (const edits of [
+        ed([sha(4), sha(5)], [null, sha(5)]),   // m4: a re-run that wrote nothing appended the owner's blob (a write based on itself)
+        ed([sha(5)]),                           // an older record: no bases
+        ed([sha(4), sha(5)], [null]),           // short
+        ed([sha(4), sha(5)], [null, sha(6)]),   // broken
+        ed([sha(5)], [sha(7)]),                 // the first base is not null (not created from nothing)
+      ]) {
+        const g = mk();
+        await expect(del(g.api, edits), JSON.stringify(edits)).rejects.toBeInstanceOf(UninstallRefusal);
+        expect(g.writes()).toEqual([]);
+      }
+      for (const edits of [ed([sha(5)], [null]), ed([sha(4), sha(5)], [null, sha(4)])]) {
+        const ok = mk();
+        expect(await del(ok.api, edits), JSON.stringify(edits)).toEqual({ commit: sha(2), tree: sha(1) });
+      }
     });
 
     it('R2b sec M-r2-4: the scan takes the Octokit namespaces from a client and refuses destructured, aliased, ?., bracket and .call forms and code inside ${…}', () => {

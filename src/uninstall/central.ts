@@ -19,7 +19,7 @@
 import type { Octokit } from '@octokit/rest';
 import type { Prompter } from '../cli/io.js';
 import { readBlobText, statusOf, type RepoRef, type TreeEntry } from '../deliver/git-data.js';
-import { centralUpdateBranch, recordPath } from '../deliver/record.js';
+import { centralUpdateBranch, editWritesChained, recordPath, type RecordedEdit } from '../deliver/record.js';
 import { centralFilesOf } from '../deliver/update.js';
 import { centralProjectName, centralWorkflowFile } from '../engine/central-path.js';
 import { isRateStop } from '../engine/github-rate.js';
@@ -379,7 +379,14 @@ export async function runCentral(o: {
     if (edit === undefined) { report.manual(what, 'the install record doesn\'t name exactly this one central CODEOWNERS pipegen edited, so pipegen leaves it', `Take pipegen's block out of ${co.path} in ${full} by hand.`); return; }
     const e = now?.entries.get(co.path);
     if (e === undefined) { report.done(`${what}: already gone`); return; }
-    if (co.created && edit.originalSha === null && edit.ownerEdited !== true) {
+    // V6b (G17C m4): a file pipegen created is pipegen's whole only when its writes chain from null (editWritesChained); an older record
+    // may hold the owner's blob as a write (a re-run that wrote nothing appended it), so anything else is the owner's to review
+    const wholeFile = edit.originalSha === null && editWritesChained(edit as RecordedEdit);
+    if (edit.originalSha === null && !wholeFile) {
+      report.manual(what, 'the install record doesn\'t prove every version of this file pipegen created was pipegen\'s own write, so pipegen doesn\'t delete it (it may hold the owner\'s lines)', `Take pipegen's block out of ${co.path} in ${full} by hand, or delete the file if it holds nothing else.`);
+      return;
+    }
+    if (co.created && wholeFile) {
       if (await commit({ files: [], deletes: [co.path], message: `pipegen uninstall: remove the central CODEOWNERS pipegen created (${show(co.path, 100)})` })) body.push(`- removes ${show(co.path)} (pipegen created it)`);
       return;
     }
