@@ -1,5 +1,6 @@
 // v0.2 Plan G G14: the production proof (src/cli/run-proof.ts) with recording fakes for GitHub, and the real fix loop, dispute decision
 // and state store; plus its wiring into `pipegen run` and `pipegen resume` (src/cli/run.ts, src/cli/main.ts).
+import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
@@ -1212,5 +1213,89 @@ describe('G14: the production arm', () => {
     } finally {
       kill.mockRestore();
     }
+  });
+});
+
+describe('G14fix: a private app through the real proof harness', () => {
+  it('run: a private app\'s proof builds its files with the real harness (no ops.appFiles) and gives it the central sha the setup pushed', async () => {
+    const w = await proofWorld({ private: true });
+    delete (w.ops as { appFiles?: unknown }).appFiles;
+    // the real harness reads HEAD's workflows for the compat copies: a real (empty) git repo
+    const dir = mkdtempSync(join(tmpdir(), 'pg-g14fix-'));
+    execFileSync('git', ['init', '-q', '-b', 'main', dir]);
+    execFileSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'i']);
+    w.input.dir = dir;
+    const shas: (string | undefined)[] = [];
+    const asm = w.input.assembleFor;
+    w.input.assembleFor = async (d) => { const a = await asm(d); return async (mode, sha) => { shas.push(sha); return (await a(mode, sha)).filter((f) => f.repo === 'central'); }; };
+    // (the world's stand-in app workflows break the real proof rules; the real harness is the app workflow under test)
+    const r = await w.run();
+    expect(r.stopped ?? '').toBe('');
+    expect(r.ok).toBe(true);
+    // the harness and the app's files are only ever built for the central commit the setup pushed
+    expect(shas.filter((s) => s !== undefined && s !== 'c'.repeat(40))).toEqual([]);
+    const harness = w.pushed.find((x) => x.variant === 'setup')?.files.find((f) => f.path === HARNESS_PATH) as { content?: unknown } | undefined;
+    expect(String(harness?.content)).toContain('c'.repeat(40));
+  });
+
+  it('run: a private app whose workflows built for the central sha read another secret than the scratch keys were made for stops, cleaned up', async () => {
+    const w = await proofWorld({ private: true });
+    const appFiles = w.ops.appFiles as NonNullable<typeof w.ops.appFiles>;
+    w.ops.appFiles = (d, deps) => {
+      const real = appFiles(d, deps);
+      return { last: real.last, appFiles: async (sha) => [...await real.appFiles(sha), { repo: 'app', path: '.github/workflows/extra.yml', content: 'on: [push]\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: echo ${{ secrets.OTHER_ONE }}\n', part: 'pipeline', reason: 'r' }] };
+    };
+    const r = await w.run();
+    expect(r.ok).toBe(false);
+    expect(r.stopped).toContain('other secrets than the ones the scratch keys were made for');
+    expect(w.tl.some((x) => x.startsWith('cleanup:'))).toBe(true);
+    // G14fix-R1 F1/F5: the check runs in the setup's appFiles callback, before any GitHub write (no secret stored, no branch pushed),
+    // the keys are deleted before the cleanup, and no proof ran
+    expect(w.tl.some((x) => x === 'secretStore' || x.startsWith('keys.setup:') || x.startsWith('push:') || x.startsWith('pushBranch:'))).toBe(false);
+    expect(at(w.tl, 'keys.deleteAll')).toBeGreaterThan(-1);
+    expect(at(w.tl, 'keys.deleteAll')).toBeLessThan(w.tl.findIndex((x) => x.startsWith('cleanup:')));
+    expect(w.tl.some((x) => x.startsWith('variant:') || x === 'evaluate')).toBe(false);
+  });
+
+  it('run: a private app whose assembled workflows break a proof rule is refused before any GitHub write (G14fix-R1 F2)', async () => {
+    const w = await proofWorld({ private: true });
+    delete (w.ops as { appFiles?: unknown }).appFiles;
+    const dir = mkdtempSync(join(tmpdir(), 'pg-g14fix-'));
+    execFileSync('git', ['init', '-q', '-b', 'main', dir]);
+    execFileSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'i']);
+    w.input.dir = dir;
+    // the world's stand-in app workflows (unpinned actions, no egress step) break the real proof rules
+    await expect(w.run()).rejects.toThrow(/breaks a proof rule/);
+    expect(w.tl.some((x) => x === 'arm' || x === 'checkRepos' || x === 'setup' || x === 'proofStart')).toBe(false);
+  });
+
+  // G14fix-R2 M2: the precheck's two other parts, each refused before arm (before checkRepos can create the helper repos)
+  const gitDir = (): string => {
+    const dir = mkdtempSync(join(tmpdir(), 'pg-g14fix-'));
+    execFileSync('git', ['init', '-q', '-b', 'main', dir]);
+    execFileSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'i']);
+    return dir;
+  };
+  const noWrite = (tl: readonly string[]): boolean => !tl.some((x) => x === 'arm' || x === 'checkRepos' || x === 'setup' || x === 'proofStart' || x === 'secretStore' || x.startsWith('push:'));
+
+  it('run: a private app whose assembled app file claims the harness path is refused before arm (G14fix-R2 R2, HARNESS_PATH reserved)', async () => {
+    const w = await proofWorld({ private: true });
+    delete (w.ops as { appFiles?: unknown }).appFiles;
+    w.input.dir = gitDir();
+    const asm = w.input.assembleFor;
+    // only the central files of the world's stand-in (its app workflows break the proof rules), plus one app file at the harness's path
+    w.input.assembleFor = async (d) => { const a = await asm(d); return async (mode, sha) => [...(await a(mode, sha)).filter((f) => f.repo === 'central'), { repo: 'app' as const, path: HARNESS_PATH, content: 'name: x\non: [pull_request]\njobs: {}\n', part: 'pipeline' as const, reason: 'r' }]; };
+    await expect(w.run()).rejects.toThrow(/Two proof files have the path/);
+    expect(noWrite(w.tl)).toBe(true);
+  });
+
+  it('run: a private app whose HEAD pipegen cannot read for the compat copies is refused before arm (G14fix-R2 R4)', async () => {
+    const w = await proofWorld({ private: true });
+    delete (w.ops as { appFiles?: unknown }).appFiles;
+    w.input.dir = mkdtempSync(join(tmpdir(), 'pg-g14fix-nogit-'));
+    const asm = w.input.assembleFor;
+    w.input.assembleFor = async (d) => { const a = await asm(d); return async (mode, sha) => (await a(mode, sha)).filter((f) => f.repo === 'central'); };
+    await expect(w.run()).rejects.toThrow();
+    expect(noWrite(w.tl)).toBe(true);
   });
 });
