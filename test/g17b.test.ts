@@ -294,6 +294,14 @@ describe('G17B-R0/R1 round 2: the image build of a Dockerfile pipegen creates in
     expect(shown(await judge([...files(a), ...created()], a.draft))).toBe('');
   });
 
+  it('assemble: only a Dockerfile created at the service\'s own folder counts (another folder\'s, or one of the other repository, is no build of it)', () => {
+    const needs = floorNeeds(profileOf([svcNoDf()]), CAPS).filter((n) => n.id !== 'dast');
+    for (const moved of [created().map((f) => ({ ...f, path: `other/${f.path}` })), created().map((f) => ({ ...f, repo: 'central' as const }))]) {
+      const x = planned(profileOf([svcNoDf()]), { needs, over: { created: moved, ...SKIP_DEPLOY }, edit: (s) => s.filter((st) => st.needId !== 'dast') });
+      expect(() => assemble(x)).toThrow(/its image is not built \(The service "app" has no Dockerfile to build\.\)/);
+    }
+  });
+
   it('referee: the image build of a created Dockerfile is pipegen\'s only while the draft creates that file', async () => {
     const a = assemble(planned(profileOf([svcNoDf()]), { over: { created: created(), ...SKIP_DEPLOY } }));
     // the same workflow files judged against a draft that creates no Dockerfile: the build and its scan are no steps of pipegen's
