@@ -736,10 +736,10 @@ describe('G10 delivery: secrets and settings before the merge', () => {
     });
     const out = await makeRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, 'main', { clock: { budget: newRateBudget(), sleep: async () => {} }, local: { home: w.home, env: {} }, now: new Date('2026-11-05T12:00:00Z') });
     expect(out).toEqual({ off: expect.stringMatching(/not one pipegen just made/) });
-    // no rule added to it, nothing deleted, nothing listed as pipegen's
+    // no rule added to it, nothing deleted; G-SIGN1-R3 sec r2-L2: listed by name only (no created_at: never taken for pipegen's own)
     expect(w.g.calls.some((c) => c.route.startsWith('POST ') || c.route.startsWith('DELETE '))).toBe(false);
     expect(w.g.repo('o/r').envs.get('pipegen-signing')?.stored.has('TEAM_NOTE')).toBe(true);
-    expect(existsSync(join(w.home, '.config', 'pipegen', 'records', 'o__r.leftovers.json'))).toBe(false);
+    expect((JSON.parse(readFileSync(join(w.home, '.config', 'pipegen', 'records', 'o__r.leftovers.json'), 'utf8')) as { items: unknown[] }).items).toEqual([{ kind: 'environment', name: 'pipegen-signing', repo: 'o/r' }]);
   });
 
   it('makeRunSigningEnvironment: G-SIGN1-R2 sec M2 a leftovers file it can not read or write is found before the PUT (off, nothing written); one that fails after the make deletes the environment', async () => {
@@ -771,6 +771,18 @@ describe('G10 delivery: secrets and settings before the merge', () => {
     expect(e).toBeInstanceOf(DeliverError);
     expect((e as DeliverError).message).toMatch(/pipegen-signing/);
     expect((e as DeliverError).leftovers).toEqual(['environment pipegen-signing']);
+    // G-SIGN1-R3 wording: the leftovers write itself failed, so the message never says it stays listed
+    expect((e as DeliverError).message).not.toMatch(/stays listed/);
+    // spec L3's path with a leftovers write that fails (the rule POST refused, the file broken, the delete refused): not "stays listed"
+    const w5 = world();
+    w5.g.hooks.push((c) => {
+      if (c.route === 'POST /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies') { mkdirSync(join(w5.home, '.config', 'pipegen', 'records'), { recursive: true }); writeFileSync(file(w5), 'not json'); return { status: 403, data: { message: 'nope' } }; }
+      return c.route === 'DELETE /repos/{owner}/{repo}/environments/{environment_name}' ? { status: 403, data: { message: 'nope' } } : undefined;
+    });
+    const o5 = await make(w5);
+    expect(o5).toEqual({ off: expect.stringMatching(/couldn't delete it/) });
+    expect((o5 as { off: string }).off).not.toMatch(/stays listed/);
+    expect((o5 as { off: string }).off).toMatch(/couldn't list it/);
   });
 
   it('dropRunSigningEnvironment: deletes the environment this run made and takes it off the leftovers file (G-SIGN1-R1)', async () => {

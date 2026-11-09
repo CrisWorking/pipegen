@@ -342,12 +342,17 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     if (e instanceof AssembleError) for (const t of dastWayPast(e.message, hinted)) err(t);
     return 1;
   } finally {
-    // ruling G-SIGN1-R1: a run that stops before delivery (any exit path) deletes the environment it made
+    // ruling G-SIGN1-R1: a run that stops before delivery (any exit path) deletes the environment it made. G-SIGN1-R3 (sec r2-L1): while a
+    // stop is under way the hook stays armed, so the registry runs it inside its awaited hook phase (deadline, state record)
     const drop = dropEnv as (() => Promise<void>) | null;
     dropEnv = null;
-    try { (disarmEnv as (() => void) | null)?.(); } catch { /* the hook only deletes what this run made */ }
-    disarmEnv = null;
-    if (drop !== null) await drop().catch(() => undefined);
+    if (drop !== null && (deps.interrupting ?? interrupting)()) {
+      disarmEnv = null;
+    } else {
+      try { (disarmEnv as (() => void) | null)?.(); } catch { /* the hook only deletes what this run made */ }
+      disarmEnv = null;
+      if (drop !== null) await drop().catch(() => undefined);
+    }
     (vault as SecretVault | null)?.wipe();
     (keyVault as SecretVault | null)?.wipe();
     try { (disarm as (() => void) | null)?.(); } catch { /* the state file keeps what was done */ }
@@ -504,6 +509,8 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     let trusted: Awaited<ReturnType<RunStages['trusted']>>;
     let made: Creators = { files: [], notes: [], testNotes: [], testDecisions: [], notProven: [] };
     let runSigningEnv: SigningEnvEntry | undefined;
+    /** G-SIGN1-R3 (spec r2-L1): the delivery happened (an environment it didn't use is deleted with another message). */
+    let deliveredRun = false;
     /** G-SIGN1-R2 sec M3: (re-)arms the environment's interrupt hook; the proof's arm calls it again, so it runs after the proof's hooks. */
     let armEnvHook: (() => void) | null = null;
     if (saved0 !== null) {
@@ -527,13 +534,14 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
           if (ran) return;
           ran = true;
           const r = await st.dropSigningEnv(facts, p, made).catch(() => ({ left: 'an error' }));
-          if ('dropped' in r) err(SIGNING_ENV_DELETED);
+          if ('dropped' in r) err(deliveredRun ? SIGNING_ENV_UNUSED : SIGNING_ENV_DELETED);
           else err(`pipegen couldn't delete the environment ${SIGNING_ENVIRONMENT} it made earlier in this run (${safeText(r.left, 600)}). Remove it by hand in the repository settings.`);
         };
         dropEnv = once;
         armEnvHook = () => {
           try { (disarmEnv as (() => void) | null)?.(); } catch { /* re-armed below */ }
-          // G-SIGN1-R2 sec M3: a label, a short deadline, its leftover into the run's state file (for `pipegen cleanup`)
+          // G-SIGN1-R2 sec M3: a label, a short deadline, and a line in the run's state file if it doesn't finish (to be seen; the local
+          // leftovers file is what keeps the environment for uninstall)
           disarmEnv = (deps.armSigningEnv ?? defaultArmSigningEnv)(once, { label: SIGNING_ENV_HOOK_LABEL, deadlineMs: SIGNING_ENV_HOOK_DEADLINE_MS, record: (item) => { runStore.record(item); } });
         };
         armEnvHook();
@@ -730,6 +738,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     if ((deps.interrupting ?? interrupting)()) { err(STOP_AT_HAND_OFF); return 1; }
     if (handOver) { try { (disarmEnv as (() => void) | null)?.(); } finally { disarmEnv = null; dropEnv = null; } }
     const res = await st.deliver(facts, p, input, vault, io, keyEnv && key !== undefined ? async () => key : undefined);
+    deliveredRun = true;
     store.setStage('delivered');
     // carry 19 (spec I4): everything delivery says
     for (const d of res.done) out(`done: ${safeText(d, 300)}`);
@@ -778,6 +787,8 @@ export const RUN_SIGNS_NOTE = `pipegen made the environment ${SIGNING_ENVIRONMEN
 
 /** Ruling G-SIGN1-R1: the deletion notice of a run that stopped before delivery. */
 export const SIGNING_ENV_DELETED = `pipegen deleted the environment ${SIGNING_ENVIRONMENT} it made earlier in this run: nothing was delivered.`;
+/** G-SIGN1-R3 (spec r2-L1): the delivered pipeline didn't use the environment the run made. */
+export const SIGNING_ENV_UNUSED = `pipegen deleted the environment ${SIGNING_ENVIRONMENT} it made earlier in this run: the delivered pipeline doesn't sign with it.`;
 /** Ruling G-SIGN1-R1: the production arm (an interrupt hook, like the proof's keys). */
 export const defaultArmSigningEnv = (cleanup: () => Promise<void>, opts: InterruptOptions): (() => void) => onInterrupt(async () => { await cleanup(); }, opts);
 /** G-SIGN1-R2 sec M3: the environment hook's label (a constant) and its deadline (short: the environment holds no secret yet). */

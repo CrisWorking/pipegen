@@ -140,6 +140,10 @@ describe('docs', () => {
     // G-SIGN1-R2: the /dev/shm fallback has its row; SIGN-3 also tries another case of the name (GitHub's names are case-insensitive)
     expect(signing.map((r) => r.join(' ')).join('\n')).toMatch(/\/dev\/shm.*Signing is off \(mode none\)/is);
     expect(signing.find((r) => r[0] === 'SIGN-3')?.[1]).toMatch(/`Pipegen-Signing`/);
+    // G-SIGN1-R3: SIGN-1 checks the PUT answer's equal timestamps (live); SIGN-2: the run stores the key pair, not `finish`
+    expect(signing.find((r) => r[0] === 'SIGN-1')?.[1]).toMatch(/`created_at` equal to `updated_at`/);
+    expect(signing.find((r) => r[0] === 'SIGN-2')?.[1]).not.toMatch(/key pair `finish` stored/);
+    expect(signing.find((r) => r[0] === 'SIGN-2')?.[1]).toMatch(/key pair the run stored/);
     expect(signing.map((r) => r.join(' ')).join('\n')).toMatch(/re-run.*environment exists.*signs/is);
     for (const r of signing) expect(r.at(-1)).toBe('not run');
     expect(text).toMatch(/G-SIGN1/);

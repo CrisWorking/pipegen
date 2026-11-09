@@ -1752,5 +1752,32 @@ describe('G-SIGN1: the signing mode re-derived after the run makes its own signi
     expect(await run(w2)).toBe(0);
     expect(w2.calls).not.toContain('signingEnv');
   });
+
+  // ---------- ruling G-SIGN1-R3 ----------
+
+  it('run: G-SIGN1-R3 sec r2-L1 a stop under way at the end leaves the environment hook armed for the registry (no direct delete)', async () => {
+    let disarms = 0;
+    const w = dropWorld({ deps: { interrupting: () => w.calls.includes('preview'), armSigningEnv: () => () => { disarms += 1; } } });
+    expect(await run(w)).toBe(1);
+    expect(w.calls).not.toContain('deliver');
+    // the registry's live queue runs the hook (awaited, its deadline and its state record); the run neither disarms it nor deletes itself
+    expect(w.calls).not.toContain('dropSigningEnv');
+    expect(disarms).toBe(0);
+    // no stop under way: the run deletes it itself, and disarms the hook
+    let d2 = 0;
+    const w2 = dropWorld({ deps: { interrupting: () => false, armSigningEnv: () => () => { d2 += 1; } } }, { dropped: true });
+    expect(await run(w2, io({ preview: false }))).toBe(1);
+    expect(w2.calls.filter((c) => c === 'dropSigningEnv')).toHaveLength(1);
+    expect(d2).toBe(1);
+  });
+
+  it('run: G-SIGN1-R3 spec r2-L1 an environment the delivered pipeline did not use is deleted with a message that does not say nothing was delivered', async () => {
+    const w = dropWorld({ built: (i) => { const b = builtOf(i); (b.assembled.draft as PipelineDraft).signing = undefined; return b; } });
+    const i = io();
+    expect(await run(w, i)).toBe(0);
+    expect(w.calls).toContain('dropSigningEnv');
+    expect(i.errs.join('\n')).not.toMatch(/nothing was delivered/);
+    expect(i.errs.join('\n')).toMatch(/pipegen deleted the environment pipegen-signing it made earlier in this run: the delivered pipeline doesn't sign with it/);
+  });
 });
 type DeliveryInputLike = { signingEnv?: unknown };
