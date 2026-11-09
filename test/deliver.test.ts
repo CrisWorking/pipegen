@@ -26,6 +26,7 @@ import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
 import type { CreatedFile, PipelineDraft, RepoProfile } from '../src/types.js';
 import { cosignKey, cosignPub } from './helpers/cosign-keys.js';
 import { FakeGitHub } from './helpers/deliver-github.js';
+import { StateStore } from '../src/proof/state.js';
 
 // ---------- fixtures ----------
 
@@ -2063,5 +2064,75 @@ describe('G17C: the install record and delivery', () => {
     expect(r2.secrets.find((s) => s.name === FP)).toMatchObject({ created: true });
     expect(r2.secrets.find((s) => s.name === KEY)).toMatchObject({ created: true });
     expect(w.asked.some((q) => q.includes(KEY) && /pipegen stored it on an earlier run/.test(q))).toBe(true);
+  });
+});
+
+// ---------- Plan V M5: the app's lease ----------
+
+describe('Plan V M5: deliver holds the app lease', () => {
+  const app = { owner: 'o', repo: 'r' };
+  const st = (w: World) => ({ home: w.home, env: {} });
+  it('deliver: another pipegen holding the app lease (an uninstall) stops deliver and deliverCentral before any GitHub call', async () => {
+    const w = world();
+    const p = profile();
+    const other = await StateStore.open(app, st(w));
+    other.acquireLease('uninstall-x', 'uninstall');
+    const e1 = await deliverCentral(w.g.octokit(), p, centralFiles(), { clock: { budget: newRateBudget(), sleep: async () => {} }, ...cdeps(w) }).then(() => null, (x: unknown) => x);
+    expect(e1).toBeInstanceOf(DeliverError);
+    expect((e1 as Error).message).toMatch(/Another pipegen \(`pipegen uninstall`, process \d+\) is working on .* Nothing was delivered\./);
+    const e2 = await deliver(w.g.octokit(), p, planDelivery(input(p, 'c'.repeat(40))), w.vault, deps(w)).then(() => null, (x: unknown) => x);
+    expect(e2).toBeInstanceOf(DeliverError);
+    expect((e2 as Error).message).toMatch(/`pipegen uninstall`/);
+    expect(w.g.calls).toEqual([]);
+    other.releaseLease();
+  });
+
+  it('deliver: run→deliver no deadlock: the lease run holds is passed down, not taken again, and stays held after', async () => {
+    const w = world();
+    const run = await StateStore.open(app, st(w));
+    run.acquireLease('20261106-100000-abc123', 'run');
+    const { res } = await (async () => {
+      const p = profile();
+      const c = await deliverCentral(w.g.octokit(), p, centralFiles(), { clock: { budget: newRateBudget(), sleep: async () => {} }, ...cdeps(w), lease: run });
+      if (c.kind !== 'pinned') throw new Error('expected a pin');
+      expect(run.holdsLeaseFor(app)).toBe(true);
+      const plan = planDelivery(input(p, c.sha, c.committed === true ? { centralCommitted: c.sha } : {}));
+      return { res: await deliver(w.g.octokit(), p, plan, w.vault, deps(w, { lease: run })) };
+    })();
+    expect(res.prNumber).toBeGreaterThan(0);
+    expect(run.holdsLeaseFor(app)).toBe(true);
+    // still run's: another pipegen can't take it until run gives it back
+    const probe = await StateStore.open(app, st(w));
+    expect(() => { probe.acquireLease('probe', 'finish'); }).toThrow(/`pipegen run`/);
+    run.releaseLease();
+    probe.acquireLease('probe', 'finish');
+    probe.releaseLease();
+  });
+
+  it('deliver: a passed-down store that holds no lease (or another app\'s) is a stop, not a new lease', async () => {
+    const w = world();
+    const p = profile();
+    const none = await StateStore.open(app, st(w));
+    await expect(deliver(w.g.octokit(), p, planDelivery(input(p, 'c'.repeat(40))), w.vault, deps(w, { lease: none }))).rejects.toThrow(/handed a lease it doesn't hold/);
+    const elsewhere = await StateStore.open({ owner: 'o', repo: 'other' }, st(w));
+    elsewhere.acquireLease('x', 'run');
+    await expect(deliver(w.g.octokit(), p, planDelivery(input(p, 'c'.repeat(40))), w.vault, deps(w, { lease: elsewhere }))).rejects.toThrow(/handed a lease it doesn't hold/);
+    elsewhere.releaseLease();
+    expect(w.g.calls).toEqual([]);
+  });
+
+  it('deliver: the lease it takes is given back on success and on an error', async () => {
+    const w = world();
+    await firstRun(w);
+    const probe = await StateStore.open(app, st(w));
+    probe.acquireLease('after-ok', 'finish');
+    probe.releaseLease();
+    // an error mid-delivery (GitHub refuses a write): the lease is given back too
+    const w2 = world();
+    w2.g.hooks.push((call) => (call.route.startsWith('POST /repos/{owner}/{repo}/git/trees') ? { status: 500 } : undefined));
+    await expect(firstRun(w2)).rejects.toThrow();
+    const probe2 = await StateStore.open(app, st(w2));
+    probe2.acquireLease('after-error', 'finish');
+    probe2.releaseLease();
   });
 });

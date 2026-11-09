@@ -3,7 +3,7 @@
 // compares any patch the issue carries (a differing one is refused and shown), touches only the files the install record lists, merges an
 // owner-edited file 3-way (or lists it as a conflict, never overwriting it), marks the result owner-edited, and appends every blob sha it writes
 // to the record through writeRecord. Every GitHub call goes to an in-memory GitHub (test/helpers/deliver-github.ts); no network.
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -18,6 +18,7 @@ import {
 } from '../src/deliver/update.js';
 import type { InstallRecord, ReviewedTool } from '../src/types.js';
 import { FakeGitHub } from './helpers/deliver-github.js';
+import { StateStore } from '../src/proof/state.js';
 
 // ---------- fixtures ----------
 
@@ -1008,5 +1009,64 @@ describe('G17 group D: update (rows 46-51)', () => {
     const appBody = prsOf(v, 'o/r')[0]?.body ?? '';
     expect(appBody).not.toBe('');
     expect(appBody).not.toContain(`o/pipelines#${centralIssue.number as number}`);
+  });
+});
+
+// ---------- Plan V M5: the app's lease ----------
+
+describe('Plan V M5: update holds the app lease', () => {
+  const st = (w: World) => ({ home: w.home, env: {} });
+  it('update: another pipegen holding the app lease (finish) stops update before any GitHub call, naming it', async () => {
+    const w = await publicWorld();
+    w.issues.app = [genuine(w)];
+    const other = await StateStore.open(app, st(w));
+    other.acquireLease('finish-abc', 'finish');
+    const from = w.g.calls.length;
+    const e = await update(w.g.octokit(), app, deps(w)).then(() => null, (x: unknown) => x);
+    expect(e).toBeInstanceOf(UpdateError);
+    expect((e as Error).message).toMatch(/^Another pipegen \(`pipegen finish`, process \d+\) is working on .* Nothing was changed\.$/);
+    expect(w.g.calls.length).toBe(from);
+    other.releaseLease();
+    // an unreadable lease: never taken over, a stop
+    writeFileSync(join(other.dir, 'lease.json'), 'not json', { mode: 0o600 });
+    await expect(update(w.g.octokit(), app, deps(w))).rejects.toThrow(/lease .*lease\.json can't be read.* Nothing was changed\./);
+    expect(w.g.calls.length).toBe(from);
+    rmSync(join(other.dir, 'lease.json'));
+    // once finish is over, update runs, and gives the lease back
+    const res = await update(w.g.octokit(), app, deps(w));
+    expect(res.prUrl).toBeDefined();
+    other.acquireLease('after', 'finish');
+    other.releaseLease();
+  });
+
+  it('update: G-LEASE-R1 (spec I1) a corrupt or 0644 proof state file beside the lease does not stop update (it never reads it)', async () => {
+    for (const bad of ['corrupt', '0644'] as const) {
+      const w = await publicWorld();
+      w.issues.app = [genuine(w)];
+      const dir = join(w.home, '.cache', 'pipegen', 'o__r');
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      chmodSync(join(w.home, '.cache'), 0o700); chmodSync(join(w.home, '.cache', 'pipegen'), 0o700);
+      writeFileSync(join(dir, 'state.json'), bad === 'corrupt' ? '{' : '{"version":1}', { mode: 0o600 });
+      if (bad === '0644') chmodSync(join(dir, 'state.json'), 0o644);
+      expect((await update(w.g.octokit(), app, deps(w))).prUrl).toBeDefined();
+    }
+  });
+
+  it('update: the lease is given back on an error', async () => {
+    const w = await publicWorld();
+    w.g.hooks.push((call) => (call.route === 'GET /repos/{owner}/{repo}' && call.params.repo === 'pipelines' ? { status: 404 } : undefined));
+    await expect(update(w.g.octokit(), app, deps(w))).rejects.toThrow(UpdateError);
+    const probe = await StateStore.open(app, st(w));
+    probe.acquireLease('after-error', 'finish');
+    probe.releaseLease();
+  });
+
+  it('update: a lease passed down is used, not taken again, and stays held', async () => {
+    const w = await publicWorld();
+    const held = await StateStore.open(app, st(w));
+    held.acquireLease('run-x', 'run');
+    await update(w.g.octokit(), app, deps(w, { lease: held }));
+    expect(held.holdsLeaseFor(app)).toBe(true);
+    held.releaseLease();
   });
 });

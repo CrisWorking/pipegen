@@ -1,5 +1,5 @@
 // v0.2 Plan G G13: `pipegen run` (src/cli/run.ts) with fake stages, and its pure parts (src/cli/run-parts.ts) with the real modules.
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
@@ -37,6 +37,8 @@ import { estimate, needKeyCount } from '../src/estimate/estimate.js';
 import { AssembleError } from '../src/layers/jobs.js';
 import { DeliverError } from '../src/deliver/git-data.js';
 import { pubKeySha256 } from '../src/engine/signing.js';
+import { holdAppLease } from '../src/proof/lease.js';
+import { runExitHooks } from '../src/util/exit-hooks.js';
 import { StateStore } from '../src/proof/state.js';
 import type { CreatedFile, InstallRecord, Need, PipelineDraft, RepoProfile } from '../src/types.js';
 import { fake } from './helpers/secret-repo.js';
@@ -225,6 +227,31 @@ describe('G13: the run, in order', () => {
     expect(store.load()?.proofOk).toBe(true);
     expect(i.errs[0]).toBe(SCOPE_LINE);
     expect(i.lines.join('\n')).toContain('delivery note');
+  });
+
+  it('run: passes its own app lease down to deliverCentral, deliver and finish: no second lease, no self-deadlock (Plan V M5)', async () => {
+    const w = world();
+    const app = { owner: OWN, repo: 'r' };
+    const st = { home: w.home, env: {} };
+    const seen: Record<string, boolean> = {};
+    const check = async (name: string, lease: StateStore): Promise<void> => {
+      seen[name] = lease.holdsLeaseFor(app);
+      // the lease run passes down is accepted, not taken again, and stays held after
+      (await holdAppLease(app, 'finish', { held: lease, state: st }))();
+      expect(lease.holdsLeaseFor(app)).toBe(true);
+      // a second lease taken in this process while run holds it would stop on run's own process: why run passes its own down
+      await expect(holdAppLease(app, 'finish', { state: st })).rejects.toThrow(/Another pipegen \(`pipegen run`, process \d+\)/);
+    };
+    const { deliverCentral: dc, deliver: dl, finish: fi } = w.stages as Required<Pick<RunStages, 'deliverCentral' | 'deliver' | 'finish'>>;
+    w.stages.deliverCentral = async (f, p, files, i2, pr, lease) => { await check('deliverCentral', lease); return dc(f, p, files, i2, pr, lease); };
+    w.stages.deliver = async (f, p, input, v, i2, key, lease) => { await check('deliver', lease); return dl(f, p, input, v, i2, key, lease); };
+    w.stages.finish = async (f, p, i2, lease) => { await check('finish', lease); return fi(f, p, i2, lease); };
+    expect(await run(w)).toBe(0);
+    expect(seen).toEqual({ deliverCentral: true, deliver: true, finish: true });
+    // given back when run ends
+    const after = await StateStore.open(app, st);
+    after.acquireLease('after', 'finish');
+    after.releaseLease();
   });
 
   it('run: remote read before auth, auth before readProject', async () => {
@@ -1063,8 +1090,19 @@ describe('G13: main dispatch', () => {
 // ---------- finish, verify, update: what they print ----------
 
 describe('G13: finish, verify and update print their results', () => {
-  const g = { gh: {} as Octokit, login: 'alice', local: { env: {} } };
+  const g = { gh: {} as Octokit, login: 'alice', local: { env: {} }, lease: undefined };
   const app = { owner: 'o', repo: 'r' };
+
+  it('finish and update: a lease the caller holds is passed on; none → none (they take their own) (Plan V M5)', async () => {
+    const held = await StateStore.open(app, { home: tmp('pg-lease-'), env: {} });
+    held.acquireLease('run-x', 'run');
+    const got: unknown[] = [];
+    await finishCommand(io(), app, {}, { ...g, lease: held }, (async (_g: unknown, _a: unknown, _o: unknown, d: Record<string, unknown>) => { got.push(d.lease); return { applied: [], skipped: [], notes: [] }; }) as never);
+    await updateCommand(io(), app, { ...g, lease: held }, (async (_g: unknown, _a: unknown, d: Record<string, unknown>) => { got.push(d.lease); return { done: false, preview: '', prompts: [], ignored: [], refused: [], conflicts: [], notes: [] }; }) as never);
+    await finishCommand(io(), app, {}, g, (async (_g: unknown, _a: unknown, _o: unknown, d: Record<string, unknown>) => { got.push(d.lease); return { applied: [], skipped: [], notes: [] }; }) as never);
+    expect(got).toEqual([held, held, undefined]);
+    held.releaseLease();
+  });
 
   it('finish --print: the commands, the applied and skipped steps, the record hash; exit 0', async () => {
     let deps: Record<string, unknown> = {};
@@ -1769,6 +1807,24 @@ describe('G-SIGN1: the signing mode re-derived after the run makes its own signi
     expect(await run(w2, io({ preview: false }))).toBe(1);
     expect(w2.calls.filter((c) => c === 'dropSigningEnv')).toHaveLength(1);
     expect(d2).toBe(1);
+  });
+
+  it('run: G-LEASE-R1 (sec M1, probe P1) a run stopped by an interrupt keeps its lease while the armed env-drop hook may still write; the exit hook drops it after', async () => {
+    let hook: (() => Promise<void>) | undefined;
+    const w = dropWorld({ deps: { interrupting: () => w.calls.includes('preview'), armSigningEnv: (cleanup) => { hook = cleanup; return () => {}; } } });
+    expect(await run(w)).toBe(1);
+    expect(hook).toBeDefined();
+    expect(w.calls).not.toContain('dropSigningEnv');
+    const leaseFile = join((await StateStore.open({ owner: OWN, repo: 'r' }, { home: w.home, env: {} })).dir, 'lease.json');
+    expect(existsSync(leaseFile)).toBe(true);
+    // another pipegen (finish) on this machine can't start while the hook phase runs
+    await expect(holdAppLease({ owner: OWN, repo: 'r' }, 'finish', { state: { home: w.home, env: {} } })).rejects.toThrow(/`pipegen run`/);
+    await (hook as () => Promise<void>)();
+    expect(w.calls).toContain('dropSigningEnv');
+    // the end of the hook phase: the sync exit hooks drop the lease
+    runExitHooks();
+    expect(existsSync(leaseFile)).toBe(false);
+    (await holdAppLease({ owner: OWN, repo: 'r' }, 'finish', { state: { home: w.home, env: {} } }))();
   });
 
   it('run: G-SIGN1-R3 spec r2-L1 an environment the delivered pipeline did not use is deleted with a message that does not say nothing was delivered', async () => {
