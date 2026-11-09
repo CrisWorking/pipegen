@@ -113,6 +113,8 @@ Runs on a push to a branch that has no open pull request.
 
 Runs on every pull request and decides whether it can merge. The gate (the check \`pipegen / gate\`) reads every result.
 
+A check marked "Blocks a pull request" blocks only after you run \`npx pipegen finish\`, which turns on the merge locks. Until then a failed gate shows on the pull request but does not stop the merge.
+
 - Secret scan, tool betterleaks/betterleaks. Looks for passwords, keys and tokens in the code and in the commits of a pull request. Blocks a pull request.
 - Code scan, service "shop-api", tool semgrep/semgrep. Looks for insecure code patterns in your source. Blocks a pull request.
 - Code scan, service "jobs-runner", tool semgrep/semgrep. Looks for insecure code patterns in your source. Blocks a pull request.
@@ -153,6 +155,13 @@ Runs on a push to the default branch: it builds, signs and checks the images tha
 - npm only: pnpm, yarn and bun are not supported yet. A Vue, Svelte or Astro TypeScript repository stops at assembly with a plain reason, because pipegen has no reviewed type checker for it.
 - The nightly job has a \`concurrency\` group, so runs never overlap. An issue it opened and any bot closed (even a stale bot running as the github-actions bot) is reopened by design. Only a person can dismiss it.
 - After rewriting main's history (a force-push), the gate may stay in block mode until 10 green pushes to main have followed.
+
+### Nightly scans
+
+- Every night a scan reads the whole git history (every branch and tag) for secrets and reports what it finds in code scanning. It never blocks a pull request: a secret it finds has already leaked, so rotate it.
+- A permanent limit of the history scan: a merge commit with three or more parents (an octopus merge) anywhere in the history makes the nightly history job fail every night, because its own changes can not be shown. Only a history rewrite removes it.
+- Another permanent limit: a commit dated after 1 January 2100 on any branch or tag makes the same job fail every night, because the scan proves it read the whole history with marker commits of that date.
+- Every night the running app scan runs again with nuclei and with ZAP's active scan, which sends attack requests to the app the nightly run starts from its own image build. The results go to code scanning and never block a pull request.
 
 ### Notes from the build
 
@@ -396,6 +405,8 @@ No check of this layer is set up here.
 
 Runs on every pull request and decides whether it can merge. The gate (the check \`pipegen / gate\`) reads every result.
 
+A check marked "Blocks a pull request" blocks only after you run \`npx pipegen finish\`, which turns on the merge locks. Until then a failed gate shows on the pull request but does not stop the merge.
+
 - Secret scan, tool betterleaks/betterleaks. Looks for passwords, keys and tokens in the code and in the commits of a pull request. Blocks a pull request.
 - Code scan, service "docs-site", tool semgrep/semgrep. Looks for insecure code patterns in your source. Blocks a pull request.
 - Dependency scan, service "docs-site", tool google/osv-scanner. Looks for known vulnerabilities in the packages you depend on. Blocks a pull request.
@@ -416,6 +427,12 @@ No check of this layer is set up here.
 - npm only: pnpm, yarn and bun are not supported yet. A Vue, Svelte or Astro TypeScript repository stops at assembly with a plain reason, because pipegen has no reviewed type checker for it.
 - The nightly job has a \`concurrency\` group, so runs never overlap. An issue it opened and any bot closed (even a stale bot running as the github-actions bot) is reopened by design. Only a person can dismiss it.
 - After rewriting main's history (a force-push), the gate may stay in block mode until 10 green pushes to main have followed.
+
+### Nightly scans
+
+- Every night a scan reads the whole git history (every branch and tag) for secrets and reports what it finds in code scanning. It never blocks a pull request: a secret it finds has already leaked, so rotate it.
+- A permanent limit of the history scan: a merge commit with three or more parents (an octopus merge) anywhere in the history makes the nightly history job fail every night, because its own changes can not be shown. Only a history rewrite removes it.
+- Another permanent limit: a commit dated after 1 January 2100 on any branch or tag makes the same job fail every night, because the scan proves it read the whole history with marker commits of that date.
 
 ### Notes from the build
 

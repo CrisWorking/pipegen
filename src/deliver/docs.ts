@@ -22,7 +22,8 @@ import { centralProjectName } from '../engine/central-path.js';
 import { CALLER_WORKFLOW, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PUSH_WORKFLOW } from '../engine/job-rules.js';
 import { pipegenDocProblems } from '../engine/created-judges/pipegen-doc.js';
 import { BOOTSTRAP_PROOFS_NOTE } from '../engine/reviewed.js';
-import { floorNeeds, MINIMUM_CATEGORIES } from '../engine/needs.js';
+import { floorNeeds, MINIMUM_CATEGORIES, WORKFLOW_LINT_TOOL } from '../engine/needs.js';
+import { codeSecurityAvailable } from '../github/availability.js';
 import { describeTuning } from '../engine/tuning.js';
 import { HUSKY_NO_CI_NOTE, SETUP_COMMANDS } from '../layers/precommit.js';
 import { FLOOR_NEEDS, GATE_CHECK_NAME, type CreatedFile, type Need, type PipelineDraft, type ReviewedTool, type Service, type StepSpec } from '../types.js';
@@ -131,6 +132,8 @@ const LAYER_TEXT: Readonly<Record<(typeof LAYERS)[number], string>> = Object.fre
   merge: `Runs on every pull request and decides whether it can merge. The gate (the check \`${GATE_CHECK_NAME}\`) reads every result.`,
   deploy: 'Runs on a push to the default branch: it builds, signs and checks the images that are deployed.',
 });
+/** G17 row 57: when the merge lines' "Blocks a pull request" starts to hold. */
+const AFTER_FINISH = 'A check marked "Blocks a pull request" blocks only after you run `npx pipegen finish`, which turns on the merge locks. Until then a failed gate shows on the pull request but does not stop the merge.';
 /** Label and plain reason for every need category. */
 const CATEGORY_TEXT: Readonly<Record<string, readonly [string, string]>> = Object.freeze({
   secrets: ['Secret scan', 'Looks for passwords, keys and tokens in the code and in the commits of a pull request.'],
@@ -193,6 +196,12 @@ const mild = (s: string): string => Array.from(s).map((c) => (ALLOWED_CH.test(c)
 /** What cleanForDoc does to the two spellings the judge lets through but GitHub renders: a single tilde strikes text through, `GH-1` links to issue 1. */
 const plainer = (s: string): string => s.replace(/~/g, ' ').replace(/\b(GH)-(?=\d)/gi, '$1 ').replace(/ {2,}/g, ' ');
 const oneLine = (s: string): string => s.replace(/\r\n?|[\n\v\f\u0085\u2028\u2029\t]+/g, ' ').trim();
+/**
+ * G17 row 60: a variable line with the block marks at its start taken off (a list mark `- * +`, a numbered mark `1.` `1)`, a quote `>`, a heading
+ * `#`, a rule `---`), so a list item or a table cell never renders as a nested list, a quote or a heading. Only marks a blank or the end follows.
+ */
+const LEAD_MARK = /^\s*(?:[-*+>#]+|\d{1,9}[.)])(?=\s|$)/;
+const unlist = (s: string): string => { let t = s.trim(); while (LEAD_MARK.test(t)) t = t.replace(LEAD_MARK, '').trim(); return t; };
 /** The cap of a variable line (cleanForDoc's own default). */
 const CAP = CLEAN_DOC_MAX;
 const isStr = (x: unknown): x is string => typeof x === 'string';
@@ -204,13 +213,14 @@ const strs = (x: unknown): string[] => (Array.isArray(x) ? x.filter(isStr) : [])
  */
 function fit(raw: unknown, max: number = CAP): string {
   const scrubbed = scrubActive(isStr(raw) ? raw : '');
-  const s = plainer(oneLine(scrubbed)).trim();
+  const s = unlist(plainer(oneLine(scrubbed)));
   if (Array.from(s).length <= max) {
     if (itemOk(s)) return s;
-    const m = plainer(mild(s)).trim();
+    const m = unlist(plainer(mild(s)));
     if (itemOk(m)) return m;
   }
-  return cleanForDoc(scrubbed, max);
+  const c = unlist(cleanForDoc(scrubbed, max));
+  return c === '' ? CLEAN_DOC_PLACEHOLDER : c;
 }
 /** Repo text (a service name, a suggestion name, a path): cleanForDoc after the vault scrub, in quotation marks so no neighbour joins it (F-9). */
 const q = (raw: unknown, max = 120): string => {
@@ -233,7 +243,7 @@ class Doc {
 }
 
 /** The creator's own AI note (D-m5): dropped from every field, on its trimmed text. */
-const isAiNote = (t: string): boolean => /^the ai explained\b/i.test(t.trim());
+const isAiNote = (t: string): boolean => /^the ai explained\b/i.test(t.normalize('NFKC').replace(/[\p{Cf}]/gu, '').replace(/[\p{Z}\s]+/gu, ' ').trim());
 const FENCE_LIKE = /^\s*(?:`{3,}|~{3,})/;
 /** A package name with its version (`@scope/pkg@1.2.3`, `pkg@1.2`): the judge refuses `@` in text, a text fence holds it. Only this shape, never a bare `@name` (a mention). */
 const AT_NAME = /(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*@\d+(?:\.\d+){1,3}[a-z0-9._-]*/gi;
@@ -250,8 +260,8 @@ function noteItems(d: Doc, raw: string): void {
   if (lines.length > 1) {
     const rest = lines.slice(1).filter((l) => l.trim() !== '');
     const snippet = ['```text', ...rest, '```'].join('\n');
-    if (!rest.some((l) => FENCE_LIKE.test(l)) && itemOk(oneLine(first)) && rest.length > 0 && rest.length <= 40 && pipegenDocProblems(snippet, STUB_OPTS).length === 0) {
-      d.li(oneLine(first));
+    if (!rest.some((l) => FENCE_LIKE.test(l)) && unlist(oneLine(first)) !== '' && itemOk(unlist(oneLine(first))) && rest.length > 0 && rest.length <= 40 && pipegenDocProblems(snippet, STUB_OPTS).length === 0) {
+      d.li(unlist(oneLine(first)));
       d.fence('text', rest);
       return;
     }
@@ -294,13 +304,13 @@ function dataOf(draft: PipelineDraft): DocData {
   const o = isObj(raw) ? raw : {};
   const bad = { transcript: 0, deployGaps: 0, lockNotes: 0, testNotes: 0, uncoveredMinimum: 0, notes: 0, credits: 0 };
   const list = (k: keyof typeof bad): unknown[] => (Array.isArray(o[k]) ? (o[k] as unknown[]) : []);
-  const texts = (k: 'transcript' | 'lockNotes' | 'testNotes' | 'notes'): string[] => { const l = list(k); bad[k] += l.filter((x) => !isStr(x)).length; return l.filter(isStr); };
+  const texts = (k: 'transcript' | 'lockNotes' | 'testNotes' | 'notes'): string[] => { const l = list(k); bad[k] += l.filter((x) => !isStr(x)).length; return l.filter(isStr).filter((x) => !isAiNote(x)); };
   const objs = (k: 'deployGaps' | 'uncoveredMinimum' | 'credits'): Record<string, unknown>[] => { const l = list(k); bad[k] += l.filter((x) => !isObj(x)).length; return l.filter(isObj); };
   const est = isObj(o.estimates) ? o.estimates : {};
   const whole = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
   const gaps = objs('deployGaps').filter((g) => { const ok = isStr(g.path) && g.path !== ''; if (!ok) bad.deployGaps++; return ok; });
   const unc = objs('uncoveredMinimum').filter((u) => { const ok = isStr(u.category); if (!ok) bad.uncoveredMinimum++; return ok; });
-  const cred = objs('credits').filter((c) => { const ok = isStr(c.text); if (!ok) bad.credits++; return ok; });
+  const cred = objs('credits').filter((c) => { const ok = isStr(c.text); if (!ok) bad.credits++; return ok && !isAiNote(c.text as string); });
   return {
     transcript: texts('transcript'),
     deployGaps: gaps.map((g) => ({ path: g.path as string, triggers: strs(g.triggers), why: isStr(g.why) ? g.why : '' })),
@@ -473,6 +483,7 @@ const soft = (text: string, f: Facts): string => (f.gateRequired ? text : text
   .replace(/\bThe gate blocks\b/g, 'The gate fails').replace(/\bblocks\b/g, 'fails the gate').replace(/\bblocked\b/g, 'failed by the gate')
   .replace(/\bblock\b/g, 'fail the gate').replace(/\bblocking\b/g, 'required'));
 const FOR_INFO = 'Runs for information; the gate does not use it.';
+const NOTHING_RUNS = 'Not set up: no tool was chosen for it, so nothing runs (see the notes below).';
 
 /** The mode line of one check, from facts the builder derived (the gate's job list, the hook file, the lock), never from the need's flags alone. */
 function modeOf(draft: PipelineDraft, reviewed: readonly ReviewedTool[], f: Facts, n: Need): string {
@@ -504,8 +515,10 @@ function modeOf(draft: PipelineDraft, reviewed: readonly ReviewedTool[], f: Fact
   try { key = jobIdFor(n.id, n.service); } catch { return FOR_INFO; }
   const e = f.list.find((x) => x.job === key && x.range !== true);
   if (e === undefined) {
-    const demoted = n.blocking && FINDINGS_CATEGORIES.has(cat) && specs.length > 0 && !specs.every((s) => readableFormat(cat, resultFormat(s.output.format)));
-    return demoted ? 'Warns only: its tool writes no results file the gate can read.' : FOR_INFO;
+    // G17 row 58: no tool, nothing runs; a demoted check runs, but the gate reads nothing from it, so it does not even warn
+    if (specs.length === 0) return NOTHING_RUNS;
+    const demoted = n.blocking && FINDINGS_CATEGORIES.has(cat) && !specs.every((s) => readableFormat(cat, resultFormat(s.output.format)));
+    return demoted ? 'Runs for information: its tool writes no results file the gate can read, so the gate does not use it.' : FOR_INFO;
   }
   const floor = FLOOR_NEEDS.includes(e.needId) || FLOOR_NEEDS.includes(e.category);
   if (!floor && draft.notProven.some((x) => x.needId === e.needId)) return 'Warns only: it is not proven yet (see Not proven yet).';
@@ -526,6 +539,8 @@ function layersSection(d: Doc, draft: PipelineDraft, data: DocData, reviewed: re
     const needs = draft.needs.filter((n) => n.layer === layer);
     d.h(3, `${layer === 'pre-commit' ? 'Pre-commit' : layer === 'push' ? 'Push' : layer === 'merge' ? 'Merge' : 'Deploy'} layer`);
     d.p(LAYER_TEXT[layer]);
+    // G17 row 57: "Blocks a pull request" holds only once finish has turned the merge locks on (none is on before the setup pull request merges)
+    if (layer === 'merge' && facts.gateRequired) d.p(AFTER_FINISH);
     if (needs.length === 0) { d.p('No check of this layer is set up here.'); continue; }
     for (const n of needs) {
       const cat = categoryOf(n.id, n.category);
@@ -537,6 +552,7 @@ function layersSection(d: Doc, draft: PipelineDraft, data: DocData, reviewed: re
     }
   }
   limitsSection(d, draft);
+  nightlySection(d, draft);
   tuningSection(d, draft);
   d.h(3, 'Notes from the build');
   const notes = buildNotes(data);
@@ -574,6 +590,32 @@ function limitsSection(d: Doc, draft: PipelineDraft): void {
   d.li('npm only: pnpm, yarn and bun are not supported yet. A Vue, Svelte or Astro TypeScript repository stops at assembly with a plain reason, because pipegen has no reviewed type checker for it.');
   d.li('The nightly job has a `concurrency` group, so runs never overlap. An issue it opened and any bot closed (even a stale bot running as the github-actions bot) is reopened by design. Only a person can dismiss it.');
   d.li(HISTORY_REWRITE_NOTE);
+}
+
+/**
+ * G17 (G15a and G16 carry): the scans of the nightly file, said under the same conditions the jobs layer writes them (src/layers/jobs.ts): the
+ * whole-history secrets scan and the nightly DAST pair only with code scanning (they report there), zizmor online when the merge layer lints the
+ * workflows with zizmor, Scorecard weekly when the plan holds it. None of them is on the gate's list, so none blocks. The history scan's two
+ * permanent limits (render-cli.ts: the octopus check over --all, and the canary commits dated 2100-01-01) are said beside it.
+ */
+function nightlySection(d: Doc, draft: PipelineDraft): void {
+  const merge = draft.needs.filter((n) => n.layer === 'merge');
+  const stepped = (n: Need, tool?: string): boolean => stepsOf(draft, n.id, n.service).some((s) => tool === undefined || s.tool.id === tool);
+  const cs = codeSecurityAvailable(draft.profile, draft.capabilities);
+  const history = cs && merge.some((n) => n.id === 'secrets' && n.service === undefined && stepped(n));
+  const zizmor = merge.some((n) => categoryOf(n.id, n.category) === 'workflow-lint' && stepped(n, WORKFLOW_LINT_TOOL));
+  const dast = cs && merge.some((n) => categoryOf(n.id, n.category) === 'dast' && n.service !== undefined && stepped(n));
+  const scorecard = merge.some((n) => categoryOf(n.id, n.category) === 'scorecard');
+  if (!history && !zizmor && !dast && !scorecard) return;
+  d.h(3, 'Nightly scans');
+  if (history) {
+    d.li('Every night a scan reads the whole git history (every branch and tag) for secrets and reports what it finds in code scanning. It never blocks a pull request: a secret it finds has already leaked, so rotate it.');
+    d.li('A permanent limit of the history scan: a merge commit with three or more parents (an octopus merge) anywhere in the history makes the nightly history job fail every night, because its own changes can not be shown. Only a history rewrite removes it.');
+    d.li('Another permanent limit: a commit dated after 1 January 2100 on any branch or tag makes the same job fail every night, because the scan proves it read the whole history with marker commits of that date.');
+  }
+  if (zizmor) d.li('Every night zizmor checks the workflows again with its online checks (it asks GitHub about the actions they use), with a read-only token. It never blocks a pull request.');
+  if (dast) d.li('Every night the running app scan runs again with nuclei and with ZAP\'s active scan, which sends attack requests to the app the nightly run starts from its own image build. The results go to code scanning and never block a pull request.');
+  if (scorecard) d.li('Once a week (on Monday) OpenSSF Scorecard scores the repository. The result goes to code scanning and never blocks a pull request.');
 }
 
 function tuningSection(d: Doc, draft: PipelineDraft): void {
@@ -770,9 +812,10 @@ function retentionSection(d: Doc): void {
 function debateSection(d: Doc, draft: PipelineDraft, data: DocData): void {
   d.h(2, SECTION_TITLES[14] as string);
   d.p('pipegen chose its tools in a short debate between AI models. The code, not the AI, checks every choice against pipegen\'s reviewed list.');
-  if (draft.scoreboard.length > 0) { d.h(3, 'Scoreboard'); for (const l of draft.scoreboard) d.li(fit(l)); }
+  const board = draft.scoreboard.filter((l) => !isAiNote(l));
+  if (board.length > 0) { d.h(3, 'Scoreboard'); for (const l of board) d.li(fit(l)); }
   if (data.transcript.length > 0 || data.bad.transcript > 0) { d.h(3, 'Transcript'); for (const l of data.transcript) d.li(fit(l)); unreadable(d, data.bad.transcript); }
-  if (draft.scoreboard.length === 0 && data.transcript.length === 0 && data.bad.transcript === 0) d.p('No debate was recorded.');
+  if (board.length === 0 && data.transcript.length === 0 && data.bad.transcript === 0) d.p('No debate was recorded.');
 }
 
 function hooksSection(d: Doc, f: Facts): void {
@@ -833,8 +876,9 @@ const DOC_REASON = 'Explains in plain English what pipegen set up, what it does 
 
 /**
  * PIPEGEN.md for a draft. Pure: the same draft and reviewed list always give the same bytes (with the same active vault). `draft.doc` holds the inputs
- * that are not on the draft (an absent `doc` reads as empty here; the referee refuses a PIPEGEN.md whose draft has none). Never throws for the draft's
- * content: a string that can not be written as it is gets cleaned.
+ * that are not on the draft (an absent `doc` reads as empty here; the referee refuses a PIPEGEN.md whose draft has none). A string that can not be
+ * written as it is gets cleaned. Throws PipegenDocError when the draft can not be described truly (a setup command that does not fit the hook file,
+ * a strictness label that does not fit the checks, a draft the gate could not list); the referee turns that into a refusal.
  */
 export function pipegenDoc(draft: PipelineDraft, reviewed: readonly ReviewedTool[]): CreatedFile {
   const data = dataOf(draft);

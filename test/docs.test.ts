@@ -1320,7 +1320,7 @@ describe('doc: fix round 1 (ruling G9-R1)', () => {
     // a blocking findings check whose tool writes no SARIF: demoted
     const demoted = shapeA({ steps: base.steps.map((st) => (st.needId === 'licences' ? { ...st, output: { ...st.output, format: 'none' as const } } : st)) });
     const dl = lineOf(headingAt(docOf(demoted), 'The four layers'), 'Licence check');
-    expect(dl).toContain('Warns only: its tool writes no results file the gate can read.');
+    expect(dl).toContain('Runs for information: its tool writes no results file the gate can read, so the gate does not use it.'); // G17 row 58
     expect(dl).not.toMatch(/Blocks a pull request/);
     expect(lineOf(layers, 'Licence check')).toMatch(/Blocks a pull request/);
   });
