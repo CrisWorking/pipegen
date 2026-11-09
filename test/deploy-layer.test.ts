@@ -1674,5 +1674,10 @@ describe('G17A-R3: the gap list is re-derived, never trusted', () => {
         expect(shown(await judge(w)), `${kind} ${wfs.length}`).toBe('');
       }
     }
+    // only the deploy workflows: a workflow the reader found no deploy in is no gap (R3 mutation survivor)
+    const LINT = '.github/workflows/lint.yml';
+    const mixed = world('keyless', [[A, DEPLOY_A], [LINT, 'on: pull_request\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make lint\n']], { profile: { existingWorkflows: [wfOf(A), { ...wfOf(LINT, ['pull_request']), deploys: false }] }, draft: { skipped: [{ part: 'deploy', reason: 'the user skipped it' }] } });
+    expect(mixed.v.gaps.map((g) => g.path)).toEqual([A]);
+    expect(shown(await judge(mixed))).toBe('');
   });
 });
