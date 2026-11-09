@@ -1618,6 +1618,9 @@ describe('G17A-R2: the referee binds the batch to the plan\'s inputs', () => {
     const plain = world('keyless', [[A, DEPLOY_A]]);
     expect((await judge(plain, [])).issues.some((i) => notHandled(A).test(i.message))).toBe(true);
     expect(shown(await judge(plain, [], plain.texts, [{ path: A, triggers: ['push'], why: 'listed' }]))).toBe('');
+    // only pipegen's marked edit counts: the same text written as a whole file (no mark) is not an edit of the user's workflow (R2 mutation survivor)
+    const whole = { ...(plain.v.inserts[0] as VerifyPlan['inserts'][number]).file, inserted: undefined } as unknown as CreatedFile;
+    expect((await judge(plain, [whole])).issues.some((i) => notHandled(A).test(i.message)), 'whole file').toBe(true);
     // the gaps pipegen itself lists (a workflow_run deploy) are accepted
     const wr = world('keyless', [[A, DEPLOY_A.replace(/on:[\s\S]*?jobs:/, 'on:\n  workflow_run:\n    workflows: [ci]\n    types: [completed]\njobs:')]]);
     expect(wr.v.inserts).toEqual([]);
