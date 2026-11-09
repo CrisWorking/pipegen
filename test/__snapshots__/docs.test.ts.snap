@@ -232,7 +232,7 @@ Warn mode lasts until 7 days after you merge (the exact date is set by \`npx pip
 
 In warn mode old findings and medium ones warn, and a new critical, high or secret finding still blocks.
 
-There are two timers. The first (7 days after you merge) is for the whole gate: it warns until then and blocks after. The second is for one check: a new blocking check can start in its own warn mode for about 14 days, and then the nightly run opens an issue to switch it to blocking.
+There are two timers. The first (7 days after you merge) is for the whole gate: it warns until then and blocks after. The second is for one check: a new blocking check can start in its own warn mode for about 14 days, and then the nightly run opens an issue to switch it to blocking. In this version that switch is made by hand: \`npx pipegen update\` names the issue and says how.
 
 These checks start in warn mode:
 
@@ -498,7 +498,7 @@ Warn mode lasts until 7 days after you merge (the exact date is set by \`npx pip
 
 In warn mode old findings and medium ones warn, and a new critical, high or secret finding still blocks.
 
-There are two timers. The first (7 days after you merge) is for the whole gate: it warns until then and blocks after. The second is for one check: a new blocking check can start in its own warn mode for about 14 days, and then the nightly run opens an issue to switch it to blocking.
+There are two timers. The first (7 days after you merge) is for the whole gate: it warns until then and blocks after. The second is for one check: a new blocking check can start in its own warn mode for about 14 days, and then the nightly run opens an issue to switch it to blocking. In this version that switch is made by hand: \`npx pipegen update\` names the issue and says how.
 
 ## Deploying old commits and retention
 

@@ -11,6 +11,7 @@ import { floorNeeds, jobCategories, MINIMUM_CATEGORIES, publishedImageServices }
 import type { Estimates, JobCategories } from '../estimate/estimate.js';
 import { signingMode, type SigningMode } from '../github/signing-mode.js';
 import { signingPlan } from '../layers/central.js';
+import { isAiNote } from '../deliver/docs.js';
 import type { DeployGap, VerifyPlan } from '../layers/deploy.js';
 import type { AssembledJobs, Job, JobsPlan } from '../layers/jobs.js';
 import type { LockPlan } from '../layers/locks.js';
@@ -177,8 +178,8 @@ export function prWaitMinutes(merge: Readonly<Record<string, Pick<Job, 'timeout-
 
 // ---------- PIPEGEN.md's inputs (carries 31-34, B7) ----------
 
-/** The creators' own AI note, never a doc field (carry 34, D-m5). */
-export const isAiNote = (s: string): boolean => /^the ai explained/i.test(s.trim());
+/** The creators' own AI note, never a doc field (carry 34, D-m5). G17-F1 (sec I2): docs.ts's one filter (format characters, NFKC, spaces). */
+export { isAiNote };
 
 export interface DocInputs {
   transcript: readonly string[];

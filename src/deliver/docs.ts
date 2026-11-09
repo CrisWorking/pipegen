@@ -253,8 +253,8 @@ class Doc {
   text(): string { this.close(); return `${this.lines.join('\n').replace(/\n+$/, '')}\n`; }
 }
 
-/** The creator's own AI note (D-m5): dropped from every field, on its trimmed text. */
-const isAiNote = (t: string): boolean => /^the ai explained\b/i.test(t.normalize('NFKC').replace(/[\p{Cf}]/gu, '').replace(/[\p{Z}\s]+/gu, ' ').trim());
+/** The creator's own AI note (D-m5): dropped from every field, on its trimmed text. G17-F1 (sec I2): the one filter (run-parts uses it). */
+export const isAiNote = (t: string): boolean => /^the ai explained\b/i.test(t.normalize('NFKC').replace(/[\p{Cf}]/gu, '').replace(/[\p{Z}\s]+/gu, ' ').trim());
 const FENCE_LIKE = /^\s*(?:`{3,}|~{3,})/;
 /** A package name with its version (`@scope/pkg@1.2.3`, `pkg@1.2`): the judge refuses `@` in text, a text fence holds it. Only this shape, never a bare `@name` (a mention). */
 const AT_NAME = /(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*@\d+(?:\.\d+){1,3}[a-z0-9._-]*/gi;
@@ -502,6 +502,8 @@ const SIGN_VERIFY_CATEGORIES: ReadonlySet<string> = new Set(['signing', 'attesta
 const UNPUBLISHED = 'Not set up: pipegen publishes no image of this service, so it signs and verifies nothing for it (see Signing and the notes below).';
 const UNPUBLISHED_VERIFY = 'Not set up for an image: pipegen publishes no image of this service, so there is no signature to check; the verify job still checks that the gate passed and that the head is the one the gate checked (see Signing and the notes below).';
 const UNSIGNED = 'Not set up: pipegen signs nothing in this setup, so no deploy is checked against a signature (see Signing).';
+/** G17-F1 (sec M2): a published image with no signing plan: no signature to check, but the verify job still checks the gate pass and the head. */
+const UNSIGNED_VERIFY = 'Not set up for a signature: pipegen signs nothing in this setup, so there is no signature to check; the verify job still checks that the gate passed and that the head is the one the gate checked (see Signing).';
 /** The services whose image pipegen publishes (the image-publish job, releaseJobs): none when the deploy part is skipped. */
 function publishedHere(draft: PipelineDraft): string[] {
   if (Array.isArray(draft.skipped) && draft.skipped.some((x) => x?.part === 'deploy')) return [];
@@ -531,7 +533,7 @@ function modeOf(draft: PipelineDraft, reviewed: readonly ReviewedTool[], f: Fact
   // G17B-R2 (design call): no publish job for the service, no signature and no verified image; a published image with no signing plan, no signature
   if (layer === 'deploy' && SIGN_VERIFY_CATEGORIES.has(cat)) {
     if (n.service === undefined || !publishedHere(draft).includes(n.service)) return cat === 'deploy-verify' ? UNPUBLISHED_VERIFY : UNPUBLISHED;
-    if (draft.signing === undefined || draft.signing === null) return UNSIGNED;
+    if (draft.signing === undefined || draft.signing === null) return cat === 'deploy-verify' ? UNSIGNED_VERIFY : UNSIGNED;
   }
   if (layer !== 'merge') {
     const only = warnOnlyWhy(draft, n);
@@ -845,7 +847,9 @@ function warnSection(d: Doc, draft: PipelineDraft, f: Facts): void {
   d.h(2, SECTION_TITLES[12] as string);
   d.p(WARN_MODE_TEXT);
   d.p(soft('In warn mode old findings and medium ones warn, and a new critical, high or secret finding still blocks.', f) + (f.gateRequired ? '' : ' Nothing requires it to pass here.'));
-  d.p(soft('There are two timers. The first (7 days after you merge) is for the whole gate: it warns until then and blocks after. The second is for one check: a new blocking check can start in its own warn mode for about 14 days, and then the nightly run opens an issue to switch it to blocking.', f));
+  d.p(soft('There are two timers. The first (7 days after you merge) is for the whole gate: it warns until then and blocks after. The second is for one check: a new blocking check can start in its own warn mode for about 14 days, and then the nightly run opens an issue to switch it to blocking.', f)
+    // G17-F1 (spec-1 M2/M4, spec-2 M2): v0.2's update can't make that switch (update.ts warnFirstWay says how to do it by hand)
+    + ' In this version that switch is made by hand: `npx pipegen update` names the issue and says how.');
   const w = draft.warnFirst === undefined ? [] : Object.keys(draft.warnFirst);
   if (w.length > 0) {
     d.p('These checks start in warn mode:');
