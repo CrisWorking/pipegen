@@ -62,7 +62,7 @@ import { expectedSigningSteps, signedImageOwner } from './signing.js';
 import { NO_IMAGE_CATEGORIES, noImageServices, publishedImageServices, WORKFLOW_LINT_TOOL } from './needs.js';
 import { FIND_RUN_STEP_ID, PUBLISH_TAG, publishedImageRepo, renderDigestStep, renderHeadCheckStep, renderPublishDigestStep } from './deploy-steps.js';
 import { callsWorkflow, strongReason } from './deploy-gating.js';
-import { calledHeadCheckEdit, deployGating, localCallOf } from '../layers/deploy.js';
+import { calledHeadCheckEdit, deployGating, isDeployWorkflow, localCallOf } from '../layers/deploy.js';
 import { ARCHIVE_TOOL_IDS, imageBuildTag, renderImageArchiveScan, renderImageBuild } from './image-handoff.js';
 import { dastStartOf, nightlyDastSpec, NIGHTLY_DAST_TOOL, renderDastRun, renderDastScrub, zapActiveSpec, ZAP_ACTIVE_LANE, ZAP_ACTIVE_TOOL } from './dast-handoff.js';
 import { ATTEST_VERIFY_SETS, KEYLESS_VERIFY_SETS, SHARED_CDN_SETS } from './egress.js';
@@ -2482,8 +2482,8 @@ function judgeSecrets(fc: FileCtx, at: (m: string) => string, withs: Obj, env: O
 
 // ---------- an edited user workflow (the marker, types.ts PipegenInserted) ----------
 
-/** The one job pipegen inserts into a user's deploy workflow (assemble.ts VERIFY_JOB_ID; not imported: assemble imports this file). */
-const VERIFY_JOB = 'pipegen-verify';
+/** The one job pipegen inserts into a user's deploy workflow (assemble.ts VERIFY_JOB_ID; not imported: assemble imports this file; a test ties the two). */
+export const VERIFY_JOB = 'pipegen-verify';
 /** Needs as a list, whatever form they were written in. */
 const needsList = (v: unknown): unknown[] => (v === undefined ? [] : Array.isArray(v) ? v : [v]);
 
@@ -2854,6 +2854,28 @@ function blockingRule(draft: PipelineDraft, ex: Expectations, add: Add, notes: s
   return demoted;
 }
 
+/**
+ * G17A-R2, with the workflow texts the verify plan was built from (RefereeDeps.workflowTexts):
+ * - sec r2-N1: every edit of an app workflow has as its original exactly the text pipegen read (insertVerify and insertHeadChecks set it so),
+ *   so the referee's two inputs agree and a doctored original is refused before delivery's base check;
+ * - sec r2-M1: every workflow the deploy layer handles (isDeployWorkflow: the reader found a deploy, not pipegen's own) is edited in the batch or
+ *   listed in draft.doc.deployGaps (which PIPEGEN.md shows as unprotected). planVerifyInserts ends each one as an edit or a gap, so a batch
+ *   that drops a caller's insert, or a called file's edit, without saying so is refused.
+ */
+function judgeDeployBatch(files: readonly CreatedFile[], draft: PipelineDraft, texts: ReadonlyMap<string, string>, add: Add): void {
+  for (const f of files) {
+    const m = f.inserted;
+    if (f.repo !== 'app' || m === undefined || typeof m.original !== 'string') continue;
+    if (texts.get(f.path) !== m.original) add(f.path, 'template', `The edit's original of ${safeText(f.path, 200)} is not the text pipegen read from the repository, so the edit would not be judged against what the repository holds.`, undefined, f.repo);
+  }
+  const gaps = new Set((Array.isArray(draft.doc?.deployGaps) ? draft.doc.deployGaps : []).map((g) => (isObj(g) ? g.path : undefined)));
+  for (const wf of draft.profile.existingWorkflows) {
+    if (!isDeployWorkflow(wf)) continue;
+    const edited = files.some((f) => f.repo === 'app' && f.path === wf.path && f.inserted !== undefined);
+    if (!edited && !gaps.has(wf.path)) add(wf.path, 'template', `The deploy workflow ${safeText(wf.path, 200)} is neither edited by pipegen in this batch nor listed as a gap in PIPEGEN.md; pipegen either protects each deploy workflow or says it does not.`, undefined, 'app');
+  }
+}
+
 // ---------- the referee ----------
 
 const fileKind = (f: CreatedFile): 'workflow' | 'action' | null => (WORKFLOW_PATH_RE.test(f.path) ? 'workflow' : ACTION_PATH_RE.test(f.path) ? 'action' : null);
@@ -3003,6 +3025,8 @@ async function judgeFiles(allFiles: CreatedFile[], draft: PipelineDraft, platfor
     }
   }
 
+  // G17A-R2: with the workflow texts the verify plan was built from, the batch is bound to the plan's inputs
+  if (deps.workflowTexts !== undefined) judgeDeployBatch(files, draft, deps.workflowTexts, add);
   for (const check of ex.deferred) check();
   // GJ-R1 (review sec M1): workflow lint runs zizmor (DECISIONS #122): a draft whose workflow-lint check has no zizmor step, or a job
   // workflow-lint that runs none of the draft's zizmor steps, is refused (poutine never stands in for it)

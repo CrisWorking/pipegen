@@ -1383,7 +1383,8 @@ describe('G13: the head check in a local called workflow (G7-R2 carry, BINDING)'
     const pwsh = 'defaults:\n  run:\n    shell: pwsh\n';
     expect(shown(await judge(w, [caller, both(withDefaults(pwsh, ins.text), withDefaults(pwsh, CALLED_A))]))).toMatch(/defaults that would change pipegen's head check/);
     const shell = 'defaults:\n  run:\n    shell: bash\n';
-    expect(shown(await judge(w, [caller, both(withDefaults(shell, ins.text), withDefaults(shell, CALLED_A))]))).toBe('');
+    // the repository's text is that original too (G17A-R2 r2-N1: the edit's original is the text pipegen read)
+    expect(shown(await judge(w, [caller, both(withDefaults(shell, ins.text), withDefaults(shell, CALLED_A))], new Map([[A, CALLER_A], [SHIP, withDefaults(shell, CALLED_A)]])))).toBe('');
     // (h) a workflow env that changes how the check runs
     const env = `env:\n  ${['BASH', 'ENV'].join('_')}: ./evil.sh\n`;
     expect(shown(await judge(w, [caller, both(withDefaults(env, ins.text), withDefaults(env, CALLED_A))]))).toMatch(/changes how code runs on the runner/);
@@ -1587,7 +1588,8 @@ describe('G17A-R1: the referee judges the edited file and the batch, never the m
     const texts = new Map([[A, CALLER_A], [SHIP, CALLED_A], [LINT, lint]]);
     const v = planVerifyInserts(w.a.draft, texts, w.a.verify);
     expect(v.inserts.map((i) => i.path)).toEqual([A]);
-    expect(shown(await judge(w, v.inserts.map((i) => i.file), texts))).toBe('');
+    expect(v.gaps.map((g) => g.path)).toEqual([SHIP]);
+    expect(shown(await judge(w, v.inserts.map((i) => i.file), texts, v.gaps))).toBe('');
     const dispatch = CALLED_A.replace('  workflow_call:', '  workflow_call:\n  workflow_dispatch:');
     const u = calledWorld(CALLER_A, dispatch);
     expect(insertAt(u, SHIP)).toBeUndefined();

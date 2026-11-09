@@ -524,6 +524,13 @@ export function deployGating(js: Obj, defaultBranch: string): DeployGating | { g
 }
 
 /**
+ * The workflows planVerifyInserts handles: the reader found a deploy in them and they are not pipegen's own. Each ends as an edit (the verify
+ * insert, or a called file's head checks) or a gap, so the referee (G17A-R2 sec r2-M1) requires each to be edited in the batch or listed in
+ * draft.doc.deployGaps.
+ */
+export const isDeployWorkflow = (wf: ExistingWorkflow): boolean => wf.deploys === true && !OWN_WORKFLOWS.has(wf.path);
+
+/**
  * The verify inserts of a draft's deploy workflows (see the file header). `texts`: each workflow's text as read (path → text); `verify`: the
  * verify job (assemble's AssembledFiles.verify; null when the deploy part is skipped, and then nothing is inserted and nothing is a gap).
  */
@@ -536,7 +543,7 @@ export function planVerifyInserts(draft: PipelineDraft, texts: ReadonlyMap<strin
   // the gated jobs that call a local workflow (caller path, job id, called path), and the calls whose head check is still to be decided
   const calls: { caller: string; job: string; path: string | null }[] = [];
   for (const wf of draft.profile.existingWorkflows) {
-    if (wf.deploys !== true || OWN_WORKFLOWS.has(wf.path)) continue;
+    if (!isDeployWorkflow(wf)) continue;
     const gap = (why: string, triggers: string[] = Array.isArray(wf.triggers) ? [...wf.triggers] : []): void => { out.gaps.push({ path: wf.path, triggers, why }); };
     const text = texts.get(wf.path);
     if (typeof text !== 'string') { gap('pipegen could not read this workflow, so it adds no check before its deploy'); continue; }
@@ -677,7 +684,7 @@ export async function environmentPlan(gh: Octokit, p: RepoProfile, caps: Capabil
   let dynamic = false;
   const inserted = new Set(opts.inserted);
   for (const wf of p.existingWorkflows) {
-    if (wf.deploys !== true || OWN_WORKFLOWS.has(wf.path)) continue;
+    if (!isDeployWorkflow(wf)) continue;
     const t = opts.texts.get(wf.path);
     if (typeof t !== 'string') continue;
     const e = environmentNames(t);
