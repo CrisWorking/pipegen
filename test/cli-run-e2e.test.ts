@@ -14,10 +14,11 @@
 // NOT covered (live only, see docs/smoke-test.md): real runner minutes, the real Actions runs and the checks they report, a real token, the
 // helper repos' real creation, GitHub's own answers to the probes, Anthropic.
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { cleanE2e, e2eWorld, OWN, APP_NAME, KEY_PW, type E2eOptions, type E2eWorld } from './helpers/e2e-world.js';
+import { cleanE2e, e2eWorld, APP_NAME, KEY_PW, type E2eOptions, type E2eWorld } from './helpers/e2e-world.js';
+import { OWN, RUN_ID } from './helpers/proof-world.js';
 import { COMPAT_PREFIX, HARNESS_PATH } from './helpers/proof-eval.js';
 import type { Call } from './helpers/deliver-github.js';
 
@@ -39,6 +40,7 @@ const PUBLIC = (): Promise<Ran> => scenario('public', { shape: 'public' });
 const FAILED = (): Promise<Ran> => scenario('private-planted-missed', { planted: 'missed' });
 
 const APP = `${OWN}/${APP_NAME}`;
+const SCRATCH = `pipegen-proof-${APP_NAME}`;
 const CENTRAL = `${OWN}/pipelines`;
 const SIGNING_ENV = 'pipegen-signing';
 const isWrite = (c: Call): boolean => !c.route.startsWith('GET ');
@@ -120,31 +122,57 @@ describe('e2e', () => {
 
   it('e2e: the cleanup is done before the preview, and delivery waits for cleaned with a passed proof', async () => {
     for (const { w, code } of [await PRIVATE(), await PUBLIC()]) {
-      expect(code).toBe(0);
-      const at = (s: string): number => w.tl.indexOf(s);
-      // the scratch secrets are deleted first, then the proof branches, then the cleanup is done; only then the preview is answered
-      expect(at('cleanup: scratch secrets deleted')).toBeGreaterThan(at('proof: scratch secrets stored'));
-      expect(at('cleanup: proof branches deleted')).toBeGreaterThan(at('cleanup: scratch secrets deleted'));
-      expect(at('cleanup: done')).toBeGreaterThan(at('cleanup: proof branches deleted'));
-      expect(at('preview: confirmed')).toBeGreaterThan(at('cleanup: done'));
+      expect(code, w.io.errs.join('\n')).toBe(0);
+      expect(w.fgh.unrouted).toEqual([]);
+      const at = (s: string): number => w.tl.findIndex((x) => x === s || x.startsWith(`${s}:`));
+      const lastAt = (s: string): number => w.tl.findLastIndex((x) => x === s || x.startsWith(`${s}:`));
+      // the REAL pushProofSetup: dependabot updates off, the no-run check, then the scratch secrets are stored, and only then the proof branches are pushed
+      expect(at('setup: dependabot updates off')).toBeGreaterThanOrEqual(0);
+      expect(at('setup: no-run check')).toBeGreaterThan(at('setup: dependabot updates off'));
+      expect(at('scratch secret stored')).toBeGreaterThan(at('setup: no-run check'));
+      expect(at(`push ${SCRATCH} proof/${RUN_ID}/main`)).toBeGreaterThan(lastAt('scratch secret stored'));
+      expect(at(`push ${SCRATCH} proof/${RUN_ID}/planted`)).toBeGreaterThan(at(`push ${SCRATCH} proof/${RUN_ID}/main`));
+      expect(at(`push ${SCRATCH} main (force)`)).toBeLessThan(at('scratch secret stored'));
+      // the REAL cleanupAfterProof: the scratch secrets first, then the proof branches, the runs, the default branch reset; only then the cleanup returns
+      expect(at('scratch secret deleted')).toBeGreaterThan(lastAt('scratch secret stored'));
+      expect(at('scratch proof branch deleted')).toBeGreaterThan(lastAt('scratch secret deleted'));
+      expect(at('scratch run deleted')).toBeGreaterThan(at('scratch secret deleted'));
+      expect(at('scratch default branch reset')).toBeGreaterThan(at('scratch proof branch deleted'));
+      expect(at('cleanup returned')).toBeGreaterThan(at('scratch default branch reset'));
+      // only after the cleanup: the preview is answered, then the PR is opened
+      expect(at('preview: confirmed')).toBeGreaterThan(at('cleanup returned'));
       expect(at('deliver: setup PR opened')).toBeGreaterThan(at('preview: confirmed'));
-      // the preview text (the confirmation) was shown after the cleanup too: the question is asked once, after it
       expect(w.io.asked.filter((q) => /Open the setup pull request with these changes\?/.test(q))).toHaveLength(1);
-      expect(w.fgh.proof.scratch.stored.length).toBeGreaterThan(0);
-      expect(w.fgh.proof.scratch.deleted).toBe(true);
-      // nothing was written to the app or the central repo before the proof passed: the first write to either comes after the cleanup
-      const cleanedAt = at('cleanup: done');
-      const firstDelivery = at('deliver: setup PR opened');
-      expect(firstDelivery).toBeGreaterThan(cleanedAt);
+      // what is left on the fake: nothing of the proof
+      expect(w.cleanups).toHaveLength(1);
+      expect(w.cleanups[0]?.leftovers).toEqual([]);
+      expect(w.fgh.repo(`${OWN}/${SCRATCH}`).stored.size).toBe(0);
+      expect([...w.fgh.repo(`${OWN}/${SCRATCH}`).refs.keys()].filter((r) => r.startsWith('heads/proof/'))).toEqual([]);
+      expect([...w.fgh.repo(CENTRAL).refs.keys()].filter((r) => r.startsWith('heads/proof/'))).toEqual([]);
+      expect(w.fgh.actionRuns(`${OWN}/${SCRATCH}`)).toEqual([]);
+      // the central proof branch exists only for a private app, and is deleted by the cleanup after the secrets
+      if (w.fgh.repo(`${OWN}/${APP_NAME}`).private) {
+        expect(at(`push pipelines proof/${RUN_ID}`)).toBeLessThan(at(`push ${SCRATCH} main (force)`));
+        expect(at('central proof branch deleted')).toBeGreaterThan(at('scratch secret deleted'));
+      } else {
+        expect(at('central proof branch deleted')).toBe(-1);
+      }
+      // nothing was written to the app or the central repo before the proof passed and was cleaned
+      const cleanedAt = at('cleanup returned');
+      expect(at('deliver: setup PR opened')).toBeGreaterThan(cleanedAt);
+      expect(w.fgh.writesTo(APP_NAME).length).toBeGreaterThan(0);
     }
-    // a proof that does not pass delivers nothing: no PR, no write to the app, the scratch secrets deleted, no preview
+    // a proof that does not pass delivers nothing: no PR, no write to the app, the real cleanup done, no preview
     const { w, code } = await FAILED();
     expect(code).toBe(2);
     expect(w.io.errs.join('\n')).toContain('the proof did not pass');
-    expect(w.tl).toContain('cleanup: done');
+    expect(w.tl).toContain('cleanup returned');
+    expect(w.tl.some((x) => x.startsWith('scratch secret deleted'))).toBe(true);
     expect(w.tl).not.toContain('preview: confirmed');
     expect(w.tl).not.toContain('deliver: setup PR opened');
-    expect(w.fgh.proof.scratch.deleted).toBe(true);
+    expect(w.cleanups).toHaveLength(1);
+    expect(w.cleanups[0]?.leftovers).toEqual([]);
+    expect(w.fgh.repo(`${OWN}/${SCRATCH}`).stored.size).toBe(0);
     expect(w.fgh.writesTo(APP_NAME)).toEqual([]);
     expect(w.fgh.writesTo('pipelines')).toEqual([]);
     expect(w.fgh.repo(APP).pulls).toEqual([]);
@@ -158,6 +186,14 @@ describe('e2e', () => {
       const planted = w.fgh.proof.pushes.find((p) => p.branch.endsWith('/planted'));
       expect(planted?.files.some((f) => f.startsWith('pipegen-planted/'))).toBe(true);
       expect(w.fgh.proof.pushes.some((p) => p.files.includes(HARNESS_PATH))).toBe(true);
+      // the pushes are the real pushProofSetup's commits (read back from its session): the base holds the project and no workflow, the main branch
+      // holds the harness and no planted file, the planted branch holds both
+      const base = w.fgh.proof.pushes.find((p) => p.repo === SCRATCH && p.branch === 'main');
+      expect(base?.files).toContain('src/server.js');
+      expect(base?.files.some((f) => f.startsWith('.github/workflows/'))).toBe(false);
+      const main = w.fgh.proof.pushes.find((p) => p.branch === `proof/${RUN_ID}/main`);
+      expect(main?.files).toContain(HARNESS_PATH);
+      expect(main?.files.some((f) => f.startsWith('pipegen-planted/'))).toBe(false);
       // the delivered batch: the setup branch and the central repo's head
       const delivered = [w.fgh.filesOn(APP, 'pipegen/setup'), w.fgh.filesOn(CENTRAL, 'main')].filter((f): f is Map<string, string> => f !== null);
       expect(delivered).toHaveLength(2);
@@ -203,6 +239,12 @@ describe('e2e', () => {
     expect(w.fgh.proof.pushes.some((p) => p.repo === 'pipelines')).toBe(false);
     expect(w.fgh.x(APP).variables.get('PIPEGEN_BLOCK_FROM')?.value).toBe('2026-11-14');
   }, 180_000);
+
+  it('e2e helpers: the proof fakes, the constants and the keys fake come from proof-world.ts, not a copy', () => {
+    const world = readFileSync(join(import.meta.dirname, 'helpers/e2e-world.ts'), 'utf8');
+    expect(world).toMatch(/from '\.\/proof-world\.js'/);
+    for (const copy of [/function fakeKeys/, /export const OWN\b/, /const RUN_ID\b/, /export const TYPED\b/, /const OWN\s*=/]) expect(world).not.toMatch(copy);
+  });
 
   // SRC BUG (G14, run-proof.ts): kept as a failing-by-design test (`it.fails`) so the suite stays green while the bug is open; when the bug is fixed
   // this test starts to pass, `it.fails` then fails, and whoever fixed it deletes the e2e's stand-in sha (STANDIN_PROOF_SHA in helpers/e2e-world.ts).

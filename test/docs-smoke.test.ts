@@ -111,6 +111,33 @@ describe('docs', () => {
     for (const task of ['G0', 'G2', 'G3', 'G4', 'G4b', 'G5', 'G6', 'G7', 'G8', 'G10', 'G11', 'G13', 'G14', 'G15']) expect(bySource, task).toMatch(new RegExp(`\\b${task}[ab]?\\b`));
   });
 
+  it('docs: smoke-test.md carries the G16-R1 live items and notes (cache-mode, closed items, cross-repo Closes, release order, signing)', () => {
+    const text = all.flatMap((t) => t.rows.map((r) => r.join(' | '))).join('\n');
+    // F4: the job-level `cache-mode: none` key must be a real GitHub key; a cross-repo `Closes <owner>/pipelines#N` from an app PR
+    const byTask = section(/Live items by task/).rows;
+    expect(byTask.some((r) => /cache-mode: none/.test(r[1] ?? '') && /progress/.test(r[2] ?? ''))).toBe(true);
+    expect(byTask.some((r) => /Closes <owner>\/pipelines#N/.test(r[1] ?? '') && /write to the central repo/.test(r[1] ?? ''))).toBe(true);
+    // F4: G15a-5, -13 and -19 are closed in the ledger: listed as closed, with where, and the result still "not run"
+    const g15a = section(/G15a live items/).rows;
+    for (const n of [5, 13, 19]) {
+      const row = g15a.find((r) => r[0] === `G15a-${n}`) as string[];
+      expect(row[1], `G15a-${n}`).toMatch(/^CLOSED /);
+      expect(row.at(-1)).toBe('not run');
+    }
+    expect(g15a.find((r) => r[0] === 'G15a-5')?.[1]).toMatch(/2026-11-06/);
+    // F5: the hook rows depend on the bumped and published version; row 14 signs only a project that builds an image
+    expect(smoke).toMatch(/version bump.*publish.*come before.*row 8.*R1.*R2|publish.*before.*row 8/is);
+    expect(section(/Task 8 Step 5/).rows[13]?.[1]).toMatch(/builds an image|has a Dockerfile/);
+    expect(section(/Task 8 Step 5/).rows[13]?.[1]).toMatch(/signs nothing|no signing/);
+    // F6: a first run on a private repo is unsigned until G-SIGN1 lands; a re-run after the environment exists signs
+    const signing = section(/Signing on a private project/).rows;
+    expect(signing.length).toBeGreaterThanOrEqual(2);
+    expect(signing.map((r) => r.join(' ')).join('\n')).toMatch(/first run.*unsigned.*G-SIGN1/is);
+    expect(signing.map((r) => r.join(' ')).join('\n')).toMatch(/re-run.*environment exists.*signs/is);
+    for (const r of signing) expect(r.at(-1)).toBe('not run');
+    expect(text).toMatch(/G-SIGN1/);
+  });
+
   it('docs: design §4.1 and §19 and the threat model say what was built', () => {
     const design = read('docs/design.md');
     // §4.1: the public layout is the two-level local chain with a records-only pipelines
@@ -127,6 +154,8 @@ describe('docs', () => {
     expect(threats).toMatch(/\| T53 \|.*full power of that code/s);
     expect(threats).toMatch(/\| T53 \|.*not the boundary/s);
     expect(threats).toMatch(/\| T53 \|.*`isolatedTestJob` is false/s);
+    // F9: no sentence the code does not show (proof runs have no isolated job)
+    expect(threats).not.toMatch(/Proof runs use the same isolation/);
     expect(threats).toMatch(/\| T54 \|.*run job of each pair has \*\*no key and no secret\*\*/s);
   });
 });
