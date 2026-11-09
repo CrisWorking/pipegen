@@ -45,6 +45,36 @@ const wf = (path: string, content: string, repo: 'app' | 'central' = 'app'): Cre
 /** pipegen's caller: runs on push and on the PR, reads one secret. */
 export const CALLER = (extra = ''): CreatedFile => wf('.github/workflows/pipegen.yml', `on: [push, pull_request]\njobs:\n  a:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: echo "\${{ secrets.API_TOKEN }}"${extra}\n`);
 
+/** Where a recording keys fake sends its effects (the e2e puts them on a fake GitHub); all optional. */
+export interface KeysEffects {
+  /** After `setup`, `placeholders` or `real` stored these names. */
+  store?: (names: readonly string[]) => Promise<void>;
+  /** The names `deleteAll` removed. */
+  purge?: () => Promise<string[]>;
+  /** The names stored right now (ScratchKeys.stored()), by kind. */
+  stored?: () => Record<string, string>;
+  /** The line `deleteAll` writes on the timeline (default `keys.deleteAll`). */
+  deleteLine?: string | null;
+}
+
+/** A ScratchKeys stand-in that records on `tl`: the scratch secrets are placeholders until the user says yes, and deleteAll removes them. */
+export function recordingKeys(tl: string[], fx: KeysEffects = {}): FixKeys & { readonly mode: FixKeys['mode'] } {
+  let mode: 'none' | 'placeholder' | 'real' = 'none';
+  return {
+    get mode() { return mode; }, lastRefusal: undefined,
+    setup: async (n: readonly string[]) => { tl.push(`keys.setup:${[...n].join(',')}`); if (mode === 'none') mode = 'placeholder'; await fx.store?.(n); },
+    placeholders: async (n: readonly string[]) => { tl.push(`keys.placeholders:${[...n].join(',')}`); if (mode === 'none') mode = 'placeholder'; await fx.store?.(n); },
+    real: async (n: readonly string[]) => { tl.push(`keys.real:${[...n].join(',')}`); mode = 'real'; await fx.store?.(n); },
+    deleteAll: async () => {
+      if (fx.deleteLine !== null) tl.push(fx.deleteLine ?? 'keys.deleteAll');
+      mode = 'none';
+      return await fx.purge?.() ?? [];
+    },
+    stored: () => fx.stored?.() ?? {},
+    ticket: async () => ({ ticket: true }), evidence: async () => null, scrubber: () => (x: string) => x,
+  } as unknown as FixKeys & { readonly mode: FixKeys['mode'] };
+}
+
 export interface WorldOpts {
   private?: boolean;
   results?: ProofResult[];
@@ -108,15 +138,7 @@ export async function proofWorld(o: WorldOpts = {}): Promise<World> {
     select: async () => { throw new Error('no select'); }, text: async () => { throw new Error('no text'); },
   };
   const io: CliIO = { prompt, out: () => {}, err: (s) => { tl.push(`err:${s.slice(0, 60)}`); }, env: {}, interactive: o.interactive ?? true };
-  let mode: 'none' | 'placeholder' | 'real' = 'none';
-  const keys = {
-    get mode() { return mode; }, lastRefusal: undefined,
-    setup: async (n: readonly string[]) => { tl.push(`keys.setup:${[...n].join(',')}`); if (mode === 'none') mode = 'placeholder'; },
-    placeholders: async (n: readonly string[]) => { tl.push(`keys.placeholders:${[...n].join(',')}`); if (mode === 'none') mode = 'placeholder'; },
-    real: async (n: readonly string[]) => { tl.push(`keys.real:${[...n].join(',')}`); mode = 'real'; },
-    deleteAll: async () => { tl.push('keys.deleteAll'); mode = 'none'; return []; },
-    ticket: async () => ({ ticket: true }), evidence: async () => null, scrubber: () => (x: string) => x,
-  } as unknown as FixKeys;
+  const keys = recordingKeys(tl);
   const results = [...(o.results ?? [PASS])];
   const pushed: World['pushed'] = [];
   const evals: World['evals'] = [];
@@ -212,7 +234,7 @@ export async function proofWorld(o: WorldOpts = {}): Promise<World> {
     ...o.input,
   };
   return {
-    tl, store, input, ops, asked, vault, meter, pushed, variants, setupCentral, evals, cleanupOpts, checkOpts, asm, armed, keysMode: () => mode,
+    tl, store, input, ops, asked, vault, meter, pushed, variants, setupCentral, evals, cleanupOpts, checkOpts, asm, armed, keysMode: () => keys.mode,
     get disarm() { return disarm; },
     run: async () => { try { return await makeRunProof(ops)(input); } finally { disarm(); } },
   };

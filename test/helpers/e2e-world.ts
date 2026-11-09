@@ -5,32 +5,34 @@
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { buildFiles, fullRun, judgeBuilt, proofBuildFor, readBuildFacts, type EnvPlanFn, type RunDeps, type RunStages, type GitHubFacts } from '../../src/cli/run.js';
 import { environmentPlan } from '../../src/layers/deploy.js';
 import { judgeAssembled } from '../../src/layers/assemble.js';
 import { finishCommand } from '../../src/cli/commands.js';
 import type { CliIO, Prompter } from '../../src/cli/io.js';
 import { makeRunProof, type ProofOps, type RunProof } from '../../src/cli/run-proof.js';
+import { cleanupAfterProof, type CleanupResult } from '../../src/proof/cleanup.js';
+import { runGit, type PushRef } from '../../src/proof/git.js';
+import { pushProofSetup, type ProofSetupDeps, type ProofSetupInput } from '../../src/proof/snapshot.js';
+import type { GuardedRepo } from '../../src/proof/target.js';
 import { gateJobList, jobIdFor } from '../../src/engine/gate-job-list.js';
 import { finish, type FinishProbe } from '../../src/deliver/finish.js';
 import { newRateBudget } from '../../src/engine/github-rate.js';
-import type { FixKeys } from '../../src/proof/fix.js';
 import { proofAppFiles } from '../../src/proof/harness.js';
 import { evaluateProof } from '../../src/proof/evaluate.js';
 import { MinutesMeter } from '../../src/proof/minutes.js';
 import type { RunOutcome } from '../../src/proof/run.js';
-import type { ProofBranch } from '../../src/proof/snapshot.js';
-import { DEFAULT_MODEL, type AiProvider, type AiRequest, type CreatedFile, type PipelineDraft } from '../../src/types.js';
+import { DEFAULT_MODEL, type AiProvider, type AiRequest, type PipelineDraft } from '../../src/types.js';
 import { usageOf, REVIEWED } from './debate-fixtures.js';
 import { betterleaksAt, CLEAN, makeStub } from './gitleaks-stub.js';
 import { cosignKey, cosignPub, envelope } from './cosign-keys.js';
 import { E2E_VALUE, E2eGitHub } from './e2e-github.js';
 import { gitRepoWith } from './git-repo-with.js';
+import { OWN, RUN_ID, SS_FIELD, TYPED, recordingKeys } from './proof-world.js';
 import { gateDoc, gateFinding, greenMain, job, run as outcomeRun } from './proof-eval.js';
 import type { VariantRuns } from '../../src/proof/evaluate.js';
 
-export const OWN = 'CrisWorking';
 /** The stand-in central sha the e2e gives the harness where the run asks for a private draft's files before the proof's own central commit exists (see the SRC BUG note). */
 export const STANDIN_PROOF_SHA = 'c'.repeat(40);
 export const APP_NAME = 'orderdesk';
@@ -38,9 +40,6 @@ export const APP_NAME = 'orderdesk';
 export const ALT = 'AltReviewer';
 export const TODAY = '2026-11-07';
 export const NOW_MS = Date.parse('2026-11-07T10:00:00Z');
-export const RUN_ID = '20261107-100000-abc123';
-/** The typed test value of the app's one secret (made up). */
-export const TYPED = ['typed', 'value', '4242424242'].join('-');
 
 /** The invented project: a Node service on Express and Postgres, with no Dockerfile and no tests. */
 export const PROJECT_FILES: Record<string, string> = {
@@ -140,25 +139,14 @@ export function writeProject(extra: Record<string, string> = {}): string {
 /** The made-up cosign key pair the key-env signing step uses (never a real key). */
 export const KEY_PW = ['made', 'up', 'phrase', '4242'].join('-');
 
-/** A FixKeys that records on the timeline: the scratch secrets are placeholders until the user says yes, and deleteAll removes them. */
-function fakeKeys(tl: (s: string) => void): FixKeys & { readonly mode: FixKeys['mode'] } {
-  let mode: FixKeys['mode'] = 'none';
-  return {
-    get mode() { return mode; }, lastRefusal: undefined,
-    setup: async (n: readonly string[]) => { tl(`keys.setup:${[...n].join(',')}`); if (mode === 'none') mode = 'placeholder'; },
-    placeholders: async (n: readonly string[]) => { tl(`keys.placeholders:${[...n].join(',')}`); if (mode === 'none') mode = 'placeholder'; },
-    real: async (n: readonly string[]) => { tl(`keys.real:${[...n].join(',')}`); mode = 'real'; },
-    deleteAll: async () => { tl('cleanup: scratch secrets deleted'); mode = 'none'; return []; },
-    ticket: async () => ({ ticket: true }), evidence: async () => null, scrubber: () => (x: string) => x,
-  } as unknown as FixKeys & { readonly mode: FixKeys['mode'] };
-}
-
 export interface E2eWorld {
   dir: string; fgh: E2eGitHub; io: CliIO & { lines: string[]; errs: string[]; asked: string[] }; deps: RunDeps; home: string; ai: ReturnType<typeof scriptedAi>;
   /** Every step in order: the proof's, the milestones of the run (the preview, the delivery), and the finish. */
   tl: string[];
   stages: Partial<RunStages>;
   run(): Promise<number>;
+  /** What the real cleanupAfterProof returned (one per proof). */
+  cleanups: CleanupResult[];
   /** The pushes of the proof and what they held. */
   readonly pushedPaths: () => string[];
 }
@@ -218,38 +206,55 @@ export async function e2eWorld(o: E2eOptions = {}): Promise<E2eWorld> {
   const gh = fgh.octokit();
   const clock = { budget: newRateBudget() };
 
-  // ---- the proof: the real fix loop, evaluation and file assembly; the GitHub-touching ops are recordings ----
-  const br = (variant: ProofBranch['variant'], n: number): ProofBranch => ({ variant, branch: `proof/${RUN_ID}/${variant}`, sha: n.toString(16).padStart(40, 'a'), commits: [] });
+  // ---- the proof: the real fix loop, evaluation and file assembly, the REAL pushProofSetup (the central head copy, the base snapshot, every check, the
+  // writes in the plan's order) and the REAL cleanupAfterProof, both against the fake GitHub. Recorded: the git transport (the pushed commits are
+  // read back from the proof session's own repo and land as refs on the fake), the scratch-secret keys (the same routes, through the fake), the
+  // proof's workflow runs and the polling of them (no Actions) ----
   const SCRATCH = `pipegen-proof-${APP_NAME}`;
+  const SCRATCH_FULL = `${OWN}/${SCRATCH}`;
+  const cleanups: CleanupResult[] = [];
+  const secretCall = (r: GuardedRepo | { owner: string; repo: string }) => ({ owner: r.owner, repo: r.repo });
   const ops: Partial<ProofOps> = {
     start: async () => { tl.push('proof: start'); return { at: NOW_MS, fromServer: true }; },
     resumeMinutes: async (_gh, _t, s) => new MinutesMeter(s.cap, NOW_MS),
     minutesStop: () => async () => false,
-    keys: () => { tl.push('proof: keys'); return fakeKeys((s) => tl.push(s)); },
-    [['secret', 'Store'].join('')]: (k: FixKeys, names: readonly string[]) => async () => { tl.push('proof: scratch secrets stored'); fgh.proof.scratch.stored = [...names]; await k.setup(names); },
-    transport: () => ({ push: async () => {} }),
-    setup: async (input, deps) => {
-      tl.push('proof: setup');
-      const app = await input.appFiles(priv ? 'c'.repeat(40) : undefined);
-      await deps.storeSecrets({ kind: 'scratch', target: { defaultBranch: 'main' } } as never, { baseSha: 'b'.repeat(40) });
-      if (input.central !== undefined) fgh.proof.pushes.push({ repo: 'pipelines', branch: `proof/${RUN_ID}`, files: input.central.files.map((f) => f.path) });
-      fgh.proof.pushes.push({ repo: SCRATCH, branch: `proof/${RUN_ID}/main`, files: app.map((f) => String(f.path)) });
-      fgh.proof.pushes.push({ repo: SCRATCH, branch: `proof/${RUN_ID}/planted`, files: [...app.map((f) => String(f.path)), ...input.plantedFiles.map((f) => String(f.path))] });
-      const { plantedSecretPlacements } = await import('../../src/proof/snapshot.js');
-      const c1b = plantedSecretPlacements(new Set(Object.keys(files)), { existingIgnore: null });
-      return {
-        session: {} as never, base: { paths: new Set(Object.keys(files)), gitleaksIgnore: null, sha: 'b'.repeat(40) } as never,
-        branches: { main: br('main', 1), planted: br('planted', 2) }, planted: c1b.expected, disabled: [], notProven: [], leftOut: [], warnings: [],
-        ...(priv ? { centralSha: 'c'.repeat(40) } : {}),
-      };
+    // the scratch keys: the real ScratchKeys also checks the repo's access (collaborators, deploy keys, teams), which this fake does not answer;
+    // this stand-in stores and deletes through the same routes, so the cleanup's deletes are the ones GitHub is asked for
+    keys: (kgh, kt) => {
+      tl.push('proof: keys');
+      const where = secretCall({ owner: kt.owner, repo: kt.scratch });
+      return recordingKeys(tl, {
+        deleteLine: null,
+        store: async (names) => {
+          for (const n of [...new Set([...names.map((x) => x.toUpperCase()), 'PIPEGEN_FP_KEY'])]) {
+            await kgh.request('PUT /repos/{owner}/{repo}/actions/secrets/{secret_name}', { ...where, secret_name: n, encrypted_value: 'AAAA', key_id: 'kid-1' });
+          }
+        },
+        purge: async () => {
+          const listed = (await kgh.request('GET /repos/{owner}/{repo}/actions/secrets', where)).data as { secrets: { name: string }[] };
+          for (const x of listed.secrets) await kgh.request('DELETE /repos/{owner}/{repo}/actions/secrets/{secret_name}', { ...where, secret_name: x.name });
+          return listed.secrets.map((x) => x.name);
+        },
+        stored: () => Object.fromEntries([...fgh.repo(SCRATCH_FULL).stored.keys()].map((n) => [n, 'placeholder'])),
+      });
     },
-    pushBranch: async (_s, variant, commits) => {
-      fgh.proof.pushes.push({ repo: SCRATCH, branch: `proof/${RUN_ID}/${variant}`, files: commits.flat().map((f) => String(f.path)) });
-      return br(variant, 3);
-    },
-    resetBase: async () => { tl.push('proof: base reset'); },
+    [SS_FIELD]: (k, names) => async () => { tl.push('proof: scratch secrets stored'); await k.setup(names); },
+    // the git transport: what the proof pushes is read back from its own session and lands as a ref on the fake GitHub
+    transport: () => ({
+      push: async (to: GuardedRepo, from, refs: readonly PushRef[], opts?: { force?: boolean }) => {
+        for (const r of refs) {
+          const out = Buffer.from(await runGit(from, ['ls-tree', '-r', '--name-only', '-z', r.sha])).toString('utf8');
+          fgh.proof.pushes.push({ repo: to.repo, branch: r.branch, files: out.split('\0').filter((x) => x !== '') });
+          tl.push(`push ${to.repo} ${r.branch}${opts?.force === true ? ' (force)' : ''}`);
+          fgh.land(`${to.owner}/${to.repo}`, r.branch, r.sha);
+        }
+      },
+    }),
+    // the real pushProofSetup; only its 5-second wait for a run the base push might start is shortened (there is no Actions to start one)
+    setup: (input: ProofSetupInput, deps: ProofSetupDeps) => { tl.push('proof: setup'); return pushProofSetup(input, { ...deps, settleMs: 0 }); },
     variant: async (_gh, _t, v) => {
       tl.push(`proof: variant ${v.branch.variant}${v.merge ? ' (merged)' : ''}`);
+      fgh.addRun(SCRATCH_FULL);
       // the recorded answer is put in at evaluation (below), where the draft's job list is known
       const out: RunOutcome = outcomeRun({ event: 'pull_request', sha: v.branch.sha });
       return { outcomes: [out], closed: !v.merge, stopped: false, missing: [], leftovers: [], ...(v.merge ? { mergeSha: 'f'.repeat(40) } : {}) } as never;
@@ -263,13 +268,12 @@ export async function e2eWorld(o: E2eOptions = {}): Promise<E2eWorld> {
     },
     userMain: async () => new Map(),
     cancelActive: async () => { tl.push('proof: cancel'); },
-    cleanup: async (_gh, _t, _s, k) => {
-      // pipegen's cleanup deletes the scratch secrets first, then the proof branches, and empties or deletes the scratch repo
-      await (k as unknown as FixKeys).deleteAll();
-      fgh.proof.scratch.deleted = true;
-      fgh.proof.cleanup.push('scratch secrets', 'proof branches', 'scratch repo emptied');
-      tl.push('cleanup: proof branches deleted', 'cleanup: done');
-      return { repoDeleted: false, leftovers: [] };
+    // the real cleanupAfterProof, wrapped only to note when it returned and what it said
+    cleanup: async (cgh, ct, store, ckeys, copts) => {
+      const res = await cleanupAfterProof(cgh, ct, store, ckeys, copts);
+      tl.push('cleanup returned');
+      cleanups.push(res);
+      return res;
     },
     // SRC BUG (G14, reported in the G16 report): a private draft carries a stand-in central pin, but run-proof.ts asks for its files once with no central
     // sha (`filesAt(startDraft, undefined)`), and the real harness refuses that. The e2e hands the real harness the stand-in sha there, so the rest
@@ -369,7 +373,7 @@ export async function e2eWorld(o: E2eOptions = {}): Promise<E2eWorld> {
     state: { home, env: {} }, local: { home, env: {} }, reviewed: () => REVIEWED, [['secret', 'Scanner'].join('')]: async () => ({ ...scanner, name: 'betterleaks' }) as never
   };
   return {
-    dir, fgh, io, deps, home, ai, tl, stages,
+    dir, fgh, io, deps, home, ai, tl, stages, cleanups,
     run: () => fullRun(dir, io, deps),
     pushedPaths: () => fgh.proof.pushes.flatMap((p) => p.files),
   };

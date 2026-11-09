@@ -29,6 +29,34 @@ export interface Call { route: string; params: Record<string, unknown> }
 type Hook = (call: Call) => { status: number; data?: unknown; headers?: Record<string, string> } | undefined;
 
 const sha1 = (s: string): string => createHash('sha1').update(s).digest('hex');
+
+/**
+ * git's real tree sha of a flat path -> entry map (nested trees built and hashed as git does: entries sorted by name with a folder compared as
+ * `name/`, folder mode 40000). A reader that rebuilds the tree to check it (the proof's copy of the central head) then finds the same sha.
+ */
+function gitTreeSha(flat: Map<string, Entry>): string {
+  interface Dir { files: Map<string, Entry>; dirs: Map<string, Dir> }
+  const root: Dir = { files: new Map(), dirs: new Map() };
+  for (const [path, e] of flat) {
+    const parts = path.split('/');
+    let d = root;
+    for (const part of parts.slice(0, -1)) {
+      let c = d.dirs.get(part);
+      if (c === undefined) { c = { files: new Map(), dirs: new Map() }; d.dirs.set(part, c); }
+      d = c;
+    }
+    d.files.set(parts.at(-1) as string, e);
+  }
+  const hash = (d: Dir): string => {
+    const items = [
+      ...[...d.files].map(([name, e]) => ({ key: name, name, mode: e.mode, sha: e.sha })),
+      ...[...d.dirs].map(([name, c]) => ({ key: `${name}/`, name, mode: '40000', sha: hash(c) })),
+    ].sort((a, b) => Buffer.compare(Buffer.from(a.key), Buffer.from(b.key)));
+    const body = Buffer.concat(items.map((i) => Buffer.concat([Buffer.from(`${i.mode} ${i.name}\0`), Buffer.from(i.sha, 'hex')])));
+    return createHash('sha1').update(`tree ${body.length}\0`).update(body).digest('hex');
+  };
+  return hash(root);
+}
 const fail = (status: number, message = 'Not Found', headers: Record<string, string> = {}): never => {
   throw Object.assign(new Error(message), { status, response: { status, headers, data: { message } } });
 };
@@ -95,7 +123,7 @@ export class FakeGitHub {
 
   #blob(r: Repo, content: string): string { const sha = gitBlobSha(content); r.blobs.set(sha, content); return sha; }
   #tree(r: Repo, flat: Map<string, Entry>): string {
-    const sha = sha1(JSON.stringify([...flat].sort(([a], [b]) => (a < b ? -1 : 1))));
+    const sha = gitTreeSha(flat);
     r.trees.set(sha, flat);
     return sha;
   }

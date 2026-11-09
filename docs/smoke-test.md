@@ -50,12 +50,23 @@ The 17 lines of plan Task 8 Step 5 (plan lines 537 to 554), in order, on the pri
 | 11 | a green commit status with the context `GATE_CHECK_NAME`, posted through the API, doesn't unblock a PR (the required check is bound to the Actions app, integration id 15368) | plan Task 8 Step 5, pre-flight §6 | not run |
 | 12 | approving, then pushing a new commit, dismisses the approval; a new approval re-runs the gate | plan Task 8 Step 5 | not run |
 | 13 | a branch with an open PR runs only the merge layer | plan Task 8 Step 5 | not run |
-| 14 | `finish --print` prints commands and changes nothing; then `finish` applies locks (app + central), the central CODEOWNERS, signing and variables (`PIPEGEN_BLOCK_FROM`) | plan Task 8 Step 5, pre-flight §6 | not run |
+| 14 | `finish --print` prints commands and changes nothing; then `finish` applies locks (app + central), the central CODEOWNERS, signing and variables (`PIPEGEN_BLOCK_FROM`). Signing is applied only for a project that builds an image (has a Dockerfile): the plain throwaway project has none, so it signs nothing and this line checks the locks, the CODEOWNERS and the variables only; signing is checked in section "Signing on a private project" | plan Task 8 Step 5, pre-flight §6, G16 review F5 | not run |
 | 15 | `verify` reports a hand-made drift | plan Task 8 Step 5 | not run |
 | 16 | a nightly issue with a patch is applied by `pipegen update` as a PR (re-derived, S27) | plan Task 8 Step 5, pre-flight §6 | not run |
 | 17 | closing an unmerged setup PR leaves the repo with no new rules (the N4 signing environment stays and is recorded, S11) | plan Task 8 Step 5, pre-flight §6 | not run |
 
 Line 3 replaces the plan line "the public project is inline, and its check is named `GATE_CHECK_NAME`". That plan text is stale: a public project is not inline. Its caller calls the local `./.github/workflows/pipegen-merge.yml` (job `gate`), a two-level chain (G2/G43, ruling S18). The check itself stays; only its wording changed. The controller fixes the plan line in `pipegen-internal`.
+
+Order: the version bump to `0.2.0` and the npm publish come before row 8, R1 and R2. The hook files `pipegen run` delivers name `pipegen@<the package version>` (`pipegen@0.1.0` in a build that has not been bumped), so on an unbumped or unpublished build row 8 and R2 would test a version that is not the build under test, and R1 needs the published package.
+
+## Signing on a private project
+
+A private project is signed only when its `pipegen-signing` environment exists and carries the default-branch rule: the capability probe proves that only by reading the environment, and nothing creates it before the probe (G16 review F6). So today a first `pipegen run` on a private repository records signing mode `none`, and `finish` upgrades nothing. Ruling G-SIGN1 changes that: the run re-derives the signing mode after it has made the environment and read it back, before assembly. These rows need a private throwaway project that builds an image (has a Dockerfile) and has no `pipegen-signing` environment at the start.
+
+| # | Check | Source | Result |
+|---|---|---|---|
+| SIGN-1 | a first run on a private project with a Dockerfile and no `pipegen-signing` environment: until ruling G-SIGN1 lands the first run is unsigned (mode `none`, nothing signs after the merge); once G-SIGN1 lands the same first run signs (the environment is made and read back with the default-branch rule before assembly, and the delivered workflows sign). Write down which of the two the build under test did | ruling G-SIGN1, G16 review F6, `src/github/capabilities.ts`, `src/deliver/finish.ts` | not run |
+| SIGN-2 | a re-run after the environment exists signs (key-env): the published image is signed with the key pair `finish` stored, and `cosign verify` with the public key in `PIPEGEN_COSIGN_PUB` passes | ruling G-SIGN1, G16 review F6, G2/G3 reports | not run |
 
 ## Public project
 
@@ -201,6 +212,8 @@ Every "Live" line of the Plan G ledger, under its source report (`task-G*-report
 | L-G15-1 | the runner's image store: `docker info` on GitHub's hosted `ubuntu-24.04` shows whether it is classic or containerd, and a real run passes the digest check on it (a concurrent tag write is the negative control) | G15a report (round 11), progress | not run |
 | L-G15-2 | GitHub's own handling of an escaped `\*` in CODEOWNERS (the gate matcher reads it as a literal star, the gitignore reading): one live probe when the release pushes | G15b report | not run |
 | L-G15-3 | the `gate/dist` built from the tag `gate-v0.2.3` matches the committed bundle on a clean machine (reproducibility) | G15b report | not run |
+| L-prog-1 | the job-level key `cache-mode: none` that `pipegen-verify` and `image-publish` carry (`render-step.ts`, deliberate; the actionlint config ignores it) is a real GitHub key: a delivered workflow with it loads and runs, and GitHub does not answer with a schema error. If GitHub rejects it, every delivered workflow with that key fails to load | progress.md (G15a round 2) | not run |
+| L-G17D-1 | a cross-repo `Closes <owner>/pipelines#N` in an app PR body closes the central issue, as GitHub does only when the PR author can write to the central repo; otherwise the issue stays open and the PR still merges | G17D report (row 51), progress.md | not run |
 
 ## G15a live items
 
@@ -212,7 +225,7 @@ From `task-G15a-report.md` ("Live items for G16" and the items added in each rou
 | G15a-2 | the OIDC token host, and Bullfrog's wildcard support, for the keyless and attest sign jobs (T52 exception) | G15a report | not run |
 | G15a-3 | gh 2.103.3 under Bullfrog: `tuf-repo.github.com` and the bundle host; confirm the bundle_url host (`tmaproduction.blob.core.windows.net`) on a private repository's attestation; confirm `--no-public-good` verifies a private repository's attestation end to end | G15a report | not run |
 | G15a-4 | gh 2.103.3: the four flags and `--source-digest`, as the pinned binary's help shows them | G15a report | not run |
-| G15a-5 | the gh release's build-provenance attestation, checked with an independent gh; then record `verifiedWith` for the gh entry and add cli/cli to MUST_VERIFY, together, in one change | G15a report | not run |
+| G15a-5 | CLOSED live 2026-11-06 (progress.md, "LIVE item closed": the gh v2.103.3 linux_amd64 attestation verified with an independent gh 2.87.3, negative control exits 1; `verifiedWith` and cli/cli in MUST_VERIFY followed in round 3). Re-confirm only if wanted: the gh release's build-provenance attestation, checked with an independent gh; then record `verifiedWith` for the gh entry and add cli/cli to MUST_VERIFY, together, in one change | G15a report | not run |
 | G15a-6 | the gh archive holds exactly one file named `gh` at the expected path | G15a report | not run |
 | G15a-7 | `docker login ghcr.io` in the digest step, then `actions/attest` with `push-to-registry: true` uses that login | G15a report | not run |
 | G15a-8 | attest in a private ghcr repository, end to end (`attestations: write`, `packages: write`) | G15a report | not run |
@@ -220,13 +233,13 @@ From `task-G15a-report.md` ("Live items for G16" and the items added in each rou
 | G15a-10 | Scorecard as a `docker://…@sha256` step: whether `with:` reaches the image as `INPUT_*` | G15a report | not run |
 | G15a-11 | the same Scorecard run on `schedule` writes `scorecard.sarif` into `/github/workspace` | G15a report | not run |
 | G15a-12 | Scorecard under Bullfrog with github-core plus osv: the CII-Best-Practices check's host, and any other host | G15a report | not run |
-| G15a-13 | gh: the attestation's source commit `63837fb778d6…` is the commit of tag v2.103.3 | G15a report | not run |
+| G15a-13 | CLOSED live 2026-11-06 (progress.md, G15a round 3: tag v2.103.3 resolves to commit 63837fb778d6a39f02be0ce76ff89f2bc8d74bdc through `gh api`, equal to the attestation's source digest). Re-confirm only if wanted: gh, the attestation's source commit `63837fb778d6…` is the commit of tag v2.103.3 | G15a report | not run |
 | G15a-14 | code scanning accepts the scrubbed Scorecard SARIF, including results with no location (the repo-level checks) | G15a report | not run |
 | G15a-15 | the weekly `if: github.event.schedule == '23 4 * * 1'` inside the called central nightly workflow (private layout): the caller's event payload is visible there | G15a report | not run |
 | G15a-16 | `actions/checkout` (the reviewed pin) with `fetch-depth: 0` on a `schedule` run fetches every branch and tag, so `--all` reaches them | G15a report | not run |
 | G15a-17 | code scanning accepts the scrubbed betterleaks SARIF (category `pipegen-secrets-history`), with results that carry `pipegenCommit` and no region | G15a report | not run |
 | G15a-18 | the full-history job's runtime and the size of its raw SARIF on a large repository (`--remerge-diff --text` over every ref) against the job timeout and the scrub's raw size cap | G15a report | not run |
-| G15a-19 | the ZAP AF active scan report from the pinned zap-stable digest (captured offline; the live run is item 24) | G15a report | not run |
+| G15a-19 | CLOSED in code (G15a report: the report was captured offline and the fixture is in the tests). The live run is item 24. The ZAP AF active scan report from the pinned zap-stable digest (captured offline; the live run is item 24) | G15a report | not run |
 | G15a-20 | the nightly nuclei pair on a `schedule` run: the image build and the archive start in the nightly file, the template fetch under Bullfrog (github-core), and code scanning accepting the scrubbed nuclei SARIF (category `pipegen-dast-nightly--<svc>`, results with URL paths and no repository file) | G15a report | not run |
 | G15a-21 | nuclei's `executionSuccessful: false` (always, per the fixture) in a code-scanning upload: does code scanning show the run as failed? | G15a report | not run |
 | G15a-22 | on a GitHub runner, `zap.sh -cmd -silent -autorun` as the image user, with `--cap-drop ALL --network host`, against `http://127.0.0.1:<port>`: the time it takes (about 100 s on a 3-URL app here) and the DOM XSS rule's browser under Bullfrog | G15a report | not run |

@@ -4,15 +4,22 @@
 // REAL here (the code under test): consent text and estimates, the project read, the capability probes, the lock-probe reads (writers, org
 // admin, sha pinning, repo ids), the needs / discover / debate / creators stages (with a scripted AI), the secrets stage, the key-env signing
 // plan, readBuildFacts + buildFiles + the referee and the guard (judgeBuilt), the assemble step, the fix loop and the evaluation of the proof
-// (src/proof/evaluate.ts, src/cli/run-proof.ts), the delivery (central workflows, the N4 signing environment, secrets, the git data API, the
-// setup PR, the install record), `gateReachable` (public app), `trusted` (reads the central repo), `prState` (GET the pull request), the
-// finish (rulesets, central merge rule, central CODEOWNERS, signing key, PIPEGEN_BLOCK_FROM) and the summary.
-// FAKE: GitHub itself (an in-memory Octokit); the git transport and the proof's runs (recorded answers: a passing `main`, the `planted`
-// variant with its findings); the AI; the clock, sleep, run id; the pinned secret scanner; the two workflow linters (zizmor's online audits
-// need a real network); the cosign key pair; `discover`'s search (the fake has none, so no new action is found and `resolvePin` is not
-// reached); the real `readProject` of the stage table is replayed in e2e-world.ts because it builds its own Octokit from the token.
+// (src/proof/evaluate.ts, src/cli/run-proof.ts), pushProofSetup (src/proof/snapshot.ts: the central head copy read from the fake, the base
+// snapshot of the project's HEAD, every tree check, Dependabot off, the no-run check, the secret store step, the main and planted pushes, in the
+// plan's order), cleanupAfterProof (src/proof/cleanup.ts: the scratch secrets first, the runs, the proof branches, the default branch reset, the
+// central proof branch), the delivery (central workflows, the N4 signing environment, secrets, the git data API, the setup PR, the install
+// record), `gateReachable` (public app), `trusted` (reads the central repo), `prState` (GET the pull request), the finish (rulesets, central
+// merge rule, central CODEOWNERS, signing key, PIPEGEN_BLOCK_FROM) and the summary.
+// FAKE: GitHub itself (an in-memory Octokit that answers the routes above); the git TRANSPORT (the pushed commits are read back from the proof
+// session's own repo and land as refs on the fake); the proof's workflow RUNS and the polling of them (recorded answers: a passing `main`, the
+// `planted` variant with its findings); the scratch-secret KEYS object (the real ScratchKeys also checks the scratch repo's access, collaborators,
+// deploy keys and teams, which the fake does not answer; its stand-in stores and deletes through the same secret routes); the AI; the clock,
+// sleep, run id; the pinned secret scanner; the two workflow linters (zizmor's online audits need a real network); the cosign key pair;
+// `discover`'s search (the fake has none, so no new action is found and `resolvePin` is not reached); the helper-repo check (`proofRepos`:
+// creating repos and the access settings are GitHub-side); the real `readProject` of the stage table is replayed in e2e-world.ts because it
+// builds its own Octokit from the token.
 // NOT covered (live only, see docs/smoke-test.md): real runner minutes, the real Actions runs and the checks they report, a real token, the
-// helper repos' real creation, GitHub's own answers to the probes, Anthropic.
+// helper repos' real creation, the real ScratchKeys access check, a real git push (the transport), GitHub's own answers to the probes, Anthropic.
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -174,7 +181,8 @@ describe('e2e', () => {
     expect(w.cleanups[0]?.leftovers).toEqual([]);
     expect(w.fgh.repo(`${OWN}/${SCRATCH}`).stored.size).toBe(0);
     expect(w.fgh.writesTo(APP_NAME)).toEqual([]);
-    expect(w.fgh.writesTo('pipelines')).toEqual([]);
+    // the one write to the central repo is the cleanup deleting the proof's own branch (the central copy the proof pushed)
+    expect(w.fgh.writesTo('pipelines').map((c) => `${c.route} ${String(c.params.ref)}`)).toEqual([`DELETE /repos/{owner}/{repo}/git/refs/{ref} heads/proof/${RUN_ID}`]);
     expect(w.fgh.repo(APP).pulls).toEqual([]);
     expect(w.io.asked.some((q) => /Open the setup pull request/.test(q))).toBe(false);
   }, 240_000);
