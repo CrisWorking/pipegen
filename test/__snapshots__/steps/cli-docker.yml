@@ -50,7 +50,7 @@
     )
     rc=0
     "${sys[@]}" /usr/bin/docker rm -f pipegen-tool-5ca176964f22c29a > /dev/null 2>&1 || true
-    "${pg_env[@]}" /usr/bin/docker create --name pipegen-tool-5ca176964f22c29a --pull=never --security-opt no-new-privileges --cap-drop ALL --network host "$PIPEGEN_IMAGE" zap-baseline.py -c zap-baseline.conf -J zap.json -z -silent > /dev/null
+    "${pg_env[@]}" /usr/bin/docker create --name pipegen-tool-5ca176964f22c29a --pull=never --security-opt no-new-privileges --cap-drop ALL --network host "$PIPEGEN_IMAGE" zap-baseline.py -c zap-baseline.conf -J zap.json -z '-silent -config api.addrs.addr.name=127.0.0.1 -config api.addrs.addr.regex=false' > /dev/null
     "${sys[@]}" /usr/bin/docker cp -a "$work/." pipegen-tool-5ca176964f22c29a:/zap/wrk
     "${pg_env[@]}" /usr/bin/docker start -a pipegen-tool-5ca176964f22c29a || rc=$?
     "${sys[@]}" /usr/bin/docker cp pipegen-tool-5ca176964f22c29a:/zap/wrk/zap.json "$out" > /dev/null 2>&1 || true

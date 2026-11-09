@@ -39,7 +39,8 @@ describe('compose: services', () => {
       expect(d.services[k].image, k).toBe(baseImageRef(w.id));
       expect(d.services[k].ports, k).toEqual([`127.0.0.1:${w.port}:${w.port}`]);
       expect(d.services[k].healthcheck, k).toEqual(DEP_TABLE[k as keyof typeof DEP_TABLE].healthcheck);
-      expect(Object.keys(d.services[k]).sort(), k).toEqual((k === 'redis' ? ['healthcheck', 'image', 'ports'] : ['environment', 'healthcheck', 'image', 'ports']).sort());
+      expect(Object.keys(d.services[k]).sort(), k).toEqual((k === 'redis' ? ['healthcheck', 'image', 'ports', 'security_opt'] : ['environment', 'healthcheck', 'image', 'ports', 'security_opt']).sort());
+      expect(d.services[k].security_opt, k).toEqual(['no-new-privileges:true']);   // G17B-R1 sec M2
     }
     expect(d.services.postgres.environment).toEqual({ POSTGRES_USER: 'pipegen', ...PG_PW_ENTRY, POSTGRES_DB: 'pipegen' });
   });
@@ -106,7 +107,7 @@ describe('compose: services', () => {
       if (name.startsWith('app-')) expect(Object.keys(s).sort()).toEqual(['build', 'cap_drop', 'depends_on', 'ports', 'security_opt']);   // no env names in this profile
       // G17 row 13: only the app containers drop capabilities, and only these exact values (a drop, never an add)
       if (name.startsWith('app-')) expect([s.cap_drop, s.security_opt]).toEqual([['ALL'], ['no-new-privileges:true']]);
-      else expect(s.cap_drop ?? s.security_opt).toBeUndefined();
+      else { expect(s.cap_drop).toBeUndefined(); expect(s.security_opt).toEqual(['no-new-privileges:true']); }   // G17B-R1 sec M2
     }
     for (const bad of ['privileged', 'cap_add', 'volumes', 'network_mode', 'pid', 'ipc', 'devices', 'extends', 'include', 'env_file', 'secrets', 'configs', 'profiles', 'x-', 'command', 'entrypoint', 'user:', 'labels']) expect(text(prof([api({ dependsOn: ALL })]))).not.toContain(bad);
   });
@@ -155,14 +156,14 @@ describe('compose: the exact text (golden)', () => {
     const want = [
       'services:',
       '  postgres:', `    image: "${r('postgres-17')}"`, '    environment:', '      POSTGRES_USER: "pipegen"', ...Object.entries(PG_PW_ENTRY).map(([k, v]) => `      ${k}: "${v}"`), '      POSTGRES_DB: "pipegen"',
-      '    ports:', '      - "127.0.0.1:5432:5432"', '    healthcheck:', '      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "pipegen", "-d", "pipegen"]', '      interval: "5s"', '      timeout: "5s"', '      retries: 20',
+      '    ports:', '      - "127.0.0.1:5432:5432"', '    healthcheck:', '      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "pipegen", "-d", "pipegen"]', '      interval: "5s"', '      timeout: "5s"', '      retries: 20', '    security_opt:', '      - "no-new-privileges:true"',
       '  mysql:', `    image: "${r('mysql-8.4')}"`, '    environment:', `      MYSQL_ROOT_${'PASS' + 'WORD'}: "${pw}"`, '      MYSQL_USER: "pipegen"', `      MYSQL_${'PASS' + 'WORD'}: "${pw}"`, '      MYSQL_DATABASE: "pipegen"',
-      '    ports:', '      - "127.0.0.1:3306:3306"', '    healthcheck:', '      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "pipegen", "--silent"]', '      interval: "5s"', '      timeout: "5s"', '      retries: 30', '      start_period: "20s"',
-      '  redis:', `    image: "${r('redis-7')}"`, '    ports:', '      - "127.0.0.1:6379:6379"', '    healthcheck:', '      test: ["CMD", "redis-cli", "ping"]', '      interval: "5s"', '      timeout: "5s"', '      retries: 20',
+      '    ports:', '      - "127.0.0.1:3306:3306"', '    healthcheck:', '      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "pipegen", "--silent"]', '      interval: "5s"', '      timeout: "5s"', '      retries: 30', '      start_period: "20s"', '    security_opt:', '      - "no-new-privileges:true"',
+      '  redis:', `    image: "${r('redis-7')}"`, '    ports:', '      - "127.0.0.1:6379:6379"', '    healthcheck:', '      test: ["CMD", "redis-cli", "ping"]', '      interval: "5s"', '      timeout: "5s"', '      retries: 20', '    security_opt:', '      - "no-new-privileges:true"',
       '  mongodb:', `    image: "${r('mongo-8.0')}"`, '    environment:', '      MONGO_INITDB_ROOT_USERNAME: "pipegen"', `      MONGO_INITDB_ROOT_${'PASS' + 'WORD'}: "${pw}"`, '      MONGO_INITDB_DATABASE: "pipegen"',
-      '    ports:', '      - "127.0.0.1:27017:27017"', '    healthcheck:', '      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand(\'ping\').ok"]', '      interval: "5s"', '      timeout: "10s"', '      retries: 30', '      start_period: "20s"',
+      '    ports:', '      - "127.0.0.1:27017:27017"', '    healthcheck:', '      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand(\'ping\').ok"]', '      interval: "5s"', '      timeout: "10s"', '      retries: 30', '      start_period: "20s"', '    security_opt:', '      - "no-new-privileges:true"',
       '  rabbitmq:', `    image: "${r('rabbitmq-4-management')}"`, '    environment:', '      RABBITMQ_DEFAULT_USER: "pipegen"', `      RABBITMQ_DEFAULT_PASS: "${pw}"`,
-      '    ports:', '      - "127.0.0.1:5672:5672"', '    healthcheck:', '      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]', '      interval: "10s"', '      timeout: "10s"', '      retries: 30', '      start_period: "30s"',
+      '    ports:', '      - "127.0.0.1:5672:5672"', '    healthcheck:', '      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]', '      interval: "10s"', '      timeout: "10s"', '      retries: 30', '      start_period: "30s"', '    security_opt:', '      - "no-new-privileges:true"',
       '  app-api:', '    build:', '      context: "./api"', '      dockerfile: "Dockerfile"', '    environment:', '      AMQP_URL: "${PIPEGEN_APP_AMQP_URL:?}"', '      DATABASE_URL: "${PIPEGEN_APP_DATABASE_URL:?}"', '      MONGODB_URI: "${PIPEGEN_APP_MONGODB_URI:?}"', '      REDIS_URL: "${PIPEGEN_APP_REDIS_URL:?}"',
       '    ports:', '      - "127.0.0.1:3000:3000"', '    cap_drop:', '      - "ALL"', '    security_opt:', '      - "no-new-privileges:true"', '    depends_on:',
       '      postgres:', '        condition: service_healthy', '      mysql:', '        condition: service_healthy', '      redis:', '        condition: service_healthy', '      mongodb:', '        condition: service_healthy', '      rabbitmq:', '        condition: service_healthy',
