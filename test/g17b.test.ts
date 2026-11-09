@@ -395,6 +395,9 @@ describe('G17B-R2 design call: pipegen publishes and signs no image built from a
     for (const l of lines) expect(l).toMatch(/Fails the run\.$/);
     expect(doc).toContain(DIGEST);
     expect(doc).toContain(AGAIN);
+    // the published image gets no "does not publish" note
+    const assembled = assemble(x, 'keyless');
+    expect(assembled.notes.join('\n')).not.toMatch(/pipegen does not publish the image/);
     // the deploy part skipped: no publish job, so neither line
     const skipped = pipegenDoc({ ...x.draft, ...SKIP_DEPLOY, doc: DOC }, REVIEWED).content;
     expect(skipped).not.toContain(DIGEST);
@@ -415,6 +418,11 @@ describe('G17B-R2 sec M2 (the fallback): the compose start\'s second build reach
     const build = domainsOf(a.merge['image-build--app'] as Job);
     expect(run).toEqual(expect.arrayContaining(['registry.npmjs.org', 'ghcr.io']));
     for (const d of build) expect(run, d).toContain(d);
+    // the test jobs that start the compose file build the same images: they reach the same hosts
+    const starts = Object.entries(a.merge).filter(([, j]) => (j as Job).steps.some((st) => /docker compose .* up -d/.test(st.run ?? '')));
+    const tests = starts.filter(([id]) => !id.startsWith('dast-run--'));
+    expect(tests.length, 'a test job starts the compose file').toBeGreaterThan(0);
+    for (const [id, j] of tests) for (const d of build) expect(domainsOf(j as Job), `${id}: ${d}`).toContain(d);
     expect(shown(await judge([...files(a), compose], a.draft))).toBe('');
   });
 
