@@ -14,7 +14,7 @@ import { centralWorkflowFile } from '../src/engine/central-path.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { pubKeySha256 } from '../src/engine/signing.js';
 import { ensureSigningEnvironment, plannedOfLocks, readEnv, SETUP_BRANCH } from '../src/deliver/deliver.js';
-import { finish, FinishError, FINISH_WRITE_ROUTES, githubFinishProbe, type FinishDeps, type FinishProbe } from '../src/deliver/finish.js';
+import { earliestBlockFrom, finish, FinishError, FINISH_WRITE_ROUTES, githubFinishProbe, type FinishDeps, type FinishProbe } from '../src/deliver/finish.js';
 import { checkRecord, protectedPathsForRecord, recordFileText, recordPath, localFinishPendingPath, readLocalRecord, readRecord, recordHash, recordMarkerOf, writeFinishPending, writeLocalRecord, writeRecord } from '../src/deliver/record.js';
 import { SettingsApi } from '../src/deliver/settings-api.js';
 import { verify } from '../src/deliver/verify.js';
@@ -1520,6 +1520,10 @@ describe('G11 exception round 3 (G11-R3)', () => {
         s.g.x('o/r').variables.delete('PIPEGEN_BLOCK_FROM');
         await expect(typedRun(s)).rejects.toThrow(/found no install record for .* that it trusts/);
         expect(varOf(s, 'PIPEGEN_BLOCK_FROM'), day).toBeUndefined();
+        // G17C-R1 (F4): the control: the same hand commit with a real day is trusted, so the day is the reason
+        s.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: recordFileText({ ...r, blockFrom: '2026-11-08' }) });
+        await typedRun(s);
+        expect(varOf(s, 'PIPEGEN_BLOCK_FROM')?.value, day).toBe('2026-11-08');
         continue;
       }
       await writeRecord(s.g.octokit(), { record: { ...r, blockFrom: day }, setupPr: s.pr, via: 'direct', files: [], base: s.g.head('o/pipelines'), clock: clock(), now: () => new Date('2026-11-08T12:00:00Z'), local: { home: s.home, env: {} } });
@@ -1734,5 +1738,26 @@ describe('G13-R2b: protected paths in the record (m7, m1)', () => {
     const res = await v(s);
     expect(res.drift.length).toBeGreaterThan(0);
     expect(res.drift[0]?.what).toBe('install record');
+  });
+});
+
+describe('G17C-R1: finish (F4, F6)', () => {
+  const app = { owner: 'o', repo: 'r' };
+  it('finish: the block date takes the earliest real day only; an impossible day or year 0000 never counts (F4: earliestBlockFrom)', () => {
+    expect(earliestBlockFrom('2026-11-12', [undefined, '', ''])).toBe('2026-11-12');
+    expect(earliestBlockFrom('2026-11-12', ['2026-02-30', '0000-01-01', '2026-13-01'])).toBe('2026-11-12');
+    expect(earliestBlockFrom('2026-11-12', ['2026-11-10', '2026-11-11', '2027-01-01'])).toBe('2026-11-10');
+    expect(earliestBlockFrom('2026-11-12', ['2027-01-01', '0000-02-29', '2026-11-09'])).toBe('2026-11-09');
+  });
+  it('finish: a local record file that is a folder → stop naming the file and `npx pipegen finish` (F6, m2)', async () => {
+    const s = await seed();
+    const f = join(s.home, '.config', 'pipegen', 'records', 'o__r.json');
+    rmSync(f, { force: true });
+    mkdirSync(f, { recursive: true });
+    const e = await finish(s.g.octokit(), app, {}, s.deps()).then(() => null, (x: unknown) => x) as Error;
+    expect(e).toBeInstanceOf(FinishError);
+    expect(e.message).toContain(f);
+    expect(e.message).toContain('npx pipegen finish');
+    expect(e.message).not.toMatch(/npx pipegen run/);
   });
 });

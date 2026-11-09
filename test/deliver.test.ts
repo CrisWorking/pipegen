@@ -108,7 +108,8 @@ afterEach(() => { for (const d of homes.splice(0)) rmSync(d, { recursive: true, 
 function world(opts: { appPrivate?: boolean; centralPrivate?: boolean; appFiles?: Record<string, string>; modes?: Record<string, string>; repo?: string } = {}): World {
   const g = new FakeGitHub();
   g.addRepo(`o/${opts.repo ?? 'r'}`, { private: opts.appPrivate ?? true, files: opts.appFiles ?? { 'README.md': 'hi\n', CODEOWNERS: CO_ORIG, [HOOK_FILES['pre-commit']]: HOOK_ORIG, 'package.json': PJ, 'package-lock.json': LOCK, '.github/workflows/deploy.yml': DEPLOY_ORIG }, ...(opts.modes === undefined ? {} : { modes: opts.modes }) });
-  g.addRepo('o/pipelines', { private: opts.centralPrivate ?? true, files: { 'README.md': 'central\n' } });
+  // G17C-R1 (m1): the central repo's GitHub id is the one input()'s proofRepos names (the record keeps an id only when it is the live one)
+  g.addRepo('o/pipelines', { private: opts.centralPrivate ?? true, files: { 'README.md': 'central\n' } }).id = 77;
   const home = mkdtempSync(join(tmpdir(), 'pg-deliver-'));
   homes.push(home);
   const vault = new SecretVault();
@@ -1464,15 +1465,72 @@ describe('G17C: the install record and delivery', () => {
   });
 
   it('row 27: the central repo id goes into the record only with createdByPipegen from the same source', () => {
-    const rc = (deliverMod as unknown as { recordCentral: (prev: unknown, pc: unknown) => unknown }).recordCentral;
+    const rc = (deliverMod as unknown as { recordCentral: (prev: unknown, pc: unknown, live: number) => unknown }).recordCentral;
     // the hole: an earlier record that names the user's repo id, and a run whose "created" carries no id
-    expect(rc({ createdByPipegen: false, repoId: 99, rulesetId: 3 }, { createdByPipegen: true })).toEqual({ createdByPipegen: true, rulesetId: 3 });
-    expect(rc({ createdByPipegen: true, repoId: 77 }, { createdByPipegen: false })).toEqual({ createdByPipegen: true, repoId: 77 });
-    expect(rc({ createdByPipegen: true, repoId: 77 }, { createdByPipegen: true, repoId: 99 })).toEqual({ createdByPipegen: true, repoId: 99 });
-    expect(rc({ createdByPipegen: true, repoId: 77 }, { createdByPipegen: true })).toEqual({ createdByPipegen: true });
-    expect(rc({ createdByPipegen: false, repoId: 99 }, { createdByPipegen: false })).toEqual({ createdByPipegen: false });
-    expect(rc(undefined, { createdByPipegen: true, repoId: 5, actionsAccess: { previous: 'none' } })).toEqual({ createdByPipegen: true, repoId: 5, actionsAccess: { previous: 'none' } });
-    expect(rc(undefined, undefined)).toEqual({ createdByPipegen: false });
+    expect(rc({ createdByPipegen: false, repoId: 99, rulesetId: 3 }, { createdByPipegen: true }, 99)).toEqual({ createdByPipegen: true, rulesetId: 3 });
+    expect(rc({ createdByPipegen: true, repoId: 77 }, { createdByPipegen: false }, 77)).toEqual({ createdByPipegen: true, repoId: 77 });
+    expect(rc({ createdByPipegen: true, repoId: 77 }, { createdByPipegen: true, repoId: 99 }, 99)).toEqual({ createdByPipegen: true, repoId: 99 });
+    expect(rc({ createdByPipegen: true, repoId: 77 }, { createdByPipegen: true }, 77)).toEqual({ createdByPipegen: true });
+    expect(rc({ createdByPipegen: false, repoId: 99 }, { createdByPipegen: false }, 99)).toEqual({ createdByPipegen: false });
+    expect(rc(undefined, { createdByPipegen: true, repoId: 5, actionsAccess: { previous: 'none' } }, 5)).toEqual({ createdByPipegen: true, repoId: 5, actionsAccess: { previous: 'none' } });
+    expect(rc(undefined, undefined, 1)).toEqual({ createdByPipegen: false });
+    // G17C-R1 (m1): an id that is not the live central repo's (a stale run-state id, a repo deleted and made again) is never recorded, nor
+    // is "created" with it: from this run or from the earlier record
+    expect(rc(undefined, { createdByPipegen: true, repoId: 111 }, 222)).toEqual({ createdByPipegen: false });
+    expect(rc({ createdByPipegen: true, repoId: 77, rulesetId: 3 }, { createdByPipegen: false }, 88)).toEqual({ createdByPipegen: false, rulesetId: 3 });
+  });
+
+  it('G17C-R1 (m1): a stale central id from the run state goes into no record; the live one does', async () => {
+    const w = world();
+    await firstRun(w, { proofRepos: { central: { repoId: 111, createdByPipegen: true }, scratch: { createdByPipegen: true } } });
+    expect((await record(w))?.central).toEqual({ createdByPipegen: false });
+    const w2 = world();
+    await firstRun(w2);
+    expect((await record(w2))?.central).toEqual({ createdByPipegen: true, repoId: 77 });
+  });
+
+  it('G17C-R1 (m4): a re-run that writes nothing over an owner-edited CODEOWNERS records no write and no base', async () => {
+    const w = world();
+    await firstRun(w);
+    const p = profile();
+    w.g.repo('o/r').refs.set('heads/main', w.g.head('o/r', SETUP_BRANCH));
+    const w1 = `${CO_ORIG}\n${B1}`;
+    const owner = `# mine\n${w1}`;
+    w.g.commitOn('o/r', 'main', { CODEOWNERS: owner });
+    const pin = (await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w)) as { sha: string }).sha;
+    const same = cf('CODEOWNERS', owner, 'codeowners', { edited: { original: owner } });
+    const whole = appFiles(pin, { withPkg: false }).filter((f) => f.edited === undefined && f.inserted === undefined).map((f) => (f.path === 'PIPEGEN.md' ? { ...f, content: '# pipegen v2\n' } : f));
+    await deliver(w.g.octokit(), p, planDelivery(input(p, pin, { files: [...centralFiles(), ...whole, same], locks: locks({ codeowners: undefined }) })), vault2(), deps(w));
+    const co = (await record(w, upd) as Rec).edits.find((e) => e.path === 'CODEOWNERS') as Rec['edits'][number] & { baseShas?: (string | null)[] };
+    expect(co.writtenShas).toEqual([gitBlobSha(w1)]);
+    expect(co.baseShas).toEqual([gitBlobSha(CO_ORIG)]);
+    expect(co.writtenShas).not.toContain(gitBlobSha(owner));
+    expect(chained(co)).toBe(true);
+  });
+
+  it('G17C-R1 (F5): central files pipegen\'s own central PR added are created once that PR is merged; any other merge leaves them adopted', async () => {
+    for (const how of ['merge', 'fast-forward', 'other head', 'other merge', 'not merged'] as const) {
+      const w = world();
+      w.g.repo('o/pipelines').rules = [{ type: 'pull_request', ruleset_id: 9 }];
+      const p = profile();
+      const c1 = await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w));
+      if (c1.kind !== 'central-pr') throw new Error('central PR expected');
+      const prHead = w.g.head('o/pipelines', upd);
+      expect((c1 as { pr?: unknown }).pr, how).toEqual({ number: 1, commit: prHead });
+      let merge: string;
+      if (how === 'fast-forward') { w.g.repo('o/pipelines').refs.set('heads/main', prHead); merge = prHead; }
+      else merge = w.g.commitOn('o/pipelines', 'main', Object.fromEntries(centralFiles().map((f) => [f.path, f.content])), 'Merge pull request #1');
+      w.g.hooks.push((call) => (call.route === 'GET /repos/{owner}/{repo}/pulls/{pull_number}' && call.params.repo === 'pipelines' && how !== 'fast-forward'
+        ? { status: 200, data: { number: 1, state: 'closed', merged_at: how === 'not merged' ? null : '2026-11-05T12:30:00Z', head: { ref: upd, sha: how === 'other head' ? 'f'.repeat(40) : prHead }, base: { ref: 'main' }, merge_commit_sha: how === 'other merge' ? 'e'.repeat(40) : merge } }
+        : undefined));
+      const c2 = await deliverCentral(w.g.octokit(), p, centralFiles(), { ...cdeps(w), pr: (c1 as { pr: { number: number; commit: string } }).pr } as never);
+      const mine = how === 'merge' || how === 'fast-forward';
+      expect(c2, how).toMatchObject({ kind: 'pinned', sha: merge });
+      expect((c2 as { committed?: true }).committed, how).toBe(mine ? true : undefined);
+      await deliver(w.g.octokit(), p, planDelivery(input(p, merge, mine ? { centralCommitted: merge } : {})), w.vault, deps(w));
+      const r = await record(w, upd) as Rec;
+      for (const f of centralFiles()) expect(r.files.find((x) => x.path === f.path)?.adopted, `${how} ${f.path}`).toBe(mine ? undefined : true);
+    }
   });
 
   it('row 28: central files a foreign commit added (identical to pipegen\'s) are recorded adopted; this run\'s own central commit is created', async () => {
@@ -1545,6 +1603,8 @@ describe('G17C: the install record and delivery', () => {
     e.wait_timer = 7;
     const b = await again();
     expect(b.env?.previous).toMatchObject({ wait_timer: 7, deployment_branch_policy: null });
+    // G17C-R1 (i1): what pipegen narrowed before the typed record is still not recorded: said, though this run captured its own change
+    expect(b.notes.join('\n')).toMatch(/pipegen-signing.*can't put back.*settings.*by hand/s);
     expect(b.env?.changed).toEqual(expect.arrayContaining(['deployment_branch_policy']));
     // opened again, and this run stops after narrowing it: the leftovers hold the settings it found, though the earlier entry has none
     e.deployment_branch_policy = null;

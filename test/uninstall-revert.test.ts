@@ -165,7 +165,7 @@ describe('V2: the revert engine', () => {
     const dep = 'version: 2\nupdates:\n  - package-ecosystem: "npm"\n    directory: "/"\n    schedule:\n      interval: "daily"\n';
     const draft ={ profile: { private: true }, centralPin: { repo: 'acme/pipelines' } } as unknown as PipelineDraft;
     const de = textEdit('dependabot', '.github/dependabot.yml', dep, `${dep}${dependabotEntryText(draft)}`);
-    expect(textOf(revertEdit(de, cur(`# mine\n${dep}${dependabotEntryText(draft)}`), blob))).toBe(`# mine\n${dep}`);
+    expect(textOf(revertEdit(de, cur(`# mine\n${dep}${dependabotEntryText(draft)}`), blob, { appOwner: 'acme' }))).toBe(`# mine\n${dep}`);   // G17C-R1: the private form needs the app owner
   });
 
   it("plan: edit not in pipegen's builder form → manual review, never removed", () => {
@@ -484,12 +484,22 @@ describe('G17C rows 24, 25: the Dependabot private form names the app owner\'s p
     for (const [repo, ctx, want] of [
       ['acme/pipelines', { appOwner: 'acme' }, 'strip'], ['Acme/pipelines', { appOwner: 'acme' }, 'strip'],
       ['evil/pipelines', { appOwner: 'acme' }, 'manual'], ['acme/other', { appOwner: 'acme' }, 'manual'],
-      // without the app owner the repo name is still bound to pipelines
-      ['acme/other', {}, 'manual'], ['acme/pipelines', {}, 'strip'],
+      // G17C-R1 (F2, m3): without the app owner the private form is never pipegen's (only the public form is)
+      ['acme/other', {}, 'manual'], ['acme/pipelines', {}, 'manual'], ['acme/pipelines', { defaultBranch: 'main' }, 'manual'], ['acme/pipelines', { appOwner: '' }, 'manual'],
     ] as const) {
       const de = textEdit('dependabot', '.github/dependabot.yml', dep, `${dep}${dependabotEntryText(priv(repo))}`);
       expect(kind(revertEdit(de, cur(`# mine\n${dep}${dependabotEntryText(priv(repo))}`), blob, ctx as never)), `${repo} ${JSON.stringify(ctx)}`).toBe(want);
     }
+  });
+  it('G17C-R1 (F2, m3): through revertEdits, the private entry of evil/pipelines is kept for manual review; acme/pipelines is stripped', () => {
+    const one = (repo: string, ctx: { defaultBranch?: string; appOwner?: string }): string => {
+      const de = textEdit('dependabot', '.github/dependabot.yml', dep, `${dep}${dependabotEntryText(priv(repo))}`);
+      const [r] = revertEdits([de], () => cur(`# mine\n${dep}${dependabotEntryText(priv(repo))}`), blob, ctx);
+      return kind((r as { result: RevertResult }).result);
+    };
+    expect(one('evil/pipelines', { defaultBranch: 'main', appOwner: 'acme' })).toBe('manual');
+    expect(one('acme/pipelines', { defaultBranch: 'main', appOwner: 'acme' })).toBe('strip');
+    expect(one('acme/pipelines', { defaultBranch: 'main' })).toBe('manual');
   });
   it('row 25: revert.ts reads the husky shebang from created-builders.ts (no copy of its own)', async () => {
     const { readFileSync } = await import('node:fs');

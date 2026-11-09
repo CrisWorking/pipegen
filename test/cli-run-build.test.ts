@@ -454,7 +454,9 @@ describe('G17C row 29: a later run that rewrites a file an earlier run adopted s
     const notes = adoptedOf(b);
     expect(notes).toHaveLength(1);
     expect(notes[0]).toContain(target.path);
-    expect(notes[0]).toMatch(/was in your repository before pipegen/);
+    // G17C-R1 (F5): the note claims only what the record says (pipegen's own file merged through its central PR may be adopted too)
+    expect(notes[0]).toMatch(/the install record lists it as adopted/);
+    expect(notes[0]).not.toMatch(/before pipegen/);
     expect(b.assembled.draft.doc?.notes ?? []).toEqual(expect.arrayContaining([notes[0]]));
     // created (not adopted): no note
     const created = { edits: [], files: [{ repo: 'app', path: target.path, part: target.part, shas: [gitBlobSha('old\n')] }] } as unknown as BuildInput['prev'];

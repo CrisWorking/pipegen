@@ -1460,6 +1460,38 @@ describe('G17C row 27: the central repo pipegen created, with its GitHub id, in 
   });
 });
 
+describe('G17C-R1 (F5): the central PR pipegen opened is remembered, so its merge proves pipegen\'s central files', () => {
+  it('state: centralPrOpened keeps the PR number and pipegen\'s commit; begin carries them for the same app only', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'pg-g17c-'));
+    const s = await StateStore.open({ owner: 'o', repo: 'r' }, { home, env: {} });
+    const app = { owner: 'o', repo: 'r', private: true, ownerType: 'User' as const, defaultBranch: 'main' };
+    s.begin('20261109-000000-abcdef', app, { cap: 1, aiCap: 1 });
+    s.centralPrOpened(4, 'd'.repeat(40));
+    expect((s.state as { centralPr?: unknown }).centralPr).toEqual({ number: 4, commit: 'd'.repeat(40) });
+    expect(() => s.centralPrOpened(0, 'd'.repeat(40))).toThrow();
+    expect(() => s.centralPrOpened(4, 'not a sha')).toThrow();
+    s.update((n) => { n.cleanupDone = true; });
+    s.begin('20261109-000001-abcdef', app, { cap: 1, aiCap: 1 });
+    expect((s.state as { centralPr?: unknown }).centralPr).toEqual({ number: 4, commit: 'd'.repeat(40) });
+    s.update((n) => { n.cleanupDone = true; });
+    s.begin('20261109-000002-abcdef', { ...app, repo: 'other' }, { cap: 1, aiCap: 1 });
+    expect((s.state as { centralPr?: unknown }).centralPr).toBeUndefined();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('run: a central PR run saves the PR; the next run gives it to deliverCentral', async () => {
+    const pr = { number: 4, commit: 'd'.repeat(40) };
+    const w = world();
+    const seen: unknown[] = [];
+    w.stages.deliverCentral = (async (...a: unknown[]) => { seen.push(a[4]); return { kind: 'central-pr', url: 'u', message: 'merge it', pr }; }) as never;
+    expect(await run(w)).toBe(2);
+    w.stages.deliverCentral = (async (...a: unknown[]) => { seen.push(a[4]); return { kind: 'pinned', sha: 'c'.repeat(40), done: [] }; }) as never;
+    w.deps.runId = () => '20261106-110000-abc123';
+    expect(await run(w)).toBe(0);
+    expect(seen).toEqual([undefined, pr]);
+  });
+});
+
 describe('G17C row 28: only the central commit deliverCentral made in this run reaches the delivery', () => {
   it('run: centralCommitted is the pin only when deliverCentral says it committed; a pin already there is never passed as this run\'s commit', async () => {
     const sha = 'c'.repeat(40);
