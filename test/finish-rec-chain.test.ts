@@ -1,0 +1,254 @@
+// v0.2 Plan G G-FINREC (ruling V6b-R1, Plan G carry; VL/review-V6b-security.md i2 and the finish/update recommendation): the central
+// CODEOWNERS finish writes is recorded as an edit whose writes chain (editWritesChained, src/deliver/record.ts):
+// - a file finish creates: an edit with originalSha null and baseShas [null], never a `files` entry, replacing any record entry at that path
+//   (i2: a deliver edit at the same path made the record refuse itself, "the same entry twice");
+// - an edit of an existing central CODEOWNERS: baseShas [gitBlobSha(original)] (the blob finish read on the head its commit is made on).
+// End to end through uninstall: a created file untouched → deleted whole; the owner added a line → kept (manual); an edited file → the
+// original restored over a chain that holds.
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { gitBlobSha } from '../src/create/guard.js';
+import { newRateBudget } from '../src/engine/github-rate.js';
+import { plannedOfLocks, SETUP_BRANCH } from '../src/deliver/deliver.js';
+import { finish, type FinishDeps, type FinishProbe } from '../src/deliver/finish.js';
+import { checkRecord, editWritesChained, readRecord, writeRecord, type RecordedEdit } from '../src/deliver/record.js';
+import { planLocks } from '../src/layers/locks.js';
+import { emptyRepoFiles } from '../src/read/quality.js';
+import type { Capabilities, CreatedFile, InstallEdit, InstallRecord, RepoProfile } from '../src/types.js';
+import { uninstallStep, type StepResult } from '../src/uninstall/apply.js';
+import { ProgressFile } from '../src/uninstall/progress.js';
+import { FinishGitHub } from './helpers/finish-github.js';
+import { blob as blobSha, cleanHomes, deps as uDeps, gh as uGh, loadedOf, local, RECORD_TEXT, sampleRecord, SHA, term, world, type World } from './helpers/uninstall-world.js';
+
+vi.mock('../src/util/exit-hooks.js', async (orig) => ({
+  ...(await orig<typeof import('../src/util/exit-hooks.js')>()),
+  interrupting: () => false,
+  onInterrupt: () => () => {},
+}));
+
+const CO_ORIG = '* @someone\n';
+const MERGE = 'on: { workflow_call: {} }\njobs: { gate: { runs-on: ubuntu-24.04, steps: [{ run: "true" }] } }\n';
+const CAPS: Capabilities = { branchProtection: true, environments: true, envRequiredReviewers: true, deploymentBranchPolicies: true, attestations: false, codeScanning: true, keylessSigningAllowed: false };
+const PROTECTED = ['.github/workflows/**', 'CODEOWNERS'];
+const CO = '.github/CODEOWNERS';
+const clock = () => ({ budget: newRateBudget(), sleep: async () => {} });
+const homes: string[] = [];
+afterEach(() => { for (const d of homes.splice(0)) rmSync(d, { recursive: true, force: true }); cleanHomes(); });
+
+interface Seed { g: FinishGitHub; deps: () => FinishDeps }
+
+/**
+ * A private project delivered by pipegen and merged (the trimmed seed of test/finish.test.ts): the central repo holds `centralFiles` (a
+ * central CODEOWNERS the owner wrote, or none), and `recordOver` changes the record deliver wrote.
+ */
+async function seed(o: { centralFiles?: Record<string, string>; recordOver?: (r: InstallRecord) => void } = {}): Promise<Seed> {
+  const g = new FinishGitHub();
+  const central = g.addRepo('o/pipelines', { private: true, ownerType: 'User', files: { 'README.md': 'central\n', '.github/workflows/r--merge.yml': MERGE, ...o.centralFiles } });
+  const pin = g.head('o/pipelines');
+  const caller = `name: pipegen\non: { pull_request: null }\npermissions: {}\njobs:\n  pipegen:\n    uses: o/pipelines/.github/workflows/r--merge.yml@${pin}\n    permissions: { contents: read }\n`;
+  const app = g.addRepo('o/r', { private: true, ownerType: 'User', files: { 'README.md': 'hi\n', CODEOWNERS: CO_ORIG } });
+  g.writers('o/r', ['a', 'b']);
+  g.writers('o/pipelines', ['a', 'b']);
+  g.users.set('a', 11);
+  g.users.set('b', 12);
+  const cf = (path: string, content: string, repo: 'app' | 'central'): CreatedFile => ({ path, content, part: 'pipeline', reason: 'x', repo });
+  const files = [cf('.github/workflows/pipegen.yml', caller, 'app'), cf('.github/workflows/r--merge.yml', MERGE, 'central')];
+  const profile: RepoProfile = {
+    owner: 'o', repo: 'r', defaultBranch: 'main', private: true, ownerType: 'User', plan: 'pro', monorepo: 'none', services: [], terraformDirs: [], hasCompose: false,
+    existingWorkflows: [], precommit: null, repoFiles: { ...emptyRepoFiles(), codeowners: 'CODEOWNERS' },
+  };
+  const centralCo = o.centralFiles?.[CO];
+  const locks = planLocks({
+    profile, caps: CAPS,
+    central: { repo: 'o/pipelines', sha: pin, branchProtection: true, codeowners: { path: centralCo === undefined ? null : CO, original: centralCo ?? '', isSymlink: false, inserted: null } },
+    writers: { app: ['a', 'b'], central: ['a', 'b'] }, owners: ['@a', '@b'], orgAdmin: false,
+    shaPinning: { state: 'read', enabled: true, allowedActions: 'all', required: false }, protectedPaths: PROTECTED,
+    appCodeowners: { original: CO_ORIG, isSymlink: false, inserted: null }, ids: { app: app.id, central: central.id }, files,
+  });
+  const co = locks.codeowners?.file.content as string;
+  app.refs.set(`heads/${SETUP_BRANCH}`, g.head('o/r'));
+  g.commitOn('o/r', SETUP_BRANCH, { '.github/workflows/pipegen.yml': caller, CODEOWNERS: co, 'PIPEGEN.md': '# pipegen\n' }, 'pipegen: setup');
+  const pr = ((await g.request('POST /repos/{owner}/{repo}/pulls', { owner: 'o', repo: 'r', head: SETUP_BRANCH, base: 'main', title: 'pipegen', body: 'pipegen sets up the checks.' })).data as { number: number }).number;
+  const record: InstallRecord = {
+    schema: 2, pipegenVersion: '0.2.0', createdAt: '2026-11-05T12:00:00Z', centralSha: pin,
+    app: { owner: 'o', repo: 'r', repoId: app.id, defaultBranch: 'main', private: true, ownerType: 'User' }, name: 'r', serviceRoots: ['.'],
+    files: [
+      { repo: 'app', path: '.github/workflows/pipegen.yml', part: 'pipeline', shas: [gitBlobSha(caller)] },
+      { repo: 'app', path: 'PIPEGEN.md', part: 'docs', shas: [gitBlobSha('# pipegen\n')] },
+      { repo: 'central', path: '.github/workflows/r--merge.yml', part: 'pipeline', shas: [gitBlobSha(MERGE)] },
+    ],
+    edits: [{ repo: 'app', path: 'CODEOWNERS', kind: 'codeowners', inserted: co.slice(CO_ORIG.length), originalSha: gitBlobSha(CO_ORIG), writtenShas: [gitBlobSha(co)] }],
+    secrets: [], variables: [], environments: [], rulesets: [], central: { repoId: central.id, createdByPipegen: true },
+    planned: plannedOfLocks(locks, 'none', [{ name: 'production', reviewers: true }]),
+    protectedPaths: PROTECTED,
+  };
+  o.recordOver?.(record);
+  const home = mkdtempSync(join(tmpdir(), 'pg-finrec-'));
+  homes.push(home);
+  await writeRecord(g.octokit(), { record, setupPr: pr, via: 'direct', files: [], base: g.head('o/pipelines'), clock: clock(), now: () => new Date('2026-11-05T12:00:00Z'), local: { home, env: {} } });
+  g.merge('o/r', SETUP_BRANCH, '2026-11-06T09:30:00Z');
+  const shm = join(home, 'shm');
+  mkdirSync(shm);
+  const probe: FinishProbe = async () => ({ plan: 'pro', caps: CAPS, centralBranchProtection: true, workflowPins: { tagPinned: 0, unchecked: false } });
+  const deps = (): FinishDeps => ({
+    out: () => {}, probe, clock: clock(), now: () => new Date('2026-11-07T10:00:00Z'), local: { home, env: {} }, keyBase: shm, isMemory: (d) => d === shm,
+    cosignBin: async () => '/opt/cosign', exec: async () => { throw new Error('no key pair in these tests'); },
+  });
+  return { g, deps };
+}
+
+const recordOn = async (s: Seed): Promise<InstallRecord> => (await readRecord(s.g.octokit(), { owner: 'o', repo: 'pipelines' }, 'r'))?.record as InstallRecord;
+const centralCoOf = (r: InstallRecord): RecordedEdit[] => r.edits.filter((e) => e.repo === 'central' && e.path === CO) as RecordedEdit[];
+const liveCo = (s: Seed): string | undefined => s.g.filesAt('o/pipelines', s.g.head('o/pipelines')).get(CO);
+const runFinish = async (s: Seed): Promise<InstallRecord> => { await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, {}, s.deps()); return recordOn(s); };
+
+describe('G-FINREC finish: the central CODEOWNERS is recorded as an edit whose writes chain', () => {
+  it('G-FINREC: a central CODEOWNERS finish creates is an edit (originalSha null, baseShas [null]), never a files entry', async () => {
+    const s = await seed();
+    const r = await runFinish(s);
+    const text = liveCo(s) as string;
+    expect(text).toMatch(/installs\/ @a @b/);
+    expect(r.files.filter((f) => f.repo === 'central' && f.path === CO)).toEqual([]);
+    const eds = centralCoOf(r);
+    expect(eds).toHaveLength(1);
+    expect(eds[0]).toMatchObject({ repo: 'central', path: CO, kind: 'codeowners', inserted: text, originalSha: null, writtenShas: [gitBlobSha(text)], baseShas: [null] });
+    expect(editWritesChained(eds[0] as RecordedEdit)).toBe(true);
+    expect(r.central?.codeowners).toEqual({ path: CO, created: true });
+  });
+
+  it('G-FINREC i2: a deliver edit at the same path (the owner deleted the file since) is replaced, never recorded twice', async () => {
+    const old = '# pipegen:begin\n/.github/workflows/ @old\n# pipegen:end\n';
+    const s = await seed({ recordOver: (r) => { r.edits.push({ repo: 'central', path: CO, kind: 'codeowners', inserted: old, originalSha: null, writtenShas: [gitBlobSha(old)], baseShas: [null] } as InstallEdit); } });
+    const res = await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, {}, s.deps());
+    expect(res.recordHash).toMatch(/^[0-9a-f]{64}$/);
+    const r = await recordOn(s);
+    const text = liveCo(s) as string;
+    expect([...r.files, ...r.edits].filter((x) => x.repo === 'central' && x.path === CO)).toHaveLength(1);
+    expect(centralCoOf(r)[0]).toMatchObject({ originalSha: null, writtenShas: [gitBlobSha(text)], baseShas: [null] });
+  });
+
+  it('G-FINREC: an older record\'s files entry for a central CODEOWNERS that is gone is replaced by the chained edit', async () => {
+    const s = await seed({ recordOver: (r) => { r.files.push({ repo: 'central', path: CO, part: 'codeowners', shas: [gitBlobSha('# earlier\n')] }); } });
+    const r = await runFinish(s);
+    expect(r.files.filter((f) => f.repo === 'central' && f.path === CO)).toEqual([]);
+    expect(centralCoOf(r)[0]).toMatchObject({ originalSha: null, writtenShas: [gitBlobSha(liveCo(s) as string)], baseShas: [null] });
+  });
+
+  it('G-FINREC: an edit of an existing central CODEOWNERS records baseShas [gitBlobSha(original)], chained to its write', async () => {
+    const own = '/docs/ @writers\n';
+    const s = await seed({ centralFiles: { [CO]: own } });
+    const r = await runFinish(s);
+    const text = liveCo(s) as string;
+    expect(text.startsWith(own)).toBe(true);
+    const eds = centralCoOf(r);
+    expect(eds).toHaveLength(1);
+    expect(eds[0]).toMatchObject({ kind: 'codeowners', inserted: text.slice(own.length), originalSha: gitBlobSha(own), writtenShas: [gitBlobSha(text)], baseShas: [gitBlobSha(own)] });
+    expect(editWritesChained(eds[0] as RecordedEdit)).toBe(true);
+    expect(r.central?.codeowners).toEqual({ path: CO, created: false });
+  });
+
+  it('G-FINREC: an existing central CODEOWNERS a files entry named (older record) is recorded only as the edit', async () => {
+    const own = '/docs/ @writers\n';
+    const s = await seed({ centralFiles: { [CO]: own }, recordOver: (r) => { r.files.push({ repo: 'central', path: CO, part: 'codeowners', shas: [gitBlobSha('# earlier\n')] }); } });
+    const r = await runFinish(s);
+    expect([...r.files, ...r.edits].filter((x) => x.repo === 'central' && x.path === CO)).toHaveLength(1);
+    expect(centralCoOf(r)[0]).toMatchObject({ originalSha: gitBlobSha(own), baseShas: [gitBlobSha(own)] });
+  });
+});
+
+// ---------- end to end: the record finish wrote, through uninstall ----------
+
+async function afterRun1(w: World): Promise<void> {
+  w.app.refs.set('heads/pipegen/uninstall', w.g.head(`o/${w.app.name}`));
+  w.app.pulls.push({ number: 1, head: 'pipegen/uninstall', base: 'main', title: 'pipegen: uninstall', body: '', state: 'closed', html_url: `https://github.com/o/${w.app.name}/pull/1` });
+  w.merged.set(`${w.app.name}#1`, '2026-11-06T10:00:00Z');
+  const pf = await ProgressFile.open({ owner: 'o', repo: w.app.name }, w.app.id, local(w));
+  pf.save({ phase: 'A-done', anchors: { appHead: SHA('a'), appTree: SHA('b'), centralHead: w.g.head('o/pipelines'), recordBlobSha: blobSha(RECORD_TEXT) }, prNumber: 1, prUrl: `https://github.com/o/${w.app.name}/pull/1`, done: [], leftovers: [] });
+}
+const prBranch = (w: World): string => `pipegen/uninstall-${w.app.name}`;
+const filesAtPr = (w: World): Map<string, string> => w.g.filesAt('o/pipelines', w.g.head('o/pipelines', prBranch(w)));
+const coCommits = (w: World): boolean => w.g.calls.some((c) => c.route === 'POST /repos/{owner}/{repo}/git/commits' && /CODEOWNERS/.test(String((c.params as { message?: unknown }).message)));
+
+/** Uninstall (last project) over finish's central CODEOWNERS record, with `onCentral` the file on the central default branch. */
+async function uninstallOver(fin: InstallRecord, onCentral: string): Promise<{ w: World; r: StepResult }> {
+  const w = world();
+  w.g.commitOn('o/pipelines', 'main', { [CO]: onCentral });
+  const rec = sampleRecord(w, { central: { repoId: w.central.id, createdByPipegen: true, ...(fin.central?.codeowners === undefined ? {} : { codeowners: fin.central.codeowners }) }, edits: centralCoOf(fin) as InstallEdit[] });
+  await afterRun1(w);
+  const r = await uninstallStep(uGh(w), loadedOf(w, rec), term().p, uDeps(w));
+  return { w, r };
+}
+
+describe('G-FINREC end to end: finish\'s central CODEOWNERS record through uninstall', () => {
+  it('G-FINREC e2e: finish creates the central CODEOWNERS → uninstall deletes it whole when untouched', async () => {
+    const s = await seed();
+    const fin = await runFinish(s);
+    const { w, r } = await uninstallOver(fin, liveCo(s) as string);
+    expect(filesAtPr(w).has(CO)).toBe(false);
+    expect(r.failed.filter((f) => /CODEOWNERS/.test(`${f.what} ${f.why}`))).toEqual([]);
+  });
+
+  it('G-FINREC e2e: finish creates the central CODEOWNERS, the owner adds a line → uninstall keeps it (manual step), no delete', async () => {
+    const s = await seed();
+    const fin = await runFinish(s);
+    const owned = `${liveCo(s) as string}docs/ @bob\n`;
+    const { w, r } = await uninstallOver(fin, owned);
+    expect(filesAtPr(w).get(CO)).toBe(owned);
+    expect(coCommits(w)).toBe(false);
+    expect(r.manual.some((m) => /CODEOWNERS/.test(m.what) && /Take pipegen's block out of/.test(m.step ?? ''))).toBe(true);
+  });
+
+  it('G-FINREC e2e: finish edits the owner\'s central CODEOWNERS → its chain holds and uninstall restores the original', async () => {
+    const own = '/docs/ @writers\n';
+    const s = await seed({ centralFiles: { [CO]: own } });
+    const fin = await runFinish(s);
+    expect(editWritesChained(centralCoOf(fin)[0] as RecordedEdit)).toBe(true);
+    const { w } = await uninstallOver(fin, liveCo(s) as string);
+    expect(filesAtPr(w).get(CO)).toBe(own);
+  });
+
+  it('G-FINREC e2e: finish edits the owner\'s central CODEOWNERS, the owner adds a line after → pipegen\'s block alone comes out', async () => {
+    const own = '/docs/ @writers\n';
+    const s = await seed({ centralFiles: { [CO]: own } });
+    const fin = await runFinish(s);
+    const owned = `${liveCo(s) as string}/api/ @bob\n`;
+    const { w } = await uninstallOver(fin, owned);
+    expect(filesAtPr(w).get(CO)).toBe(`${own}/api/ @bob\n`);
+  });
+});
+
+// ---------- older records: still readable, and they fail closed ----------
+
+describe('G-FINREC older records: readable, never chained, never deleted whole', () => {
+  it('G-FINREC older: an edit without bases, or with the short bases of an older update, reads and proves nothing', () => {
+    const w = world();
+    const W0 = '# pipegen:begin\n/.github/workflows/ @o\n# pipegen:end\n';
+    const W1 = `${W0}# again\n`;
+    const plain: InstallEdit = { repo: 'central', path: CO, kind: 'codeowners', inserted: W0, originalSha: null, writtenShas: [blobSha(W0), blobSha(W1)] };
+    for (const e of [plain, { ...plain, baseShas: [null] } as InstallEdit]) {
+      const r = checkRecord(JSON.parse(JSON.stringify(sampleRecord(w, { edits: [e] }))));
+      expect(editWritesChained(r.edits[0] as RecordedEdit), JSON.stringify(e)).toBe(false);
+    }
+    // more bases than writes is still refused
+    expect(() => checkRecord(JSON.parse(JSON.stringify(sampleRecord(w, { edits: [{ ...plain, writtenShas: [blobSha(W0)], baseShas: [null, null] } as InstallEdit] }))))).toThrow(/baseShas|form/);
+  });
+
+  it('G-FINREC older: a central CODEOWNERS an older finish recorded in files (no edit) is kept by uninstall as a manual step', async () => {
+    const s = await seed();
+    const fin = await runFinish(s);
+    const text = liveCo(s) as string;
+    const w = world();
+    w.g.commitOn('o/pipelines', 'main', { [CO]: text });
+    const rec = sampleRecord(w, {
+      central: { repoId: w.central.id, createdByPipegen: true, codeowners: { path: CO, created: true } },
+      files: [...sampleRecord(w).files, { repo: 'central', path: CO, part: 'codeowners', shas: [gitBlobSha(text)] }],
+    });
+    expect(fin.central?.codeowners).toEqual({ path: CO, created: true });
+    await afterRun1(w);
+    const r = await uninstallStep(uGh(w), loadedOf(w, rec), term().p, uDeps(w));
+    expect(filesAtPr(w).get(CO)).toBe(text);
+    expect(r.manual.some((m) => /CODEOWNERS/.test(m.what))).toBe(true);
+  });
+});
