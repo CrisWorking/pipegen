@@ -18,11 +18,12 @@ import { isDeepStrictEqual } from 'node:util';
 import { Document, isAlias, isMap, isScalar, isSeq, parseDocument, visit, type Node as YamlNode, type Pair, type YAMLMap, type YAMLSeq } from 'yaml';
 import { gitBlobSha } from '../create/guard.js';
 import { buildPackageJson } from '../create/package-edit.js';
-import { CODEOWNERS_BEGIN, CODEOWNERS_END, dependabotEntry, dependabotEntryText, HOOK_FILES, HOOKS_MARKER, hookBlock, hookDataProblem, type DependabotEntry, type HookCommand, type HookManager } from '../engine/created-builders.js';
+import { CODEOWNERS_BEGIN, CODEOWNERS_END, dependabotEntry, dependabotEntryText, HOOK_FILES, HOOKS_MARKER, HUSKY_SHEBANG, hookBlock, hookDataProblem, type DependabotEntry, type HookCommand, type HookManager } from '../engine/created-builders.js';
 import { HEAD_CHECK_STEP_ID, renderHeadCheckStep } from '../engine/deploy-steps.js';
 import { stepsToYaml } from '../engine/render-step.js';
 import { parseYaml } from '../engine/yaml-parse.js';
 import { VERIFY_JOB_ID } from '../layers/assemble.js';
+import { CENTRAL_REPO } from '../proof/target.js';
 import type { InstallEdit, PipelineDraft } from '../types.js';
 import { safeText } from '../util/safe-text.js';
 
@@ -40,8 +41,11 @@ export type RevertResult =
 export interface CurrentFile { text: string; sha: string }
 /** A git blob by sha (the original pipegen recorded, a version pipegen wrote), or null when it can't be read. Its text must hash to the sha. */
 export type BlobReader = (sha: string) => string | null;
-/** What the verify-job strip needs besides the texts: the app's default branch, which pipegen's head check names. */
-export interface RevertContext { defaultBranch?: string }
+/**
+ * What the strips need besides the texts: the app's default branch, which pipegen's head check names; the app's owner, whose
+ * `<owner>/pipelines` the private Dependabot entry ignores (G17 row 24: without it, only the repo name `pipelines` is bound).
+ */
+export interface RevertContext { defaultBranch?: string; appOwner?: string }
 
 type TextEdit = Extract<InstallEdit, { kind: 'codeowners' | 'hooks' | 'dependabot' }>;
 type VerifyEdit = Extract<InstallEdit, { kind: 'verify-job' }>;
@@ -74,18 +78,18 @@ export function revertEdit(e: InstallEdit, current: CurrentFile, blob: BlobReade
     return revertPair({ edit: e, current }, null, blob).json;
   }
   // V2-R1 sec M3: the text to remove is offered only when it is in pipegen's builder form (V4 still escapes it when it prints it)
-  if (e.ownerEdited === true) return manual(OWNER_EDITED(e.path), e.kind === 'verify-job' || textFormProblem(e) !== null ? undefined : e.inserted);
+  if (e.ownerEdited === true) return manual(OWNER_EDITED(e.path), e.kind === 'verify-job' || textFormProblem(e, ctx) !== null ? undefined : e.inserted);
   if (gitBlobSha(current.text) !== current.sha) return manual(`${show(e.path)}: the text read is not the blob of its sha, so pipegen changes nothing there.`);
-  return e.kind === 'verify-job' ? revertVerify(e, current, blob, ctx) : revertText(e, current, blob);
+  return e.kind === 'verify-job' ? revertVerify(e, current, blob, ctx) : revertText(e, current, blob, ctx);
 }
 
 // ---------- codeowners, hooks, dependabot ----------
 
 const WHAT: Readonly<Record<TextEdit['kind'], string>> = { codeowners: 'a CODEOWNERS block', hooks: "a hooks block", dependabot: 'a Dependabot entry' };
 
-function revertText(e: TextEdit, current: CurrentFile, blob: BlobReader): RevertResult {
+function revertText(e: TextEdit, current: CurrentFile, blob: BlobReader, ctx: RevertContext): RevertResult {
   const where = show(e.path);
-  const form = textFormProblem(e);
+  const form = textFormProblem(e, ctx);
   // not pipegen's builder form: nothing proves the text is pipegen's, so it is neither removed nor offered as the text to remove
   if (form !== null) return manual(`${where}: the recorded text is not ${WHAT[e.kind]} as pipegen writes it (${form}), so pipegen removes nothing there; review the file by hand.`);
   const same = unchanged(e, current);
@@ -98,7 +102,7 @@ function revertText(e: TextEdit, current: CurrentFile, blob: BlobReader): Revert
     if (original !== null && current.text === original + e.inserted) return { kind: 'restore', text: original };
   }
   const s = stripOnce(current.text, e.inserted);
-  const left = typeof s === 'string' ? afterStripProblem(e, s, current.text) : s.why;
+  const left = typeof s === 'string' ? afterStripProblem(e, s, current.text, ctx) : s.why;
   if (typeof s === 'string' && left === null) return { kind: 'strip', text: s };
   return manual(`${where}: ${left ?? ''}; take pipegen's text out by hand.`, e.inserted);
 }
@@ -108,7 +112,7 @@ function revertText(e: TextEdit, current: CurrentFile, blob: BlobReader): Revert
  * and for the YAML kinds the current file must read as the stripped one plus exactly pipegen's hooks or entry, so no owner line nested under
  * pipegen's key or item is moved to another parent by the cut.
  */
-function afterStripProblem(e: TextEdit, stripped: string, current: string): string | null {
+function afterStripProblem(e: TextEdit, stripped: string, current: string, ctx: RevertContext): string | null {
   if (e.kind === 'codeowners') return stripped.includes(CODEOWNERS_BEGIN) || stripped.includes(CODEOWNERS_END) ? "a pipegen CODEOWNERS marker is still in the file besides pipegen's recorded block" : null;
   if (e.kind === 'hooks') {
     if (stripped.includes(HOOKS_MARKER)) return `a ${HOOKS_MARKER} marker is still in the file besides pipegen's recorded block`;
@@ -120,7 +124,7 @@ function afterStripProblem(e: TextEdit, stripped: string, current: string): stri
     if (f === null) return 'the hooks block is not pipegen\'s';
     return hookDataProblem(f.manager, stripped, current, f.commands) === null ? null : 'the file does not read as the rest plus exactly pipegen\'s hooks (an owner line may sit under pipegen\'s block)';
   }
-  const f = dependabotFormOf(e.path, e.inserted, false);
+  const f = dependabotFormOf(e.path, e.inserted, false, ctx);
   if (f === null) return 'the Dependabot entry is not pipegen\'s';
   const a = parseYaml(stripped, 'strict');
   const b = parseYaml(current, 'strict');
@@ -150,7 +154,7 @@ function stripOnce(text: string, ins: string): string | { why: string } {
 }
 
 /** Why the recorded `inserted` is not what pipegen's builder writes for its kind and path, or null. */
-function textFormProblem(e: TextEdit): string | null {
+function textFormProblem(e: TextEdit, ctx: RevertContext): string | null {
   const ins = e.inserted;
   if (typeof ins !== 'string' || ins === '' || !ins.endsWith('\n') || ins.includes('\r')) return 'not whole lines';
   if (e.kind === 'codeowners') {
@@ -166,11 +170,9 @@ function textFormProblem(e: TextEdit): string | null {
   }
   if (e.repo !== 'app') return 'not in the app repository';
   if (e.kind === 'hooks') return hooksFormProblem(e.path, ins, e.originalSha === null);
-  return dependabotFormProblem(e.path, ins, e.originalSha === null);
+  return dependabotFormProblem(e.path, ins, e.originalSha === null, ctx);
 }
 
-/** The husky shebang hookFile writes at the top of a new script (created-builders.ts HUSKY_SHEBANG, not exported). */
-const HUSKY_SHEBANG = '#!/usr/bin/env sh\n';
 const MANAGERS: readonly HookManager[] = ['pre-commit', 'husky', 'lefthook'];
 const parseJson = (s: string | undefined): string | null => { if (s === undefined) return null; try { const v: unknown = JSON.parse(s); return typeof v === 'string' ? v : null; } catch { return null; } };
 
@@ -228,18 +230,22 @@ function hookCommandsOf(manager: HookManager, body: string, i: string): HookComm
 }
 
 /** Why `ins` is not dependabotFile's insert (its one github-actions entry, after the prefixes dependabotFile adds), or null. */
-function dependabotFormProblem(path: string, ins: string, isNew: boolean): string | null {
+function dependabotFormProblem(path: string, ins: string, isNew: boolean, ctx: RevertContext): string | null {
   if (path !== '.github/dependabot.yml' && path !== '.github/dependabot.yaml') return 'not the Dependabot file';
-  return dependabotFormOf(path, ins, isNew) === null ? 'not the github-actions entry pipegen writes' : null;
+  return dependabotFormOf(path, ins, isNew, ctx) === null ? 'not the github-actions entry pipegen writes' : null;
 }
 /** The entry dependabotFile's insert holds and whether the insert carries the `updates:` line, or null when `ins` is not exactly that insert. */
-function dependabotFormOf(path: string, ins: string, isNew: boolean): { entry: DependabotEntry; updatesLine: boolean } | null {
+function dependabotFormOf(path: string, ins: string, isNew: boolean, ctx: RevertContext): { entry: DependabotEntry; updatesLine: boolean } | null {
   if (path !== '.github/dependabot.yml' && path !== '.github/dependabot.yaml') return null;
   const prefixes = isNew ? ['version: 2\nupdates:\n'] : ['', '\n', 'updates:\n', '\nupdates:\n'];
   const ignored = /\n {6}- dependency-name: ("[^"\n]*")\n$/.exec(ins)?.[1];
   const repo = parseJson(ignored)?.replace(/\/\*$/, '');
   const drafts: PipelineDraft[] = [{ profile: { private: false } } as unknown as PipelineDraft];
-  if (repo !== undefined) drafts.push({ profile: { private: true }, centralPin: { repo } } as unknown as PipelineDraft);
+  // G17 row 24: the private form ignores the app owner's central repo only (dependabotEntry's `<owner>/pipelines`); any other name is not
+  // pipegen's entry. The owner is checked when the caller gives it (Plan V: plan.ts passes the app's owner)
+  const [owner, name] = (repo ?? '').split('/');
+  const bound = name === CENTRAL_REPO && (ctx.appOwner === undefined || owner?.toLowerCase() === ctx.appOwner.toLowerCase());
+  if (repo !== undefined && bound) drafts.push({ profile: { private: true }, centralPin: { repo } } as unknown as PipelineDraft);
   for (const d of drafts) {
     let text: string;
     try { text = dependabotEntryText(d); } catch { continue; }   // no valid central repo: only the public form

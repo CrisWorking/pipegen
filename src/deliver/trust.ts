@@ -19,7 +19,7 @@ import type { RateClock } from '../engine/github-rate.js';
 import type { InstallRecord } from '../types.js';
 import { safeText } from '../util/safe-text.js';
 import type { RepoRef } from './git-data.js';
-import { readLocalRecord, readRecord, RecordError, writeLocalRecord, type LocalRecordDeps, type ReadRecordResult } from './record.js';
+import { localRecordPath, readLocalRecord, readRecord, RecordError, writeLocalRecord, type LocalRecordDeps, type ReadRecordResult } from './record.js';
 
 export interface TrustedRecord {
   /** The record pipegen builds on, or null (it claims nothing). */
@@ -72,6 +72,8 @@ export const TYPED_VIEW_FIELDS = {
   variables: { keep: ['name', 'scope', 'created', 'githubCreatedAt', 'unconfirmed'], drop: ['previous'] },
   environments: { keep: ['name', 'created', 'githubCreatedAt', 'unconfirmed'], fresh: ['changed', 'branchPolicyIds'], drop: ['previous'] },
   rulesets: { keep: ['kind', 'id', 'name', 'githubCreatedAt', 'unconfirmed'] },
+  // G17 row 30: the app's plain facts, key by key (a key the schema gains is absent from the view until classified)
+  app: { keep: ['owner', 'repo', 'repoId', 'defaultBranch', 'private', 'ownerType'] },
   // the record drops orgRuleset whole (record.drop); its fields are listed so a field it gains is classified on purpose (G11-R-sec1 pinnedSha)
   orgRuleset: { keep: [], drop: ['org', 'id', 'name', 'githubCreatedAt', 'unconfirmed', 'pinnedSha'] },
 } as const satisfies Record<string, { keep: readonly string[]; fresh?: readonly string[]; drop?: readonly string[] }>;
@@ -113,7 +115,7 @@ export function confirmView(r: InstallRecord): { lines: string[]; view: InstallR
     ...pick(r, f.record.keep),
     // written fresh: this run re-derives its edits, re-plans, and writes the roots and protected paths from the draft
     edits: [], planned: { signingMode: 'none', environments: [], owners: { app: [], central: [] }, codeOwners: [] }, serviceRoots: [], protectedPaths: [],
-    app: { ...r.app },
+    app: pick(r.app, f.app.keep),
     files: r.files.map((x) => pick(x, f.files.keep)),
     secrets: r.secrets.map((x) => pick(x, f.secrets.keep)),
     variables: r.variables.map((x) => pick(x, f.variables.keep)),
@@ -154,7 +156,15 @@ export async function trustedPrevious(gh: Octokit, app: RepoRef, central: RepoRe
   const onBranch = updateBranch === null ? null : await readFor(gh, central, app.repo, updateBranch, clock);
   const exists = onDefault !== null || onBranch !== null;
   if (!exists) return { record: null, exists };
-  const file = await readLocalRecord(app, local).catch((e: unknown) => { if (e instanceof RecordError) return null; throw e; });
+  // G17 row 31 (open question 10, as G10-R-sec3): a local record file that can't be read (a link, a folder, not pipegen's form, a records
+  // folder pipegen won't use) is a hard "untrusted", like a hash that matches neither record: no question, nothing vouched over it
+  const file = await readLocalRecord(app, local).catch((e: unknown) => { if (e instanceof RecordError) return 'unreadable' as const; throw e; });
+  if (file === 'unreadable') {
+    let where = 'this machine\'s local record file';
+    try { where = `this machine's local record file ${localRecordPath(app, local)}`; } catch { /* no path for this name */ }
+    notes.push(`The install record of ${safeText(`${central.owner}/${central.repo}`, 120)} can't be checked: ${where} can't be read (it is a link, a folder, or not in the form pipegen writes), so pipegen claims nothing from any install record and treats every existing file and secret as not its own. Remove that file, then run \`npx pipegen run\` again (pipegen then asks you to confirm the record).`);
+    return { record: null, exists, why: 'mismatch' };
+  }
   // 1. vouched by this machine's local record file: the newest such record, the central PR branch first (it was built on the default one)
   for (const r of [onBranch, onDefault]) {
     if (file === null || r === null || r === 'unreadable' || r.hash !== file.recordHash) continue;

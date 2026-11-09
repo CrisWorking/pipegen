@@ -140,7 +140,8 @@ async function firstRun(w: World, over: Partial<DeliveryInput> = {}, dOver: Part
   const p = profile();
   const c = await deliverCentral(w.g.octokit(), p, centralFiles(), { clock: { budget: newRateBudget(), sleep: async () => {} }, ...cdeps(w) });
   if (c.kind !== 'pinned') throw new Error('expected a pin');
-  const plan = planDelivery(input(p, c.sha, over, draftOver));
+  // G17 row 28: as run.ts does, the commit deliverCentral made in this run goes with the delivery
+  const plan = planDelivery(input(p, c.sha, { ...(c.committed === true ? { centralCommitted: c.sha } : {}), ...over }, draftOver));
   const res = await deliver(w.g.octokit(), p, plan, w.vault, deps(w, dOver, answers));
   return { p, pin: c.sha, plan, res };
 }
@@ -382,7 +383,7 @@ describe('G10 delivery: central and the pin (S26)', () => {
     const before = w.g.calls.length;
     const c3 = await deliverCentral(w.g.octokit(), p, centralFiles(' # v2'), cdeps(w));
     expect(c3.kind).toBe('central-pr');
-    if (c3.kind === 'central-pr') expect(c3.message).toMatch(/merge the central PR, then run (pipegen )?again/i);
+    if (c3.kind === 'central-pr') expect(c3.message).toMatch(/merge the central PR, then run (pipegen |`npx pipegen run` )?again/i);
     expect(w.g.calls.slice(before).some((x) => x.params.repo === 'r' && !x.route.startsWith('GET '))).toBe(false);
     expect(w.g.repo('o/pipelines').pulls.filter((x) => x.state === 'open').length).toBe(1);   // the same central PR, updated, never a second one
     const branchFiles = w.g.filesAt('o/pipelines', w.g.head('o/pipelines', `pipegen/update-${centralProjectName('r')}`));
@@ -425,7 +426,7 @@ describe('G10 delivery: central and the pin (S26)', () => {
     const r = await record(w);
     expect(r?.planned.orgRequiredWorkflow).toEqual({ path: reqFile.path, rule: l.orgRequiredWorkflow?.rule });
     expect(r?.files.find((f) => f.path === reqFile.path)).toEqual({ repo: 'central', path: reqFile.path, part: 'pipeline', shas: [gitBlobSha(reqFile.content)] });
-    expect(r?.edits.find((e) => e.repo === 'central')).toEqual({ repo: 'central', path: '.github/CODEOWNERS', kind: 'codeowners', inserted: coFile.content, originalSha: null, writtenShas: [gitBlobSha(coFile.content)] });
+    expect(r?.edits.find((e) => e.repo === 'central')).toEqual({ repo: 'central', path: '.github/CODEOWNERS', kind: 'codeowners', inserted: coFile.content, originalSha: null, writtenShas: [gitBlobSha(coFile.content)], baseShas: [null] });
     // a lock-plan file missing from the judged batch stops the plan
     expect(() => planDelivery(input(p, c.sha, { locks: l }))).toThrow(/required workflow.*not among the judged files/);
   });
@@ -506,9 +507,9 @@ describe('G10 delivery: the record', () => {
     // edits in their own forms, never in files[]
     expect(r?.files.some((f) => ['CODEOWNERS', 'package.json', '.github/workflows/deploy.yml', HOOK_FILES['pre-commit']].includes(f.path))).toBe(false);
     const co = r?.edits.find((e) => e.path === 'CODEOWNERS');
-    expect(co).toEqual({ repo: 'app', path: 'CODEOWNERS', kind: 'codeowners', inserted: '\n# pipegen:begin\n.github/workflows/** @a @b\n# pipegen:end\n', originalSha: gitBlobSha(CO_ORIG), writtenShas: [gitBlobSha(setupFiles(w).get('CODEOWNERS') as string)] });
+    expect(co).toEqual({ repo: 'app', path: 'CODEOWNERS', kind: 'codeowners', inserted: '\n# pipegen:begin\n.github/workflows/** @a @b\n# pipegen:end\n', originalSha: gitBlobSha(CO_ORIG), writtenShas: [gitBlobSha(setupFiles(w).get('CODEOWNERS') as string)], baseShas: [gitBlobSha(CO_ORIG)] });
     expect(r?.edits.find((e) => e.kind === 'hooks')).toMatchObject({ path: HOOK_FILES['pre-commit'], inserted: '  # pipegen:hooks\n  - repo: local\n', originalSha: gitBlobSha(HOOK_ORIG) });
-    expect(r?.edits.find((e) => e.kind === 'verify-job')).toEqual({ repo: 'app', path: '.github/workflows/deploy.yml', kind: 'verify-job', jobs: ['pipegen-verify'], needs: [{ job: 'deploy', added: ['pipegen-verify'] }], originalSha: gitBlobSha(DEPLOY_ORIG), writtenShas: [gitBlobSha(DEPLOY_NEW)] });
+    expect(r?.edits.find((e) => e.kind === 'verify-job')).toEqual({ repo: 'app', path: '.github/workflows/deploy.yml', kind: 'verify-job', jobs: ['pipegen-verify'], needs: [{ job: 'deploy', added: ['pipegen-verify'] }], originalSha: gitBlobSha(DEPLOY_ORIG), writtenShas: [gitBlobSha(DEPLOY_NEW)], baseShas: [gitBlobSha(DEPLOY_ORIG)] });
     expect(r?.central).toEqual({ repoId: 77, createdByPipegen: true });
     expect(r?.scratch).toEqual({ createdByPipegen: true });
     // a second run appends the new blob sha, keeps the first original
@@ -527,8 +528,8 @@ describe('G10 delivery: the record', () => {
     const w = world();
     await firstRun(w);
     const r = await record(w);
-    expect(r?.edits.find((e) => e.kind === 'package-lock')).toEqual({ repo: 'app', path: 'package-lock.json', kind: 'package-lock', json: 'package.json', originalSha: gitBlobSha(LOCK), writtenShas: [gitBlobSha(LOCK_NEW)] });
-    expect(r?.edits.find((e) => e.kind === 'package-json')).toEqual({ repo: 'app', path: 'package.json', kind: 'package-json', add: { vitest: '5.0.5' }, setTest: true, previousTest: 'echo "Error: no test specified" && exit 1', lock: 'package-lock.json', originalSha: gitBlobSha(PJ), writtenShas: [gitBlobSha(PJ_NEW)] });
+    expect(r?.edits.find((e) => e.kind === 'package-lock')).toEqual({ repo: 'app', path: 'package-lock.json', kind: 'package-lock', json: 'package.json', originalSha: gitBlobSha(LOCK), writtenShas: [gitBlobSha(LOCK_NEW)], baseShas: [gitBlobSha(LOCK)] });
+    expect(r?.edits.find((e) => e.kind === 'package-json')).toEqual({ repo: 'app', path: 'package.json', kind: 'package-json', add: { vitest: '5.0.5' }, setTest: true, previousTest: 'echo "Error: no test specified" && exit 1', lock: 'package-lock.json', originalSha: gitBlobSha(PJ), writtenShas: [gitBlobSha(PJ_NEW)], baseShas: [gitBlobSha(PJ)] });
   });
 
   it('deliver: record path is installs/<centralProjectName>.json', async () => {
@@ -1050,7 +1051,8 @@ describe('G10 fix round 1 (review-G10, ruling G10-R2)', () => {
     await deliver(w.g.octokit(), p, planDelivery(input(p, pin)), w.vault, deps(w));
     const r = await record(w);
     expect(r?.files.find((f) => f.path === '.github/workflows/r--merge.yml')?.adopted).toBe(true);
-    expect(r?.files.find((f) => f.path === '.github/workflows/r--nightly.yml')?.adopted).toBeUndefined();
+    // G17 row 28 (G10-r2 P2): that commit also added r--nightly.yml; it isn't pipegen's commit, so that file is adopted too
+    expect(r?.files.find((f) => f.path === '.github/workflows/r--nightly.yml')?.adopted).toBe(true);
   });
 
   it('fix 1: the judged central file list must be given, not empty, and the central tree it is written on (I4)', async () => {
@@ -1223,7 +1225,8 @@ describe('G10 fix round 2 (review-G10-r1, ruling G10-R3)', () => {
     const c2 = await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w));
     expect(c2).toEqual({ kind: 'pinned', sha: (c1 as { sha: string }).sha, done: [] });
     await deliver(w.g.octokit(), p, planDelivery(input(p, (c2 as { sha: string }).sha)), w.vault, deps(w));
-    expect((await record(w))?.files.find((f) => f.path === '.github/workflows/r--merge.yml')?.adopted).toBeUndefined();
+    // G17 row 28 (G10-r2 P2): the commit is from the run that stopped, not from this one, so nothing proves pipegen added the files: adopted
+    expect((await record(w))?.files.find((f) => f.path === '.github/workflows/r--merge.yml')?.adopted).toBe(true);
   });
 
   it('fix 2: an existing file byte-identical to pipegen\'s is neither a stop nor rewritten, and is recorded adopted (N2)', async () => {
@@ -1234,7 +1237,7 @@ describe('G10 fix round 2 (review-G10-r1, ruling G10-R3)', () => {
     const p = profile();
     const c = await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w));
     expect(c.kind).toBe('pinned');
-    await deliver(w.g.octokit(), p, planDelivery(input(p, (c as { sha: string }).sha)), w.vault, deps(w));
+    await deliver(w.g.octokit(), p, planDelivery(input(p, (c as { sha: string }).sha, { centralCommitted: (c as { sha: string }).sha })), w.vault, deps(w));
     expect(setupFiles(w).get('PIPEGEN.md')).toBe('# pipegen\n');
     expect(w.g.calls.some((x) => x.route === 'POST /repos/{owner}/{repo}/git/trees' && JSON.stringify(x.params).includes('"path":"PIPEGEN.md"'))).toBe(false);
     const r = await record(w) as Rec;
@@ -1514,8 +1517,9 @@ describe('G17C: the install record and delivery', () => {
     expect(a.env?.previous).toBeUndefined();
     expect(a.notes.join('\n')).toMatch(/pipegen-signing.*can't put back.*settings.*by hand/s);
     // someone opened it again since: this run narrows it, and records what it was just before
-    const e = w.g.repo('o/r').envs.get('pipegen-signing') as { deployment_branch_policy: unknown; wait_timer: number };
+    const e = w.g.repo('o/r').envs.get('pipegen-signing') as { deployment_branch_policy: unknown; wait_timer: number; policies: unknown[] };
     e.deployment_branch_policy = null;
+    e.policies = [];   // GitHub drops the branch rules with the custom policy
     e.wait_timer = 7;
     const b = await again();
     expect(b.env?.previous).toMatchObject({ wait_timer: 7, deployment_branch_policy: null });

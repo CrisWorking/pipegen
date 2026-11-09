@@ -127,6 +127,8 @@ export interface RunState {
   agreed?: AgreedTerms;
   /** G14-R1 (spec M1): pipegen created the central `pipelines` repo in this run (kept for a resume's delivery record). */
   centralCreated?: boolean;
+  /** G17 row 27: GitHub's id of the central repo pipegen created (centralCreated): the record names it, and uninstall deletes only that id. */
+  centralRepoId?: number;
   /** The cleanup of this run finished with nothing left behind (cleanupAfterProof). */
   cleanupDone?: boolean;
   /** What the cleanup couldn't remove (plain text, names only), for `pipegen cleanup`. */
@@ -198,6 +200,7 @@ const stateSchema = z.strictObject({
     strictness: z.string().max(40).optional(), scanner: z.enum(['gitleaks', 'betterleaks']).optional(), monthlyMinutes: nonNeg.optional(),
   }).optional(),
   centralCreated: z.boolean().optional(),
+  centralRepoId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
   cleanupDone: z.boolean().optional(),
   leftovers: z.array(text).max(1000),
   notes: z.array(text).max(1000),
@@ -384,7 +387,7 @@ export class StateStore {
       ...(keepId ? { scratchRepoId: old.scratchRepoId } : {}),
       ...(old !== null && old.actionsAccessPrevious !== undefined && old.app.owner.toLowerCase() === app.owner.toLowerCase() && old.app.repo.toLowerCase() === app.repo.toLowerCase() ? { actionsAccessPrevious: old.actionsAccessPrevious } : {}),
       // G14-R2 (spec minor): pipegen made the central repo in an earlier run of this app (kept like the Actions access level)
-      ...(old !== null && old.centralCreated === true && old.app.owner.toLowerCase() === app.owner.toLowerCase() && old.app.repo.toLowerCase() === app.repo.toLowerCase() ? { centralCreated: true } : {}),
+      ...(old !== null && old.centralCreated === true && old.app.owner.toLowerCase() === app.owner.toLowerCase() && old.app.repo.toLowerCase() === app.repo.toLowerCase() ? { centralCreated: true, ...(old.centralRepoId === undefined ? {} : { centralRepoId: old.centralRepoId }) } : {}),
       ...(init.draft === undefined ? {} : { draft: init.draft }),
       ...(init.agreed === undefined ? {} : { agreed: structuredClone(init.agreed) }),
       leftovers: [], notes: [], updatedAt: '',
@@ -544,6 +547,12 @@ export class StateStore {
     if (previous !== 'none' && previous !== 'user' && previous !== 'organization' && previous !== 'enterprise') throw new StateError('The Actions access level to record is not one GitHub has.');
     if (this.#need().actionsAccessPrevious !== undefined) return;
     this.update((s) => { s.actionsAccessPrevious = previous; });
+  }
+
+  /** G17 row 27: pipegen just created the central repo (checkProofRepos' onCreated); its GitHub id is kept with the flag, never apart. */
+  centralCreatedWith(id: number): void {
+    if (!Number.isSafeInteger(id) || id <= 0) throw new StateError('The repo id to record is not one.');
+    this.update((s) => { s.centralCreated = true; s.centralRepoId = id; });
   }
 
   /** The id GitHub gave the scratch repo pipegen just created (checkProofRepos' onCreated). */
