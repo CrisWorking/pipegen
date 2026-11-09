@@ -91,7 +91,7 @@ import { askConsent, consentScreen } from './consent.js';
 import { tokenLogin } from './inspect.js';
 import { finishCommand, interactiveRun } from './commands.js';
 export { interactiveRun };
-import type { CliIO } from './io.js';
+import type { CliIO, Prompter } from './io.js';
 import {
   assembledJobs, consentJobs, docFor, draftFromDebate, isAiNote, parseStrictness, pickOwners, proofAssembler, prWaitMinutes,
   signingFor, strictNeeds, warnFirstFor, type Strictness,
@@ -722,6 +722,17 @@ export function proofReposFor(repos: Pick<ProofRepos, 'created' | 'createdIds' |
   };
 }
 
+/** The run's trust step (the stage `trusted`): the earlier record pipegen builds on, with its notes and (G17C-R1, F6/m2) the run's own way on. */
+export async function trustedForRun(f: Pick<GitHubFacts, 'gh' | 'clock'>, p: { owner: string; repo: string }, local: LocalRecordDeps, prompt: Prompter, interactive: boolean): Promise<{ record: InstallRecord | null; notes: string[] }> {
+  const notes: string[] = [];
+  const central = { owner: p.owner, repo: CENTRAL_REPO };
+  const c = await readRepo(f.gh, central, f.clock);
+  if (c === null) return { record: null, notes };
+  const t = await trustedPrevious(f.gh, { owner: p.owner, repo: p.repo }, central, c.defaultBranch, null, local, f.clock, notes, { io: prompt, interactive });
+  if (t.why === 'unreadable') notes.push(UNREADABLE_RUN_WAY_ON);
+  return { record: t.record, notes };
+}
+
 /** The pinned scanner, downloaded and checked against its pin; the version from the same pins table (the audit's defaultSecretScanner). */
 async function pinnedScanner(name: 'gitleaks' | 'betterleaks'): Promise<{ name: 'gitleaks' | 'betterleaks'; path: string; version: string }> {
   const pins = loadPinnedBinaries();
@@ -1106,15 +1117,7 @@ function realStages(io: CliIO, deps: RunDeps): RunStages {
       const files = await buildFiles(i, facts, envPlan);
       return { ...files, ...(await judgeBuilt(i, files, facts)), proof: proofBuildFor(i, facts, envPlan) };
     },
-    async trusted(f, p, io2) {
-      const notes: string[] = [];
-      const central = { owner: p.owner, repo: CENTRAL_REPO };
-      const c = await readRepo(f.gh, central, f.clock);
-      if (c === null) return { record: null, notes };
-      const t = await trustedPrevious(f.gh, { owner: p.owner, repo: p.repo }, central, c.defaultBranch, null, local, f.clock, notes, { io: io2.prompt, interactive });
-      if (t.why === 'unreadable') notes.push(UNREADABLE_RUN_WAY_ON);   // G17C-R1 (F6, m2): the run's own way on
-      return { record: t.record, notes };
-    },
+    trusted: (f, p, io2) => trustedForRun(f, p, local, io2.prompt, interactive),
     deliverCentral: (f, p, files, io2, pr) => deliverCentral(f.gh, p, files, { clock: f.clock, local, io: io2.prompt, interactive, ...(pr === undefined ? {} : { pr }) }),
     readCentralFileList: (f, p) => readCentralFileList(f.gh, p, f.clock),
     preview: (input) => previewText(planDelivery(input)),

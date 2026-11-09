@@ -288,20 +288,30 @@ export type CentralResult = { kind: 'pinned'; sha: string; done: string[]; commi
 export interface CentralPr { number: number; commit: string }
 
 /**
- * G17C-R1 (F5): whether `pin` is pipegen's own central PR commit as merged: the commit itself (the branch fast-forwarded), or the merge
- * commit GitHub names for that pull request, from pipegen's branch `head` into `base`, with pipegen's commit still its head (no other
- * commit in it). Anything unreadable or different is no proof (the files stay adopted).
+ * G17C-R1 (F5), G17C-R2: whether `pin` proves pipegen added the new files of `files`: the central pull request `pr` (read on GitHub, even
+ * when the pin is pipegen's commit X itself, r2-i1) is merged from pipegen's branch `head` into `base`, with X still its head and `pin` as
+ * GitHub's merge commit; the pin is X, or has one parent (squash, rebase), or exactly the parents [base side, X] (r2-m1); and every file
+ * that is new at the pin's first parent was added by X (absent in X's parent, the same blob in X and in the pin). Anything unreadable or
+ * different is no proof (the files stay adopted).
  */
-async function isOwnPrMerge(gh: Octokit, c: RepoRef, head: string, base: string, pr: CentralPr | undefined, pin: string, clock: RateClock): Promise<boolean> {
+async function isOwnPrMerge(gh: Octokit, c: RepoRef, head: string, base: string, pr: CentralPr | undefined, pin: string, files: readonly CreatedFile[], clock: RateClock): Promise<boolean> {
   if (pr === undefined || !Number.isSafeInteger(pr.number) || pr.number <= 0 || !SHA_RE.test(pr.commit)) return false;
-  if (pin === pr.commit) return true;
-  let d: unknown;
-  try { d = await ghRead(gh, 'GET /repos/{owner}/{repo}/pulls/{pull_number}', c, { pull_number: pr.number }, clock); } catch (e) {
-    if (statusOf(e) === undefined) throw e;
+  try {
+    const d = await ghRead(gh, 'GET /repos/{owner}/{repo}/pulls/{pull_number}', c, { pull_number: pr.number }, clock);
+    const merged = isObj(d) && d.number === pr.number && typeof d.merged_at === 'string' && d.merged_at !== '' && d.merge_commit_sha === pin
+      && isObj(d.head) && d.head.sha === pr.commit && d.head.ref === head && isObj(d.base) && d.base.ref === base;
+    if (!merged) return false;
+    const at = await readTree(gh, c, pin, clock);
+    if (pin !== pr.commit && !(at.parents.length === 1 || (at.parents.length === 2 && at.parents[1] === pr.commit))) return false;
+    const first = at.parents[0] === undefined ? null : await readTree(gh, c, at.parents[0], clock);
+    const x = await readTree(gh, c, pr.commit, clock);
+    const xParent = x.parents[0] === undefined ? null : await readTree(gh, c, x.parents[0], clock);
+    return files.every((f) => first?.entries.has(f.path) === true
+      || (xParent?.entries.has(f.path) !== true && x.entries.get(f.path)?.sha !== undefined && x.entries.get(f.path)?.sha === at.entries.get(f.path)?.sha));
+  } catch (e) {
+    if (statusOf(e) === undefined && !(e instanceof DeliverError)) throw e;
     return false;
   }
-  return isObj(d) && d.number === pr.number && typeof d.merged_at === 'string' && d.merged_at !== '' && d.merge_commit_sha === pin
-    && isObj(d.head) && d.head.sha === pr.commit && d.head.ref === head && isObj(d.base) && d.base.ref === base;
 }
 
 async function centralRepoOf(gh: Octokit, p: RepoProfile, clock: RateClock): Promise<{ ref: RepoRef; defaultBranch: string; id: number }> {
@@ -381,7 +391,7 @@ export async function deliverCentral(gh: Octokit, p: RepoProfile, files: readonl
       if (h.onDefault && h.missing.length === 0) pin = was;
     }
     // G17C-R1 (F5): the merge of pipegen's own central PR proves pipegen added its new files, like the commit made here
-    const own = await isOwnPrMerge(gh, c, branch, defaultBranch, deps.pr, pin, clock);
+    const own = await isOwnPrMerge(gh, c, branch, defaultBranch, deps.pr, pin, files, clock);
     return { kind: 'pinned', sha: pin, done: [], ...(own ? { committed: true as const } : {}) };
   }
   const later = prev.exists || updateExists || await centralHasRules(gh, c, defaultBranch, clock);

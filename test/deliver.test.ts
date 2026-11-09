@@ -1634,6 +1634,7 @@ describe('G17C: the install record and delivery', () => {
       .then((r) => r.notes.join('\n'), (e: unknown) => (e as Error).message);
     expect(said).toContain(localFile(w));
     expect(said).toContain('Remove or fix that local record file, then run `npx pipegen run` again');
+    writeFileSync(localFile(w), '{ not json', { mode: 0o600 });   // deliver saved its record file again
     const t = await trustedForRun({ gh: w.g.octokit(), clock: { budget: newRateBudget(), sleep: async () => {} } }, p, { home: w.home, env: {} }, io(w), false);
     expect(t.record).toBeNull();
     expect(t.notes.join('\n')).toContain(localFile(w));
