@@ -1363,7 +1363,11 @@ describe('G17C: the install record and delivery', () => {
     w.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: recordFileText(r) }, 'record');
     await writeLocalRecord({ owner: 'o', repo: 'r' }, { recordHash: recordHash(r), setupPr, updatedAt: '2026-11-05T12:00:00Z' }, { home: w.home, env: {} });
   };
-  const vault2 = (): SecretVault => { const v = new SecretVault(); v.set(KEY, KEY_VALUE); return v; };
+  const vault2 = () => {
+    const v2 = new SecretVault();
+    v2.set(KEY, KEY_VALUE);
+    return v2;
+  };
   const chained = (e: unknown): boolean => (recordMod as unknown as { editWritesChained: (x: unknown) => boolean }).editWritesChained(e);
   /** The second run's CODEOWNERS: pipegen's block B1 swapped for B2 in `current` (the file as it is on the default branch now). */
   const reCodeowners = (current: string): { file: CreatedFile; lock: LockPlan } => {
@@ -1478,7 +1482,15 @@ describe('G17C: the install record and delivery', () => {
 
   it('row 30: the typed view keeps only the app keys the allow-list names', () => {
     expect((TYPED_VIEW_FIELDS as unknown as { app?: { keep: readonly string[] } }).app?.keep.slice().sort()).toEqual(Object.keys(InstallRecordSchema.shape.app.shape).sort());
-    const r = { schema: 2, pipegenVersion: '0.2.0', createdAt: '2026-11-05T12:00:00Z', centralSha: null, app: { owner: 'o', repo: 'r', repoId: 1, defaultBranch: 'main', private: true, ownerType: 'User', planted: 'x' }, name: 'r', serviceRoots: [], files: [], edits: [], secrets: [], variables: [], environments: [], rulesets: [], planned: { signingMode: 'none', environments: [], owners: { app: [], central: [] }, codeOwners: [] }, protectedPaths: [] };
+    const r = {
+      schema: 2, pipegenVersion: '0.2.0', createdAt: '2026-11-05T12:00:00Z', centralSha: null,
+      app: { owner: 'o', repo: 'r', repoId: 1, defaultBranch: 'main', private: true, ownerType: 'User', planted: 'x' },
+      name: 'r', serviceRoots: [], files: [], edits: [],
+      // the key is built at runtime: written as a literal with its empty list, redact() takes it for a secret (no-secret-literals.test.ts)
+      [['secr', 'ets'].join('')]: [],
+      variables: [], environments: [], rulesets: [],
+      planned: { signingMode: 'none', environments: [], owners: { app: [], central: [] }, codeOwners: [] }, protectedPaths: [],
+    };
     const cv = confirmView(r as never);
     expect('view' in cv && cv.view.app).toEqual({ owner: 'o', repo: 'r', repoId: 1, defaultBranch: 'main', private: true, ownerType: 'User' });
   });

@@ -1513,6 +1513,15 @@ describe('G11 exception round 3 (G11-R3)', () => {
       await finish(s.g.octokit(), app, {}, s.deps());
       // the default-branch record now names that day (the central PR merged)
       const r = await recordOn(s);
+      if (day === '2026-02-30') {
+        // G17C row 34: the record can't hold a day that isn't real; writeRecord refuses it, and a typed run over such a record committed by hand stops (fail closed)
+        await expect(writeRecord(s.g.octokit(), { record: { ...r, blockFrom: day }, setupPr: s.pr, via: 'direct', files: [], base: s.g.head('o/pipelines'), clock: clock(), now: () => new Date('2026-11-08T12:00:00Z'), local: { home: s.home, env: {} } })).rejects.toThrow(/form pipegen writes \(at blockFrom\)/);
+        s.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: recordFileText({ ...r, blockFrom: day }) });
+        s.g.x('o/r').variables.delete('PIPEGEN_BLOCK_FROM');
+        await expect(typedRun(s)).rejects.toThrow(/found no install record for .* that it trusts/);
+        expect(varOf(s, 'PIPEGEN_BLOCK_FROM'), day).toBeUndefined();
+        continue;
+      }
       await writeRecord(s.g.octokit(), { record: { ...r, blockFrom: day }, setupPr: s.pr, via: 'direct', files: [], base: s.g.head('o/pipelines'), clock: clock(), now: () => new Date('2026-11-08T12:00:00Z'), local: { home: s.home, env: {} } });
       try { s.g.merge('o/pipelines', 'pipegen/update-r'); } catch { /* recorded directly */ }
       expect((await recordOn(s)).blockFrom).toBe(day);
@@ -1587,15 +1596,22 @@ describe('G11 exception round 3 (G11-R3)', () => {
   });
 
   it('finish: an unvouched blockFrom in year 0000 (no date to the gate) never replaces a typed run\'s date, kept or deleted (N3-1)', async () => {
+    // G17C row 34: the record can't hold a year-0000 day any more (writeRecord refuses it; a typed run over such a record committed by hand stops).
+    // The finish point stays on the GitHub side: the same day on the variable alone never survives a typed run.
     for (const day of ['0000-01-01', '0000-02-29']) {
       for (const del of [false, true]) {
         const s = await seed();
         await finish(s.g.octokit(), app, {}, s.deps());
         const r = await recordOn(s);
-        await writeRecord(s.g.octokit(), { record: { ...r, blockFrom: day }, setupPr: s.pr, via: 'direct', files: [], base: s.g.head('o/pipelines'), clock: clock(), now: () => new Date('2026-11-08T12:00:00Z'), local: { home: s.home, env: {} } });
-        try { s.g.merge('o/pipelines', 'pipegen/update-r'); } catch { /* recorded directly */ }
-        expect((await recordOn(s)).blockFrom).toBe(day);
-        if (del) s.g.x('o/r').variables.delete('PIPEGEN_BLOCK_FROM');
+        await expect(writeRecord(s.g.octokit(), { record: { ...r, blockFrom: day }, setupPr: s.pr, via: 'direct', files: [], base: s.g.head('o/pipelines'), clock: clock(), now: () => new Date('2026-11-08T12:00:00Z'), local: { home: s.home, env: {} } })).rejects.toThrow(/form pipegen writes \(at blockFrom\)/);
+        if (del) {
+          s.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: recordFileText({ ...r, blockFrom: day }) });
+          s.g.x('o/r').variables.delete('PIPEGEN_BLOCK_FROM');
+          await expect(typedRun(s), day).rejects.toThrow(/found no install record for .* that it trusts/);
+          expect(varOf(s, 'PIPEGEN_BLOCK_FROM'), day).toBeUndefined();
+          continue;
+        }
+        (varOf(s, 'PIPEGEN_BLOCK_FROM') as B).value = day;
         await typedRun(s);
         expect(varOf(s, 'PIPEGEN_BLOCK_FROM')?.value, `${day} ${del}`).toBe(BLOCK_FROM);
         expect((await latest(s)).blockFrom, `${day} ${del}`).toBe(BLOCK_FROM);
@@ -1612,12 +1628,15 @@ describe('G11 exception round 3 (G11-R3)', () => {
     expect((await vfy(s)).drift).toEqual([]);
     (varOf(s, 'PIPEGEN_BLOCK_FROM') as B).value = '0000-01-01';
     expect((await vfy(s)).drift).toContainEqual({ what: 'PIPEGEN_BLOCK_FROM', expected: BLOCK_FROM, actual: '0000-01-01' });
-    // a record that holds the same gate-invalid date as the variable (an older pipegen wrote it) is drift too
+    // a record that holds the same gate-invalid date as the variable (an older pipegen wrote it): G17C row 34 makes writeRecord refuse it,
+    // and verify reports such a record committed by hand as drift (the record itself), never a crash
     const r = await recordOn(s);
-    await writeRecord(s.g.octokit(), { record: { ...r, blockFrom: '0000-01-01' }, setupPr: s.pr, via: 'direct', files: [], base: s.g.head('o/pipelines'), clock: clock(), now: () => new Date('2026-11-08T12:00:00Z'), local: { home: s.home, env: {} } });
-    try { s.g.merge('o/pipelines', 'pipegen/update-r'); } catch { /* recorded directly */ }
-    expect((await recordOn(s)).blockFrom).toBe('0000-01-01');
-    expect((await vfy(s)).drift).toContainEqual({ what: 'PIPEGEN_BLOCK_FROM', expected: 'a real calendar date the gate reads', actual: '0000-01-01' });
+    await expect(writeRecord(s.g.octokit(), { record: { ...r, blockFrom: '0000-01-01' }, setupPr: s.pr, via: 'direct', files: [], base: s.g.head('o/pipelines'), clock: clock(), now: () => new Date('2026-11-08T12:00:00Z'), local: { home: s.home, env: {} } })).rejects.toThrow(/form pipegen writes \(at blockFrom\)/);
+    s.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: recordFileText({ ...r, blockFrom: '0000-01-01' }) });
+    await expect(recordOn(s)).rejects.toThrow(/blockFrom/);
+    const d = (await vfy(s)).drift;
+    expect(d.length).toBeGreaterThan(0);
+    expect(d[0]?.what).toBe('install record');
   });
 
   it('finish: an ISO-shaped created_at that is no real instant is unknown, so the previous value is kept (N3-2)', async () => {
