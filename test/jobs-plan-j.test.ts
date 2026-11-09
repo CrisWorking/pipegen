@@ -396,3 +396,23 @@ describe('GJ-R1: fix round 1 (reviews GJ security and spec)', () => {
     expect(m.uncoveredMinimum.filter((u) => u.category === 'deps').map((u) => u.service)).toEqual(['b']);
   });
 });
+
+describe('G16 F2: --skip tests on a service with no test script', () => {
+  // the run's path (run.ts draftFromDebate + strictNeeds): the debate keyed the floor's tests needs and left them uncovered (no test script),
+  // but the draft's and the plan's needs hold no tests need once tests are skipped; the uncovered key is still on plan.uncovered
+  const noTests = (skipped: PipelineDraft['skipped']): ReturnType<typeof planned> => {
+    const x = planned(profileOf([node({ scripts: ['lint'], hasTests: false })]), { over: { ...SKIP_DEPLOY, skipped: [...SKIP_DEPLOY.skipped, ...skipped] } });
+    const needs = x.plan.needs.filter((n) => !['unit-tests', 'full-tests', 'migration-check'].includes(n.id));
+    return { draft: { ...x.draft, needs }, plan: { ...x.plan, needs } };
+  };
+
+  it('G16 F2: a skipped tests need left uncovered is not a blocking need with no tool (the run goes on)', () => {
+    const x = noTests([{ part: 'tests', reason: 't' }]);
+    expect(x.plan.uncovered.filter((u) => u.blocking).map((u) => u.needId)).toEqual(expect.arrayContaining(['unit-tests']));
+    expect(() => assemble(x)).not.toThrow();
+  });
+
+  it('G16 F2: the same uncovered tests need, not skipped, still stops (no tool covers it)', () => {
+    expect(() => assemble(noTests([]))).toThrow(/blocking checks have no tool it can run \("unit-tests"/);
+  });
+});
