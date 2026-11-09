@@ -57,7 +57,7 @@ import { safeText } from '../util/safe-text.js';
 import { generateCosignKeys } from '../layers/deploy.js';
 import type { CosignExec, CosignResolver } from './cosign-keys.js';
 import { ensureSigningEnvironment, plannedOfLocks, readEnv, SETUP_BRANCH } from './deliver.js';
-import { DeliverError, isoAt, readBlobText, readHead, readRepo, readTree, statusOf, type RepoRef, type TreeEntry } from './git-data.js';
+import { compareStatus, DeliverError, isoAt, readBlobText, readHead, readRepo, readTree, statusOf, type RepoRef, type TreeEntry } from './git-data.js';
 import { centralOf, centralUpdateBranch, localFinishPendingPath, protectedPathsOfRecord, readFinishPending, readLocalRecord, RecordError, writeFinishPending, writeRecord, type FinishPending, type LocalRecordDeps } from './record.js';
 import { classicPutForm, holdsWanted, isObj, PLANNED_ROUTES, refusedAsUnavailable, SettingsApi } from './settings-api.js';
 import { trustedPrevious } from './trust.js';
@@ -123,7 +123,7 @@ interface Ctx {
   /** I1: what earlier runs saved before their writes (the local pending file), and the app's repo id it belongs to. */
   pending: FinishPending; repoId: number;
   branch: string; ownerType: 'User' | 'Organization'; private: boolean;
-  centralHead: string; centralTree: Map<string, TreeEntry>; centralCo: CoFacts;
+  centralHead: string; centralBranch: string; centralTree: Map<string, TreeEntry>; centralCo: CoFacts;
   applied: string[]; skipped: { what: string; why: string }[]; notes: string[]; commands: string[];
   rulesets: Map<'gate' | 'reviews', InstallRecord['rulesets'][number]>; classic?: InstallRecord['classicProtection']; orgRuleset?: InstallRecord['orgRuleset'];
   repoSettings: NonNullable<InstallRecord['repoSettings']>; centralRec: Partial<NonNullable<InstallRecord['central']>>;
@@ -165,10 +165,10 @@ const sameObject = (priorAt: string | undefined, at: string | null): boolean => 
 /** G11-R3 (R2-4): two created_at strings name the same instant (GitHub may write `…00Z` or `…00.000Z`); an unparsable one names none. */
 const sameInstant = (a: string, b: string): boolean => { const x = Date.parse(a); return Number.isFinite(x) && x === Date.parse(b); };
 /**
- * A ruleset is found by its id, which GitHub never reuses: the same object unless both created_at are known and differ (an unconfirmed
- * ruleset pipegen made stays recorded on a re-run).
+ * A ruleset is found by its id, which GitHub never reuses: the same object unless both created_at are known and name other instants (an
+ * unconfirmed ruleset pipegen made stays recorded on a re-run). G17 row 42: compared as instants (GitHub may write `…03Z` or `…03.000Z`).
  */
-const sameRuleset = (priorAt: string | undefined, at: string | null): boolean => priorAt === undefined || at === null || priorAt === at;
+const sameRuleset = (priorAt: string | undefined, at: string | null): boolean => priorAt === undefined || at === null || sameInstant(priorAt, at);
 /**
  * The earlier entry (the record's first, then the pending file's) for the object GitHub holds now: `same` (adopted whole) or `maybe` (a
  * created_at unknown on either side: only its `previous` is kept). A known, different created_at: another object, no entry.
@@ -501,20 +501,50 @@ async function orgRequired(x: Ctx): Promise<void> {
   const rules = Array.isArray(body.rules) ? body.rules : [];
   const wf = (rules[0] as { parameters?: { workflows?: Record<string, unknown>[] } } | undefined)?.parameters?.workflows?.[0];
   if (wf === undefined || wf.path !== F.file.path) { x.skipped.push({ what, why: 'The planned rule doesn\'t name the required workflow.' }); return; }
-  wf.sha = x.centralHead;
   const name = String(body.name);
   const t: Target = { kind: 'org', org: x.app.owner };
+  let pin = x.centralHead;
   await step(x, `${what} (ruleset ${show(name, 100)})`, async () => {
     const existing = await listRulesets(x, t);
+    // G17 row 41 (G11 R2-3): the record commit moves the central head on every run, so a re-run keeps the live pin while it still holds
+    // pipegen's required workflow (a commit on the central default branch whose file is the one planned now); anything else: the head
+    pin = await keptPin(x, t, name, existing, F.file.path, gitBlobSha(F.file.content)) ?? x.centralHead;
+    wf.sha = pin;
     if (x.print) { await printRuleset(x, t, name, { ...F.rule, body }, existing); return; }
     const r = await upsertRuleset(x, t, name, body, existing);
     const p = x.rec.orgRuleset;
     const prior = p !== undefined && p.id === r.id && sameRuleset(p.githubCreatedAt, r.createdAt) ? p : undefined;
     const entry = recordedRuleset(x, r, prior, `the org ruleset ${show(name, 100)}`, `The org ruleset ${show(name, 100)} that was already there`);
     // G11-R-sec1: the commit the rule's workflow entry is pinned to (read back above), so verify can hold the live rule to it
-    if (entry !== undefined) x.orgRuleset = { org: x.app.owner, id: r.id, name, ...entry, pinnedSha: x.centralHead };
-    x.applied.push(`${what} (ruleset ${show(name, 100)}, pinned to ${x.centralHead.slice(0, 12)})${r.wrote === 'none' ? ' (already in place)' : ''}`);
+    if (entry !== undefined) x.orgRuleset = { org: x.app.owner, id: r.id, name, ...entry, pinnedSha: pin };
+    x.applied.push(`${what} (ruleset ${show(name, 100)}, pinned to ${pin.slice(0, 12)})${r.wrote === 'none' ? ' (already in place)' : ''}`);
   });
+}
+
+/**
+ * G17 row 41: the commit the live same-name org rule pins, when finish may keep it: one workflow entry, at `path`, naming a full sha that is on
+ * the central default branch (compare: identical or behind) and holds `path` as the blob `blob` (pipegen's required workflow as planned now).
+ * Anything else, or anything GitHub doesn't show: null (finish pins the central head).
+ */
+async function keptPin(x: Ctx, t: Target, name: string, existing: readonly { id: number; name: string }[], path: string, blob: string): Promise<string | null> {
+  const same = existing.filter((r) => r.name === name);
+  if (same.length !== 1 || same[0] === undefined) return null;
+  const cur = await getRuleset(x, t, same[0].id);
+  const rules = cur !== null && Array.isArray(cur.rules) ? cur.rules.filter(isObj) : [];
+  const wfs = rules.flatMap((r) => (isObj(r.parameters) && Array.isArray(r.parameters.workflows) ? r.parameters.workflows : [null]));
+  const only = wfs.length === 1 && isObj(wfs[0]) ? wfs[0] : null;
+  const sha = only?.sha;
+  if (only === null || only.path !== path || typeof sha !== 'string' || !/^[0-9a-f]{40}$/.test(sha)) return null;
+  if (sha === x.centralHead) return sha;
+  try {
+    const status = await compareStatus(x.gh, x.central, x.centralBranch, sha, x.clock);
+    if (status !== 'identical' && status !== 'behind') return null;
+    const e = (await readTree(x.gh, x.central, sha, x.clock)).entries.get(path);
+    return e !== undefined && e.type === 'blob' && e.mode === '100644' && e.sha === blob ? sha : null;
+  } catch (e) {
+    if (isStop(e)) throw e;
+    return null;
+  }
 }
 
 // ---------- 4. environments ----------
@@ -654,12 +684,19 @@ async function signing(x: Ctx): Promise<void> {
       x.commands.push(apiCmd('POST', '/repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies', { ...appParams(x), environment_name: SIGNING_ENVIRONMENT }, { name: x.branch, type: 'branch' }));
     }
     if (needKey) {
-      x.commands.push('# A new key pair, in a private folder: cosign asks for a password; save it to pipegen-signing.password (never in a command line)');
+      // G17 row 45 (G13 sec M5): the key pair is made in a memory folder, never the clone (where it could be committed), and its password
+      // goes through COSIGN_PASSWORD (cosign reads it there), never a file or a command line
+      x.commands.push('# A new key pair, in a fresh memory folder (/dev/shm: never your clone, where the key could be committed). The password is random, kept only in COSIGN_PASSWORD for these commands, never in a file.');
+      x.commands.push('cd "$(mktemp -d -p /dev/shm)"');
+      x.commands.push('umask 077');
+      x.commands.push('COSIGN_PASSWORD="$(head -c 32 /dev/urandom | base64 | tr -d \'\\n\')"; export COSIGN_PASSWORD');
       x.commands.push('cosign generate-key-pair --output-key-prefix pipegen-signing');
       x.commands.push(`gh secret set ${COSIGN_KEY_SECRET} --env ${SIGNING_ENVIRONMENT} --repo ${repo} < pipegen-signing.key`);
-      x.commands.push(`gh secret set ${PASSWORD_SECRET} --env ${SIGNING_ENVIRONMENT} --repo ${repo} < pipegen-signing.password`);
+      x.commands.push(`printf '%s' "$COSIGN_PASSWORD" | gh secret set ${PASSWORD_SECRET} --env ${SIGNING_ENVIRONMENT} --repo ${repo}`);
       x.commands.push(`gh variable set ${COSIGN_PUB_VAR} --env ${SIGNING_ENVIRONMENT} --repo ${repo} < pipegen-signing.pub`);
-      x.commands.push('# Then delete the three files. The verify step checks the new public key\'s sha256 only after a pull request puts it in your workflow (run `npx pipegen run` again).');
+      x.commands.push('unset COSIGN_PASSWORD');
+      x.commands.push('cd - >/dev/null && rm -rf -- "$OLDPWD"');
+      x.commands.push('# The verify step checks the new public key\'s sha256 only after a pull request puts it in your workflow (run `npx pipegen run` again).');
     } else if (x.rec.cosignPub !== undefined) await step(x, whatPub, () => setVariable(x, SIGNING_SCOPE, COSIGN_PUB_VAR, x.rec.cosignPub as string, whatPub));
     else x.skipped.push(noPub());
     return;
@@ -707,7 +744,7 @@ async function signing(x: Ctx): Promise<void> {
         const after = await secretAt(x, name).catch((e: unknown) => { if (isStop(e)) throw e; return null; });
         const at = after !== null && isoAt(after) ? { githubCreatedAt: after } : { unconfirmed: true as const };
         const prior = x.rec.secrets.find((s) => s.name === name && s.scope === SIGNING_SCOPE);
-        const own = before !== null && prior?.created === true && prior.githubCreatedAt === before;
+        const own = before !== null && prior?.created === true && prior.githubCreatedAt !== undefined && sameInstant(prior.githubCreatedAt, before);   // G17 row 43: as instants
         x.secrets.push(before === null || own ? { name, scope: SIGNING_SCOPE, created: true, ...at } : { name, scope: SIGNING_SCOPE, created: false, overwritten: true, ...at });
       }
       fresh = pair.pub;
@@ -818,9 +855,27 @@ function buildRecord(x: Ctx, mergedAt: string, blockFrom: string): InstallRecord
     ...(x.orgRuleset ?? r.orgRuleset) === undefined ? {} : { orgRuleset: x.orgRuleset ?? r.orgRuleset },
     ...(Object.keys({ ...r.repoSettings, ...x.repoSettings }).length === 0 ? {} : { repoSettings: { ...r.repoSettings, ...x.repoSettings } }),
     central: { ...(r.central ?? { createdByPipegen: false }), ...x.centralRec },
-    planned: x.planned,
+    planned: x.typed ? x.planned : appliedPlanned(x.planned, x.fresh),
     ...(x.cosign === undefined ? {} : { cosignPubSha256: x.cosign.sha, cosignPub: x.cosign.pub }),
   };
+}
+
+/**
+ * G17 row 44 (G11 r1 sec): the `planned` finish records is the plan it applied: each lock request the record planned, as planLocks makes it NOW
+ * (the request finish sent), so verify's baseline (the review count, code-owner review, last-push approval) is never a weaker plan planted in
+ * the record. A planned lock planLocks can't plan now (finish skipped it, with a reason) keeps the record's request, so verify still reports it
+ * missing. The rest (signing mode, environments, owners) is the record's, as finish applied it.
+ */
+function appliedPlanned(p: InstallPlanned, f: LockPlan): InstallPlanned {
+  const out: InstallPlanned = structuredClone(p);
+  if (p.rulesets !== undefined && f.rulesets !== undefined) {
+    out.rulesets = { gate: structuredClone(f.rulesets.gate), ...(p.rulesets.reviews === undefined ? {} : { reviews: structuredClone(f.rulesets.reviews ?? p.rulesets.reviews) }) };
+  }
+  if (p.classic !== undefined && f.classic !== undefined) out.classic = structuredClone(f.classic);
+  if (p.centralRuleset !== undefined && f.centralRuleset !== undefined) out.centralRuleset = structuredClone(f.centralRuleset);
+  if (p.orgRequiredWorkflow !== undefined && f.orgRequiredWorkflow !== undefined) out.orgRequiredWorkflow = { path: f.orgRequiredWorkflow.file.path, rule: structuredClone(f.orgRequiredWorkflow.rule) };
+  if (p.shaPinning !== undefined && f.shaPinning !== undefined) out.shaPinning = structuredClone(f.shaPinning);
+  return out;
 }
 
 // ---------- the setup pull request ----------
@@ -961,7 +1016,7 @@ export async function finish(gh: Octokit, app: RepoRef, opts: FinishOpts, deps: 
     x = {
       gh, api, app, central, clock, deps, print: opts.print === true, rotate: opts.rotateKey === true,
       rec, typed, planned, fresh, profile, caps: probed.caps, shaRead, pending, repoId: appRepo.id, branch: appRepo.defaultBranch, ownerType: appRepo.ownerType, private: appRepo.private,
-      centralHead, centralTree, centralCo,
+      centralHead, centralBranch: centralRepo.defaultBranch, centralTree, centralCo,
       applied: [], skipped: [], notes, commands: [],
       rulesets: new Map(), repoSettings: {}, centralRec: {}, environments: new Map(), variables: [], secrets: [],
       centralFiles: [], files: rec.files.map((f) => ({ ...f, shas: [...f.shas] })), edits: rec.edits.map((e) => structuredClone(e)),

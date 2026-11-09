@@ -18,6 +18,7 @@
 // members, so the gate can't check those approvals), and says (G26) that a key rotation resets the baseline.
 import type { Octokit } from '@octokit/rest';
 import { validDate } from '../../gate/src/date.js';
+import { centralWorkflowFile } from '../engine/central-path.js';
 import { CENTRAL_PROTECTED_PATHS, CODEOWNERS_END } from '../engine/created-builders.js';
 import type { RateClock } from '../engine/github-rate.js';
 import { protectedMatcher } from '../engine/protected-match.js';
@@ -28,6 +29,7 @@ import { CENTRAL_RULESET, CO_PLACES, GATE_RULESET, REVIEWS_RULESET } from '../la
 import { GATE_CHECK_INTEGRATION_ID, GATE_CHECK_NAME, PROTECTED_PATHS_BASE, type InstallRecord } from '../types.js';
 import { safeText } from '../util/safe-text.js';
 import { readEnv, SETUP_BRANCH } from './deliver.js';
+import { parseYamlLimited } from '../read/limits.js';
 import { compareStatus, DeliverError, readBlobText, readHead, readRepo, readTree, statusOf, type RepoRef, type TreeEntry } from './git-data.js';
 import { centralOf, protectedPathsOfRecord, readLocalRecord, readRecord, RecordError, recordMarkerOf, recordPath, type LocalRecordDeps } from './record.js';
 import { classicPutForm, holdsWanted, isObj, SettingsApi } from './settings-api.js';
@@ -138,8 +140,21 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
     }
   };
 
+  // G17 rows 40 and 46: the org rule's required workflow as it is at a commit the rule names (undefined: GitHub doesn't show that commit)
+  const reqPath = centralWorkflowFile(r.app.repo, 'required');
+  const requiredAt = async (sha: string): Promise<RequiredAt | undefined> => {
+    try {
+      const e = (await readTree(gh, central, sha, clock)).entries.get(reqPath);
+      if (e === undefined || e.type !== 'blob') return { path: reqPath, blob: e?.sha ?? null, text: null };
+      return { path: reqPath, blob: e.sha, text: await readBlobText(gh, central, e.sha, MAX_TEXT, clock) };
+    } catch (err) {
+      if (!(err instanceof DeliverError) && statusOf(err) !== 404 && statusOf(err) !== 422) throw err;
+      return undefined;
+    }
+  };
+
   // the locks (I3): each planned one in force once finish ran, and its live contents as pipegen set them
-  await locks(api, app, central, r, drift, notes, statusOnDefault);
+  await locks(api, app, central, r, drift, notes, statusOnDefault, requiredAt);
 
   // the pinned central commit: on the central default branch's history
   if (r.centralSha !== null) {
@@ -164,6 +179,18 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
 
 type Obj = Record<string, unknown>;
 type Lock = 'gate' | 'reviews' | 'central' | 'org';
+/** The required workflow at one commit: its path, its blob (null: not there as a file) and its text (null: not there). */
+interface RequiredAt { path: string; blob: string | null; text: string | null }
+
+/** The commit at which the required workflow `text` calls the project's merge workflow `<central>/<merge>@<sha>` (null: no such one call). */
+function mergeCallOf(text: string, central: RepoRef, merge: string): string | null {
+  let doc: unknown;
+  try { doc = parseYamlLimited(text); } catch { return null; }
+  const jobs = isObj(doc) && isObj(doc.jobs) ? Object.values(doc.jobs).filter(isObj) : [];
+  const prefix = `${central.owner}/${central.repo}/${merge}@`.toLowerCase();
+  const shas = jobs.map((j) => j.uses).filter((u): u is string => typeof u === 'string' && u.toLowerCase().startsWith(prefix)).map((u) => u.slice(prefix.length));
+  return shas.length === 1 && SHA_RE.test(shas[0] as string) ? shas[0] as string : null;
+}
 const onDefaultBranch = (status: string | null): boolean => status === 'identical' || status === 'behind';
 /** A sha GitHub's compare may be asked about (40 hex), as the org rule names it. */
 const SHA_RE = /^[0-9a-f]{40}$/;
@@ -309,7 +336,7 @@ function pinTo(want: Obj, pinnedSha: string | undefined): Obj {
  * protection and the recorded rulesets are both checked when the record holds both (G11-R2 c); the org rule's pinned commit must be on the
  * central default branch (G11-R-sec1); stricter settings are notes.
  */
-async function locks(api: SettingsApi, app: RepoRef, central: RepoRef, r: InstallRecord, drift: VerifyDrift[], notes: string[], statusOnDefault: (sha: string) => Promise<string | null>): Promise<void> {
+async function locks(api: SettingsApi, app: RepoRef, central: RepoRef, r: InstallRecord, drift: VerifyDrift[], notes: string[], statusOnDefault: (sha: string) => Promise<string | null>, requiredAt: (sha: string) => Promise<RequiredAt | undefined>): Promise<void> {
   const P = r.planned;
   const finished = r.mergedAt !== undefined;
   const get = async (route: string, params: Obj): Promise<Obj | null> => { const d = await api.readOr404(route, params); return isObj(d) ? d : null; };
@@ -332,6 +359,21 @@ async function locks(api: SettingsApi, app: RepoRef, central: RepoRef, r: Instal
       for (const sha of shas) {
         const status = SHA_RE.test(sha) ? await statusOnDefault(sha) : null;
         if (!onDefaultBranch(status)) d.drift.push({ what, expected: `the pinned commit ${show(sha, 64)} on the central default branch`, actual: status });
+        if (!SHA_RE.test(sha)) continue;
+        const at = await requiredAt(sha);
+        // G17 row 40 (G11 R2-2): with no recorded pin, a commit on the default branch is not enough: the file the rule runs there must be
+        // one pipegen wrote (its blob one of the recorded shas of that central file); an older commit without it, or another file, is drift
+        if (pinnedSha === undefined) {
+          const wrote = r.files.filter((f) => f.repo === 'central' && f.path === at?.path).flatMap((f) => f.shas);
+          if (at === undefined || at.blob === null || !wrote.includes(at.blob)) d.drift.push({ what, expected: `${at?.path ?? 'the required workflow'} at ${sha} as pipegen wrote it`, actual: at === undefined ? 'unreadable' : at.blob });
+        }
+        // G17 row 46: after `pipegen update` re-pinned the app to a new central commit, the rule still runs the required workflow that
+        // calls the merge workflow at the old one (a stale pin): named plainly, with the way on
+        const call = at?.text === null || at === undefined || r.centralSha === null ? null : mergeCallOf(at.text, central, centralWorkflowFile(r.app.repo, 'merge'));
+        if (call !== null && call !== r.centralSha) {
+          d.drift.push({ what, expected: `the required workflow at the pinned commit ${sha} calling the merge workflow at the app's central commit ${r.centralSha}`, actual: `it calls it at ${call} (a stale pin)` });
+          notes.push(`The org required workflow rule still runs the merge workflow at the central commit ${call.slice(0, 12)}, not at ${(r.centralSha as string).slice(0, 12)}, the one the app calls since \`pipegen update\`. Merge the central pull request that updates ${show(at?.path ?? 'the required workflow')} (run \`pipegen update\` again if there is none), then run \`npx pipegen finish\`: it pins the rule to the new commit.`);
+        }
       }
     }
     drift.push(...d.drift);
