@@ -36,17 +36,21 @@ const MERGED_AT = '2026-11-06T09:30:00Z';
 const BLOCK_FROM = '2026-11-13';
 const PUB = cosignPub(3);
 const PW_NAME = ['PIPEGEN_COSIGN', 'PASS' + 'WORD'].join('_');
+const KNOWN_PW = 'Zq9Kd7LmZq9Kd7LmZq9Kd7LmZq9Kd7LmZq9Kd7LmZq9K';   // 44 characters, the fake base64's output
 const PW_VAR = ['COSIGN', 'PASS' + 'WORD'].join('_');   // built at runtime: a redact pattern reads `NAME="…"` as a value
 /** G17-R4 (sec C1): the key-pair commands finish --print gives (app o/r), one subshell block a failure ends. */
 const KEY_BLOCK = [
   '(',
-  '  set -eu',
+  '  set -eu +x',
   '  umask 077',
   '  d="$(mktemp -d -p /dev/shm)"',
   '  trap \'rm -rf -- "$d"\' EXIT',
+  '  trap \'exit 130\' HUP INT TERM',
   '  test -d "$d"',
+  '  case "$(stat -f -c %T "$d")" in tmpfs|ramfs) ;; *) exit 1 ;; esac',
   '  cd "$d"',
   `  ${PW_VAR}="$(head -c 32 /dev/urandom | base64 | tr -d '\\n')"; export ${PW_VAR}`,
+  '  test "${#COSIGN_PASSWORD}" -eq 44',
   '  cosign generate-key-pair --output-key-prefix pipegen-signing',
   '  gh secret set PIPEGEN_COSIGN_KEY --env pipegen-signing --repo o/r < pipegen-signing.key',
   `  printf '%s' "$COSIGN_PASSWORD" | gh secret set ${PW_NAME} --env pipegen-signing --repo o/r`,
@@ -1968,7 +1972,7 @@ describe('G17 group D fix round 1 (G17-R4)', () => {
    * Runs the printed block under `sh` from a stand-in clone, with a fake cosign and gh first on PATH and /dev/shm swapped for `shm` (an
    * existing folder, or one that doesn't exist). After the block the same script prints what the user's shell holds then.
    */
-  const runBlock = (block: string, sh: string, o: { shmExists: boolean; cosignFails?: boolean }) => {
+  const runBlock = (block: string, sh: string, o: { shmExists: boolean; cosignFails?: boolean; disk?: boolean; noBase64?: boolean; xtrace?: boolean }) => {
     const root = mkdtempSync(join(tmpdir(), 'pg-keyblock-'));
     homes.push(root);
     const bin = join(root, 'bin');
@@ -1985,8 +1989,14 @@ describe('G17 group D fix round 1 (G17-R4)', () => {
     writeFileSync(join(bin, 'gh'), '#!/bin/sh\necho "gh $* stdin=$(wc -c | tr -d \' \')" >> "$PG_LOG"\n');
     chmodSync(join(bin, 'cosign'), 0o755);
     chmodSync(join(bin, 'gh'), 0o755);
+    // the stand-in /dev/shm is a temp folder on disk: a fake stat says what it is (tmpfs, or a disk file system); base64 gives a known
+    // 44-character password, or fails
+    writeFileSync(join(bin, 'stat'), `#!/bin/sh\necho ${o.disk === true ? 'ext2/ext3' : 'tmpfs'}\n`);
+    writeFileSync(join(bin, 'base64'), o.noBase64 === true ? '#!/bin/sh\ncat > /dev/null\nexit 127\n' : `#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' ${KNOWN_PW}\n`);
+    chmodSync(join(bin, 'stat'), 0o755);
+    chmodSync(join(bin, 'base64'), 0o755);
     const script = join(root, 'paste.sh');
-    writeFileSync(script, `umask 022\n${block.split('/dev/shm').join(shm)}\necho "rc=$? env=\${${PW_VAR}-unset} umask=$(umask) cwd=$(pwd)"\n`);
+    writeFileSync(script, `umask 022\n${o.xtrace === true ? 'set -x\n' : ''}${block.split('/dev/shm').join(shm)}\necho "rc=$? env=\${${PW_VAR}-unset} umask=$(umask) cwd=$(pwd)"\n`);
     writeFileSync(log, '');
     const before = tree(root);
     const r = spawnSync(sh, sh === 'zsh' ? ['-f', script] : [script], { cwd: clone, env: { PATH: `${bin}:${process.env.PATH ?? '/usr/bin:/bin'}`, PG_LOG: log, HOME: root }, encoding: 'utf8' });
@@ -2038,6 +2048,46 @@ describe('G17 group D fix round 1 (G17-R4)', () => {
       expect(bad.after, sh).toEqual(bad.before);
       expect(bad.out, sh).toContain(`env=unset umask=${sh === 'zsh' ? '022' : '0022'} cwd=${bad.clone}`);
     }
+  });
+
+  it('finish --print: the key-pair block stops before cosign when /dev/shm is not a memory folder (a disk folder, as on Windows Git Bash), in every shell (G17-R5, sec m1)', async () => {
+    const block = await keyBlock();
+    for (const sh of SHELLS) {
+      const x = runBlock(block, sh, { shmExists: true, disk: true });
+      expect(x.out, `${sh}: ${x.r.stderr}`).toMatch(/^rc=[1-9]\d* /m);
+      expect(x.calls, sh).toEqual([]);   // no cosign, no gh
+      expect(x.after, sh).toEqual(x.before);   // the folder removed, nothing written
+      expect(x.out, sh).toContain(`env=unset umask=${sh === 'zsh' ? '022' : '0022'} cwd=${x.clone}`);
+    }
+  });
+
+  it('finish --print: with set -x in the user\'s shell the block never prints the password, and still makes the pair (G17-R5, sec m2)', async () => {
+    const block = await keyBlock();
+    for (const sh of SHELLS) {
+      const x = runBlock(block, sh, { shmExists: true, xtrace: true });
+      expect(x.out, `${sh}: ${x.r.stderr}`).toMatch(/^rc=0 /m);
+      expect(x.calls.length, sh).toBe(4);
+      expect(x.out + x.r.stderr, sh).not.toContain(KNOWN_PW);
+    }
+  });
+
+  it('finish --print: a failing base64 (an empty password) stops the block before cosign, in every shell (G17-R5, sec i1)', async () => {
+    const block = await keyBlock();
+    for (const sh of SHELLS) {
+      const x = runBlock(block, sh, { shmExists: true, noBase64: true });
+      expect(x.out, `${sh}: ${x.r.stderr}`).toMatch(/^rc=[1-9]\d* /m);
+      expect(x.calls, sh).toEqual([]);
+      expect(x.after, sh).toEqual(x.before);
+    }
+  });
+
+  it('finish --print: no printed # line holds a backtick or $( (a stock zsh runs them when pasted) and the key-pair note says to run the whole block again (G17-R5, sec i3, i4)', async () => {
+    const s = await seed({ keyEnv: true });
+    const res = await finish(s.g.octokit(), app, { print: true, rotateKey: true }, s.deps());
+    const hashes = (res.commands ?? []).filter((c) => c.startsWith('#'));
+    expect(hashes.length).toBeGreaterThan(0);
+    for (const c of hashes) expect(c).not.toMatch(/`|\$\(/);
+    expect(hashes.find((c) => c.includes('A new key pair'))).toMatch(/stopped after a gh line, run the whole block again/);
   });
 
   // ---------- M1: the fail-closed guards rows 40-51 added ----------
