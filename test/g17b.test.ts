@@ -198,6 +198,11 @@ describe('G17 row 19 (open question 9): a blocking check of an image pipegen can
     expect(() => assemble(x)).toThrow(/The blocking check "image-(?:build|scan)" for "api" can not run: its image is not built \(The service "api" is in a sub-folder[^)]*\)\. pipegen never scans another image in its place, makes it warn-only or leaves it out\./);
   });
 
+  it('assemble: a blocking DAST check of the same service keeps its own reason (the image stop comes after the DAST starts)', () => {
+    const x = planned(prof, { over: SKIP_DEPLOY });
+    expect(() => assemble(x)).toThrow(/^The blocking check "dast" for "api" can not run: it has no container image pipegen builds/);
+  });
+
   it('assemble: non-blocking, the same checks leave with a note (no job, no gate entry)', () => {
     const needs = floorNeeds(prof, CAPS).filter((n) => !without.has(n.id)).map((n) => (n.service === 'api' && (n.id === 'image-scan' || n.id === 'image-build') ? { ...n, blocking: false } : n));
     const x = planned(prof, { needs, over: SKIP_DEPLOY, edit: (s) => s.filter((st) => !without.has(st.needId)) });
