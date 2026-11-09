@@ -10,7 +10,9 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { composeText } from '../src/create/compose.js';
-import { dockerfileProblems, type DockerfileCtx } from '../src/create/dockerfile-rules.js';
+import { dockerfileProblems, dockerignoreText, type DockerfileCtx } from '../src/create/dockerfile-rules.js';
+import { pipegenDoc } from '../src/deliver/docs.js';
+import { renderComposeUp } from '../src/engine/render-step.js';
 import { dockerfileInstructions } from '../src/ai/prompts/dockerfile.js';
 import { baseImageRef, loadBaseImages } from '../src/engine/base-images.js';
 import { dastStartOf, renderDastRun } from '../src/engine/dast-handoff.js';
@@ -211,7 +213,7 @@ describe('G17 row 19 (open question 9): a blocking check of an image pipegen can
     expect(needs.filter((n) => n.service === 'api' && (n.id === 'image-scan' || n.id === 'image-build')).every((n) => n.blocking)).toBe(true);
     const x = planned(prof, { needs, over: SKIP_DEPLOY, edit: (s) => s.filter((st) => !without.has(st.needId)) });
     expect(() => assemble(x)).toThrow(AssembleError);
-    expect(() => assemble(x)).toThrow(/The blocking check "image-(?:build|scan)" for "api" can not run: its image is not built \(The service "api" is in a sub-folder[^)]*\)\. pipegen never scans another image in its place, makes it warn-only or leaves it out\./);
+    expect(() => assemble(x)).toThrow(/The blocking check "image-(?:build|scan)" for "api" can not run: its image is not built \(The service "api" is in a sub-folder[^)]*\)\. pipegen never scans another image in its place, makes it warn-only or leaves it out\. Next step: pipegen v0\.2 builds an image from the repository root only; move the service's Dockerfile and build context to the root, or wait for a later version, then run `npx pipegen run` again\./);
   });
 
   it('assemble: a blocking DAST check of the same service keeps its own reason (the image stop comes after the DAST starts)', () => {
@@ -228,14 +230,14 @@ describe('G17 row 19 (open question 9): a blocking check of an image pipegen can
   });
 });
 
-describe('G17 row 19: scope (reported): a service with no Dockerfile of its own keeps the note', () => {
-  it('assemble: no Dockerfile in the repository (pipegen may create one): the image checks leave with the note, as before G17', () => {
+describe('G17B-R1 round 2, risk 1: a service with no Dockerfile at all (none created) stops like row 19', () => {
+  it('assemble: no Dockerfile in the repository and none created: a blocking image check stops, with a next step', () => {
     const prof2 = profileOf([node({ frameworks: ['express'], port: 3000, scripts: ['test', 'lint', 'start'] })]);
     const needs = floorNeeds(prof2, CAPS).filter((n) => n.id !== 'dast');
     expect(needs.some((n) => n.id === 'image-build' && n.blocking)).toBe(true);
-    const a = assemble(planned(prof2, { needs, over: SKIP_DEPLOY, edit: (s) => s.filter((st) => st.needId !== 'dast') }));
-    expect(Object.keys(a.merge).filter((k) => /image/.test(k))).toEqual([]);
-    expect(a.notes.join('\n')).toMatch(/The image of "app" is not built or scanned yet: The service "app" has no Dockerfile to build/);
+    const x = planned(prof2, { needs, over: SKIP_DEPLOY, edit: (s) => s.filter((st) => st.needId !== 'dast') });
+    expect(() => assemble(x)).toThrow(AssembleError);
+    expect(() => assemble(x)).toThrow(/^The blocking check "image-(?:build|scan)" for "app" can not run: its image is not built \(The service "app" has no Dockerfile to build\.\)\. pipegen never scans another image in its place, makes it warn-only or leaves it out\. Next step: add a Dockerfile to the service's folder, or let pipegen create one, then run `npx pipegen run` again\.$/);
   });
 });
 
@@ -269,5 +271,70 @@ describe('G17B-R1 sec M1: the ZAP API answers only 127.0.0.1 in every ZAP form p
   it('threat model: T54 says the ZAP API answers only 127.0.0.1, so the scanned app can not drive it', () => {
     const r = readFileSync('docs/threat-model.md', 'utf8').split('\n').find((l) => l.startsWith('| T54 |')) as string;
     expect(r).toMatch(/ZAP API answers only 127\.0\.0\.1/);
+  });
+});
+
+describe('G17B-R0/R1 round 2: the image build of a Dockerfile pipegen creates in the same run', () => {
+  const REF = baseImageRef('node-24-bookworm-slim');
+  const SINGLE = [`FROM ${REF}`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'COPY . .', 'ENV NODE_ENV=production', 'EXPOSE 3000', 'USER node', 'CMD ["npm", "start"]', ''].join('\n');
+  const svcNoDf = () => node({ frameworks: ['express'], port: 3000, scripts: ['test', 'lint', 'start'] });
+  const created = (): CreatedFile[] => [
+    { path: 'Dockerfile', content: SINGLE, part: 'docker', reason: 't', repo: 'app' },
+    { path: '.dockerignore', content: dockerignoreText(svcNoDf(), false), part: 'docker', reason: 't', repo: 'app' },
+  ];
+
+  it('assemble: the image build and the blocking image scan render from the created Dockerfile; DAST starts the checked archive; the referee passes', async () => {
+    const a = assemble(planned(profileOf([svcNoDf()]), { over: { created: created(), ...SKIP_DEPLOY } }));
+    const build = a.merge['image-build--app'] as Job;
+    expect(build, 'the image build').toBeDefined();
+    expect(build.steps.find((st) => st.with?.file !== undefined)?.with?.file).toBe('Dockerfile');
+    expect(a.merge['image-scan--app'], 'the image scan').toBeDefined();
+    expect((a.merge['dast-run--app'] as Job).needs).toEqual(['image-build--app']);
+    expect(a.notes.join('\n')).not.toMatch(/not built or scanned yet/);
+    expect(shown(await judge([...files(a), ...created()], a.draft))).toBe('');
+  });
+
+  it('referee: the image build of a created Dockerfile is pipegen\'s only while the draft creates that file', async () => {
+    const a = assemble(planned(profileOf([svcNoDf()]), { over: { created: created(), ...SKIP_DEPLOY } }));
+    // the same workflow files judged against a draft that creates no Dockerfile: the build and its scan are no steps of pipegen's
+    const without = { ...a.draft, created: a.draft.created.filter((f) => f.part !== 'docker') };
+    expect(shown(await judge(files(a), without))).toMatch(/image-build--app/);
+  });
+});
+
+describe('G17B-R1 round 2: the referee refuses the registry form of an image scan for an image the draft does not build', () => {
+  it('referee: a registry-form trivy-image for a service with no image build is no step of pipegen\'s', async () => {
+    const a = assemble(planned(profileOf([web()]), { over: SKIP_DEPLOY }));
+    // drop the image build from the draft only: the files keep a scan job, which must not pass as the registry form
+    const d = { ...a.draft, steps: a.draft.steps.filter((st) => st.needId !== 'image-build'), needs: a.draft.needs.filter((n) => n.id !== 'image-build') };
+    const r = await judge(files(a), d);
+    expect(r.notes.join('\n')).toMatch(/The image scan "image-scan" \(trivy-image\) reads only the archive of the pull request's own image, and the draft builds no image for "app", so no step may claim to be it\./);
+    expect(shown(r)).toMatch(/image-scan--app/);
+  });
+});
+
+describe('G17B-R1 round 2, risk 4 (R0 concern 3): compose up fails with a fixed pipegen message', () => {
+  it('render: compose up (and the proof form) ends with a fixed message on failure, naming the capability limit; no container log text', () => {
+    for (const st of [renderComposeUp(), renderComposeUp({ proofOverride: true })]) {
+      expect(st.run).toContain('|| { echo "::error::pipegen: the containers did not start. pipegen starts your app containers with no Linux capability and no privilege gain (cap_drop ALL, no-new-privileges), so an image that needs one (a root entrypoint that switches users or changes file owners) can not start: run the app as a non-root user. See PIPEGEN.md, Limits of these checks."; exit 1; }');
+      expect(st.run).not.toMatch(/logs|\$\(/);
+    }
+  });
+});
+
+describe('G17B-R1 round 2: PIPEGEN.md says the DAST limits', () => {
+  it('docs: the ZAP API bind, the second build on the compose path, and the capability limit of the compose containers', () => {
+    const prof = profileOf([node({ dockerfile: 'Dockerfile', port: 3000, scripts: ['test', 'lint', 'start'], dependsOn: [PG] })]);
+    const compose: CreatedFile = { path: 'docker-compose.pipegen.yml', content: composeText(prof, loadBaseImages()) as string, part: 'compose', reason: 't', repo: 'app' };
+    const a = assemble(planned(prof, { over: { created: [compose], ...SKIP_DEPLOY } }));
+    const doc = pipegenDoc(a.draft, REVIEWED).content;
+    expect(doc).toContain('The running app scan talks to ZAP through its API, which answers only 127.0.0.1, so the scanned app can not reach it.');
+    expect(doc).toContain('With pipegen\'s compose file, the running app scan builds the app\'s image itself, in its own job: a second build of the same Dockerfile. The image scan reads the other build.');
+    expect(doc).toContain('The app containers in pipegen\'s compose file run with no Linux capability and no privilege gain, and the database and queue containers with no privilege gain. An app image that needs a capability (a root entrypoint that switches users or changes file owners) does not start: run the app as a non-root user.');
+    // without a compose file, the archive start: no second build line
+    const b = assemble(planned(profileOf([web()]), { over: SKIP_DEPLOY }));
+    const docB = pipegenDoc(b.draft, REVIEWED).content;
+    expect(docB).toContain('The running app scan talks to ZAP through its API, which answers only 127.0.0.1');
+    expect(docB).not.toContain('a second build of the same Dockerfile');
   });
 });

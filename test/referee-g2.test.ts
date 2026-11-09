@@ -672,10 +672,13 @@ describe('G2 fix round 1 (ruling G2-R1)', () => {
     const baseSteps = [...renderJobPrelude({ baseRef: true }, p).steps, ...baseB.steps];
     const r2 = await runWith([imageFile({ 'image-build--app': buildJob(d), 'image-scan--app': scanJob(d), 'base-scan': job(baseSteps, { outputs: jobOutputsFor(baseSteps), permissions: { contents: 'read', actions: 'read' } }) })], d);
     expect(r2.issues.some((i) => /In the job "base-scan"/.test(i.message) && notOurs.test(i.message)), show(r2)).toBe(true);
-    // the archive form still passes, and with no image build the registry form is as before
+    // the archive form still passes; G17B-R1 round 2 (R0 carry 2): with no image build the registry form is refused too (it scans an image
+    // that is not the pull request's own)
     expect(show(await runWith([imageFile({ 'image-build--app': buildJob(d), 'image-scan--app': scanJob(d) })], d))).toBe('');
     const noBuild = draftOf({ profile: imgProf, needs: [needOf('image-scan', 'app')], steps: [scanSpec()] });
-    expect(show(await runWith([imageFile({ 'image-scan--app': job(reg.steps, { outputs: jobOutputsFor(reg.steps) }) })], noBuild))).toBe('');
+    const rn = await runWith([imageFile({ 'image-scan--app': job(reg.steps, { outputs: jobOutputsFor(reg.steps) }) })], noBuild);
+    expect(rn.ok, show(rn)).toBe(false);
+    expect(rn.notes.some((n) => /reads only the archive of the pull request's own image, and the draft builds no image for "app"/.test(n)), show(rn)).toBe(true);
   });
 
   it('referee: an image push runs only in a deploy job of pipegen.yml on a default-branch push (G2-R1 I3)', async () => {
