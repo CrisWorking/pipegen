@@ -50,7 +50,7 @@ import { safeText } from '../util/safe-text.js';
 import {
   commitFiles, compareStatus, DeliverError, ghRead, ghWrite, isoAt, openOrUpdatePr, readHead, readRepo, readTree, refusedMove, sameInstant, setBranch, statusOf, type RepoRef, type TreeEntry,
 } from './git-data.js';
-import { addLocalLeftovers, centralPrBase, centralUpdateBranch, localRecordPath, ownWholeFile, protectedPathsForRecord, RecordError, writeRecord, type Leftover, type LocalRecordDeps, type RecordedEdit } from './record.js';
+import { addLocalLeftovers, centralPrBase, dropLocalLeftovers, localLeftoversPath, readLocalLeftovers, centralUpdateBranch, localRecordPath, ownWholeFile, protectedPathsForRecord, RecordError, writeRecord, type Leftover, type LocalRecordDeps, type RecordedEdit } from './record.js';
 import { trustedPrevious, UNREADABLE_RUN_WAY_ON } from './trust.js';
 
 export { DeliverError };
@@ -97,6 +97,11 @@ export interface DeliveryInput {
    * proves pipegen added a new central file; a file another commit added, byte-identical to pipegen's text, is recorded adopted.
    */
   centralCommitted?: string;
+  /**
+   * Ruling G-SIGN1: the N4 environment pipegen-signing THIS run made before assembly (makeRunSigningEnvironment), so the first run on a
+   * private repo signs. deliver builds on it (made by pipegen, so uninstall deletes it) only while GitHub's created_at still matches.
+   */
+  signingEnv?: EnvEntry;
 }
 
 export interface DeliveryPlan {
@@ -120,6 +125,8 @@ export interface DeliveryPlan {
   centralFileList: string[] | null;
   /** See DeliveryInput.centralCommitted; null: this run made no central commit. */
   centralCommitted: string | null;
+  /** See DeliveryInput.signingEnv. */
+  signingEnv?: EnvEntry;
 }
 
 /** Why a file is never delivered, or null. */
@@ -189,6 +196,7 @@ export function planDelivery(i: DeliveryInput): DeliveryPlan {
     protectedPaths: [...i.protectedPaths], excluded, aiWritten: kept.filter((f) => f.aiEdited === true).map((f) => f.path),
     ...(i.proofRepos === undefined ? {} : { proofRepos: i.proofRepos }), centralFileList: needList ? [...(i.centralFileList as readonly string[])] : null,
     centralCommitted: typeof i.centralCommitted === 'string' && SHA_RE.test(i.centralCommitted) ? i.centralCommitted : null,
+    ...(i.signingEnv === undefined ? {} : { signingEnv: i.signingEnv }),
   };
 }
 
@@ -257,7 +265,12 @@ export function previewText(d: DeliveryPlan): string {
   }
   out.push('', 'Secrets pipegen stores in the app repo now (names only; values never shown):', `  ${FP_KEY} (the key for secret fingerprints; kept if it already exists)`);
   for (const n of d.secretNames) out.push(`  ${n} (asked before replacing one that already exists)`);
-  if (d.draft.signing?.mode === 'key-env') out.push('', `Created now, before the merge: the environment ${SIGNING_ENVIRONMENT} (default branch only), and the signing key in it (${SIGNING_SECRETS.join(', ')}). It blocks nothing: it only lets default-branch jobs sign and verify images.`);
+  if (d.draft.signing?.mode === 'key-env') {
+    out.push('', d.signingEnv === undefined
+      ? `Created now, before the merge: the environment ${SIGNING_ENVIRONMENT} (default branch only), and the signing key in it (${SIGNING_SECRETS.join(', ')}). It blocks nothing: it only lets default-branch jobs sign and verify images.`
+      // ruling G-SIGN1: the environment this run made (and read back) before assembly
+      : `The environment ${SIGNING_ENVIRONMENT} (default branch only) was made earlier in this run and read back. Created now, before the merge: the signing key in it (${SIGNING_SECRETS.join(', ')}). It blocks nothing: it only lets default-branch jobs sign and verify images.`);
+  }
   const planned = plannedOf(d);
   const after: string[] = [];
   if (planned.rulesets !== undefined) after.push('the merge locks on the default branch (rulesets pipegen and pipegen-reviews; classic branch protection where rulesets are not offered)');
@@ -461,9 +474,11 @@ const defaultOnly = (e: EnvRead, branch: string): boolean => e.settings.deployme
  * environment that reads back default-branch only is returned. `known`: its entry in an earlier record (kept when GitHub's created_at
  * still matches: `previous` is captured once, never pipegen's own settings).
  */
-export async function ensureSigningEnvironment(gh: Octokit, app: RepoRef, defaultBranch: string, known: EnvEntry | undefined, clock: RateClock = clockOf(gh), notes: string[] = []): Promise<EnvEntry> {
+export async function ensureSigningEnvironment(gh: Octokit, app: RepoRef, defaultBranch: string, known: EnvEntry | undefined, clock: RateClock = clockOf(gh), notes: string[] = [], opts: { onlyNew?: boolean; onMade?: (createdAt: string) => void } = {}): Promise<EnvEntry> {
   const params = { environment_name: SIGNING_ENVIRONMENT };
   const cur = await readEnv(gh, app, clock);
+  // ruling G-SIGN1: the run's own environment is only ever a new one; one that is there is left as it is (nothing written)
+  if (opts.onlyNew === true && cur !== null) throw new SigningEnvThere(THERE_ALREADY);
   const ids: number[] = [];
   const changed: (keyof EnvSettings)[] = [];
   const addPolicy = async (): Promise<void> => {
@@ -471,7 +486,14 @@ export async function ensureSigningEnvironment(gh: Octokit, app: RepoRef, defaul
     if (isObj(d) && Number.isSafeInteger(d.id)) ids.push(d.id as number);
   };
   if (cur === null) {
-    await ghWrite(gh, 'PUT /repos/{owner}/{repo}/environments/{environment_name}', app, { ...params, deployment_branch_policy: { protected_branches: false, custom_branch_policies: true } }, clock);
+    const put = await ghWrite(gh, 'PUT /repos/{owner}/{repo}/environments/{environment_name}', app, { ...params, deployment_branch_policy: { protected_branches: false, custom_branch_policies: true } }, clock);
+    if (opts.onlyNew === true) {
+      // G-SIGN1-R2 sec L1: the PUT is create-or-update; only an answer whose created_at is its updated_at is an environment it just made
+      const made = isObj(put) ? put.created_at : undefined;
+      const upd = isObj(put) ? put.updated_at : undefined;
+      if (!isoAt(made) || !isoAt(upd) || !sameInstant(made, upd)) throw new SigningEnvRaced(RACED);
+      opts.onMade?.(made);
+    }
     await addPolicy();
   } else {
     const others = cur.policies.filter((x) => !(x.name === defaultBranch && x.type === 'branch'));
@@ -508,6 +530,110 @@ export async function ensureSigningEnvironment(gh: Octokit, app: RepoRef, defaul
   const at = isoAt(back.createdAt) ? { githubCreatedAt: back.createdAt } : { unconfirmed: true as const };
   if (cur === null) return { name: SIGNING_ENVIRONMENT, created: true, ...at, changed: [], branchPolicyIds: policyIds };
   return { name: SIGNING_ENVIRONMENT, created: false, ...at, previous: { ...cur.settings, branch_policies: cur.policies.map((x) => ({ name: x.name, type: x.type })) }, changed, branchPolicyIds: policyIds };
+}
+
+const THERE_ALREADY = `The environment ${SIGNING_ENVIRONMENT} is already there, and pipegen's probe could not prove it usable from the default branch only, so pipegen leaves it as it is.`;
+const RACED = `The environment ${SIGNING_ENVIRONMENT} that GitHub answered with is not one pipegen just made (it was there already), so pipegen claims nothing and signs nothing; check its settings in the repository.`;
+/** Ruling G-SIGN1: ensureSigningEnvironment's refusal (onlyNew) of an environment that is already there; nothing of pipegen's is in it. */
+export class SigningEnvThere extends DeliverError {}
+/** G-SIGN1-R3 (sec r2-L2): the PUT answered with an environment that doesn't look just made (it may still be pipegen's: listed by name). */
+export class SigningEnvRaced extends SigningEnvThere {}
+
+/**
+ * Ruling G-SIGN1: the run's own N4 environment, made after consent and before assembly so a first run on a private repo can sign. Only a
+ * NEW pipegen-signing is made (one already there is never touched here: the probe could not prove it), with the default-branch rule,
+ * then READ BACK by ensureSigningEnvironment: only an environment that reads back default-branch only comes back as `env`. It goes into
+ * the local leftovers file at once (with GitHub's created_at), so a run that stops before its install record still names it. Fail closed:
+ * any other answer is `off` (the run stays unsigned, the reason said); an environment a failed attempt may have left is listed by name.
+ * Throws (DeliverError, the environment named) only when a made environment can't be listed locally.
+ */
+export async function makeRunSigningEnvironment(gh: Octokit, app: RepoRef, defaultBranch: string, x: { clock?: RateClock; local?: LocalRecordDeps; now: Date }): Promise<{ env: EnvEntry } | { off: string }> {
+  const clock = x.clock ?? clockOf(gh);
+  const item = (at?: string): Leftover => ({ kind: 'environment', name: SIGNING_ENVIRONMENT, repo: `${app.owner}/${app.repo}`, ...(at === undefined ? {} : { githubCreatedAt: at }) });
+  // read first: an answer pipegen can't read means nothing was written, and nothing of the user's is listed as pipegen's
+  let before: EnvRead | null;
+  try { before = await readEnv(gh, app, clock); } catch (e) {
+    return { off: e instanceof DeliverError ? e.message : `pipegen couldn't read the environment ${SIGNING_ENVIRONMENT} (${statusOf(e) === undefined ? 'an error' : `HTTP ${statusOf(e)}`}).` };
+  }
+  if (before !== null) return { off: THERE_ALREADY };
+  // G-SIGN1-R2 sec M2: the leftovers file (and its folder) must be usable BEFORE anything is written
+  try { await readLocalLeftovers(app, x.local ?? {}); } catch (e) {
+    return { off: `pipegen can't use its local leftovers file (${e instanceof RecordError ? e.message : 'an error'}), so it makes no signing environment it couldn't list.` };
+  }
+  let env: EnvEntry;
+  let madeAt: string | undefined;
+  try {
+    env = await ensureSigningEnvironment(gh, app, defaultBranch, undefined, clock, [], { onlyNew: true, onMade: (at) => { madeAt = at; } });
+  } catch (e) {
+    // G-SIGN1-R3 (sec r2-L2): after a PUT pipegen can't claim, the environment is listed by name only (no created_at: never taken for
+    // pipegen's own), so uninstall reports it
+    if (e instanceof SigningEnvRaced) { await addLocalLeftovers(app, [item()], x.now, x.local ?? {}).catch(() => undefined); return { off: e.message }; }
+    if (e instanceof SigningEnvThere) return { off: e.message };
+    const why = e instanceof DeliverError ? e.message : `pipegen couldn't make the environment ${SIGNING_ENVIRONMENT} with its default-branch rule (${statusOf(e) === undefined ? 'an error' : `HTTP ${statusOf(e)}`}).`;
+    if (madeAt !== undefined) {
+      // G-SIGN1-R2 spec L3: the PUT made it (its created_at proves it): the half-made environment is listed, then deleted again
+      const listed = await addLocalLeftovers(app, [item(madeAt)], x.now, x.local ?? {}).then(() => true, () => false);
+      const d = await dropRunSigningEnvironment(gh, app, { name: SIGNING_ENVIRONMENT, created: true, githubCreatedAt: madeAt, changed: [], branchPolicyIds: [] }, { ...x, listed });
+      return { off: 'dropped' in d ? `${why} pipegen deleted it again.` : `${why} pipegen couldn't delete it (${d.left}).` };
+    }
+    // the PUT may have made it: listed by name (no created_at, so nothing later takes it for pipegen's own); unreadable now counts as there
+    const there = await readEnv(gh, app, clock).then((r) => r !== null, () => true);
+    if (there) await addLocalLeftovers(app, [item()], x.now, x.local ?? {}).catch(() => undefined);
+    return { off: `${why}${there ? ` It may be left in the repository settings: check it, or remove it.` : ''}` };
+  }
+  if (!env.created || env.name !== SIGNING_ENVIRONMENT) return { off: `The environment ${SIGNING_ENVIRONMENT} didn't read back as one pipegen made.` };
+  try {
+    await addLocalLeftovers(app, [item(env.githubCreatedAt)], x.now, x.local ?? {});
+  } catch (e) {
+    const why = e instanceof RecordError ? e.message : 'an error';
+    // G-SIGN1-R2 sec M2: it can't be listed, so it is deleted again (only this run's, contents checked); a stop only when that fails too
+    const d = await dropRunSigningEnvironment(gh, app, env, { ...x, listed: false });
+    if ('dropped' in d) return { off: `pipegen made the environment ${SIGNING_ENVIRONMENT} but couldn't list it in the local leftovers file (${why}), so it deleted it again.` };
+    throw new DeliverError(`pipegen made the environment ${SIGNING_ENVIRONMENT} in ${show(`${app.owner}/${app.repo}`)} but couldn't list it in the local leftovers file (${why}) or delete it again (${d.left}), so it stops here. Remove the environment by hand, or run \`npx pipegen run\` again.`, { cause: e, leftovers: [`environment ${SIGNING_ENVIRONMENT}`] });
+  }
+  return { env };
+}
+
+/**
+ * Ruling G-SIGN1-R1: a run that made its own environment (makeRunSigningEnvironment) and stops before delivery deletes it again, as the
+ * proof's keys are cleaned up. Only the environment this run made: its GitHub created_at must still be `env`'s (another one is never
+ * deleted). Gone already, or deleted: its entry leaves the local leftovers file (`dropped`). Anything else keeps the environment and its
+ * leftovers entry, and `left` says why and names the file.
+ */
+export async function dropRunSigningEnvironment(gh: Octokit, app: RepoRef, env: EnvEntry, x: { clock?: RateClock; local?: LocalRecordDeps; now: Date; listed?: boolean }): Promise<{ dropped: true } | { left: string }> {
+  const clock = x.clock ?? clockOf(gh);
+  const file = localLeftoversPath(app, x.local ?? {});
+  // G-SIGN1-R3: `listed: false` when the caller's own leftovers write failed (the message never says it is listed then)
+  const left = (why: string): { left: string } => ({ left: x.listed === false ? `${why}; pipegen couldn't list it in ${file} either` : `${why}; it stays listed in ${file}` });
+  const ours = (l: Leftover): boolean => l.kind === 'environment' && l.name === SIGNING_ENVIRONMENT && l.repo.toLowerCase() === `${app.owner}/${app.repo}`.toLowerCase() && l.scope === undefined;
+  if (env.name !== SIGNING_ENVIRONMENT || !env.created || env.githubCreatedAt === undefined) return left('it is not an environment this run made');
+  let cur: EnvRead | null;
+  try { cur = await readEnv(gh, app, clock); } catch (e) { return left(e instanceof DeliverError ? `pipegen couldn't read it` : 'an error'); }
+  if (cur !== null) {
+    if (!sameInstant(env.githubCreatedAt, cur.createdAt)) return left('it is not the one this run made (GitHub gives another created_at), so pipegen keeps it');
+    // G-SIGN1-R2 sec M1 (as uninstall's V-S5): the run stores nothing there before delivery, so anything in it is someone else's
+    const held = await envContents(gh, app, clock);
+    if (held === null) return left('pipegen couldn\'t list its secrets and variables, so it keeps it');
+    if (held.length > 0) return left(`it holds ${held.slice(0, 20).join(', ')}${held.length > 20 ? ', …' : ''}, which pipegen didn't add, so pipegen keeps it`);
+    try { await ghWrite(gh, 'DELETE /repos/{owner}/{repo}/environments/{environment_name}', app, { environment_name: SIGNING_ENVIRONMENT }, clock); } catch (e) {
+      if (statusOf(e) !== 404) return left(statusOf(e) === undefined ? 'an error' : `HTTP ${statusOf(e)}`);
+    }
+  }
+  await dropLocalLeftovers(app, ours, x.now, x.local ?? {}).catch(() => undefined);
+  return { dropped: true };
+}
+
+/** The names of the signing environment's secrets and variables, or null when either list can't be read whole. */
+async function envContents(gh: Octokit, app: RepoRef, clock: RateClock): Promise<string[] | null> {
+  const out: string[] = [];
+  for (const [route, key] of [['GET /repos/{owner}/{repo}/environments/{environment_name}/secrets', 'secrets'], ['GET /repos/{owner}/{repo}/environments/{environment_name}/variables', 'variables']] as const) {
+    let d: unknown;
+    try { d = await ghRead(gh, route, app, { environment_name: SIGNING_ENVIRONMENT, per_page: 100 }, clock); } catch { return null; }
+    const list = isObj(d) && Array.isArray(d[key]) ? (d[key] as unknown[]).filter(isObj) : null;
+    if (list === null || !isObj(d) || typeof d.total_count !== 'number' || d.total_count !== list.length) return null;
+    out.push(...list.map((x) => show(typeof x.name === 'string' ? x.name : '(no name)', 100)));
+  }
+  return out;
 }
 
 // ---------- secrets (steps 3-4) ----------
@@ -899,7 +1025,7 @@ export async function deliver(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vaul
     let key: SigningKey | null = null;
     let replacePair = false;
     // G13 carry 60: a re-run whose trusted record already names this public key (a `finish --rotate-key` made it) keeps the stored pair
-    const keepPair = d.draft.signing?.mode === 'key-env' && deps.signingKey === undefined && typeof d.draft.signing.cosignPubSha256 === 'string' && prev?.cosignPubSha256 === d.draft.signing.cosignPubSha256;
+    const keepPair = d.draft.signing?.mode === 'key-env' && deps.signingKey === undefined && d.signingEnv === undefined && typeof d.draft.signing.cosignPubSha256 === 'string' && prev?.cosignPubSha256 === d.draft.signing.cosignPubSha256;
     if (d.draft.signing?.mode === 'key-env' && !keepPair) {
       const want = d.draft.signing.cosignPubSha256;
       if (deps.signingKey === undefined || typeof want !== 'string') throw new DeliverError('key-env signing needs the key pair pipegen made before the setup pull request, and its public key hash.');
@@ -918,9 +1044,12 @@ export async function deliver(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vaul
 
     try {
     if (key !== null) {
-      const known = prev?.environments.find((e) => e.name === SIGNING_ENVIRONMENT);
+      // ruling G-SIGN1: the environment this run made before assembly comes first (its created_at decides, in ensureSigningEnvironment,
+      // whether it is still pipegen's own); else the earlier record's entry
+      const runEnv = d.signingEnv?.name === SIGNING_ENVIRONMENT && d.signingEnv.created ? d.signingEnv : undefined;
+      const known = runEnv ?? prev?.environments.find((e) => e.name === SIGNING_ENVIRONMENT);
       env = await ensureSigningEnvironment(gh, app, appRepo.defaultBranch, known, clock, notes);
-      if (env.created && known === undefined) stored.push({ kind: 'environment', name: SIGNING_ENVIRONMENT, repo: `${p.owner}/${p.repo}`, ...(env.githubCreatedAt === undefined ? {} : { githubCreatedAt: env.githubCreatedAt }) });
+      if (env.created && (known === undefined || known === runEnv)) stored.push({ kind: 'environment', name: SIGNING_ENVIRONMENT, repo: `${p.owner}/${p.repo}`, ...(env.githubCreatedAt === undefined ? {} : { githubCreatedAt: env.githubCreatedAt }) });
       // N3: an existing environment pipegen narrowed: its settings before go into the leftovers, so a stop doesn't lose them for uninstall
       // G17 row 32: also when the earlier entry had no settings to restore (a typed trust) and this run captured them
       else if (!env.created && known?.previous === undefined && env.changed.length > 0 && env.previous !== undefined) stored.push({ kind: 'environment', name: SIGNING_ENVIRONMENT, repo: `${p.owner}/${p.repo}`, previous: { ...env.previous }, changed: [...env.changed], ...(env.githubCreatedAt === undefined ? {} : { githubCreatedAt: env.githubCreatedAt }) });

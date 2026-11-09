@@ -130,6 +130,8 @@ export interface E2eOptions {
   answers?: { preview?: boolean };
   /** A private app that already has a Dockerfile and the `pipegen-signing` environment (default-branch rule), so the run signs with a key pair (key-env). */
   signing?: boolean;
+  /** Ruling G-SIGN1: with `signing`, whether the `pipegen-signing` environment is there before the run (default true); false = the first run makes it. */
+  signingEnv?: boolean;
   /** The recorded planted run: `caught` (default) reports the planted problems; `missed` reports none, so the proof must fail. */
   planted?: 'caught' | 'missed';
 }
@@ -170,7 +172,7 @@ export async function e2eWorld(o: E2eOptions = {}): Promise<E2eWorld> {
   fgh.addRepo(`${OWN}/${APP_NAME}`, { files, private: priv, ownerType: 'User' });
   fgh.addRepo(`${OWN}/pipelines`, { files: { 'README.md': '# pipelines\n' }, private: true, ownerType: 'User' });
   fgh.addRepo(`${OWN}/pipegen-proof-${APP_NAME}`, { files: { 'README.md': '# scratch\n' }, private: true, ownerType: 'User' });
-  if (o.signing === true) {
+  if (o.signing === true && o.signingEnv !== false) {
     // left by an earlier pipegen install: the signing environment, limited to the default branch (the only way a first read can prove it)
     fgh.repo(`${OWN}/${APP_NAME}`).envs.set('pipegen-signing', {
       id: 900, created_at: '2026-10-01T00:00:00Z', wait_timer: 0, prevent_self_review: false, reviewers: [], can_admins_bypass: true,
@@ -199,7 +201,7 @@ export async function e2eWorld(o: E2eOptions = {}): Promise<E2eWorld> {
       asked.push(msg);
       if (/Is this right/.test(msg)) return true;
       if (/more than the/.test(msg)) return true;
-      if (/Create the setup pull request|pull request/i.test(msg) && !/consent|send/i.test(msg)) { tl.push('preview: confirmed'); return o.answers?.preview ?? true; }
+      if (/Create the setup pull request|pull request/i.test(msg) && !/consent|send|Go ahead\?$/i.test(msg)) { tl.push('preview: confirmed'); return o.answers?.preview ?? true; }
       return true;
     },
     select: async (msg) => { asked.push(msg); throw new Error(`no select: ${msg.slice(0, 60)}`); },

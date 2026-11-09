@@ -147,7 +147,7 @@ function world(o: { local?: RepoProfile; facts?: GitHubFacts; debate?: DebateRes
     bundle: async (d, k) => { rec('bundle', d, k); return { files: [] } as unknown as CodeBundle; },
     scan: async (d, c, k, agreed) => { rec('scan', d, c, k, agreed); return { files: [], found: o.found ?? { names: [], values: [], [TL_KEY]: [] } } as unknown as CodeBundle; },
     activity: async () => { rec('activity'); return { pushes: 10, prs: 5, capped: false }; },
-    consent: async (f, p, prov, est, b, auth, extra) => { rec('consent', f, p, prov, est, b, auth, extra); return o.consent === false ? null : ({} as never); },
+    consent: async (f, p, prov, est, b, auth, extra, opts) => { rec('consent', f, p, prov, est, b, auth, extra, opts); return o.consent === false ? null : ({ terms: { signingEnv: opts?.signingEnv === true } } as never); },
     state: async (p) => { rec('state', p); return StateStore.open(p, { home, env: {} }); },
     gateReachable: async () => { rec('gateReachable'); return o.gate ?? true; },
     helperRepos: async () => { rec('helperRepos'); return o.missingRepos ?? []; },
@@ -1505,3 +1505,279 @@ describe('G17C row 28: only the central commit deliverCentral made in this run r
     }
   });
 });
+
+// ---------- ruling G-SIGN1: the first run on a private repo signs when the plan allows ----------
+
+describe('G-SIGN1: the signing mode re-derived after the run makes its own signing environment', () => {
+  /** A private repo whose environments work but whose pipegen-signing rule is not proven (there is no such environment yet). */
+  const UNPROVEN = { ...CAPS, attestations: false, environments: true, deploymentBranchPolicies: false };
+  const IMAGE = (): RepoProfile => LOCAL({ services: [{ ...APP, dockerfile: 'Dockerfile' }] });
+  const ENV = { name: 'pipegen-signing', created: true, githubCreatedAt: '2026-11-06T10:00:05Z', changed: [], branchPolicyIds: [7] };
+  type Made = Awaited<ReturnType<RunStages['signingEnv']>>;
+  function signWorld(made: Made | (() => Promise<Made>), o: Parameters<typeof world>[0] = {}): World {
+    const w = world({ local: IMAGE(), facts: facts({ caps: UNPROVEN }), ...o });
+    w.stages.signingEnv = async (f, p) => { w.calls.push('signingEnv'); w.got.signingEnv = [f, p]; return typeof made === 'function' ? made() : made; };
+    return w;
+  }
+
+  it('run: G-SIGN1 a first private run with no proven signing environment makes it after consent, reads it back, and signs (key-env)', async () => {
+    const w = signWorld({ env: ENV });
+    const i = io();
+    expect(await run(w, i)).toBe(0);
+    // after the yes and before the needs (so the needs, the debate, the build and the referee all see the proven rule)
+    expect(w.calls.indexOf('consent')).toBeLessThan(w.calls.indexOf('signingEnv'));
+    expect(w.calls.indexOf('scan')).toBeLessThan(w.calls.indexOf('signingEnv'));
+    expect(w.calls.indexOf('signingEnv')).toBeLessThan(w.calls.indexOf('needs'));
+    expect(w.calls.filter((c) => c === 'signingEnv')).toHaveLength(1);
+    expect((w.got.signingEnv?.[1] as RepoProfile).defaultBranch).toBe('main');
+    expect((w.got.needs?.[1] as GitHubFacts['caps']).deploymentBranchPolicies).toBe(true);
+    const d = w.builds[0]?.draft as PipelineDraft;
+    expect(d.capabilities.deploymentBranchPolicies).toBe(true);
+    expect(d.signing?.mode).toBe('key-env');
+    expect(d.signing?.cosignPubSha256).toBe(pubKeySha256('PUB'));
+    expect(w.builds[0]?.facts.caps.deploymentBranchPolicies).toBe(true);
+    // one pair, handed to deliver with the environment the run made
+    expect(w.calls.filter((c) => c === 'signingKey')).toHaveLength(1);
+    expect((w.got.deliver?.[0] as DeliveryInputLike).signingEnv).toEqual(ENV);
+    expect(typeof w.got.deliver?.[1]).toBe('function');
+    expect(i.errs.join('\n')).toMatch(/made the environment pipegen-signing \(default branch only\) and read it back, so this run signs/);
+  });
+
+  it('run: G-SIGN1 an environment that is there already, can not be made or does not read back leaves the run unsigned (fail closed)', async () => {
+    const unsigned = async (w: World, i: ReturnType<typeof io>): Promise<void> => {
+      expect(await run(w, i)).toBe(0);
+      const d = w.builds[0]?.draft as PipelineDraft;
+      expect(d.signing).toBeUndefined();
+      expect(d.capabilities.deploymentBranchPolicies).toBe(false);
+      expect((w.got.needs?.[1] as GitHubFacts['caps']).deploymentBranchPolicies).toBe(false);
+      expect(w.calls).not.toContain('signingKey');
+      expect(w.got.deliver?.[0]).not.toHaveProperty('signingEnv');
+      expect(w.got.deliver?.[1]).toBeUndefined();
+      expect(i.errs.join('\n')).toMatch(/Signing is off \(mode none\)/);
+      expect(i.errs.join('\n')).not.toMatch(/so this run signs/);
+    };
+    const i1 = io();
+    await unsigned(signWorld({ off: "The environment pipegen-signing doesn't read back as usable from the default branch only." }), i1);
+    expect(i1.errs.join('\n')).toMatch(/Signing is off \(mode none\): The environment pipegen-signing doesn't read back/);
+    // an answer that is not a fresh environment of that name is never taken as proof
+    await unsigned(signWorld({ env: { ...ENV, created: false } }), io());
+    await unsigned(signWorld({ env: { ...ENV, name: 'production' } }), io());
+    await unsigned(signWorld({ env: { ...ENV, branchPolicyIds: [] } }), io());
+    // a stop the stage can't turn into "off" (the environment couldn't be listed locally) stops the run, naming what was left
+    const w = signWorld(async () => { throw new DeliverError('pipegen made pipegen-signing but could not list it', { leftovers: ['environment pipegen-signing'] }); });
+    const i = io();
+    expect(await run(w, i)).toBe(1);
+    expect(i.errs.join('\n')).toMatch(/left: environment pipegen-signing/);
+    expect(w.calls).not.toContain('needs');
+  });
+
+  it('run: G-SIGN1 no memory folder: no environment is made and the run stays unsigned, not refused', async () => {
+    const w = signWorld({ env: ENV }, { deps: { isMemory: () => false } });
+    const i = io();
+    expect(await run(w, i)).toBe(0);
+    expect(w.calls).not.toContain('signingEnv');
+    expect(w.builds[0]?.draft.signing).toBeUndefined();
+    expect(i.errs.join('\n')).toMatch(/Signing is off \(mode none\).*\/dev\/shm/);
+    expect(i.errs.join('\n')).not.toContain(NO_MEMORY_FOLDER);
+  });
+
+  it('run: G-SIGN1 nothing is made when the plan does not allow key-env or the rule is proven already', async () => {
+    for (const [why, o] of [
+      ['no image', { local: LOCAL() }],
+      ['attestations sign', { facts: facts({ caps: { ...UNPROVEN, attestations: true } }) }],
+      ['no environments', { facts: facts({ caps: { ...UNPROVEN, environments: false } }) }],
+      ['proven already', { facts: facts({ caps: { ...UNPROVEN, deploymentBranchPolicies: true } }) }],
+      ['public', { local: { ...IMAGE() }, facts: facts({ caps: UNPROVEN }, { private: false }) }],
+    ] as const) {
+      const w = signWorld({ env: ENV }, o as Parameters<typeof world>[0]);
+      expect(await run(w), why).toBe(0);
+      expect(w.calls, why).not.toContain('signingEnv');
+      expect(w.got.deliver?.[0], why).not.toHaveProperty('signingEnv');
+    }
+  });
+
+  // ---------- ruling G-SIGN1-R1 ----------
+
+  function dropWorld(o: Parameters<typeof world>[0] = {}, drop: Awaited<ReturnType<RunStages['dropSigningEnv']>> = { dropped: true }): World {
+    const w = signWorld({ env: ENV }, o);
+    w.stages.dropSigningEnv = async (f, p, env) => { w.calls.push('dropSigningEnv'); w.got.dropSigningEnv = [f, p, env]; return drop; };
+    return w;
+  }
+
+  it('run: G-SIGN1-R1 a run that made the environment and stops before delivery deletes it (failed proof, a no at the preview, an error)', async () => {
+    const cases: [string, World, number][] = [
+      ['failed proof', dropWorld({ proof: async () => ({ ok: false, stopped: 'the proof did not pass' }) }), 2],
+      ['no at the preview', dropWorld(), 1],
+      ['an error', dropWorld({ built: () => { throw new Error('boom'); } }), 1],
+    ];
+    for (const [why, w, code] of cases) {
+      const i = why === 'no at the preview' ? io({ preview: false }) : io();
+      expect(await run(w, i), why).toBe(code);
+      expect(w.calls, why).not.toContain('deliver');
+      expect(w.calls.filter((c) => c === 'dropSigningEnv'), why).toHaveLength(1);
+      expect(w.got.dropSigningEnv?.[2], why).toEqual(ENV);
+      expect(i.errs.join('\n'), why).toMatch(/pipegen deleted the environment pipegen-signing it made earlier in this run/);
+    }
+    // delivered: delivery owns it (the record names it), nothing is deleted
+    const ok = dropWorld();
+    expect(await run(ok)).toBe(0);
+    expect(ok.calls).toContain('deliver');
+    expect(ok.calls).not.toContain('dropSigningEnv');
+    // nothing made (signing off): nothing to delete
+    const off = signWorld({ off: 'x' });
+    off.stages.dropSigningEnv = async () => { off.calls.push('dropSigningEnv'); return { dropped: true }; };
+    expect(await run(off, io({ preview: false }))).toBe(1);
+    expect(off.calls).not.toContain('dropSigningEnv');
+  });
+
+  it('run: G-SIGN1-R1 a delete that fails keeps the leftovers entry, and the message names it', async () => {
+    const w = dropWorld({}, { left: 'HTTP 403; it stays listed in /home/u/.config/pipegen/records/crisworking__r.leftovers.json' });
+    const i = io({ preview: false });
+    expect(await run(w, i)).toBe(1);
+    expect(i.errs.join('\n')).toMatch(/pipegen couldn't delete the environment pipegen-signing it made earlier in this run \(HTTP 403; it stays listed in .*crisworking__r\.leftovers\.json\)/);
+    expect(i.errs.join('\n')).not.toMatch(/pipegen deleted the environment/);
+  });
+
+  it('run: G-SIGN1-R1 an interrupt before delivery deletes it too: armed when it is made, disarmed when delivery takes it', async () => {
+    const armed: { cleanup?: () => Promise<void>; disarmed: number; at: string[] } = { disarmed: 0, at: [] };
+    const w = dropWorld({ deps: { armSigningEnv: (cleanup) => { armed.cleanup = cleanup; armed.at.push(`armed after ${w.calls.at(-1)}`); return () => { armed.disarmed += 1; armed.at.push(`disarmed before ${w.calls.length}`); }; } } });
+    expect(await run(w)).toBe(0);
+    expect(armed.at[0]).toBe('armed after signingEnv');
+    expect(armed.disarmed).toBe(1);
+    expect(w.calls).not.toContain('dropSigningEnv');
+    await armed.cleanup?.();
+    expect(w.calls).toContain('dropSigningEnv');
+    // the disarm came before delivery
+    const w2 = dropWorld({ deps: { armSigningEnv: () => () => { w2.calls.push('disarm'); } } });
+    expect(await run(w2)).toBe(0);
+    expect(w2.calls.indexOf('disarm')).toBeLessThan(w2.calls.indexOf('deliver'));
+    // a stop before delivery deletes once, through the run, and disarms too
+    let dis = 0;
+    let hook: (() => Promise<void>) | undefined;
+    const w3 = dropWorld({ deps: { armSigningEnv: (cleanup) => { hook = cleanup; return () => { dis += 1; }; } } });
+    expect(await run(w3, io({ preview: false }))).toBe(1);
+    expect(dis).toBe(1);
+    expect(w3.calls.filter((c) => c === 'dropSigningEnv')).toHaveLength(1);
+    // an interrupt hook that fires as well deletes nothing twice
+    await hook?.();
+    expect(w3.calls.filter((c) => c === 'dropSigningEnv')).toHaveLength(1);
+  });
+
+  it('run: G-SIGN1-R1 the consent screen says pipegen creates pipegen-signing before the proof, only when that path can run', async () => {
+    const asked = async (w: World): Promise<unknown> => { await run(w); return (w.got.consent?.[7] as { signingEnv?: boolean } | undefined)?.signingEnv; };
+    expect(await asked(signWorld({ env: ENV }))).toBe(true);
+    expect(await asked(signWorld({ env: ENV }, { local: LOCAL() }))).toBe(false);
+    expect(await asked(signWorld({ env: ENV }, { deps: { isMemory: () => false } }))).toBe(false);
+    expect(await asked(signWorld({ env: ENV }, { facts: facts({ caps: { ...UNPROVEN, deploymentBranchPolicies: true } }) }))).toBe(false);
+    expect(await asked(signWorld({ env: ENV }, { facts: facts({ caps: { ...UNPROVEN, attestations: true } }) }))).toBe(false);
+  });
+
+  // ---------- ruling G-SIGN1-R2 ----------
+
+  it('run: G-SIGN1-R2 a re-run whose record names a public key but whose environment the run made again gets a fresh pair (sec I1)', async () => {
+    // the owner deleted pipegen-signing (and the key with it); the trusted record still names the old public key
+    const OLD = 'a'.repeat(64);
+    const w = dropWorld({ record: { cosignPubSha256: OLD, edits: [], files: [] } as unknown as InstallRecord });
+    expect(await run(w)).toBe(0);
+    expect(w.calls.filter((c) => c === 'signingKey')).toHaveLength(1);
+    const d = w.builds[0]?.draft as PipelineDraft;
+    expect(d.signing?.mode).toBe('key-env');
+    expect(d.signing?.cosignPubSha256).toBe(pubKeySha256('PUB'));
+    expect(d.signing?.cosignPubSha256).not.toBe(OLD);
+    expect((w.got.deliver?.[0] as DeliveryInputLike).signingEnv).toEqual(ENV);
+    expect(typeof w.got.deliver?.[1]).toBe('function');
+    expect(w.calls).not.toContain('dropSigningEnv');
+    // with the environment proven (not made by this run) the recorded key is still kept: no pair
+    const w2 = world({ local: IMAGE(), facts: facts({ caps: { ...UNPROVEN, deploymentBranchPolicies: true } }), record: { cosignPubSha256: OLD, edits: [], files: [] } as unknown as InstallRecord });
+    expect(await run(w2)).toBe(0);
+    expect(w2.calls).not.toContain('signingKey');
+    expect(w2.builds[0]?.draft.signing?.cosignPubSha256).toBe(OLD);
+  });
+
+  it('run: G-SIGN1-R2 delivery gets the environment only when it will set it up; otherwise the run deletes it after delivery (sec I1)', async () => {
+    // the delivered draft signs nothing (no key-env plan reached the build): delivery won't touch the environment
+    const w = dropWorld({ built: (i) => { const b = builtOf(i); (b.assembled.draft as PipelineDraft).signing = undefined; return b; } });
+    expect(await run(w)).toBe(0);
+    expect(w.got.deliver?.[0]).not.toHaveProperty('signingEnv');
+    expect(w.got.deliver?.[1]).toBeUndefined();
+    expect(w.calls.indexOf('deliver')).toBeLessThan(w.calls.indexOf('dropSigningEnv'));
+  });
+
+  it('run: G-SIGN1-R2 the environment hook is queued after the proof\'s hooks, with a label, a short deadline and a state record (sec M3)', async () => {
+    const order: string[] = [];
+    let opts: { label?: string; deadlineMs?: number; record?: (item: string) => void } | undefined;
+    const w = dropWorld({
+      proof: async (x) => { x.arm(async () => {}, () => undefined); return passingProof(x); },
+      deps: {
+        arm: () => { order.push('proof-arm'); return () => { order.push('proof-disarm'); }; },
+        armSigningEnv: (_c, o) => { order.push('env-arm'); opts = o; return () => { order.push('env-disarm'); }; },
+      },
+    });
+    expect(await run(w)).toBe(0);
+    // armed when made, then queued again after the proof's hooks (the last registration is the environment's)
+    expect(order.slice(0, 4)).toEqual(['env-arm', 'proof-arm', 'env-disarm', 'env-arm']);
+    expect(opts?.label).toMatch(/deleting the signing environment pipegen-signing this run made/);
+    expect(opts?.deadlineMs).toBeGreaterThan(0);
+    expect(opts?.deadlineMs).toBeLessThanOrEqual(30_000);
+    // the record goes into the run's state file (for `pipegen cleanup`)
+    opts?.record?.('deleting the signing environment pipegen-signing this run made: not finished');
+    const st = (await StateStore.open(LOCAL(), { home: w.home, env: {} })).load();
+    expect(st?.leftovers).toContain('deleting the signing environment pipegen-signing this run made: not finished');
+  });
+
+  it('run: G-SIGN1-R2 an interrupt already under way at the hand-off stops the run before delivery (sec M4)', async () => {
+    const w = dropWorld({ deps: { interrupting: () => w.calls.includes('preview') } });
+    const i = io();
+    expect(await run(w, i)).toBe(1);
+    expect(w.calls).not.toContain('deliver');
+    expect(i.errs.join('\n')).toMatch(/a stop began.*nothing was delivered/i);
+    // not interrupting: delivered
+    const w2 = dropWorld({ deps: { interrupting: () => false } });
+    expect(await run(w2)).toBe(0);
+    expect(w2.calls).toContain('deliver');
+  });
+
+  it('run: G-SIGN1-R2 the environment is made only when the consent the user gave named it (sec N1)', async () => {
+    // the screen said nothing (its flag false), though the path could run when the run got there
+    const w = dropWorld();
+    w.stages.consent = async (...a) => { w.calls.push('consent'); void a; return { terms: { signingEnv: false } } as never; };
+    const i = io();
+    expect(await run(w, i)).toBe(0);
+    expect(w.calls).not.toContain('signingEnv');
+    expect(w.builds[0]?.draft.signing).toBeUndefined();
+    expect(i.errs.join('\n')).toMatch(/Signing is off \(mode none\).*consent/);
+    // a token with no such term (an older screen): the same
+    const w2 = dropWorld();
+    w2.stages.consent = async () => ({}) as never;
+    expect(await run(w2)).toBe(0);
+    expect(w2.calls).not.toContain('signingEnv');
+  });
+
+  // ---------- ruling G-SIGN1-R3 ----------
+
+  it('run: G-SIGN1-R3 sec r2-L1 a stop under way at the end leaves the environment hook armed for the registry (no direct delete)', async () => {
+    let disarms = 0;
+    const w = dropWorld({ deps: { interrupting: () => w.calls.includes('preview'), armSigningEnv: () => () => { disarms += 1; } } });
+    expect(await run(w)).toBe(1);
+    expect(w.calls).not.toContain('deliver');
+    // the registry's live queue runs the hook (awaited, its deadline and its state record); the run neither disarms it nor deletes itself
+    expect(w.calls).not.toContain('dropSigningEnv');
+    expect(disarms).toBe(0);
+    // no stop under way: the run deletes it itself, and disarms the hook
+    let d2 = 0;
+    const w2 = dropWorld({ deps: { interrupting: () => false, armSigningEnv: () => () => { d2 += 1; } } }, { dropped: true });
+    expect(await run(w2, io({ preview: false }))).toBe(1);
+    expect(w2.calls.filter((c) => c === 'dropSigningEnv')).toHaveLength(1);
+    expect(d2).toBe(1);
+  });
+
+  it('run: G-SIGN1-R3 spec r2-L1 an environment the delivered pipeline did not use is deleted with a message that does not say nothing was delivered', async () => {
+    const w = dropWorld({ built: (i) => { const b = builtOf(i); (b.assembled.draft as PipelineDraft).signing = undefined; return b; } });
+    const i = io();
+    expect(await run(w, i)).toBe(0);
+    expect(w.calls).toContain('dropSigningEnv');
+    expect(i.errs.join('\n')).not.toMatch(/nothing was delivered/);
+    expect(i.errs.join('\n')).toMatch(/pipegen deleted the environment pipegen-signing it made earlier in this run: the delivered pipeline doesn't sign with it/);
+  });
+});
+type DeliveryInputLike = { signingEnv?: unknown };

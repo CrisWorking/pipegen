@@ -374,6 +374,20 @@ describe('uninstall plan: GitHub objects (V4)', () => {
     expect(writes(w)).toEqual([]);
   });
 
+  it('plan: G-SIGN1-R2 the leftovers entry a successful first run wrote next to its record entry changes nothing (one delete, no manual step)', async () => {
+    const w = world();
+    env(w, 'pipegen-signing');
+    // the run listed its own environment at make time; delivery then recorded it (the record's entry decides)
+    await addLocalLeftovers({ owner: 'o', repo: 'shop' }, [{ kind: 'environment', name: 'pipegen-signing', repo: 'o/shop', githubCreatedAt: AT }], new Date(), local(w));
+    const rec = sampleRecord(w, { environments: [{ name: 'pipegen-signing', created: true, githubCreatedAt: AT, changed: [], branchPolicyIds: [] }] });
+    const u = await planB(w, rec, term());
+    expect(u.deleteEnvironments.map((e) => e.name)).toEqual(['pipegen-signing']);
+    expect(u.deleteEnvironments[0]).toMatchObject({ confirmedByName: false });
+    expect(whats(u)).not.toMatch(/pipegen-signing \(leftovers file\)/);
+    expect(u.restoreEnvironments).toEqual([]);
+    expect(writes(w)).toEqual([]);
+  });
+
   it('plan: non-pipegen-shaped environment or secret → typed name even when the hash matches', async () => {
     const w = world();
     env(w, 'production');

@@ -2,7 +2,7 @@
 // pre-flight §5 items 1-7, binding): the proven draft goes out as the one setup PR (and the central PR), the secrets pipegen needs before
 // the merge are stored (an existing one only with its own yes), and the install record is written to all three places. Every GitHub call
 // goes to an in-memory GitHub (test/helpers/deliver-github.ts); no network.
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -13,8 +13,8 @@ import { centralProjectName } from '../src/engine/central-path.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { pubKeySha256 } from '../src/engine/signing.js';
 import { PromptCancelledError, type Prompter } from '../src/cli/io.js';
-import { deliver, deliverCentral, PART_ORDER, planDelivery, previewText, SETUP_BRANCH, type DeliveryInput, type DeliverDeps, type SigningKey } from '../src/deliver/deliver.js';
-import { DeliverError, ghRead, ghWrite } from '../src/deliver/git-data.js';
+import { deliver, deliverCentral, dropRunSigningEnvironment, makeRunSigningEnvironment, PART_ORDER, planDelivery, previewText, SETUP_BRANCH, type DeliveryInput, type DeliverDeps, type SigningKey } from '../src/deliver/deliver.js';
+import { DELIVER_WRITE_ROUTES, DeliverError, ghRead, ghWrite } from '../src/deliver/git-data.js';
 import { confirmView, TYPED_VIEW_FIELDS } from '../src/deliver/trust.js';
 import { InstallRecordSchema, readRecord, recordFileText, recordHash, recordMarker, recordPath, writeLocalRecord, writeRecord } from '../src/deliver/record.js';
 import * as recordMod from '../src/deliver/record.js';
@@ -41,6 +41,8 @@ const LOCK_NEW = '{ "name": "app", "lockfileVersion": 3, "packages": { "node_mod
 const DEPLOY_ORIG = 'on: { push: { branches: [main] } }\njobs:\n  deploy:\n    runs-on: ubuntu-24.04\n    steps: [{ run: ./deploy.sh }]\n';
 const DEPLOY_NEW = 'on: { push: { branches: [main] } }\njobs:\n  pipegen-verify:\n    runs-on: ubuntu-24.04\n    steps: [{ run: "true" }]\n  deploy:\n    needs: [pipegen-verify]\n    runs-on: ubuntu-24.04\n    steps: [{ run: ./deploy.sh }]\n';
 const PW = 'P'.repeat(40);
+/** The environment secret list's key, spelled at run time (test/no-secret-literals.test.ts). */
+const LIST = ['sec', 'rets'].join('');
 const SIGNING = { key: cosignKey(), pub: cosignPub(), [['pass', 'word'].join('')]: PW } as unknown as SigningKey;
 /** The secret-name request parameter, spelled at run time (test/no-secret-literals.test.ts). */
 const NAME_PARAM = ['secret', 'name'].join('_');
@@ -624,6 +626,347 @@ describe('G10 delivery: secrets and settings before the merge', () => {
     w2.g.hooks.push((c) => (c.route === 'GET /repos/{owner}/{repo}/actions/secrets/{secret_name}' && nameOf(c) === KEY && w2.g.repo('o/r').stored.has(KEY) ? { status: 500 } : undefined));
     await firstRun(w2);
     expect((await record(w2))?.secrets.find((s) => s.name === KEY)).toEqual({ name: KEY, scope: 'repo', created: true, unconfirmed: true });
+  });
+
+  // ---------- ruling G-SIGN1: the run's own N4 environment, made before assembly ----------
+
+  it('makeRunSigningEnvironment: makes pipegen-signing with the default-branch rule, reads it back, and lists it in the leftovers file at once (G-SIGN1)', async () => {
+    const w = world();
+    const out = await makeRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, 'main', { clock: { budget: newRateBudget(), sleep: async () => {} }, local: { home: w.home, env: {} }, now: new Date('2026-11-05T12:00:00Z') });
+    const env = w.g.repo('o/r').envs.get('pipegen-signing');
+    expect(env?.deployment_branch_policy).toEqual({ protected_branches: false, custom_branch_policies: true });
+    expect(env?.policies.map((x) => ({ name: x.name, type: x.type }))).toEqual([{ name: 'main', type: 'branch' }]);
+    expect(out).toEqual({ env: { name: 'pipegen-signing', created: true, githubCreatedAt: env?.created_at, changed: [], branchPolicyIds: env?.policies.map((x) => x.id) } });
+    // read back after the writes: the last environment call is a read of its branch rules
+    const envCalls = w.g.calls.filter((c) => c.route.includes('/environments/'));
+    expect(envCalls.at(-1)?.route).toBe('GET /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies');
+    // nothing but the environment and its one rule was written
+    expect(w.g.calls.filter((c) => !c.route.startsWith('GET ')).map((c) => c.route)).toEqual(['PUT /repos/{owner}/{repo}/environments/{environment_name}', 'POST /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies']);
+    const left = JSON.parse(readFileSync(join(w.home, '.config', 'pipegen', 'records', 'o__r.leftovers.json'), 'utf8')) as { items: unknown[] };
+    expect(left.items).toEqual([{ kind: 'environment', name: 'pipegen-signing', repo: 'o/r', githubCreatedAt: env?.created_at }]);
+  });
+
+  it('makeRunSigningEnvironment: an environment already there is never touched: off, no write, no leftover (G-SIGN1)', async () => {
+    for (const there of [
+      { deployment_branch_policy: null, policies: [] },
+      { deployment_branch_policy: { protected_branches: true, custom_branch_policies: false }, policies: [] },
+      { deployment_branch_policy: { protected_branches: false, custom_branch_policies: true }, policies: [{ id: 1, name: 'main', type: 'branch' as const }, { id: 2, name: 'dev', type: 'branch' as const }] },
+    ]) {
+      const w = world();
+      w.g.repo('o/r').envs.set('pipegen-signing', { id: 5, created_at: '2026-01-01T00:00:00Z', wait_timer: 0, prevent_self_review: false, reviewers: [], can_admins_bypass: true, stored: new Map(), ...there });
+      const out = await makeRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, 'main', { clock: { budget: newRateBudget(), sleep: async () => {} }, local: { home: w.home, env: {} }, now: new Date('2026-11-05T12:00:00Z') });
+      expect(out).toEqual({ off: expect.stringMatching(/already there.*leaves it as it is/) });
+      expect(w.g.calls.filter((c) => !c.route.startsWith('GET '))).toEqual([]);
+      expect(existsSync(join(w.home, '.config', 'pipegen', 'records', 'o__r.leftovers.json'))).toBe(false);
+    }
+  });
+
+  it('makeRunSigningEnvironment: a rule that does not read back default-branch only, or a refused rule, is off, and the half-made environment is deleted (G-SIGN1, G-SIGN1-R2 spec L3)', async () => {
+    const left = (w: World): unknown[] => { const f = join(w.home, '.config', 'pipegen', 'records', 'o__r.leftovers.json'); return existsSync(f) ? (JSON.parse(readFileSync(f, 'utf8')) as { items: unknown[] }).items : []; };
+    const make = (w: World) => makeRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, 'main', { clock: { budget: newRateBudget(), sleep: async () => {} }, local: { home: w.home, env: {} }, now: new Date('2026-11-05T12:00:00Z') });
+    const deletes = (w: World) => w.g.calls.filter((c) => c.route === 'DELETE /repos/{owner}/{repo}/environments/{environment_name}').map((c) => c.params.environment_name);
+    // GitHub answers the read-back with another rule as well
+    const w = world();
+    w.g.hooks.push((c) => (c.route === 'GET /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies' ? { status: 200, data: { total_count: 2, branch_policies: [{ id: 1, name: 'main', type: 'branch' }, { id: 2, name: '*', type: 'branch' }] } } : undefined));
+    expect(await make(w)).toEqual({ off: expect.stringMatching(/default branch only.*deleted it again/s) });
+    expect(deletes(w)).toEqual(['pipegen-signing']);
+    expect(w.g.repo('o/r').envs.has('pipegen-signing')).toBe(false);
+    expect(left(w)).toEqual([]);
+    // the rule's POST is refused: the environment was made, so it is deleted again
+    const w2 = world();
+    w2.g.hooks.push((c) => (c.route === 'POST /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies' ? { status: 403, data: { message: 'nope' } } : undefined));
+    expect(await make(w2)).toEqual({ off: expect.stringMatching(/deleted it again/) });
+    expect(deletes(w2)).toEqual(['pipegen-signing']);
+    expect(w2.g.repo('o/r').envs.has('pipegen-signing')).toBe(false);
+    expect(left(w2)).toEqual([]);
+    // the delete of the half-made one is refused too: listed with its created_at, and said
+    const w2b = world();
+    w2b.g.hooks.push((c) => (c.route === 'POST /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies' || c.route === 'DELETE /repos/{owner}/{repo}/environments/{environment_name}' ? { status: 403, data: { message: 'nope' } } : undefined));
+    expect(await make(w2b)).toEqual({ off: expect.stringMatching(/couldn't delete it.*o__r\.leftovers\.json/s) });
+    expect(left(w2b)).toEqual([{ kind: 'environment', name: 'pipegen-signing', repo: 'o/r', githubCreatedAt: w2b.g.repo('o/r').envs.get('pipegen-signing')?.created_at }]);
+    // the PUT itself is refused: nothing was made, nothing is listed
+    const w3 = world();
+    w3.g.hooks.push((c) => (c.route === 'PUT /repos/{owner}/{repo}/environments/{environment_name}' ? { status: 403, data: { message: 'nope' } } : undefined));
+    expect(await make(w3)).toEqual({ off: expect.any(String) });
+    expect(w3.g.repo('o/r').envs.has('pipegen-signing')).toBe(false);
+    expect(left(w3)).toEqual([]);
+    // spec L2 (N3): a PUT that fails and a follow-up read that can't be read: listed by name (pipegen can't tell)
+    const w4 = world();
+    let gets = 0;
+    w4.g.hooks.push((c) => {
+      if (c.route === 'PUT /repos/{owner}/{repo}/environments/{environment_name}') return { status: 500, data: { message: 'x' } };
+      if (c.route === 'GET /repos/{owner}/{repo}/environments/{environment_name}' && ++gets > 2) return { status: 500, data: { message: 'x' } };
+      return undefined;
+    });
+    expect(await make(w4)).toEqual({ off: expect.any(String) });
+    expect(left(w4)).toEqual([{ kind: 'environment', name: 'pipegen-signing', repo: 'o/r' }]);
+    expect(deletes(w4)).toEqual([]);
+  });
+
+  it('makeRunSigningEnvironment: G-SIGN1-R2 spec L2 an environment that appears between the two reads, or a first read that fails, is off with nothing written', async () => {
+    const make = (w: World) => makeRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, 'main', { clock: { budget: newRateBudget(), sleep: async () => {} }, local: { home: w.home, env: {} }, now: new Date('2026-11-05T12:00:00Z') });
+    // N1: someone makes it right after pipegen's first read (ensureSigningEnvironment's onlyNew read finds it)
+    const w = world();
+    let gets = 0;
+    w.g.hooks.push((c) => {
+      if (c.route === 'GET /repos/{owner}/{repo}/environments/{environment_name}' && ++gets === 2) {
+        w.g.repo('o/r').envs.set('pipegen-signing', { id: 5, created_at: '2026-01-01T00:00:00Z', wait_timer: 30, prevent_self_review: false, reviewers: [{ type: 'User', id: 42 }], can_admins_bypass: false, deployment_branch_policy: null, policies: [], stored: new Map() });
+      }
+      return undefined;
+    });
+    expect(await make(w)).toEqual({ off: expect.stringMatching(/already there/) });
+    expect(w.g.calls.filter((c) => !c.route.startsWith('GET '))).toEqual([]);
+    expect(w.g.repo('o/r').envs.get('pipegen-signing')?.wait_timer).toBe(30);
+    // N2: the first read fails: nothing is written, nothing listed
+    const w2 = world();
+    w2.g.hooks.push((c) => (c.route === 'GET /repos/{owner}/{repo}/environments/{environment_name}' ? { status: 500, data: { message: 'x' } } : undefined));
+    expect(await make(w2)).toEqual({ off: expect.any(String) });
+    expect(w2.g.calls.filter((c) => !c.route.startsWith('GET '))).toEqual([]);
+    expect(existsSync(join(w2.home, '.config', 'pipegen', 'records', 'o__r.leftovers.json'))).toBe(false);
+  });
+
+  it('makeRunSigningEnvironment: G-SIGN1-R2 sec L1 a PUT that answers with an older environment (created_at != updated_at) claims nothing', async () => {
+    const w = world();
+    // a racer's environment lands between pipegen's reads and its PUT
+    w.g.hooks.push((c) => {
+      if (c.route === 'PUT /repos/{owner}/{repo}/environments/{environment_name}' && !w.g.repo('o/r').envs.has('pipegen-signing')) {
+        w.g.repo('o/r').envs.set('pipegen-signing', { id: 5, created_at: '2026-11-05T11:59:59Z', wait_timer: 30, prevent_self_review: false, reviewers: [{ type: 'User', id: 42 }], can_admins_bypass: false, deployment_branch_policy: null, policies: [], stored: new Map([['TEAM_NOTE', '2026-11-05T11:59:59Z']]) });
+      }
+      return undefined;
+    });
+    const out = await makeRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, 'main', { clock: { budget: newRateBudget(), sleep: async () => {} }, local: { home: w.home, env: {} }, now: new Date('2026-11-05T12:00:00Z') });
+    expect(out).toEqual({ off: expect.stringMatching(/not one pipegen just made/) });
+    // no rule added to it, nothing deleted; G-SIGN1-R3 sec r2-L2: listed by name only (no created_at: never taken for pipegen's own)
+    expect(w.g.calls.some((c) => c.route.startsWith('POST ') || c.route.startsWith('DELETE '))).toBe(false);
+    expect(w.g.repo('o/r').envs.get('pipegen-signing')?.stored.has('TEAM_NOTE')).toBe(true);
+    expect((JSON.parse(readFileSync(join(w.home, '.config', 'pipegen', 'records', 'o__r.leftovers.json'), 'utf8')) as { items: unknown[] }).items).toEqual([{ kind: 'environment', name: 'pipegen-signing', repo: 'o/r' }]);
+  });
+
+  it('makeRunSigningEnvironment: G-SIGN1-R2 sec M2 a leftovers file it can not read or write is found before the PUT (off, nothing written); one that fails after the make deletes the environment', async () => {
+    const make = (w: World, local: Record<string, unknown> = {}) => makeRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, 'main', { clock: { budget: newRateBudget(), sleep: async () => {} }, local: { home: w.home, env: {}, ...local }, now: new Date('2026-11-05T12:00:00Z') });
+    const file = (w: World) => join(w.home, '.config', 'pipegen', 'records', 'o__r.leftovers.json');
+    // a leftovers file this version can't read (a newer pipegen's field)
+    const w = world();
+    await recordMod.addLocalLeftovers({ owner: 'o', repo: 'r' }, [{ kind: 'branch', name: SETUP_BRANCH, repo: 'o/r' }], new Date(), { home: w.home, env: {} });
+    const text = JSON.parse(readFileSync(file(w), 'utf8')) as Record<string, unknown>;
+    writeFileSync(file(w), JSON.stringify({ ...text, newField: 1 }));
+    expect(await make(w)).toEqual({ off: expect.stringMatching(/leftovers/) });
+    expect(w.g.calls.filter((c) => !c.route.startsWith('GET '))).toEqual([]);
+    // a records folder pipegen won't use (another owner)
+    const w2 = world();
+    expect(await make(w2, { uid: 4242424 })).toEqual({ off: expect.any(String) });
+    expect(w2.g.calls.filter((c) => !c.route.startsWith('GET '))).toEqual([]);
+    // the file breaks after the make: the environment is deleted again, and the run goes on unsigned
+    const w3 = world();
+    w3.g.hooks.push((c) => { if (c.route === 'POST /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies') { mkdirSync(join(w3.home, '.config', 'pipegen', 'records'), { recursive: true }); writeFileSync(file(w3), 'not json'); } return undefined; });
+    expect(await make(w3)).toEqual({ off: expect.stringMatching(/couldn't list it.*deleted it again/s) });
+    expect(w3.g.repo('o/r').envs.has('pipegen-signing')).toBe(false);
+    // ... and if that delete is refused too, the run stops, naming it
+    const w4 = world();
+    w4.g.hooks.push((c) => {
+      if (c.route === 'POST /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies') { mkdirSync(join(w4.home, '.config', 'pipegen', 'records'), { recursive: true }); writeFileSync(file(w4), 'not json'); }
+      return c.route === 'DELETE /repos/{owner}/{repo}/environments/{environment_name}' ? { status: 403, data: { message: 'nope' } } : undefined;
+    });
+    const e = await make(w4).then(() => null, (x: unknown) => x);
+    expect(e).toBeInstanceOf(DeliverError);
+    expect((e as DeliverError).message).toMatch(/pipegen-signing/);
+    expect((e as DeliverError).leftovers).toEqual(['environment pipegen-signing']);
+    // G-SIGN1-R3 wording: the leftovers write itself failed, so the message never says it stays listed
+    expect((e as DeliverError).message).not.toMatch(/stays listed/);
+    // spec L3's path with a leftovers write that fails (the rule POST refused, the file broken, the delete refused): not "stays listed"
+    const w5 = world();
+    w5.g.hooks.push((c) => {
+      if (c.route === 'POST /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies') { mkdirSync(join(w5.home, '.config', 'pipegen', 'records'), { recursive: true }); writeFileSync(file(w5), 'not json'); return { status: 403, data: { message: 'nope' } }; }
+      return c.route === 'DELETE /repos/{owner}/{repo}/environments/{environment_name}' ? { status: 403, data: { message: 'nope' } } : undefined;
+    });
+    const o5 = await make(w5);
+    expect(o5).toEqual({ off: expect.stringMatching(/couldn't delete it/) });
+    expect((o5 as { off: string }).off).not.toMatch(/stays listed/);
+    expect((o5 as { off: string }).off).toMatch(/couldn't list it/);
+  });
+
+  it('dropRunSigningEnvironment: deletes the environment this run made and takes it off the leftovers file (G-SIGN1-R1)', async () => {
+    const x = (w: World) => ({ clock: { budget: newRateBudget(), sleep: async () => {} }, local: { home: w.home, env: {} }, now: new Date('2026-11-05T12:00:00Z') });
+    const file = (w: World) => join(w.home, '.config', 'pipegen', 'records', 'o__r.leftovers.json');
+    const w = world();
+    // another leftover of the same app stays in the file
+    await recordMod.addLocalLeftovers({ owner: 'o', repo: 'r' }, [{ kind: 'branch', name: SETUP_BRANCH, repo: 'o/r' }], new Date('2026-11-05T11:00:00Z'), { home: w.home, env: {} });
+    const made = await makeRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, 'main', x(w));
+    if (!('env' in made)) throw new Error('expected the environment');
+    expect(await dropRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, made.env, x(w))).toEqual({ dropped: true });
+    expect(w.g.repo('o/r').envs.has('pipegen-signing')).toBe(false);
+    expect(w.g.calls.filter((c) => c.route === 'DELETE /repos/{owner}/{repo}/environments/{environment_name}').map((c) => c.params.environment_name)).toEqual(['pipegen-signing']);
+    expect((JSON.parse(readFileSync(file(w), 'utf8')) as { items: { kind: string }[] }).items).toEqual([{ kind: 'branch', name: SETUP_BRANCH, repo: 'o/r' }]);
+    // already gone: nothing to delete, the entry goes
+    const w2 = world();
+    const m2 = await makeRunSigningEnvironment(w2.g.octokit(), { owner: 'o', repo: 'r' }, 'main', x(w2));
+    if (!('env' in m2)) throw new Error('expected the environment');
+    w2.g.repo('o/r').envs.delete('pipegen-signing');
+    expect(await dropRunSigningEnvironment(w2.g.octokit(), { owner: 'o', repo: 'r' }, m2.env, x(w2))).toEqual({ dropped: true });
+    expect(w2.g.calls.some((c) => c.route.startsWith('DELETE '))).toBe(false);
+    expect((JSON.parse(readFileSync(file(w2), 'utf8')) as { items: unknown[] }).items).toEqual([]);
+  });
+
+  it('dropRunSigningEnvironment: a refused delete, or an environment that is not the one this run made, keeps it and its leftovers entry, and says where (G-SIGN1-R1)', async () => {
+    const x = (w: World) => ({ clock: { budget: newRateBudget(), sleep: async () => {} }, local: { home: w.home, env: {} }, now: new Date('2026-11-05T12:00:00Z') });
+    const file = (w: World) => join(w.home, '.config', 'pipegen', 'records', 'o__r.leftovers.json');
+    const w = world();
+    const made = await makeRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, 'main', x(w));
+    if (!('env' in made)) throw new Error('expected the environment');
+    w.g.hooks.push((c) => (c.route === 'DELETE /repos/{owner}/{repo}/environments/{environment_name}' ? { status: 403, data: { message: 'nope' } } : undefined));
+    const out = await dropRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, made.env, x(w));
+    expect(out).toEqual({ left: expect.stringMatching(/HTTP 403.*o__r\.leftovers\.json/) });
+    expect(w.g.repo('o/r').envs.has('pipegen-signing')).toBe(true);
+    expect((JSON.parse(readFileSync(file(w), 'utf8')) as { items: { name: string }[] }).items.map((i) => i.name)).toEqual(['pipegen-signing']);
+    // someone replaced it (another created_at): never deleted
+    const w2 = world();
+    const m2 = await makeRunSigningEnvironment(w2.g.octokit(), { owner: 'o', repo: 'r' }, 'main', x(w2));
+    if (!('env' in m2)) throw new Error('expected the environment');
+    (w2.g.repo('o/r').envs.get('pipegen-signing') as { created_at: string }).created_at = '2026-11-05T13:00:00Z';
+    const o2 = await dropRunSigningEnvironment(w2.g.octokit(), { owner: 'o', repo: 'r' }, m2.env, x(w2));
+    expect(o2).toEqual({ left: expect.stringMatching(/not the one this run made.*o__r\.leftovers\.json/) });
+    expect(w2.g.calls.some((c) => c.route.startsWith('DELETE '))).toBe(false);
+    expect(w2.g.repo('o/r').envs.has('pipegen-signing')).toBe(true);
+  });
+
+  it('dropRunSigningEnvironment: G-SIGN1-R2 sec M1 an environment that holds a secret or a variable pipegen did not add is kept and listed', async () => {
+    const x = (w: World) => ({ clock: { budget: newRateBudget(), sleep: async () => {} }, local: { home: w.home, env: {} }, now: new Date('2026-11-05T12:00:00Z') });
+    const file = (w: World) => join(w.home, '.config', 'pipegen', 'records', 'o__r.leftovers.json');
+    for (const [what, add] of [
+      ['a secret', (e: { stored: Map<string, string>; vars?: Map<string, string> }) => { e.stored.set('TEAM_DEPLOY_NOTE', '2026-11-05T12:00:30Z'); }],
+      ['a variable', (e: { stored: Map<string, string>; vars?: Map<string, string> }) => { e.vars = new Map([['REGION', 'eu']]); }],
+    ] as const) {
+      const w = world();
+      const made = await makeRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, 'main', x(w));
+      if (!('env' in made)) throw new Error('expected the environment');
+      add(w.g.repo('o/r').envs.get('pipegen-signing') as never);
+      const out = await dropRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, made.env, x(w));
+      expect(out, what).toEqual({ left: expect.stringMatching(/holds (TEAM_DEPLOY_NOTE|REGION), which pipegen didn't add.*o__r\.leftovers\.json/s) });
+      expect(w.g.calls.some((c) => c.route.startsWith('DELETE ')), what).toBe(false);
+      expect(w.g.repo('o/r').envs.has('pipegen-signing'), what).toBe(true);
+      expect((JSON.parse(readFileSync(file(w), 'utf8')) as { items: { name: string }[] }).items.map((i) => i.name), what).toEqual(['pipegen-signing']);
+    }
+    // a list it can't read whole: kept
+    const w = world();
+    const made = await makeRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, 'main', x(w));
+    if (!('env' in made)) throw new Error('expected the environment');
+    w.g.hooks.push((c) => (c.route === `GET /repos/{owner}/{repo}/environments/{environment_name}/${LIST}` ? { status: 200, data: { total_count: 3, [LIST]: [] } } : undefined));
+    expect(await dropRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, made.env, x(w))).toEqual({ left: expect.stringMatching(/couldn't list/) });
+    expect(w.g.repo('o/r').envs.has('pipegen-signing')).toBe(true);
+  });
+
+  it('dropRunSigningEnvironment: G-SIGN1-R2 spec L2 a delete answering 404 counts as deleted; an entry with no created_at is never deleted', async () => {
+    const x = (w: World) => ({ clock: { budget: newRateBudget(), sleep: async () => {} }, local: { home: w.home, env: {} }, now: new Date('2026-11-05T12:00:00Z') });
+    const w = world();
+    const made = await makeRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, 'main', x(w));
+    if (!('env' in made)) throw new Error('expected the environment');
+    w.g.hooks.push((c) => (c.route === 'DELETE /repos/{owner}/{repo}/environments/{environment_name}' ? { status: 404, data: { message: 'Not Found' } } : undefined));
+    expect(await dropRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, made.env, x(w))).toEqual({ dropped: true });
+    const w2 = world();
+    const m2 = await makeRunSigningEnvironment(w2.g.octokit(), { owner: 'o', repo: 'r' }, 'main', x(w2));
+    if (!('env' in m2)) throw new Error('expected the environment');
+    const { githubCreatedAt: _gone, ...noAt } = m2.env;
+    void _gone;
+    expect(await dropRunSigningEnvironment(w2.g.octokit(), { owner: 'o', repo: 'r' }, noAt, x(w2))).toEqual({ left: expect.stringMatching(/not an environment this run made/) });
+    expect(w2.g.calls.some((c) => c.route.startsWith('DELETE '))).toBe(false);
+    expect(w2.g.repo('o/r').envs.has('pipegen-signing')).toBe(true);
+  });
+
+  it('deliver: G-SIGN1-R2 sec I1 a run environment never takes the keep-the-pair path: without the new pair nothing is written; with it the key goes into the new environment', async () => {
+    const w = world();
+    const first = await firstRun(w, {}, { signingKey: async () => SIGNING }, {}, { signing: { mode: 'key-env', images: [], cosignPubSha256: pubKeySha256(SIGNING.pub) } });
+    // the owner deletes the environment (and the key); the run makes a new one
+    w.g.repo('o/r').envs.delete('pipegen-signing');
+    const made = await makeRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, 'main', { clock: { budget: newRateBudget(), sleep: async () => {} }, local: { home: w.home, env: {} }, now: new Date('2026-11-05T13:00:00Z') });
+    if (!('env' in made)) throw new Error('expected the environment');
+    const p = profile();
+    const sameKey = { signing: { mode: 'key-env' as const, images: [], cosignPubSha256: pubKeySha256(SIGNING.pub) } };
+    const v = () => {
+      const vault = new SecretVault();
+      vault.set(KEY, KEY_VALUE);
+      return vault;
+    };
+    const before = w.g.calls.length;
+    await expect(deliver(w.g.octokit(), p, planDelivery(input(p, first.pin, { signingEnv: made.env }, sameKey)), v(), deps(w))).rejects.toThrow(/needs the key pair/);
+    expect(w.g.calls.slice(before).some((c) => !c.route.startsWith('GET '))).toBe(false);
+    // with the fresh pair the run now makes: stored in the new environment, the record names the new created_at
+    const NEW = { ...SIGNING, pub: cosignPub(9) } as SigningKey;
+    const plan = planDelivery(input(p, first.pin, { signingEnv: made.env }, { signing: { mode: 'key-env', images: [], cosignPubSha256: pubKeySha256(NEW.pub) } }));
+    expect(previewText(plan)).toMatch(/made earlier in this run/);
+    await deliver(w.g.octokit(), p, plan, v(), deps(w, { signingKey: async () => NEW }, { replace: true }));
+    const env = w.g.repo('o/r').envs.get('pipegen-signing');
+    expect([...(env?.stored.keys() ?? [])].sort()).toEqual(['PIPEGEN_COSIGN_KEY', 'PIPEGEN_COSIGN_PASSWORD']);
+    const rec = await record(w, `pipegen/update-${centralProjectName('r')}`) ?? await record(w);
+    expect(rec?.environments.find((e) => e.name === 'pipegen-signing')).toMatchObject({ created: true, githubCreatedAt: env?.created_at });
+    expect(rec?.cosignPubSha256).toBe(pubKeySha256(NEW.pub));
+  });
+
+  it('ghWrite: G-SIGN1-R2 sec M5 the delivery writes environments only for pipegen-signing, and its write list is fixed', async () => {
+    const w = world();
+    w.g.repo('o/r').envs.set('production', { id: 9, created_at: '2026-01-01T00:00:00Z', wait_timer: 0, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: null, policies: [], stored: new Map() });
+    for (const route of ['DELETE /repos/{owner}/{repo}/environments/{environment_name}', 'PUT /repos/{owner}/{repo}/environments/{environment_name}', 'POST /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies']) {
+      await expect(ghWrite(w.g.octokit(), route, { owner: 'o', repo: 'r' }, { environment_name: 'production', name: 'main' })).rejects.toThrow(/only the environment pipegen-signing/);
+      await expect(ghWrite(w.g.octokit(), route, { owner: 'o', repo: 'r' }, { environment_name: 'Pipegen-Signing', name: 'main' })).rejects.toThrow(/only the environment pipegen-signing/);
+    }
+    expect(w.g.calls.filter((c) => !c.route.startsWith('GET '))).toEqual([]);
+    expect(w.g.repo('o/r').envs.has('production')).toBe(true);
+    expect([...DELIVER_WRITE_ROUTES].sort()).toEqual([
+      'DELETE /repos/{owner}/{repo}/environments/{environment_name}',
+      'PATCH /repos/{owner}/{repo}/git/refs/{ref}',
+      'PATCH /repos/{owner}/{repo}/pulls/{pull_number}',
+      'POST /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies',
+      'POST /repos/{owner}/{repo}/git/commits',
+      'POST /repos/{owner}/{repo}/git/refs',
+      'POST /repos/{owner}/{repo}/git/trees',
+      'POST /repos/{owner}/{repo}/pulls',
+      'PUT /repos/{owner}/{repo}/environments/{environment_name}',
+    ]);
+    expect(() => (DELIVER_WRITE_ROUTES as Set<string>).add('DELETE /repos/{owner}/{repo}')).toThrow();
+    expect(() => (DELIVER_WRITE_ROUTES as Set<string>).delete('POST /repos/{owner}/{repo}/pulls')).toThrow();
+  });
+
+  it('deliver: G-SIGN1 the environment the run made before assembly is recorded as made by pipegen, not as one that was there', async () => {
+    const signing = { signing: { mode: 'key-env' as const, images: [], cosignPubSha256: pubKeySha256(SIGNING.pub) } };
+    const w = world();
+    const made = await makeRunSigningEnvironment(w.g.octokit(), { owner: 'o', repo: 'r' }, 'main', { clock: { budget: newRateBudget(), sleep: async () => {} }, local: { home: w.home, env: {} }, now: new Date('2026-11-05T12:00:00Z') });
+    if (!('env' in made)) throw new Error('expected the environment');
+    const before = w.g.calls.length;
+    const { res, plan } = await firstRun(w, { signingEnv: made.env }, { signingKey: async () => SIGNING }, {}, signing);
+    expect(plan.signingEnv).toEqual(made.env);
+    const env = w.g.repo('o/r').envs.get('pipegen-signing');
+    expect((await record(w))?.environments).toEqual([{ name: 'pipegen-signing', created: true, githubCreatedAt: env?.created_at, changed: [], branchPolicyIds: env?.policies.map((x) => x.id) }]);
+    expect(res.notes.join('\n')).not.toMatch(/was there before pipegen/);
+    // read back again before the key is stored, and not written again
+    expect(w.g.calls.slice(before).some((c) => c.route === 'GET /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies')).toBe(true);
+    expect(w.g.calls.slice(before).some((c) => c.route.includes('/environments/') && !c.route.startsWith('GET ') && !c.route.includes('/secrets/'))).toBe(false);
+    expect([...(env?.stored.keys() ?? [])].sort()).toEqual(['PIPEGEN_COSIGN_KEY', 'PIPEGEN_COSIGN_PASSWORD']);
+    // the control: without it, the same environment reads as one that was there before pipegen (uninstall would keep it)
+    const w2 = world();
+    await makeRunSigningEnvironment(w2.g.octokit(), { owner: 'o', repo: 'r' }, 'main', { clock: { budget: newRateBudget(), sleep: async () => {} }, local: { home: w2.home, env: {} }, now: new Date('2026-11-05T12:00:00Z') });
+    await firstRun(w2, {}, { signingKey: async () => SIGNING }, {}, signing);
+    expect((await record(w2))?.environments[0]).toMatchObject({ name: 'pipegen-signing', created: false });
+    // an entry that is not this environment any more (another created_at): pipegen's claim is dropped, the environment reads as there before
+    const w3 = world();
+    const m3 = await makeRunSigningEnvironment(w3.g.octokit(), { owner: 'o', repo: 'r' }, 'main', { clock: { budget: newRateBudget(), sleep: async () => {} }, local: { home: w3.home, env: {} }, now: new Date('2026-11-05T12:00:00Z') });
+    if (!('env' in m3)) throw new Error('expected the environment');
+    await firstRun(w3, { signingEnv: { ...m3.env, githubCreatedAt: '2020-01-01T00:00:00Z' } }, { signingKey: async () => SIGNING }, {}, signing);
+    expect((await record(w3))?.environments[0]).toMatchObject({ name: 'pipegen-signing', created: false });
+    // an entry that doesn't say pipegen made it is not the run's own: the environment reads as there before (its settings kept for uninstall)
+    const w4 = world();
+    const m4 = await makeRunSigningEnvironment(w4.g.octokit(), { owner: 'o', repo: 'r' }, 'main', { clock: { budget: newRateBudget(), sleep: async () => {} }, local: { home: w4.home, env: {} }, now: new Date('2026-11-05T12:00:00Z') });
+    if (!('env' in m4)) throw new Error('expected the environment');
+    await firstRun(w4, { signingEnv: { ...m4.env, created: false } }, { signingKey: async () => SIGNING }, {}, signing);
+    expect((await record(w4))?.environments[0]).toMatchObject({ name: 'pipegen-signing', created: false, previous: expect.any(Object) });
+  });
+
+  it('preview: G-SIGN1 an environment made earlier in this run is said so; the key is still created now', () => {
+    const signing = { signing: { mode: 'key-env' as const, images: [], cosignPubSha256: pubKeySha256(SIGNING.pub) } };
+    const p = profile();
+    const env = { name: 'pipegen-signing', created: true, githubCreatedAt: '2026-11-05T12:00:00Z', changed: [], branchPolicyIds: [1] };
+    const text = previewText(planDelivery(input(p, 'c'.repeat(40), { signingEnv: env }, signing)));
+    expect(text).toMatch(/made earlier in this run/);
+    expect(text).toMatch(/signing key in it/);
+    expect(previewText(planDelivery(input(p, 'c'.repeat(40), {}, signing)))).not.toMatch(/made earlier in this run/);
   });
 
   it('deliver: the signing key pair must be in cosign\'s exact form; the private key goes through its own store path (G11, G10-R1)', async () => {

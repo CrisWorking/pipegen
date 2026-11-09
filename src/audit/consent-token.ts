@@ -82,6 +82,8 @@ export interface ConsentTerms {
   readonly dir: string | null;
   /** The secret scanner and version the screen named: the AI step runs exactly that one (Plan P Task 7). */
   readonly secretScanner: Readonly<Pick<SecretScanner, 'name' | 'version'>>;
+  /** G-SIGN1-R2 (sec N1): the 'full' screen said pipegen creates the pipegen-signing environment before the proof. */
+  readonly signingEnv?: true;
 }
 
 const ISSUED_TOKENS = new WeakSet<object>();

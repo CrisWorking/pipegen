@@ -373,6 +373,17 @@ export async function addLocalLeftovers(app: RepoRef, items: readonly Leftover[]
   return writeLocalJson(app, '.leftovers', LEFTOVERS.parse({ updatedAt: now.toISOString(), items: all }), deps);
 }
 
+/** Ruling G-SIGN1-R1: takes the entries `drop` matches off the local leftovers file (the others stay). Returns the file's path. */
+export async function dropLocalLeftovers(app: RepoRef, drop: (x: Leftover) => boolean, now: Date, deps: LocalRecordDeps = {}): Promise<string> {
+  const had = await readLocalLeftovers(app, deps);
+  return writeLocalJson(app, '.leftovers', LEFTOVERS.parse({ updatedAt: now.toISOString(), items: had.filter((x) => !drop(x)) }), deps);
+}
+
+/** Where the local leftovers file of an app is (the path only; nothing is read or created). */
+export function localLeftoversPath(app: RepoRef, deps: LocalRecordDeps = {}): string {
+  return join(configBase(deps), 'pipegen', 'records', `${localName(app)}.leftovers.json`);
+}
+
 // ---------- finish's pending file (G11 fix round 1, I1) ----------
 
 /**
