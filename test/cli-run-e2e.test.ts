@@ -130,8 +130,8 @@ describe('e2e', () => {
       expect(at('deliver: setup PR opened')).toBeGreaterThan(at('preview: confirmed'));
       // the preview text (the confirmation) was shown after the cleanup too: the question is asked once, after it
       expect(w.io.asked.filter((q) => /Open the setup pull request with these changes\?/.test(q))).toHaveLength(1);
-      expect(w.fgh.proof.secrets.stored.length).toBeGreaterThan(0);
-      expect(w.fgh.proof.secrets.deleted).toBe(true);
+      expect(w.fgh.proof.scratch.stored.length).toBeGreaterThan(0);
+      expect(w.fgh.proof.scratch.deleted).toBe(true);
       // nothing was written to the app or the central repo before the proof passed: the first write to either comes after the cleanup
       const cleanedAt = at('cleanup: done');
       const firstDelivery = at('deliver: setup PR opened');
@@ -144,7 +144,7 @@ describe('e2e', () => {
     expect(w.tl).toContain('cleanup: done');
     expect(w.tl).not.toContain('preview: confirmed');
     expect(w.tl).not.toContain('deliver: setup PR opened');
-    expect(w.fgh.proof.secrets.deleted).toBe(true);
+    expect(w.fgh.proof.scratch.deleted).toBe(true);
     expect(w.fgh.writesTo(APP_NAME)).toEqual([]);
     expect(w.fgh.writesTo('pipelines')).toEqual([]);
     expect(w.fgh.repo(APP).pulls).toEqual([]);

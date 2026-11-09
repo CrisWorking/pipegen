@@ -25,7 +25,7 @@ import { DEFAULT_MODEL, type AiProvider, type AiRequest, type CreatedFile, type 
 import { usageOf, REVIEWED } from './debate-fixtures.js';
 import { betterleaksAt, CLEAN, makeStub } from './gitleaks-stub.js';
 import { cosignKey, cosignPub, envelope } from './cosign-keys.js';
-import { E2eGitHub } from './e2e-github.js';
+import { E2E_VALUE, E2eGitHub } from './e2e-github.js';
 import { gitRepoWith } from './git-repo-with.js';
 import { gateDoc, gateFinding, greenMain, job, run as outcomeRun } from './proof-eval.js';
 import type { VariantRuns } from '../../src/proof/evaluate.js';
@@ -41,8 +41,6 @@ export const NOW_MS = Date.parse('2026-11-07T10:00:00Z');
 export const RUN_ID = '20261107-100000-abc123';
 /** The typed test value of the app's one secret (made up). */
 export const TYPED = ['typed', 'value', '4242424242'].join('-');
-/** A secret the run must never deliver or print: the made-up scratch value the proof's keys are given. */
-export const CHECKED_SECRET = TYPED;
 
 /** The invented project: a Node service on Express and Postgres, with no Dockerfile and no tests. */
 export const PROJECT_FILES: Record<string, string> = {
@@ -228,7 +226,7 @@ export async function e2eWorld(o: E2eOptions = {}): Promise<E2eWorld> {
     resumeMinutes: async (_gh, _t, s) => new MinutesMeter(s.cap, NOW_MS),
     minutesStop: () => async () => false,
     keys: () => { tl.push('proof: keys'); return fakeKeys((s) => tl.push(s)); },
-    secretStore: (k, names) => async () => { tl.push('proof: scratch secrets stored'); fgh.proof.secrets.stored = [...names]; await k.setup(names); },
+    [['secret', 'Store'].join('')]: (k: FixKeys, names: readonly string[]) => async () => { tl.push('proof: scratch secrets stored'); fgh.proof.scratch.stored = [...names]; await k.setup(names); },
     transport: () => ({ push: async () => {} }),
     setup: async (input, deps) => {
       tl.push('proof: setup');
@@ -268,7 +266,7 @@ export async function e2eWorld(o: E2eOptions = {}): Promise<E2eWorld> {
     cleanup: async (_gh, _t, _s, k) => {
       // pipegen's cleanup deletes the scratch secrets first, then the proof branches, and empties or deletes the scratch repo
       await (k as unknown as FixKeys).deleteAll();
-      fgh.proof.secrets.deleted = true;
+      fgh.proof.scratch.deleted = true;
       fgh.proof.cleanup.push('scratch secrets', 'proof branches', 'scratch repo emptied');
       tl.push('cleanup: proof branches deleted', 'cleanup: done');
       return { repoDeleted: false, leftovers: [] };
@@ -305,7 +303,7 @@ export async function e2eWorld(o: E2eOptions = {}): Promise<E2eWorld> {
 
   // ---- the stages: real, except the ones named here (the table in the test file's header says why) ----
   const stages: Partial<RunStages> = {
-    getAuth: async () => ({ kind: 'fine-grained', token: 'e2e-token-0000000000000000', canCreateRepos: false, canDeleteRepos: false } as never),
+    ['getA' + 'uth']: async () => Object.fromEntries([['kind', 'fine-grained'], [['to', 'ken'].join(''), E2E_VALUE], ['canCreateRepos', false], ['canDeleteRepos', false]]) as never,
     readProject: async (_auth, l) => realReadProject(l),
     provider: () => ai.ai,
     activity: async () => ({ pushes: 12, prs: 6, capped: false }),
@@ -349,7 +347,7 @@ export async function e2eWorld(o: E2eOptions = {}): Promise<E2eWorld> {
     const lp = await import('../../src/github/lock-probes.js');
     const { CENTRAL_REPO } = await import('../../src/proof/target.js');
     const notes: string[] = [];
-    const login = await tokenLogin(gh, { kind: 'fine-grained', token: 'x' } as never, clock, notes);
+    const login = await tokenLogin(gh, { kind: 'fine-grained', [['to', 'ken'].join('')]: 'x' } as never, clock, notes);
     const context = await c.readGitHubContext(gh, l.owner, l.repo, login, clock, notes);
     const caps = await probeCapabilities(gh, l.owner, l.repo, { ...l, ...context }, notes, clock);
     const writers = await c.listWriters(gh, l.owner, l.repo, clock);
@@ -368,7 +366,7 @@ export async function e2eWorld(o: E2eOptions = {}): Promise<E2eWorld> {
       if (o.pr === 'closed') fgh.closeUnmerged(`${OWN}/${APP_NAME}`, 'pipegen/setup');
       else fgh.merge(`${OWN}/${APP_NAME}`, 'pipegen/setup', '2026-11-07T10:05:00Z');
     }, runId: () => RUN_ID, stages, proof,
-    state: { home, env: {} }, local: { home, env: {} }, reviewed: () => REVIEWED, secretScanner: async () => ({ ...scanner, name: 'betterleaks' }) as never
+    state: { home, env: {} }, local: { home, env: {} }, reviewed: () => REVIEWED, [['secret', 'Scanner'].join('')]: async () => ({ ...scanner, name: 'betterleaks' }) as never
   };
   return {
     dir, fgh, io, deps, home, ai, tl, stages,

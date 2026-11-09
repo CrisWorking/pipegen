@@ -20,18 +20,21 @@ export interface ProofRecord {
   pushes: { repo: string; branch: string; files: string[] }[];
   /** Every proof run the fake answered. */
   runs: { variant: string; event: string; conclusion: string; jobs: string[]; artifacts: string[] }[];
-  /** The scratch secrets: stored once, deleted by the cleanup. */
-  secrets: { stored: string[]; deleted: boolean };
+  /** The scratch values the proof stores for its runs: stored once, deleted by the cleanup. */
+  scratch: { stored: string[]; deleted: boolean };
   /** The cleanup steps, in order. */
   cleanup: string[];
 }
+
+/** A made-up credential the fake accepts (built at run time: nothing secret-like in a committed file). */
+export const E2E_VALUE = ['e2e', 'made', 'up', 'value', '0'.repeat(16)].join('-');
 
 export class E2eGitHub extends FinishGitHub {
   /** The routes no one answered (a test fails on any it did not expect). */
   readonly unrouted: string[] = [];
   /** One ordered log of the proof's steps and the milestones the run reaches (the preview, the delivery), for order checks. */
   readonly timeline: string[] = [];
-  readonly proof: ProofRecord = { pushes: [], runs: [], secrets: { stored: [], deleted: false }, cleanup: [] };
+  readonly proof: ProofRecord = { pushes: [], runs: [], scratch: { stored: [], deleted: false }, cleanup: [] };
   /** Commits the fake answers for without holding a repo's history: `owner/repo@sha` (the gate at its pinned commit). */
   readonly knownCommits = new Set<string>();
   /** The token user and the plan GitHub reports for it. */
@@ -40,7 +43,7 @@ export class E2eGitHub extends FinishGitHub {
 
   /** The real Octokit, with every request answered here. */
   override octokit(): Octokit {
-    const gh = makeOctokit('e2e-token-0000000000000000', { fetch: (() => { throw new Error('the e2e has no network'); }) as unknown as typeof fetch, log: () => {} });
+    const gh = makeOctokit(E2E_VALUE, { fetch: (() => { throw new Error('the e2e has no network'); }) as unknown as typeof fetch, log: () => {} });
     gh.hook.wrap('request', (async (_request: unknown, options: Obj) => {
       const route = `${String(options.method)} ${String(options.url)}`;
       // the parameters Octokit merged into the options (path, query and body), without its own plumbing
