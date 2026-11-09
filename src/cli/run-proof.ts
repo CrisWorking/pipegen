@@ -281,7 +281,7 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
     // E-b11: the scratch keys read the names of the assembled proof workflows. G14fix: a private (pinned) draft's harness needs the
     // proof central's commit, known only after pushProofSetup, so before the setup only the central files and the secret names are
     // computed (from the assembled app and central workflows; the harness and the compat copies read no secret but GITHUB_TOKEN, and
-    // the full set is compared in the setup's appFiles callback, before any GitHub write); the app files are built once, for
+    // the full set is compared in the setup's appFiles callback, before any write of the setup); the app files are built once, for
     // setup.centralSha. G14fix-R1 F2: the proof-rule checks that need no sha (assembled app workflows, compat copies) run here too,
     // before arm and before any GitHub write
     const first: Pick<DraftFiles, 'central' | 'app'> = startDraft.centralPin === undefined ? await filesAt(startDraft, undefined) : await (async () => {
@@ -356,7 +356,7 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
       const setup = await o.setup({
         target: t, dir: i.dir, ...(repos.defaultBranchState === undefined ? {} : { defaultBranchState: repos.defaultBranchState }),
         ...(first.central.length === 0 ? {} : { central: { files: first.central } }),
-        // G14fix-R1 F1: the secret names are compared here, in pushProofSetup's read-only step 1, before any GitHub write
+        // G14fix-R1 F1: the secret names are compared here, in pushProofSetup's read-only step 1, before any write of the setup
         appFiles: async (sha) => { const f = await filesAt(startDraft, sha); sameNames({ app: f.app, central: first.central }); return f.app; }, plantedFiles: planted.files,
         dockerServices: p.services.filter((s) => s.dockerfile !== undefined || startDraft.created.some((f) => f.path === dockerfileAt(s))),
       }, { gh, transport, io, storeSecrets: storeStep });

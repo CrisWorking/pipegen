@@ -1265,7 +1265,37 @@ describe('G14fix: a private app through the real proof harness', () => {
     execFileSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'i']);
     w.input.dir = dir;
     // the world's stand-in app workflows (unpinned actions, no egress step) break the real proof rules
-    await expect(w.run()).rejects.toThrow();
+    await expect(w.run()).rejects.toThrow(/breaks a proof rule/);
     expect(w.tl.some((x) => x === 'arm' || x === 'checkRepos' || x === 'setup' || x === 'proofStart')).toBe(false);
+  });
+
+  // G14fix-R2 M2: the precheck's two other parts, each refused before arm (before checkRepos can create the helper repos)
+  const gitDir = (): string => {
+    const dir = mkdtempSync(join(tmpdir(), 'pg-g14fix-'));
+    execFileSync('git', ['init', '-q', '-b', 'main', dir]);
+    execFileSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'i']);
+    return dir;
+  };
+  const noWrite = (tl: readonly string[]): boolean => !tl.some((x) => x === 'arm' || x === 'checkRepos' || x === 'setup' || x === 'proofStart' || x === 'secretStore' || x.startsWith('push:'));
+
+  it('run: a private app whose assembled app file claims the harness path is refused before arm (G14fix-R2 R2, HARNESS_PATH reserved)', async () => {
+    const w = await proofWorld({ private: true });
+    delete (w.ops as { appFiles?: unknown }).appFiles;
+    w.input.dir = gitDir();
+    const asm = w.input.assembleFor;
+    // only the central files of the world's stand-in (its app workflows break the proof rules), plus one app file at the harness's path
+    w.input.assembleFor = async (d) => { const a = await asm(d); return async (mode, sha) => [...(await a(mode, sha)).filter((f) => f.repo === 'central'), { repo: 'app' as const, path: HARNESS_PATH, content: 'name: x\non: [pull_request]\njobs: {}\n', part: 'pipeline' as const, reason: 'r' }]; };
+    await expect(w.run()).rejects.toThrow(/Two proof files have the path/);
+    expect(noWrite(w.tl)).toBe(true);
+  });
+
+  it('run: a private app whose HEAD pipegen cannot read for the compat copies is refused before arm (G14fix-R2 R4)', async () => {
+    const w = await proofWorld({ private: true });
+    delete (w.ops as { appFiles?: unknown }).appFiles;
+    w.input.dir = mkdtempSync(join(tmpdir(), 'pg-g14fix-nogit-'));
+    const asm = w.input.assembleFor;
+    w.input.assembleFor = async (d) => { const a = await asm(d); return async (mode, sha) => (await a(mode, sha)).filter((f) => f.repo === 'central'); };
+    await expect(w.run()).rejects.toThrow();
+    expect(noWrite(w.tl)).toBe(true);
   });
 });

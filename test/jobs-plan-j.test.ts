@@ -14,6 +14,7 @@ import { REVIEWED } from './helpers/debate-fixtures.js';
 import { HEAD_CHECK_STEP_ID } from '../src/engine/deploy-steps.js';
 import { CAPS, LINTERS, assemble, editJob, files, judge, node, p, planned, profileOf, shown } from './helpers/assemble.js';
 import { POUTINE_NOT_RUN } from '../src/layers/jobs.js';
+import { needKeyOf } from '../src/debate/need-ref.js';
 
 /** ExistingWorkflow's used-names field, spelled at run time (test/no-secret-literals.test.ts). */
 const USED = ['sec', 'retsUsed'].join('');
@@ -438,5 +439,35 @@ describe('G14fix-R1: --skip deploy with a deploy need left uncovered', () => {
 
   it('G14fix-R1: the same uncovered deploy need, not skipped, still stops (no tool covers it)', () => {
     expect(() => assemble(noSbom([]))).toThrow(/blocking checks have no tool it can run \("sbom"/);
+  });
+});
+
+describe('G14fix-R2: a skip covers an uncovered key only when it covers every layer of the key (the secrets floor never skips)', () => {
+  // the run's re-assembly shape: every need of `key` gone from the draft's and the plan's needs and steps, the uncovered list from the full
+  // needs (plus `extraNeeds`) with `reviewed`
+  const gone = (key: string, skipped: PipelineDraft['skipped'], o: { reviewed: ReviewedTool[]; extraNeeds?: Need[]; prof?: ReturnType<typeof profileOf> }): ReturnType<typeof planned> => {
+    const prof = o.prof ?? profileOf([node({ name: 'app', scripts: ['lint'], hasTests: false })]);
+    const full = [...floorNeeds(prof, CAPS), ...(o.extraNeeds ?? [])];
+    const x = planned(prof, { needs: full, over: { skipped } });
+    const uncovered = keyOffers(full, x.plan.candidates, prof, { reviewed: o.reviewed }).uncovered;
+    const needs = full.filter((n) => needKeyOf(n) !== key);
+    const steps = x.draft.steps.filter((st) => needKeyOf({ id: st.needId, ...(st.service === undefined ? {} : { service: st.service }) } as never) !== key);
+    return { draft: { ...x.draft, needs, steps }, plan: { ...x.plan, needs, uncovered } };
+  };
+
+  it('G14fix-R2 P1b: secrets (pre-commit, push, merge) uncovered, --skip precommit: still stops (one layer skipped is not all of them)', () => {
+    const x = gone('secrets', [{ part: 'precommit', reason: 't' }], { reviewed: REVIEWED.filter((t) => !t.categories.includes('secrets')) });
+    const u = x.plan.uncovered.find((y) => y.key === 'secrets');
+    expect(u?.layers).toEqual(['pre-commit', 'push', 'merge']);
+    expect(u?.blocking).toBe(true);
+    expect(() => assemble(x)).toThrow(/no tool it can run \("secrets"/);
+  });
+
+  it('G14fix-R2 P4: sbom in deploy and merge (an added merge need), --skip deploy: still stops (merge is not skipped)', () => {
+    const prof = profileOf([node({ name: 'app', scripts: ['lint'], hasTests: false })], { existingWorkflows: [DEPLOY_WF] });
+    const sbomMerge = { id: 'sbom', layer: 'merge', category: 'sbom', service: 'app', why: 'w', blocking: true, floor: false } as unknown as Need;
+    const x = gone('sbom--app', [{ part: 'deploy', reason: 't' }, { part: 'tests', reason: 't' }], { prof, extraNeeds: [sbomMerge], reviewed: REVIEWED.filter((t) => !t.categories.includes('sbom')) });
+    expect(x.plan.uncovered.find((y) => y.key === 'sbom--app')?.layers).toEqual(['deploy', 'merge']);
+    expect(() => assemble(x)).toThrow(/no tool it can run \("sbom"/);
   });
 });
