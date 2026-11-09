@@ -154,6 +154,7 @@ function reposSection(p: RepoProfile, repos: HelperRepo[], app: boolean): string
       for (const r of missing) lines.push(`${INDENT}${INDENT}gh repo create ${full(r.name)} --private`);
     }
     lines.push(`${INDENT}With a token, pipegen never creates or deletes repos${scratch === undefined ? '.' : `; after the proof it empties the scratch repo ${full(scratch.name)}.`}`);
+    lines.push(`${INDENT}pipegen's own GitHub App login (which makes and deletes these repos itself) is planned next.`);
   }
   return lines;
 }

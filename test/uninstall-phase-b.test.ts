@@ -313,7 +313,7 @@ describe('uninstall phase B: the record and the local files (V-N5)', () => {
     expect(r2.status).toBe('b-done');
     for (const f of a.files) expect(existsSync(f), f).toBe(false);
     expect(existsSync(uninstallProgressPath({ owner: 'o', repo: 'shop' }, local(a.w)))).toBe(false);
-    expect(text(r2)).toMatch(/GitHub App/);   // F9: how to remove the App from the repo
+    expect(text(r2)).toMatch(/GitHub App/);   // F9 (#127): v0.2 installs no App, so the message says there is none to remove
 
     // a leftover branch entry pipegen/setup is still on GitHub: the files stay
     const b = await make([{ kind: 'branch', name: 'pipegen/setup', repo: 'o/shop' }]);

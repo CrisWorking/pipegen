@@ -49,7 +49,7 @@ const LIVE = 'pipegen\'s workflow is still on the app\'s default branch (you kep
 const DONE_WORDS: Readonly<Record<string, string>> = { deleted: 'deleted', gone: 'already gone', restored: 'put back as it was before pipegen', closed: 'closed', 'not-open': 'already closed', done: 'done' };
 /** GitHub's answers to a scratch cleanup write for something already gone (E's cleanup takes the same). */
 const SCRATCH_GONE = new Set([404, 409, 410, 422]);
-const APP_STEP = (full: string): string => `To remove the pipegen GitHub App from ${full}: on GitHub, open Settings → GitHub Apps (Applications → Installed GitHub Apps for a personal account, or the organisation's settings), choose pipegen → Configure, and take ${full} out of its repository access (or uninstall the App if no other repo uses it).`;
+const APP_STEP = (full: string): string => `v0.2 installs no pipegen GitHub App (it uses your fine-grained token), so there is no App to remove from ${full}. When you are done, delete the token on GitHub (Settings → Developer settings → Fine-grained personal access tokens) or take ${full} out of its access. pipegen's own GitHub App login is planned next.`;
 
 /** Phase B (run 2) of a confirmed plan; apply.ts's dispatcher calls it with the plan's phase-B api. */
 export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, ctx: PhaseBContext): Promise<StepResult> {
@@ -382,7 +382,7 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
     if (left === 0) r.done.push(`${what}: emptied (its proof/ branches, secrets, variables, workflow runs and caches)`);
     if (!plan.deleteRepos.some((x) => x.kind === 'scratch' && x.how === 'delete')) {
       r.skipped.push({ what: `the default branch ${show(def, 100)} of ${what}`, why: recorded
-        ? `it keeps the copy of your code the proof used (pipegen removes only what the proof added): delete the repo when you don't need it (gh repo delete ${s.fullName}, or run \`pipegen uninstall --delete-repos\` with the pipegen App)`
+        ? `it keeps the copy of your code the proof used (pipegen removes only what the proof added): delete the repo when you don't need it (gh repo delete ${s.fullName}, or run \`pipegen uninstall --delete-repos\` to print the command)`
         : 'it keeps the copy of your code the proof used (pipegen removes only what the proof added); the install record holds no id of this repo, so check it is the one pipegen made before you delete it' });
     }
   }
@@ -407,7 +407,7 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
     const what = `repo ${show(d.repo, 140)}`;
     const command = `gh repo delete ${d.repo}`;
     const tokenMode = d.how !== 'delete' || ctx.deps.canDeleteRepos !== true;
-    const noApp = '--delete-repos: this token can\'t delete repos (only the pipegen App, with the Administration write you consented to, can), so pipegen deleted nothing';
+    const noApp = '--delete-repos: a fine-grained token can\'t delete repos in v0.2 (pipegen\'s own GitHub App login, which can, is planned next), so pipegen deleted nothing';
     const hardStop = (e: unknown): void => { if (isRateStop(e) || e instanceof GitHubAccessError || statusOf(e) === 401) throw e; };
     if (d.kind === 'scratch') {
       let s: GuardedRepo;

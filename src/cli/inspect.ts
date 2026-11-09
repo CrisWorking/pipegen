@@ -197,7 +197,7 @@ export async function inspect(dir: string, io: CliIO, opts: { allowBroad: boolea
   } else {
     for (const line of githubLines(t, github.p, github.auth, github.caps)) say(line);
     say('');
-    say('Read-only permissions pipegen needs here (for a token or its GitHub App)');
+    say('Read-only permissions pipegen needs here (for a fine-grained token)');
     for (const r of permissionsTable('read')) say(`${I}- ${r.permission}: ${r.why}`);
   }
   if (notes.length > 0) {

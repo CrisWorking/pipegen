@@ -17,8 +17,8 @@ No Plan G test needs anything on this list. `test/cli-run-e2e.test.ts` runs the 
 
 | # | Check | Source | Result |
 |---|---|---|---|
-| A1 | pipegen's GitHub App login works, or a fine-grained token with the write table plus Issues read (S12) | pre-flight §6 | not run |
-| A2 | the `pipelines` and `pipegen-proof-<app>` repos are created by the App or by hand, and they are private | pre-flight §6 | not run |
+| A1 | a fine-grained token with the write table plus Issues read works (S12). v0.2 has no App login (DECISIONS #127; planned next) | pre-flight §6 | not run |
+| A2 | the `pipelines` and `pipegen-proof-<app>` repos are created by hand with the `gh repo create … --private` commands pipegen prints, and they are private | pre-flight §6 | not run |
 | A3 | an Actions-minutes budget of about 1,000 to 2,500 minutes is available | pre-flight §6 | not run |
 | A4 | an Anthropic key is set in the environment of the run | pre-flight §6 | not run |
 | A5 | the alt account `CrisWorkAlt` has write access to both repos (at least two writers) | pre-flight §6 | not run |
@@ -256,7 +256,7 @@ From `task-G15a-report.md` ("Live items for G16" and the items added in each rou
 
 ## Uninstall (V-live)
 
-Plan V's live check, after the Task 8 Step 5 list. Steps only: nobody ran them. Use a private throwaway repo of `CrisWorking` and its own `pipelines`, with the App login (so `--delete-repos` deletes) and, for UN-9, a token. Write the **before** lists first (UN-2) and the **after** lists last (UN-8); the difference must be exactly what pipegen made.
+Plan V's live check, after the Task 8 Step 5 list. Steps only: nobody ran them. Use a private throwaway repo of `CrisWorking` and its own `pipelines`, with a fine-grained token (v0.2 has no App login, so `--delete-repos` prints the `gh repo delete` commands and deletes nothing). Write the **before** lists first (UN-2) and the **after** lists last (UN-8); the difference must be exactly what pipegen made.
 
 | # | Check | Source | Result |
 |---|---|---|---|
@@ -265,10 +265,10 @@ Plan V's live check, after the Task 8 Step 5 list. Steps only: nobody ran them. 
 | UN-3 | `pipegen uninstall` with no terminal (piped, or `CI=1`) stops before any GitHub call and changes nothing | Plan V V7, V-S13 | not run |
 | UN-4 | first run (phase A): the preview names every file, edit and lock; one yes; the PR `pipegen/uninstall` opens; pipegen's own open PRs are closed; the rulesets, the org rule and the classic protection are gone or restored to `previous`; exit 0 with "merge it, then run again" | Plan V V7, V-B2 | not run |
 | UN-5 | merge the uninstall PR (the required gate does not block it, because the locks are off); running `pipegen uninstall` before the merge only says to merge | Plan V V7, V-B2 | not run |
-| UN-6 | second run (phase B) with `--delete-repos` and the App login: secrets (`PIPEGEN_` ones directly, an own-name one only after you type it), variables, environments, settings, the scratch repo emptied; the central PR opens; exit 0 | Plan V V7 | not run |
-| UN-7 | merge the central PR, run `pipegen uninstall --delete-repos` again: the install record is rebuilt from the saved blob (no "No install record"), the repos are deleted after their names are typed, the local files go, the final message says how to remove the App | Plan V V7, V6 carry | not run |
-| UN-8 | the **after** lists, compared with UN-2: nothing pipegen didn't create is gone, nothing pipegen created is left except what the final message lists (the kept default branch of the scratch repo, the App) | Plan V V7 | not run |
-| UN-9 | token mode: the same second run with a fine-grained token deletes no repo and prints `gh repo delete` only for a repo whose checks passed; a leftover `pipegen/update-<name>` branch on `pipelines` withholds the command until it is deleted | Plan V V7, V-S3 | not run |
+| UN-6 | second run (phase B) with `--delete-repos` and a fine-grained token: secrets (`PIPEGEN_` ones directly, an own-name one only after you type it), variables, environments, settings, the scratch repo emptied; the central PR opens; exit 0 | Plan V V7 | not run |
+| UN-7 | merge the central PR, run `pipegen uninstall --delete-repos` again: the install record is rebuilt from the saved blob (no "No install record"), the `gh repo delete` commands for the scratch repo and `pipelines` are printed (nothing is deleted by pipegen), the local files go, the final message says there is no App to remove (delete the token) | Plan V V7, V6 carry | not run |
+| UN-8 | the **after** lists, compared with UN-2: nothing pipegen didn't create is gone, nothing pipegen created is left except what the final message lists (the kept default branch of the scratch repo, the two repos until you run the printed `gh repo delete` commands) | Plan V V7 | not run |
+| UN-9 | the printed commands: pipegen prints `gh repo delete` only for a repo whose checks passed, and deletes no repo; a leftover `pipegen/update-<name>` branch on `pipelines` withholds the command until it is deleted | Plan V V7, V-S3 | not run |
 | UN-10 | an object pipegen did not create: a secret or ruleset recreated by hand after the install (same name, new id and `created_at`) is kept and listed "not the one pipegen created" | Plan V V7, V-B6 | not run |
 | UN-11 | the throwaway repo, its `pipelines` and `pipegen-proof-<repo>` are deleted by hand at the end | Plan V V7 | not run |
 

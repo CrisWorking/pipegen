@@ -355,7 +355,9 @@ describe('V7: the docs say what was built', () => {
   it('docs: design §14 (the repo-deletion right, the secrets line, the two runs and why), the threat model row and the V-live checklist', () => {
     const design = read('docs/design.md');
     const s14 = design.slice(design.indexOf('## 14. Uninstall'), design.indexOf('## 15.'));
-    expect(s14).toContain('`--delete-repos` uses the repo-deletion right the App already has (Administration: write); with a token, pipegen prints the `gh repo delete` commands.');
+    // #127: v0.2 prints the commands; the App's right is the planned path
+    expect(s14).toContain('In v0.2, `--delete-repos` prints the `gh repo delete` commands');
+    expect(s14).toMatch(/Planned next, with pipegen's own GitHub App login: `--delete-repos` will use the repo-deletion right the App already has \(Administration: write\)/);
     expect(s14).not.toMatch(/asked for only then/);
     expect(s14).toContain('Secrets pipegen created are removed: `PIPEGEN_`-prefixed ones directly, the app\'s own names only after you type the name.');
     expect(s14).not.toMatch(/Only secrets with the `PIPEGEN_` prefix/);
@@ -373,7 +375,7 @@ describe('V7: the docs say what was built', () => {
     expect(rows.join('\n')).toMatch(/create.*merged.*finish[^]*before[^]*phase A[^]*merge[^]*phase B[^]*after[^]*deleted by hand/is);
   });
 
-  it('docs: the README uninstall section (permissions, the proxy limit, the App by hand, the two runs, the kept org-rule file, the update branch)', () => {
+  it('docs: the README uninstall section (permissions, the proxy limit, no App to remove, the two runs, the kept org-rule file, the update branch)', () => {
     const readme = read('README.md');
     const sec = readme.slice(readme.indexOf('## Uninstall (v0.2)'), readme.indexOf('## Install safely'));
     expect(sec.length).toBeGreaterThan(500);
@@ -381,9 +383,59 @@ describe('V7: the docs say what was built', () => {
     expect(sec).toMatch(/Administration \(read and write\) is optional/);
     expect(sec).toMatch(/Members: read is optional/);
     expect(sec).toMatch(/HTTPS_PROXY/);
-    expect(sec).toMatch(/remove it: on GitHub, open Settings/);
+    expect(sec).toMatch(/no App to remove/);
     expect(sec).toMatch(/--required\.yml.*unfinished until you remove the organisation rule/s);
     expect(sec).toMatch(/pipegen\/update-<name>.*withholds the command/s);
     expect(sec).toMatch(/needs a terminal/);
+  });
+});
+
+describe('V7 fold 3 (DECISIONS #127): v0.2 uses a fine-grained token; the App is planned, never the current path', () => {
+  const read = (rel: string): string => readFileSync(join(import.meta.dirname, '..', rel), 'utf8');
+  const PLANNED = /planned/i;
+
+  it('docs: README and design never call the App the current path (every line naming the App says it is planned, or is about a token kind)', () => {
+    for (const f of ['README.md', 'docs/design.md']) {
+      const lines = read(f).split('\n').filter((l) => /\bApp\b/.test(l));
+      for (const l of lines) {
+        // the one other mention: a ghu_ login set in GITHUB_TOKEN (a token kind), and the App in the deleted-repo sentence below the marker
+        const ok = PLANNED.test(l) || /GITHUB_TOKEN/.test(l) || /Plan L|code paths exist/.test(l);
+        expect(ok, `${f}: ${l.slice(0, 120)}`).toBe(true);
+      }
+    }
+    const readme = read('README.md');
+    const access = readme.slice(readme.indexOf('- **Access:**'), readme.indexOf('- **Shown before anything runs:**'));
+    expect(access).toMatch(/in v0\.2 you use a \*\*fine-grained token\*\*/);
+    expect(access).not.toMatch(/a GitHub App or fine-grained token/);
+    for (const part of [/gh repo create <owner>\/pipelines --private/, /pipegen-proof-<repo> --private/, /empties the scratch repo after the proof instead of deleting it/, /`gh repo delete` commands/, /GitHub App login \(which makes and deletes these repos itself\) is planned next\./]) expect(access, String(part)).toMatch(part);
+    const design = read('docs/design.md');
+    const s12 = design.slice(design.indexOf('## 12. Access'), design.indexOf('## 13.'));
+    expect(s12).toMatch(/\*\*v0\.2 uses a fine-grained token\*\*/);
+    expect(s12).toMatch(/\*\*Planned next \(Plan L, after the release\): pipegen's own GitHub App\*\*/);
+    expect(s12).not.toMatch(/GitHub App\*\* first/);
+    const s14 = design.slice(design.indexOf('## 14. Uninstall'), design.indexOf('## 15.'));
+    expect(s14).not.toMatch(/uses the repo-deletion right the App already has \(Administration: write\); with a token/);
+    const t5 = read('docs/threat-model.md').split('\n').find((l) => l.startsWith('| T5 |')) as string;
+    expect(t5).toMatch(/v0\.2 uses a \*\*fine-grained token\*\*/);
+    expect(t5).toMatch(PLANNED);
+    expect(read('docs/smoke-test.md')).not.toMatch(/created by the App or by hand|pipegen's GitHub App login works/);
+  });
+
+  it('docs: the help text, the consent screen and the error texts say v0.2 uses a token and the App login is planned', async () => {
+    const h = mkio({ cwd: tmpdir() });
+    expect(await main(['--help'], h)).toBe(0);
+    const help = h.lines.join('\n');
+    expect(help).toMatch(/in v0\.2 you use a fine-grained token/);
+    expect(help).toMatch(/--delete-repos\s+uninstall: also print the gh repo delete commands/);
+    expect(help).toMatch(/GitHub App login \(which makes and deletes these repos itself\) is planned next/);
+    expect(help).not.toMatch(/With the pipegen App it deletes/);
+    // no message of src tells the user to log in with, or install, the pipegen App (the App's own code paths excepted)
+    const client = read('src/github/client.ts');
+    expect(client).not.toMatch(/install the pipegen GitHub App|or pipegen\\?'s GitHub App|use pipegen\\?'s GitHub App|or log in again/);
+    expect(client).toMatch(/v0\.2 ships\s+\/\/\s+no App login \(DECISIONS #127/);
+    expect(client).not.toMatch(/v0\.1 ships\s+\/\/\s+no login command/);
+    const phaseB = read('src/uninstall/phase-b.ts');
+    expect(phaseB).not.toMatch(/with the pipegen App\)|open Settings → GitHub Apps/);
+    expect(phaseB).toMatch(/no App to remove/);
   });
 });
