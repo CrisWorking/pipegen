@@ -62,7 +62,7 @@ import { expectedSigningSteps, signedImageOwner } from './signing.js';
 import { NO_IMAGE_CATEGORIES, noImageServices, publishedImageServices, WORKFLOW_LINT_TOOL } from './needs.js';
 import { FIND_RUN_STEP_ID, PUBLISH_TAG, publishedImageRepo, renderDigestStep, renderHeadCheckStep, renderPublishDigestStep } from './deploy-steps.js';
 import { callsWorkflow, strongReason } from './deploy-gating.js';
-import { calledHeadCheckEdit, deployGating, isDeployWorkflow, localCallOf } from '../layers/deploy.js';
+import { calledHeadCheckEdit, deployGating, INSERT_REFUSED_GAP, isDeployWorkflow, localCallOf, SKIP_DEPLOY_GAP } from '../layers/deploy.js';
 import { ARCHIVE_TOOL_IDS, imageBuildTag, renderImageArchiveScan, renderImageBuild } from './image-handoff.js';
 import { dastStartOf, nightlyDastSpec, NIGHTLY_DAST_TOOL, renderDastRun, renderDastScrub, zapActiveSpec, ZAP_ACTIVE_LANE, ZAP_ACTIVE_TOOL } from './dast-handoff.js';
 import { ATTEST_VERIFY_SETS, KEYLESS_VERIFY_SETS, SHARED_CDN_SETS } from './egress.js';
@@ -2868,11 +2868,27 @@ function judgeDeployBatch(files: readonly CreatedFile[], draft: PipelineDraft, t
     if (f.repo !== 'app' || m === undefined || typeof m.original !== 'string') continue;
     if (texts.get(f.path) !== m.original) add(f.path, 'template', `The edit's original of ${safeText(f.path, 200)} is not the text pipegen read from the repository, so the edit would not be judged against what the repository holds.`, undefined, f.repo);
   }
-  const gaps = new Set((Array.isArray(draft.doc?.deployGaps) ? draft.doc.deployGaps : []).map((g) => (isObj(g) ? g.path : undefined)));
+  const listed = (Array.isArray(draft.doc?.deployGaps) ? draft.doc.deployGaps : []).filter(isObj);
+  const gaps = new Set(listed.map((g) => g.path));
+  const skipped = draft.skipped.some((s) => isObj(s) && s.part === 'deploy');
   for (const wf of draft.profile.existingWorkflows) {
     if (!isDeployWorkflow(wf)) continue;
     const edited = files.some((f) => f.repo === 'app' && f.path === wf.path && f.inserted !== undefined);
+    // G17A-R3 r3-M1: the gap list is re-derived, never trusted: a workflow is an edit or a gap, never both
+    if (edited && gaps.has(wf.path)) add(wf.path, 'template', `The deploy workflow ${safeText(wf.path, 200)} is both edited by pipegen and listed as a gap in PIPEGEN.md; it is one or the other.`, undefined, 'app');
     if (!edited && !gaps.has(wf.path)) add(wf.path, 'template', `The deploy workflow ${safeText(wf.path, 200)} is neither edited by pipegen in this batch nor listed as a gap in PIPEGEN.md; pipegen either protects each deploy workflow or says it does not.`, undefined, 'app');
+  }
+  // G17A-R3 r3-M1: a listed gap for a workflow the deploy layer gates (deployGating on the text read finds no gap) is accepted only with the
+  // layer's own reasons there: insertVerify refused the edit, or the deploy part is skipped
+  for (const g of listed) {
+    const path = g.path;
+    const wf = typeof path === 'string' ? draft.profile.existingWorkflows.find((x) => x.path === path) : undefined;
+    const text = typeof path === 'string' ? texts.get(path) : undefined;
+    if (wf === undefined || !isDeployWorkflow(wf) || typeof text !== 'string') continue;
+    const parsed = parseYaml(text, 'user');
+    if (!('parsed' in parsed) || 'gap' in deployGating(parsed.parsed.js, draft.profile.defaultBranch)) continue;
+    const why = typeof g.why === 'string' ? g.why : '';
+    if (!(why.startsWith(INSERT_REFUSED_GAP) || (skipped && why === SKIP_DEPLOY_GAP))) add(wf.path, 'template', `The deploy workflow ${safeText(wf.path, 200)} is listed as a gap, but pipegen's deploy layer protects it; a gap there is only the layer's own (pipegen could not add its check without changing the file${skipped ? ', or the deploy part is skipped' : ''}).`, undefined, 'app');
   }
 }
 

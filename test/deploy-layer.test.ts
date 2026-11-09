@@ -1617,7 +1617,8 @@ describe('G17A-R2: the referee binds the batch to the plan\'s inputs', () => {
     // a plain deploy whose insert is dropped is refused too, unless the doc lists it as a gap (PIPEGEN.md then says it is unprotected)
     const plain = world('keyless', [[A, DEPLOY_A]]);
     expect((await judge(plain, [])).issues.some((i) => notHandled(A).test(i.message))).toBe(true);
-    expect(shown(await judge(plain, [], plain.texts, [{ path: A, triggers: ['push'], why: 'listed' }]))).toBe('');
+    // (G17A-R3 r3-M1: a gap for a workflow the layer gates carries the layer's own reason, here insertVerify's refusal)
+    expect(shown(await judge(plain, [], plain.texts, [{ path: A, triggers: ['push'], why: 'pipegen can not add its check without changing the rest of the file: listed' }]))).toBe('');
     // only pipegen's marked edit counts: the same text written as a whole file (no mark) is not an edit of the user's workflow (R2 mutation survivor)
     const whole = { ...(plain.v.inserts[0] as VerifyPlan['inserts'][number]).file, inserted: undefined } as unknown as CreatedFile;
     expect((await judge(plain, [whole])).issues.some((i) => notHandled(A).test(i.message)), 'whole file').toBe(true);

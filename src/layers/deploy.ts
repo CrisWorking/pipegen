@@ -529,14 +529,22 @@ export function deployGating(js: Obj, defaultBranch: string): DeployGating | { g
  * draft.doc.deployGaps.
  */
 export const isDeployWorkflow = (wf: ExistingWorkflow): boolean => wf.deploys === true && !OWN_WORKFLOWS.has(wf.path);
+/** G17A-R3 r3-I1: the gap reason of every deploy workflow when the deploy part is skipped (the referee accepts it only then). */
+export const SKIP_DEPLOY_GAP = 'you skipped the deploy part (--skip deploy), so pipegen adds no check before its deploy';
+/** G17A-R3 r3-M1: how the gap reason starts when insertVerify refuses the edit of a workflow the layer gates (the one gap the referee accepts there). */
+export const INSERT_REFUSED_GAP = 'pipegen can not add its check without changing the rest of the file: ';
 
 /**
  * The verify inserts of a draft's deploy workflows (see the file header). `texts`: each workflow's text as read (path → text); `verify`: the
- * verify job (assemble's AssembledFiles.verify; null when the deploy part is skipped, and then nothing is inserted and nothing is a gap).
+ * verify job (assemble's AssembledFiles.verify; null when the deploy part is skipped, and then nothing is inserted and every deploy workflow is a
+ * gap with SKIP_DEPLOY_GAP, G17A-R3 r3-I1, so PIPEGEN.md lists each as unprotected and the referee's edited-or-listed rule holds).
  */
 export function planVerifyInserts(draft: PipelineDraft, texts: ReadonlyMap<string, string>, verify: Job | null): VerifyPlan {
   const out: VerifyPlan = { inserts: [], gaps: [], notProven: [], preview: [], notes: [] };
-  if (verify === null) return out;
+  if (verify === null) {
+    for (const wf of draft.profile.existingWorkflows) if (isDeployWorkflow(wf)) out.gaps.push({ path: wf.path, triggers: Array.isArray(wf.triggers) ? [...wf.triggers] : [], why: SKIP_DEPLOY_GAP });
+    return out;
+  }
   const def = draft.profile.defaultBranch;
   // G13 (G7-R2 carry): a workflow started only by workflow_call is a gap only when no gated job calls it (decided after every caller)
   const deferred = new Map<string, { triggers: string[]; why: string }>();
@@ -563,7 +571,7 @@ export function planVerifyInserts(draft: PipelineDraft, texts: ReadonlyMap<strin
     let edit: ReturnType<typeof insertVerify>;
     try { edit = insertVerify(text, deployJobs, verify, needsOnly); } catch (e) {
       if (!(e instanceof EditRefused || e instanceof RenderError)) throw e;
-      gap(`pipegen can not add its check without changing the rest of the file: ${safeText(e.message, 200)}`, triggers);
+      gap(`${INSERT_REFUSED_GAP}${safeText(e.message, 200)}`, triggers);
       continue;
     }
     const file: CreatedFile = { path: wf.path, content: edit.text, part: 'deploy-verify', reason: `Adds the ${VERIFY_JOB} job, which proves the commit passed the gate (and, for an image, that pipegen signed it) before ${deployJobs.length === 1 ? 'the deploy job runs' : 'the deploy jobs run'}, and starts each of them with pipegen's head check, except a job that calls another workflow, or one pipegen gates only for its runner or vars and can not start with the check (see the notes).`, repo: 'app', inserted: edit.inserted };
