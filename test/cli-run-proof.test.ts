@@ -1214,3 +1214,20 @@ describe('G14: the production arm', () => {
     }
   });
 });
+
+describe('G14fix: a private app through the real proof harness', () => {
+  it('run: a private app\'s proof builds its files with the real harness (no ops.appFiles) and gives it the central sha the setup pushed', async () => {
+    const w = await proofWorld({ private: true });
+    delete (w.ops as { appFiles?: unknown }).appFiles;
+    const shas: (string | undefined)[] = [];
+    const asm = w.input.assembleFor;
+    w.input.assembleFor = async (d) => { const a = await asm(d); return async (mode, sha) => { shas.push(sha); return a(mode, sha); }; };
+    const r = await w.run();
+    expect(r.stopped ?? '').not.toContain('no proof central sha');
+    expect(r.ok).toBe(true);
+    // the harness and the app's files are only ever built for the central commit the setup pushed
+    expect(shas.filter((s) => s !== undefined && s !== 'c'.repeat(40))).toEqual([]);
+    const harness = w.pushed.find((x) => x.variant === 'setup')?.files.find((f) => f.path === HARNESS_PATH) as { content?: unknown } | undefined;
+    expect(String(harness?.content)).toContain('c'.repeat(40));
+  });
+});
