@@ -357,7 +357,9 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     (vault as SecretVault | null)?.wipe();
     (keyVault as SecretVault | null)?.wipe();
     try { (disarm as (() => void) | null)?.(); } catch { /* the state file keeps what was done */ }
-    try { (store as StateStore | null)?.releaseLease(); } catch { /* released at exit anyway */ }
+    // G-LEASE-R1 (sec M1): while a stop is under way, the interrupt hooks (the env drop, the proof cleanup) still write to GitHub after this
+    // finally; the lease stays until the exit hook acquireLease registered drops it, at the end of the hook phase
+    if (!(deps.interrupting ?? interrupting)()) try { (store as StateStore | null)?.releaseLease(); } catch { /* released at exit anyway */ }
   }
 
   async function go(): Promise<number> {

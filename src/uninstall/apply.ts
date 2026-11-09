@@ -354,7 +354,8 @@ export async function uninstallStep(gh: Octokit, loaded: LoadedRecord, io: Promp
       }
     }
   } finally {
-    lease.releaseLease();
+    // G-LEASE-R1 (sec M1): kept while a stop is under way; the exit hook drops it after the interrupt hooks
+    if (!interrupting()) lease.releaseLease();
   }
 }
 

@@ -1,5 +1,5 @@
 // v0.2 Plan G G13: `pipegen run` (src/cli/run.ts) with fake stages, and its pure parts (src/cli/run-parts.ts) with the real modules.
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
@@ -38,6 +38,7 @@ import { AssembleError } from '../src/layers/jobs.js';
 import { DeliverError } from '../src/deliver/git-data.js';
 import { pubKeySha256 } from '../src/engine/signing.js';
 import { holdAppLease } from '../src/proof/lease.js';
+import { runExitHooks } from '../src/util/exit-hooks.js';
 import { StateStore } from '../src/proof/state.js';
 import type { CreatedFile, InstallRecord, Need, PipelineDraft, RepoProfile } from '../src/types.js';
 import { fake } from './helpers/secret-repo.js';
@@ -1806,6 +1807,24 @@ describe('G-SIGN1: the signing mode re-derived after the run makes its own signi
     expect(await run(w2, io({ preview: false }))).toBe(1);
     expect(w2.calls.filter((c) => c === 'dropSigningEnv')).toHaveLength(1);
     expect(d2).toBe(1);
+  });
+
+  it('run: G-LEASE-R1 (sec M1, probe P1) a run stopped by an interrupt keeps its lease while the armed env-drop hook may still write; the exit hook drops it after', async () => {
+    let hook: (() => Promise<void>) | undefined;
+    const w = dropWorld({ deps: { interrupting: () => w.calls.includes('preview'), armSigningEnv: (cleanup) => { hook = cleanup; return () => {}; } } });
+    expect(await run(w)).toBe(1);
+    expect(hook).toBeDefined();
+    expect(w.calls).not.toContain('dropSigningEnv');
+    const leaseFile = join((await StateStore.open({ owner: OWN, repo: 'r' }, { home: w.home, env: {} })).dir, 'lease.json');
+    expect(existsSync(leaseFile)).toBe(true);
+    // another pipegen (finish) on this machine can't start while the hook phase runs
+    await expect(holdAppLease({ owner: OWN, repo: 'r' }, 'finish', { state: { home: w.home, env: {} } })).rejects.toThrow(/`pipegen run`/);
+    await (hook as () => Promise<void>)();
+    expect(w.calls).toContain('dropSigningEnv');
+    // the end of the hook phase: the sync exit hooks drop the lease
+    runExitHooks();
+    expect(existsSync(leaseFile)).toBe(false);
+    (await holdAppLease({ owner: OWN, repo: 'r' }, 'finish', { state: { home: w.home, env: {} } }))();
   });
 
   it('run: G-SIGN1-R3 spec r2-L1 an environment the delivered pipeline did not use is deleted with a message that does not say nothing was delivered', async () => {

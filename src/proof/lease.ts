@@ -4,7 +4,9 @@
 // half-locked. The lease is the same file as the proof's (`<cache>/pipegen/<owner>__<repo>/lease.json`), with the same rules: a live
 // process on this machine holding it → a stop naming its command; a lease left by a process that is gone → taken over; an unreadable
 // lease or one of another machine → a stop. It is taken before the command's first GitHub call, given back on every exit path (the
-// returned release, in the caller's finally) and, on a signal or a plain exit, by the exit hook acquireLease registers.
+// returned release, in the caller's finally) and, on a signal or a plain exit, by the exit hook acquireLease registers. While a stop is
+// under way (interrupting()) the release is skipped: the exit hook drops the lease after the interrupt hooks end (G-LEASE-R1, sec M1).
+// Only the lease is taken: the proof's state file in the same folder is not read (G-LEASE-R1, spec I1).
 //
 // A caller that already holds the lease (run holds it from its start, then delivers and finishes in the same process) passes its store
 // down (`held`): the lease is not taken a second time (that would stop on this very process), and it stays held when the callee ends.
@@ -12,6 +14,7 @@ import { randomBytes } from 'node:crypto';
 import type { LocalRecordDeps } from '../deliver/record.js';
 import { StateError, StateStore, type LeaseCommand, type StateDeps } from './state.js';
 import { ProofStopError, type ProofApp } from './target.js';
+import { interrupting } from '../util/exit-hooks.js';
 
 /** Gives the lease back (a no-op for a lease the caller passed down). Safe to call twice. */
 export type ReleaseLease = () => void;
@@ -33,9 +36,12 @@ export async function holdAppLease(app: Pick<ProofApp, 'owner' | 'repo'>, comman
     if (!o.held.holdsLeaseFor(app)) throw new StateError(`pipegen ${command} was handed a lease it doesn't hold for ${app.owner}/${app.repo}; it changes nothing.`);
     return () => {};
   }
-  const store = await StateStore.open(app, o.state);
+  // G-LEASE-R1 (spec I1): the lease only; the saved proof state is not read (finish and update never use it)
+  const store = await StateStore.openForLease(app, o.state);
   store.acquireLease(`${command}-${randomBytes(6).toString('hex')}`, command);
-  return () => { store.releaseLease(); };
+  // G-LEASE-R1 (sec M1): while a stop is under way the interrupt hooks may still write to GitHub; the lease stays until the exit hook
+  // acquireLease registered drops it, at the end of the hook phase
+  return () => { if (!interrupting()) store.releaseLease(); };
 }
 
 /** Whether `e` is the lease's own stop (another pipegen holds it, or its folder or file can't be trusted). */

@@ -196,7 +196,7 @@ The builder ("developer") picks among **reviewed tools** for blocking needs, and
 
 Only what pipegen **created** is deleted. Environments that existed before pipegen get their **previous settings restored**, not deleted. Only secrets with the `PIPEGEN_` prefix that the record says pipegen created are removed.
 
-One pipegen command per repo on a machine (threat model T55): `run`, `cleanup`, `uninstall`, `finish` and `update` each hold the repo's lease for their whole run, taken before their first GitHub call. Another one started on the same repo stops at once, with nothing read or changed, and names the command it waits for. `run` passes its lease down to the delivery and to the finish it runs itself.
+One pipegen command per repo on a machine (threat model T55): `run`, `cleanup`, `uninstall`, `finish` and `update` each hold the repo's lease, taken before their first GitHub write. `uninstall`, `finish` and `update` hold it for their whole run; `run` holds it from just before the proof to the end, and `cleanup` around its cleanup writes. Another one started on the same repo stops, with nothing changed, and names the command it waits for. `run` passes its lease down to the delivery and to the finish it runs itself.
 
 ## 15. pipegen's own supply chain
 

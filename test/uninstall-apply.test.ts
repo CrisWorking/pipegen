@@ -12,7 +12,9 @@ import { PromptCancelledError, type Prompter } from '../src/cli/io.js';
 import { gitBlobSha } from '../src/create/guard.js';
 import { finish, FinishError } from '../src/deliver/finish.js';
 import { localRecordPath, recordPath } from '../src/deliver/record.js';
+import { holdAppLease } from '../src/proof/lease.js';
 import { StateStore } from '../src/proof/state.js';
+import { runExitHooks } from '../src/util/exit-hooks.js';
 import type { InstallEdit, InstallRecord } from '../src/types.js';
 import { applyPhaseA, confirmPlan, PhaseApi, takeApi, uninstallStep, type PhaseBRunner, type PhasePlan, type StepDeps, type StepResult } from '../src/uninstall/apply.js';
 import { UninstallError } from '../src/uninstall/errors.js';
@@ -530,6 +532,12 @@ describe('uninstall apply, phase A (V5)', () => {
     expect(writeCalls(w).filter((c) => c.params.repo === 'pipelines')).toEqual([]);
     expect(readFileSync(lr, 'utf8')).toBe('{"recordHash":"x"}\n');
     expect(h.fns).toEqual([]);   // the interrupt hook is unregistered after the run
+    // G-LEASE-R1 (sec M1): a stopped run keeps the app's lease past its own end; the exit hook drops it after the hook phase
+    const leaseFile = join((await StateStore.open({ owner: 'o', repo: 'shop' }, local(w))).dir, 'lease.json');
+    expect(existsSync(leaseFile)).toBe(true);
+    await expect(holdAppLease({ owner: 'o', repo: 'shop' }, 'finish', { state: local(w) })).rejects.toThrow(/`pipegen uninstall`/);
+    runExitHooks();
+    expect(existsSync(leaseFile)).toBe(false);
     // the re-run resumes run 1: the rest of the locks, the same PR (updated), no second delete of the ruleset
     h.stop.now = false;
     const before = w.g.calls.length;

@@ -3,7 +3,7 @@
 // compares any patch the issue carries (a differing one is refused and shown), touches only the files the install record lists, merges an
 // owner-edited file 3-way (or lists it as a conflict, never overwriting it), marks the result owner-edited, and appends every blob sha it writes
 // to the record through writeRecord. Every GitHub call goes to an in-memory GitHub (test/helpers/deliver-github.ts); no network.
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -1037,6 +1037,19 @@ describe('Plan V M5: update holds the app lease', () => {
     expect(res.prUrl).toBeDefined();
     other.acquireLease('after', 'finish');
     other.releaseLease();
+  });
+
+  it('update: G-LEASE-R1 (spec I1) a corrupt or 0644 proof state file beside the lease does not stop update (it never reads it)', async () => {
+    for (const bad of ['corrupt', '0644'] as const) {
+      const w = await publicWorld();
+      w.issues.app = [genuine(w)];
+      const dir = join(w.home, '.cache', 'pipegen', 'o__r');
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      chmodSync(join(w.home, '.cache'), 0o700); chmodSync(join(w.home, '.cache', 'pipegen'), 0o700);
+      writeFileSync(join(dir, 'state.json'), bad === 'corrupt' ? '{' : '{"version":1}', { mode: 0o600 });
+      if (bad === '0644') chmodSync(join(dir, 'state.json'), 0o644);
+      expect((await update(w.g.octokit(), app, deps(w))).prUrl).toBeDefined();
+    }
   });
 
   it('update: the lease is given back on an error', async () => {

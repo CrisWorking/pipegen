@@ -2256,7 +2256,7 @@ describe('Plan V M5: finish holds the app lease', () => {
     const from = s.g.calls.length;
     const e = await finish(s.g.octokit(), app, {}, s.deps()).then(() => null, (x: unknown) => x);
     expect(e).toBeInstanceOf(FinishError);
-    expect((e as Error).message).toMatch(/^Another pipegen \(`pipegen uninstall`, process \d+\) is working on .* Wait for it to finish, or stop it, then run pipegen again\. Nothing was applied\.$/);
+    expect((e as Error).message).toMatch(/^Another pipegen \(`pipegen uninstall`, process \d+\) is working on .* Wait for it to finish, or stop it, then run pipegen again\. If process \d+ is not pipegen, remove \S+lease\.json and run pipegen again\. Nothing was applied\.$/);
     expect(s.g.calls.length).toBe(from);
     // --print too: it reads what the uninstall is changing
     await expect(finish(s.g.octokit(), app, { print: true }, s.deps())).rejects.toThrow(/`pipegen uninstall`/);
@@ -2291,6 +2291,19 @@ describe('Plan V M5: finish holds the app lease', () => {
     writeFileSync(lease, JSON.stringify({ pid: 2 ** 22 + 12345, host: hostname(), runId: 'gone', [['to', 'ken'].join('')]: 't', command: 'uninstall' }), { mode: 0o600 });
     expect((await finish(s.g.octokit(), app, {}, s.deps())).applied).toBeDefined();
     expect(existsSync(lease)).toBe(false);
+  });
+
+  it('finish: G-LEASE-R1 (spec I1) a corrupt or 0644 proof state file beside the lease does not stop finish (it never reads it)', async () => {
+    for (const bad of ['corrupt', '0644'] as const) {
+      const s = await seed();
+      const dir = join(s.home, '.cache', 'pipegen', 'o__r');
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      chmodSync(join(s.home, '.cache'), 0o700); chmodSync(join(s.home, '.cache', 'pipegen'), 0o700);
+      writeFileSync(join(dir, 'state.json'), bad === 'corrupt' ? '{' : '{"version":1}', { mode: 0o600 });
+      if (bad === '0644') chmodSync(join(dir, 'state.json'), 0o644);
+      expect((await finish(s.g.octokit(), app, {}, s.deps())).applied.length).toBeGreaterThan(0);
+      expect(readFileSync(join(dir, 'state.json'), 'utf8')).toBe(bad === 'corrupt' ? '{' : '{"version":1}');
+    }
   });
 
   it('finish: run passes its lease down: finish takes no second one (no self-deadlock) and leaves it held', async () => {

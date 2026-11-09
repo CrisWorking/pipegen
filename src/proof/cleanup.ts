@@ -26,7 +26,7 @@ import type { CliIO } from '../cli/io.js';
 import { SecretVault } from '../create/secrets.js';
 import type { AiSpendMeter } from '../ai/spend-meter.js';
 import type { PipelineDraft } from '../types.js';
-import { onInterrupt, type InterruptContext } from '../util/exit-hooks.js';
+import { interrupting, onInterrupt, type InterruptContext } from '../util/exit-hooks.js';
 import { safeText } from '../util/safe-text.js';
 import { CapReachedError, type CapReached } from './caps.js';
 import { settleWrites } from './inflight.js';
@@ -751,7 +751,8 @@ export async function cleanupLeftovers(gh: Octokit, store: StateStore, opts: { c
   if (st === null) throw new StateError('There is no saved proof state.');
   // Plan V M5: a lease the caller already holds (uninstall's run 2) stays held after: giving it back would leave a gap in which another
   // pipegen (finish, update) could take it in the middle of the caller's run
-  const took = !store.holdsLeaseFor(st.app);
+  // G-LEASE-R1 (sec I1): from the store itself, never from the app the state file names
+  const took = !store.holdsLease();
   store.acquireLease(st.runId, 'cleanup');
   try {
     const t = proofTarget(st.app, { runId: st.runId });
@@ -761,6 +762,7 @@ export async function cleanupLeftovers(gh: Octokit, store: StateStore, opts: { c
       ...(opts.clock === undefined ? {} : { clock: opts.clock }), ...(opts.cancelWaitMs === undefined ? {} : { cancelWaitMs: opts.cancelWaitMs }),
     });
   } finally {
-    if (took) store.releaseLease();
+    // G-LEASE-R1 (sec M1): kept while a stop is under way; the exit hook drops it after the interrupt hooks
+    if (took && !interrupting()) store.releaseLease();
   }
 }
