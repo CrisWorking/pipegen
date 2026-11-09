@@ -129,10 +129,13 @@ describe('docs', () => {
     expect(smoke).toMatch(/version bump.*publish.*come before.*row 8.*R1.*R2|publish.*before.*row 8/is);
     expect(section(/Task 8 Step 5/).rows[13]?.[1]).toMatch(/builds an image|has a Dockerfile/);
     expect(section(/Task 8 Step 5/).rows[13]?.[1]).toMatch(/signs nothing|no signing/);
-    // F6: a first run on a private repo is unsigned until G-SIGN1 lands; a re-run after the environment exists signs
+    // F6, ruling G-SIGN1 (landed): a first run on a private repo with no signing environment makes it, reads it back, and signs; a re-run
+    // after the environment exists signs; an environment already there that can't be proven is left as it is, and the run is unsigned
     const signing = section(/Signing on a private project/).rows;
-    expect(signing.length).toBeGreaterThanOrEqual(2);
-    expect(signing.map((r) => r.join(' ')).join('\n')).toMatch(/first run.*unsigned.*G-SIGN1/is);
+    expect(signing.length).toBeGreaterThanOrEqual(3);
+    expect(signing.map((r) => r.join(' ')).join('\n')).toMatch(/first run.*no `pipegen-signing` environment signs.*G-SIGN1/is);
+    expect(signing.map((r) => r.join(' ')).join('\n')).not.toMatch(/until ruling G-SIGN1 lands|first run is unsigned/i);
+    expect(signing.map((r) => r.join(' ')).join('\n')).toMatch(/already there.*unchanged.*Signing is off \(mode none\)/is);
     expect(signing.map((r) => r.join(' ')).join('\n')).toMatch(/re-run.*environment exists.*signs/is);
     for (const r of signing) expect(r.at(-1)).toBe('not run');
     expect(text).toMatch(/G-SIGN1/);
