@@ -108,7 +108,7 @@ describe('docs', () => {
     // a source for every row of the per-task table, and the tasks the brief names
     for (const row of section(/Live items by task/).rows) expect(row[2], `source of ${row[0] ?? ''}`).toMatch(/\S/);
     const bySource = section(/Live items by task/).rows.map((r) => r[2]).join(' ');
-    for (const task of ['G0', 'G2', 'G3', 'G4', 'G4b', 'G5', 'G6', 'G7', 'G8', 'G10', 'G11', 'G13', 'G14', 'G15']) expect(bySource, task).toMatch(new RegExp(`\\b${task}\\b`));
+    for (const task of ['G0', 'G2', 'G3', 'G4', 'G4b', 'G5', 'G6', 'G7', 'G8', 'G10', 'G11', 'G13', 'G14', 'G15']) expect(bySource, task).toMatch(new RegExp(`\\b${task}[ab]?\\b`));
   });
 
   it('docs: design §4.1 and §19 and the threat model say what was built', () => {
