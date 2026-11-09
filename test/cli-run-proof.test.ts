@@ -28,6 +28,7 @@ import type { FixKeys } from '../src/proof/fix.js';
 import type { CliIO } from '../src/cli/io.js';
 import type { CreatedFile, PipelineDraft } from '../src/types.js';
 import { cleanHomes, failOn, PASS, proofWorld, RUN_ID, TYPED } from './helpers/proof-world.js';
+import { isWorkflowFile, realAssembled } from './helpers/real-workflows.js';
 
 afterAll(cleanHomes);
 const GATE_TOOL = REVIEWED.find((x) => x.id === 'pipegen-gate') as ReviewedTool;
@@ -1255,6 +1256,39 @@ describe('G14fix: a private app through the real proof harness', () => {
     expect(at(w.tl, 'keys.deleteAll')).toBeGreaterThan(-1);
     expect(at(w.tl, 'keys.deleteAll')).toBeLessThan(w.tl.findIndex((x) => x.startsWith('cleanup:')));
     expect(w.tl.some((x) => x.startsWith('variant:') || x === 'evaluate')).toBe(false);
+  });
+
+  // G17-F1 (sec I1, spec-1 M3): with the real assembled central workflows (whose step and output names hold the word `secrets`), the names
+  // read before the setup are known (not null), so the post-setup sameNames check is live: another secret read after the setup stops
+  it('run: G17-F1 with the real assembled central workflows the scratch keys know their names, and another secret read after the setup stops the proof', async () => {
+    const central = realAssembled().private.filter((f) => f.repo === 'central' && isWorkflowFile(f));
+    expect(central.map((f) => f.path)).toEqual(expect.arrayContaining(['.github/workflows/r--merge.yml', '.github/workflows/r--push.yml']));
+    const realCentral = (w: Awaited<ReturnType<typeof proofWorld>>): void => {
+      const asm = w.input.assembleFor;
+      w.input.assembleFor = async (d) => { const a = await asm(d); return async (mode, sha) => [...(await a(mode, sha)).filter((f) => f.repo === 'app'), ...central]; };
+    };
+    // the control: the same files after the setup, no stop for the names
+    const same = await proofWorld({ private: true });
+    realCentral(same);
+    const ok = await same.run();
+    expect(ok.stopped ?? '').not.toContain('other secrets than the ones the scratch keys were made for');
+    // the scratch keys were made for the names the files read (readByWorkflows given), not for every organisation secret
+    const made = same.tl.find((x) => x.startsWith('keys.new:'));
+    expect(made).toBeDefined();
+    expect(made).not.toBe('keys.new:<none>');
+    expect(made).toContain('PIPEGEN_FP_KEY');
+    // another secret read by the files built for the setup's central sha
+    const w = await proofWorld({ private: true });
+    realCentral(w);
+    const appFiles = w.ops.appFiles as NonNullable<typeof w.ops.appFiles>;
+    w.ops.appFiles = (d, deps) => {
+      const real = appFiles(d, deps);
+      return { last: real.last, appFiles: async (sha) => [...await real.appFiles(sha), { repo: 'app', path: '.github/workflows/extra.yml', content: `on: [push]\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: echo \${{ ${['sec', 'rets'].join('')}.OTHER_ONE }}\n`, part: 'pipeline', reason: 'r' }] };
+    };
+    const r = await w.run();
+    expect(r.ok).toBe(false);
+    expect(r.stopped).toContain('other secrets than the ones the scratch keys were made for');
+    expect(w.tl.some((x) => x === 'secretStore' || x.startsWith('keys.setup:') || x.startsWith('push:') || x.startsWith('pushBranch:'))).toBe(false);
   });
 
   it('run: a private app whose assembled workflows break a proof rule is refused before any GitHub write (G14fix-R1 F2)', async () => {

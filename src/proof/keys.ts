@@ -687,11 +687,16 @@ const isTokenRejected = (gh: Octokit, e: unknown): boolean => (e as { status?: u
  * E8 (carry E4-R4 R7): the secret names the proof's workflows read, for ScratchKeysDeps.readByWorkflows, upper-cased, sorted.
  * Fix round 2 (review O-1): read from the DECODED YAML, never the raw text. Each workflow is parsed by the referee's own
  * parser (engine/yaml-parse.ts, user mode); then every string scalar, keys included (escapes, quoting, block and flow styles
- * already decoded), is searched for `secrets` in any letter case (Unicode case folding: `ſecrets` counts too), each followed
- * by `.NAME` or `['NAME']` / `["NAME"]`. null (every organisation secret counts as read: ScratchKeys' fail-closed default)
- * when a workflow can't be parsed, when `secrets` appears without a name (`secrets[expr]`, `toJSON(secrets)`, the word in a
- * name or a script), or when a `secrets:` key passes anything but a map (`secrets: inherit` passes them all). The key
- * `secrets:` of a reusable-workflow call itself reads nothing: its values are scanned like any scalar.
+ * already decoded), is searched for the `secrets` context in any letter case (Unicode case folding: `ſecrets` counts too), each
+ * followed by `.NAME` or `['NAME']` / `["NAME"]`. G17-F1 (sec I1, spec-1 M3): only where GitHub reads an expression, so the word in
+ * a step name, an artifact or output name (`pipegen-out-secrets-sha256`) or a script no longer makes every pipegen pipeline
+ * unknown: the text of each `${{ … }}` (expressionParts: a `}}` inside a quoted string doesn't end it, and one with no end runs to
+ * the end of the scalar) and the whole value of an `if` key (an expression without `${{ }}`). Inside it, `secrets` is the context
+ * unless it is part of a longer name (a letter, digit, `_` or `-` on either side) or a property (`.` before it: `needs.secrets.x`).
+ * null (every organisation secret counts as read: ScratchKeys' fail-closed default) when a workflow can't be parsed, when the
+ * context appears without a name (`secrets[expr]`, `toJSON(secrets)`, the word in a quoted string of an expression), or when a
+ * `secrets:` key passes anything but a map (`secrets: inherit` passes them all). The key `secrets:` of a reusable-workflow call
+ * itself reads nothing: its values are scanned like any scalar.
  * Plan G G0 (E-F2 m2): an empty list (or no list) is null too. A proof always pushes at least one workflow, so an empty list
  * can only be a caller that passed the wrong set; read as "reads no secret" it would let an org secret through the brand.
  */
@@ -703,27 +708,66 @@ export function workflowSecretNames(workflows: readonly { content: string | Uint
     const r = parseYaml(text, 'user');
     if (!('parsed' in r)) return null;
     if (passesAllSecrets(r.parsed.js)) return null;
+    const ifs = new Set<string>();
+    ifValues(r.parsed.js, ifs);
     for (const scalar of r.parsed.scalars) {
-      if (scalar === 'secrets') continue;   // the reusable-workflow call's key (its map's values are scalars of their own)
-      for (const m of scalar.matchAll(/\bsecrets\b/giu)) {
-        const rest = scalar.slice((m.index ?? 0) + m[0].length);
-        const dot = /^\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)/.exec(rest);
-        const idx = /^\s*\[\s*(['"])([A-Za-z_][A-Za-z0-9_]*)\1\s*\]/.exec(rest);
-        const name = dot?.[1] ?? idx?.[2];
-        if (name === undefined) return null;
-        names.add(name.toUpperCase());
+      for (const expr of ifs.has(scalar) ? [scalar] : expressionParts(scalar)) {
+        for (const m of expr.matchAll(SECRETS_CONTEXT)) {
+          const rest = expr.slice((m.index ?? 0) + m[0].length);
+          const dot = /^\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)/.exec(rest);
+          const idx = /^\s*\[\s*(['"])([A-Za-z_][A-Za-z0-9_]*)\1\s*\]/.exec(rest);
+          const name = dot?.[1] ?? idx?.[2];
+          if (name === undefined) return null;
+          names.add(name.toUpperCase());
+        }
       }
     }
   }
   return [...names].sort();
 }
 
-/** Any `secrets:` key whose value isn't a map (`secrets: inherit`): every secret is passed on, so no name list is known. */
+/** G17-F1: the `secrets` context in an expression (any letter case, `ſ` folds to s): not part of a longer name, not a property. */
+const SECRETS_CONTEXT = /(?<![\p{L}\p{N}_.\-])secrets(?![\p{L}\p{N}_\-])/giu;
+
+/**
+ * G17-F1: the expressions of one scalar, each `${{` up to its `}}`. A `}}` inside a single-quoted string (`''` is a quote inside it)
+ * doesn't end it; an expression with no end (or a string that never closes) runs to the end of the scalar. Each part is at least
+ * what GitHub reads as the expression, never less (a longer part only finds more).
+ */
+function expressionParts(s: string): string[] {
+  const out: string[] = [];
+  for (let i = s.indexOf('${{'); i >= 0; i = s.indexOf('${{', i)) {
+    let j = i + 3;
+    let quoted = false;
+    for (; j < s.length; j++) {
+      if (s[j] === "'") quoted = !quoted;   // `''` toggles twice: still inside
+      else if (!quoted && s[j] === '}' && s[j + 1] === '}') break;
+    }
+    out.push(s.slice(i + 3, j));
+    i = j + 2;
+  }
+  return out;
+}
+
+/** G17-F1: every string value of an `if` key (any letter case): GitHub reads it whole as an expression. */
+function ifValues(v: unknown, out: Set<string>): void {
+  if (Array.isArray(v)) { for (const x of v) ifValues(x, out); return; }
+  if (typeof v !== 'object' || v === null) return;
+  for (const [k, x] of Object.entries(v)) {
+    if (k.toLowerCase() === 'if' && typeof x === 'string') out.add(x);
+    ifValues(x, out);
+  }
+}
+
+/** Any `secrets:` key whose value isn't a map (`secrets: inherit`): every secret is passed on, so no name list is known. Also any key
+ * spelled `secrets` in another letter case (G17-F1: outside an expression the word reads nothing, so this case is decided here). */
 function passesAllSecrets(v: unknown): boolean {
   if (Array.isArray(v)) return v.some(passesAllSecrets);
   if (typeof v !== 'object' || v === null) return false;
   for (const [k, x] of Object.entries(v)) {
     if (k === 'secrets' && (typeof x !== 'object' || x === null || Array.isArray(x))) return true;
+    // G17-F1: a key that is `secrets` in another letter case (`SECRETS`, `ſecrets`) is never taken as reading nothing: unknown
+    if (k !== 'secrets' && /^secrets$/iu.test(k)) return true;
     if (passesAllSecrets(x)) return true;
   }
   return false;
