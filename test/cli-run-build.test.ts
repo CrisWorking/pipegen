@@ -429,3 +429,29 @@ describe('G17A-R2: judgeBuilt and the fix loop pass the workflow texts to the re
     expect(report.issues.map((x) => `${x.file}: ${x.message}`)).toEqual([]);
   });
 });
+
+// ---------- G17A-R3 r3-I1: --skip deploy on a repository with a deploy workflow is no false stop ----------
+describe('G17A-R3: --skip deploy lists each deploy workflow as a gap, through the real build path', () => {
+  const DEPLOY = '.github/workflows/deploy.yml';
+  const PLAIN = 'on:\n  push:\n    branches: [main]\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    environment: production\n    steps:\n      - run: ./ship.sh\n';
+  const wf = (path: string, triggers: string[], deploys: boolean) => ({ path, triggers, deploys, [['secrets', 'Used'].join('')]: [], jobs: [] });
+  for (const priv of [false, true]) {
+    it(`G17A-R3 r3-I1: --skip deploy with a push deploy workflow: no issue from judgeBuilt or the fix loop; PIPEGEN.md lists it as unprotected (${priv ? 'private' : 'public'})`, async () => {
+      const i0 = input(priv);
+      const profile = { ...i0.draft.profile, existingWorkflows: [wf(DEPLOY, ['push'], true)] } as unknown as PipelineDraft['profile'];
+      const i = { ...i0, draft: { ...i0.draft, profile, skipped: [...i0.draft.skipped, { part: 'deploy', reason: 'the user skipped it' }] } } as unknown as BuildInput;
+      const facts = { ...FACTS, centralFiles: [], texts: new Map([[DEPLOY, PLAIN]]) } as unknown as BuildFacts;
+      const files = await buildFiles(i, facts);
+      expect(files.verify.inserts).toEqual([]);
+      expect(files.verify.gaps.map((g) => [g.path, g.why])).toEqual([[DEPLOY, expect.stringMatching(/you skipped the deploy part \(--skip deploy\)/)]]);
+      expect(files.assembled.draft.doc?.deployGaps.map((g) => g.path)).toEqual([DEPLOY]);
+      const md = files.doc.content;
+      expect(md).toMatch(/deploy\.yml.*you skipped the deploy part/);
+      const judged = await judgeBuilt(i, files, facts, { linters: judgeDeps.linters, judge: noLinters });
+      expect(judged.report.issues.map((x) => `${x.file}: ${x.message}`)).toEqual([]);
+      const pb = proofBuildFor(i, facts, undefined, { linters: judgeDeps.linters, guard: async (fs) => ({ ok: [...fs], refused: [], notes: [] }), runLinters: async () => [] });
+      const report = await pb.referee(i.draft);
+      expect(report.issues.map((x) => `${x.file}: ${x.message}`)).toEqual([]);
+    });
+  }
+});

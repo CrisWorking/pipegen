@@ -1637,3 +1637,41 @@ describe('G17A-R2: the referee binds the batch to the plan\'s inputs', () => {
     expect(r2.issues.some((i) => new RegExp(`The edit's original of ${SHIP.replace(/[./]/g, '\\$&')} is not the text pipegen read`).test(i.message)), shown(r2)).toBe(true);
   });
 });
+
+// ---------- G17A-R3 (r3-I1, r3-M1): a listed gap is re-derived; --skip deploy makes every deploy workflow a gap ----------
+describe('G17A-R3: the gap list is re-derived, never trusted', () => {
+  const CALLER_B2 = 'on:\n  push:\n    branches: [main]\njobs:\n  release:\n    uses: ./.github/workflows/ship.yml\n';
+  const forgedGap = (path: string): RegExp => new RegExp(`${path.replace(/[./]/g, '\\$&')} is listed as a gap, but pipegen's deploy layer protects it`);
+  it('G17A-R3 r3-M1: a false gap for a workflow the layer gates is refused (probe FG1); an insert-refusal reason is accepted', async () => {
+    const two = world('keyless', [[A, CALLER_A], [B, CALLER_B2], [SHIP, CALLED_A]]);
+    const ta = insertAt(two, A)?.file as CreatedFile;
+    const fg1 = await judge(two, [ta], two.texts, [{ path: B, triggers: ['push'], why: 'forged' }, { path: SHIP, triggers: ['workflow_call'], why: 'forged' }]);
+    expect(fg1.issues.some((i) => forgedGap(B).test(i.message)), shown(fg1)).toBe(true);
+    // a plain deploy listed with the layer's own insert-refusal reason: accepted (the reason pipegen writes when insertVerify refuses)
+    const plain = world('keyless', [[A, DEPLOY_A]]);
+    const refusal = await judge(plain, [], plain.texts, [{ path: A, triggers: ['push'], why: 'pipegen can not add its check without changing the rest of the file: x' }]);
+    expect(shown(refusal)).toBe('');
+    const other = await judge(plain, [], plain.texts, [{ path: A, triggers: ['push'], why: 'listed' }]);
+    expect(other.issues.some((i) => forgedGap(A).test(i.message)), shown(other)).toBe(true);
+    // the skip reason only when the deploy part is skipped
+    const skipWhy = await judge(plain, [], plain.texts, [{ path: A, triggers: ['push'], why: 'you skipped the deploy part (--skip deploy), so pipegen adds no check before its deploy' }]);
+    expect(skipWhy.issues.some((i) => forgedGap(A).test(i.message)), shown(skipWhy)).toBe(true);
+  });
+  it('G17A-R3 r3-M1: a workflow both edited and listed as a gap is refused (probe FG3)', async () => {
+    const w = world('keyless', [[A, DEPLOY_A]]);
+    const r = await judge(w, undefined, w.texts, [{ path: A, triggers: ['push'], why: 'pipegen can not add its check without changing the rest of the file: x' }]);
+    expect(r.issues.some((i) => /is both edited by pipegen and listed as a gap/.test(i.message)), shown(r)).toBe(true);
+  });
+  it('G17A-R3 r3-I1: with the deploy part skipped, every deploy workflow is a gap with the skip reason, and the referee accepts it', async () => {
+    for (const kind of ['keyless', 'key-env', 'none'] as const) {
+      for (const wfs of [[[A, DEPLOY_A]], [[A, CALLER_A], [SHIP, CALLED_A]], [[A, CALLER_A], [B, CALLER_B2], [SHIP, CALLED_A]]] as [string, string][][]) {
+        const w = world(kind, wfs, { draft: { skipped: [{ part: 'deploy', reason: 'the user skipped it' }] } });
+        expect(w.a.verify).toBeNull();
+        expect(w.v.inserts).toEqual([]);
+        expect(w.v.gaps.map((g) => g.path).sort()).toEqual(wfs.map(([path]) => path).sort());
+        for (const g of w.v.gaps) expect(g.why).toMatch(/^you skipped the deploy part \(--skip deploy\)/);
+        expect(shown(await judge(w)), `${kind} ${wfs.length}`).toBe('');
+      }
+    }
+  });
+});
