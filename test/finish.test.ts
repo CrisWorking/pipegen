@@ -25,6 +25,10 @@ import { emptyRepoFiles } from '../src/read/quality.js';
 import type { Capabilities, CreatedFile, InstallPlanned, InstallRecord, Plan, RepoProfile } from '../src/types.js';
 import { cosignKey, cosignPub, envelope } from './helpers/cosign-keys.js';
 import { FinishGitHub } from './helpers/finish-github.js';
+import { hostname } from 'node:os';
+import { update, UpdateError } from '../src/deliver/update.js';
+import { StateStore } from '../src/proof/state.js';
+import { runExitHooks } from '../src/util/exit-hooks.js';
 
 // ---------- fixtures ----------
 
@@ -2217,5 +2221,126 @@ describe('G17C-R1: finish (F4, F6)', () => {
     expect(e.message).toContain(f);
     expect(e.message).toContain('npx pipegen finish');
     expect(e.message).not.toMatch(/npx pipegen run/);
+  });
+});
+
+// ---------- Plan V M5: the app's lease ----------
+
+describe('Plan V M5: finish holds the app lease', () => {
+  const app = { owner: 'o', repo: 'r' };
+  const st = (s: Seed) => ({ home: s.home, env: {} });
+  /** `base` with `before` awaited ahead of each of its request() calls (the rest of the Octokit unchanged). */
+  const withRequest = (base: ReturnType<FinishGitHub['octokit']>, before: (route: string) => Promise<void>): ReturnType<FinishGitHub['octokit']> =>
+    new Proxy(base, { get: (t, k, r) => (k === 'request'
+      ? async (route: string, params?: Record<string, unknown>) => { await before(route); return t.request(route as never, params as never); }
+      : Reflect.get(t, k, r)) });
+  const noIo = { confirm: async () => false, select: async () => { throw new Error('no select'); }, text: async () => { throw new Error('no text'); } };
+  /** finish's Octokit, with `rival` run (to its end) right before finish's first write: the two pipegen commands side by side. */
+  const sideBySide = (s: Seed, rival: () => Promise<unknown>) => {
+    const base = s.g.octokit();
+    const seen: { result?: unknown; callsDuring?: number } = {};
+    const gh = withRequest(base, async (route) => {
+      if (!route.startsWith('GET ') && !('result' in seen)) {
+        const before = s.g.calls.length;
+        seen.result = await rival().then(() => 'ran', (e: unknown) => e);
+        seen.callsDuring = s.g.calls.length - before;
+      }
+    });
+    return { gh, seen };
+  };
+
+  it('finish: another pipegen holding the app lease (an uninstall\'s phase A) stops finish before any GitHub call, naming it', async () => {
+    const s = await seed();
+    const other = await StateStore.open(app, st(s));
+    other.acquireLease('uninstall-abc', 'uninstall');
+    const from = s.g.calls.length;
+    const e = await finish(s.g.octokit(), app, {}, s.deps()).then(() => null, (x: unknown) => x);
+    expect(e).toBeInstanceOf(FinishError);
+    expect((e as Error).message).toMatch(/^Another pipegen \(`pipegen uninstall`, process \d+\) is working on .* Wait for it to finish, or stop it, then run pipegen again\. If process \d+ is not pipegen, remove \S+lease\.json and run pipegen again\. Nothing was applied\.$/);
+    expect(s.g.calls.length).toBe(from);
+    // --print too: it reads what the uninstall is changing
+    await expect(finish(s.g.octokit(), app, { print: true }, s.deps())).rejects.toThrow(/`pipegen uninstall`/);
+    expect(s.g.calls.length).toBe(from);
+    other.releaseLease();
+    // once the uninstall is over, finish runs
+    expect((await finish(s.g.octokit(), app, {}, s.deps())).applied.length).toBeGreaterThan(0);
+  });
+
+  it('finish: update beside finish: update stops before any GitHub call, naming finish; finish ends as planned and gives the lease back', async () => {
+    const s = await seed();
+    const { gh, seen } = sideBySide(s, () => update(s.g.octokit(), app, { io: noIo, reviewed: [], local: { home: s.home, env: {} } }));
+    const res = await finish(gh, app, {}, s.deps());
+    expect(seen.result).toBeInstanceOf(UpdateError);
+    expect((seen.result as Error).message).toMatch(/Another pipegen \(`pipegen finish`, process \d+\) is working on .* Nothing was changed\.$/);
+    expect(seen.callsDuring).toBe(0);
+    expect(res.applied.length).toBeGreaterThan(0);
+    const probe = await StateStore.open(app, st(s));
+    probe.acquireLease('after', 'update');
+    probe.releaseLease();
+  });
+
+  it('finish: a second finish beside finish stops too (the same lease, same stale-lease rules)', async () => {
+    const s = await seed();
+    const { gh, seen } = sideBySide(s, () => finish(s.g.octokit(), app, {}, s.deps()));
+    await finish(gh, app, {}, s.deps());
+    expect(seen.result).toBeInstanceOf(FinishError);
+    expect((seen.result as Error).message).toMatch(/`pipegen finish`/);
+    expect(seen.callsDuring).toBe(0);
+    // a lease left by a process that is gone is taken over, as run's is
+    const lease = join(s.home, '.cache', 'pipegen', 'o__r', 'lease.json');
+    writeFileSync(lease, JSON.stringify({ pid: 2 ** 22 + 12345, host: hostname(), runId: 'gone', [['to', 'ken'].join('')]: 't', command: 'uninstall' }), { mode: 0o600 });
+    expect((await finish(s.g.octokit(), app, {}, s.deps())).applied).toBeDefined();
+    expect(existsSync(lease)).toBe(false);
+  });
+
+  it('finish: G-LEASE-R1 (spec I1) a corrupt or 0644 proof state file beside the lease does not stop finish (it never reads it)', async () => {
+    for (const bad of ['corrupt', '0644'] as const) {
+      const s = await seed();
+      const dir = join(s.home, '.cache', 'pipegen', 'o__r');
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      chmodSync(join(s.home, '.cache'), 0o700); chmodSync(join(s.home, '.cache', 'pipegen'), 0o700);
+      writeFileSync(join(dir, 'state.json'), bad === 'corrupt' ? '{' : '{"version":1}', { mode: 0o600 });
+      if (bad === '0644') chmodSync(join(dir, 'state.json'), 0o644);
+      expect((await finish(s.g.octokit(), app, {}, s.deps())).applied.length).toBeGreaterThan(0);
+      expect(readFileSync(join(dir, 'state.json'), 'utf8')).toBe(bad === 'corrupt' ? '{' : '{"version":1}');
+    }
+  });
+
+  it('finish: run passes its lease down: finish takes no second one (no self-deadlock) and leaves it held', async () => {
+    const s = await seed();
+    const run = await StateStore.open(app, st(s));
+    run.acquireLease('20261106-100000-abc123', 'run');
+    const res = await finish(s.g.octokit(), app, {}, s.deps({ lease: run }));
+    expect(res.applied.length).toBeGreaterThan(0);
+    expect(run.holdsLeaseFor(app)).toBe(true);
+    run.releaseLease();
+  });
+
+  it('finish: the lease is given back on an error and is dropped by the exit hook on an interrupt', async () => {
+    // an error: no install record → FinishError, lease given back
+    const s = await seed();
+    rmSync(join(s.home, '.config'), { recursive: true, force: true });
+    await expect(finish(s.g.octokit(), app, {}, s.deps())).rejects.toThrow(FinishError);
+    const probe = await StateStore.open(app, st(s));
+    probe.acquireLease('after-error', 'update');
+    probe.releaseLease();
+    // an interrupt: the sync exit hooks (what SIGINT/SIGTERM run after the interrupt hooks) drop finish's lease while it runs
+    const s2 = await seed();
+    const lease = join(s2.home, '.cache', 'pipegen', 'o__r', 'lease.json');
+    let heldAtWrite: boolean | null = null;
+    let afterHooks: boolean | null = null;
+    const base = s2.g.octokit();
+    const gh = withRequest(base, async (route) => {
+      if (!route.startsWith('GET ') && heldAtWrite === null) {
+        heldAtWrite = existsSync(lease);
+        runExitHooks();
+        afterHooks = existsSync(lease);
+      }
+    });
+    // another pipegen may take the lease once the hook dropped it; finish's own release never removes that one
+    await finish(gh, app, {}, s2.deps()).catch(() => undefined);
+    expect(heldAtWrite).toBe(true);
+    expect(afterHooks).toBe(false);
+    expect(existsSync(lease)).toBe(false);
   });
 });

@@ -10,8 +10,11 @@ import type { Octokit } from '@octokit/rest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PromptCancelledError, type Prompter } from '../src/cli/io.js';
 import { gitBlobSha } from '../src/create/guard.js';
+import { finish, FinishError } from '../src/deliver/finish.js';
 import { localRecordPath, recordPath } from '../src/deliver/record.js';
+import { holdAppLease } from '../src/proof/lease.js';
 import { StateStore } from '../src/proof/state.js';
+import { runExitHooks } from '../src/util/exit-hooks.js';
 import type { InstallEdit, InstallRecord } from '../src/types.js';
 import { applyPhaseA, confirmPlan, PhaseApi, takeApi, uninstallStep, type PhaseBRunner, type PhasePlan, type StepDeps, type StepResult } from '../src/uninstall/apply.js';
 import { UninstallError } from '../src/uninstall/errors.js';
@@ -529,6 +532,12 @@ describe('uninstall apply, phase A (V5)', () => {
     expect(writeCalls(w).filter((c) => c.params.repo === 'pipelines')).toEqual([]);
     expect(readFileSync(lr, 'utf8')).toBe('{"recordHash":"x"}\n');
     expect(h.fns).toEqual([]);   // the interrupt hook is unregistered after the run
+    // G-LEASE-R1 (sec M1): a stopped run keeps the app's lease past its own end; the exit hook drops it after the hook phase
+    const leaseFile = join((await StateStore.open({ owner: 'o', repo: 'shop' }, local(w))).dir, 'lease.json');
+    expect(existsSync(leaseFile)).toBe(true);
+    await expect(holdAppLease({ owner: 'o', repo: 'shop' }, 'finish', { state: local(w) })).rejects.toThrow(/`pipegen uninstall`/);
+    runExitHooks();
+    expect(existsSync(leaseFile)).toBe(false);
     // the re-run resumes run 1: the rest of the locks, the same PR (updated), no second delete of the ruleset
     h.stop.now = false;
     const before = w.g.calls.length;
@@ -572,6 +581,36 @@ describe('uninstall apply, phase A (V5)', () => {
     await run(w, rec, term({ go: () => false }));
     probe.acquireLease('after-declined');
     probe.releaseLease();
+  });
+
+  it('apply: finish beside an uninstall phase A stops before any GitHub call, naming uninstall (Plan V M5); finish after it runs', async () => {
+    const w = world();
+    const rec = sampleRecord(w);
+    w.app.rulesets.set(41, liveRs());
+    const shop = { owner: 'o', repo: 'shop' };
+    const finishDeps = { out: () => {}, probe: async () => { throw new Error('finish must not probe'); }, cosignBin: async () => '/none', local: local(w) };
+    // phase A's first write: `pipegen finish` starts in the same repo on this machine (the command phase A's messages suggest)
+    const base = gh(w);
+    let rival: unknown = null;
+    let callsDuring = -1;
+    const side = new Proxy(base, { get: (t, k, r) => (k === 'request'
+      ? async (route: string, params?: Record<string, unknown>) => {
+        if (!route.startsWith('GET ') && rival === null) {
+          const before = w.g.calls.length;
+          rival = await finish(base, shop, {}, finishDeps as never).then(() => 'ran', (e: unknown) => e);
+          callsDuring = w.g.calls.length - before;
+        }
+        return t.request(route as never, params as never);
+      }
+      : Reflect.get(t, k, r)) });
+    const r = await uninstallStep(side, loadedOf(w, rec), term().p, deps(w));
+    expect(r.status).toBe('a-done');
+    expect(rival).toBeInstanceOf(FinishError);
+    expect((rival as Error).message).toMatch(/^Another pipegen \(`pipegen uninstall`, process \d+\) is working on .* Nothing was applied\.$/);
+    expect(callsDuring).toBe(0);
+    // uninstall gave the lease back: finish now gets past it (and stops on its own checks, not on the lease)
+    const after = await finish(base, shop, {}, finishDeps as never).then(() => null, (e: unknown) => e);
+    expect(String((after as Error | null)?.message)).not.toMatch(/Another pipegen/);
   });
 
   it('apply: pipegen/setup deleted only after its pull request closed, while it is the commit the plan checked and no pull request is open on it', async () => {

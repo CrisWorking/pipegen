@@ -12,6 +12,7 @@ import { ensurePinnedBinary } from '../engine/linters.js';
 import { loadReviewed } from '../engine/reviewed.js';
 import { getAuth, GITHUB_TIMEOUT_MS, makeOctokit } from '../github/client.js';
 import { readOrigin } from '../read/project.js';
+import type { StateStore } from '../proof/state.js';
 import { CENTRAL_REPO } from '../proof/target.js';
 import type { RepoRef } from '../deliver/git-data.js';
 import type { Auth } from '../types.js';
@@ -23,7 +24,11 @@ import type { CliIO } from './io.js';
 export const interactiveRun = (io: Pick<CliIO, 'interactive' | 'env'>): boolean => io.interactive === true && (io.env.CI ?? '') === '';
 
 /** What finish, verify and update need of GitHub (tests pass a fake). */
-export interface CommandGitHub { gh: Octokit; login: string | null; local?: LocalRecordDeps; clock?: RateClock }
+/**
+ * `lease` (Plan V M5): the app's lease a caller already holds (run, which finishes in its own process); undefined → finish and update take it
+ * themselves. A required key, so a caller that holds one can't leave it out by accident (that would stop on its own process).
+ */
+export interface CommandGitHub { gh: Octokit; login: string | null; local?: LocalRecordDeps; clock?: RateClock; lease: StateStore | undefined }
 
 /** The folder's origin repo, a token for it and its central repo (least privilege: `write` for finish and update, `read` for verify). */
 export async function connect(io: CliIO, dir: string, o: { allowBroad: boolean; mode: 'read' | 'write' }): Promise<{ app: RepoRef; g: CommandGitHub; token: string | null; canDeleteRepos: boolean; kind: Auth['kind'] }> {
@@ -35,7 +40,7 @@ export async function connect(io: CliIO, dir: string, o: { allowBroad: boolean; 
   const login = await tokenLogin(gh, auth, clock, notes);
   for (const n of notes) io.err(n);
   // V7 fold 1: what the auth layer computed, copied as it is (never inferred): uninstall's --delete-repos acts only on canDeleteRepos
-  return { app, token: auth.token, canDeleteRepos: auth.canDeleteRepos, kind: auth.kind, g: { gh, login, clock, local: { env: io.env } } };
+  return { app, token: auth.token, canDeleteRepos: auth.canDeleteRepos, kind: auth.kind, g: { gh, login, clock, local: { env: io.env }, lease: undefined } };
 }
 
 const show = (s: string, n = 300): string => safeText(s, n);
@@ -45,6 +50,7 @@ export async function finishCommand(io: CliIO, app: RepoRef, opts: FinishOpts, g
   const res = await run(g.gh, app, opts, {
     out: (l) => { io.out(l); }, probe: githubFinishProbe(g.login), cosignBin: () => ensurePinnedBinary('cosign'),
     ...(g.clock === undefined ? {} : { clock: g.clock }), local: g.local ?? {}, io: io.prompt, interactive: interactiveRun(io),
+    ...(g.lease === undefined ? {} : { lease: g.lease }),
   });
   for (const a of res.applied) io.out(`applied: ${show(a)}`);
   for (const s of res.skipped) io.out(`skipped: ${show(s.what)} (${show(s.why, 600)})`);
@@ -77,6 +83,7 @@ export async function verifyCommand(io: CliIO, app: RepoRef, g: CommandGitHub, r
 export async function updateCommand(io: CliIO, app: RepoRef, g: CommandGitHub, run: typeof update = update): Promise<number> {
   const res = await run(g.gh, app, {
     io: io.prompt, reviewed: loadReviewed(), interactive: interactiveRun(io), local: g.local ?? {}, ...(g.clock === undefined ? {} : { clock: g.clock }),
+    ...(g.lease === undefined ? {} : { lease: g.lease }),
   });
   if (res.preview !== '') io.out(res.preview);
   if (res.prUrl !== undefined) io.out(`pull request: ${show(res.prUrl)}`);

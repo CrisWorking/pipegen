@@ -259,17 +259,18 @@ export interface RunStages {
   /** previewText(planDelivery(input)): what the one confirmation shows. */
   preview(input: DeliveryInput): string;
   /** `pr` (G17C-R1, F5): the central pull request an earlier run opened, from the run state. */
-  deliverCentral(f: GitHubFacts, p: RepoProfile, files: readonly CreatedFile[], io: CliIO, pr?: CentralPr): Promise<CentralResult>;
+  /** `lease` (Plan V M5): run's own lease of the app, passed down (deliver takes no second one: that would stop on this process). */
+  deliverCentral(f: GitHubFacts, p: RepoProfile, files: readonly CreatedFile[], io: CliIO, pr: CentralPr | undefined, lease: StateStore): Promise<CentralResult>;
   readCentralFileList(f: GitHubFacts, p: RepoProfile): Promise<string[]>;
   signingKey(): Promise<SigningKey>;
   /** Ruling G-SIGN1: makeRunSigningEnvironment (the run's own pipegen-signing, made new and read back), or why signing is off. */
   signingEnv(f: GitHubFacts, p: RepoProfile): Promise<{ env: SigningEnvEntry } | { off: string }>;
   /** Ruling G-SIGN1-R1: dropRunSigningEnvironment (the run stops before delivery: the environment it made is deleted), or why it stays. */
   dropSigningEnv(f: GitHubFacts, p: RepoProfile, env: SigningEnvEntry): Promise<{ dropped: true } | { left: string }>;
-  deliver(f: GitHubFacts, p: RepoProfile, input: DeliveryInput, vault: SecretVault, io: CliIO, signingKey?: () => Promise<SigningKey>): Promise<DeliverResult>;
+  deliver(f: GitHubFacts, p: RepoProfile, input: DeliveryInput, vault: SecretVault, io: CliIO, signingKey: (() => Promise<SigningKey>) | undefined, lease: StateStore): Promise<DeliverResult>;
   /** The setup PR: merged, closed (unmerged) or still open. */
   prState(f: GitHubFacts, p: RepoProfile, pr: number): Promise<'merged' | 'closed' | 'open'>;
-  finish(f: GitHubFacts, p: RepoProfile, io: CliIO): Promise<number>;
+  finish(f: GitHubFacts, p: RepoProfile, io: CliIO, lease: StateStore): Promise<number>;
 }
 export interface Creators { files: CreatedFile[]; notes: string[]; testNotes: string[]; testDecisions: PipelineDraft['testDecisions']; notProven: PipelineDraft['notProven'] }
 
@@ -356,7 +357,9 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     (vault as SecretVault | null)?.wipe();
     (keyVault as SecretVault | null)?.wipe();
     try { (disarm as (() => void) | null)?.(); } catch { /* the state file keeps what was done */ }
-    try { (store as StateStore | null)?.releaseLease(); } catch { /* released at exit anyway */ }
+    // G-LEASE-R1 (sec M1): while a stop is under way, the interrupt hooks (the env drop, the proof cleanup) still write to GitHub after this
+    // finally; the lease stays until the exit hook acquireLease registered drops it, at the end of the hook phase
+    if (!(deps.interrupting ?? interrupting)()) try { (store as StateStore | null)?.releaseLease(); } catch { /* released at exit anyway */ }
   }
 
   async function go(): Promise<number> {
@@ -478,11 +481,11 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
       if (agreed.scanner !== undefined) scannerName = agreed.scanner;
       if (agreed.monthlyMinutes !== undefined) agreedMinutes = agreed.monthlyMinutes;
       runId = saved0.runId;
-      store.acquireLease(runId);
+      store.acquireLease(runId, 'resume');
     } else {
       runId = (deps.runId ?? (() => newRunId(now())))();
-      // S20: one pipegen per app repo on this machine
-      store.acquireLease(runId);
+      // S20: one pipegen per app repo on this machine (Plan V M5: deliver and finish below use this lease, passed down)
+      store.acquireLease(runId, 'run');
       store.begin(runId, { owner: p.owner, repo: p.repo, private: p.private, ownerType: p.ownerType, defaultBranch: p.defaultBranch }, {
         cap: est.setupMinutesCap, aiCap: est.aiCostCapUsd,
         // G14-R1 (sec I2, M6): the consent's terms, for a resume (names only)
@@ -681,7 +684,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     let centralCommitted: string | undefined;
     if (p.private) {
       const centralFiles = built.files.filter((f) => f.repo === 'central' && !f.path.endsWith('--required.yml') && /^\.github\/workflows\/[^/]+--[^/]+\.ya?ml$/.test(f.path));
-      const c = await st.deliverCentral(facts, p, centralFiles, io, saved.centralPr);
+      const c = await st.deliverCentral(facts, p, centralFiles, io, saved.centralPr, runStore);
       // G17C-R1 (F5): the PR and pipegen's commit on it are kept, so the next run can prove its merge put pipegen's files there
       if (c.kind === 'central-pr' && c.pr !== undefined) store.centralPrOpened(c.pr.number, c.pr.commit);
       if (c.kind === 'central-pr') { out(safeText(c.message, 600)); err('exit code 2: merge the central pull request, then run `npx pipegen run` again.'); return 2; }
@@ -737,7 +740,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     // here (its hook deletes the environment); else delivery takes the run's signing environment (the record or its leftovers name it)
     if ((deps.interrupting ?? interrupting)()) { err(STOP_AT_HAND_OFF); return 1; }
     if (handOver) { try { (disarmEnv as (() => void) | null)?.(); } finally { disarmEnv = null; dropEnv = null; } }
-    const res = await st.deliver(facts, p, input, vault, io, keyEnv && key !== undefined ? async () => key : undefined);
+    const res = await st.deliver(facts, p, input, vault, io, keyEnv && key !== undefined ? async () => key : undefined, runStore);
     deliveredRun = true;
     store.setStage('delivered');
     // carry 19 (spec I4): everything delivery says
@@ -758,7 +761,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
       out('A team that applies settings itself: `npx pipegen finish --print` prints the commands instead.');
       return 0;
     }
-    const code = await st.finish(facts, p, io);
+    const code = await st.finish(facts, p, io, runStore);
     // 21. the summary
     out(code === 0 ? 'pipegen set up this repository.' : 'pipegen delivered the setup; finish did not complete (see above).');
     return code;
@@ -1241,7 +1244,7 @@ function realStages(io: CliIO, deps: RunDeps): RunStages {
       return { ...files, ...(await judgeBuilt(i, files, facts)), proof: proofBuildFor(i, facts, envPlan) };
     },
     trusted: (f, p, io2) => trustedForRun(f, p, local, io2.prompt, interactive),
-    deliverCentral: (f, p, files, io2, pr) => deliverCentral(f.gh, p, files, { clock: f.clock, local, io: io2.prompt, interactive, ...(pr === undefined ? {} : { pr }) }),
+    deliverCentral: (f, p, files, io2, pr, lease) => deliverCentral(f.gh, p, files, { clock: f.clock, local, io: io2.prompt, interactive, lease, ...(pr === undefined ? {} : { pr }) }),
     readCentralFileList: (f, p) => readCentralFileList(f.gh, p, f.clock),
     preview: (input) => previewText(planDelivery(input)),
     dropSigningEnv: (f, p, env) => dropRunSigningEnvironment(f.gh, { owner: p.owner, repo: p.repo }, env, { clock: f.clock, local, now: new Date((deps.now ?? Date.now)()) }),
@@ -1251,12 +1254,12 @@ function realStages(io: CliIO, deps: RunDeps): RunStages {
       const k = await generateCosignKeys(() => ensurePinnedBinary('cosign'));
       return { key: k.privateKey, password: k.password, pub: k.publicKey };
     },
-    deliver: (f, p, input, v, io2, signingKey) => deliver(f.gh, p, planDelivery(input), v, { io: io2.prompt, clock: f.clock, local, interactive, ...(signingKey === undefined ? {} : { signingKey }) }),
+    deliver: (f, p, input, v, io2, signingKey, lease) => deliver(f.gh, p, planDelivery(input), v, { io: io2.prompt, clock: f.clock, local, interactive, lease, ...(signingKey === undefined ? {} : { signingKey }) }),
     async prState(f, p, pr) {
       const d = (await f.gh.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', { owner: p.owner, repo: p.repo, pull_number: pr })).data as { merged_at?: string | null; state?: string };
       return typeof d.merged_at === 'string' ? 'merged' : d.state === 'closed' ? 'closed' : 'open';
     },
-    finish: (f, p, io2) => finishCommand(io2, { owner: p.owner, repo: p.repo }, {}, { gh: f.gh, login: f.login, local, clock: f.clock }),
+    finish: (f, p, io2, lease) => finishCommand(io2, { owner: p.owner, repo: p.repo }, {}, { gh: f.gh, login: f.login, local, clock: f.clock, lease }),
   };
 }
 

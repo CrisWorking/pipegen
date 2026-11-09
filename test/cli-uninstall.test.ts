@@ -363,9 +363,9 @@ describe('V7: the docs say what was built', () => {
     expect(s14).not.toMatch(/Only secrets with the `PIPEGEN_` prefix/);
     expect(s14).toMatch(/two runs of the same command \(phase A, phase B\)/);
     expect(s14).toMatch(/Why two runs: the uninstall PR deletes `pipegen\.yml`.*`pipegen \/ gate`.*`pipegen-verify`.*install record/s);
-    const t55 = read('docs/threat-model.md').split('\n').find((l) => l.startsWith('| T55 |')) as string;
-    expect(t55).toMatch(/An edited install record turns uninstall into a delete tool/);
-    for (const part of [/GitHub's current id and `created_at` equal the recorded ones/, /path claim/, /builder forms/, /strict schema/, /typed|Names are typed/, /trustedPrevious/]) expect(t55, String(part)).toMatch(part);
+    const t56 = read('docs/threat-model.md').split('\n').find((l) => l.startsWith('| T56 |')) as string;
+    expect(t56).toMatch(/An edited install record turns uninstall into a delete tool/);
+    for (const part of [/GitHub's current id and `created_at` equal the recorded ones/, /path claim/, /builder forms/, /strict schema/, /typed|Names are typed/, /trustedPrevious/]) expect(t56, String(part)).toMatch(part);
     // the V-live rows: the steps in order, every result "not run"
     const smoke = read('docs/smoke-test.md');
     const sec = smoke.slice(smoke.indexOf('## Uninstall (V-live)'), smoke.indexOf('## Release'));

@@ -26,7 +26,7 @@ import type { CliIO } from '../cli/io.js';
 import { SecretVault } from '../create/secrets.js';
 import type { AiSpendMeter } from '../ai/spend-meter.js';
 import type { PipelineDraft } from '../types.js';
-import { onInterrupt, type InterruptContext } from '../util/exit-hooks.js';
+import { interrupting, onInterrupt, type InterruptContext } from '../util/exit-hooks.js';
 import { safeText } from '../util/safe-text.js';
 import { CapReachedError, type CapReached } from './caps.js';
 import { settleWrites } from './inflight.js';
@@ -749,7 +749,11 @@ export function restoreAiSpend(meter: AiSpendMeter, s: Pick<RunState, 'aiCostUsd
 export async function cleanupLeftovers(gh: Octokit, store: StateStore, opts: { canDeleteRepo: boolean; clock?: PollClock; cancelWaitMs?: number; settleMs?: number; io: Pick<CliIO, 'prompt' | 'out' | 'err'> }): Promise<CleanupResult> {
   const st = store.state;
   if (st === null) throw new StateError('There is no saved proof state.');
-  store.acquireLease(st.runId);
+  // Plan V M5: a lease the caller already holds (uninstall's run 2) stays held after: giving it back would leave a gap in which another
+  // pipegen (finish, update) could take it in the middle of the caller's run
+  // G-LEASE-R1 (sec I1): from the store itself, never from the app the state file names
+  const took = !store.holdsLease();
+  store.acquireLease(st.runId, 'cleanup');
   try {
     const t = proofTarget(st.app, { runId: st.runId });
     const keys = new ScratchKeys(gh, t, new SecretVault(), { io: opts.io, leftover: () => {} });
@@ -758,6 +762,7 @@ export async function cleanupLeftovers(gh: Octokit, store: StateStore, opts: { c
       ...(opts.clock === undefined ? {} : { clock: opts.clock }), ...(opts.cancelWaitMs === undefined ? {} : { cancelWaitMs: opts.cancelWaitMs }),
     });
   } finally {
-    store.releaseLease();
+    // G-LEASE-R1 (sec M1): kept while a stop is under way; the exit hook drops it after the interrupt hooks
+    if (took && !interrupting()) store.releaseLease();
   }
 }

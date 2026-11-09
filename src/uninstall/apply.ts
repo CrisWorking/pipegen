@@ -354,7 +354,8 @@ export async function uninstallStep(gh: Octokit, loaded: LoadedRecord, io: Promp
       }
     }
   } finally {
-    lease.releaseLease();
+    // G-LEASE-R1 (sec M1): kept while a stop is under way; the exit hook drops it after the interrupt hooks
+    if (!interrupting()) lease.releaseLease();
   }
 }
 
@@ -744,7 +745,7 @@ async function liveWorkflow(gh: Octokit, loaded: LoadedRecord, clock: RateClock,
 async function takeLease(app: RepoRef, deps: StateDeps | undefined): Promise<StateStore> {
   try {
     const store = await StateStore.open(app, deps ?? {});
-    store.acquireLease(`uninstall-${randomBytes(6).toString('hex')}`);
+    store.acquireLease(`uninstall-${randomBytes(6).toString('hex')}`, 'uninstall');
     return store;
   } catch (e) {
     if (e instanceof ProofStopError || e instanceof StateError) throw new UninstallError(`${(e as Error).message} Nothing was changed.`, { cause: e });
