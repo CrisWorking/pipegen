@@ -1653,9 +1653,13 @@ describe('G-SIGN1: the signing mode re-derived after the run makes its own signi
     expect(w2.calls.indexOf('disarm')).toBeLessThan(w2.calls.indexOf('deliver'));
     // a stop before delivery deletes once, through the run, and disarms too
     let dis = 0;
-    const w3 = dropWorld({ deps: { armSigningEnv: () => () => { dis += 1; } } });
+    let hook: (() => Promise<void>) | undefined;
+    const w3 = dropWorld({ deps: { armSigningEnv: (cleanup) => { hook = cleanup; return () => { dis += 1; }; } } });
     expect(await run(w3, io({ preview: false }))).toBe(1);
     expect(dis).toBe(1);
+    expect(w3.calls.filter((c) => c === 'dropSigningEnv')).toHaveLength(1);
+    // an interrupt hook that fires as well deletes nothing twice
+    await hook?.();
     expect(w3.calls.filter((c) => c === 'dropSigningEnv')).toHaveLength(1);
   });
 
