@@ -685,17 +685,25 @@ async function signing(x: Ctx): Promise<void> {
     }
     if (needKey) {
       // G17 row 45 (G13 sec M5): the key pair is made in a memory folder, never the clone (where it could be committed), and its password
-      // goes through COSIGN_PASSWORD (cosign reads it there), never a file or a command line
-      x.commands.push('# A new key pair, in a fresh memory folder (/dev/shm: never your clone, where the key could be committed). The password is random, kept only in COSIGN_PASSWORD for these commands, never in a file.');
-      x.commands.push('cd "$(mktemp -d -p /dev/shm)"');
-      x.commands.push('umask 077');
-      x.commands.push('COSIGN_PASSWORD="$(head -c 32 /dev/urandom | base64 | tr -d \'\\n\')"; export COSIGN_PASSWORD');
-      x.commands.push('cosign generate-key-pair --output-key-prefix pipegen-signing');
-      x.commands.push(`gh secret set ${COSIGN_KEY_SECRET} --env ${SIGNING_ENVIRONMENT} --repo ${repo} < pipegen-signing.key`);
-      x.commands.push(`printf '%s' "$COSIGN_PASSWORD" | gh secret set ${PASSWORD_SECRET} --env ${SIGNING_ENVIRONMENT} --repo ${repo}`);
-      x.commands.push(`gh variable set ${COSIGN_PUB_VAR} --env ${SIGNING_ENVIRONMENT} --repo ${repo} < pipegen-signing.pub`);
-      x.commands.push('unset COSIGN_PASSWORD');
-      x.commands.push('cd - >/dev/null && rm -rf -- "$OLDPWD"');
+      // goes through COSIGN_PASSWORD (cosign reads it there), never a file or a command line. G17-R4 (sec C1): one subshell block that the
+      // first failure ends (a missing /dev/shm, cosign or gh), so no key is made outside the folder and nothing is stored after a failure;
+      // the folder is a variable its trap removes (never "$OLDPWD"), and the password and umask end with the subshell
+      x.commands.push('# A new key pair, made in a fresh memory folder (/dev/shm: never your clone, where the key could be committed). Paste the whole block into a POSIX shell (sh, bash or zsh; from fish or csh, start sh first). It stops at the first failure and then stores nothing; the folder, the random password (only in COSIGN_PASSWORD, never a file) and the umask end with it. Without /dev/shm (macOS, Windows) it stops before making a key: run `npx pipegen finish --rotate-key` on a Linux host instead.');
+      x.commands.push([
+        '(',
+        '  set -eu',
+        '  umask 077',
+        '  d="$(mktemp -d -p /dev/shm)"',
+        '  trap \'rm -rf -- "$d"\' EXIT',
+        '  test -d "$d"',
+        '  cd "$d"',
+        '  COSIGN_PASSWORD="$(head -c 32 /dev/urandom | base64 | tr -d \'\\n\')"; export COSIGN_PASSWORD',
+        '  cosign generate-key-pair --output-key-prefix pipegen-signing',
+        `  gh secret set ${COSIGN_KEY_SECRET} --env ${SIGNING_ENVIRONMENT} --repo ${repo} < pipegen-signing.key`,
+        `  printf '%s' "$COSIGN_PASSWORD" | gh secret set ${PASSWORD_SECRET} --env ${SIGNING_ENVIRONMENT} --repo ${repo}`,
+        `  gh variable set ${COSIGN_PUB_VAR} --env ${SIGNING_ENVIRONMENT} --repo ${repo} < pipegen-signing.pub`,
+        ')',
+      ].join('\n'));
       x.commands.push('# The verify step checks the new public key\'s sha256 only after a pull request puts it in your workflow (run `npx pipegen run` again).');
     } else if (x.rec.cosignPub !== undefined) await step(x, whatPub, () => setVariable(x, SIGNING_SCOPE, COSIGN_PUB_VAR, x.rec.cosignPub as string, whatPub));
     else x.skipped.push(noPub());
