@@ -1561,11 +1561,22 @@ describe('G17A-R1: the referee judges the edited file and the batch, never the m
     const blind = await judge(w, [caller], null);
     expect(blind.issues.some((i) => /pipegen can not tell whether \.github\/workflows\/ship\.yml takes its head check/.test(i.message)), shown(blind)).toBe(true);
     expect(shown(await judge(w, [caller, called], null))).toBe('');
+    // an edit of the called file whose mark names another caller is no edit for this one (mutation survivor, R1)
+    const other = { ...called, inserted: { ...called.inserted, calledBy: ['.github/workflows/other.yml'] } } as CreatedFile;
+    const ro = await judge(w, [caller, other]);
+    expect(ro.issues.some((i) => /"ship" calls \.github\/workflows\/ship\.yml, whose jobs pipegen starts with its head check, and the batch holds no such edit of it naming this workflow/.test(i.message)), shown(ro)).toBe(true);
     // shape B (one job, four-space indentation): the same rule
     const b = calledWorld(CALLER_B, CALLED_B);
     expect(shown(await judge(b))).toBe('');
     const rb = await judge(b, [insertAt(b, A)?.file as CreatedFile]);
     expect(rb.issues.some((i) => /"release" calls \.github\/workflows\/ship\.yml, whose jobs pipegen starts with its head check/.test(i.message)), shown(rb)).toBe(true);
+  });
+  it('G17A-R1 (row 5 mutation survivor): an edited user workflow is never a layout file, so its pipegen-verify holding the gate is refused', async () => {
+    const w = world('keyless', [[A, DEPLOY_A]]);
+    const ins = w.v.inserts[0] as VerifyPlan['inserts'][number];
+    expect(ins.text.split('mode: find-run').length).toBe(2);
+    const r = await judge(w, [{ ...ins.file, content: ins.text.replace('mode: find-run', 'mode: gate') }]);
+    expect(r.issues.some((i) => i.check === 'not-gate-readable' && /outside pipegen's layout/.test(i.message)), shown(r)).toBe(true);
   });
   it('G17A-R1 sec M2: no false refusal when the called workflow can not take the head check (another, ungated workflow calls it; more than workflow_call)', async () => {
     const LINT = '.github/workflows/lint.yml';
