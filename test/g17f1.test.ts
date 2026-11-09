@@ -45,6 +45,9 @@ describe('G17-F1 sec I1: workflowSecretNames counts `secrets` only as the contex
     expect(read(`name: check ${SEC}\n`)).toEqual([]);
     expect(read(`needs: [${SEC}]\nenv:\n  K: \${{ needs.${SEC}.outputs.pipegen-out-${SEC}-sha256 }}\n`)).toEqual([]);
     expect(read(`env:\n  K: \${{ steps.x.outputs.pipegen-out-${SEC}-status }}\n`)).toEqual([]);
+    // a longer name on one side only (mutants K6, K8: each side is checked on its own)
+    expect(read(`env:\n  K: \${{ steps.x.outputs.my-${SEC} }}\n`)).toEqual([]);
+    expect(read(`env:\n  K: \${{ ${SEC}-list }}\n`)).toEqual([]);
     // the context, in any letter case and after any operator
     expect(read(`env:\n  K: \${{ !${SEC}.A && (${SEC.toUpperCase()}.B || ${SEC}['c']) }}\n`)).toEqual(['A', 'B', 'C']);
   });
