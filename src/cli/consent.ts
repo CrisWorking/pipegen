@@ -161,7 +161,7 @@ function reposSection(p: RepoProfile, repos: HelperRepo[], app: boolean): string
 /** Ruling G-SIGN1-R1: the GitHub write the first private run makes before the proof (its own signing environment). */
 function signingEnvSection(p: RepoProfile): string[] {
   return ['Signing environment',
-    `${INDENT}This private repo's images are signed with a key pair kept in an environment only the default branch can use. pipegen creates the environment pipegen-signing (usable from the default branch only) in ${shownName(`${p.owner}/${p.repo}`, 200)} before the proof, right after this yes, and reads it back; it deletes it again if the run stops before the setup pull request.`];
+    `${INDENT}This private repo's images are signed with a key pair kept in an environment only the default branch can use. pipegen creates the environment pipegen-signing (usable from the default branch only) in ${shownName(`${p.owner}/${p.repo}`, 200)} before the proof, right after this yes, and reads it back. It is deleted again if the run stops before you confirm the preview (if pipegen can't delete it, it says so and lists it); after that, the delivery keeps it and the install record names it.`];
 }
 
 function minutesSection(p: RepoProfile, est: Estimates): string[] {
@@ -298,7 +298,9 @@ function screenFor(p: RepoProfile, provider: AiProvider, est: Estimates | AuditA
   const text = sections.filter((s) => s.length > 0).map((s) => s.join('\n')).join('\n\n');
   // checkPricedFor above proved est.pricedFor is set and matches the provider shown
   const secretScanner = Object.freeze({ name: facts.secretScanner.name, version: facts.secretScanner.version });
-  return makeScreen(text, { mode, pricedFor: { ...(est.pricedFor as PricedFor) }, capUsd, files: bundle, dir: counted ? (bundle as CountingSummary).dir : null, secretScanner });
+  // G-SIGN1-R2 (sec N1): the signing environment line, carried in the terms, so the run makes the environment only when the screen said so
+  const signingEnv = mode === 'full' && (facts as FullConsentFacts).signingEnv === true;
+  return makeScreen(text, { mode, pricedFor: { ...(est.pricedFor as PricedFor) }, capUsd, files: bundle, dir: counted ? (bundle as CountingSummary).dir : null, secretScanner, ...(signingEnv ? { signingEnv: true } : {}) });
 }
 
 /**

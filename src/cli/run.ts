@@ -74,7 +74,7 @@ import { armProofCleanup, type ProofMeters } from '../proof/cleanup.js';
 import { makeFixGuard, makeFixReferee } from '../proof/fix.js';
 import { COMPAT_PREFIX, HARNESS_PATH } from '../proof/harness.js';
 import { isPlantedPath } from '../debate/planted.js';
-import { onInterrupt, type InterruptContext } from '../util/exit-hooks.js';
+import { interrupting, onInterrupt, type InterruptContext, type InterruptOptions } from '../util/exit-hooks.js';
 import { makeCleanupOnly, makeRunProof, type ProofBuild, type ProofInput, type ProofReturn, type RunProof } from './run-proof.js';
 import { keyOffers, type Choice } from '../debate/builder.js';
 import { restoreAiSpend } from '../proof/cleanup.js';
@@ -297,7 +297,9 @@ export interface RunDeps {
   /** G14: the cleanup of a resumed run whose proof passed but whose cleanup didn't finish (default makeCleanupOnly()). */
   cleanupOnly?: ReturnType<typeof makeCleanupOnly>;
   /** Ruling G-SIGN1-R1: arms the deletion of the run's own signing environment on an interrupt; returns the disarm (default onInterrupt). */
-  armSigningEnv?: (cleanup: () => Promise<void>) => () => void;
+  armSigningEnv?: (cleanup: () => Promise<void>, opts: InterruptOptions) => () => void;
+  /** Ruling G-SIGN1-R2 (sec M4): whether a stop has begun (default exit-hooks' interrupting()), read at the delivery hand-off. */
+  interrupting?: () => boolean;
   /** sec M4: whether the memory folder is one (default isMemoryFolder). */
   isMemory?: (dir: string) => boolean;
   /** sec I1: the pinned secret scanner (default ensurePinnedBinary with the pins). */
@@ -434,11 +436,14 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     let bundle: CodeBundle | undefined;
     let scannerName: 'gitleaks' | 'betterleaks' = chooseSecretScanner(io.env);
     let agreedMinutes = est.monthlyMinutes;
+    // G-SIGN1-R2 (sec N1): whether the consent the user gave named the signing environment (the token's terms, not a recomputation)
+    let agreedSigningEnv = false;
     if (counted !== undefined) {
       // ruling G-SIGN1-R1: the screen names the signing environment the run creates before the proof, only when that path can run
       const consent = await st.consent(facts, p, provider, est, counted, auth, extra, { signingEnv: firstRunSigningCan(p, facts.caps) && hasMemory() });
       if (consent === null) { err('No consent: nothing was created, nothing was sent to an AI and no secret was asked for. exit code 1.'); return 1; }
       scannerName = (consent as { terms?: { secretScanner?: { name: 'gitleaks' | 'betterleaks' } } }).terms?.secretScanner?.name ?? scannerName;
+      agreedSigningEnv = (consent as { terms?: { signingEnv?: unknown } }).terms?.signingEnv === true;
       // the secret scan of the counted files only; a finding stops the run before anything is sent to an AI
       bundle = await st.scan(dir, consent, knownValues, { ai: provider, capUsd: est.aiCostCapUsd });
       if (bundle.found.names.length > 0 || bundle.found.values.length > 0) { err(SECRET_FOUND); return 2; }
@@ -499,6 +504,8 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     let trusted: Awaited<ReturnType<RunStages['trusted']>>;
     let made: Creators = { files: [], notes: [], testNotes: [], testDecisions: [], notProven: [] };
     let runSigningEnv: SigningEnvEntry | undefined;
+    /** G-SIGN1-R2 sec M3: (re-)arms the environment's interrupt hook; the proof's arm calls it again, so it runs after the proof's hooks. */
+    let armEnvHook: (() => void) | null = null;
     if (saved0 !== null) {
       trusted = await st.trusted(facts, p, io);
       for (const n of trusted.notes) err(n);
@@ -508,7 +515,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
       // ruling G-SIGN1: the first run on a private repo signs when the plan allows. After the yes (a GitHub write) and before the needs, the
       // debate, assembly and the referee: the run's own pipegen-signing, made new and read back with the default-branch rule, and only
       // then the signing mode re-derived from the proven capabilities. Anything else stays unsigned, with the reason said (fail closed)
-      const first = await firstRunSigning(p, facts.caps, () => st.signingEnv(facts, p), hasMemory);
+      const first = await firstRunSigning(p, facts.caps, () => st.signingEnv(facts, p), hasMemory, agreedSigningEnv);
       for (const n of first.notes) err(n);
       if (first.env !== undefined) {
         facts = { ...facts, caps: first.caps };
@@ -524,7 +531,12 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
           else err(`pipegen couldn't delete the environment ${SIGNING_ENVIRONMENT} it made earlier in this run (${safeText(r.left, 600)}). Remove it by hand in the repository settings.`);
         };
         dropEnv = once;
-        disarmEnv = (deps.armSigningEnv ?? defaultArmSigningEnv)(once);
+        armEnvHook = () => {
+          try { (disarmEnv as (() => void) | null)?.(); } catch { /* re-armed below */ }
+          // G-SIGN1-R2 sec M3: a label, a short deadline, its leftover into the run's state file (for `pipegen cleanup`)
+          disarmEnv = (deps.armSigningEnv ?? defaultArmSigningEnv)(once, { label: SIGNING_ENV_HOOK_LABEL, deadlineMs: SIGNING_ENV_HOOK_DEADLINE_MS, record: (item) => { runStore.record(item); } });
+        };
+        armEnvHook();
         keyEnvApplies = signingMode(p, facts.caps) === 'key-env' && publishedImageServices(p, facts.caps).length > 0;
       }
       // 9-10
@@ -563,7 +575,8 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
       }
     } else {
       if (keyEnvApplies) {
-        pubSha = trusted.record?.cosignPubSha256;
+        // G-SIGN1-R2 sec I1: an environment this run made holds no key, so a recorded public key is never reused for it (a fresh pair)
+        pubSha = runSigningEnv === undefined ? trusted.record?.cosignPubSha256 : undefined;
         if (pubSha === undefined) {
           pair = await st.signingKey();
           pubSha = pubKeySha256(pair.pub);
@@ -626,7 +639,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
       ...(debated === undefined || base === undefined ? {} : { debate: debated, withWinners: ((b: PipelineDraft, d: DebateResult, d0: PipelineDraft) => (w: ReadonlyMap<string, Choice>) => ({ ...d0, steps: draftFromDebate(b, d, w).draft.steps }))(base, debated, draft) }),
       reviewed, platform: plat, dir, ...(bundle === undefined ? {} : { bundle }),
       scanner: () => (deps.secretScanner ?? pinnedScanner)(scannerName),
-      arm: (cleanup, meters) => { disarm = (deps.arm ?? defaultArm)(runStore, cleanup, meters); },
+      arm: (cleanup, meters) => { disarm = (deps.arm ?? defaultArm)(runStore, cleanup, meters); if (dropEnv !== null) armEnvHook?.(); },
       variantMinutes: Math.max(1, Math.ceil(est.setupMinutes / 2)),
       checkRepos: async () => {
         const r = await st.proofRepos(facts, p, auth, runStore, runId, proofActions(reviewed));
@@ -688,13 +701,18 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
       const again = await ask(`The pipeline as built needs about ${est2.monthlyMinutes} Actions minutes a month, more than the ${agreedMinutes} you agreed to. Go on?`);
       if (!again) { err('Nothing was delivered: you said no to the higher minutes. The secrets you typed were wiped.'); return 1; }
     }
+    // 19's inputs (key-env: the key pair made in memory, carry 16 and 28). G-SIGN1-R2 sec I1: delivery gets the run's environment only
+    // when it will set it up (it stores the new key in it); otherwise the run keeps it and deletes it when it ends
+    const keyEnv = built.assembled.draft.signing?.mode === 'key-env';
+    const key = pair;
+    const handOver = runSigningEnv !== undefined && keyEnv && key !== undefined;
     const input: DeliveryInput = {
       draft: built.assembled.draft, files: built.files, locks: built.locks, secretNames: sec.names,
       protectedPaths: codeownersProtectedPaths(built.assembled.draft, reviewed), environments: built.environments,
       proofRepos: proofReposFor(repos, saved),
       ...(centralFileList === undefined ? {} : { centralFileList }),
       ...(centralCommitted === undefined ? {} : { centralCommitted }),
-      ...(runSigningEnv === undefined ? {} : { signingEnv: runSigningEnv }),
+      ...(handOver && runSigningEnv !== undefined ? { signingEnv: runSigningEnv } : {}),
     };
     if (built.assembled.draft.centralPin?.sha === UNPINNED) throw new Error('pipegen would deliver a draft with no central commit pinned; nothing was delivered.');
     const note = bootstrapProofsNote(io.env);
@@ -707,11 +725,10 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
       '', `A pull request waits about ${built.minutes.prWait} minutes at most for the checks; about ${est2.monthlyMinutes} Actions minutes a month.`,
     ].join('\n');
     if (!(await ask(`${preview}\n\nOpen the setup pull request with these changes?`))) { err('Nothing was delivered: you said no. The secrets you typed were wiped. exit code 1.'); return 1; }
-    // 19. deliver (key-env: the key pair made in memory, carry 16 and 28)
-    const keyEnv = built.assembled.draft.signing?.mode === 'key-env';
-    const key = pair;
-    // ruling G-SIGN1-R1: delivery takes the run's signing environment from here (the record or its leftovers name it)
-    try { (disarmEnv as (() => void) | null)?.(); } finally { disarmEnv = null; dropEnv = null; }
+    // 19. deliver. G-SIGN1-R2 sec M4, one synchronous step (no signal handler runs in between): a stop already under way ends the run
+    // here (its hook deletes the environment); else delivery takes the run's signing environment (the record or its leftovers name it)
+    if ((deps.interrupting ?? interrupting)()) { err(STOP_AT_HAND_OFF); return 1; }
+    if (handOver) { try { (disarmEnv as (() => void) | null)?.(); } finally { disarmEnv = null; dropEnv = null; } }
     const res = await st.deliver(facts, p, input, vault, io, keyEnv && key !== undefined ? async () => key : undefined);
     store.setStage('delivered');
     // carry 19 (spec I4): everything delivery says
@@ -762,7 +779,14 @@ export const RUN_SIGNS_NOTE = `pipegen made the environment ${SIGNING_ENVIRONMEN
 /** Ruling G-SIGN1-R1: the deletion notice of a run that stopped before delivery. */
 export const SIGNING_ENV_DELETED = `pipegen deleted the environment ${SIGNING_ENVIRONMENT} it made earlier in this run: nothing was delivered.`;
 /** Ruling G-SIGN1-R1: the production arm (an interrupt hook, like the proof's keys). */
-export const defaultArmSigningEnv = (cleanup: () => Promise<void>): (() => void) => onInterrupt(async () => { await cleanup(); });
+export const defaultArmSigningEnv = (cleanup: () => Promise<void>, opts: InterruptOptions): (() => void) => onInterrupt(async () => { await cleanup(); }, opts);
+/** G-SIGN1-R2 sec M3: the environment hook's label (a constant) and its deadline (short: the environment holds no secret yet). */
+export const SIGNING_ENV_HOOK_LABEL = `deleting the signing environment ${SIGNING_ENVIRONMENT} this run made`;
+export const SIGNING_ENV_HOOK_DEADLINE_MS = 30_000;
+/** G-SIGN1-R2 sec M4: a stop began before the hand-off to delivery. */
+export const STOP_AT_HAND_OFF = 'pipegen stopped: a stop began before the delivery, so nothing was delivered. exit code 1.';
+/** G-SIGN1-R2 sec N1: the path could run, but the consent the user answered didn't name the signing environment. */
+export const NOT_AGREED_SIGNING_OFF = `Signing is off (mode none): the consent screen you answered didn't say pipegen creates the environment ${SIGNING_ENVIRONMENT}, so it makes none.`;
 
 /**
  * Whether firstRunSigning would make the run's own environment (the memory folder aside): a private repo with environments, the rule not
@@ -781,10 +805,12 @@ export function firstRunSigningCan(p: RepoProfile, caps: Capabilities): boolean 
  * fresh environment of that name with its branch rule turns deploymentBranchPolicies on. Fail closed: any other answer keeps `caps` as
  * probed (signing mode none) with the reason in `notes`; nothing claims signing that the read-back didn't prove.
  */
-export async function firstRunSigning(p: RepoProfile, caps: Capabilities, make: () => Promise<{ env: SigningEnvEntry } | { off: string }>, memory: () => boolean): Promise<{ caps: Capabilities; env?: SigningEnvEntry; notes: string[] }> {
+export async function firstRunSigning(p: RepoProfile, caps: Capabilities, make: () => Promise<{ env: SigningEnvEntry } | { off: string }>, memory: () => boolean, agreed: boolean): Promise<{ caps: Capabilities; env?: SigningEnvEntry; notes: string[] }> {
   if (!firstRunSigningCan(p, caps)) return { caps, notes: [] };
   const proven: Capabilities = { ...caps, deploymentBranchPolicies: true };
   if (!memory()) return { caps, notes: [NO_MEMORY_SIGNING_OFF] };
+  // G-SIGN1-R2 (sec N1): only when the consent the user answered named the environment
+  if (!agreed) return { caps, notes: [NOT_AGREED_SIGNING_OFF] };
   const made = await make();
   if ('off' in made) return { caps, notes: [`Signing is off (mode none): ${made.off}`] };
   const e = made.env;

@@ -28,6 +28,7 @@ const fail = (status: number, message = 'Not Found'): never => {
   throw Object.assign(new Error(message), { status, response: { status, headers: {}, data: { message } } });
 };
 const FINISH_ROUTES = new Set([
+  'GET /repos/{owner}/{repo}/environments/{environment_name}/variables',
   'GET /repos/{owner}/{repo}', 'PATCH /repos/{owner}/{repo}', 'GET /repos/{owner}/{repo}/collaborators',
   'GET /repos/{owner}/{repo}/rulesets', 'POST /repos/{owner}/{repo}/rulesets', 'GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', 'PUT /repos/{owner}/{repo}/rulesets/{ruleset_id}',
   'GET /repos/{owner}/{repo}/branches/{branch}/protection', 'PUT /repos/{owner}/{repo}/branches/{branch}/protection',
@@ -249,6 +250,11 @@ export class FinishGitHub extends FakeGitHub {
         if (v === undefined) fail(404);
         (v as { value: string }).value = p.value;
         return ok({}, 204);
+      }
+      case 'GET /repos/{owner}/{repo}/environments/{environment_name}/variables': {
+        if (!repo.envs.has(p.environment_name)) fail(404);
+        const m = [...(x.envVars.get(p.environment_name) ?? new Map())];
+        return ok({ total_count: m.length, variables: m.map(([name, v]) => ({ name, value: (v as { value: string }).value })) });
       }
       case 'GET /repos/{owner}/{repo}/environments/{environment_name}/variables/{name}': {
         const v = x.envVars.get(p.environment_name)?.get(p.name);

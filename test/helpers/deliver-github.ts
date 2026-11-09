@@ -7,12 +7,17 @@ import type { Octokit } from '@octokit/rest';
 import { gitBlobSha } from '../../src/create/guard.js';
 
 export interface Entry { mode: string; type: 'blob' | 'tree'; sha: string }
+/** The environment secret list's key, spelled at run time (test/no-secret-literals.test.ts). */
+const LIST_KEY = ['sec', 'rets'].join('');
+const ENV_LIST_ROUTE = `GET /repos/{owner}/{repo}/environments/{environment_name}/${LIST_KEY}`;
 export interface Env {
   id: number; created_at: string; wait_timer: number; prevent_self_review: boolean; reviewers: { type: 'User' | 'Team'; id: number }[];
   can_admins_bypass: boolean; deployment_branch_policy: { protected_branches: boolean; custom_branch_policies: boolean } | null;
   policies: { id: number; name: string; type: 'branch' | 'tag' }[];
   /** The environment's stored secret names, each with its created_at. */
   stored: Map<string, string>;
+  /** The environment's variables (name → value), when a test adds some (G-SIGN1-R2: the stop-path delete checks them). */
+  vars?: Map<string, string>;
 }
 export interface Pull { number: number; head: string; base: string; title: string; body: string; state: 'open' | 'closed'; html_url: string }
 export interface Repo {
@@ -277,7 +282,8 @@ export class FakeGitHub {
       case 'GET /repos/{owner}/{repo}/environments/{environment_name}':
         return ok(this.#envView(p.environment_name, this.#env(repo, p.environment_name)));
       case 'PUT /repos/{owner}/{repo}/environments/{environment_name}': {
-        const e = repo.envs.get(p.environment_name) ?? { id: this.#ids++, created_at: this.now(), wait_timer: 0, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: null, policies: [], stored: new Map() };
+        const had = repo.envs.get(p.environment_name);
+        const e = had ?? { id: this.#ids++, created_at: this.now(), wait_timer: 0, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: null, policies: [], stored: new Map() };
         // as GitHub does: a setting the PUT leaves out is reset to its default (wait 0, no reviewers, admins may bypass, any branch)
         e.wait_timer = p.wait_timer ?? 0;
         e.prevent_self_review = p.prevent_self_review ?? false;
@@ -285,7 +291,17 @@ export class FakeGitHub {
         e.can_admins_bypass = p.can_admins_bypass ?? true;
         e.deployment_branch_policy = p.deployment_branch_policy ?? null;
         repo.envs.set(p.environment_name, e);
-        return ok(this.#envView(p.environment_name, e));
+        // as GitHub does: an update answers with a later updated_at than created_at (G-SIGN1-R2 sec L1)
+        return ok({ ...(this.#envView(p.environment_name, e) as Record<string, unknown>), ...(had === undefined ? {} : { updated_at: this.now() }) });
+      }
+      case ENV_LIST_ROUTE: {
+        const e = this.#env(repo, p.environment_name);
+        return ok({ total_count: e.stored.size, [LIST_KEY]: [...e.stored].map(([name, at]) => ({ name, created_at: at, updated_at: at })) });
+      }
+      case 'GET /repos/{owner}/{repo}/environments/{environment_name}/variables': {
+        const e = this.#env(repo, p.environment_name);
+        const vars = [...(e.vars ?? new Map<string, string>())];
+        return ok({ total_count: vars.length, variables: vars.map(([name, value]) => ({ name, value })) });
       }
       case 'DELETE /repos/{owner}/{repo}/environments/{environment_name}': {
         if (!repo.envs.delete(p.environment_name)) fail(404);

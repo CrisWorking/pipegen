@@ -40,8 +40,17 @@ const SHA_RE = /^[0-9a-f]{40}$/;
 const BRANCH_RE = /^(?![/.])(?!.*(?:\.\.|\/\/|@\{|\.lock(?:\/|$)))[A-Za-z0-9._/-]{1,200}(?<![/.])$/;
 const MAX_TREE_ENTRIES = 100_000;
 
-/** The only writes the delivery sends through here (the git data API, the setup and central pull requests, the N4 signing environment). */
-const WRITE_ROUTES: ReadonlySet<string> = new Set([
+function fixedSet(xs: readonly string[]): ReadonlySet<string> {
+  const s = new Set(xs);
+  const fixed = (): never => { throw new TypeError('DELIVER_WRITE_ROUTES is fixed.'); };
+  Object.defineProperties(s, { add: { value: fixed }, delete: { value: fixed }, clear: { value: fixed } });
+  return Object.freeze(s);
+}
+/**
+ * The only writes the delivery sends through here (the git data API, the setup and central pull requests, the N4 signing environment).
+ * Fixed (G-SIGN1-R2 sec M5: frozen, pinned by an exact-set test). The environment writes go to pipegen-signing only (ghWrite).
+ */
+export const DELIVER_WRITE_ROUTES: ReadonlySet<string> = fixedSet([
   'POST /repos/{owner}/{repo}/git/trees',
   'POST /repos/{owner}/{repo}/git/commits',
   'POST /repos/{owner}/{repo}/git/refs',
@@ -53,6 +62,8 @@ const WRITE_ROUTES: ReadonlySet<string> = new Set([
   // ruling G-SIGN1-R1: only dropRunSigningEnvironment (deliver.ts), for the pipegen-signing environment the same run made
   'DELETE /repos/{owner}/{repo}/environments/{environment_name}',
 ]);
+/** The one environment the delivery writes (the N4 signing environment; the same name as capabilities.ts SIGNING_ENVIRONMENT). */
+const DELIVER_ENVIRONMENT = 'pipegen-signing';
 const READ_RE = /^GET \/repos\/\{owner\}\/\{repo\}(?:\/[A-Za-z0-9_{}/.-]*)?$/;
 
 export const statusOf = (e: unknown): number | undefined => {
@@ -91,7 +102,9 @@ export async function ghRead(gh: Octokit, route: string, r: RepoRef, params: Rec
 
 /** One of WRITE_ROUTES; anything else is refused before it is sent. */
 export async function ghWrite(gh: Octokit, route: string, r: RepoRef, params: Record<string, unknown>, clock: RateClock = clockOf(gh)): Promise<unknown> {
-  if (!WRITE_ROUTES.has(route)) throw new DeliverError(`"${safeText(route, 120)}" is not a write the delivery makes.`);
+  if (!DELIVER_WRITE_ROUTES.has(route)) throw new DeliverError(`"${safeText(route, 120)}" is not a write the delivery makes.`);
+  // G-SIGN1-R2 sec M5: an environment write goes to the signing environment only (exact name; GitHub's names are case-insensitive)
+  if (route.includes('/environments/{environment_name}') && params.environment_name !== DELIVER_ENVIRONMENT) throw new DeliverError(`The delivery writes only the environment ${DELIVER_ENVIRONMENT}, not ${safeText(String(params.environment_name), 100)}.`);
   return (await send(gh, route, r, params, clock)).data;
 }
 

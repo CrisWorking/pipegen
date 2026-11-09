@@ -19,7 +19,7 @@ const POLICIES = `GET ${R}/environments/pipegen-signing/deployment-branch-polici
 const SCAN = `GET ${R}/code-scanning/analyses`;
 const UPGRADE = 'Upgrade to GitHub Pro or make this repository public to enable this feature.';
 const NOT_ENABLED = 'Code scanning is not enabled for this repository. Please enable code scanning in the repository settings.';
-const POLICY_NOTE = "Couldn't prove deployment branch policies here; key-based signing is decided at setup, when `pipegen run` makes the `pipegen-signing` environment and reads it back.";
+const POLICY_NOTE = "Couldn't prove deployment branch policies here; key-based signing may be decided at setup, when `pipegen run` makes the `pipegen-signing` environment and reads it back.";
 const ok: Reply = { body: [] };
 const noEnvs: Reply = { body: { total_count: 0, environments: [] } };
 const err = (status: number, message: string, headers: Record<string, string> = {}): Reply => ({ status, body: { message }, headers });

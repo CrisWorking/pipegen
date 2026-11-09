@@ -283,7 +283,8 @@ describe('G-SIGN1-R1: the signing environment line', () => {
     const text = (signingEnv?: boolean) => consentText(p, claude, est, bundle, permissionsTable('write', { appCreatesRepos: false }), repos(p, [true, true]), 'full', { appCreatesRepos: false, ...gitleaksFacts(), ...(signingEnv === undefined ? {} : { signingEnv }) });
     const on = text(true);
     expect(on).toMatch(/pipegen creates the environment pipegen-signing \(usable from the default branch only\) in acme\/shop before the proof/);
-    expect(on).toMatch(/deletes it again if the run stops before the setup pull request/);
+    expect(on).toMatch(/It is deleted again if the run stops before you confirm the preview/);
+    expect(on).not.toMatch(/before the setup pull request/);
     expect(text(false)).not.toMatch(/pipegen-signing/);
     expect(text()).not.toMatch(/pipegen-signing/);
   });
