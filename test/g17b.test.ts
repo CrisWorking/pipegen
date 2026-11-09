@@ -395,6 +395,10 @@ describe('G17B-R2 design call: pipegen publishes and signs no image built from a
     for (const l of lines) expect(l).toMatch(/Fails the run\.$/);
     expect(doc).toContain(DIGEST);
     expect(doc).toContain(AGAIN);
+    // the deploy part skipped: no publish job, so neither line
+    const skipped = pipegenDoc({ ...x.draft, ...SKIP_DEPLOY, doc: DOC }, REVIEWED).content;
+    expect(skipped).not.toContain(DIGEST);
+    expect(skipped).not.toContain(AGAIN);
     // published, but no signing plan: the verify line can not promise a signature
     const { signing: _s, ...unsigned } = x.draft;
     const v = section(pipegenDoc({ ...unsigned, doc: DOC }, REVIEWED).content, '### Deploy layer').split('\n').find((l) => /^- Verify before deploy, service "app"/.test(l)) as string;

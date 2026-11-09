@@ -883,10 +883,11 @@ export const PROOF_OVERRIDE_PATH = '$RUNNER_TEMP/pipegen-proof/docker-compose.pi
  * never builds on the bridge network (where Bullfrog blocks the package registries, spike S8). Without it the step is unchanged.
  */
 /**
- * G17B-R1 round 2 (risk 4, R0 concern 3): when compose up fails, one fixed message (no container log or repo text): the app containers run with
- * no capability and no privilege gain, which an image that needs one can not start under. Docker's own error stays above it in the log.
+ * G17B-R1 round 2 (risk 4, R0 concern 3), G17B-R2 (sec M2, spec I3): when compose up fails, one fixed message (no container log or repo text).
+ * It names no cause (a failing database or a failed build fails the same way): docker's own error stays above it in the log, and the
+ * capability limit is said as a possible cause only. It points to no file, so it holds in the proof run too (no PIPEGEN.md there yet).
  */
-export const COMPOSE_UP_FAILED = '|| { echo "::error::pipegen: the containers did not start. pipegen starts your app containers with no Linux capability and no privilege gain (cap_drop ALL, no-new-privileges), so an image that needs one (a root entrypoint that switches users or changes file owners) can not start: run the app as a non-root user. See PIPEGEN.md, Limits of these checks."; exit 1; }';
+export const COMPOSE_UP_FAILED = '|| { echo "::error::pipegen: the containers did not start (see docker\'s error above). If the app image needs a Linux capability or a privilege gain (a root entrypoint that switches users or changes file owners), it can not start: pipegen starts the app containers with neither (cap_drop ALL, no-new-privileges), so run the app as a non-root user."; exit 1; }';
 
 export function renderComposeUp(opts: { proofOverride?: true } = {}): RenderedStep {
   if (opts.proofOverride === true) {

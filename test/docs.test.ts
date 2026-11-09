@@ -16,7 +16,7 @@ import { docRecomputeProblem, GATE_REASONS, HISTORY_REWRITE_NOTE, pipegenDoc, pi
 import { pipegenDocProblems } from '../src/engine/created-judges/pipegen-doc.js';
 import { referee } from '../src/engine/referee.js';
 import { BOOTSTRAP_PROOFS_NOTE } from '../src/engine/reviewed.js';
-import { floorNeeds, MINIMUM_CATEGORIES, WORKFLOW_LINT_TOOL } from '../src/engine/needs.js';
+import { floorNeeds, MINIMUM_CATEGORIES, publishedImageServices, WORKFLOW_LINT_TOOL } from '../src/engine/needs.js';
 import { assembleJobs, HOOKS_CI_NOTES, NOT_RENDERED_V02, POUTINE_NOT_RUN, PYPI_PUBLISH_NOTE, WORKFLOW_LINT_SUGGESTION } from '../src/layers/jobs.js';
 import { HOOK_FILES, hookCommands } from '../src/engine/created-builders.js';
 import { HUSKY_NO_CI_NOTE, precommitFiles, SETUP_COMMANDS } from '../src/layers/precommit.js';
@@ -274,13 +274,16 @@ describe('doc: the 18 sections', () => {
   it('doc: unprotected deploy triggers listed', () => {
     const gaps = [{ path: '.github/workflows/release.yml', triggers: ['workflow_dispatch'], why: 'It starts by hand, so no verify job is added.' }, { path: '.github/workflows/after-build.yml', triggers: ['workflow_run'], why: 'A deploy started by workflow_run is a gap.' }];
     for (const [label, make] of SHAPES) {
-      const sec = headingAt(docOf(make({}, { deployGaps: gaps })), 'Deploys');
+      const d = make({}, { deployGaps: gaps });
+      const sec = headingAt(docOf(d), 'Deploys');
       expect(sec, label).toContain('".github/workflows/release.yml" (triggers: workflow_dispatch): It starts by hand, so no verify job is added.');
       expect(sec).toContain('".github/workflows/after-build.yml" (triggers: workflow_run)');
       expect(sec).toMatch(/any other trigger than a push to the default branch gets no verify job/);
       expect(sec).toMatch(/`workflow_run` is a gap too/);
       expect(sec).toMatch(/branch other than the default branch/);
-      expect(sec).toMatch(/verified image digest/);
+      // G17B-R2: the verify job has a digest output only when pipegen publishes an image
+      if (publishedImageServices(d.profile, d.capabilities).length > 0) expect(sec, label).toMatch(/verified image digest/);
+      else expect(sec, label).not.toMatch(/verified image digest/);
     }
     // a private repo without environments: the default-branch limit can not be enforced (plan l. 71)
     const free = shapeA({ capabilities: { ...ALL_CAPS, environments: false } });
@@ -565,7 +568,11 @@ describe('doc: carries (lines present when they apply, absent when they do not)'
     expect(a).toMatch(/App code runs with full power/);
     // C-MUST-1 image findings have no base (19), the scanned image is not the published one (20)
     expect(a).toMatch(/Image findings have no base yet: there is no earlier scan of the base commit to compare with, so image findings warn on the pull request that installs pipegen and block on every other/);
-    expect(a).toMatch(/The scanned image is not the published image[\s\S]*moving base image tag/);
+    // G17B-R2: only with a publish job: shape A's shop-api sits in a sub-folder, so pipegen publishes no image of it (v0.2: the root only)
+    expect(a).not.toMatch(/The scanned image is not the published image/);
+    const rooted = shapeA({ profile: { ...shapeA().profile, services: shapeA().profile.services.map((x) => (x.name === 'shop-api' ? { ...x, path: '.' } : x)) } });
+    expect(publishedImageServices(rooted.profile, rooted.capabilities)).toEqual(['shop-api']);
+    expect(docOf(rooted)).toMatch(/The scanned image is not the published image[\s\S]*moving base image tag/);
     // DAST residuals (18)
     expect(a).toMatch(/unscrubbed between the job that runs the app and the job that reads the result/);
     expect(a).toMatch(/A hostile app can always answer a scanner cleanly/);
