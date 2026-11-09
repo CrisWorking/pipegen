@@ -709,8 +709,8 @@ const appendSha = (shas: readonly string[], sha: string): string[] => (shas.at(-
 
 /**
  * G17 row 22: the writes of an edit, with the blob each one started from (`base`; null: the file wasn't there). A write is appended only
- * when the sha changed; its base goes with it. A chain an earlier write left without a base (`pipegen update`) stays as it is: from then on
- * the bases prove nothing (editWritesChained), never a wrong pairing.
+ * when the sha changed; its base goes with it. A chain an earlier write left without a base (an older record, or `pipegen update` before
+ * G-FINREC) stays as it is: from then on the bases prove nothing (editWritesChained), never a wrong pairing.
  */
 function writesOf(prev: RecordedEdit | undefined, sha: string, base: string | null, wrote: boolean): { writtenShas: string[]; baseShas?: (string | null)[] } {
   const was = prev?.writtenShas ?? [];

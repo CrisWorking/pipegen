@@ -60,7 +60,7 @@ import { ensureSigningEnvironment, plannedOfLocks, readEnv, SETUP_BRANCH } from 
 import { compareStatus, DeliverError, isoAt, readBlobText, readHead, readRepo, readTree, statusOf, type RepoRef, type TreeEntry } from './git-data.js';
 import { holdAppLease, isLeaseStop, stateDepsOf, type ReleaseLease } from '../proof/lease.js';
 import type { StateStore } from '../proof/state.js';
-import { centralOf, centralUpdateBranch, localFinishPendingPath, protectedPathsOfRecord, readFinishPending, readLocalRecord, RecordError, writeFinishPending, writeRecord, type FinishPending, type LocalRecordDeps } from './record.js';
+import { centralOf, centralUpdateBranch, localFinishPendingPath, protectedPathsOfRecord, readFinishPending, readLocalRecord, RecordError, writeFinishPending, type RecordedEdit, writeRecord, type FinishPending, type LocalRecordDeps } from './record.js';
 import { classicPutForm, holdsWanted, isObj, PLANNED_ROUTES, refusedAsUnavailable, SettingsApi } from './settings-api.js';
 import { trustedPrevious } from './trust.js';
 
@@ -846,21 +846,23 @@ function centralCodeowners(x: Ctx): void {
     return;
   }
   // m5: the record entry is decided first; a file pipegen can't record is never written
+  // G-FINREC (V6b-R1, Plan G carry): the file is recorded as ONE edit whose write chains from the blob finish read (editWritesChained):
+  // the record commit is made on x.centralHead, the head that blob was read from (writeRecord refuses a moved head). Any other record entry
+  // at that path (a deliver edit, an older finish's `files` entry) describes a file that is no longer there as it was: it is replaced, so
+  // the record never names the path twice (sec i2: the record refused itself).
   const sha = gitBlobSha(F.file.content);
-  if (c.path === null) {
-    const at = x.files.findIndex((f) => f.repo === 'central' && f.path === F.file.path);
-    const shas = at < 0 ? [sha] : [...(x.files[at]?.shas ?? []).filter((s) => s !== sha), sha];
-    const entry = { repo: 'central' as const, path: F.file.path, part: 'codeowners' as const, shas };
-    x.files = at < 0 ? [...x.files, entry] : x.files.map((f, i) => (i === at ? entry : f));
-  } else {
-    const original = c.text;
-    const inserted = F.file.content.startsWith(original) ? F.file.content.slice(original.length) : null;
-    if (inserted === null || inserted === '') {
-      x.skipped.push({ what: `the central CODEOWNERS (${show(F.file.path)})`, why: 'pipegen\'s lines would not simply follow the file\'s own text, so the install record couldn\'t say what to take out on uninstall; pipegen leaves the file as it is.' });
-      return;
-    }
-    x.edits = [...x.edits.filter((e) => !(e.repo === 'central' && e.path === F.file.path)), { repo: 'central', path: F.file.path, kind: 'codeowners', inserted, originalSha: gitBlobSha(original), writtenShas: [sha] }];
+  const base = c.path === null ? null : gitBlobSha(c.text);
+  const original = c.text;
+  // the planned file is the one finish read (locks.ts codeownersPlan names the path it found); any other path proves nothing about its base
+  const inserted = c.path === null ? F.file.content : c.path === F.file.path && F.file.content.startsWith(original) ? F.file.content.slice(original.length) : null;
+  if (inserted === null || inserted === '') {
+    x.skipped.push({ what: `the central CODEOWNERS (${show(F.file.path)})`, why: 'pipegen\'s lines would not simply follow the file\'s own text, so the install record couldn\'t say what to take out on uninstall; pipegen leaves the file as it is.' });
+    return;
   }
+  const here = (e: { repo: string; path: string }): boolean => e.repo === 'central' && e.path === F.file.path;
+  const edit: RecordedEdit = { repo: 'central', path: F.file.path, kind: 'codeowners', inserted, originalSha: base, writtenShas: [sha], baseShas: [base] };
+  x.files = x.files.filter((f) => !here(f));
+  x.edits = [...x.edits.filter((e) => !here(e)), edit];
   x.centralFiles.push({ path: F.file.path, content: F.file.content });
   x.centralRec.codeowners = { path: F.file.path, created: c.path === null };
 }

@@ -39,7 +39,7 @@ import { safeMarkdown, safeText } from '../util/safe-text.js';
 import { commitFiles, DeliverError, ghRead, statusOf, openOrUpdatePr, readBlobText, readHead, readRepo, readTree, setBranch, type RepoRef, type TreeEntry } from './git-data.js';
 import { holdAppLease, isLeaseStop, stateDepsOf, type ReleaseLease } from '../proof/lease.js';
 import type { StateStore } from '../proof/state.js';
-import { centralOf, centralUpdateBranch, localRecordPath, readLocalRecord, RecordError, recordWriteReached, writeRecord, type LocalRecordDeps } from './record.js';
+import { centralOf, centralUpdateBranch, localRecordPath, readLocalRecord, RecordError, recordWriteReached, type RecordedEdit, writeRecord, type LocalRecordDeps } from './record.js';
 import { trustedPrevious } from './trust.js';
 
 // ---------- constants ----------
@@ -839,7 +839,10 @@ function centralPrBody(p: Plan): string {
 
 // ---------- the record ----------
 
-/** The record with every written blob sha appended (newest last) and the merged files marked ownerEdited; the new central pin when re-pinned. */
+/**
+ * The record with every written blob sha appended (newest last), each edit's write with the live blob it started from (baseShas, while the
+ * edit's chain is whole), and the merged files marked ownerEdited; the new central pin when re-pinned.
+ */
 export function recordAfter(record: InstallRecord, changes: readonly FileChange[], repin: string | null): InstallRecord {
   const r = structuredClone(record);
   for (const c of changes) {
@@ -850,9 +853,16 @@ export function recordAfter(record: InstallRecord, changes: readonly FileChange[
       if (f.shas.at(-1) !== sha) f.shas.push(sha);
       if (c.ownerEdited) f.ownerEdited = true;
     } else {
-      const e = r.edits.find((x) => x.repo === c.repo && x.path === c.path);
+      const e = r.edits.find((x) => x.repo === c.repo && x.path === c.path) as RecordedEdit | undefined;
       if (e === undefined) throw new UpdateError(`${show(c.path)} is not in the install record.`);
-      if (e.writtenShas.at(-1) !== sha) e.writtenShas.push(sha);
+      if (e.writtenShas.at(-1) !== sha) {
+        // G-FINREC (V6b-R1): the write's base is the blob update read live and committed onto (currentSha; the app commit's parent is the
+        // head it read, writeRecord refuses a moved central head). It goes with the write only when every earlier write has its base: a
+        // chain an older record or update left without bases stays short, proving nothing (editWritesChained), never a wrong pairing. An
+        // owner write between pipegen's makes currentSha differ from the last written sha, so the chain breaks there (and ownerEdited is set).
+        if (Array.isArray(e.baseShas) && e.baseShas.length === e.writtenShas.length) e.baseShas.push(c.currentSha);
+        e.writtenShas.push(sha);
+      }
       if (c.ownerEdited) e.ownerEdited = true;
     }
   }
