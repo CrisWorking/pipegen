@@ -1430,6 +1430,16 @@ describe('G17C: the install record and delivery', () => {
     const co = (await record(w, upd) as Rec).edits.find((e) => e.path === 'CODEOWNERS') as { inserted: string; writtenShas: string[] };
     expect(co.inserted).toBe(ins1);
     expect(co.writtenShas).toEqual([gitBlobSha(cur)]);
+    // the same with no block swap in the lock plan (nothing for the swap path to rebuild the insert from): the record's insert is kept
+    const w2 = world();
+    await firstRun(w2);
+    w2.g.repo('o/r').refs.set('heads/main', w2.g.head('o/r', SETUP_BRANCH));
+    const pin2 = (await deliverCentral(w2.g.octokit(), p, centralFiles(), cdeps(w2)) as { sha: string }).sha;
+    const whole2 = appFiles(pin2, { withPkg: false }).filter((f) => f.edited === undefined && f.inserted === undefined).map((f) => (f.path === 'PIPEGEN.md' ? { ...f, content: '# pipegen v2\n' } : f));
+    await deliver(w2.g.octokit(), p, planDelivery(input(p, pin2, { files: [...centralFiles(), ...whole2, same], locks: locks({ codeowners: undefined }) })), vault2(), deps(w2));
+    const co2 = (await record(w2, upd) as Rec).edits.find((e) => e.path === 'CODEOWNERS') as { inserted: string; writtenShas: string[] };
+    expect(co2.inserted).toBe(ins1);
+    expect(co2.writtenShas).toEqual([gitBlobSha(cur)]);
   });
 
   it('row 23 (deliver): a re-run that swaps pipegen\'s block keeps the separator pipegen added in the recorded insert', async () => {
@@ -1536,6 +1546,16 @@ describe('G17C: the install record and delivery', () => {
     const b = await again();
     expect(b.env?.previous).toMatchObject({ wait_timer: 7, deployment_branch_policy: null });
     expect(b.env?.changed).toEqual(expect.arrayContaining(['deployment_branch_policy']));
+    // opened again, and this run stops after narrowing it: the leftovers hold the settings it found, though the earlier entry has none
+    e.deployment_branch_policy = null;
+    e.policies = [];
+    e.wait_timer = 9;
+    w.g.hooks.push((c) => (!c.route.startsWith('GET ') && c.params.repo === 'r' && /\/git\//.test(c.route) ? { status: 500, data: { message: 'boom' } } : undefined));
+    const err = await again().then(() => null, (x: unknown) => x) as DeliverError;
+    expect(err).toBeInstanceOf(DeliverError);
+    expect(err.leftovers).toEqual(expect.arrayContaining(['environment pipegen-signing (narrowed)']));
+    const items = JSON.parse(readFileSync(leftoversFile(w), 'utf8')).items as { kind: string; previous?: Record<string, unknown> }[];
+    expect(items.find((x) => x.kind === 'environment')?.previous).toMatchObject({ wait_timer: 9, deployment_branch_policy: null });
   });
 
   it('row 33: a re-run over a whole file the owner changed after pipegen wrote it stops with a true message', async () => {

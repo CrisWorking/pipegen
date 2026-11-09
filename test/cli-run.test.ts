@@ -1459,3 +1459,17 @@ describe('G17C row 27: the central repo pipegen created, with its GitHub id, in 
     expect(proofReposFor({ created: [] }, {}).central).toEqual({ createdByPipegen: false });
   });
 });
+
+describe('G17C row 28: only the central commit deliverCentral made in this run reaches the delivery', () => {
+  it('run: centralCommitted is the pin only when deliverCentral says it committed; a pin already there is never passed as this run\'s commit', async () => {
+    const sha = 'c'.repeat(40);
+    for (const committed of [true, undefined, false]) {
+      const w = world();
+      w.stages.deliverCentral = async () => ({ kind: 'pinned', sha, done: [], ...(committed === undefined ? {} : { committed }) }) as never;
+      expect(await run(w)).toBe(0);
+      const input = w.got.deliver?.[0] as { centralCommitted?: string };
+      if (committed === true) expect(input.centralCommitted).toBe(sha);
+      else expect(input, String(committed)).not.toHaveProperty('centralCommitted');
+    }
+  });
+});
