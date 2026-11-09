@@ -56,7 +56,7 @@ import { PROTECTED_PATHS_BASE, type Capabilities, type CreatedFile, type EnvSett
 import { safeText } from '../util/safe-text.js';
 import { generateCosignKeys } from '../layers/deploy.js';
 import type { CosignExec, CosignResolver } from './cosign-keys.js';
-import { ensureSigningEnvironment, plannedOfLocks, readEnv, SETUP_BRANCH } from './deliver.js';
+import { ensureSigningEnvironment, pathClash, plannedOfLocks, readEnv, SETUP_BRANCH } from './deliver.js';
 import { compareStatus, DeliverError, isoAt, readBlobText, readHead, readRepo, readTree, statusOf, type RepoRef, type TreeEntry } from './git-data.js';
 import { holdAppLease, isLeaseStop, stateDepsOf, type ReleaseLease } from '../proof/lease.js';
 import type { StateStore } from '../proof/state.js';
@@ -120,7 +120,8 @@ export interface FinishResult {
 type EnvEntry = InstallRecord['environments'][number];
 type VarEntry = InstallRecord['variables'][number];
 type SecretEntry = InstallRecord['secrets'][number];
-export interface CoFacts { path: string | null; text: string; isSymlink: boolean; block: string | null }
+/** sha: the blob read (G-FINREC-R1 sec M2: the text must hash back to it, else the read was lossy and proves no base). */
+export interface CoFacts { path: string | null; text: string; isSymlink: boolean; block: string | null; sha?: string }
 interface Ctx {
   gh: Octokit; api: SettingsApi; app: RepoRef; central: RepoRef; clock: RateClock; deps: FinishDeps; print: boolean; rotate: boolean;
   rec: InstallRecord; typed: boolean; planned: InstallPlanned; fresh: LockPlan; profile: RepoProfile; caps: Capabilities; shaRead: ShaPinningRead;
@@ -259,7 +260,7 @@ export async function coFacts(gh: Octokit, r: RepoRef, entries: ReadonlyMap<stri
     if (e === undefined) continue;
     if (e.type !== 'blob' || e.mode === '120000') return { path, text: '', isSymlink: true, block: null };
     const text = await readBlobText(gh, r, e.sha, MAX_TEXT, clock);
-    return { path, text, isSymlink: false, block: blockOf(text) };
+    return { path, text, isSymlink: false, block: blockOf(text), sha: e.sha };
   }
   return { path: null, text: '', isSymlink: false, block: null };
 }
@@ -850,13 +851,24 @@ function centralCodeowners(x: Ctx): void {
   // the record commit is made on x.centralHead, the head that blob was read from (writeRecord refuses a moved head). Any other record entry
   // at that path (a deliver edit, an older finish's `files` entry) describes a file that is no longer there as it was: it is replaced, so
   // the record never names the path twice (sec i2: the record refused itself).
+  const what = `the central CODEOWNERS (${show(F.file.path)})`;
+  // G-FINREC-R1 (sec M2), deliver's checkBase for this one file: the text must be the blob read (a file that isn't UTF-8 is read lossily,
+  // and writing it back would drop the owner's bytes), and a new file must not clash with what is there
+  if (c.path !== null && (c.sha === undefined || gitBlobSha(c.text) !== c.sha)) {
+    x.skipped.push({ what, why: 'it is not UTF-8 text, so pipegen can\'t add its lines without changing the owner\'s bytes; pipegen leaves the file as it is (save it as UTF-8, then run `npx pipegen finish` again).' });
+    return;
+  }
+  if (c.path === null && pathClash(F.file.path, x.centralTree)) {
+    x.skipped.push({ what, why: `${show(F.file.path)} clashes with a file of another letter case, a file where its folder would be, or a folder of that name in the central repo; pipegen writes nothing there (move that file, then run \`npx pipegen finish\` again).` });
+    return;
+  }
   const sha = gitBlobSha(F.file.content);
   const base = c.path === null ? null : gitBlobSha(c.text);
   const original = c.text;
   // the planned file is the one finish read (locks.ts codeownersPlan names the path it found); any other path proves nothing about its base
   const inserted = c.path === null ? F.file.content : c.path === F.file.path && F.file.content.startsWith(original) ? F.file.content.slice(original.length) : null;
   if (inserted === null || inserted === '') {
-    x.skipped.push({ what: `the central CODEOWNERS (${show(F.file.path)})`, why: 'pipegen\'s lines would not simply follow the file\'s own text, so the install record couldn\'t say what to take out on uninstall; pipegen leaves the file as it is.' });
+    x.skipped.push({ what, why: 'pipegen\'s lines would not simply follow the file\'s own text, so the install record couldn\'t say what to take out on uninstall; pipegen leaves the file as it is.' });
     return;
   }
   const here = (e: { repo: string; path: string }): boolean => e.repo === 'central' && e.path === F.file.path;

@@ -18,6 +18,7 @@
 // members, so the gate can't check those approvals), and says (G26) that a key rotation resets the baseline.
 import type { Octokit } from '@octokit/rest';
 import { validDate } from '../../gate/src/date.js';
+import { codeOwners, ownersLookup, PIPEGEN_BLOCK_BEGIN, PIPEGEN_BLOCK_END, pipegenBlockOwners } from '../../gate/src/integrity.js';
 import { centralWorkflowFile } from '../engine/central-path.js';
 import { CENTRAL_PROTECTED_PATHS, CODEOWNERS_END } from '../engine/created-builders.js';
 import type { RateClock } from '../engine/github-rate.js';
@@ -84,9 +85,20 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
   }
   for (const ed of r.edits) {
     const e = trees[ed.repo]?.get(ed.path);
+    const readText = async (): Promise<string> => (e === undefined || e.type !== 'blob' ? '' : await readBlobText(gh, ed.repo === 'app' ? app : central, e.sha, MAX_TEXT, clock));
+    // G-FINREC-R1 (sec M1): in every CODEOWNERS pipegen created or edited (app or central, its own write included), a rule after pipegen's
+    // block wins over it; one that takes a protected path from the block's owners is drift (inserted text alone can't show that)
+    const coText = ed.kind === 'codeowners' && e !== undefined && e.type === 'blob' && e.mode !== '120000' ? await readText() : null;
+    if (coText !== null) {
+      const over = overridingRules(coText, ed.repo === 'app' ? [...new Set([...protectedListOf(r, 'app'), ...PROTECTED_PATHS_BASE])] : CENTRAL_PROTECTED_PATHS);
+      // markers missing with the inserted text gone too: the check below names it once
+      if (over === null ? coText.split((ed as { inserted: string }).inserted).length === 2 : over.length > 0) {
+        drift.push({ what: `a CODEOWNERS rule after pipegen's block in ${label(ed.repo, ed.path)}`, expected: 'no rule after pipegen\'s block that takes a protected path from its owners', actual: over === null ? 'pipegen\'s begin or end line is missing or repeated' : show(over.join(' | '), 600) });
+      }
+    }
     if (e !== undefined && ed.writtenShas.includes(e.sha)) continue;
     if (ed.kind === 'codeowners' || ed.kind === 'hooks' || ed.kind === 'dependabot') {
-      const text = e === undefined || e.type !== 'blob' ? '' : await readBlobText(gh, ed.repo === 'app' ? app : central, e.sha, MAX_TEXT, clock);
+      const text = coText ?? await readText();
       if (text.split(ed.inserted).length !== 2) drift.push({ what: `pipegen's lines in ${label(ed.repo, ed.path)}`, expected: 'pipegen\'s inserted text, once', actual: e === undefined ? null : 'changed or missing' });
     } else {
       drift.push({ what: label(ed.repo, ed.path), expected: ed.writtenShas.at(-1) ?? 'the file pipegen wrote', actual: e?.sha ?? null });
@@ -445,6 +457,54 @@ async function findSetupPr(api: SettingsApi, app: RepoRef): Promise<number | und
   const d = await api.readOr404('GET /repos/{owner}/{repo}/pulls', { owner: app.owner, repo: app.repo, head: `${app.owner}:${SETUP_BRANCH}`, state: 'all', per_page: 100 });
   const list = Array.isArray(d) ? d.filter(isObj).filter((p) => isObj(p.head) && p.head.ref === SETUP_BRANCH && Number.isSafeInteger(p.number)) : [];
   return list.map((p) => p.number as number).sort((a, b) => b - a)[0];
+}
+
+/** Paths a protected pattern (the gate's form) stands for, to test a CODEOWNERS rule against: each wildcard filled, a subtree with files
+ * of the common kinds and a nested one, a bare name at the root and one folder down. */
+function protectedSamples(paths: readonly string[]): string[] {
+  const out = new Set<string>();
+  const fill = (p: string): string => p.replace(/\*\*\//g, '').replace(/\*\*/g, 'x').replace(/[*?]/g, 'x');
+  for (const raw of paths) {
+    const p = raw.replace(/^\.?\//, '');
+    for (const at of p.includes('/') && !p.startsWith('**/') ? [p] : [p.replace(/^\*\*\//, ''), `a/${p.replace(/^\*\*\//, '')}`]) {
+      if (at.endsWith('/**')) {
+        const dir = fill(at.slice(0, -3));
+        for (const f of ['x', 'x.yml', 'x.yaml', 'x.json', 'x.toml', 'x.md', 'a/x.yml', 'a/x.json']) out.add(`${dir}/${f}`);
+      } else out.add(fill(at));
+    }
+  }
+  return [...out].filter((x) => x !== '' && !x.split('/').includes(''));
+}
+
+/**
+ * G-FINREC-R1 (sec M1): the rules after pipegen's block (they win over it: the last matching rule counts) that cover a protected path and
+ * name no owner, or an owner outside the block's (a team, an e-mail, another login). "Covers" is tested from the protected side (sample
+ * paths of each protected pattern, matched with the gate's own CODEOWNERS matching, so `*` and `**` count) and from the rule's side. A line
+ * GitHub skips owns nothing; a line the gate can't read counts. Lines before the block lose to it. null: not exactly one begin line and one
+ * end line after it (nothing can say where the block ends). pipegen's own output has nothing after its block but what the owner wrote.
+ */
+export function overridingRules(text: string, protectedPaths: readonly string[]): string[] | null {
+  const lines = text.split(/\r?\n/);
+  const begins = lines.flatMap((l, i) => (l === PIPEGEN_BLOCK_BEGIN ? [i] : []));
+  const ends = lines.flatMap((l, i) => (l === PIPEGEN_BLOCK_END ? [i] : []));
+  if (begins.length !== 1 || ends.length !== 1 || (ends[0] as number) < (begins[0] as number)) return null;
+  const owners = new Set(pipegenBlockOwners(text));
+  const samples = protectedSamples(protectedPaths);
+  const isProt = protectedMatcher(protectedPaths.map((p) => p.replace(/^\.\//, '/')));
+  const out: string[] = [];
+  for (const raw of lines.slice((ends[0] as number) + 1)) {
+    const line = raw.trim();
+    if (line === '' || line.startsWith('#')) continue;
+    const rule = codeOwners(raw)[0];
+    if (rule === undefined) continue;
+    if (rule.unreadable !== undefined) { out.push(line.slice(0, 200)); continue; }
+    const named = line.split(/\s+/).length - 1;
+    if (named > 0 && rule.owners.length === named && rule.owners.every((o) => owners.has(o))) continue;
+    const ruleSample = rule.pattern.replace(/^\//, '').replace(/\/$/, '/x').replace(/\*\*/g, 'x').replace(/[*?]/g, 'x');
+    const covers = isProt(ruleSample) || samples.some((p) => { const m = ownersLookup([rule], p); return 'unresolved' in m || m.owners !== undefined; });
+    if (covers) out.push(line);
+  }
+  return out;
 }
 
 /**

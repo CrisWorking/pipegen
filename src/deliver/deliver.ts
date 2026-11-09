@@ -894,14 +894,21 @@ async function checkPinnedOwn(gh: Octokit, c: RepoRef, pin: string, pinned: read
   return adopted;
 }
 
+/**
+ * Whether a new file at `path` would clash with the tree: a file of another letter case, a file where one of its folders would be, or a
+ * folder of that name (a blob under it). Only for a path the tree doesn't hold as such. Shared with finish's central CODEOWNERS (G-FINREC-R1).
+ */
+export function pathClash(path: string, entries: ReadonlyMap<string, TreeEntry>): boolean {
+  const lower = path.toLowerCase();
+  return [...entries.keys()].some((key) => { const k = key.toLowerCase(); return k === lower || lower.startsWith(`${k}/`) || k.startsWith(`${lower}/`); });
+}
+
 /** Base-tree checks of the app files (step 2): what changes, and the mode each file keeps. Throws before anything is written. */
 function checkBase(files: readonly CreatedFile[], entries: ReadonlyMap<string, TreeEntry>, prev: InstallRecord | null, repo: 'app' | 'central', adopted: Set<CreatedFile>): Map<CreatedFile, string> {
   const changed = new Map<CreatedFile, string>();
-  const keys = [...entries.keys()].map((k) => k.toLowerCase());
   for (const f of files) {
     const e = entries.get(f.path);
-    const lower = f.path.toLowerCase();
-    if (e === undefined && keys.some((k) => k === lower || lower.startsWith(`${k}/`) || k.startsWith(`${lower}/`))) throw new DeliverError(`${show(f.path)} clashes with a file of another letter case, a file where its folder would be, or a folder of that name.`);
+    if (e === undefined && pathClash(f.path, entries)) throw new DeliverError(`${show(f.path)} clashes with a file of another letter case, a file where its folder would be, or a folder of that name.`);
     if (e !== undefined && (e.mode === '120000' || e.type !== 'blob')) throw new DeliverError(`${show(f.path)} is a symbolic link or not a plain file in your repository; pipegen won't write through it.`);
     const original = f.inserted?.original ?? f.edited?.original;
     if (original !== undefined) {
