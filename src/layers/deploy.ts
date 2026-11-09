@@ -231,7 +231,7 @@ export function insertVerify(original: string, deployJobs: readonly string[], ve
   for (const i of ranked) { text += original.slice(from, i.at) + i.text; from = i.at; }
   text += original.slice(from);
   const inserted: PipegenInserted = { original, jobs: [VERIFY_JOB], needs: [...new Set(deployJobs)].map((job) => ({ job, added: [VERIFY_JOB] })), headCheck: headJobs, ...(needsOnly.length > 0 ? { needsOnly: [...new Set(needsOnly)] } : {}) };
-  checkEdit(text, inserted, verify);
+  checkEdit(text, inserted, headCheckOf(verify), verify);
   return { text, inserted, insertions: ranked.map(({ at, text: t }) => ({ at, text: t })) };
 }
 
@@ -240,14 +240,14 @@ export function insertVerify(original: string, deployJobs: readonly string[], ve
  * exactly `verify`, every job the mark gates still needs it (sec M4), every job of `headCheck` starts with the verify job's head check
  * exactly, and without pipegen's job, needs and head checks it is the original exactly.
  */
-function checkEdit(text: string, mark: PipegenInserted, verify: Job): void {
+function checkEdit(text: string, mark: PipegenInserted, head: RenderedStep, verify: Job | null): void {
   const now = parseYaml(text, 'user');
   const was = parseYaml(mark.original, 'user');
   if (!('parsed' in now) || !('parsed' in was)) return refuse('with pipegen\'s job added the file would not be valid YAML');
   const jobs = now.parsed.js.jobs as Obj;
   // G13 (G7-R2 carry): a called workflow holds no verify job, only pipegen's head checks
   const called = mark.calledBy !== undefined;
-  if (called ? Object.hasOwn(jobs, VERIFY_JOB) || mark.jobs.length > 0 || mark.needs.length > 0 : !isDeepStrictEqual(jobs[VERIFY_JOB], parseDocument(verifyJobYaml(verify)).toJS()[VERIFY_JOB])) refuse(`the ${VERIFY_JOB} job in the file is not the one pipegen writes`);
+  if (called ? Object.hasOwn(jobs, VERIFY_JOB) || mark.jobs.length > 0 || mark.needs.length > 0 : verify === null || !isDeepStrictEqual(jobs[VERIFY_JOB], parseDocument(verifyJobYaml(verify)).toJS()[VERIFY_JOB])) refuse(`the ${VERIFY_JOB} job in the file is not the one pipegen writes`);
   const rest = structuredClone(now.parsed.js);
   const restJobs = rest.jobs as Obj;
   if (!called) delete restJobs[VERIFY_JOB];
@@ -263,7 +263,7 @@ function checkEdit(text: string, mark: PipegenInserted, verify: Job): void {
     else if (typeof before === 'string' && kept.length === 1) j.needs = kept[0];
     else j.needs = kept;
   }
-  const want = stepJs(headCheckOf(verify));
+  const want = stepJs(head);
   for (const id of mark.headCheck ?? []) {
     const j = restJobs[id];
     const steps = isObj(j) && Array.isArray(j.steps) ? j.steps : [];
@@ -288,7 +288,7 @@ export function renewVerifyJob(text: string, mark: PipegenInserted, verify: Job)
   const start = lineStart(text, from);
   const tail = text.slice(start, to).endsWith('\n') ? eolOf(text) : '';
   const out = `${text.slice(0, start)}${indentLines(verifyJobYaml(verify), col).replace(/\n/g, eolOf(text))}${tail}${text.slice(to)}`;
-  checkEdit(out, mark, verify);
+  checkEdit(out, mark, headCheckOf(verify), verify);
   return out;
 }
 
@@ -309,9 +309,13 @@ export function localCallOf(job: unknown): string | null {
  */
 export function insertHeadChecks(original: string, calledBy: readonly string[], verify: Job): { text: string; inserted: PipegenInserted; insertions: Insertion[] } {
   if (calledBy.length === 0) refuse('no gated job calls it');
+  return insertHeadCheckStep(original, calledBy, headCheckOf(verify));
+}
+/** insertHeadChecks with the head check step itself (the referee renders it from the default branch: G17A-R1 sec M2). */
+function insertHeadCheckStep(original: string, calledBy: readonly string[], head: RenderedStep): { text: string; inserted: PipegenInserted; insertions: Insertion[] } {
+  if (calledBy.length === 0) refuse('no gated job calls it');
   const { map } = parsedDoc(original);
   const eol = eolOf(original);
-  const head = headCheckOf(verify);
   const insertions: Insertion[] = [];
   const ids: string[] = [];
   for (const pair of map.items as Pair<YamlNode, YamlNode>[]) {
@@ -335,7 +339,7 @@ export function insertHeadChecks(original: string, calledBy: readonly string[], 
   for (const i of insertions) { text += original.slice(from, i.at) + i.text; from = i.at; }
   text += original.slice(from);
   const inserted: PipegenInserted = { original, jobs: [], needs: [], headCheck: ids, calledBy: [...new Set(calledBy)].sort() };
-  checkEdit(text, inserted, verify);
+  checkEdit(text, inserted, head, null);
   return { text, inserted, insertions };
 }
 
@@ -385,6 +389,36 @@ function callersOf(path: string, texts: ReadonlyMap<string, string>): string[] {
 }
 
 /**
+ * G13 (G7-R2 carry) and G17A-R1 sec M2: the one predicate of whether pipegen starts each job of the local called workflow `path` with its head
+ * check: the edit (insertHeadChecks' form), or why not. calledHeadChecks builds the inserts from it, and the referee re-derives it from the
+ * same texts, so a batch that drops a called file's edit is refused. `callers`: the gated workflows that call it (the mark's calledBy);
+ * `gatedCalls`: `<workflow>:<job>` of every gated job that calls a workflow; `head`: the verify job's head check step.
+ */
+export function calledHeadCheckEdit(draft: PipelineDraft, texts: ReadonlyMap<string, string>, path: string, callers: readonly string[], gatedCalls: ReadonlySet<string>, head: RenderedStep | undefined): { edit: ReturnType<typeof insertHeadChecks> } | { why: string } {
+  const text = texts.get(path);
+  if (OWN_WORKFLOWS.has(path) || !draft.profile.existingWorkflows.some((w) => w.path === path)) return { why: 'it is not one of this repository\'s workflows pipegen read' };
+  if (typeof text !== 'string') return { why: 'pipegen could not read it' };
+  const parsed = parseYaml(text, 'user');
+  if (!('parsed' in parsed)) return { why: `pipegen can not edit it safely (${safeText(parsed.problems.join('; '), 200)})` };
+  const js = parsed.parsed.js;
+  const triggers = triggersOf(js.on);
+  if (triggers === null || triggers.length !== 1 || triggers[0] !== 'workflow_call') return { why: 'it is started by more than workflow_call, and pipegen\'s head check refuses any run but a push' };
+  const others = callersOf(path, texts).filter((c) => !gatedCalls.has(c));
+  if (others.length > 0) return { why: `it is also called by ${others.map((c) => show(c)).join(', ')}, which pipegen doesn't gate, where the head check would stop every run` };
+  const top = userTopProblem(js, { permissions: false });
+  if (top !== null) return { why: top };
+  const jobs = isObj(js.jobs) ? js.jobs : {};
+  const bad = Object.keys(jobs).filter((id) => !stepsGated(jobs[id]) || !readsContents(jobs[id], js.permissions));
+  if (bad.length > 0) return { why: `its job ${bad.map(show).join(', ')} has a step that could run after pipegen's head check failed, or no contents: read for the check` };
+  try {
+    return { edit: insertHeadCheckStep(text, callers, head ?? refuse(`the ${VERIFY_JOB} job has no head check`)) };
+  } catch (e) {
+    if (!(e instanceof EditRefused || e instanceof RenderError)) throw e;
+    return { why: safeText(e.message, 200) };
+  }
+}
+
+/**
  * G13 (G7-R2 carry, BINDING): for each local workflow that gated deploy jobs call, pipegen's head check as the first step of each of its jobs
  * (insertHeadChecks), when it can: the file is one of the repository's workflows, started only by workflow_call, called by no job pipegen
  * doesn't gate (in any other run the check would refuse a pull request or a schedule), its env and defaults leave pipegen's step alone, and
@@ -395,30 +429,12 @@ function calledHeadChecks(draft: PipelineDraft, texts: ReadonlyMap<string, strin
   const covered = new Set<string>();
   const why = new Map<string, string>();
   const gatedCalls = new Set(calls.map((c) => `${c.caller}:${c.job}`));
+  const head = verify.steps.find((s) => s.id === HEAD_CHECK_STEP_ID);
   for (const path of [...new Set(calls.map((c) => c.path).filter((x): x is string => x !== null))].sort()) {
     const callers = [...new Set(calls.filter((c) => c.path === path).map((c) => c.caller))];
-    const no = (w: string): void => { why.set(path, w); };
-    const text = texts.get(path);
-    if (OWN_WORKFLOWS.has(path) || !draft.profile.existingWorkflows.some((w) => w.path === path)) { no('it is not one of this repository\'s workflows pipegen read'); continue; }
-    if (typeof text !== 'string') { no('pipegen could not read it'); continue; }
-    const parsed = parseYaml(text, 'user');
-    if (!('parsed' in parsed)) { no(`pipegen can not edit it safely (${safeText(parsed.problems.join('; '), 200)})`); continue; }
-    const js = parsed.parsed.js;
-    const triggers = triggersOf(js.on);
-    if (triggers === null || triggers.length !== 1 || triggers[0] !== 'workflow_call') { no('it is started by more than workflow_call, and pipegen\'s head check refuses any run but a push'); continue; }
-    const others = callersOf(path, texts).filter((c) => !gatedCalls.has(c));
-    if (others.length > 0) { no(`it is also called by ${others.map((c) => show(c)).join(', ')}, which pipegen doesn't gate, where the head check would stop every run`); continue; }
-    const top = userTopProblem(js, { permissions: false });
-    if (top !== null) { no(top); continue; }
-    const jobs = isObj(js.jobs) ? js.jobs : {};
-    const bad = Object.keys(jobs).filter((id) => !stepsGated(jobs[id]) || !readsContents(jobs[id], js.permissions));
-    if (bad.length > 0) { no(`its job ${bad.map(show).join(', ')} has a step that could run after pipegen's head check failed, or no contents: read for the check`); continue; }
-    let edit: ReturnType<typeof insertHeadChecks>;
-    try { edit = insertHeadChecks(text, callers, verify); } catch (e) {
-      if (!(e instanceof EditRefused || e instanceof RenderError)) throw e;
-      no(safeText(e.message, 200));
-      continue;
-    }
+    const plan = calledHeadCheckEdit(draft, texts, path, callers, gatedCalls, head);
+    if ('why' in plan) { why.set(path, plan.why); continue; }
+    const { edit } = plan;
     const file: CreatedFile = { path, content: edit.text, part: 'deploy-verify', reason: `Starts each job of this workflow, which pipegen's gated deploy jobs call, with pipegen's head check, so a called deploy that waited for an approval, or a re-run, stops once a newer commit is on the default branch.`, repo: 'app', inserted: edit.inserted };
     out.inserts.push({ path, text: edit.text, inserted: edit.inserted, insertions: edit.insertions, file });
     out.preview.push(`${path}: pipegen starts ${(edit.inserted.headCheck ?? []).map(show).join(', ')} with its head check (the workflow is called by ${callers.map((c) => show(c)).join(', ')}).`);

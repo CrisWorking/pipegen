@@ -1110,10 +1110,11 @@ function realStages(io: CliIO, deps: RunDeps): RunStages {
  * The referee (seven arguments, against AssembledFiles.draft: carries 11, 50) and the guard on the same batch (carry 51). Never
  * isolatedTestJob (carry 54). The guard's refusals and the referee's issues both stop the run.
  */
-export async function judgeBuilt(i: BuildInput, files: Pick<Built, 'assembled' | 'files' | 'verify' | 'extra'>, facts: Pick<BuildFacts, 'appCo' | 'centralCo' | 'pipegenDoc' | 'serviceTypes' | 'baseTree' | 'centralFiles'>, deps: { linters?: () => ReturnType<typeof ensureLinters>; judge?: typeof judgeAssembled; guard?: typeof guardCreatedFiles } = {}): Promise<{ report: RefereeReport; guardProblems: string[] }> {
+export async function judgeBuilt(i: BuildInput, files: Pick<Built, 'assembled' | 'files' | 'verify' | 'extra'>, facts: Pick<BuildFacts, 'appCo' | 'centralCo' | 'pipegenDoc' | 'serviceTypes' | 'baseTree' | 'centralFiles'> & Partial<Pick<BuildFacts, 'texts'>>, deps: { linters?: () => ReturnType<typeof ensureLinters>; judge?: typeof judgeAssembled; guard?: typeof guardCreatedFiles } = {}): Promise<{ report: RefereeReport; guardProblems: string[] }> {
   const report = await (deps.judge ?? judgeAssembled)(files.assembled, {
     platform: i.platform, reviewed: i.reviewed, linters: (deps.linters ?? ensureLinters)(), ghToken: i.auth.token ?? '',
-    refereeDeps: { vault: i.vault, createdInputs: createdInputsFor(i, facts) }, extra: files.extra,
+    // G17A-R1 sec M2: the workflow texts the verify plan was built from, so the referee re-derives the called-file head checks
+    refereeDeps: { vault: i.vault, createdInputs: createdInputsFor(i, facts), ...(facts.texts === undefined ? {} : { workflowTexts: facts.texts }) }, extra: files.extra,
   });
   const g = await (deps.guard ?? guardCreatedFiles)(files.files.filter((x) => x.repo === 'app'), {
     root: i.dir, baseTree: facts.baseTree, installRecord: guardRecord(i.prev), profile: files.assembled.draft.profile, repo: 'app',
@@ -1137,7 +1138,7 @@ export function proofBuildFor(i: BuildInput, facts: BuildFacts, envPlan: EnvPlan
   const judge = makeFixReferee({
     assemble: async (d) => { const b = await rebuild(d); return { files: b.files, draft: b.assembled.draft }; },
     platform: i.platform, reviewed: i.reviewed, linters: (deps.linters ?? ensureLinters)(), ghToken: i.auth.token ?? null,
-    deps: { vault: i.vault, createdInputs: createdInputsFor(i, facts), ...(deps.runLinters === undefined ? {} : { runLinters: deps.runLinters }) },
+    deps: { vault: i.vault, createdInputs: createdInputsFor(i, facts), workflowTexts: facts.texts, ...(deps.runLinters === undefined ? {} : { runLinters: deps.runLinters }) },
   });
   const ctx = { root: i.dir, baseTree: facts.baseTree, installRecord: guardRecord(i.prev), repo: 'app' as const, closure: loadReviewedClosure(i.reviewed), vault: i.vault };
   const guard = deps.guard ?? guardCreatedFiles;

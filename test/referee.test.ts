@@ -681,7 +681,8 @@ describe('referee: blocking needs (B7)', () => {
     const r = await run([wf({ scan: job(steps) })], draftOf([spec]), { list });
     expect(r.demoted).toEqual(['secrets']);
     expect(r.notes.join(' ')).toMatch(/secrets/);
-    expect(r.ok, show(r)).toBe(true);
+    // G17A-R1 sec I3: a demoted floor findings check is refused even alone (the gate's floor holds only what its job list holds)
+    expect(r.issues.map((i) => `${i.check}: ${i.message}`), show(r)).toEqual([expect.stringMatching(/^not-gate-readable: The floor check "secrets" writes nothing the gate can read: as a warning it leaves the gate's list/)]);
   });
   it('referee: blocking dast with zap-json accepted; blocking hooks-ci accepted', async () => {
     // G4-R1: DAST runs in two jobs (the app from its checked image archive, the scan, the raw hand-off; then the hash check and the scrub)

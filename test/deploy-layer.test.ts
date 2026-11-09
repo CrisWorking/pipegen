@@ -118,9 +118,10 @@ function world(kind: Kind, wfs: [string, string][] = [[A, DEPLOY_A]], over: { pr
   const texts = new Map(wfs);
   return { draft: x.draft, plan: x.plan, a, v: planVerifyInserts(a.draft, texts, a.verify), texts };
 }
-// G17A-R1 sec M2: the referee gets the workflow texts the plan was built from (run.ts passes BuildFacts.texts), so it re-derives the called-file head checks
-const judge = (w: World, extra: CreatedFile[] = w.v.inserts.map((i) => i.file), texts: ReadonlyMap<string, string> | undefined = w.texts) =>
-  judgeAssembled(w.a, { ...JD, extra, refereeDeps: { ...JD.refereeDeps, ...(texts === undefined ? {} : { workflowTexts: texts }) } });
+// G17A-R1 sec M2: the referee gets the workflow texts the plan was built from (run.ts passes BuildFacts.texts), so it re-derives the called-file
+// head checks; null: none given
+const judge = (w: World, extra: CreatedFile[] = w.v.inserts.map((i) => i.file), texts: ReadonlyMap<string, string> | null = w.texts) =>
+  judgeAssembled(w.a, { ...JD, extra, refereeDeps: { ...JD.refereeDeps, ...(texts === null ? {} : { workflowTexts: texts }) } });
 const verifyOf = (w: World): Job => w.a.verify as Job;
 const step = (j: Job, id: string): Obj => j.steps.find((s) => s.id === id) as Obj;
 const insertedJob = (text: string): Obj => (parse(text) as Obj).jobs['pipegen-verify'] as Obj;
@@ -1557,9 +1558,9 @@ describe('G17A-R1: the referee judges the edited file and the batch, never the m
     const r = await judge(w, [caller]);
     expect(r.issues.some((i) => /"ship" calls \.github\/workflows\/ship\.yml, whose jobs pipegen starts with its head check, and the batch holds no such edit of it naming this workflow/.test(i.message)), shown(r)).toBe(true);
     // without the workflow texts the referee can not tell: refused unless the edit is there (fails closed)
-    const blind = await judge(w, [caller], undefined);
+    const blind = await judge(w, [caller], null);
     expect(blind.issues.some((i) => /pipegen can not tell whether \.github\/workflows\/ship\.yml takes its head check/.test(i.message)), shown(blind)).toBe(true);
-    expect(shown(await judge(w, [caller, called], undefined))).toBe('');
+    expect(shown(await judge(w, [caller, called], null))).toBe('');
     // shape B (one job, four-space indentation): the same rule
     const b = calledWorld(CALLER_B, CALLED_B);
     expect(shown(await judge(b))).toBe('');

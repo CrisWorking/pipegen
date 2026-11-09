@@ -61,8 +61,8 @@ import { slotProblem, type SlotKind } from './slots.js';
 import { expectedSigningSteps, signedImageOwner } from './signing.js';
 import { NO_IMAGE_CATEGORIES, noImageServices, publishedImageServices, WORKFLOW_LINT_TOOL } from './needs.js';
 import { FIND_RUN_STEP_ID, PUBLISH_TAG, publishedImageRepo, renderDigestStep, renderHeadCheckStep, renderPublishDigestStep } from './deploy-steps.js';
-import { strongReason } from './deploy-gating.js';
-import { deployGating } from '../layers/deploy.js';
+import { callsWorkflow, strongReason } from './deploy-gating.js';
+import { calledHeadCheckEdit, deployGating, localCallOf } from '../layers/deploy.js';
 import { ARCHIVE_TOOL_IDS, imageBuildTag, renderImageArchiveScan, renderImageBuild } from './image-handoff.js';
 import { dastStartOf, nightlyDastSpec, NIGHTLY_DAST_TOOL, renderDastRun, renderDastScrub, zapActiveSpec, ZAP_ACTIVE_LANE, ZAP_ACTIVE_TOOL } from './dast-handoff.js';
 import { ATTEST_VERIFY_SETS, KEYLESS_VERIFY_SETS, SHARED_CDN_SETS } from './egress.js';
@@ -92,7 +92,9 @@ export interface Linters { actionlint: () => Promise<string>; zizmor: () => Prom
 /** The linter run (7b's runLinters): actionlint and zizmor over the workflow files, findings as issues. */
 export type RunLinters = (files: CreatedFile[], linters: Linters, ghToken: string | null) => Promise<RefereeIssue[]>;
 /** The injectable parts. `runLinters` defaults to the real one (linters.ts); a throwing runner is an issue. */
-export interface RefereeDeps { runLinters?: RunLinters; /** the created-file rules (default: CREATED_RULES); tests inject their own */ createdRules?: readonly CreatedRule[]; /** what delivery knows (D0b): the central CODEOWNERS path, PIPEGEN.md's shas, the vault check */ createdInputs?: CreatedInputs; /** the secret vault (D5): a value the user gave pipegen inside any file is an issue */ vault?: KnownValueCheck }
+export interface RefereeDeps { runLinters?: RunLinters; /** the created-file rules (default: CREATED_RULES); tests inject their own */ createdRules?: readonly CreatedRule[]; /** what delivery knows (D0b): the central CODEOWNERS path, PIPEGEN.md's shas, the vault check */ createdInputs?: CreatedInputs; /** the secret vault (D5): a value the user gave pipegen inside any file is an issue */ vault?: KnownValueCheck;
+  /** G17A-R1 sec M2: the app's workflow texts the verify plan was built from (BuildFacts.texts, path → text), so the referee re-derives which called workflows take pipegen's head check; absent, a gated call without that edit is refused */
+  workflowTexts?: ReadonlyMap<string, string> }
 
 // ---------- the tables ----------
 
@@ -827,6 +829,9 @@ interface FileCtx {
   others: Map<string, Parsed>;
   /** how many times the name PIPEGEN_DB_PASSWORD sits inside runtime-env steps recognised by content (D4): the only place it may be */
   dbPwOk: number;
+  /** G17A-R1 sec M2: every file of the batch, and the app's workflow texts (RefereeDeps.workflowTexts) */
+  batch?: readonly CreatedFile[];
+  workflowTexts?: ReadonlyMap<string, string>;
 }
 
 const issueFor = (fc: FileCtx) => (check: RefereeCheck, message: string): void => fc.add(fc.file.path, check, message);
@@ -2046,16 +2051,23 @@ function judgeGateName(fc: FileCtx, id: string, j: Obj): void {
   if (gateNameLike(j.name) || (j.name === undefined && gateNameLike(id))) bad('not-gate-readable', `The job ${show(id)} is named like the gate (${GATE_CHECK_NAME}, compared without case, spaces or doubled slashes); a check under the gate's name could pass for it, so only the gate job may have it.`);
 }
 
-/** Whether a called workflow declares the secret `name` under workflow_call (exactly that name). */
+/** Whether a called workflow declares the secret `name` under workflow_call (exactly that name: readsSecret compares the name the same way). */
 function declaresSecret(js: Obj, name: string): boolean {
   const call = isObj(js.on) ? js.on.workflow_call : undefined;
   return isObj(call) && isObj(call.secrets) && Object.hasOwn(call.secrets, name);
 }
-/** Whether a job of a workflow reads the secret `name` (`secrets.NAME` or `secrets['NAME']`, any spelling of the context), in any key or value. */
+/** A `${{ … }}` expression of a string (G17A-R1 sec N1: only an expression reads a secret). */
+const EXPRESSION_RE = /\$\{\{([\s\S]*?)\}\}/g;
+/**
+ * Whether a job of a workflow reads the secret `name`: `secrets.NAME` or `secrets['NAME']` inside a `${{ }}` expression (G17A-R1 sec N1: the
+ * same text in a step name or plain run text reads nothing), in any key or value. The context may be spelled in any case; the name is
+ * compared exactly, as declaresSecret compares it (spec M4: the two agree).
+ */
 function readsSecret(js: Obj, name: string): boolean {
   const n = name.replace(/[^A-Za-z0-9_]/g, '\\$&');
-  const re = new RegExp(`\\bsecrets\\s*(?:\\.\\s*${n}\\b|\\[\\s*['"]${n}['"]\\s*\\])`, 'i');
-  const walk = (v: unknown): boolean => (typeof v === 'string' ? re.test(v) : Array.isArray(v) ? v.some(walk) : isObj(v) ? Object.entries(v).some(([k, x]) => re.test(k) || walk(x)) : false);
+  const re = new RegExp(`(?<![A-Za-z0-9_.])[Ss][Ee][Cc][Rr][Ee][Tt][Ss]\\s*(?:\\.\\s*${n}(?![A-Za-z0-9_-])|\\[\\s*(?:'${n}'|"${n}")\\s*\\])`);
+  const reads = (text: string): boolean => [...text.matchAll(EXPRESSION_RE)].some((m) => re.test(m[1] as string));
+  const walk = (v: unknown): boolean => (typeof v === 'string' ? reads(v) : Array.isArray(v) ? v.some(walk) : isObj(v) ? Object.entries(v).some(([k, x]) => reads(k) || walk(x)) : false);
   return walk(js.jobs);
 }
 
@@ -2470,6 +2482,8 @@ function judgeSecrets(fc: FileCtx, at: (m: string) => string, withs: Obj, env: O
 
 // ---------- an edited user workflow (the marker, types.ts PipegenInserted) ----------
 
+/** The one job pipegen inserts into a user's deploy workflow (assemble.ts VERIFY_JOB_ID; not imported: assemble imports this file). */
+const VERIFY_JOB = 'pipegen-verify';
 /** Needs as a list, whatever form they were written in. */
 const needsList = (v: unknown): unknown[] => (v === undefined ? [] : Array.isArray(v) ? v : [v]);
 
@@ -2483,6 +2497,10 @@ function judgeEdited(fc: FileCtx, parsed: Parsed, mark: PipegenInserted): void {
   }
   if (mark.calledBy !== undefined) { judgeCalled(fc, parsed, mark); return; }
   if (!Array.isArray(mark.jobs) || mark.jobs.length === 0 || !Array.isArray(mark.needs) || typeof mark.original !== 'string') { bad('template', 'The edit mark is incomplete.'); return; }
+  // G17A-R1 sec I1: an edit of a user's deploy workflow inserts pipegen-verify and nothing else (insertVerify's only form), so the rows 2-4
+  // re-derivation below always runs; a mark that leaves it out, or adds a job beside it, would skip it or slip a job in (the rest of the file
+  // is still judged, so every other issue of such an edit is reported too)
+  if (!isDeepStrictEqual(mark.jobs, [VERIFY_JOB])) { bad('template', `An edit of a user's deploy workflow inserts exactly one job, ${VERIFY_JOB}; this mark lists ${mark.jobs.map((x) => show(x)).join(', ')}.`); }
   const orig = parseYaml(mark.original, 'user');
   if (!('parsed' in orig)) { bad('template', `The user's original workflow can not be read (${orig.problems.join('; ')}), so pipegen can not show its edit is only the inserted job.`); return; }
   const jobs = parsed.js.jobs;
@@ -2511,6 +2529,8 @@ function judgeEdited(fc: FileCtx, parsed: Parsed, mark: PipegenInserted): void {
     // a gated job that can run although a job it needs failed is not gated (ruling 5; fix round 2, ruling 1)
     if (!gatedIfAllowed(j.if)) bad('template', `The job ${show(n.job)} has an if: other than success() or success() && <condition without a status function or a top-level ||>, so it could run even when pipegen's check fails; it would not really be gated.`);
     const list = needsList(j.needs);
+    // G17A-R1 sec I2: pipegen adds the one need pipegen-verify to each job it gates, nothing else
+    if (!isDeepStrictEqual(added, [VERIFY_JOB])) bad('template', `The edit mark must say pipegen adds exactly the need ${VERIFY_JOB} to ${show(n.job)}; it says ${show(JSON.stringify(added))}.`);
     for (const a of added) {
       if (typeof a !== 'string' || !mark.jobs.includes(a)) bad('template', `The need ${show(a)} added to ${show(n.job)} is not a job pipegen inserted.`);
       if (!list.includes(a)) bad('template', `The job ${show(n.job)} does not need ${show(a)}, which the edit says pipegen added.`);
@@ -2522,8 +2542,9 @@ function judgeEdited(fc: FileCtx, parsed: Parsed, mark: PipegenInserted): void {
     else j.needs = kept;
   }
   // G7-R1 sec I1: every job that waits for pipegen-verify and has steps starts with pipegen's head check (the verify job's own, of this
-  // repository's default branch, exactly), so the check runs in the deploy job after an approval wait and on every re-run of that job
-  if (mark.jobs.includes('pipegen-verify')) {
+  // repository's default branch, exactly), so the check runs in the deploy job after an approval wait and on every re-run of that job (the
+  // mark lists exactly pipegen-verify, G17A-R1 sec I1, so this always runs)
+  {
     const heads: unknown[] = mark.headCheck === undefined ? [] : Array.isArray(mark.headCheck) ? mark.headCheck : [null];
     let want: unknown = null;
     try { want = stepsToYaml([renderHeadCheckStep(fc.draft.profile.defaultBranch)]).toJSON()[0]; } catch (e) { if (!(e instanceof RenderError)) throw e; }
@@ -2538,9 +2559,14 @@ function judgeEdited(fc: FileCtx, parsed: Parsed, mark: PipegenInserted): void {
     else {
       const gated = new Set(mark.needs.map((n) => (isObj(n) ? n.job : undefined)));
       const reason = (id: string): string => g.strong.get(id) ?? g.weak.get(id) ?? 'pipegen does not gate it';
-      for (const id of g.deployJobs) if (!gated.has(id)) bad('template', `The job ${show(id)} must wait for pipegen-verify (${reason(id)}), and the edit does not make it wait.`);
+      // G17A-R1 sec I2: the file decides, not the mark: every job the layer gates must need pipegen-verify in the edited file, and be in the mark
+      for (const id of g.deployJobs) {
+        const fj = jobs[id];
+        if (!gated.has(id) || !isObj(fj) || !needsList(fj.needs).includes(VERIFY_JOB)) bad('template', `The job ${show(id)} must wait for pipegen-verify (${reason(id)}), and the edit does not make it wait.`);
+      }
       for (const id of gated) if (typeof id !== 'string' || !g.deployJobs.includes(id)) bad('template', `The edit makes the job ${show(id)} wait for pipegen-verify, but pipegen's deploy layer does not gate it.`);
       for (const id of only) if (typeof id === 'string' && g.deployJobs.includes(id) && !g.needsOnly.includes(id)) bad('template', `The job ${show(id)} may not wait without pipegen's head check: ${reason(id)}, and it can take the check.`);
+      judgeCalledEdits(fc, origJobs, g.deployJobs);
     }
     for (const id of only) {
       const o = typeof id === 'string' && isObj(origJobs[id]) ? origJobs[id] : undefined;
@@ -2570,6 +2596,46 @@ function judgeEdited(fc: FileCtx, parsed: Parsed, mark: PipegenInserted): void {
   // G1 (C5a, C7s): the jobs pipegen inserts follow the same layout rules under the user's triggers (no gate on a push to another branch, no find-run on schedule)
   judgeLayoutJobs(fc, parsed.js.on, triggersOf(parsed.js.on), jobs, mark.jobs);
   judgeJobs(fc, jobs, mark.jobs);
+}
+
+/**
+ * G17A-R1 sec M2: each gated job of this edited workflow that calls a local workflow the deploy layer starts with its head check
+ * (calledHeadCheckEdit, the layer's own predicate, on the workflow texts the plan was built from) needs that called file's edit in the
+ * batch, naming this workflow as its caller; judgeCalled judges the edit itself. The gated calls are re-derived from every edited deploy
+ * workflow of the batch (deployGating on its original), as planVerifyInserts collects them. Without the texts the referee can not tell,
+ * so a gated call without that edit is refused.
+ */
+function judgeCalledEdits(fc: FileCtx, origJobs: Obj, deployJobs: readonly string[]): void {
+  const bad = issueFor(fc);
+  const batch = fc.batch ?? [];
+  const edited = (path: string): CreatedFile | undefined => batch.find((f) => f.repo === 'app' && f.path === path && f.inserted !== undefined);
+  let gatedCalls: Set<string> | undefined;
+  const gated = (): Set<string> => {
+    if (gatedCalls !== undefined) return gatedCalls;
+    gatedCalls = new Set();
+    for (const f of batch) {
+      const m = f.inserted;
+      if (f.repo !== 'app' || m === undefined || m.calledBy !== undefined || typeof m.original !== 'string') continue;
+      if (fc.draft.profile.existingWorkflows.find((w) => w.path === f.path)?.deploys !== true) continue;
+      const o = parseYaml(m.original, 'user');
+      if (!('parsed' in o)) continue;
+      const g = deployGating(o.parsed.js, fc.draft.profile.defaultBranch);
+      if ('gap' in g) continue;
+      const oj = isObj(o.parsed.js.jobs) ? o.parsed.js.jobs : {};
+      for (const id of g.deployJobs) if (callsWorkflow(oj[id])) gatedCalls.add(`${f.path}:${id}`);
+    }
+    return gatedCalls;
+  };
+  let head: RenderedStep | undefined;
+  try { head = renderHeadCheckStep(fc.draft.profile.defaultBranch); } catch (e) { if (!(e instanceof RenderError)) throw e; }
+  for (const id of deployJobs) {
+    const path = localCallOf(origJobs[id]);
+    if (path === null) continue;
+    const callers = edited(path)?.inserted?.calledBy;
+    if (Array.isArray(callers) && callers.includes(fc.file.path)) continue;
+    if (fc.workflowTexts === undefined) { bad('template', `The job ${show(id)} calls ${path}, and pipegen can not tell whether ${path} takes its head check (the referee was not given the repository's workflow texts), while the batch holds no edit of it naming this workflow as its caller.`); continue; }
+    if ('edit' in calledHeadCheckEdit(fc.draft, fc.workflowTexts, path, [fc.file.path], gated(), head)) bad('template', `The job ${show(id)} calls ${path}, whose jobs pipegen starts with its head check, and the batch holds no such edit of it naming this workflow as its caller, so a called deploy that waited for an approval, or a re-run, would not be checked.`);
+  }
 }
 
 /**
@@ -2771,14 +2837,19 @@ function blockingRule(draft: PipelineDraft, ex: Expectations, add: Add, notes: s
       ? `The check ${show(need.id)} is not one pipegen knows how the gate reads, so it runs as a warning only (non-blocking).`
       : `The check ${show(need.id)}${need.service === undefined ? '' : ` for ${show(need.service)}`} is judged by its findings, but its tool writes no SARIF the gate can read, so it runs as a warning only (non-blocking).`);
   });
-  // G17 row 7 (G9 carry 13): the gate's floor check passes on the need id. A floor check of one service demoted to a warning (its tool writes
-  // nothing the gate reads) while another blocking check of the same need stays in the gate's list would leave that service unjudged with the
-  // floor still met: refused (alone, the demoted floor check leaves the floor unmet and the gate fails closed, so it stays a note)
+  // G17 row 7 (G9 carry 13; G17A-R1 sec I3): a floor findings check (secrets, sast, deps) demoted to a warning (its tool writes nothing the
+  // gate reads) is refused, whether or not another check of its need stays. The gate's floor check passes on the need id, so with another
+  // blocking check of the same need in the gate's list the floor is met and nothing judges this one; alone, it is not in the gate's list at
+  // all, and the gate builds its floor from that list (gate/src/settings.ts floorNeeds: secrets plus the list's floor entries), so only a
+  // demoted secrets check would fail closed there: sast or deps would go unjudged on every pull request
   for (const i of floorDemoted) {
     const need = draft.needs[i] as (typeof draft.needs)[number];
     if (!FLOOR_NEEDS.includes(need.id)) continue;
     const kept = draft.needs.some((n, j) => j !== i && isObj(n) && n.blocking && n.id === need.id && !floorDemoted.includes(j) && !unread.includes(j));
-    if (kept) add(`draft.needs[${i}]`, 'not-gate-readable', `The floor check ${show(need.id)}${need.service === undefined ? '' : ` for ${show(need.service)}`} writes nothing the gate can read, while another check of ${show(need.id)} is in the gate's list: the gate's floor would pass on that one and nothing would judge this one. Use a tool whose result the gate reads.`);
+    const what = `The floor check ${show(need.id)}${need.service === undefined ? '' : ` for ${show(need.service)}`} writes nothing the gate can read`;
+    add(`draft.needs[${i}]`, 'not-gate-readable', kept
+      ? `${what}, while another check of ${show(need.id)} is in the gate's list: the gate's floor would pass on that one and nothing would judge this one. Use a tool whose result the gate reads.`
+      : `${what}: as a warning it leaves the gate's list, and the gate's floor holds only what that list holds, so nothing would judge it. Use a tool whose result the gate reads.`);
   }
   return demoted;
 }
@@ -2913,7 +2984,7 @@ async function judgeFiles(allFiles: CreatedFile[], draft: PipelineDraft, platfor
   for (const f of files) {
     const p = parsed.get(`${f.repo}:${f.path}`);
     if (p === undefined) continue;
-    const fc: FileCtx = { file: f, add, ex, draft, others: parsed, dbPwOk: 0, js: p.js };
+    const fc: FileCtx = { file: f, add, ex, draft, others: parsed, dbPwOk: 0, js: p.js, batch: files, ...(deps.workflowTexts === undefined ? {} : { workflowTexts: deps.workflowTexts }) };
     if (fileKind(f) === 'action') judgeAction(fc, p.js);
     else if (f.inserted !== undefined) judgeEdited(fc, p, f.inserted);
     else {
