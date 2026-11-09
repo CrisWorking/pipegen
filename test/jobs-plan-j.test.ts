@@ -416,3 +416,26 @@ describe('G16 F2: --skip tests on a service with no test script', () => {
     expect(() => assemble(noTests([]))).toThrow(/blocking checks have no tool it can run \("unit-tests"/);
   });
 });
+
+describe('G14fix-R1: --skip deploy with a deploy need left uncovered', () => {
+  // the same path as G16 F2, matched by layer: the skipped deploy layer's needs are gone from the draft's needs, but the debate left a
+  // blocking deploy-layer key uncovered (no reviewed tool for sbom); the uncovered entry carries its layers so --skip deploy covers it
+  const noSbom = (skipped: PipelineDraft['skipped']): ReturnType<typeof planned> => {
+    const prof = profileOf([node()], { existingWorkflows: [DEPLOY_WF] });
+    const x = planned(prof, { over: { skipped } });
+    const reviewed = REVIEWED.filter((t) => !t.categories.includes('sbom'));
+    const uncovered = keyOffers(x.plan.needs, x.plan.candidates, prof, { reviewed }).uncovered;
+    const needs = x.plan.needs.filter((n) => n.layer !== 'deploy');
+    return { draft: { ...x.draft, needs }, plan: { ...x.plan, needs, uncovered } };
+  };
+
+  it('G14fix-R1: a skipped deploy need left uncovered is not a blocking need with no tool (the run goes on)', () => {
+    const x = noSbom([{ part: 'deploy', reason: 't' }]);
+    expect(x.plan.uncovered.filter((u) => u.blocking).map((u) => u.needId)).toEqual(expect.arrayContaining(['sbom']));
+    expect(() => assemble(x)).not.toThrow();
+  });
+
+  it('G14fix-R1: the same uncovered deploy need, not skipped, still stops (no tool covers it)', () => {
+    expect(() => assemble(noSbom([]))).toThrow(/blocking checks have no tool it can run \("sbom"/);
+  });
+});

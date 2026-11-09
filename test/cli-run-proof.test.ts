@@ -1249,5 +1249,23 @@ describe('G14fix: a private app through the real proof harness', () => {
     expect(r.ok).toBe(false);
     expect(r.stopped).toContain('other secrets than the ones the scratch keys were made for');
     expect(w.tl.some((x) => x.startsWith('cleanup:'))).toBe(true);
+    // G14fix-R1 F1/F5: the check runs in the setup's appFiles callback, before any GitHub write (no secret stored, no branch pushed),
+    // the keys are deleted before the cleanup, and no proof ran
+    expect(w.tl.some((x) => x === 'secretStore' || x.startsWith('keys.setup:') || x.startsWith('push:') || x.startsWith('pushBranch:'))).toBe(false);
+    expect(at(w.tl, 'keys.deleteAll')).toBeGreaterThan(-1);
+    expect(at(w.tl, 'keys.deleteAll')).toBeLessThan(w.tl.findIndex((x) => x.startsWith('cleanup:')));
+    expect(w.tl.some((x) => x.startsWith('variant:') || x === 'evaluate')).toBe(false);
+  });
+
+  it('run: a private app whose assembled workflows break a proof rule is refused before any GitHub write (G14fix-R1 F2)', async () => {
+    const w = await proofWorld({ private: true });
+    delete (w.ops as { appFiles?: unknown }).appFiles;
+    const dir = mkdtempSync(join(tmpdir(), 'pg-g14fix-'));
+    execFileSync('git', ['init', '-q', '-b', 'main', dir]);
+    execFileSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'i']);
+    w.input.dir = dir;
+    // the world's stand-in app workflows (unpinned actions, no egress step) break the real proof rules
+    await expect(w.run()).rejects.toThrow();
+    expect(w.tl.some((x) => x === 'arm' || x === 'checkRepos' || x === 'setup' || x === 'proofStart')).toBe(false);
   });
 });
