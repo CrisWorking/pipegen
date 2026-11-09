@@ -20,7 +20,6 @@ import type { GuardedRepo } from '../../src/proof/target.js';
 import { gateJobList, jobIdFor } from '../../src/engine/gate-job-list.js';
 import { finish, type FinishProbe } from '../../src/deliver/finish.js';
 import { newRateBudget } from '../../src/engine/github-rate.js';
-import { proofAppFiles } from '../../src/proof/harness.js';
 import { evaluateProof } from '../../src/proof/evaluate.js';
 import { MinutesMeter } from '../../src/proof/minutes.js';
 import type { RunOutcome } from '../../src/proof/run.js';
@@ -34,8 +33,6 @@ import { OWN, RUN_ID, SS_FIELD, TYPED, recordingKeys } from './proof-world.js';
 import { gateDoc, gateFinding, greenMain, job, run as outcomeRun } from './proof-eval.js';
 import type { VariantRuns } from '../../src/proof/evaluate.js';
 
-/** The stand-in central sha the e2e gives the harness where the run asks for a private draft's files before the proof's own central commit exists (see the SRC BUG note). */
-export const STANDIN_PROOF_SHA = 'c'.repeat(40);
 export const APP_NAME = 'orderdesk';
 /** The second writer (code owners need two). */
 export const ALT = 'AltReviewer';
@@ -46,7 +43,7 @@ export const NOW_MS = Date.parse('2026-11-07T10:00:00Z');
 export const PROJECT_FILES: Record<string, string> = {
   'package.json': `${JSON.stringify({
     name: 'orderdesk', version: '1.0.0', private: true, main: 'src/server.js',
-    scripts: { start: 'node src/server.js', test: 'node --test' }, dependencies: { express: '4.21.0', pg: '8.13.0' },
+    scripts: { start: 'node src/server.js' }, dependencies: { express: '4.21.0', pg: '8.13.0' },
   }, null, 2)}\n`,
   'package-lock.json': `${JSON.stringify({
     name: 'orderdesk', version: '1.0.0', lockfileVersion: 3, requires: true,
@@ -133,8 +130,6 @@ export interface E2eOptions {
   answers?: { preview?: boolean };
   /** A private app that already has a Dockerfile and the `pipegen-signing` environment (default-branch rule), so the run signs with a key pair (key-env). */
   signing?: boolean;
-  /** Leave out the stand-in central sha (see the SRC BUG note): the run then meets the bug itself. */
-  noStandin?: boolean;
   /** The recorded planted run: `caught` (default) reports the planted problems; `missed` reports none, so the proof must fail. */
   planted?: 'caught' | 'missed';
 }
@@ -284,13 +279,6 @@ export async function e2eWorld(o: E2eOptions = {}): Promise<E2eWorld> {
       tl.push('cleanup returned');
       cleanups.push(res);
       return res;
-    },
-    // SRC BUG (G14, reported in the G16 report): a private draft carries a stand-in central pin, but run-proof.ts asks for its files once with no central
-    // sha (`filesAt(startDraft, undefined)`), and the real harness refuses that. The e2e hands the real harness the stand-in sha there, so the rest
-    // of the private run is still covered; `test/cli-run-e2e.test.ts` keeps the reproduction as `it.fails`.
-    appFiles: (d, depsX) => {
-      const real = proofAppFiles(d, depsX);
-      return o.noStandin === true || d.centralPin === undefined ? real : { ...real, appFiles: (sha) => real.appFiles(sha ?? STANDIN_PROOF_SHA) };
     },
   };
   const proof: RunProof = (i) => makeRunProof(ops)(i);

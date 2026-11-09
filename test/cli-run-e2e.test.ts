@@ -254,13 +254,11 @@ describe('e2e', () => {
     for (const copy of [/function fakeKeys/, /export const OWN\b/, /const RUN_ID\b/, /export const TYPED\b/, /const OWN\s*=/]) expect(world).not.toMatch(copy);
   });
 
-  // SRC BUG (G14, run-proof.ts): kept as a failing-by-design test (`it.fails`) so the suite stays green while the bug is open; when the bug is fixed
-  // this test starts to pass, `it.fails` then fails, and whoever fixed it deletes the e2e's stand-in sha (STANDIN_PROOF_SHA in helpers/e2e-world.ts).
-  // Repro: a private app, the real proofAppFiles. run.ts gives the proof a draft with the stand-in central pin (`sha: UNPINNED`); run-proof.ts then
-  // asks for its files once with no central sha (`filesAt(startDraft, undefined)`, before the setup), and harnessWorkflow's verify-lookup job refuses
-  // a pinned draft without a central sha: "The draft has a central pin, but no proof central sha was given." The run exits 1 before any proof push.
-  it.fails('e2e: a private app run reaches the proof with the real harness (SRC BUG run-proof.ts: files asked with no central sha)', async () => {
-    const { w, code } = await scenario('private-no-standin', { noStandin: true });
+  // Pins the G14fix repair (run-proof.ts): a private app's proof asks the real harness for its files only for the central commit the setup pushed
+  // (before it, a precheck checks the assembled workflows and the compat copies), so the run no longer stops with "The draft has a central pin,
+  // but no proof central sha was given." The fixture has no test script, so the run also passes the no-test-script + `--skip tests` path.
+  it('e2e: a private app run reaches the proof with the real harness (no stand-in central sha)', async () => {
+    const { w, code } = await scenario('private-real-harness', {});
     expect(w.io.errs.join('\n')).not.toContain('The draft has a central pin, but no proof central sha was given.');
     expect(code).toBe(0);
   }, 120_000);
