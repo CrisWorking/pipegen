@@ -5,6 +5,7 @@
 // - an edit of an existing central CODEOWNERS: baseShas [gitBlobSha(original)] (the blob finish read on the head its commit is made on).
 // End to end through uninstall: a created file untouched → deleted whole; the owner added a line → kept (manual); an edited file → the
 // original restored over a chain that holds.
+import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,7 +15,10 @@ import { newRateBudget } from '../src/engine/github-rate.js';
 import { plannedOfLocks, SETUP_BRANCH } from '../src/deliver/deliver.js';
 import { finish, type FinishDeps, type FinishProbe } from '../src/deliver/finish.js';
 import { checkRecord, editWritesChained, readRecord, writeRecord, type RecordedEdit } from '../src/deliver/record.js';
+import { overridingRules, verify } from '../src/deliver/verify.js';
+import { CENTRAL_PROTECTED_PATHS, codeownersBlock, codeownersFile, codeownersReplace } from '../src/engine/created-builders.js';
 import { planLocks } from '../src/layers/locks.js';
+import { PROTECTED_PATHS_BASE } from '../src/types.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
 import type { Capabilities, CreatedFile, InstallEdit, InstallRecord, RepoProfile } from '../src/types.js';
 import { uninstallStep, type StepResult } from '../src/uninstall/apply.js';
@@ -39,7 +43,7 @@ const clock = () => ({ budget: newRateBudget(), sleep: async () => {} });
 const homes: string[] = [];
 afterEach(() => { for (const d of homes.splice(0)) rmSync(d, { recursive: true, force: true }); cleanHomes(); });
 
-interface Seed { g: FinishGitHub; deps: () => FinishDeps }
+interface Seed { g: FinishGitHub; deps: () => FinishDeps; home: string }
 
 /**
  * A private project delivered by pipegen and merged (the trimmed seed of test/finish.test.ts): the central repo holds `centralFiles` (a
@@ -98,7 +102,7 @@ async function seed(o: { centralFiles?: Record<string, string>; recordOver?: (r:
     out: () => {}, probe, clock: clock(), now: () => new Date('2026-11-07T10:00:00Z'), local: { home, env: {} }, keyBase: shm, isMemory: (d) => d === shm,
     cosignBin: async () => '/opt/cosign', exec: async () => { throw new Error('no key pair in these tests'); },
   });
-  return { g, deps };
+  return { g, deps, home };
 }
 
 const recordOn = async (s: Seed): Promise<InstallRecord> => (await readRecord(s.g.octokit(), { owner: 'o', repo: 'pipelines' }, 'r'))?.record as InstallRecord;
@@ -253,4 +257,147 @@ describe('G-FINREC older records: readable, never chained, never deleted whole',
     expect(filesAtPr(w).get(CO)).toBe(text);
     expect(r.manual.some((m) => /CODEOWNERS/.test(m.what))).toBe(true);
   });
+});
+
+// ---------- Fold R1 (G-FINREC-R1) ----------
+
+const verifyOf = async (s: Seed) => verify(s.g.octokit(), { owner: 'o', repo: 'r' }, { local: { home: s.home, env: {} }, clock: clock() });
+const coDrift = async (s: Seed) => (await verifyOf(s)).drift.filter((d) => /CODEOWNERS/.test(d.what));
+const tamper = (s: Seed, repo: 'o/pipelines' | 'o/r', path: string, text: string): void => { s.g.commitOn(repo, 'main', { [path]: text }, 'owner: edit'); };
+const appCo = (s: Seed): string => s.g.filesAt('o/r', s.g.head('o/r')).get('CODEOWNERS') as string;
+
+describe('G-FINREC-R1 sec M1 / spec I1: verify reports a rule after pipegen\'s block that takes a protected path from its owners', () => {
+  it('G-FINREC-R1 I1: a finish-created central CODEOWNERS: untouched, no drift; an owner line on an unprotected path, no drift', async () => {
+    const s = await seed();
+    await runFinish(s);
+    expect(await coDrift(s)).toEqual([]);
+    tamper(s, 'o/pipelines', CO, `${liveCo(s) as string}/src/ @bob\n`);
+    expect(await coDrift(s)).toEqual([]);
+  });
+
+  it('G-FINREC-R1 I1: pipegen\'s block cut out (created file, and an edited existing one) is drift on its lines', async () => {
+    const s = await seed();
+    await runFinish(s);
+    tamper(s, 'o/pipelines', CO, '/docs/ @bob\n');
+    expect((await coDrift(s)).map((d) => d.what)).toContain('pipegen\'s lines in central file .github/CODEOWNERS (protected)');
+    const own = '/docs/ @writers\n';
+    const t = await seed({ centralFiles: { [CO]: own } });
+    await runFinish(t);
+    tamper(t, 'o/pipelines', CO, own);
+    expect((await coDrift(t)).map((d) => d.what)).toContain('pipegen\'s lines in central file .github/CODEOWNERS (protected)');
+  });
+
+  it('G-FINREC-R1 M1 (probe P2): an ownerless rule and another owner after the block of a finish-created central CODEOWNERS: one drift entry naming both', async () => {
+    const s = await seed();
+    await runFinish(s);
+    tamper(s, 'o/pipelines', CO, `${liveCo(s) as string}/installs/\n/.github/workflows/ @mallory\n`);
+    const d = await coDrift(s);
+    expect(d).toHaveLength(1);
+    expect(d[0]?.what).toMatch(/central file \.github\/CODEOWNERS/);
+    expect(d[0]?.actual).toMatch(/\/installs\//);
+    expect(d[0]?.actual).toMatch(/@mallory/);
+  });
+
+  it('G-FINREC-R1 M1 (probe P2b): an ownerless rule after the block of an edited existing central CODEOWNERS is drift', async () => {
+    const own = '/docs/ @writers\n';
+    const s = await seed({ centralFiles: { [CO]: own } });
+    await runFinish(s);
+    expect(await coDrift(s)).toEqual([]);
+    tamper(s, 'o/pipelines', CO, `${liveCo(s) as string}/installs/\n`);
+    const d = await coDrift(s);
+    expect(d).toHaveLength(1);
+    expect(d[0]?.actual).toMatch(/\/installs\//);
+  });
+
+  it('G-FINREC-R1 M1: the app CODEOWNERS pipegen edited: an override after the block is drift; untouched it is not', async () => {
+    const s = await seed();
+    await runFinish(s);
+    expect(await coDrift(s)).toEqual([]);
+    tamper(s, 'o/r', 'CODEOWNERS', `${appCo(s)}* @mallory\n`);
+    const d = await coDrift(s);
+    expect(d.some((x) => /app file CODEOWNERS/.test(x.what) && /@mallory/.test(String(x.actual)))).toBe(true);
+  });
+
+  it('G-FINREC-R1 M1: a second end marker that would hide an override is drift', async () => {
+    const s = await seed();
+    await runFinish(s);
+    tamper(s, 'o/pipelines', CO, `${liveCo(s) as string}# pipegen:end\n/installs/ @mallory\n`);
+    expect(await coDrift(s)).not.toEqual([]);
+  });
+
+  it('G-FINREC-R1 M1 overridingRules: which rules after the block count (*, **, ownerless, teams, outside owners) and which don\'t', () => {
+    const block = codeownersBlock(CENTRAL_PROTECTED_PATHS, ['@a', '@b']);
+    const after = (rules: string): string[] | null => overridingRules(`${block}${rules}`, CENTRAL_PROTECTED_PATHS);
+    for (const bad of ['*', '* @bob', '** @bob', '/installs/', '/installs/** @a @bob', '.github/ @bob', '/.github/workflows/*.yml @bob', '*.yaml @bob', '*.json @bob', 'installs/ @o/team', 'CODEOWNERS @bob', '/.github/ @a @o/team', 'docs/CODEOWNERS @bob', '/docs/ @bob']) {
+      expect(after(`${bad}\n`), bad).toEqual([bad]);
+    }
+    for (const ok of ['/web/ @bob', '/installs/ @a', '* @A @b', '# a comment', '', '/src/** @bob', 'README.md']) {
+      expect(after(`${ok}\n`), ok).toEqual([]);
+    }
+    // before the block: the block wins (last match), never drift
+    expect(overridingRules(`* @bob\n/installs/\n\n${block}`, CENTRAL_PROTECTED_PATHS)).toEqual([]);
+    // not exactly one begin and one end line, in order: unreadable (null), drift
+    expect(overridingRules(`${block}# pipegen:end\n`, CENTRAL_PROTECTED_PATHS)).toBeNull();
+    expect(overridingRules('/installs/ @a\n', CENTRAL_PROTECTED_PATHS)).toBeNull();
+  });
+
+  it('G-FINREC-R1 M1: no false drift on pipegen\'s own output, for every layout pipegen writes', () => {
+    const appPaths = [...PROTECTED_PATHS_BASE, '.gitleaks.toml', 'svc/.semgrep.yml', 'trivy.yaml'];
+    for (const [paths, owners] of [[CENTRAL_PROTECTED_PATHS, ['@a', '@b']], [appPaths, ['@Alice', '@bob-2']], [['CODEOWNERS'], ['@x']]] as [readonly string[], string[]][]) {
+      const block = codeownersBlock(paths, owners);
+      for (const original of ['', '* @someone\n', '* @someone', '/docs/ @w\n# end\n', '*.js @o/frontend\n\n']) {
+        const made = codeownersFile(original, block);
+        expect(overridingRules(made, paths), JSON.stringify(original)).toEqual([]);
+        // a re-run swaps the block in place (codeownersReplace): still nothing after it but what was there
+        const again = codeownersReplace(made, made.slice(original.length), codeownersBlock(paths, [...owners, '@carol']));
+        expect(again === null ? null : overridingRules(again, paths), JSON.stringify(original)).toEqual([]);
+      }
+    }
+  });
+});
+
+const rawBlobSha = (raw: Buffer): string => createHash('sha1').update(Buffer.concat([Buffer.from(`blob ${raw.length}\0`), raw])).digest('hex');
+
+describe('G-FINREC-R1 sec M2: finish writes the central CODEOWNERS only over a base it can prove, and never into a clash', () => {
+  it('G-FINREC-R1 M2 (probes P1, P1u): a central CODEOWNERS that is not UTF-8 is skipped, its bytes untouched, nothing recorded; uninstall leaves it', async () => {
+    const raw = Buffer.concat([Buffer.from('# ', 'utf8'), Buffer.from([0xc9]), Buffer.from('quipe\n/docs/ @writers\n', 'utf8')]);
+    const real = rawBlobSha(raw);
+    const s = await seed({ centralFiles: { [CO]: 'placeholder\n' } });
+    const c = s.g.repo('o/pipelines');
+    const tree = c.trees.get(c.commits.get(s.g.head('o/pipelines'))?.tree as string);
+    (tree?.get(CO) as { sha: string }).sha = real;
+    s.g.hooks.push((call) => (call.route === 'GET /repos/{owner}/{repo}/git/blobs/{file_sha}' && call.params.file_sha === real ? { status: 200, data: { sha: real, encoding: 'base64', content: raw.toString('base64'), size: raw.length } } : undefined));
+    const res = await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, {}, s.deps());
+    expect(res.skipped.some((x) => /central CODEOWNERS/.test(x.what) && /UTF-8/.test(x.why))).toBe(true);
+    const h = s.g.repo('o/pipelines');
+    expect(h.trees.get(h.commits.get(s.g.head('o/pipelines'))?.tree as string)?.get(CO)?.sha).toBe(real);
+    const r = await recordOn(s);
+    expect(centralCoOf(r)).toEqual([]);
+    expect(r.central?.codeowners).toBeUndefined();
+    // P1u: uninstall over that record names no central CODEOWNERS, so it changes nothing there
+    const w = world();
+    w.g.commitOn('o/pipelines', 'main', { [CO]: raw.toString('utf8') });
+    const rec = sampleRecord(w, { central: { repoId: w.central.id, createdByPipegen: true, ...(r.central?.codeowners === undefined ? {} : { codeowners: r.central.codeowners }) }, edits: centralCoOf(r) as InstallEdit[] });
+    await afterRun1(w);
+    await uninstallStep(uGh(w), loadedOf(w, rec), term().p, uDeps(w));
+    expect(coCommits(w)).toBe(false);
+  });
+
+  for (const [name, files] of [
+    ['a folder at the path (.github/CODEOWNERS/notes.md)', { '.github/CODEOWNERS/notes.md': 'mine\n' }],
+    ['another letter case (.github/codeowners, probe P4)', { '.github/codeowners': '/docs/ @writers\n' }],
+  ] as [string, Record<string, string>][]) {
+    it(`G-FINREC-R1 M2: a created write that clashes with ${name} is skipped, nothing written or recorded`, async () => {
+      const s = await seed({ centralFiles: files });
+      const before = new Map(s.g.filesAt('o/pipelines', s.g.head('o/pipelines')));
+      const res = await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, {}, s.deps());
+      expect(res.skipped.some((x) => /central CODEOWNERS/.test(x.what) && /clashes/.test(x.why))).toBe(true);
+      const after = s.g.filesAt('o/pipelines', s.g.head('o/pipelines'));
+      expect(after.has(CO)).toBe(false);
+      for (const [p, t] of Object.entries(files)) expect(after.get(p)).toBe(before.get(p) ?? t);
+      const r = await recordOn(s);
+      expect(centralCoOf(r)).toEqual([]);
+      expect(r.central?.codeowners).toBeUndefined();
+    });
+  }
 });
