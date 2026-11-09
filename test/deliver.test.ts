@@ -20,6 +20,7 @@ import { InstallRecordSchema, readRecord, recordFileText, recordHash, recordMark
 import * as recordMod from '../src/deliver/record.js';
 import * as deliverMod from '../src/deliver/deliver.js';
 import { COMPAT_PREFIX, HARNESS_PATH } from '../src/proof/harness.js';
+import { trustedForRun } from '../src/cli/run.js';
 import type { LockPlan } from '../src/layers/locks.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
 import type { CreatedFile, PipelineDraft, RepoProfile } from '../src/types.js';
@@ -1509,7 +1510,8 @@ describe('G17C: the install record and delivery', () => {
   });
 
   it('G17C-R1 (F5): central files pipegen\'s own central PR added are created once that PR is merged; any other merge leaves them adopted', async () => {
-    for (const how of ['merge', 'fast-forward', 'other head', 'other merge', 'not merged'] as const) {
+    // G17C-R2: the PR is read on the fast path too (r2-i1: the run state alone proves nothing), and its branch and base are pinned (spec M2)
+    for (const how of ['merge', 'fast-forward', 'other head', 'other merge', 'not merged', 'fast-forward not merged', 'other head ref', 'other base'] as const) {
       const w = world();
       w.g.repo('o/pipelines').rules = [{ type: 'pull_request', ruleset_id: 9 }];
       const p = profile();
@@ -1518,10 +1520,10 @@ describe('G17C: the install record and delivery', () => {
       const prHead = w.g.head('o/pipelines', upd);
       expect((c1 as { pr?: unknown }).pr, how).toEqual({ number: 1, commit: prHead });
       let merge: string;
-      if (how === 'fast-forward') { w.g.repo('o/pipelines').refs.set('heads/main', prHead); merge = prHead; }
+      if (how.startsWith('fast-forward')) { w.g.repo('o/pipelines').refs.set('heads/main', prHead); merge = prHead; }
       else merge = w.g.commitOn('o/pipelines', 'main', Object.fromEntries(centralFiles().map((f) => [f.path, f.content])), 'Merge pull request #1');
-      w.g.hooks.push((call) => (call.route === 'GET /repos/{owner}/{repo}/pulls/{pull_number}' && call.params.repo === 'pipelines' && how !== 'fast-forward'
-        ? { status: 200, data: { number: 1, state: 'closed', merged_at: how === 'not merged' ? null : '2026-11-05T12:30:00Z', head: { ref: upd, sha: how === 'other head' ? 'f'.repeat(40) : prHead }, base: { ref: 'main' }, merge_commit_sha: how === 'other merge' ? 'e'.repeat(40) : merge } }
+      w.g.hooks.push((call) => (call.route === 'GET /repos/{owner}/{repo}/pulls/{pull_number}' && call.params.repo === 'pipelines'
+        ? { status: 200, data: { number: 1, state: 'closed', merged_at: how.endsWith('not merged') ? null : '2026-11-05T12:30:00Z', head: { ref: how === 'other head ref' ? 'feature' : upd, sha: how === 'other head' ? 'f'.repeat(40) : prHead }, base: { ref: how === 'other base' ? 'dev' : 'main' }, merge_commit_sha: how === 'other merge' ? 'e'.repeat(40) : merge } }
         : undefined));
       const c2 = await deliverCentral(w.g.octokit(), p, centralFiles(), { ...cdeps(w), pr: (c1 as { pr: { number: number; commit: string } }).pr } as never);
       const mine = how === 'merge' || how === 'fast-forward';
@@ -1530,6 +1532,47 @@ describe('G17C: the install record and delivery', () => {
       await deliver(w.g.octokit(), p, planDelivery(input(p, merge, mine ? { centralCommitted: merge } : {})), w.vault, deps(w));
       const r = await record(w, upd) as Rec;
       for (const f of centralFiles()) expect(r.files.find((x) => x.path === f.path)?.adopted, `${how} ${f.path}`).toBe(mine ? undefined : true);
+    }
+  });
+
+  it('G17C-R2 (r2-m1): the merge proves only files pipegen\'s commit added; a hand-made, reversed or rewound merge leaves every file adopted', async () => {
+    const WEEKLY = cf('.github/workflows/r--weekly.yml', 'on: { workflow_call: {} }\njobs: { w: { runs-on: ubuntu-24.04, steps: [{ run: "true" }] } }\n', 'pipeline', { repo: 'central' });
+    const files3 = (): CreatedFile[] => [...centralFiles(), WEEKLY];
+    const nightly = centralFiles()[1] as CreatedFile;
+    const all = (fs: CreatedFile[]): Record<string, string> => Object.fromEntries(fs.map((f) => [f.path, f.content]));
+    const cases = {
+      // P1: a merge [base, X] whose tree also adds an owner file X never had
+      P1: { files: files3, history: (w: World, X: string) => { const D0 = w.g.head('o/pipelines'); const M = w.g.commitOn('o/pipelines', 'main', all(files3()), 'evil merge'); w.g.repo('o/pipelines').commits.get(M)!.parents = [D0, X]; return M; } },
+      // P2: [X, base + owner file]: main merged into pipegen's branch and pushed to main
+      P2: { files: files3, history: (w: World, X: string) => { const D1 = w.g.commitOn('o/pipelines', 'main', { [WEEKLY.path]: WEEKLY.content }, 'owner adds weekly'); const M = w.g.commitOn('o/pipelines', 'main', all(files3()), 'reversed merge'); w.g.repo('o/pipelines').commits.get(M)!.parents = [X, D1]; return M; } },
+      // P3: the owner's identical nightly was on main before the PR (in X's parent); main force-pushed back, then GitHub merged [I, X]
+      P3: { files: centralFiles, before: (w: World) => { const I = w.g.head('o/pipelines'); w.g.commitOn('o/pipelines', 'main', { [nightly.path]: nightly.content }, 'owner adds nightly'); return I; }, history: (w: World, X: string, I?: string) => { w.g.repo('o/pipelines').refs.set('heads/main', I as string); const M = w.g.commitOn('o/pipelines', 'main', all(centralFiles()), 'Merge pull request #1'); w.g.repo('o/pipelines').commits.get(M)!.parents = [I as string, X]; return M; } },
+      // P4 (control): GitHub's merge [D1, X], the owner added weekly on main meanwhile
+      P4: { files: files3, history: (w: World, X: string) => { const D1 = w.g.commitOn('o/pipelines', 'main', { [WEEKLY.path]: WEEKLY.content }, 'owner adds weekly'); const M = w.g.commitOn('o/pipelines', 'main', all(centralFiles()), 'Merge pull request #1'); w.g.repo('o/pipelines').commits.get(M)!.parents = [D1, X]; return M; } },
+      // P5 (control): a squash (one parent: the base), the owner added weekly meanwhile
+      P5: { files: files3, history: (w: World) => { w.g.commitOn('o/pipelines', 'main', { [WEEKLY.path]: WEEKLY.content }, 'owner adds weekly'); return w.g.commitOn('o/pipelines', 'main', all(centralFiles()), 'squash #1'); } },
+    } as const;
+    for (const [name, k] of Object.entries(cases) as [keyof typeof cases, { files: () => CreatedFile[]; before?: (w: World) => string; history: (w: World, X: string, I?: string) => string }][]) {
+      const w = world();
+      const I = k.before?.(w);
+      w.g.repo('o/pipelines').rules = [{ type: 'pull_request', ruleset_id: 9 }];
+      const p = profile();
+      const c1 = await deliverCentral(w.g.octokit(), p, centralFiles(), cdeps(w));
+      if (c1.kind !== 'central-pr') throw new Error('central PR expected');
+      const pr = (c1 as { pr: { number: number; commit: string } }).pr;
+      const X = w.g.head('o/pipelines', upd);
+      const M = k.history(w, X, I);
+      w.g.hooks.push((call) => (call.route === 'GET /repos/{owner}/{repo}/pulls/{pull_number}' && call.params.repo === 'pipelines'
+        ? { status: 200, data: { number: pr.number, state: 'closed', merged_at: '2026-11-05T12:30:00Z', head: { ref: upd, sha: X }, base: { ref: 'main' }, merge_commit_sha: M } } : undefined));
+      const c2 = await deliverCentral(w.g.octokit(), p, k.files(), { ...cdeps(w), pr } as never);
+      const proven = name === 'P4' || name === 'P5';
+      expect((c2 as { committed?: true }).committed, name).toBe(proven ? true : undefined);
+      await deliver(w.g.octokit(), p, planDelivery(input(p, M, { files: [...k.files(), ...appFiles(M)], ...(proven ? { centralCommitted: M } : {}) })), w.vault, deps(w));
+      const r = await record(w, upd) as Rec;
+      for (const f of k.files()) {
+        const own = proven && f.path !== WEEKLY.path;
+        expect(r.files.find((x) => x.path === f.path)?.adopted, `${name} ${f.path}`).toBe(own ? undefined : true);
+      }
     }
   });
 
@@ -1574,10 +1617,28 @@ describe('G17C: the install record and delivery', () => {
       expect(err).toBeInstanceOf(DeliverError);
       expect(err.message).toContain(localFile(w));
       expect(err.message).toMatch(/can't be read/);
+      // G17C-R2 (spec M1): deliverCentral's own way on
+      expect(err.message).toContain('Remove or fix that local record file, then run `npx pipegen run` again');
       expect(w.asked.filter((q) => /to trust exactly these entries/.test(q))).toEqual([]);
       if (how !== 'a folder') expect(readFileSync(localFile(w), 'utf8')).toBe(how === 'not JSON' ? '{ not json' : JSON.stringify({ recordHash: 'x' }));
     });
   }
+
+  it('G17C-R2 (spec M1): with an unreadable local record file, deliver and the run\'s trust step give `npx pipegen run` as the next step', async () => {
+    const w = world();
+    await firstRun(w);
+    writeFileSync(localFile(w), '{ not json', { mode: 0o600 });   // a folder would also stop the save at the end, before the notes
+    const p = profile();
+    const pin = w.g.head('o/pipelines');
+    const said = await deliver(w.g.octokit(), p, planDelivery(input(p, pin)), vault2(), deps(w, {}, { replace: true }))
+      .then((r) => r.notes.join('\n'), (e: unknown) => (e as Error).message);
+    expect(said).toContain(localFile(w));
+    expect(said).toContain('Remove or fix that local record file, then run `npx pipegen run` again');
+    const t = await trustedForRun({ gh: w.g.octokit(), clock: { budget: newRateBudget(), sleep: async () => {} } }, p, { home: w.home, env: {} }, io(w), false);
+    expect(t.record).toBeNull();
+    expect(t.notes.join('\n')).toContain(localFile(w));
+    expect(t.notes.join('\n')).toContain('Remove or fix that local record file, then run `npx pipegen run` again');
+  });
 
   it('row 32: after a typed trust, the signing environment\'s settings before this run\'s change are recorded; with no change, a manual-review note', async () => {
     const signing = { signing: { mode: 'key-env' as const, images: [], cosignPubSha256: pubKeySha256(SIGNING.pub) } };

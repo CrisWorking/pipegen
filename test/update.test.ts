@@ -3,7 +3,7 @@
 // compares any patch the issue carries (a differing one is refused and shown), touches only the files the install record lists, merges an
 // owner-edited file 3-way (or lists it as a conflict, never overwriting it), marks the result owner-edited, and appends every blob sha it writes
 // to the record through writeRecord. Every GitHub call goes to an in-memory GitHub (test/helpers/deliver-github.ts); no network.
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -525,6 +525,17 @@ describe('G12 fix round 1 (G12-R1)', () => {
     const w = await publicWorld();
     await writeLocalRecord(app, { recordHash: 'f'.repeat(64), setupPr: 1, updatedAt: '2026-11-01T00:00:00Z' }, { home: w.home, env: {} });
     await expect(update(w.g.octokit(), app, deps(w))).rejects.toThrow(/no install record .* that it trusts/);
+    expect(writes(w)).toEqual([]);
+  });
+
+  it('G17C-R2 (spec M1): a local record file that is a folder → update stops with its own next step, nothing written', async () => {
+    const w = await publicWorld();
+    const file = localRecordPath(app, { home: w.home, env: {} });
+    rmSync(file, { force: true });
+    mkdirSync(file, { recursive: true });
+    const e = await update(w.g.octokit(), app, deps(w)).then(() => null, (x: unknown) => x as Error);
+    expect(e?.message).toContain(file);
+    expect(e?.message).toContain('Remove or fix that local record file, run `npx pipegen run` in this repo (it re-checks the full setup), then run update again.');
     expect(writes(w)).toEqual([]);
   });
 
