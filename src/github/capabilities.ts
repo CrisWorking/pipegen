@@ -25,8 +25,9 @@
 //   true ONLY when GET /environments lists `pipegen-signing` with `deployment_branch_policy.custom_branch_policies:
 //   true` AND GET …/environments/pipegen-signing/deployment-branch-policies lists exactly one rule, a branch rule for
 //   the default branch. Anything else (no environment yet, another rule, a refusal) → false with the note
-//   "Couldn't prove deployment branch policies here; key-based signing is decided at `finish`." Plan G `finish`
-//   creates the environment and the rule, reads both back, and only then asks signingMode again.
+//   "Couldn't prove deployment branch policies here; key-based signing is decided at setup, when `pipegen run` makes the `pipegen-signing` environment and reads it back."
+//   Ruling G-SIGN1: `pipegen run` (firstRunSigning, after consent, before assembly) makes a NEW environment and the rule,
+//   reads both back, and only then asks signingMode again; an environment already there is never changed there.
 //
 // The plan table (what each plan allows; S3 overrides the brief where they differ, DECISIONS #77):
 //
@@ -208,7 +209,7 @@ export async function probeCapabilities(
       }), ['deploymentBranchPolicies']);
       deploymentBranchPolicies = rules.ok && onlyDefaultBranch(rules.data, p.defaultBranch);
     }
-    if (!deploymentBranchPolicies) notes.push("Couldn't prove deployment branch policies here; key-based signing is decided at `finish`.");
+    if (!deploymentBranchPolicies) notes.push("Couldn't prove deployment branch policies here; key-based signing is decided at setup, when `pipegen run` makes the `pipegen-signing` environment and reads it back.");
   }
 
   return {

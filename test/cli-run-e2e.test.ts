@@ -262,4 +262,50 @@ describe('e2e', () => {
     expect(w.io.errs.join('\n')).not.toContain('The draft has a central pin, but no proof central sha was given.');
     expect(code).toBe(0);
   }, 120_000);
+
+  // Ruling G-SIGN1 (G16 review F6): a private app that builds an image, with NO pipegen-signing environment before the run. The run makes
+  // the environment itself after consent, reads it back with the default-branch rule, re-derives the signing mode (key-env) before assembly,
+  // and the first run signs: the delivered workflows sign with the key, the key is stored, the record says pipegen made the environment.
+  it('e2e: G-SIGN1 the first run on a private repo with no signing environment makes it, reads it back, and signs', async () => {
+    const { w, code } = await scenario('private-signing-fresh', { signing: true, signingEnv: false });
+    expect(code, w.io.errs.join('\n')).toBe(0);
+    expect(w.io.lines.at(-1)).toBe('pipegen set up this repository.');
+    expect(w.fgh.unrouted).toEqual([]);
+    expect(w.io.errs.join('\n')).toMatch(/pipegen made the environment pipegen-signing \(default branch only\) and read it back, so this run signs/);
+    expect(w.io.errs.join('\n')).not.toMatch(/Signing is off/);
+
+    // the environment: made once (the PUT and its one rule), before any proof push and before the setup PR; read back after its rule
+    const calls = w.fgh.calls;
+    const envPuts = calls.filter((c) => c.route === 'PUT /repos/{owner}/{repo}/environments/{environment_name}' && c.params.environment_name === SIGNING_ENV);
+    expect(envPuts).toHaveLength(1);
+    const putAt = calls.indexOf(envPuts[0] as Call);
+    const ruleAt = indexOfCall(calls, (c) => c.route === 'POST /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies');
+    const readBackAt = calls.findIndex((c, i) => i > ruleAt && c.route === 'GET /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies');
+    expect(putAt).toBeGreaterThanOrEqual(0);
+    expect(ruleAt).toBeGreaterThan(putAt);
+    expect(readBackAt).toBeGreaterThan(ruleAt);
+    const firstProofWrite = indexOfCall(calls, (c) => isWrite(c) && String(c.params.repo) === SCRATCH);
+    expect(firstProofWrite).toBeGreaterThan(readBackAt);
+    expect(indexOfCall(calls, (c) => c.route === 'POST /repos/{owner}/{repo}/pulls')).toBeGreaterThan(readBackAt);
+    const env = w.fgh.repo(APP).envs.get(SIGNING_ENV);
+    expect(env?.deployment_branch_policy).toEqual({ protected_branches: false, custom_branch_policies: true });
+    expect(env?.policies.map((p) => p.name)).toEqual(['main']);
+    expect([...(env?.stored.keys() ?? [])].sort()).toEqual(['PIPEGEN_COSIGN_KEY', 'PIPEGEN_COSIGN_PASSWORD']);
+    expect(w.fgh.x(APP).envVars.get(SIGNING_ENV)?.get('PIPEGEN_COSIGN_PUB')?.value).toMatch(/^-----BEGIN/);
+
+    // the record: key-env, the public key, and the environment as pipegen's own (uninstall deletes it), with GitHub's created_at
+    const central = w.fgh.filesOn(CENTRAL, 'main') as Map<string, string>;
+    const record = JSON.parse(central.get('installs/orderdesk.json') as string) as Record<string, any>;
+    expect(record.planned.signingMode).toBe('key-env');
+    expect(typeof record.cosignPubSha256).toBe('string');
+    expect(record.environments).toEqual([expect.objectContaining({ name: SIGNING_ENV, created: true, githubCreatedAt: env?.created_at })]);
+    expect(record.environments[0].previous).toBeUndefined();
+
+    // the delivered workflows sign with the key in the environment (key-env), as the seeded run's do
+    const sign = central.get('.github/workflows/orderdesk--sign.yml') as string;
+    expect(sign).toMatch(/environments pipegen-signing, key-env|\(environment pipegen-signing, key-env\)/);
+    expect(sign).toMatch(/^\s+environment: pipegen-signing$/m);
+    expect(sign).toMatch(/cosign" sign --yes --key env:\/\/PIPEGEN_COSIGN_KEY/);
+    expect(sign).toMatch(/PIPEGEN_COSIGN_KEY: "\$\{\{ secrets\.PIPEGEN_COSIGN_KEY \}\}"/);
+  }, 240_000);
 });

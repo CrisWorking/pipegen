@@ -9,6 +9,7 @@
 //   2. getAuth (write mode, exactly the app, pipelines and pipegen-proof-<repo>).   3. readProject's GitHub half: context, capabilities,
 //      writers (listWriters and readWriters), the org and sha-pinning reads.   4. supportLevel.   5-6. the provider and the code bundle.
 //   7. the consent (estimate from the floor needs, needKeys, 2 variants, nightly; one AI meter), assertBootstrapAllowed first.
+//   7b. (ruling G-SIGN1, a first run) firstRunSigning: the run's own pipegen-signing, made new and read back, then the signing mode again.
 //   8. checkProofRepos.   9. planNeeds.   10. discover + pin.   11. debate.   12. the creators.   13. the secrets, PIPEGEN_FP_KEY.
 //   14. nothing (Slack: --skip slack is accepted and does nothing in v0.2).   15. assemble, the deploy layer, pre-commit, locks, PIPEGEN.md,
 //      one referee call (seven arguments) and the guard on the same batch.   16-17. the proof (G14, run-proof.ts: the helper repos,
@@ -40,7 +41,7 @@ import { debate as runDebate, type DebateResult } from '../debate/debate.js';
 import { needKeyOf } from '../debate/need-ref.js';
 import { decideTests } from '../debate/tests.js';
 import type { StarterDeps } from '../create/tests.js';
-import { deliver, deliverCentral, DeliverError, planDelivery, previewText, readCentralFileList, type DeliverResult, type DeliveryInput, type SigningKey, type CentralPr, type CentralResult } from '../deliver/deliver.js';
+import { deliver, deliverCentral, DeliverError, makeRunSigningEnvironment, planDelivery, previewText, readCentralFileList, type DeliverResult, type DeliveryInput, type SigningKey, type CentralPr, type CentralResult } from '../deliver/deliver.js';
 import { pipegenDoc } from '../deliver/docs.js';
 import { coFacts, type CoFacts } from '../deliver/finish.js';
 import { readBlobText, readHead, readRepo, readTree } from '../deliver/git-data.js';
@@ -60,7 +61,7 @@ import { assertBootstrapAllowed, bootstrapProofsNote, loadReviewed } from '../en
 import { loadQualityBar } from '../engine/quality-bar.js';
 import { loadBaseImages } from '../engine/base-images.js';
 import { activity30d, estimate, needKeyCount, type Activity, type Estimates } from '../estimate/estimate.js';
-import { probeCapabilities } from '../github/capabilities.js';
+import { probeCapabilities, SIGNING_ENVIRONMENT } from '../github/capabilities.js';
 import { getAuth, GITHUB_TIMEOUT_MS, hideToken, listWriters, makeOctokit, permissionsTable, readGitHubContext } from '../github/client.js';
 import { readOrgAdmin, readRepoId, readShaPinning, readWriters, type ShaPinningRead } from '../github/lock-probes.js';
 import { assemble, judgeAssembled, type AssembledFiles } from '../layers/assemble.js';
@@ -260,6 +261,8 @@ export interface RunStages {
   deliverCentral(f: GitHubFacts, p: RepoProfile, files: readonly CreatedFile[], io: CliIO, pr?: CentralPr): Promise<CentralResult>;
   readCentralFileList(f: GitHubFacts, p: RepoProfile): Promise<string[]>;
   signingKey(): Promise<SigningKey>;
+  /** Ruling G-SIGN1: makeRunSigningEnvironment (the run's own pipegen-signing, made new and read back), or why signing is off. */
+  signingEnv(f: GitHubFacts, p: RepoProfile): Promise<{ env: SigningEnvEntry } | { off: string }>;
   deliver(f: GitHubFacts, p: RepoProfile, input: DeliveryInput, vault: SecretVault, io: CliIO, signingKey?: () => Promise<SigningKey>): Promise<DeliverResult>;
   /** The setup PR: merged, closed (unmerged) or still open. */
   prState(f: GitHubFacts, p: RepoProfile, pr: number): Promise<'merged' | 'closed' | 'open'>;
@@ -375,7 +378,8 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     const auth = await st.getAuth({ owner: origin.owner, repos: [origin.repo, CENTRAL_REPO, `pipegen-proof-${origin.repo}`], allowBroad: flags.allowBroad === true });
     token = auth.token;
     // 3. readProject's GitHub half
-    const facts = await st.readProject(auth, local);
+    // `let`: ruling G-SIGN1 re-derives the capabilities once the run's own signing environment has read back (after consent)
+    let facts = await st.readProject(auth, local);
     const p: RepoProfile = { ...local, ...facts.context };
     // 4. support level (no --skip changes it)
     const support = supportLevel(p, 'v0.2');
@@ -398,8 +402,9 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     // 7. consent: the bootstrap switch first (carry 46), then the services the proof can't prove, the estimate, the screen
     assertBootstrapAllowed(io.env);
     // G13-R1 (sec M4): key-env makes its key pair only in memory; a host without a memory folder is refused before anything costs money
-    const keyEnvApplies = signingMode(p, facts.caps) === 'key-env' && publishedImageServices(p, facts.caps).length > 0;
-    if (keyEnvApplies && !(deps.isMemory ?? isMemoryFolder)(MEMORY_DIR)) { err(NO_MEMORY_FOLDER); return 2; }
+    const hasMemory = (): boolean => (deps.isMemory ?? isMemoryFolder)(MEMORY_DIR);
+    let keyEnvApplies = signingMode(p, facts.caps) === 'key-env' && publishedImageServices(p, facts.caps).length > 0;
+    if (keyEnvApplies && !hasMemory()) { err(NO_MEMORY_FOLDER); return 2; }
     // 8, read only (ruling G14-R0 1): helper repos this token can't create are named before anything costs money. The writing check
     // (checkProofRepos: create, Actions access, default branch) runs inside the proof, where a throw is cleaned up
     const missing = await st.helperRepos(facts, p).catch(() => null);
@@ -478,12 +483,23 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     let plan: DebateDraftPlan;
     let trusted: Awaited<ReturnType<RunStages['trusted']>>;
     let made: Creators = { files: [], notes: [], testNotes: [], testDecisions: [], notProven: [] };
+    let runSigningEnv: SigningEnvEntry | undefined;
     if (saved0 !== null) {
       trusted = await st.trusted(facts, p, io);
       for (const n of trusted.notes) err(n);
       draft = saved0.draft as PipelineDraft;
       plan = planOfSaved(draft, reviewed);
     } else {
+      // ruling G-SIGN1: the first run on a private repo signs when the plan allows. After the yes (a GitHub write) and before the needs, the
+      // debate, assembly and the referee: the run's own pipegen-signing, made new and read back with the default-branch rule, and only
+      // then the signing mode re-derived from the proven capabilities. Anything else stays unsigned, with the reason said (fail closed)
+      const first = await firstRunSigning(p, facts.caps, () => st.signingEnv(facts, p), hasMemory);
+      for (const n of first.notes) err(n);
+      if (first.env !== undefined) {
+        facts = { ...facts, caps: first.caps };
+        runSigningEnv = first.env;
+        keyEnvApplies = signingMode(p, facts.caps) === 'key-env' && publishedImageServices(p, facts.caps).length > 0;
+      }
       // 9-10
       const needsPlan = await st.needs(p, facts.caps, bundle as CodeBundle, ai, facts.writers.length, knownValues);
       const candidates = await st.discover(needsPlan.needs, p, facts, reviewed, ai, onUsage);
@@ -651,6 +667,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
       proofRepos: proofReposFor(repos, saved),
       ...(centralFileList === undefined ? {} : { centralFileList }),
       ...(centralCommitted === undefined ? {} : { centralCommitted }),
+      ...(runSigningEnv === undefined ? {} : { signingEnv: runSigningEnv }),
     };
     if (built.assembled.draft.centralPin?.sha === UNPINNED) throw new Error('pipegen would deliver a draft with no central commit pinned; nothing was delivered.');
     const note = bootstrapProofsNote(io.env);
@@ -708,6 +725,32 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
  * Carries 16 and 24: what deliver records of the helper repos: the central repo pipegen created (with GitHub's id) and the Actions access
  * level it changed there (checkProofRepos), the scratch repo pipegen created (the state file's id).
  */
+type SigningEnvEntry = InstallRecord['environments'][number];
+/** Ruling G-SIGN1: why a first run that could sign with a key pair doesn't, when the machine has no memory folder for the pair. */
+export const NO_MEMORY_SIGNING_OFF = `Signing is off (mode none): this repository's images would be signed with a key pair, which pipegen makes only in memory (${MEMORY_DIR}), and this machine has no such folder, so pipegen made no signing environment. Run pipegen on Linux (WSL or a Linux container works too) to sign.`;
+export const RUN_SIGNS_NOTE = `pipegen made the environment ${SIGNING_ENVIRONMENT} (default branch only) and read it back, so this run signs its images with a key pair (key-env).`;
+
+/**
+ * Ruling G-SIGN1 (G16 review F6): the first run on a private repo signs when the plan allows. Asked only when key-env is what the proven
+ * rule would give (a private repo, environments, no attestations, a published image) and the probe could not prove the rule (no
+ * pipegen-signing yet). `make` is the run's own environment (makeRunSigningEnvironment: made new, read back default-branch only); only a
+ * fresh environment of that name with its branch rule turns deploymentBranchPolicies on. Fail closed: any other answer keeps `caps` as
+ * probed (signing mode none) with the reason in `notes`; nothing claims signing that the read-back didn't prove.
+ */
+export async function firstRunSigning(p: RepoProfile, caps: Capabilities, make: () => Promise<{ env: SigningEnvEntry } | { off: string }>, memory: () => boolean): Promise<{ caps: Capabilities; env?: SigningEnvEntry; notes: string[] }> {
+  if (!p.private || !caps.environments || caps.deploymentBranchPolicies) return { caps, notes: [] };
+  const proven: Capabilities = { ...caps, deploymentBranchPolicies: true };
+  if (signingMode(p, proven) !== 'key-env' || publishedImageServices(p, proven).length === 0) return { caps, notes: [] };
+  if (!memory()) return { caps, notes: [NO_MEMORY_SIGNING_OFF] };
+  const made = await make();
+  if ('off' in made) return { caps, notes: [`Signing is off (mode none): ${made.off}`] };
+  const e = made.env;
+  if (e?.name !== SIGNING_ENVIRONMENT || e.created !== true || !Array.isArray(e.branchPolicyIds) || e.branchPolicyIds.length === 0) {
+    return { caps, notes: [`Signing is off (mode none): the environment ${SIGNING_ENVIRONMENT} didn't read back as one this run made with its default-branch rule.`] };
+  }
+  return { caps: proven, env: e, notes: [RUN_SIGNS_NOTE] };
+}
+
 export function proofReposFor(repos: Pick<ProofRepos, 'created' | 'createdIds' | 'actionsAccess'>, saved: { scratchRepoId?: number; actionsAccessPrevious?: string; centralCreated?: boolean; centralRepoId?: number }): NonNullable<DeliveryInput['proofRepos']> {
   // G17 row 27: this run's id of the repo it created, else the one the state saved when an earlier (interrupted) run of it created the repo
   const id = repos.createdIds?.[CENTRAL_REPO] ?? (saved.centralCreated === true ? saved.centralRepoId : undefined);
@@ -1121,6 +1164,7 @@ function realStages(io: CliIO, deps: RunDeps): RunStages {
     deliverCentral: (f, p, files, io2, pr) => deliverCentral(f.gh, p, files, { clock: f.clock, local, io: io2.prompt, interactive, ...(pr === undefined ? {} : { pr }) }),
     readCentralFileList: (f, p) => readCentralFileList(f.gh, p, f.clock),
     preview: (input) => previewText(planDelivery(input)),
+    signingEnv: (f, p) => makeRunSigningEnvironment(f.gh, { owner: p.owner, repo: p.repo }, p.defaultBranch, { clock: f.clock, local, now: new Date((deps.now ?? Date.now)()) }),
     async signingKey() {
       // carry 28: the one in-memory key maker (finish uses it too)
       const k = await generateCosignKeys(() => ensurePinnedBinary('cosign'));

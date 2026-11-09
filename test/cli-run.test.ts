@@ -1505,3 +1505,95 @@ describe('G17C row 28: only the central commit deliverCentral made in this run r
     }
   });
 });
+
+// ---------- ruling G-SIGN1: the first run on a private repo signs when the plan allows ----------
+
+describe('G-SIGN1: the signing mode re-derived after the run makes its own signing environment', () => {
+  /** A private repo whose environments work but whose pipegen-signing rule is not proven (there is no such environment yet). */
+  const UNPROVEN = { ...CAPS, attestations: false, environments: true, deploymentBranchPolicies: false };
+  const IMAGE = (): RepoProfile => LOCAL({ services: [{ ...APP, dockerfile: 'Dockerfile' }] });
+  const ENV = { name: 'pipegen-signing', created: true, githubCreatedAt: '2026-11-06T10:00:05Z', changed: [], branchPolicyIds: [7] };
+  type Made = Awaited<ReturnType<RunStages['signingEnv']>>;
+  function signWorld(made: Made | (() => Promise<Made>), o: Parameters<typeof world>[0] = {}): World {
+    const w = world({ local: IMAGE(), facts: facts({ caps: UNPROVEN }), ...o });
+    w.stages.signingEnv = async (f, p) => { w.calls.push('signingEnv'); w.got.signingEnv = [f, p]; return typeof made === 'function' ? made() : made; };
+    return w;
+  }
+
+  it('run: G-SIGN1 a first private run with no proven signing environment makes it after consent, reads it back, and signs (key-env)', async () => {
+    const w = signWorld({ env: ENV });
+    const i = io();
+    expect(await run(w, i)).toBe(0);
+    // after the yes and before the needs (so the needs, the debate, the build and the referee all see the proven rule)
+    expect(w.calls.indexOf('consent')).toBeLessThan(w.calls.indexOf('signingEnv'));
+    expect(w.calls.indexOf('scan')).toBeLessThan(w.calls.indexOf('signingEnv'));
+    expect(w.calls.indexOf('signingEnv')).toBeLessThan(w.calls.indexOf('needs'));
+    expect(w.calls.filter((c) => c === 'signingEnv')).toHaveLength(1);
+    expect((w.got.signingEnv?.[1] as RepoProfile).defaultBranch).toBe('main');
+    expect((w.got.needs?.[1] as GitHubFacts['caps']).deploymentBranchPolicies).toBe(true);
+    const d = w.builds[0]?.draft as PipelineDraft;
+    expect(d.capabilities.deploymentBranchPolicies).toBe(true);
+    expect(d.signing?.mode).toBe('key-env');
+    expect(d.signing?.cosignPubSha256).toBe(pubKeySha256('PUB'));
+    expect(w.builds[0]?.facts.caps.deploymentBranchPolicies).toBe(true);
+    // one pair, handed to deliver with the environment the run made
+    expect(w.calls.filter((c) => c === 'signingKey')).toHaveLength(1);
+    expect((w.got.deliver?.[0] as DeliveryInputLike).signingEnv).toEqual(ENV);
+    expect(typeof w.got.deliver?.[1]).toBe('function');
+    expect(i.errs.join('\n')).toMatch(/made the environment pipegen-signing \(default branch only\) and read it back, so this run signs/);
+  });
+
+  it('run: G-SIGN1 an environment that is there already, can not be made or does not read back leaves the run unsigned (fail closed)', async () => {
+    const unsigned = async (w: World, i: ReturnType<typeof io>): Promise<void> => {
+      expect(await run(w, i)).toBe(0);
+      const d = w.builds[0]?.draft as PipelineDraft;
+      expect(d.signing).toBeUndefined();
+      expect(d.capabilities.deploymentBranchPolicies).toBe(false);
+      expect((w.got.needs?.[1] as GitHubFacts['caps']).deploymentBranchPolicies).toBe(false);
+      expect(w.calls).not.toContain('signingKey');
+      expect(w.got.deliver?.[0]).not.toHaveProperty('signingEnv');
+      expect(w.got.deliver?.[1]).toBeUndefined();
+      expect(i.errs.join('\n')).toMatch(/Signing is off \(mode none\)/);
+      expect(i.errs.join('\n')).not.toMatch(/so this run signs/);
+    };
+    const i1 = io();
+    await unsigned(signWorld({ off: "The environment pipegen-signing doesn't read back as usable from the default branch only." }), i1);
+    expect(i1.errs.join('\n')).toMatch(/Signing is off \(mode none\): The environment pipegen-signing doesn't read back/);
+    // an answer that is not a fresh environment of that name is never taken as proof
+    await unsigned(signWorld({ env: { ...ENV, created: false } }), io());
+    await unsigned(signWorld({ env: { ...ENV, name: 'production' } }), io());
+    await unsigned(signWorld({ env: { ...ENV, branchPolicyIds: [] } }), io());
+    // a stop the stage can't turn into "off" (the environment couldn't be listed locally) stops the run, naming what was left
+    const w = signWorld(async () => { throw new DeliverError('pipegen made pipegen-signing but could not list it', { leftovers: ['environment pipegen-signing'] }); });
+    const i = io();
+    expect(await run(w, i)).toBe(1);
+    expect(i.errs.join('\n')).toMatch(/left: environment pipegen-signing/);
+    expect(w.calls).not.toContain('needs');
+  });
+
+  it('run: G-SIGN1 no memory folder: no environment is made and the run stays unsigned, not refused', async () => {
+    const w = signWorld({ env: ENV }, { deps: { isMemory: () => false } });
+    const i = io();
+    expect(await run(w, i)).toBe(0);
+    expect(w.calls).not.toContain('signingEnv');
+    expect(w.builds[0]?.draft.signing).toBeUndefined();
+    expect(i.errs.join('\n')).toMatch(/Signing is off \(mode none\).*\/dev\/shm/);
+    expect(i.errs.join('\n')).not.toContain(NO_MEMORY_FOLDER);
+  });
+
+  it('run: G-SIGN1 nothing is made when the plan does not allow key-env or the rule is proven already', async () => {
+    for (const [why, o] of [
+      ['no image', { local: LOCAL() }],
+      ['attestations sign', { facts: facts({ caps: { ...UNPROVEN, attestations: true } }) }],
+      ['no environments', { facts: facts({ caps: { ...UNPROVEN, environments: false } }) }],
+      ['proven already', { facts: facts({ caps: { ...UNPROVEN, deploymentBranchPolicies: true } }) }],
+      ['public', { local: { ...IMAGE() }, facts: facts({ caps: UNPROVEN }, { private: false }) }],
+    ] as const) {
+      const w = signWorld({ env: ENV }, o as Parameters<typeof world>[0]);
+      expect(await run(w), why).toBe(0);
+      expect(w.calls, why).not.toContain('signingEnv');
+      expect(w.got.deliver?.[0], why).not.toHaveProperty('signingEnv');
+    }
+  });
+});
+type DeliveryInputLike = { signingEnv?: unknown };
