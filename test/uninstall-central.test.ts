@@ -42,7 +42,7 @@ function centralLocks(w: World, over: Partial<NonNullable<InstallRecord['central
   w.settings.access = 'user';
   return {
     central: { repoId: w.central.id, createdByPipegen: true, rulesetId: 55, rulesetCreatedAt: AT, codeowners: { path: '.github/CODEOWNERS', created: true }, actionsAccess: { previous: 'none' }, ...over },
-    edits: [{ repo: 'central', path: '.github/CODEOWNERS', kind: 'codeowners', inserted: OWNERS_INS, originalSha: null, writtenShas: [blob(OWNERS_INS)] }],
+    edits: [{ repo: 'central', path: '.github/CODEOWNERS', kind: 'codeowners', inserted: OWNERS_INS, originalSha: null, writtenShas: [blob(OWNERS_INS)], baseShas: [null] } as InstallEdit /* V6b: chained from null, as deliver records it */],
   };
 }
 
@@ -349,7 +349,7 @@ describe('uninstall central: inside target.ts (V3-hook1, V3-wiki, spec N3)', () 
     // the central CODEOWNERS block: no commit while another project is there
     const head = w.g.head('o/pipelines');
     const tree = w.central.commits.get(head)?.tree as string;
-    const edits: InstallEdit[] = [{ repo: 'central', path: '.github/CODEOWNERS', kind: 'codeowners', inserted: OWNERS_INS, originalSha: null, writtenShas: [blob(OWNERS_INS)] }];
+    const edits: InstallEdit[] = [{ repo: 'central', path: '.github/CODEOWNERS', kind: 'codeowners', inserted: OWNERS_INS, originalSha: null, writtenShas: [blob(OWNERS_INS)], baseShas: [null] } as InstallEdit /* V6b: chained from null, as deliver records it */];
     await expect(api.commitUninstall('central', { parent: head, baseTree: tree, files: [{ path: '.github/CODEOWNERS', content: '', mode: '100644' }], deletes: [], message: 'x', recordEdits: edits })).rejects.toBeInstanceOf(UninstallRefusal);
     // another project's central workflow alone counts too
     const w2 = world();

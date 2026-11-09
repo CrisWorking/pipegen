@@ -17,6 +17,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { Document, isAlias, isMap, isScalar, isSeq, parseDocument, visit, type Node as YamlNode, type Pair, type YAMLMap, type YAMLSeq } from 'yaml';
 import { gitBlobSha } from '../create/guard.js';
+import { editWritesChained, type RecordedEdit } from '../deliver/record.js';
 import { buildPackageJson } from '../create/package-edit.js';
 import { CODEOWNERS_BEGIN, CODEOWNERS_END, dependabotEntry, dependabotEntryText, HOOK_FILES, HOOKS_MARKER, HUSKY_SHEBANG, hookBlock, hookDataProblem, type DependabotEntry, type HookCommand, type HookManager } from '../engine/created-builders.js';
 import { HEAD_CHECK_STEP_ID, renderHeadCheckStep } from '../engine/deploy-steps.js';
@@ -65,6 +66,13 @@ function readBlob(blob: BlobReader, sha: string | null | undefined): string | nu
 }
 /** Unchanged: the current sha is the last one pipegen wrote, and update never merged the owner's edits into it. */
 const unchanged = (e: InstallEdit, current: CurrentFile): boolean => e.ownerEdited !== true && e.writtenShas.length > 0 && current.sha === e.writtenShas[e.writtenShas.length - 1];
+/**
+ * V6b (G17C-R1, V2 I1/I2): the writes of `e` are one unbroken pipegen chain from its original (editWritesChained: one recorded base per
+ * write, the first the original, each later one the write before it, not ownerEdited). Only then is the first original the file without
+ * pipegen's writes and nothing else. A missing, short or broken baseShas (an older record, `pipegen update`'s appends, a re-run that recorded
+ * the owner's blob as a write) proves nothing: the first original is never written back over it.
+ */
+const chained = (e: InstallEdit): boolean => editWritesChained(e as RecordedEdit);
 const OWNER_EDITED = (path: string): string => `${show(path)}: \`pipegen update\` merged its change into the owner's edits, so the file is the owner's now; review pipegen's part by hand.`;
 
 /**
@@ -95,7 +103,7 @@ function revertText(e: TextEdit, current: CurrentFile, blob: BlobReader, ctx: Re
   const same = unchanged(e, current);
   if (e.originalSha === null) {
     if (same && current.text === e.inserted) return { kind: 'delete' };
-    return manual(`${where} is a file pipegen created and it has changed since; delete it, or take pipegen's part out by hand.`, e.inserted);
+    return manual(`${where} is a file pipegen created and it has changed since; take pipegen's part out by hand (delete the file only if nothing else is left in it).`, e.inserted);
   }
   if (same) {
     const original = readBlob(blob, e.originalSha);
@@ -279,8 +287,9 @@ function revertVerify(e: VerifyEdit, current: CurrentFile, blob: BlobReader, ctx
   const s = stripVerify(e, current.text, blob, ctx, original);
   if (typeof s !== 'string') return manual(`${where}: ${s.why}. ${byHand(e)}`);
   // unchanged, and the strip reads exactly as the original: the original's own bytes come back
-  // V2-R1 sec I2: only after ONE write (originalSha is the first original: after a re-run the owner's bytes between the writes would go)
-  if (e.writtenShas.length === 1 && unchanged(e, current) && original !== null && isDeepStrictEqual(jsOf(s), jsOf(original))) return { kind: 'restore', text: original };
+  // V2-R1 sec I2, V6b (G17C-R1): only over a proven chain of pipegen's writes from the original (originalSha is the first original: after
+  // a re-run the owner's bytes between the writes would go); anything else keeps the byte-exact strip
+  if (chained(e) && unchanged(e, current) && original !== null && isDeepStrictEqual(jsOf(s), jsOf(original))) return { kind: 'restore', text: original };
   return { kind: 'strip', text: s };
 }
 
@@ -460,8 +469,8 @@ function stripVerify(e: VerifyEdit, text: string, blob: BlobReader, ctx: RevertC
 
 /**
  * The package.json edit and its lock edit, reverted together or not at all (m6, V-S8): both restored from their original blobs only when
- * both are unchanged, each written exactly once (V2-R1 sec I1: originalSha is the first original, so after a re-run the owner's changes between
- * the writes would go), the package.json is byte for byte its original rebuilt with the recorded edit (buildPackageJson, the package judge's
+ * both are unchanged, the writes of each a proven pipegen chain from its original (editWritesChained; V2-R1 sec I1, V6b: originalSha is
+ * the first original, so after a re-run the owner's changes between the writes would go), the package.json is byte for byte its original rebuilt with the recorded edit (buildPackageJson, the package judge's
  * own check), and both originals can be read.
  * Anything else: both manual. `lock` is null only for a package.json whose record names no lock. `current: null` = the file is gone.
  */
@@ -480,7 +489,8 @@ export function revertPair(json: { edit: JsonEdit; current: CurrentFile | null }
     if (c === null) return { why: `${show(e.path)} is no longer there` };
     if (gitBlobSha(c.text) !== c.sha) return { why: `the text read for ${show(e.path)} is not the blob of its sha` };
     if (!unchanged(e, c)) return { why: `${show(e.path)} changed since pipegen wrote it` };
-    if (e.writtenShas.length !== 1) return { why: `pipegen wrote ${show(e.path)} more than once, so its first original may lack the owner's changes between the writes` };
+    // V6b (G17C-R1): the first original only over a proven chain of pipegen's writes (an older record with no bases proves nothing)
+    if (!chained(e)) return { why: `the install record doesn't prove every write of ${show(e.path)} was pipegen's, made on the one before it, so its first original may lack the owner's changes` };
     const o = readBlob(blob, e.originalSha);
     return o === null ? { why: `pipegen can't read the original ${show(e.path)}` } : o;
   };
