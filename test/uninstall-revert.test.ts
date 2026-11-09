@@ -474,3 +474,29 @@ describe('V2: the revert engine', () => {
     expect(textOf(revertEdit(plain, cur(`#!/usr/bin/env sh\nfoo\n${hb}bar\n`), blob))).toBe('#!/usr/bin/env sh\nfoo\nbar\n');
   });
 });
+
+// ---------- G17 group C ----------
+
+describe('G17C rows 24, 25: the Dependabot private form names the app owner\'s pipelines repo; one husky shebang', () => {
+  const dep = 'version: 2\nupdates:\n  - package-ecosystem: "npm"\n    directory: "/"\n    schedule:\n      interval: "daily"\n';
+  const priv = (repo: string): PipelineDraft => ({ profile: { private: true }, centralPin: { repo } }) as unknown as PipelineDraft;
+  it('row 24: the private entry is pipegen\'s only for <app owner>/pipelines; another central repo name is manual', () => {
+    for (const [repo, ctx, want] of [
+      ['acme/pipelines', { appOwner: 'acme' }, 'strip'], ['Acme/pipelines', { appOwner: 'acme' }, 'strip'],
+      ['evil/pipelines', { appOwner: 'acme' }, 'manual'], ['acme/other', { appOwner: 'acme' }, 'manual'],
+      // without the app owner the repo name is still bound to pipelines
+      ['acme/other', {}, 'manual'], ['acme/pipelines', {}, 'strip'],
+    ] as const) {
+      const de = textEdit('dependabot', '.github/dependabot.yml', dep, `${dep}${dependabotEntryText(priv(repo))}`);
+      expect(kind(revertEdit(de, cur(`# mine\n${dep}${dependabotEntryText(priv(repo))}`), blob, ctx as never)), `${repo} ${JSON.stringify(ctx)}`).toBe(want);
+    }
+  });
+  it('row 25: revert.ts reads the husky shebang from created-builders.ts (no copy of its own)', async () => {
+    const { readFileSync } = await import('node:fs');
+    const cb = await import('../src/engine/created-builders.js');
+    expect((cb as unknown as { HUSKY_SHEBANG?: string }).HUSKY_SHEBANG).toBe('#!/usr/bin/env sh\n');
+    const src = readFileSync(new URL('../src/uninstall/revert.ts', import.meta.url), 'utf8');
+    expect(src).not.toMatch(/const HUSKY_SHEBANG\s*=/);
+    expect(src).toMatch(/\bHUSKY_SHEBANG\b.*from '\.\.\/engine\/created-builders\.js'|import \{[^}]*\bHUSKY_SHEBANG\b[^}]*\} from '\.\.\/engine\/created-builders\.js'/s);
+  });
+});

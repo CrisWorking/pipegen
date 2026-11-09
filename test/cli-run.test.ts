@@ -1432,3 +1432,30 @@ describe('G13-R2: the state file never holds a known value (ruling G13-R2 4)', (
     expect(() => store.recordVerdict({ ok: false, stopped: 'typed-value-1234567890' })).toThrow();
   });
 });
+
+// ---------- G17 group C ----------
+
+describe('G17C row 27: the central repo pipegen created, with its GitHub id, in the run state and the record', () => {
+  it('state: onCreated keeps the central repo\'s id with centralCreated; begin carries both for the same app only', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'pg-g17c-'));
+    const s = await StateStore.open({ owner: 'o', repo: 'r' }, { home, env: {} });
+    const app = { owner: 'o', repo: 'r', private: true, ownerType: 'User' as const, defaultBranch: 'main' };
+    s.begin('20261109-000000-abcdef', app, { cap: 1, aiCap: 1 });
+    onCreatedFor(s, 'r')('pipelines', 4242);
+    expect(s.state?.centralCreated).toBe(true);
+    expect((s.state as { centralRepoId?: number }).centralRepoId).toBe(4242);
+    s.update((n) => { n.cleanupDone = true; });
+    s.begin('20261109-000001-abcdef', app, { cap: 1, aiCap: 1 });
+    expect((s.state as { centralRepoId?: number }).centralRepoId).toBe(4242);
+    s.update((n) => { n.cleanupDone = true; });
+    s.begin('20261109-000002-abcdef', { ...app, repo: 'other' }, { cap: 1, aiCap: 1 });
+    expect((s.state as { centralRepoId?: number }).centralRepoId).toBeUndefined();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('run: a resume\'s delivery records the saved id with createdByPipegen; no id is ever taken from elsewhere', () => {
+    expect(proofReposFor({ created: [] }, { centralCreated: true, centralRepoId: 4242 } as never).central).toEqual({ createdByPipegen: true, repoId: 4242 });
+    expect(proofReposFor({ created: ['pipelines'], createdIds: { pipelines: 9 } }, {}).central).toEqual({ createdByPipegen: true, repoId: 9 });
+    expect(proofReposFor({ created: [] }, {}).central).toEqual({ createdByPipegen: false });
+  });
+});
