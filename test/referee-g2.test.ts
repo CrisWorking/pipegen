@@ -400,15 +400,18 @@ describe('G2: the image hand-off (B6)', () => {
     // the same image on both sides: refused
     const same = await runWith([workflow({ 'image-scan--app': head(X), 'base-scan': base(X) })], d);
     expect(same.ok, show(same)).toBe(false);
+    expect(registryNote(same), show(same)).toBe(true);
     // the same, with the twin in another file of the same pipeline
     const split = await runWith([workflow({ 'image-scan--app': head(X) }), { ...workflow({ 'base-scan': base(X) }), path: '.github/workflows/pipegen-merge.yml' }], d);
     expect(split.ok, show(split)).toBe(false);
+    expect(registryNote(split), show(split)).toBe(true);
     // G2-R-sec 3: compared on the parsed reference and the digest, not the text: another spelling of the same image, or another name with
     // the same digest, is the same input
     const D1 = `sha256:${'1'.repeat(64)}`;
     for (const [h, b] of [[`docker.io/library/nginx@${D1}`, `nginx@${D1}`], [`nginx@${D1}`, `index.docker.io/library/nginx@${D1}`], [`library/nginx@${D1}`, `docker.io/library/nginx@${D1}`], [X, `ghcr.io/o/other@${D1}`], [X, `docker.io/library/nginx@${D1}`]] as const) {
       const r = await runWith([workflow({ 'image-scan--app': head(h), 'base-scan': base(b) })], d);
       expect(r.ok, `${h} / ${b}: ${show(r)}`).toBe(false);
+      expect(registryNote(r), `${h} / ${b}: ${show(r)}`).toBe(true);
     }
     // a tag with the digest, or upper case: not a form pipegen writes, so the twin is no step of pipegen's at all
     for (const b of [`ghcr.io/o/r-app:v1@${D1}`, `GHCR.IO/o/r-app@${D1}`, `ghcr.io/O/r-app@${D1}`]) {
@@ -420,6 +423,7 @@ describe('G2: the image hand-off (B6)', () => {
     // a base twin with no head step of its check, or next to a head that reads the PR's image archive: nothing to compare, refused
     const alone = await runWith([workflow({ 'base-scan': base(Y) })], d);
     expect(alone.ok, show(alone)).toBe(false);
+    expect(registryNote(alone), show(alone)).toBe(true);
     const ad0 = imageDraft();
     const withArchive = await runWith([imageFile({ 'image-build--app': buildJob(ad0), 'image-scan--app': scanJob(ad0), 'base-scan': base(Y) })], ad0);
     // (G2-R1 I2: with the image build in the draft no base twin of that scan is pipegen's step at all)

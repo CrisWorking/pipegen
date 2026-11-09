@@ -12,19 +12,20 @@ import { describe, expect, it } from 'vitest';
 import { composeText } from '../src/create/compose.js';
 import { dockerfileProblems, dockerignoreText, type DockerfileCtx } from '../src/create/dockerfile-rules.js';
 import { pipegenDoc } from '../src/deliver/docs.js';
-import { renderComposeUp } from '../src/engine/render-step.js';
+import { COMPOSE_UP_FAILED, renderComposeUp } from '../src/engine/render-step.js';
 import { dockerfileInstructions } from '../src/ai/prompts/dockerfile.js';
 import { baseImageRef, loadBaseImages } from '../src/engine/base-images.js';
 import { dastStartOf, renderDastRun } from '../src/engine/dast-handoff.js';
 import { publishedImageRepo } from '../src/engine/deploy-steps.js';
 import { floorNeeds } from '../src/engine/needs.js';
+import { imageProfile } from '../src/engine/image-handoff.js';
 import { PLATFORM_ACTION_IDS } from '../src/engine/pin.js';
 import { repoToolCheckJs } from '../src/engine/render-cli.js';
 import { RenderError } from '../src/engine/render-error.js';
 import { AssembleError, type Job } from '../src/layers/jobs.js';
 import { emptyServiceQuality } from '../src/read/quality.js';
-import type { CreatedFile, Service } from '../src/types.js';
-import { assemble, CAPS, files, judge, node, p, planned, profileOf, SEC, shown, type Obj } from './helpers/assemble.js';
+import type { CreatedFile, ExistingWorkflow, PipelineDoc, Service } from '../src/types.js';
+import { assemble, CAPS, domainsOf, files, judge, node, p, planned, profileOf, SEC, shown, type Obj } from './helpers/assemble.js';
 import { REVIEWED } from './helpers/debate-fixtures.js';
 import { makeTempDir } from './helpers/make-repo.js';
 
@@ -296,7 +297,8 @@ describe('G17B-R0/R1 round 2: the image build of a Dockerfile pipegen creates in
 
   it('assemble: only a Dockerfile created at the service\'s own folder counts (another folder\'s, or one of the other repository, is no build of it)', () => {
     const needs = floorNeeds(profileOf([svcNoDf()]), CAPS).filter((n) => n.id !== 'dast');
-    for (const moved of [created().map((f) => ({ ...f, path: `other/${f.path}` })), created().map((f) => ({ ...f, repo: 'central' as const }))]) {
+    // G17B-R2 (spec M1): a created Dockerfile of another part (one the Dockerfile judge does not read) is no build either
+    for (const moved of [created().map((f) => ({ ...f, path: `other/${f.path}` })), created().map((f) => ({ ...f, repo: 'central' as const })), created().map((f) => ({ ...f, part: 'docs' as const }))]) {
       const x = planned(profileOf([svcNoDf()]), { needs, over: { created: moved, ...SKIP_DEPLOY }, edit: (s) => s.filter((st) => st.needId !== 'dast') });
       expect(() => assemble(x)).toThrow(/its image is not built \(The service "app" has no Dockerfile to build\.\)/);
     }
@@ -321,11 +323,13 @@ describe('G17B-R1 round 2: the referee refuses the registry form of an image sca
   });
 });
 
-describe('G17B-R1 round 2, risk 4 (R0 concern 3): compose up fails with a fixed pipegen message', () => {
-  it('render: compose up (and the proof form) ends with a fixed message on failure, naming the capability limit; no container log text', () => {
+describe('G17B-R1 round 2, risk 4 (R0 concern 3) + G17B-R2 (sec M2, spec I3): compose up fails with a fixed pipegen message that names no cause', () => {
+  it('render: compose up (and the proof form) ends with a fixed message on failure: docker\'s error above, the capability limit as a possible cause only; no PIPEGEN.md, no container log text', () => {
+    const MSG = '|| { echo "::error::pipegen: the containers did not start (see docker\'s error above). If the app image needs a Linux capability or a privilege gain (a root entrypoint that switches users or changes file owners), it can not start: pipegen starts the app containers with neither (cap_drop ALL, no-new-privileges), so run the app as a non-root user."; exit 1; }';
+    expect(COMPOSE_UP_FAILED).toBe(MSG);
     for (const st of [renderComposeUp(), renderComposeUp({ proofOverride: true })]) {
-      expect(st.run).toContain('|| { echo "::error::pipegen: the containers did not start. pipegen starts your app containers with no Linux capability and no privilege gain (cap_drop ALL, no-new-privileges), so an image that needs one (a root entrypoint that switches users or changes file owners) can not start: run the app as a non-root user. See PIPEGEN.md, Limits of these checks."; exit 1; }');
-      expect(st.run).not.toMatch(/logs|\$\(/);
+      expect(st.run).toContain(MSG);
+      expect(st.run).not.toMatch(/logs|\$\(|PIPEGEN\.md/);
     }
   });
 });
@@ -344,5 +348,91 @@ describe('G17B-R1 round 2: PIPEGEN.md says the DAST limits', () => {
     const docB = pipegenDoc(b.draft, REVIEWED).content;
     expect(docB).toContain('The running app scan talks to ZAP through its API, which answers only 127.0.0.1');
     expect(docB).not.toContain('a second build of the same Dockerfile');
+  });
+});
+
+describe('G17B-R2 design call: pipegen publishes and signs no image built from a Dockerfile it created; PIPEGEN.md says so', () => {
+  const REF = baseImageRef('node-24-bookworm-slim');
+  const SINGLE = [`FROM ${REF}`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --omit=dev --ignore-scripts --git=/usr/bin/git', 'COPY . .', 'ENV NODE_ENV=production', 'EXPOSE 3000', 'USER node', 'CMD ["npm", "start"]', ''].join('\n');
+  const svcNoDf = () => node({ frameworks: ['express'], port: 3000, scripts: ['test', 'lint', 'start'] });
+  const created = (): CreatedFile[] => [
+    { path: 'Dockerfile', content: SINGLE, part: 'docker', reason: 't', repo: 'app' },
+    { path: '.dockerignore', content: dockerignoreText(svcNoDf(), false), part: 'docker', reason: 't', repo: 'app' },
+  ];
+  const USED = ['sec', 'retsUsed'].join('');
+  const deployWf = { path: '.github/workflows/deploy.yml', triggers: ['push'], deploys: true, [USED]: [], jobs: ['deploy'] } as unknown as ExistingWorkflow;
+  const DOC: PipelineDoc = { transcript: [], deployGaps: [], lockNotes: [], estimates: { monthlyMinutes: 120, includedMinutes: 3000 }, setupCommand: '', testNotes: [], uncoveredMinimum: [], notes: [] };
+  const section = (doc: string, head: string): string => { const i = doc.indexOf(head); const j = doc.indexOf(`\n${head.split(' ')[0]} `, i + head.length); return doc.slice(i, j < 0 ? undefined : j); };
+  const DIGEST = 'Deploy with the verified image digest';
+  const AGAIN = 'the publish job builds again at the merge commit';
+  const NOTE = 'pipegen does not publish the image of the service "app", so it signs nothing for it and the verify job checks no image of it: pipegen v0.2 publishes only the image of a service at the repository root built from a Dockerfile of the repository\'s own (not one pipegen created).';
+  const UNPUBLISHED = 'Not set up: pipegen publishes no image of this service, so it signs and verifies nothing for it (see Signing and the notes below).';
+
+  it('docs: with a created root Dockerfile, no signing or verify line says "Fails the run."; they say Not set up, the note names the service, and no digest or publish line is written', () => {
+    const x = planned(profileOf([svcNoDf()], { existingWorkflows: [deployWf] }), { over: { created: created() } });
+    const deployNeeds = x.draft.needs.filter((n) => n.layer === 'deploy' && ['signing', 'attestation', 'deploy-verify'].includes(n.id));
+    expect(deployNeeds.map((n) => n.id).sort(), 'the plan holds signing and verify needs for the service').toEqual(expect.arrayContaining(['deploy-verify', 'signing']));
+    const a = assemble(x);
+    expect(a.notes).toContain(NOTE);
+    const doc = pipegenDoc({ ...a.draft, doc: { ...DOC, notes: a.notes } }, REVIEWED).content;
+    const deploy = section(doc, '### Deploy layer');
+    const lines = deploy.split('\n').filter((l) => /^- (?:Image signing|Build attestation|Verify before deploy), service "app"/.test(l));
+    expect(lines.length).toBe(deployNeeds.length);
+    for (const l of lines) {
+      expect(l).not.toContain('Fails the run.');
+      expect(l.endsWith(UNPUBLISHED), l).toBe(true);
+    }
+    expect(section(doc, '## The four layers')).toContain(`- ${NOTE}`);
+    expect(doc).not.toContain(DIGEST);
+    expect(doc).not.toContain(AGAIN);
+  });
+
+  it('docs: the control, a root service with its own Dockerfile that pipegen publishes and signs: Fails the run, the digest line and the publish line stay', () => {
+    const x = planned(profileOf([web()], { existingWorkflows: [deployWf] }), { over: { signing: { mode: 'keyless', images: [{ service: 'app', repo: publishedImageRepo('o', 'r', 'app') }] } } });
+    const doc = pipegenDoc({ ...x.draft, doc: DOC }, REVIEWED).content;
+    const lines = section(doc, '### Deploy layer').split('\n').filter((l) => /^- (?:Image signing|Verify before deploy), service "app"/.test(l));
+    expect(lines.length).toBe(2);
+    for (const l of lines) expect(l).toMatch(/Fails the run\.$/);
+    expect(doc).toContain(DIGEST);
+    expect(doc).toContain(AGAIN);
+    // published, but no signing plan: the verify line can not promise a signature
+    const { signing: _s, ...unsigned } = x.draft;
+    const v = section(pipegenDoc({ ...unsigned, doc: DOC }, REVIEWED).content, '### Deploy layer').split('\n').find((l) => /^- Verify before deploy, service "app"/.test(l)) as string;
+    expect(v).toMatch(/Not set up: pipegen signs nothing in this setup, so no deploy is checked against a signature \(see Signing\)\.$/);
+  });
+});
+
+describe('G17B-R2 sec M2 (the fallback): the compose start\'s second build reaches the package registry', () => {
+  it('assemble: with pipegen\'s compose file, the DAST run job reaches every host its image build reaches (registry.npmjs.org, ghcr.io); the referee passes', async () => {
+    const prof = profileOf([node({ dockerfile: 'Dockerfile', port: 3000, scripts: ['test', 'lint', 'start'], dependsOn: [PG] })]);
+    const compose: CreatedFile = { path: 'docker-compose.pipegen.yml', content: composeText(prof, loadBaseImages()) as string, part: 'compose', reason: 't', repo: 'app' };
+    const a = assemble(planned(prof, { over: { created: [compose], ...SKIP_DEPLOY } }));
+    const run = domainsOf(a.merge['dast-run--app'] as Job);
+    const build = domainsOf(a.merge['image-build--app'] as Job);
+    expect(run).toEqual(expect.arrayContaining(['registry.npmjs.org', 'ghcr.io']));
+    for (const d of build) expect(run, d).toContain(d);
+    expect(shown(await judge([...files(a), compose], a.draft))).toBe('');
+  });
+
+  it('docs: the fallback keeps the second-build line in PIPEGEN.md (the archive start with --no-build is a carry)', () => {
+    expect(readFileSync('docs/smoke-test.md', 'utf8')).toMatch(/\| L-G17B-1 \| the compose-path DAST run/);
+  });
+});
+
+describe('G17B-R2 spec M1, I2: the created Dockerfile counts only as part docker; a sub-folder one gets the sub-folder next step', () => {
+  it('imageProfile: a created Dockerfile of another part fills nothing', () => {
+    const prof = profileOf([node()]);
+    const df = (part: CreatedFile['part']): CreatedFile => ({ path: 'Dockerfile', content: 'x', part, reason: 't', repo: 'app' });
+    expect(imageProfile(prof, [df('docker')]).services[0]?.dockerfile).toBe('Dockerfile');
+    expect(imageProfile(prof, [df('docs')])).toBe(prof);
+  });
+
+  it('assemble: a Dockerfile pipegen creates in a sub-folder service\'s folder stops with the sub-folder next step, not "add a Dockerfile"', () => {
+    const prof = profileOf([node({ name: 'api', path: 'api', frameworks: ['express'], port: 3000, scripts: ['test', 'lint', 'start'] })]);
+    const df: CreatedFile = { path: 'api/Dockerfile', content: 'x', part: 'docker', reason: 't', repo: 'app' };
+    const without = new Set(['dast', 'dockerfile-lint']);
+    const needs = floorNeeds(prof, CAPS).filter((n) => !without.has(n.id));
+    const x = planned(prof, { needs, over: { created: [df], ...SKIP_DEPLOY }, edit: (s) => s.filter((st) => !without.has(st.needId)) });
+    expect(() => assemble(x)).toThrow(/can not run: its image is not built .*Next step: pipegen v0\.2 builds an image from the repository root only;/);
   });
 });
