@@ -14,7 +14,7 @@ import { UninstallRefusal } from '../src/uninstall/target.js';
 import { ProgressFile, uninstallProgressPath } from '../src/uninstall/progress.js';
 import type { LoadedRecord } from '../src/uninstall/record.js';
 import type { Env } from './helpers/deliver-github.js';
-import { entryImportProblems } from './helpers/import-scan.js';
+import { codeFilesUnder, entryImportProblems } from './helpers/import-scan.js';
 import {
   AT, blob, cleanHomes, deps, gh, loadedOf, local, mergePr, RECORD_TEXT, sampleRecord, SEC, SHA, term, world, writes, type Term, type World,
 } from './helpers/uninstall-world.js';
@@ -198,7 +198,7 @@ describe('uninstall phase B: secrets, variables, environments, settings (V6)', (
 
     // the source scan: E's scratch writers are called only from apply.ts (the phase-bound api), never from another file
     const dir = join(import.meta.dirname, '..', 'src', 'uninstall');
-    for (const f of readdirSync(dir).filter((x) => x.endsWith('.ts') && x !== 'apply.ts')) {
+    for (const f of readdirSync(dir).filter((x) => /\.(?:[cm]?[jt]s|[jt]sx)$/.test(x) && x !== 'apply.ts')) {
       const code = readFileSync(join(dir, f), 'utf8').replace(/\/\/.*$/gm, '');
       expect(code, f).not.toMatch(/\b(?:cleanupWrite|deleteScratchSecret|deleteScratchRepo|cleanupLeftovers|guardedWrite)\s*\(/);
     }
@@ -368,7 +368,10 @@ describe('uninstall phase B: the phase-bound api and the source rules (V5-R1 car
     // itself is allowed one construction: deleteCentralRepo makes the typed-name-only api it deletes the repo with (V3; spec M7).
     const root = join(import.meta.dirname, '..');
     const found: string[] = [];
-    for (const f of srcFiles(join(root, 'src'))) found.push(...entryImportProblems(relative(root, f).split(sep).join('/'), readFileSync(f, 'utf8')));
+    // V7 (V6-R3 M3): every code file under src, whatever its extension (.mts, .cts, .js too); a file that isn't code is a problem
+    const tree = codeFilesUnder(join(root, 'src'));
+    expect(tree.other).toEqual([]);
+    for (const f of tree.code) found.push(...entryImportProblems(relative(root, f).split(sep).join('/'), readFileSync(f, 'utf8')));
     expect(found).toEqual([]);
     // the scan's own must-catch examples (in a file of src/uninstall that is not allowed them)
     const forms: Record<string, string> = {
@@ -414,13 +417,3 @@ describe('uninstall phase B: the phase-bound api and the source rules (V5-R1 car
     expect(entryImportProblems('src/uninstall/central.ts', "import { UninstallRefusal, type UninstallApi } from './target.js';\nimport type { PhaseApi } from './apply.js';")).toEqual([]);
   });
 });
-
-/** Every .ts file under `dir`. */
-function srcFiles(dir: string): string[] {
-  const out: string[] = [];
-  for (const e of readdirSync(dir, { withFileTypes: true })) {
-    if (e.isDirectory()) out.push(...srcFiles(join(dir, e.name)));
-    else if (e.name.endsWith('.ts')) out.push(join(dir, e.name));
-  }
-  return out;
-}

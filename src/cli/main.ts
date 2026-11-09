@@ -16,6 +16,7 @@ import { connect, finishCommand, updateCommand, verifyCommand } from './commands
 import { inspect } from './inspect.js';
 import { processIO, type CliIO } from './io.js';
 import { fullRun } from './run.js';
+import { uninstallCommand } from './uninstall.js';
 import { parseTypeFlags } from './type-confirm.js';
 
 /**
@@ -45,6 +46,10 @@ function usage(): string[] {
     '  pipegen verify     Compares the repo with what pipegen recorded and lists any drift (exit code 1 on drift).',
     '  pipegen update     Opens pull requests that move pipegen\'s files to this version; never overwrites your edits.',
     '  pipegen cleanup    Removes what an interrupted proof left in GitHub (the scratch repo\'s branches, keys, runs).',
+    '  pipegen uninstall  Removes what pipegen installed, in two runs: the first opens a pull request that takes pipegen out of your app',
+    '                     and removes the merge locks; after you merge it, the second removes the rest (secrets, variables, settings,',
+    '                     the central repo\'s files). Only what the install record lists and GitHub confirms pipegen made; it asks',
+    '                     before each deletion and needs a terminal.',
     '  pipegen hook secrets  What pipegen\'s pre-commit hook runs: its pinned gitleaks on the staged changes.',
     '',
     'Safe mode, for a repo you don\'t trust: run pipegen from OUTSIDE it, with an exact version and npm\'s own registry,',
@@ -74,6 +79,9 @@ function usage(): string[] {
     '  --strictness <level>  run: starter, standard (default) or strict: which checks block a merge from the start.',
     '  --print               finish: print the commands instead of running them.',
     '  --rotate-key          finish: make a new signing key pair (key-env signing).',
+    '  --delete-repos        uninstall: also delete the repos pipegen made (the proof\'s scratch repo; the central repo, when yours is the',
+    '                        last project). With the pipegen App it deletes them after you type their names; with a token it prints the',
+    '                        gh repo delete commands.',
     '  --allow-broad-token   Accept a classic token (it reaches every repo you have).',
     '  -h, --help            Show this help.',
     '  -v, --version         Show the version.',
@@ -87,10 +95,10 @@ function usage(): string[] {
 /** G13 (carry 4): the commands each command-specific option works with. --dir and --allow-broad-token work everywhere. */
 const OPTION_COMMANDS: Readonly<Record<string, readonly string[]>> = {
   out: ['audit'], force: ['audit'], json: ['audit'], ai: ['audit'], model: ['audit'], effort: ['audit'], verbose: ['audit'],
-  type: ['audit', 'run'], skip: ['run'], strictness: ['run'], print: ['finish'], 'rotate-key': ['finish'],
+  type: ['audit', 'run'], skip: ['run'], strictness: ['run'], print: ['finish'], 'rotate-key': ['finish'], 'delete-repos': ['uninstall'],
 };
 /** The commands G13 adds (each reads the folder's origin; unsafeFolderStop first, ruling G13-R0 14). */
-const SETUP_COMMANDS: ReadonlySet<string> = new Set(['run', 'resume', 'finish', 'verify', 'update', 'cleanup']);
+const SETUP_COMMANDS: ReadonlySet<string> = new Set(['run', 'resume', 'finish', 'verify', 'update', 'cleanup', 'uninstall']);
 /** The option no command but `cmds` takes, as the one plain line. */
 function optionProblem(values: Record<string, unknown>, command: string): string | null {
   for (const [o, cmds] of Object.entries(OPTION_COMMANDS)) {
@@ -103,9 +111,9 @@ function optionProblem(values: Record<string, unknown>, command: string): string
 /** The commands main dispatches to (tests replace them; the defaults are the real ones). */
 export interface Commands {
   fullRun: typeof fullRun; cleanup: typeof cleanupCommand; connect: typeof connect;
-  finish: typeof finishCommand; verify: typeof verifyCommand; update: typeof updateCommand;
+  finish: typeof finishCommand; verify: typeof verifyCommand; update: typeof updateCommand; uninstall: typeof uninstallCommand;
 }
-const REAL: Commands = { fullRun, cleanup: cleanupCommand, connect, finish: finishCommand, verify: verifyCommand, update: updateCommand };
+const REAL: Commands = { fullRun, cleanup: cleanupCommand, connect, finish: finishCommand, verify: verifyCommand, update: updateCommand, uninstall: uninstallCommand };
 /** Ruling S10: options that may be given more than once (each --type names one service). */
 const REPEATABLE: ReadonlySet<string> = new Set(['type']);
 
@@ -117,7 +125,7 @@ export async function run(argv: string[], io: CliIO, cmds: Partial<Commands> = {
   let values: {
     dir?: string; out?: string; force?: boolean; json?: boolean; ai?: string; model?: string; effort?: string;
     type?: string[]; verbose?: boolean; 'allow-broad-token'?: boolean; help?: boolean; version?: boolean;
-    skip?: string; strictness?: string; print?: boolean; 'rotate-key'?: boolean;
+    skip?: string; strictness?: string; print?: boolean; 'rotate-key'?: boolean; 'delete-repos'?: boolean;
   };
   let positionals: string[];
   let tokens: { kind: string; name?: string }[];
@@ -142,6 +150,7 @@ export async function run(argv: string[], io: CliIO, cmds: Partial<Commands> = {
         strictness: { type: 'string' },
         print: { type: 'boolean' },
         'rotate-key': { type: 'boolean' },
+        'delete-repos': { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
         version: { type: 'boolean', short: 'v' },
       },
@@ -247,10 +256,10 @@ export async function run(argv: string[], io: CliIO, cmds: Partial<Commands> = {
 }
 
 /**
- * run, finish, verify, update and cleanup (G13): unsafeFolderStop first (carry 1), then the command. An unexpected error is one cleaned line
+ * run, finish, verify, update, cleanup (G13) and uninstall (V7): unsafeFolderStop first (carry 1), then the command. An unexpected error is one cleaned line
  * (no token, no stack trace) and exit 1.
  */
-async function setupCommand(command: string, dir: string, values: { type?: string[]; skip?: string; strictness?: string; print?: boolean; 'rotate-key'?: boolean; 'allow-broad-token'?: boolean }, io: CliIO, c: Commands): Promise<number> {
+async function setupCommand(command: string, dir: string, values: { type?: string[]; skip?: string; strictness?: string; print?: boolean; 'rotate-key'?: boolean; 'delete-repos'?: boolean; 'allow-broad-token'?: boolean }, io: CliIO, c: Commands): Promise<number> {
   const allowBroad = values['allow-broad-token'] === true;
   let types: ReturnType<typeof parseTypeFlags> = [];
   if (command === 'run') {
@@ -270,6 +279,8 @@ async function setupCommand(command: string, dir: string, values: { type?: strin
     // G14 (ruling G13-R0 10, G14-R0 Q3): the saved draft only; --skip, --type and --strictness are refused above (optionProblem)
     if (command === 'resume') return await c.fullRun(dir, io, { resume: true, flags: { allowBroad }, local: { env: io.env }, state: { env: io.env } });
     if (command === 'cleanup') return await c.cleanup(dir, io, { allowBroad });
+    // V7: unsafeFolderStop ran above; --delete-repos is the command's own flag (optionProblem); connect is G13's seam
+    if (command === 'uninstall') return await c.uninstall(io, { dir, allowBroad, deleteRepos: values['delete-repos'] === true, connect: c.connect });
     const { app, g, token: t } = await c.connect(io, dir, { allowBroad, mode: command === 'verify' ? 'read' : 'write' });
     token = t;
     if (command === 'finish') return await c.finish(io, app, { print: values.print === true, rotateKey: values['rotate-key'] === true }, g);
