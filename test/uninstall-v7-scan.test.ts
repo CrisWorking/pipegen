@@ -60,6 +60,10 @@ describe('V7 scan: the G-forms the V6-R3 review found', () => {
     for (const spec of ['./target.js', './target.mjs', './target.ts', './target']) {
       expect(problems('src/uninstall/zz-ext.mts', `import { UninstallApi } from '${spec}';\nexport const U = UninstallApi;`).length, spec).toBeGreaterThan(0);
     }
+    // the specifier's spelling decides which module it is: a namespace import of the guarded module, however it is written
+    for (const spec of ['./target.js', './target.mjs', './target.cjs', './target.ts', './target', './target.mts']) {
+      expect(problems('src/uninstall/central.ts', `import * as t from '${spec}';`).length, `ns ${spec}`).toBeGreaterThan(0);
+    }
     expect(problems('src/uninstall/zz-ext.cts', "const t = require('./target.js');").length).toBeGreaterThan(0);
     expect(problems('src/cli/zz.js', "export * from '../uninstall/target.js';").length).toBeGreaterThan(0);
   });
