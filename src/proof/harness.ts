@@ -625,6 +625,12 @@ export interface ProofAppFiles {
   appFiles: (centralSha: string | undefined) => Promise<CreatedFile[]>;
   /** What the last call rendered: the harness, the compat copies (with what is not compared). */
   last(): { harness: Harness; compat: CompatResult } | null;
+  /**
+   * G14fix-R1 (review F2): the checks that need no central sha, before the setup (and so before any GitHub write): the assembled
+   * workflows at no sha plus the compat copies of HEAD pass the proof rules, and no two of them (or the harness's path) share a path.
+   * Only the harness waits for the sha; `appFiles` checks the full set again.
+   */
+  precheck?(): Promise<void>;
 }
 
 /**
@@ -657,5 +663,19 @@ export function proofAppFiles(draft: PipelineDraft, deps: { assemble: ProofAssem
       return all;
     },
     last: () => last,
+    precheck: async () => {
+      const assembled = await deps.assemble(PROOF_SIGNING_MODE, undefined);
+      const compat = await compatCopies(draft.profile, deps.dir);
+      const all = [...assembled, ...compat.files];
+      const seen = new Set<string>([HARNESS_PATH.toLowerCase()]);
+      for (const f of all) {
+        const k = f.path.toLowerCase();
+        if (seen.has(k)) throw new ProofStopError(`Two proof files have the path ${safeText(f.path, 120)}; pipegen won't guess which one to push.`);
+        seen.add(k);
+      }
+      checkProofWorkflows(all.map((f) => ({ path: f.path, content: f.content, kind: isCompatCopy(f) ? 'compat' as const : 'proof' as const })), {
+        ...(deps.harness.reviewed === undefined ? {} : { reviewed: deps.harness.reviewed }), central: 'later',
+      });
+    },
   };
 }

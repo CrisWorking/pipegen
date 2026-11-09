@@ -426,7 +426,8 @@ describe('G14fix-R1: --skip deploy with a deploy need left uncovered', () => {
     const reviewed = REVIEWED.filter((t) => !t.categories.includes('sbom'));
     const uncovered = keyOffers(x.plan.needs, x.plan.candidates, prof, { reviewed }).uncovered;
     const needs = x.plan.needs.filter((n) => n.layer !== 'deploy');
-    return { draft: { ...x.draft, needs }, plan: { ...x.plan, needs, uncovered } };
+    const steps = x.draft.steps.filter((st) => needs.some((n) => n.id === st.needId));
+    return { draft: { ...x.draft, needs, steps }, plan: { ...x.plan, needs, uncovered } };
   };
 
   it('G14fix-R1: a skipped deploy need left uncovered is not a blocking need with no tool (the run goes on)', () => {

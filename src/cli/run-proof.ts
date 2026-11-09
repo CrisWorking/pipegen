@@ -236,11 +236,14 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
 
     // the files of a draft for the proof: the run's proof assembler for it (signing none, the proof layout), split by repo
     const created = async (d: PipelineDraft): Promise<CreatedFile[]> => (await build.rebuild(d)).assembled.created.filter((f) => f.repo === 'app');
-    const filesOf = async (d: PipelineDraft, centralSha: string | undefined): Promise<DraftFiles> => {
+    const pafOf = async (d: PipelineDraft): Promise<{ asm: ProofAssemble; paf: ReturnType<typeof o.appFiles> }> => {
       const asm = await i.assembleFor(d);
       const own = await created(d);
       const appOnly: ProofAssemble = async (mode, sha) => [...own, ...(await asm(mode, sha)).filter((f) => f.repo === 'app')];
-      const paf = o.appFiles(d, { assemble: appOnly, harness: { platform: i.platform, reviewed: i.reviewed, createdTests: false, signing: d.signing?.mode ?? 'none' }, dir: i.dir });
+      return { asm, paf: o.appFiles(d, { assemble: appOnly, harness: { platform: i.platform, reviewed: i.reviewed, createdTests: false, signing: d.signing?.mode ?? 'none' }, dir: i.dir }) };
+    };
+    const filesOf = async (d: PipelineDraft, centralSha: string | undefined): Promise<DraftFiles> => {
+      const { asm, paf } = await pafOf(d);
       const central = d.centralPin === undefined ? [] : (await asm('none', undefined)).filter((f) => f.repo === 'central');
       const app = await paf.appFiles(centralSha);
       return { central, app, last: paf.last() };
@@ -277,14 +280,27 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
 
     // E-b11: the scratch keys read the names of the assembled proof workflows. G14fix: a private (pinned) draft's harness needs the
     // proof central's commit, known only after pushProofSetup, so before the setup only the central files and the secret names are
-    // computed (from the assembled app and central workflows; the harness and the compat copies read no secret, and the full set is
-    // compared after the setup); the app files are built once, for setup.centralSha
+    // computed (from the assembled app and central workflows; the harness and the compat copies read no secret but GITHUB_TOKEN, and
+    // the full set is compared in the setup's appFiles callback, before any GitHub write); the app files are built once, for
+    // setup.centralSha. G14fix-R1 F2: the proof-rule checks that need no sha (assembled app workflows, compat copies) run here too,
+    // before arm and before any GitHub write
     const first: Pick<DraftFiles, 'central' | 'app'> = startDraft.centralPin === undefined ? await filesAt(startDraft, undefined) : await (async () => {
+      const { paf } = await pafOf(startDraft);
+      await paf.precheck?.();
       const asm = await i.assembleFor(startDraft);
       const all = await asm('none', undefined);
       return { central: all.filter((f) => f.repo === 'central'), app: [...await created(startDraft), ...all.filter((f) => f.repo === 'app')] };
     })();
     const readBy = workflowSecretNames(pushed(first));
+    // G14fix: the scratch keys are made for the secret names read before the setup; the pushed set must read no other one
+    // (GITHUB_TOKEN, the harness's, is the platform's token, never a stored secret; null before = every secret counts as read)
+    const platformless = (n: readonly string[]): string => JSON.stringify([...new Set(n.filter((x) => x.toUpperCase() !== 'GITHUB_TOKEN'))].sort());
+    const sameNames = (f: Pick<DraftFiles, 'app' | 'central'>): void => {
+      const after = workflowSecretNames(pushed(f));
+      if (readBy !== null && (after === null || platformless(after) !== platformless(readBy))) {
+        throw new ProofStopError('pipegen stopped: the proof workflows read other secrets than the ones the scratch keys were made for.');
+      }
+    };
     const raw = o.keys(gh, t, vault, { io, leftover: (x) => store.record(x), ...(readBy === null ? {} : { readByWorkflows: readBy }) });
     const keys = guardedKeys(raw, store);
     const cleanup = (signal?: AbortSignal): Promise<CleanupResult> => o.cleanup(gh, t, store, raw as unknown as ScratchKeys, {
@@ -340,7 +356,8 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
       const setup = await o.setup({
         target: t, dir: i.dir, ...(repos.defaultBranchState === undefined ? {} : { defaultBranchState: repos.defaultBranchState }),
         ...(first.central.length === 0 ? {} : { central: { files: first.central } }),
-        appFiles: async (sha) => (await filesAt(startDraft, sha)).app, plantedFiles: planted.files,
+        // G14fix-R1 F1: the secret names are compared here, in pushProofSetup's read-only step 1, before any GitHub write
+        appFiles: async (sha) => { const f = await filesAt(startDraft, sha); sameNames({ app: f.app, central: first.central }); return f.app; }, plantedFiles: planted.files,
         dockerServices: p.services.filter((s) => s.dockerfile !== undefined || startDraft.created.some((f) => f.path === dockerfileAt(s))),
       }, { gh, transport, io, storeSecrets: storeStep });
       const centralSha = setup.centralSha;
@@ -358,13 +375,8 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
       };
       // C1: the files the setup pushed are the start draft's, central included (anything else stops the proof)
       if (fileKey(cur.files.central) !== centralKey) throw new ProofStopError(CENTRAL_CHANGED);
-      // G14fix: the scratch keys were made for the secret names read before the setup; the pushed set must read no other one
-      // (GITHUB_TOKEN, the harness's, is the platform's token, never a stored secret; null before = every secret counts as read)
-      const platformless = (n: readonly string[]): string => JSON.stringify([...new Set(n.filter((x) => x.toUpperCase() !== 'GITHUB_TOKEN'))].sort());
-      const after = workflowSecretNames(pushed(cur.files));
-      if (readBy !== null && (after === null || platformless(after) !== platformless(readBy))) {
-        throw new ProofStopError('pipegen stopped: the proof workflows read other secrets than the ones the scratch keys were made for.');
-      }
+      // G14fix: the pushed set again (the same cached files the setup's callback checked)
+      sameNames(cur.files);
       let round = 1;
       let merged = false;
       // sec M2: main and planted of a draft as a fresh round off the base, with fresh C1b placements

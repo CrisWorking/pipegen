@@ -74,7 +74,7 @@ describe('G4b: the type-check through the repo\'s own tsc (ruling G4-R3)', () =>
     expect(repoToolFor(typeCheck(), none)).toBeNull();
     expect(repoToolProblem(typeCheck(), none)).toBe('tsc: typescript is not in the lockfile, so pipegen has no pinned type checker to run (add typescript as a dev dependency and commit package-lock.json)');
     const o = offersOf(none);
-    expect(o.uncovered).toContainEqual({ key: 'type-check--app', needId: 'type-check', service: 'app', blocking: true, reason: 'no-repo-tool' });
+    expect(o.uncovered).toContainEqual({ key: 'type-check--app', needId: 'type-check', service: 'app', layers: ['push', 'merge'], blocking: true, reason: 'no-repo-tool' });
     expect(o.byCode.map((b) => b.key)).not.toContain('type-check--app');
     const x = planned(profileOf([none]));
     expect(() => assemble(x)).toThrow(/"type-check" for "app": tsc: typescript is not in the lockfile, so pipegen has no pinned type checker to run \(add typescript as a dev dependency and commit package-lock\.json\)\)\. It never guesses a tool\./);

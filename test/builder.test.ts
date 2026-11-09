@@ -503,8 +503,8 @@ describe('builder (added, pre-flight §7)', () => {
     const { ai, calls } = scripted(ok());
     const r = await buildChoices(needs, map, P, bundle, ai, deps());
     expect(r.uncovered).toEqual([
-      { key: 'unit-tests--api', needId: 'unit-tests', service: 'api', blocking: true, reason: 'no-reviewed-tool' },
-      { key: 'image-scan--web', needId: 'image-scan', service: 'web', blocking: true, reason: 'none-offered' },
+      { key: 'unit-tests--api', needId: 'unit-tests', service: 'api', layers: ['merge'], blocking: true, reason: 'no-reviewed-tool' },
+      { key: 'image-scan--web', needId: 'image-scan', service: 'web', layers: ['merge'], blocking: true, reason: 'none-offered' },
     ]);
     expect(r.choices.map((c) => c.key)).not.toContain('image-scan--web');
     expect(schemaNames(calls[0]!).keys).not.toContain('image-scan--web');
@@ -536,7 +536,7 @@ describe('builder (added, pre-flight §7)', () => {
       { key: 'lint--web', needId: 'lint', service: 'web', kind: 'project-script', blocking: true },
     ]);
     // m2: a blocking need whose check has no reviewed entry at all is reported like uncovered, never as covered by code
-    expect(r.uncovered).toContainEqual({ key: 'unit-tests--api', needId: 'unit-tests', service: 'api', blocking: true, reason: 'no-reviewed-tool' });
+    expect(r.uncovered).toContainEqual({ key: 'unit-tests--api', needId: 'unit-tests', service: 'api', layers: ['merge'], blocking: true, reason: 'no-reviewed-tool' });
     const keys = schemaNames(calls[0]!).keys;
     const block = calls[0]!.user.slice(calls[0]!.user.indexOf(`<${BUILDER_NEEDS_TAG}>`), calls[0]!.user.indexOf(`</${BUILDER_NEEDS_TAG}>`));
     expect(block).toContain('"sast--api"');
@@ -571,7 +571,7 @@ describe('builder (added, pre-flight §7)', () => {
     const bare = profile({ services: [API, { ...WEB, npmLockfileVersion: 3, quality: { ...emptyServiceQuality(), tsconfig: true } }] });
     const second = scripted(ok());
     const u = await buildChoices(needs, candidatesFor(needs, bare), bare, bundle, second.ai, deps());
-    expect(u.uncovered).toContainEqual({ key: 'type-check--web', needId: 'type-check', service: 'web', blocking: true, reason: 'no-repo-tool' });
+    expect(u.uncovered).toContainEqual({ key: 'type-check--web', needId: 'type-check', service: 'web', layers: ['push', 'merge'], blocking: true, reason: 'no-repo-tool' });
     expect(schemaNames(second.calls[0]!).keys).not.toContain('type-check--web');
   });
 
