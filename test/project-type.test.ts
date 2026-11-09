@@ -1061,8 +1061,8 @@ describe('GJ-R4 (review GJ-r3 N1-N5, N7): continued build lines, a container ove
       const p = await read(files, notes);
       expect(p.services.map((s) => [s.path, s.language])).toEqual([['.', 'node']]);
       expect(needsOf(p, p.services[0]?.name as string)).toContain('image-build');
-      if (folder !== null) expect(notes.join('\n')).toContain(`The folder ${folder} has container files but no plain Dockerfile or Containerfile, and no workflow, compose or bake file builds it, so pipegen takes it as part of the root app`);
-      else expect(notes.join('\n')).not.toMatch(/takes it as part of the root app/);
+      if (folder !== null) expect(notes.join('\n')).toContain(`The folder ${folder} has container files but no plain Dockerfile or Containerfile, and no workflow, compose or bake file builds it, so pipegen does not take it as a service of its own`);
+      else expect(notes.join('\n')).not.toMatch(/part of the root app/);
       const { a, issues } = await assembled(p);
       expect(issues).toBe('');
       expect(Object.keys(a.merge).some((k) => /image/.test(k))).toBe(true);

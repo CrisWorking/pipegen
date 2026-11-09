@@ -112,8 +112,6 @@ const plainPath = (p: string): string => (PLAIN_PATH_RE.test(p) ? p : 'a folder'
 // G17 row 67 (N6): and `docker-compose-prod.yml` / `compose_dev.yaml` names, and `docker-bake.json`
 const COMPOSE_FILE_RE = /^(?:docker-)?compose(?:[._-][\w.-]+)?\.ya?ml$/i;
 const BAKE_FILE_RE = /^docker-bake(?:[._-][\w.-]+)?\.(?:hcl|json)$/i;
-/** G17 row 71: folders whose container files package the root app itself (the note may say "part of the root app" only for these). */
-const PACKAGING_DIRS = new Set(['docker', '.docker', 'deploy', 'deployment', 'deployments', 'container', 'containers', 'packaging']);
 const MAX_BUILD_FILES = 20;
 const MAX_BUILD_FILE_BYTES = 2_000_000;
 // Root files read by direct path so the file cap can never hide them.
@@ -475,9 +473,8 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
       for (const d of subs.filter((x) => !ownApp(x))) {
         const why = plainContainer(d) ? 'a plain Dockerfile but no app manifest or code' : 'container files but no plain Dockerfile or Containerfile';
         if (ownAppRaw(d)) { note(ctx, `The folder ${plainPath(d)} holds a GitHub Actions container file, not the app, so pipegen does not take it as a service and does not build or scan its image.`); continue; }
-        // G17 row 71: "part of the root app" only for a packaging folder (docker/, deploy/); a tools/ image or a container action is not the app
-        const what = inGithub(d) ? 'does not take it as a service of its own (a GitHub Actions container file is not the app)'
-          : PACKAGING_DIRS.has(baseOf(d)) ? 'takes it as part of the root app' : 'does not take it as a service of its own';
+        // G17 row 71 / F2: the note never claims the folder is "part of the root app" (neutral for every folder, packaging folders too)
+        const what = inGithub(d) ? 'does not take it as a service of its own (a GitHub Actions container file is not the app)' : 'does not take it as a service of its own';
         note(ctx, `The folder ${plainPath(d)} has ${why}, and no workflow, compose or bake file builds it, so pipegen ${what} and does not build or scan its image.`);
       }
     } else dirs = dockerDirs.length > 0 ? dockerDirs : ['.'];

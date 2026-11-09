@@ -163,12 +163,12 @@ describe('G17 row 71: the note for a folder not taken as a service never says "p
       expect(n).not.toMatch(/actions\/n[^\n]*part of the root app/);
     }
   });
-  it('a tools/ image: no "part of the root app" claim; the packaging folders keep it', async () => {
+  it('a tools/ image: no "part of the root app" claim, and the packaging folders get the same neutral text', async () => {
     const notes: string[] = [];
     await read(express({ 'tools/Dockerfile.lint': 'FROM alpine\n', 'docker/Dockerfile.dev': 'FROM node:24\n' }), notes);
     const n = notes.join('\n');
     expect(n).toContain('The folder tools has container files but no plain Dockerfile or Containerfile, and no workflow, compose or bake file builds it, so pipegen does not take it as a service of its own and does not build or scan its image.');
-    expect(n).toContain('The folder docker has container files but no plain Dockerfile or Containerfile, and no workflow, compose or bake file builds it, so pipegen takes it as part of the root app');
+    expect(n).toContain('The folder docker has container files but no plain Dockerfile or Containerfile, and no workflow, compose or bake file builds it, so pipegen does not take it as a service of its own and does not build or scan its image.');
   });
 });
 
