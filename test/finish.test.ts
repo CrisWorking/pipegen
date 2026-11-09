@@ -4,6 +4,7 @@
 // ruleset and CODEOWNERS last, and updates the install record; `pipegen verify` reports drift between the repos and the record. Every GitHub
 // call goes to an in-memory GitHub (test/helpers/finish-github.ts); cosign is a fake exec; no network.
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -35,6 +36,22 @@ const MERGED_AT = '2026-11-06T09:30:00Z';
 const BLOCK_FROM = '2026-11-13';
 const PUB = cosignPub(3);
 const PW_NAME = ['PIPEGEN_COSIGN', 'PASS' + 'WORD'].join('_');
+/** G17-R4 (sec C1): the key-pair commands finish --print gives (app o/r), one subshell block a failure ends. */
+const KEY_BLOCK = [
+  '(',
+  '  set -eu',
+  '  umask 077',
+  '  d="$(mktemp -d -p /dev/shm)"',
+  '  trap \'rm -rf -- "$d"\' EXIT',
+  '  test -d "$d"',
+  '  cd "$d"',
+  '  COSIGN_PASSWORD="$(head -c 32 /dev/urandom | base64 | tr -d \'\\n\')"; export COSIGN_PASSWORD',
+  '  cosign generate-key-pair --output-key-prefix pipegen-signing',
+  '  gh secret set PIPEGEN_COSIGN_KEY --env pipegen-signing --repo o/r < pipegen-signing.key',
+  `  printf '%s' "$COSIGN_PASSWORD" | gh secret set ${PW_NAME} --env pipegen-signing --repo o/r`,
+  '  gh variable set PIPEGEN_COSIGN_PUB --env pipegen-signing --repo o/r < pipegen-signing.pub',
+  ')',
+].join('\n');
 /** The record's list of stored names, its key spelled at run time (test/no-secret-literals.test.ts). */
 const LIST = ['sec', 'rets'].join('') as 'secrets';
 interface KeyEntry { name: string; scope: `env:${string}`; created: boolean; githubCreatedAt: string }
@@ -1837,14 +1854,18 @@ describe('G17 group D: finish and verify (rows 40-46)', () => {
     const s = await seed({ keyEnv: true });
     const res = await finish(s.g.octokit(), app, { print: true, rotateKey: true }, s.deps());
     const cmds = res.commands ?? [];
-    const at = (re: RegExp) => cmds.findIndex((c) => re.test(c));
-    expect(at(/^cd "\$\(mktemp -d -p \/dev\/shm\)"$/)).toBeGreaterThanOrEqual(0);
-    expect(at(/^cd "\$\(mktemp -d -p \/dev\/shm\)"$/)).toBeLessThan(at(/^cosign generate-key-pair/));
-    expect(at(/COSIGN_PASSWORD/)).toBeLessThan(at(/^cosign generate-key-pair/));
+    // G17-R4 (sec C1): one subshell block a failure ends; the folder is a variable the trap removes, never "$OLDPWD"
+    const block = cmds.find((c) => c.includes('cosign generate-key-pair')) as string;
+    expect(block).toBe(KEY_BLOCK);
+    expect(block.indexOf('mktemp -d -p /dev/shm')).toBeLessThan(block.indexOf('cosign generate-key-pair'));
+    expect(block.indexOf('COSIGN_PASSWORD=')).toBeLessThan(block.indexOf('cosign generate-key-pair'));
     const text = cmds.join('\n');
     expect(text).not.toMatch(/\.password\b/);
-    expect(text).toMatch(new RegExp(`^printf '%s' "\\$COSIGN_PASSWORD" \\| gh secret set ${PW_NAME} --env pipegen-signing --repo o/r$`, 'm'));
-    expect(text).toMatch(/^unset COSIGN_PASSWORD/m);
+    expect(text).not.toMatch(/OLDPWD|cd -/);
+    expect(text).toMatch(new RegExp(`^  printf '%s' "\\$COSIGN_PASSWORD" \\| gh secret set ${PW_NAME} --env pipegen-signing --repo o/r$`, 'm'));
+    // nothing of the block outside it: no umask, password or folder left in the user's shell
+    for (const c of cmds.filter((x) => x !== block && !x.startsWith('#'))) expect(c).not.toMatch(/umask|COSIGN_PASSWORD|mktemp|cosign /);
+    expect(cmds[cmds.indexOf(block) - 1]).toMatch(/^# .*POSIX shell.*stops at the first failure.*npx pipegen finish --rotate-key/);
     expect(s.execs).toEqual([]);
   });
 
@@ -1902,5 +1923,204 @@ describe('G17 group D: finish and verify (rows 40-46)', () => {
     expect(await orgDrift(s)).toContainEqual({ what: ORG, expected: `${REQ} at ${c} as pipegen wrote it`, actual: gitBlobSha(other) });
     orgWf(s)[0]!.sha = good;
     expect(await orgDrift(s)).toEqual([]);
+  });
+});
+
+describe('G17 group D fix round 1 (G17-R4)', () => {
+  const app = { owner: 'o', repo: 'r' };
+  const vfy = (s: Seed) => verify(s.g.octokit(), app, { local: { home: s.home, env: {} }, clock: clock() });
+  type B = Record<string, any>;
+  const orgRs = (s: Seed) => [...s.g.orgRulesets.values()][0] as { id: number; body: B; created_at: string };
+  const orgWf = (s: Seed): B[] => (orgRs(s).body.rules as B[])[0]?.parameters.workflows as B[];
+  const ORG = 'the org required workflow rule (pipegen-required--r)';
+  const REQ = centralWorkflowFile('r', 'required');
+  const latest = async (s: Seed) => { try { const r = await recordOn(s, 'pipegen/update-r'); if (r) return r; } catch { /* none */ } return recordOn(s); };
+  const orgDrift = async (s: Seed) => (await vfy(s)).drift.filter((d) => d.what === ORG);
+  const central = (s: Seed, path: string, sha = s.g.head('o/pipelines')) => s.g.filesAt('o/pipelines', sha).get(path) as string;
+  const io = { confirm: async () => false, select: async () => { throw new Error('no'); }, text: async () => 'o/r' } as never;
+  /** A finished project whose org rule pins a commit that is not the central head (the record commit moved it). */
+  const pinnedOff = async () => {
+    const s = await seed({ org: true });
+    await finish(s.g.octokit(), app, {}, s.deps());
+    const pinned = orgWf(s)[0]?.sha as string;
+    expect(s.g.head('o/pipelines')).not.toBe(pinned);
+    return { s, pinned };
+  };
+  /** A project whose org rule finish found and couldn't show it made: no recorded pin (O8), so verify checks the file the rule runs. */
+  const unpinned = async () => {
+    const s = await seed({ org: true });
+    const body = structuredClone((await recordOn(s)).planned.orgRequiredWorkflow?.rule.body) as B;
+    body.enforcement = 'disabled';
+    s.g.orgRulesets.set(4242, { id: 4242, org: 'o', body: { ...body }, created_at: '2026-01-01T00:00:00Z' } as never);
+    await finish(s.g.octokit(), app, {}, s.deps());
+    expect((await recordOn(s)).orgRuleset).toBeUndefined();
+    expect(await orgDrift(s)).toEqual([]);
+    return s;
+  };
+
+  // ---------- C1: the printed key-pair block, run as the user would ----------
+
+  const SHELLS = ['sh', 'bash', 'dash', 'zsh'].filter((sh) => spawnSync('sh', ['-c', `command -v ${sh}`], { stdio: 'ignore' }).status === 0);
+  /** Every path under `dir` (files and folders), sorted, with each file's text: what a run may not change. */
+  const tree = (dir: string): string[] => readdirSync(dir, { recursive: true, encoding: 'utf8' }).sort().map((p) => (statSync(join(dir, p)).isDirectory() ? `${p}/` : `${p}=${readFileSync(join(dir, p), 'utf8')}`));
+  /**
+   * Runs the printed block under `sh` from a stand-in clone, with a fake cosign and gh first on PATH and /dev/shm swapped for `shm` (an
+   * existing folder, or one that doesn't exist). After the block the same script prints what the user's shell holds then.
+   */
+  const runBlock = (block: string, sh: string, o: { shmExists: boolean; cosignFails?: boolean }) => {
+    const root = mkdtempSync(join(tmpdir(), 'pg-keyblock-'));
+    homes.push(root);
+    const bin = join(root, 'bin');
+    const clone = join(root, 'clone');
+    const shm = join(root, 'shm');
+    const log = join(root, 'calls.log');
+    mkdirSync(bin);
+    mkdirSync(clone);
+    if (o.shmExists) mkdirSync(shm);
+    writeFileSync(join(clone, 'keep.txt'), 'uncommitted work\n');
+    mkdirSync(join(clone, 'src'));
+    writeFileSync(join(clone, 'src', 'app.ts'), 'export {};\n');
+    writeFileSync(join(bin, 'cosign'), `#!/bin/sh\necho "cosign $* in=$(pwd) pw=\${#COSIGN_PASSWORD}" >> "$PG_LOG"\nprintf 'KEY\\n' > pipegen-signing.key\nprintf 'PUB\\n' > pipegen-signing.pub\n${o.cosignFails === true ? 'exit 1\n' : ''}`);
+    writeFileSync(join(bin, 'gh'), '#!/bin/sh\necho "gh $* stdin=$(wc -c | tr -d \' \')" >> "$PG_LOG"\n');
+    chmodSync(join(bin, 'cosign'), 0o755);
+    chmodSync(join(bin, 'gh'), 0o755);
+    const script = join(root, 'paste.sh');
+    writeFileSync(script, `umask 022\n${block.split('/dev/shm').join(shm)}\necho "rc=$? pw=\${COSIGN_PASSWORD-unset} umask=$(umask) pwd=$(pwd)"\n`);
+    writeFileSync(log, '');
+    const before = tree(root);
+    const r = spawnSync(sh, sh === 'zsh' ? ['-f', script] : [script], { cwd: clone, env: { PATH: `${bin}:${process.env.PATH ?? '/usr/bin:/bin'}`, PG_LOG: log, HOME: root }, encoding: 'utf8' });
+    const calls = readFileSync(log, 'utf8').split('\n').filter((l) => l !== '');
+    writeFileSync(log, '');
+    return { r, out: r.stdout, before, after: tree(root), calls, clone, shm };
+  };
+  const keyBlock = async () => {
+    const s = await seed({ keyEnv: true });
+    const res = await finish(s.g.octokit(), app, { print: true, rotateKey: true }, s.deps());
+    // every printed command of the key pair (the row 45 test pins their exact form), pasted in order
+    const block = (res.commands ?? []).filter((c) => !c.startsWith('#') && /mktemp|umask|COSIGN_PASSWORD|cosign |pipegen-signing\.|OLDPWD/.test(c)).join('\n');
+    expect(block).toContain('cosign generate-key-pair');
+    return block;
+  };
+
+  it('finish --print: the key-pair block, run in a POSIX shell without /dev/shm, stops before any key: nothing written, the clone untouched, no secret stored (G17-R4, sec C1)', async () => {
+    const block = await keyBlock();
+    expect(SHELLS).toContain('sh');
+    for (const sh of SHELLS) {
+      const x = runBlock(block, sh, { shmExists: false });
+      expect(x.r.status, `${sh}: ${x.r.stderr}`).toBe(0);
+      expect(x.out, sh).toMatch(/^rc=[1-9]\d* /m);
+      expect(x.calls, sh).toEqual([]);   // no cosign, no gh
+      expect(x.after, sh).toEqual(x.before);   // no pipegen-signing.* anywhere, keep.txt and src/ still there
+      expect(x.after, sh).toContain('clone/keep.txt=uncommitted work\n');
+      expect(x.out, sh).toContain(`pw=unset umask=${sh === 'zsh' ? '022' : '0022'} pwd=${x.clone}`);
+    }
+  });
+
+  it('finish --print: the key-pair block, run in a POSIX shell, makes the pair in the memory folder only and removes it; a failed cosign stores nothing (G17-R4, sec C1)', async () => {
+    const block = await keyBlock();
+    for (const sh of SHELLS) {
+      const ok = runBlock(block, sh, { shmExists: true });
+      expect(ok.out, `${sh}: ${ok.r.stderr}`).toMatch(/^rc=0 /m);
+      expect(ok.calls[0], sh).toMatch(new RegExp(`^cosign generate-key-pair --output-key-prefix pipegen-signing in=${ok.shm}/[^/]+ pw=4[0-9]$`));
+      expect(ok.calls.slice(1), sh).toEqual([
+        'gh secret set PIPEGEN_COSIGN_KEY --env pipegen-signing --repo o/r stdin=4',
+        `gh secret set ${PW_NAME} --env pipegen-signing --repo o/r stdin=${(ok.calls[0] as string).replace(/.* pw=/, '')}`,
+        'gh variable set PIPEGEN_COSIGN_PUB --env pipegen-signing --repo o/r stdin=4',
+      ]);
+      expect(ok.after, sh).toEqual(ok.before);   // the memory folder is gone; nothing written anywhere else
+      expect(ok.out, sh).toContain(`pw=unset umask=${sh === 'zsh' ? '022' : '0022'} pwd=${ok.clone}`);
+      // cosign fails (after writing a key): no gh call, nothing stored, the folder still removed
+      const bad = runBlock(block, sh, { shmExists: true, cosignFails: true });
+      expect(bad.out, sh).toMatch(/^rc=[1-9]\d* /m);
+      expect(bad.calls.length, sh).toBe(1);
+      expect(bad.calls[0], sh).toMatch(/^cosign /);
+      expect(bad.after, sh).toEqual(bad.before);
+      expect(bad.out, sh).toContain(`pw=unset umask=${sh === 'zsh' ? '022' : '0022'} pwd=${bad.clone}`);
+    }
+  });
+
+  // ---------- M1: the fail-closed guards rows 40-51 added ----------
+
+  it('finish: a live pin is not kept when GitHub says it is ahead of the central default branch, or the compare can\'t be read (row 41, M1: S41g, S41h)', async () => {
+    for (const answer of [{ status: 200, data: { status: 'ahead', files: [] } }, { status: 200, data: { files: [] } }]) {
+      const { s, pinned } = await pinnedOff();
+      s.g.hooks.push((c) => (c.route === 'GET /repos/{owner}/{repo}/compare/{basehead}' && String(c.params.basehead).endsWith(`...${pinned}`) ? answer : undefined));
+      const head = s.g.head('o/pipelines');
+      await finish(s.g.octokit(), app, {}, s.deps());
+      expect(orgWf(s)[0]?.sha, JSON.stringify(answer.data)).toBe(head);
+      expect((await latest(s)).orgRuleset?.pinnedSha).toBe(head);
+    }
+  });
+
+  it('finish: a live pin whose required workflow has pipegen\'s blob but another mode is not kept (row 41, M1: S41f)', async () => {
+    const { s } = await pinnedOff();
+    const rp = s.g.repo('o/pipelines');
+    const text = central(s, REQ);
+    const c = s.g.commitOn('o/pipelines', 'main', { 'other.txt': 'x\n' }, 'an executable required workflow');
+    const t = rp.trees.get(rp.commits.get(c)?.tree as string) as Map<string, { mode: string }>;
+    (t.get(REQ) as { mode: string }).mode = '100755';
+    s.g.commitOn('o/pipelines', 'main', { [REQ]: text, 'other.txt': 'y\n' }, 'back to 100644');
+    expect(s.g.modeAt('o/pipelines', c, REQ)).toBe('100755');
+    expect(s.g.modeAt('o/pipelines', s.g.head('o/pipelines'), REQ)).toBe('100644');
+    orgWf(s)[0]!.sha = c;
+    const head = s.g.head('o/pipelines');
+    await finish(s.g.octokit(), app, {}, s.deps());
+    expect(orgWf(s)[0]?.sha).toBe(head);
+  });
+
+  it('verify: with no recorded pin, a commit GitHub won\'t show, or one whose required workflow is another pipegen file, is drift (row 40, M1: S40c, S40b)', async () => {
+    const s = await unpinned();
+    const good = orgWf(s)[0]?.sha as string;
+    s.g.hooks.push((c) => (c.route === 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}' && c.params.repo === 'pipelines' && c.params.commit_sha === good ? { status: 404, data: { message: 'Not Found' } } : undefined));
+    expect(await orgDrift(s)).toContainEqual({ what: ORG, expected: `the required workflow at ${good} as pipegen wrote it`, actual: 'unreadable' });
+    s.g.hooks.pop();
+    expect(await orgDrift(s)).toEqual([]);
+    // the required workflow's path holding the blob of another file pipegen wrote (the merge workflow)
+    const c = s.g.commitOn('o/pipelines', 'main', { [REQ]: MERGE }, 'the merge workflow at the required path');
+    orgWf(s)[0]!.sha = c;
+    expect(await orgDrift(s)).toContainEqual({ what: ORG, expected: `${REQ} at ${c} as pipegen wrote it`, actual: gitBlobSha(MERGE) });
+  });
+
+  it('finish: a weaker gate ruleset, classic protection or org rule planted in the record is never recorded as planned; verify holds the live locks to pipegen\'s (row 44, M1: S44c, S44d, S44f)', async () => {
+    const s = await seed({ org: true, plannedOver: (p) => {
+      const gate = p.rulesets?.gate.body as B;
+      gate.rules = (gate.rules as B[]).filter((r) => r.type !== 'non_fast_forward');
+      (p.classic?.body as B).enforce_admins = false;
+      (p.orgRequiredWorkflow?.rule.body as B).enforcement = 'evaluate';
+    } });
+    await finish(s.g.octokit(), app, {}, s.deps());
+    const r = await recordOn(s);
+    expect(r.planned.rulesets?.gate.body).toEqual(s.locks.rulesets?.gate.body);
+    expect(r.planned.classic?.body).toEqual(s.locks.classic?.body);
+    expect((r.planned.orgRequiredWorkflow?.rule.body as B).enforcement).toBe('active');
+    expect((await vfy(s)).drift).toEqual([]);
+    // the live gate ruleset loses non_fast_forward: drift against pipegen's plan, not the planted one
+    const gate = [...s.g.repo('o/r').rulesets.values()].find((b) => b.name === 'pipegen') as B;
+    gate.rules = (gate.rules as B[]).filter((x) => x.type !== 'non_fast_forward');
+    expect((await vfy(s)).drift.map((d) => d.what)).toContain('ruleset pipegen');
+  });
+
+  it('finish --rotate-key: a stored key whose earlier entry has no created_at is never claimed as pipegen\'s own (row 43, M1: S43b)', async () => {
+    const s = await seed({ keyEnv: true, recordOver: (r) => {
+      for (const k of (r as unknown as Record<string, { githubCreatedAt?: string; unconfirmed?: true }[]>)[LIST] ?? []) { delete k.githubCreatedAt; k.unconfirmed = true; }
+    } });
+    await finish(s.g.octokit(), app, { rotateKey: true }, s.deps());
+    const keys = ((await latest(s)) as unknown as Record<string, { name: string; scope: string; created: boolean; overwritten?: true }[]>)[LIST]?.filter((k) => k.scope === 'env:pipegen-signing') ?? [];
+    expect(keys.map((k) => k.name).sort()).toEqual(['PIPEGEN_COSIGN_KEY', PW_NAME].sort());
+    for (const k of keys) expect(k, k.name).toMatchObject({ created: false, overwritten: true });
+  });
+
+  // ---------- I1: what a typed run records when it keeps the pin ----------
+
+  it('finish: a typed run that keeps a good org-rule pin records the rule, its created_at and the kept pin (row 41, I1)', async () => {
+    const { s, pinned } = await pinnedOff();
+    const id = orgRs(s).id;
+    rmSync(join(s.home, '.config'), { recursive: true, force: true });
+    const res = await finish(s.g.octokit(), app, {}, s.deps({ io, interactive: true }));
+    try { s.g.merge('o/pipelines', 'pipegen/update-r'); } catch { /* recorded directly */ }
+    expect(orgWf(s)[0]?.sha).toBe(pinned);
+    expect(res.applied.join('\n')).toMatch(/the org required workflow \(ruleset pipegen-required--r, pinned to [0-9a-f]{12}\) \(already in place\)/);
+    expect((await recordOn(s)).orgRuleset).toEqual({ org: 'o', id, name: 'pipegen-required--r', githubCreatedAt: expect.stringMatching(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.000Z$/), pinnedSha: pinned });
+    expect((await vfy(s)).drift).toEqual([]);
   });
 });

@@ -919,4 +919,83 @@ describe('G17 group D: update (rows 46-51)', () => {
     expect(body).toContain(`Closes o/pipelines#${central.number as number}`);
     expect(body).not.toContain(`Closes #${old.number as number}`);
   });
+
+  // ---------- G17-R4 (fix round 1): the row 49 way on; M1 tests for the guards of rows 46, 50 and 51 ----------
+
+  it('update: a re-pin refused because the central commit the app calls can\'t be read gives its own way on, never the M1 text (row 49, G17-R4)', async () => {
+    const v = await privateWorld();
+    await update(v.g.octokit(), app, deps(v));
+    mergeCentral(v);
+    v.g.hooks.push((c) => (c.route === 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}' && c.params.repo === 'pipelines' && c.params.commit_sha === v.c0 ? { status: 404, data: { message: 'Not Found' } } : undefined));
+    const r = await update(v.g.octokit(), app, deps(v));
+    const said = r.notes.join(' ');
+    expect(said).toMatch(/can't read the central commit the app calls/);
+    expect(said).toMatch(/Make the app call a commit of the central repo's default branch again \(as pipegen wrote it\); then run `pipegen update` again\./);
+    expect(said).not.toMatch(/Bring the central file back/);
+    expect(prsOf(v, 'o/r')).toEqual([]);
+  });
+
+  it('update: in a merge run, a quoted gate line of the owner\'s own edit is held too and closes no issue (row 50, M1: S50b)', async () => {
+    const written = gateFile(OLD, OLD_V);
+    const current = `${written}\n  mine:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: "crisworking/pipegen/gate@${OLD}" # gate-v${OLD_V}\n        with:\n          mode: gate\n`;
+    const w = await publicWorld({ written, current });
+    const prompt = issue(updateBody(NEW_V));
+    w.issues.app = [prompt];
+    const res = await update(w.g.octokit(), app, deps(w));
+    expect(res.done).toBe(true);
+    const out = appFile(w, PIPEGEN_YML, UPDATE_BRANCH) as string;
+    expect(out).toContain(`"crisworking/pipegen/gate@${OLD}" # gate-v${OLD_V}`);
+    expect(res.notes.join(' ')).toMatch(/pipegen\.yml: a gate line of your own edit stays on its pin.*by hand/);
+    const body = prsOf(w, 'o/r')[0]?.body ?? '';
+    expect(body).toMatch(/Left on its old pin on purpose.*a gate line of your own edit/s);
+    expect(body).not.toContain(`Closes #${prompt.number as number}`);
+  });
+
+  it('update: when the app\'s own re-pin is held back, the required workflow doesn\'t move either (row 46, M1: S46f)', async () => {
+    const w = await privateWorld();
+    w.g.commitOn('o/pipelines', 'main', { [C_REQ]: reqText(w.c0) }, 'the required workflow');
+    const run = `gh attestation verify "oci://$IMAGE" --repo o/r --signer-workflow o/pipelines/.github/workflows/r--sign.yml --signer-digest ${w.c0}`;
+    const deploy = `name: deploy\non: { push: { branches: [main] } }\npermissions: {}\njobs:\n  pipegen-verify:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: crisworking/pipegen/gate@${OLD} # gate-v${OLD_V}\n        with:\n          mode: find-run\n          central-sha: ${w.c0}\n      - run: ${run}\n  deploy:\n    needs: [pipegen-verify]\n    runs-on: ubuntu-24.04\n    steps:\n      - run: ./deploy.sh\n`;
+    w.g.commitOn('o/r', 'main', { '.github/workflows/deploy.yml': deploy }, 'deploy');
+    await vouch(w, {
+      ...w.record,
+      files: [...w.record.files, { repo: 'central', path: C_REQ, part: 'pipeline', shas: [gitBlobSha(reqText(w.c0))] }],
+      edits: [{ repo: 'app', path: '.github/workflows/deploy.yml', kind: 'verify-job', jobs: ['pipegen-verify'], needs: [{ job: 'deploy', added: ['pipegen-verify'] }], originalSha: gitBlobSha('x'), writtenShas: [gitBlobSha(deploy)] }],
+    });
+    await update(w.g.octokit(), app, deps(w));
+    mergeCentral(w);
+    const before = w.g.head('o/pipelines', centralUpdateBranch('r'));
+    const r = await update(w.g.octokit(), app, deps(w));
+    expect(r.done).toBe(false);
+    expect(prsOf(w, 'o/r')).toEqual([]);
+    expect(r.notes.join(' ')).toMatch(/deploy\.yml.*can't rebuild.*verify job/);
+    expect(r.notes.join(' ')).not.toMatch(/npx pipegen finish/);
+    expect(r.centralPrUrl).toBeUndefined();
+    expect(w.g.head('o/pipelines', centralUpdateBranch('r'))).toBe(before);
+    expect(centralFile(w, C_REQ, centralUpdateBranch('r'))).toBe(reqText(w.c0));
+  });
+
+  it('update: the reviewed version\'s own issue is acted on even with a superseded line; with a central pull request the app pull request closes no central issue (row 51, M1: S51c, S51d)', async () => {
+    const w = await publicWorld();
+    const own = issue(`<!-- pipegen:key=update-${NEW_V} -->\n> Superseded by #999: pipegen gate v${NEW_V} is out.\n## pipegen gate v${NEW_V} is available\n`);
+    w.issues.app = [own];
+    const res = await update(w.g.octokit(), app, deps(w));
+    expect(res.ignored.map((x) => x.issue)).not.toContain(own.number);
+    expect(res.refused.map((x) => x.issue)).not.toContain(own.number);
+    expect(prsOf(w, 'o/r')[0]?.body ?? '').toContain(`Closes #${own.number as number}`);
+    // the re-pin run with a central pull request (the required workflow follows): the central issue is the central pull request's to close
+    const v = await privateWorld();
+    v.g.commitOn('o/pipelines', 'main', { [C_REQ]: reqText(v.c0) }, 'the required workflow');
+    await vouch(v, { ...v.record, files: [...v.record.files, { repo: 'central', path: C_REQ, part: 'pipeline', shas: [gitBlobSha(reqText(v.c0))] }] });
+    await update(v.g.octokit(), app, deps(v));
+    mergeCentral(v);
+    const centralIssue = issue(updateBody(NEW_V));
+    v.issues.central = [centralIssue];
+    const r2 = await update(v.g.octokit(), app, deps(v));
+    expect(r2.centralPrUrl).toBeDefined();
+    expect(r2.prompts.map((p) => p.issue)).toContain(centralIssue.number);
+    const appBody = prsOf(v, 'o/r')[0]?.body ?? '';
+    expect(appBody).not.toBe('');
+    expect(appBody).not.toContain(`o/pipelines#${centralIssue.number as number}`);
+  });
 });
