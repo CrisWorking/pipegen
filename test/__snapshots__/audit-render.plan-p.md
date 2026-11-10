@@ -33,68 +33,91 @@ Available here: environments.
 
 Repo: private, owned by a user account, GitHub plan: free.
 
-## Checks by layer
+## Checks by part
 
-### Before each commit (git hooks on the developer's machine): serious gaps (1 of 3 checks covered)
+<details>
+<summary>1 On your computer (✗ 1 · ⚠ 1 · ✓ 1)</summary>
 
-| | Status | Check | Why | Found |
+| Mark | Status | Check | Why | Found |
 |---|---|---|---|---|
-|   | covered | Git hook manager | The repo uses husky to run git hooks. | husky in .husky/pre-commit |
-| ⚠ | missing | Secret scan | Without a secret scan before each commit, a key can be committed without anyone noticing. | — |
-|   | missing | Format and lint hook for shop-api (warning only) | Without a format and lint hook, style problems are only found later, in CI or in review. | — |
+| ✓ | covered | Git hook manager | The repo uses husky to run git hooks. | husky in .husky/pre-commit |
+| ✗ | missing | Secret scan | Without a secret scan before each commit, a key can be committed without anyone noticing. | — |
+| ⚠ | missing | Format and lint hook for shop-api (warning only) | Without a format and lint hook, style problems are only found later, in CI or in review. | — |
 
-### On every push: serious gaps (2 of 11 checks covered)
+</details>
 
-| | Status | Check | Why | Found |
+<details>
+<summary>2 Every pull request (✗ 14 · ⚠ 2 · ✓ 4)</summary>
+
+| Mark | Status | Check | Why | Found |
 |---|---|---|---|---|
-| ⚠ | missing | Git hooks re-run in CI | Without running the hooks in CI, anyone who skips them locally is never caught. | — |
-| ⚠ | missing | Secret scan | Without a secret scan in CI, a key committed without the local hook is only found after it leaks. | — |
-| ⚠ | missing | Code scan (SAST) for shop-api | Without a code scan, common security bugs reach the main branch unnoticed. | — |
-| ⚠ | partial | Dependency check for shop-api | npm-audit runs, but its failure is ignored (continue-on-error), so it can never fail the build. | npm-audit in .github/workflows/ci.yml (job audit) |
-|   | covered | Unit tests for shop-api | Your own \`npm test\` runs on every push. | your own \`npm test\` in .github/workflows/ci.yml (job test) |
-|   | covered | Lint for shop-api | Your own \`npm run lint\` runs on every push. | your own \`npm run lint\` in .github/workflows/ci.yml (job test) |
-| ⚠ | missing | Type check for shop-api | Why type-check. | — |
-| ⚠ | partial | Format check for shop-api | Why format. | — |
-| ⚠ | partial | Test coverage minimum for shop-api | Why coverage. | — |
-| ⚠ | partial | Dockerfile lint for shop-api | Why dockerfile-lint. | — |
-| ⚠ | partial | Action pin check | Why workflow-pin-check. | — |
+| ✗ | missing | Git hooks re-run in CI | Without running the hooks in CI, anyone who skips them locally is never caught. | — |
+| ✗ | missing | Secret scan, on every push | Without a secret scan in CI, a key committed without the local hook is only found after it leaks. | — |
+| ✗ | missing | Code scan (SAST) for shop-api | Without a code scan, common security bugs reach the main branch unnoticed. | — |
+| ✗ | partial | Dependency check for shop-api | npm-audit runs, but its failure is ignored (continue-on-error), so it can never fail the build. | npm-audit in .github/workflows/ci.yml (job audit) |
+| ✓ | covered | Unit tests for shop-api, on every push | Your own \`npm test\` runs on every push. | your own \`npm test\` in .github/workflows/ci.yml (job test) |
+| ✓ | covered | Lint for shop-api | Your own \`npm run lint\` runs on every push. | your own \`npm run lint\` in .github/workflows/ci.yml (job test) |
+| ✗ | missing | Secret scan, on every pull request | Without a secret scan in CI, a key committed without the local hook is only found after it leaks. | — |
+| ✓ | covered | Unit tests for shop-api, on every pull request | Your own \`npm test\` runs on every pull request. | your own \`npm test\` in .github/workflows/ci.yml (job test) |
+| ✓ | covered | Full test suite for shop-api | Your own \`npm test\` runs on every pull request. | your own \`npm test\` in .github/workflows/ci.yml (job test) |
+| ✗ | missing | Type check for shop-api | Why type-check. | — |
+| ⚠ | missing | Copy-paste check (warning only) | Why duplication. | — |
+| ⚠ | missing | Dead code and unused dependencies for shop-api (warning only) | Why dead-code. | — |
+| ✗ | missing | Workflow lint | Why workflow-lint. | — |
+| ✗ | partial | Format check for shop-api, on every push | Why format. | — |
+| ✗ | partial | Format check for shop-api, on every pull request | Why format. | — |
+| ✗ | partial | Test coverage minimum for shop-api, on every push | Why coverage. | — |
+| ✗ | partial | Test coverage minimum for shop-api, on every pull request | Why coverage. | — |
+| ✗ | partial | Dockerfile lint for shop-api, on every push | Why dockerfile-lint. | — |
+| ✗ | partial | Dockerfile lint for shop-api, on every pull request | Why dockerfile-lint. | — |
+| ✗ | partial | Licence check | Why licences. | — |
 
-### On every pull request, before merge: serious gaps (2 of 15 checks covered)
+</details>
 
-| | Status | Check | Why | Found |
+<details>
+<summary>3 Before merge (✗ 1 · ⚠ 1 · ✓ 0)</summary>
+
+| Mark | Status | Check | Why | Found |
 |---|---|---|---|---|
-| ⚠ | missing | Secret scan | Without a secret scan in CI, a key committed without the local hook is only found after it leaks. | — |
-|   | covered | Unit tests for shop-api | Your own \`npm test\` runs on every pull request. | your own \`npm test\` in .github/workflows/ci.yml (job test) |
-|   | covered | Full test suite for shop-api | Your own \`npm test\` runs on every pull request. | your own \`npm test\` in .github/workflows/ci.yml (job test) |
-|   | missing | Merge gate (pipegen) | No single required check sums up every scan, so a failing scan does not stop a merge. | — |
-|   | unknown | Running-app scan (DAST) for shop-api | A job calls a reusable workflow from another repo, and pipegen can't see inside it. | acme/security/.github/workflows/zap.yml<U+200B>@<U+200B>v2 in .github/workflows/ci.yml (job zap) |
-|   | missing | Copy-paste check (warning only) | Why duplication. | — |
-|   | missing | Dead code and unused dependencies for shop-api (warning only) | Why dead-code. | — |
-| ⚠ | missing | Workflow lint | Why workflow-lint. | — |
-| ⚠ | partial | Format check for shop-api | Why format. | — |
-| ⚠ | partial | Test coverage minimum for shop-api | Why coverage. | — |
-| ⚠ | partial | Dockerfile lint for shop-api | Why dockerfile-lint. | — |
-| ⚠ | partial | Action pin check | Why workflow-pin-check. | — |
-| ⚠ | partial | New-dependency review | Why dependency-review. | — |
-| ⚠ | partial | Licence check | Why licences. | — |
-| ⚠ | partial | API scan against the spec (API DAST) | Why api-dast. | — |
+| ⚠ | missing | Merge gate (pipegen) | No single required check sums up every scan, so a failing scan does not stop a merge. | — |
+| ✗ | partial | New-dependency review | Why dependency-review. | — |
 
-### When the code is deployed or released: serious gaps (0 of 4 checks covered)
+</details>
 
-| | Status | Check | Why | Found |
+<details>
+<summary>4 Build and release (✗ 1 · ⚠ 0 · ✓ 0 · ? 1)</summary>
+
+| Mark | Status | Check | Why | Found |
 |---|---|---|---|---|
-| ⚠ | missing | Software bill of materials (SBOM) for shop-api | Without an SBOM, nobody can tell later which components a release shipped. | — |
-|   | missing | Deploy check (pipegen) for shop-api | Deploys don't check that the commit passed the pipeline. | — |
-|   | unknown | Trusted publishing | Why publishing. | — |
-|   | unknown | Network lock for release jobs | Why egress. | — |
+| ✗ | missing | Software bill of materials (SBOM) for shop-api | Without an SBOM, nobody can tell later which components a release shipped. | — |
+| ? | unknown | Trusted publishing | Why publishing. | — |
 
-### On a schedule and in repo files: gaps (0 of 3 checks covered)
+</details>
 
-| | Status | Check | Why | Found |
+<details>
+<summary>5 Deploy (✗ 1 · ⚠ 1 · ✓ 0 · ? 2)</summary>
+
+| Mark | Status | Check | Why | Found |
 |---|---|---|---|---|
-|   | missing | Dependency update config (warning only) | Why update-config. | — |
-|   | missing | OpenSSF Scorecard (warning only) | Why scorecard. | — |
-|   | missing | Fuzzing (built in v0.3) for shop-api (warning only) | Why fuzzing. | — |
+| ? | unknown | Running-app scan (DAST) for shop-api | A job calls a reusable workflow from another repo, and pipegen can't see inside it. | acme/security/.github/workflows/zap.yml<U+200B>@<U+200B>v2 in .github/workflows/ci.yml (job zap) |
+| ⚠ | missing | Deploy check (pipegen) for shop-api | Deploys don't check that the commit passed the pipeline. | — |
+| ✗ | partial | API scan against the spec (API DAST) | Why api-dast. | — |
+| ? | unknown | Network lock for release jobs | Why egress. | — |
+
+</details>
+
+<details>
+<summary>6 Scheduled and repo settings (✗ 2 · ⚠ 3 · ✓ 0)</summary>
+
+| Mark | Status | Check | Why | Found |
+|---|---|---|---|---|
+| ⚠ | missing | Dependency update config (warning only) | Why update-config. | — |
+| ⚠ | missing | OpenSSF Scorecard (warning only) | Why scorecard. | — |
+| ⚠ | missing | Fuzzing (built in v0.3) for shop-api (warning only) | Why fuzzing. | — |
+| ✗ | partial | Action pin check, on every push | Why workflow-pin-check. | — |
+| ✗ | partial | Action pin check, on every pull request | Why workflow-pin-check. | — |
+
+</details>
 
 ## Checks that don't apply here
 
@@ -125,7 +148,7 @@ For each check that isn't covered:
 - Dependency update config, on a schedule (now missing): pipegen would write \`.github/dependabot.yml\`
 - OpenSSF Scorecard, on a schedule (now missing): OpenSSF Scorecard: scores the repo weekly
 - Fuzzing (built in v0.3) for shop-api, on a schedule (now missing): pipegen builds fuzzing in v0.3
-- Workflow lint, on every pull request (now missing): actionlint 1\.7.12 (rhysd/actionlint), plus zizmor 1\.31.1 (zizmorcore/zizmor), actionlint and zizmor: check the workflows
+- Workflow lint, on every pull request (now missing): actionlint 1\.7.12 (rhysd/actionlint), actionlint and zizmor: check the workflows
 
 pipegen would also create:
 

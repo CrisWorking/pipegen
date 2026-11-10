@@ -31,43 +31,63 @@ Available here: environments.
 
 Repo: private, owned by a user account, GitHub plan: free.
 
-## Checks by layer
+## Checks by part
 
-### Before each commit (git hooks on the developer's machine): serious gaps (1 of 3 checks covered)
+<details>
+<summary>1 On your computer (✗ 1 · ⚠ 1 · ✓ 1)</summary>
 
-| | Status | Check | Why | Found |
+| Mark | Status | Check | Why | Found |
 |---|---|---|---|---|
-|   | covered | Git hook manager | The repo uses husky to run git hooks. | husky in .husky/pre-commit |
-| ⚠ | missing | Secret scan | Without a secret scan before each commit, a key can be committed without anyone noticing. | — |
-|   | missing | Format and lint hook for shop-api (warning only) | Without a format and lint hook, style problems are only found later, in CI or in review. | — |
+| ✓ | covered | Git hook manager | The repo uses husky to run git hooks. | husky in .husky/pre-commit |
+| ✗ | missing | Secret scan | Without a secret scan before each commit, a key can be committed without anyone noticing. | — |
+| ⚠ | missing | Format and lint hook for shop-api (warning only) | Without a format and lint hook, style problems are only found later, in CI or in review. | — |
 
-### On every push: serious gaps (2 of 6 checks covered)
+</details>
 
-| | Status | Check | Why | Found |
+<details>
+<summary>2 Every pull request (✗ 5 · ⚠ 0 · ✓ 4)</summary>
+
+| Mark | Status | Check | Why | Found |
 |---|---|---|---|---|
-| ⚠ | missing | Git hooks re-run in CI | Without running the hooks in CI, anyone who skips them locally is never caught. | — |
-| ⚠ | missing | Secret scan | Without a secret scan in CI, a key committed without the local hook is only found after it leaks. | — |
-| ⚠ | missing | Code scan (SAST) for shop-api | Without a code scan, common security bugs reach the main branch unnoticed. | — |
-| ⚠ | partial | Dependency check for shop-api | npm-audit runs, but its failure is ignored (continue-on-error), so it can never fail the build. | npm-audit in .github/workflows/ci.yml (job audit) |
-|   | covered | Unit tests for shop-api | Your own \`npm test\` runs on every push. | your own \`npm test\` in .github/workflows/ci.yml (job test) |
-|   | covered | Lint for shop-api | Your own \`npm run lint\` runs on every push. | your own \`npm run lint\` in .github/workflows/ci.yml (job test) |
+| ✗ | missing | Git hooks re-run in CI | Without running the hooks in CI, anyone who skips them locally is never caught. | — |
+| ✗ | missing | Secret scan, on every push | Without a secret scan in CI, a key committed without the local hook is only found after it leaks. | — |
+| ✗ | missing | Code scan (SAST) for shop-api | Without a code scan, common security bugs reach the main branch unnoticed. | — |
+| ✗ | partial | Dependency check for shop-api | npm-audit runs, but its failure is ignored (continue-on-error), so it can never fail the build. | npm-audit in .github/workflows/ci.yml (job audit) |
+| ✓ | covered | Unit tests for shop-api, on every push | Your own \`npm test\` runs on every push. | your own \`npm test\` in .github/workflows/ci.yml (job test) |
+| ✓ | covered | Lint for shop-api | Your own \`npm run lint\` runs on every push. | your own \`npm run lint\` in .github/workflows/ci.yml (job test) |
+| ✗ | missing | Secret scan, on every pull request | Without a secret scan in CI, a key committed without the local hook is only found after it leaks. | — |
+| ✓ | covered | Unit tests for shop-api, on every pull request | Your own \`npm test\` runs on every pull request. | your own \`npm test\` in .github/workflows/ci.yml (job test) |
+| ✓ | covered | Full test suite for shop-api | Your own \`npm test\` runs on every pull request. | your own \`npm test\` in .github/workflows/ci.yml (job test) |
 
-### On every pull request, before merge: serious gaps (2 of 5 checks covered)
+</details>
 
-| | Status | Check | Why | Found |
+<details>
+<summary>3 Before merge (✗ 0 · ⚠ 1 · ✓ 0)</summary>
+
+| Mark | Status | Check | Why | Found |
 |---|---|---|---|---|
-| ⚠ | missing | Secret scan | Without a secret scan in CI, a key committed without the local hook is only found after it leaks. | — |
-|   | covered | Unit tests for shop-api | Your own \`npm test\` runs on every pull request. | your own \`npm test\` in .github/workflows/ci.yml (job test) |
-|   | covered | Full test suite for shop-api | Your own \`npm test\` runs on every pull request. | your own \`npm test\` in .github/workflows/ci.yml (job test) |
-|   | missing | Merge gate (pipegen) | No single required check sums up every scan, so a failing scan does not stop a merge. | — |
-|   | unknown | Running-app scan (DAST) for shop-api | A job calls a reusable workflow from another repo, and pipegen can't see inside it. | acme/security/.github/workflows/zap.yml<U+200B>@<U+200B>v2 in .github/workflows/ci.yml (job zap) |
+| ⚠ | missing | Merge gate (pipegen) | No single required check sums up every scan, so a failing scan does not stop a merge. | — |
 
-### When the code is deployed or released: serious gaps (0 of 2 checks covered)
+</details>
 
-| | Status | Check | Why | Found |
+<details>
+<summary>4 Build and release (✗ 1 · ⚠ 0 · ✓ 0)</summary>
+
+| Mark | Status | Check | Why | Found |
 |---|---|---|---|---|
-| ⚠ | missing | Software bill of materials (SBOM) for shop-api | Without an SBOM, nobody can tell later which components a release shipped. | — |
-|   | missing | Deploy check (pipegen) for shop-api | Deploys don't check that the commit passed the pipeline. | — |
+| ✗ | missing | Software bill of materials (SBOM) for shop-api | Without an SBOM, nobody can tell later which components a release shipped. | — |
+
+</details>
+
+<details>
+<summary>5 Deploy (✗ 0 · ⚠ 1 · ✓ 0 · ? 1)</summary>
+
+| Mark | Status | Check | Why | Found |
+|---|---|---|---|---|
+| ? | unknown | Running-app scan (DAST) for shop-api | A job calls a reusable workflow from another repo, and pipegen can't see inside it. | acme/security/.github/workflows/zap.yml<U+200B>@<U+200B>v2 in .github/workflows/ci.yml (job zap) |
+| ⚠ | missing | Deploy check (pipegen) for shop-api | Deploys don't check that the commit passed the pipeline. | — |
+
+</details>
 
 ## What pipegen would add
 

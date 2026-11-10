@@ -35,59 +35,61 @@ What your GitHub plan allows
   Available here: environments.
   Repo: private, owned by a user account, GitHub plan: free.
 
-Checks by layer
+Checks by part
 
-  Before each commit (git hooks on the developer's machine): serious gaps (1 of 3 checks covered)
-      covered  Git hook manager
+1 On your computer
+    ✓ covered  Git hook manager
                The repo uses husky to run git hooks.
                Found: husky in .husky/pre-commit
-    ⚠ missing  Secret scan
+    ✗ missing  Secret scan
                Without a secret scan before each commit, a key can be committed without anyone
                noticing.
-      missing  Format and lint hook for shop-api (warning only)
+    ⚠ missing  Format and lint hook for shop-api (warning only)
                Without a format and lint hook, style problems are only found later, in CI or in
                review.
 
-  On every push: serious gaps (2 of 6 checks covered)
-    ⚠ missing  Git hooks re-run in CI
+2 Every pull request
+    ✗ missing  Git hooks re-run in CI
                Without running the hooks in CI, anyone who skips them locally is never caught.
-    ⚠ missing  Secret scan
+    ✗ missing  Secret scan, on every push
                Without a secret scan in CI, a key committed without the local hook is only found
                after it leaks.
-    ⚠ missing  Code scan (SAST) for shop-api
+    ✗ missing  Code scan (SAST) for shop-api
                Without a code scan, common security bugs reach the main branch unnoticed.
-    ⚠ partial  Dependency check for shop-api
+    ✗ partial  Dependency check for shop-api
                npm-audit runs, but its failure is ignored (continue-on-error), so it can never fail
                the build.
                Found: npm-audit in .github/workflows/ci.yml (job audit)
-      covered  Unit tests for shop-api
+    ✓ covered  Unit tests for shop-api, on every push
                Your own `npm test` runs on every push.
                Found: your own `npm test` in .github/workflows/ci.yml (job test)
-      covered  Lint for shop-api
+    ✓ covered  Lint for shop-api
                Your own `npm run lint` runs on every push.
                Found: your own `npm run lint` in .github/workflows/ci.yml (job test)
-
-  On every pull request, before merge: serious gaps (2 of 5 checks covered)
-    ⚠ missing  Secret scan
+    ✗ missing  Secret scan, on every pull request
                Without a secret scan in CI, a key committed without the local hook is only found
                after it leaks.
-      covered  Unit tests for shop-api
+    ✓ covered  Unit tests for shop-api, on every pull request
                Your own `npm test` runs on every pull request.
                Found: your own `npm test` in .github/workflows/ci.yml (job test)
-      covered  Full test suite for shop-api
+    ✓ covered  Full test suite for shop-api
                Your own `npm test` runs on every pull request.
                Found: your own `npm test` in .github/workflows/ci.yml (job test)
-      missing  Merge gate (pipegen)
+
+3 Before merge
+    ⚠ missing  Merge gate (pipegen)
                No single required check sums up every scan, so a failing scan does not stop a merge.
-      unknown  Running-app scan (DAST) for shop-api
+
+4 Build and release
+    ✗ missing  Software bill of materials (SBOM) for shop-api
+               Without an SBOM, nobody can tell later which components a release shipped.
+
+5 Deploy
+    ? unknown  Running-app scan (DAST) for shop-api
                A job calls a reusable workflow from another repo, and pipegen can't see inside it.
                Found: acme/security/.github/workflows/zap.yml@v2 in .github/workflows/ci.yml (job
                zap)
-
-  When the code is deployed or released: serious gaps (0 of 2 checks covered)
-    ⚠ missing  Software bill of materials (SBOM) for shop-api
-               Without an SBOM, nobody can tell later which components a release shipped.
-      missing  Deploy check (pipegen) for shop-api
+    ⚠ missing  Deploy check (pipegen) for shop-api
                Deploys don't check that the commit passed the pipeline.
 
 What pipegen would add

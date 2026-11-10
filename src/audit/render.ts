@@ -9,6 +9,9 @@
 // permissions it needs (after the settings `finish` would turn on); the notes and what this audit can't see; the next
 // step.
 //
+// PL-A5: the checks are grouped by report part (src/audit/parts.ts), the same titles, order and marks (✗ fix first, ⚠ consider,
+// ✓ already good) as the short report; Markdown folds each part in a <details>. The verdict line still counts layers.
+//
 // Rulings: S8 (the next step is the model's text, keyed by CURRENT_MILESTONE; no command that doesn't exist in v0.1),
 // S12 (monthly minutes highlighted only when the plan's included minutes are known and the estimate is over half of
 // them; the basis always shown), S13 (renderJson: every string cleaned, wouldAdd tools slimmed), S14 (a layer is
@@ -28,7 +31,8 @@ import { excludedSummaryLines, GIT_EXCLUDED_LINES, type ScanFound } from '../ai/
 import { SCHEDULED_CATEGORIES } from '../engine/need-ids.js';
 import { ACTIVITY_CAPPED_PREFIX } from '../estimate/estimate.js';
 import type { RepoToolStep } from '../engine/reviewed.js';
-import type { Layer, Need, Part, RepoProfile, ReviewedTool } from '../types.js';
+import type { Layer, Need, NeedCategory, Part, RepoProfile, ReviewedTool } from '../types.js';
+import { isSmallProject, PART_TITLE, partOf, QUALITY_FOR_SMALL, type PartId } from './parts.js';
 import type { SkippedGroup, WouldSet } from './choose.js';
 import { num, plural, size, usd as money } from '../util/format.js';
 import { makeSafeOutput, OUTPUT_CAP, type OutputTarget } from '../util/safe-output.js';
@@ -145,13 +149,6 @@ export const cantSeeFor = (p: RepoProfile): string[] => CANT_SEE.filter((x) => x
 /** Plan P Task 9: the four layers, and a fifth group for the SCHEDULED_CATEGORIES rows (merge-layer needs read on their own trigger). */
 type Group = Layer | 'scheduled';
 const GROUPS: readonly Group[] = ['pre-commit', 'push', 'merge', 'deploy', 'scheduled'];
-const GROUP_TITLE: Readonly<Record<Group, string>> = {
-  'pre-commit': "Before each commit (git hooks on the developer's machine)",
-  push: 'On every push',
-  merge: 'On every pull request, before merge',
-  deploy: 'When the code is deployed or released',
-  scheduled: 'On a schedule and in repo files',
-};
 const WARNING_ONLY = 'warning only';
 const isScheduled = (n: Pick<Need, 'category'>) => (SCHEDULED_CATEGORIES as ReadonlySet<string>).has(n.category);
 const LAYER_WHEN: Readonly<Record<Layer, string>> = {
@@ -187,11 +184,15 @@ const WIDTH = 100;
 
 // ---------- the document: target-neutral blocks of cleaned text ----------
 
-interface Row { serious: boolean; status: Coverage['status']; check: string; why: string; found: string | null }
+/** A row's mark, the short report's: ✗ fix first, ⚠ consider, ✓ already good, ? pipegen couldn't tell. */
+type Mark = '✗' | '⚠' | '✓' | '?';
+interface Row { mark: Mark; status: Coverage['status']; check: string; why: string; found: string | null }
 type Block =
   | { kind: 'text'; text: string }
   | { kind: 'item'; text: string; depth: number; warn: boolean }
   | { kind: 'sub'; title: string }
+  /** PL-A5: one report part (src/audit/parts.ts) with its rows: a folded <details> in Markdown. */
+  | { kind: 'part'; part: PartId; rows: Row[] }
   | { kind: 'rows'; rows: Row[] }
   /** One of pipegen's own fixed commands, under the block before it (depth: that item's depth, or -1 under text). */
   | { kind: 'command'; command: string; depth: number };
@@ -213,6 +214,8 @@ export interface RenderCtx {
   mergeLock: boolean;
   /** The check's service builds no image (buildsNoImage): signing is named "Release signing" (final review M4). */
   noImage(need: Pick<Need, 'service'>): boolean;
+  /** PL-A2: the profile's services, so the full report ranks a row as the short report does (isSerious). */
+  services: AuditReport['profile']['services'];
 }
 
 type Ctx = RenderCtx;
@@ -221,6 +224,7 @@ export function ctxFor(target: OutputTarget, opts: RenderOptions, mergeLock: boo
   return {
     target,
     mergeLock,
+    services,
     noImage: noImageCheck({ services }), // G17-R2 (F10): services indexed once
     v: (s, max = OUTPUT_CAP.name) => clean(s, { target, max }),
     own: (s, max = OUTPUT_CAP.text) => clean(s, { target, max, redact: false }),
@@ -251,7 +255,9 @@ export interface LayerView { layer: Group; rows: Coverage[]; needed: boolean; ga
  * A blocking floor need (every coverage row is a floor need) that is missing or partial, and that a tool or the
  * project's own script should cover: pipegen's own checks are gaps pipegen fills, never serious (ruling U16).
  */
-export const isSerious = (c: Coverage) => c.need.blocking === true && !isBuiltInNeed(c.need) && (c.status === 'missing' || c.status === 'partial');
+export const isSerious = (c: Coverage, profile?: Pick<RepoProfile, 'services'>) => c.need.blocking === true && !isBuiltInNeed(c.need) && (c.status === 'missing' || c.status === 'partial')
+  // PL-A2: on a small project the quality checks are "consider" (the report only; the pipeline still blocks on them)
+  && !(profile !== undefined && QUALITY_FOR_SMALL.has(c.need.category as NeedCategory) && isSmallProject(profile));
 
 export function layerViews(r: AuditReport): LayerView[] {
   return GROUPS.map((layer) => {
@@ -260,7 +266,7 @@ export function layerViews(r: AuditReport): LayerView[] {
     return {
       layer, rows, needed: rows.length > 0,
       gaps: rows.some((c) => c.status === 'missing' || c.status === 'partial'),
-      serious: rows.some(isSerious),
+      serious: rows.some((c) => isSerious(c, r.profile)),
       unknown: rows.some((c) => c.status === 'unknown'),
       covered: rows.filter((c) => c.status === 'covered').length,
     };
@@ -295,12 +301,18 @@ const checkLabel = (c: Ctx, need: Pick<Need, 'id' | 'service'>) =>
   `${needLabel(need.id, { noImage: c.noImage(need) }) ?? c.v(need.id)}${need.service === undefined ? '' : ` for ${c.v(need.service)}`}`;
 const lowerFirst = (s: string) => (/^[A-Z][a-z]/.test(s) ? `${s[0]?.toLowerCase()}${s.slice(1)}` : s);
 
-function row(c: Ctx, cov: Coverage, services: readonly string[] = []): Row {
+/** The mark of a row, as the short report ranks it: a serious gap ✗, any other gap ⚠ (warning-only, pipegen's own check), covered ✓. */
+const markOf = (c: Ctx, cov: Coverage): Mark => (cov.status === 'covered' ? '✓' : cov.status === 'unknown' ? '?' : isSerious(cov, c) ? '✗' : '⚠');
+
+/** When a check runs, for a row whose check is on several layers of one part. */
+const whenOf = (need: Pick<Need, 'category' | 'layer'>) => (isScheduled(need) ? 'on a schedule' : LAYER_WHEN[need.layer]);
+
+function row(c: Ctx, cov: Coverage, services: readonly string[] = [], when: string | null = null): Row {
   const by = cov.by === undefined ? null : c.v(cov.by, OUTPUT_CAP.path);
   const where = cov.where === undefined ? null : c.v(cov.where, OUTPUT_CAP.path);
   const label = services.length > 1 ? groupLabel(c, cov.need, services) : checkLabel(c, cov.need);
   return {
-    serious: isSerious(cov), status: cov.status, check: `${label}${cov.need.blocking ? '' : ` (${WARNING_ONLY})`}`, why: c.v(cov.credit ?? cov.why, OUTPUT_CAP.text),
+    mark: markOf(c, cov), status: cov.status, check: `${label}${when === null ? '' : `, ${when}`}${cov.need.blocking ? '' : ` (${WARNING_ONLY})`}`, why: c.v(cov.credit ?? cov.why, OUTPUT_CAP.text),
     found: by !== null && where !== null ? `${by} in ${where}` : by ?? where,
   };
 }
@@ -444,17 +456,22 @@ function planSection(r: AuditReport, c: Ctx): Section {
   return { title: 'What your GitHub plan allows', blocks };
 }
 
-function layersSection(c: Ctx, views: LayerView[]): Section {
+/**
+ * PL-A5: the checks grouped by report part (partOf), the same titles, order and marks as the short report (✗ fix first,
+ * ⚠ consider, ✓ already good), with every row of the check (each layer, each service) and its why. A part with no check
+ * is left out. A check that sits on several layers of one part says when each runs.
+ */
+function partsSection(r: AuditReport, c: Ctx): Section {
   const blocks: Block[] = [];
-  for (const v of views) {
-    if (v.layer === 'scheduled' && !v.needed) continue; // a group with no checks is left out, not counted
-    blocks.push({ kind: 'sub', title: `${GROUP_TITLE[v.layer]}: ${layerStatus(v)}` });
-    if (v.needed) {
-      const groups = groupByService(c, v.rows, (cov) => `${cov.status}\u0000${cov.why}\u0000${cov.by ?? ''}\u0000${cov.where ?? ''}`);
-      blocks.push({ kind: 'rows', rows: groups.map((g) => row(c, g.first, g.services)) });
-    }
+  for (const part of [1, 2, 3, 4, 5, 6] as const) {
+    const rows = r.coverage.filter((cov) => partOf(cov.need) === part);
+    if (rows.length === 0) continue;
+    const groups = groupByService(c, rows, (cov) => `${cov.status}\u0000${cov.why}\u0000${cov.by ?? ''}\u0000${cov.where ?? ''}`);
+    const when = new Map<string, Set<string>>();
+    for (const g of groups) when.set(g.first.need.id, (when.get(g.first.need.id) ?? new Set()).add(whenOf(g.first.need)));
+    blocks.push({ kind: 'part', part, rows: groups.map((g) => row(c, g.first, g.services, (when.get(g.first.need.id)?.size ?? 0) > 1 ? whenOf(g.first.need) : null)) });
   }
-  return { title: 'Checks by layer', blocks };
+  return { title: 'Checks by part', blocks };
 }
 
 /** Services named in the terminal's skipped lines before "and N more" (Markdown and JSON list them all). */
@@ -510,9 +527,8 @@ function toolText(c: Ctx, w: WouldAddRow): string {
       : '';
     return `${note}${gateNote}`;
   }
-  let out = reviewedText(c, t);
-  for (const a of w.also) if (a !== null && 'candidate' in a) out += `, plus ${reviewedText(c, a)}`;
-  return `${out}, ${note}`;
+  // one tool per check: the model's note names any second tool, so the row does not repeat it (PL-A5)
+  return `${reviewedText(c, t)}, ${note}`;
 }
 
 const reviewedText = (c: Ctx, t: ReviewedTool) => `${c.v(t.candidate.name)} ${c.v(t.candidate.version)} (${c.v(t.candidate.repo)})`;
@@ -674,7 +690,7 @@ export function buildDoc(r: AuditReport, c: Ctx): Doc {
   const intro = ['pipegen changed nothing in the repo or on GitHub.'];
   intro.push(r.ai === undefined ? 'Nothing was sent to an AI.' : 'You ran it with --ai: the AI part below says what the AI step found.');
   const sections = [
-    warningsSection(r, c), quickSecretSection(r, c), typeSection(r, c), planSection(r, c), layersSection(c, views), skippedSection(r, c), addSection(r, c), wouldSetSection(r, c),
+    warningsSection(r, c), quickSecretSection(r, c), typeSection(r, c), planSection(r, c), partsSection(r, c), skippedSection(r, c), addSection(r, c), wouldSetSection(r, c),
     costsSection(r, c), bundleSection(r, c), permissionsSection(r, c), notesSection(r, c), { title: "What this audit can't see", blocks: cantSeeFor(r.profile).map((l) => item(l)) }, nextSection(r, c),
   ].filter((s): s is Section => s !== null);
   return { title: `pipegen audit: ${c.v(`${r.profile.owner}/${r.profile.repo}`, OUTPUT_CAP.path)}`, intro, commit: commitLine(r, c), verdict: verdictOf(views.filter((v) => v.layer !== 'scheduled')),
@@ -683,8 +699,8 @@ export function buildDoc(r: AuditReport, c: Ctx): Doc {
 
 // ---------- terminal ----------
 
-/** Words wrapped to WIDTH code points; a word longer than a line is cut across lines. */
-export function wrap(s: string, first: string, rest: string = ' '.repeat([...first].length)): string[] {
+/** Words wrapped to `width` (default WIDTH) code points; a word longer than a line is cut across lines. */
+export function wrap(s: string, first: string, rest: string = ' '.repeat([...first].length), width: number = WIDTH): string[] {
   const out: string[] = [];
   let line = first;
   let len = [...first].length;
@@ -693,14 +709,14 @@ export function wrap(s: string, first: string, rest: string = ' '.repeat([...fir
   for (const word of s.split(' ')) {
     if (word === '') continue;
     let w = [...word];
-    if (!fresh && len + 1 + w.length > WIDTH) {
+    if (!fresh && len + 1 + w.length > width) {
       out.push(line);
       line = rest;
       len = restLen;
       fresh = true;
     }
-    while ((fresh ? 0 : 1) + w.length > WIDTH - len && WIDTH - len > 10) {
-      const take = WIDTH - len - (fresh ? 0 : 1);
+    while ((fresh ? 0 : 1) + w.length > width - len && width - len > 10) {
+      const take = width - len - (fresh ? 0 : 1);
       out.push(`${line}${fresh ? '' : ' '}${w.slice(0, take).join('')}`);
       w = w.slice(take);
       line = rest;
@@ -724,18 +740,23 @@ function terminalBlocks(blocks: Block[], out: string[]): void {
     else if (b.kind === 'sub') {
       out.push('');
       append(out, wrap(b.title, '  '));
+    } else if (b.kind === 'part') {
+      out.push('', `${b.part} ${PART_TITLE[b.part]}`);
+      terminalRows(b.rows, out);
     } else if (b.kind === 'command') {
       // U17: on a line of its own, never wrapped (a line over 100 characters is fine), so it pastes as one command
       out.push(`${'  '.repeat(Math.max(b.depth, 0) + 2)}${b.command}`);
-    } else {
-      for (const r of b.rows) {
-        const lead = `    ${r.serious ? '⚠' : ' '} ${r.status.padEnd(STATUS_WIDTH)} `;
-        const pad = ' '.repeat(lead.length);
-        append(out, wrap(r.check, lead, pad));
-        append(out, wrap(r.why, pad));
-        if (r.found !== null) append(out, wrap(`Found: ${r.found}`, pad));
-      }
-    }
+    } else terminalRows(b.rows, out);
+  }
+}
+
+function terminalRows(rows: readonly Row[], out: string[]): void {
+  for (const r of rows) {
+    const lead = `    ${r.mark} ${r.status.padEnd(STATUS_WIDTH)} `;
+    const pad = ' '.repeat(lead.length);
+    append(out, wrap(r.check, lead, pad));
+    append(out, wrap(r.why, pad));
+    if (r.found !== null) append(out, wrap(`Found: ${r.found}`, pad));
   }
 }
 
@@ -787,12 +808,21 @@ function markdownBlocks(blocks: Block[], out: string[]): void {
       const indent = b.depth < 0 ? '' : '  '.repeat(b.depth + 1);
       const fence = fenceFor(b.command);
       out.push(`${indent}${fence}sh`, `${indent}${b.command}`, `${indent}${fence}`);
-    } else {
-      out.push('| | Status | Check | Why | Found |', '|---|---|---|---|---|');
-      for (const r of b.rows) out.push(`| ${r.serious ? '⚠' : ' '} | ${r.status} | ${r.check} | ${r.why} | ${r.found ?? '—'} |`);
-    }
+    } else if (b.kind === 'part') {
+      // folded: the summary says what is inside (pipegen's own title and counts, no repo value)
+      const n = (m: Mark) => b.rows.filter((x) => x.mark === m).length;
+      const unknown = n('?');
+      out.push('<details>', `<summary>${b.part} ${PART_TITLE[b.part]} (✗ ${num(n('✗'))} · ⚠ ${num(n('⚠'))} · ✓ ${num(n('✓'))}${unknown > 0 ? ` · ? ${num(unknown)}` : ''})</summary>`, '');
+      markdownRows(b.rows, out);
+      out.push('', '</details>');
+    } else markdownRows(b.rows, out);
     last = b.kind;
   }
+}
+
+function markdownRows(rows: readonly Row[], out: string[]): void {
+  out.push('| Mark | Status | Check | Why | Found |', '|---|---|---|---|---|');
+  for (const r of rows) out.push(`| ${r.mark} | ${r.status} | ${r.check} | ${r.why} | ${r.found ?? '—'} |`);
 }
 
 /** The report as a Markdown file (`--out`): every value through safeMarkdown, every excluded pattern listed. */
