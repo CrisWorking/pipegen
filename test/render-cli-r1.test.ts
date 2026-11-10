@@ -539,6 +539,17 @@ describe('round 2: lock size and order (rulings 5 and 7)', () => {
     expect(() => renderStepWith(spec(t), t, platform(), ctx, { npmClosures: { eslint: JSON.stringify(fine) } })).not.toThrow();
   });
 
+  it('a closure under 120 KiB compact but over it as the indented JSON the step carries is refused', () => {
+    const t = entry('eslint');
+    const big = JSON.parse(closureText('eslint')) as { packages: Record<string, Record<string, unknown>> };
+    const pad: Record<string, number> = {};
+    for (let i = 0; JSON.stringify(big).length + JSON.stringify(pad).length < 118 * 1024; i++) pad[`k${i}`] = i;
+    (big.packages['node_modules/eslint'] as Record<string, unknown>).pad = pad;
+    const text = JSON.stringify(big);
+    expect(text.length).toBeLessThan(120 * 1024);
+    expect(() => renderStepWith(spec(t), t, platform(), ctx, { npmClosures: { eslint: text } })).toThrow(/too large/);
+  });
+
   it2('a finished result folder is read-only', () => {
     const run = lastRun(render('trivy-config'));
     expect(run.run).toContain('chmod -R a-w "$RUNNER_TEMP/pipegen-raw/pipegen-out-iac"');

@@ -624,7 +624,7 @@ describe('6b: snapshots', () => {
     await expect(yamlOf(render('zap-baseline', {}, ctx, withPolicy('zap-baseline', ['slots'])).steps)).toMatchFileSnapshot('__snapshots__/steps/cli-docker.yml');
   });
 
-  it('snapshot: an npm checker (prettier, installed from pipegen\'s closure lock, in a service folder; the snapshot is small because a big lock would be one very long line)', async () => {
+  it('snapshot: an npm checker (prettier, installed from pipegen\'s closure lock, in a service folder; the lock is a multi-line readable JSON block)', async () => {
     const c = ctxFor([service({ name: 'web', path: 'apps/web', runtimeVersion: '24' })]);
     await expect(yamlOf(render('prettier', { service: 'web', workingDir: 'apps/web' }, c).steps)).toMatchFileSnapshot('__snapshots__/steps/cli-npm.yml');
   });
@@ -649,12 +649,19 @@ describe('6b: snapshots', () => {
         expect(pins[0]?.resolved).toBe(`https://registry.npmjs.org/${pins[0]?.name}/-/${pins[0]?.name}-${pins[0]?.version}.tgz`);
         expect(pins[0]?.integrity).toMatch(/^sha512-/);
       }
-      for (const key of ['PIPEGEN_NPM_LOCK', 'PIPEGEN_NPM_PACKAGE']) {
-        const s = docs.find((d) => d.env?.[key] !== undefined) as RenderedStep;
-        expect(JSON.parse(s.env?.[key] as string)).toBeTypeOf('object');
-      }
+      const rendered = npmSteps();
+      expect(docs.length).toBe(rendered.length);
+      let compared = 0;
+      docs.forEach((d, i) => {
+        for (const [k, v] of Object.entries(rendered[i]?.env ?? {})) {
+          if (!/^[[{]/.test(String(v))) continue;
+          expect(d.env?.[k], k).toBe(v);
+          compared++;
+        }
+      });
+      expect(compared).toBeGreaterThanOrEqual(4);
     });
-    it('no env value line over 120 characters in the fixtures', () => {
+    it('no JSON env value line over 120 characters in the fixtures (measured on the parsed value)', () => {
       const lines = yamlOf(npmSteps()).split('\n');
       const at = lines.findIndex((l) => /^\s+PIPEGEN_NPM_EXPECT: \|/.test(l));
       expect(at).toBeGreaterThan(-1);

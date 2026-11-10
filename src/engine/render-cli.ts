@@ -1212,8 +1212,9 @@ function checkerInstall(tool: ReviewedTool, pins: readonly (NpmPin & { resolved:
   } catch (e) {
     return refuse(e instanceof NpmClosureError ? e.message : `the npm closure lock of ${show(tool.id)} could not be read`);
   }
-  const compact = JSON.stringify(JSON.parse(lock));
-  if (compact.length > MAX_LOCK_BYTES) return refuse(`The npm closure lock of ${show(tool.id)} is too large to carry in a workflow.`);
+  // Measure what the step carries (the indented form): one NAME=value env string must stay under Linux MAX_ARG_STRLEN.
+  const carried = readableJson(JSON.parse(lock));
+  if (Buffer.byteLength(carried) > MAX_LOCK_BYTES) return refuse(`The npm closure lock of ${show(tool.id)} is too large to carry in a workflow.`);
   const pkg = readableJson({ name: 'pipegen-closure', version: '0.0.0', private: true, dependencies: closureRootDependencies(lock) });
   const lines = [
     'mkdir -p "$RUNNER_TEMP/pipegen-npm"',
@@ -1226,7 +1227,7 @@ function checkerInstall(tool: ReviewedTool, pins: readonly (NpmPin & { resolved:
     ...allowlist(`$nodebin:${FIXED_PATH}`, []),
     `( cd -- "$npmdir" && "\${pg_env[@]}" "$nodebin/npm" ci --ignore-scripts --no-audit --no-fund --userconfig "$npmdir/user.npmrc" --globalconfig "$npmdir/global.npmrc" --workspaces=false ${NPM_CI_GIT} --registry=${REGISTRY_URL} )`,
   ];
-  return { lines, env: { PIPEGEN_NPM_LOCK: readableJson(JSON.parse(compact)), PIPEGEN_NPM_PACKAGE: pkg } };
+  return { lines, env: { PIPEGEN_NPM_LOCK: carried, PIPEGEN_NPM_PACKAGE: pkg } };
 }
 
 /** The id hash of a folder's guarded `npm ci` and the marker file it leaves (one per job and folder). */
