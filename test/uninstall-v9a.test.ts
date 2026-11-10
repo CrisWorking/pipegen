@@ -228,6 +228,22 @@ describe('V9a sec M2: v0.2 never deletes or prints a delete for a repo the user 
   });
 });
 
+describe('V9a sec M2: the record says pipegen created the repos (App-shaped records)', () => {
+  it('phase B: a repo the record says pipegen created is never listed as "you created it"; its kept default branch is a note either way', async () => {
+    const w = world();
+    await afterRun1(w);
+    // the record names the repos as pipegen's, the scratch repo with another id than GitHub's: not the one the record names
+    const rec = sampleRecord(w, { central: { repoId: w.central.id, createdByPipegen: true }, scratch: { createdByPipegen: true, repoId: 999_999 } });
+    await run(w, rec, term(), { deleteRepos: true, canDeleteRepos: false });
+    mergePr(w, w.central, 'pipegen/uninstall-shop');
+    const r = await run(w, rec, term(), { deleteRepos: true, canDeleteRepos: false });
+    const notes = (r.notes ?? []).join('\n');
+    expect(notes).not.toMatch(/you created it/);
+    expect(notes).toMatch(/the default branch main of scratch repo o\/pipegen-proof-shop keeps the copy of your code/);
+    expect(r.skipped.some((x) => /default branch/.test(x.what))).toBe(false);
+  });
+});
+
 describe('V9a sec M3: a scratch repo answering 404', () => {
   const WORDS = /gone, or this token can't see it/;
 
