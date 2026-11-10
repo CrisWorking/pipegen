@@ -39,10 +39,16 @@ describe('fixtures', () => {
       // Real scanner output (test/fixtures/sarif, C1a) holds two benign strings that look like secrets to redact(): osv-scanner's
       // empty `redactionTokens` array and trivy's already-masked match line. Nothing else is excused.
       const text = buf.toString('utf8').replaceAll('"redactionTokens": [],', '').replaceAll('GITHUB_TOKEN=****************************************', 'masked match');
+      // Plan P PL-A5: the audit report's JSON golden files carry the report's own field names (the secret names a workflow uses, the secret-like files found,
+      // the secret check's wording, the token counts of the AI cost). redact() reads `<name with secret/token>: <value>` as a secret, so only those exact keys are
+      // excused, and only in those two files; every value is still scanned.
+      const REPORT_KEYS = ['secretsUsed', 'secretsBaseline', 'secretsInTree', 'secretCheck', 'aiTokens', 'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens'];
+      const reportJson = /^test\/__snapshots__\/audit-render\.[a-z-]+\.json$/.test(f);
+      const unkeyed = reportJson ? REPORT_KEYS.reduce((t, k) => t.replaceAll(`"${k}":`, '"field":'), text) : text;
       // G15a round 5: the real ZAP reports (test/fixtures/zap) carry ZAP's own HTML help text (an alert's `solution`) as one JSON string
       // over 4 KB; split it at its paragraph ends so every piece is still scanned (each under 4 KB). Nothing is excused.
       const scanned = f.startsWith('test/fixtures/scorecard/') ? SCORECARD_PROSE.reduce((t, x) => t.replaceAll(x, 'scorecard prose'), text.replaceAll('\\n', '\n'))
-        : f.startsWith('test/fixtures/zap/') ? text.replaceAll('</p>', '</p>\n') : text;
+        : f.startsWith('test/fixtures/zap/') ? text.replaceAll('</p>', '</p>\n') : unkeyed;
       if (scanned !== text) expect(Math.max(...scanned.split('\n').map((l) => l.length)), f).toBeLessThan(4096);
       // ZAP's reports put `"@name": "http://<host>:<port>",` right before `"@host": …` on the next line, and redact() reads a URL's
       // authority across a line break up to that '@' (over-redaction, the safe side); so the ZAP reports are scanned line by line
