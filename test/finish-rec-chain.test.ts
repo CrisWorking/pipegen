@@ -68,7 +68,7 @@ async function seed(o: { centralFiles?: Record<string, string>; recordOver?: (r:
   const centralCo = o.centralFiles?.[CO];
   const locks = planLocks({
     profile, caps: CAPS,
-    central: { repo: 'o/pipelines', sha: pin, branchProtection: true, codeowners: { path: centralCo === undefined ? null : CO, original: centralCo ?? '', isSymlink: false, inserted: null } },
+    central: { repo: 'o/pipelines', sha: pin, branchProtection: true, codeowners: { path: centralCo === undefined ? null : CO, original: centralCo ?? '', isSymlink: false, inserted: centralCo?.startsWith('# pipegen:begin') === true ? centralCo : null } },
     writers: { app: ['a', 'b'], central: ['a', 'b'] }, owners: ['@a', '@b'], orgAdmin: false,
     shaPinning: { state: 'read', enabled: true, allowedActions: 'all', required: false }, protectedPaths: PROTECTED,
     appCodeowners: { original: CO_ORIG, isSymlink: false, inserted: null }, ids: { app: app.id, central: central.id }, files,
@@ -510,5 +510,59 @@ describe('G-FINREC-R2: verify fold (N1, N2, N3, i1)', () => {
     const t = await seed();
     await runFinish(t);
     expect(await coDrift(t)).toEqual([]);
+  });
+});
+
+describe('G-FINREC-R2 i1 (review): the central CODEOWNERS central reads holds pipegen\'s block with the planned owners and no override after it', () => {
+  const BLOCK = codeownersBlock(CENTRAL_PROTECTED_PATHS, ['@a', '@b']);
+  const i1 = async (s: Seed) => (await coDrift(s)).filter((x) => x.what === 'pipegen\'s block in the central CODEOWNERS');
+
+  it('G-FINREC-R2 i1: pipegen\'s own output (created, and a block another project wrote that finish reused) gives no drift', async () => {
+    const s = await seed();
+    await runFinish(s);
+    expect(await coDrift(s)).toEqual([]);
+    const t = await seed({ centralFiles: { [CO]: BLOCK } });
+    const r = await runFinish(t);
+    expect(centralCoOf(r)).toEqual([]);
+    expect(await coDrift(t)).toEqual([]);
+  });
+
+  it('G-FINREC-R2 i1: the block holds other owners than planned: drift', async () => {
+    const t = await seed({ centralFiles: { [CO]: BLOCK } });
+    await runFinish(t);
+    tamper(t, 'o/pipelines', CO, codeownersBlock(CENTRAL_PROTECTED_PATHS, ['@a', '@mallory']));
+    const d = await i1(t);
+    expect(d).toHaveLength(1);
+    expect(d[0]?.actual).toMatch(/@mallory/);
+    // fewer owners is not the plan either
+    const u = await seed({ centralFiles: { [CO]: BLOCK } });
+    await runFinish(u);
+    tamper(u, 'o/pipelines', CO, codeownersBlock(CENTRAL_PROTECTED_PATHS, ['@a']));
+    expect(await i1(u)).toHaveLength(1);
+  });
+
+  it('G-FINREC-R2 i1: an override after a block pipegen didn\'t record an edit for: drift, with the advice', async () => {
+    const t = await seed({ centralFiles: { [CO]: BLOCK } });
+    await runFinish(t);
+    tamper(t, 'o/pipelines', CO, `${BLOCK}/installs/ @mallory\n`);
+    const d = await coDrift(t);
+    expect(d).toHaveLength(1);
+    expect(d[0]?.actual).toMatch(/\/installs\/ @mallory \(covers installs\/\*\*\)/);
+    expect(d[0]?.expected).toMatch(/move them above `# pipegen:begin`/);
+    // a second end line: the markers can't be read
+    const u = await seed({ centralFiles: { [CO]: BLOCK } });
+    await runFinish(u);
+    tamper(u, 'o/pipelines', CO, `${BLOCK}# pipegen:end\n`);
+    expect((await coDrift(u)).length).toBeGreaterThan(0);
+  });
+
+  it('G-FINREC-R2 i1: the central CODEOWNERS can\'t be read: drift, not a crash', async () => {
+    const s = await seed();
+    await runFinish(s);
+    const sha = s.g.repo('o/pipelines').trees.get(s.g.repo('o/pipelines').commits.get(s.g.head('o/pipelines'))?.tree as string)?.get(CO)?.sha as string;
+    s.g.hooks.push((call) => (call.route === 'GET /repos/{owner}/{repo}/git/blobs/{file_sha}' && call.params.file_sha === sha ? { status: 404, data: { message: 'Not Found' } } : undefined));
+    const d = await i1(s);
+    expect(d).toHaveLength(1);
+    expect(d[0]?.actual).toMatch(/can't be read/);
   });
 });
