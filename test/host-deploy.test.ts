@@ -4,7 +4,7 @@ import { symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { buildAudit } from '../src/audit/model.js';
-import { renderTerminal } from '../src/audit/render.js';
+import { renderMarkdown, renderTerminal } from '../src/audit/render.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { hostDeployOf } from '../src/read/host-deploy.js';
 import type { Capabilities } from '../src/types.js';
@@ -88,6 +88,18 @@ describe('PL-B2 in the audit', () => {
     const t = renderTerminal(r, { knownValues: [], now: () => NOW });
     expect(t).toContain('⚠ Netlify deploys this site from Git (netlify.toml)');
     expect(consider(t)).toContain('Netlify deploy (netlify.toml): deploy from a workflow');
+  });
+  it('the Consider line also shows in the verbose terminal report and in markdown (Fold R1)', async () => {
+    const dir = makeRepo('static-vite-spa', 'https://github.com/o/r.git');
+    writeIn(dir, 'netlify.toml', '[build]\n  publish = "dist"\n');
+    const r = await auditOf(dir);
+    const line = 'Netlify deploy (netlify.toml): deploy from a workflow';
+    expect(r.notes.some((n) => n.startsWith(line))).toBe(true);
+    expect(renderTerminal(r, { knownValues: [], now: () => NOW, verbose: true })).toContain(line);
+    expect(renderMarkdown(r, { knownValues: [], now: () => NOW })).toContain(line);
+    // short view: shown once, not twice
+    const t = renderTerminal(r, { knownValues: [], now: () => NOW });
+    expect(t.split(line).length - 1).toBe(1);
   });
   it('vercel.json with a deploy workflow → no line', async () => {
     const dir = makeRepo('static-astro', 'https://github.com/o/r.git');

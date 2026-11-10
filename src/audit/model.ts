@@ -491,7 +491,7 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
   coverage = await defaultSetupRows(deps, profile, coverage, signalsUnread);
   coverage = await lastRunRows(deps, profile, coverage, signalsUnread, notes);
   const hostDeploys = await hostDeploysOf(dir, profile);
-  for (const n of creditNotes(coverage, profile)) notes.add(n);
+  for (const n of creditNotes(coverage, profile, hostDeploys)) notes.add(n);
   const wouldSet = wouldSetFor.map((x) => wouldSetSettings(x, coverage, skippedWf)).reduce((a, b) => same(a, b));
   const wouldAdd = wouldAddRows(profile, coverage, deps, caps);
 
