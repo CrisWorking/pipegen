@@ -30,6 +30,7 @@ import type { CreatedFile, PipelineDraft } from '../src/types.js';
 import { cleanHomes, failOn, PASS, proofWorld, RUN_ID, TYPED } from './helpers/proof-world.js';
 import { isWorkflowFile, realAssembled } from './helpers/real-workflows.js';
 import { workflowSecretNames } from '../src/proof/keys.js';
+import { compatCopiesFrom } from '../src/proof/harness.js';
 
 afterAll(cleanHomes);
 const GATE_TOOL = REVIEWED.find((x) => x.id === 'pipegen-gate') as ReviewedTool;
@@ -1294,6 +1295,30 @@ describe('G14fix: a private app through the real proof harness', () => {
     expect(r.ok).toBe(false);
     expect(r.stopped).toContain('other secrets than the ones the scratch keys were made for');
     expect(w.tl.some((x) => x === 'secretStore' || x.startsWith('keys.setup:') || x.startsWith('push:') || x.startsWith('pushBranch:'))).toBe(false);
+  });
+
+  // G17-F1 round 3 (sec r2 M1, the reviewer's probe r2-compat): a private app whose compat copy (in the after-setup set only) comes from a
+  // job holding U+0085, U+2028 or U+2029. The copy writes the YAML escape, so the names are known after the setup too and compared
+  it('run: G17-F1 round 3 a private proof whose compared job holds U+0085, U+2028 or U+2029 passes, with the names compared, no false stop', async () => {
+    const central = realAssembled().private.filter((f) => f.repo === 'central' && isWorkflowFile(f));
+    for (const esc of ['\\N', '\\L', '\\P', '']) {
+      const copy = compatCopiesFrom([{ path: '.github/workflows/ci.yml', content: `on: [pull_request]\njobs:\n  t:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: "echo a${esc}b"\n` }]);
+      expect(copy.notCompared, esc).toEqual([]);
+      const w = await proofWorld({ private: true });
+      const asm = w.input.assembleFor;
+      w.input.assembleFor = async (d) => { const a = await asm(d); return async (mode, sha) => [...(await a(mode, sha)).filter((f) => f.repo === 'app'), ...central]; };
+      const appFiles = w.ops.appFiles as NonNullable<typeof w.ops.appFiles>;
+      const after: string[] = [];
+      w.ops.appFiles = (d, deps) => { const real = appFiles(d, deps); return { last: real.last, appFiles: async (sha) => { const f = [...await real.appFiles(sha), ...copy.files]; after.push(...f.map((x) => x.content)); return f; } }; };
+      const r = await w.run();
+      expect(r.stopped ?? '', esc).toBe('');
+      expect(r.ok, esc).toBe(true);
+      expect(w.tl.filter((x) => x.startsWith('keys.setup:')), esc).toEqual(['keys.setup:API_TOKEN']);
+      // the names were compared: known before (keys made with them) and after (the set with the copy reads them, not null)
+      expect(w.tl.find((x) => x.startsWith('keys.new:')), esc).toContain('PIPEGEN_FP_KEY');
+      expect(after.some((c) => c.includes('pipegen compat copy')), esc).toBe(true);
+      expect(workflowSecretNames(after.map((content) => ({ content }))), esc).not.toBeNull();
+    }
   });
 
   it('run: G17-F1-R2 a public app with the real assembled workflows passes its proof; the placeholders hold no GITHUB_ or PIPEGEN_ name', async () => {

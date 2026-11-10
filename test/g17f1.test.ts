@@ -6,6 +6,9 @@ import { describe, expect, it } from 'vitest';
 import { docFor, isAiNote as runIsAiNote } from '../src/cli/run-parts.js';
 import { isAiNote as docsIsAiNote, pipegenDoc } from '../src/deliver/docs.js';
 import { workflowSecretNames } from '../src/proof/keys.js';
+import { compatCopiesFrom } from '../src/proof/harness.js';
+import { escapeLineBreaks } from '../src/engine/yaml-breaks.js';
+import { Document, parse, Scalar } from 'yaml';
 import { publishedImageRepo } from '../src/engine/deploy-steps.js';
 import type { ExistingWorkflow, PipelineDoc } from '../src/types.js';
 import { node, planned, profileOf, SEC } from './helpers/assemble.js';
@@ -90,6 +93,43 @@ describe('G17-F1-R2 N1: a YAML 1.1 line break the YAML 1.2 parser reads as conte
     }
     // the control: without them, the names
     expect(read(`env:\n  A: x # c\n  B: ${ref('ORG_H')}\n`)).toEqual(['ORG_H']);
+  });
+});
+
+describe('G17-F1 round 3 (sec r2 M1): pipegen writes NEL, LS and PS as the YAML escapes \\N, \\L, \\P', () => {
+  const RAW = /[\u0085\u2028\u2029]/;
+  const CHARS = [['\u0085', '\\N'], ['\u2028', '\\L'], ['\u2029', '\\P']] as const;
+
+  it('compat: a copied job whose step holds U+0085, U+2028 or U+2029 is compared; the copy holds the escape, no raw character, and reads back the same', () => {
+    for (const [ch, esc] of CHARS) {
+      const r = compatCopiesFrom([{ path: '.github/workflows/ci.yml', content: `on: [pull_request]\njobs:\n  t:\n    runs-on: ubuntu-24.04\n    steps:\n      - name: "a${esc}b"\n        run: "echo a${esc}b"\n` }]);
+      expect(r.notCompared, JSON.stringify(ch)).toEqual([]);
+      expect(r.files.length).toBe(1);
+      const text = (r.files[0] as { content: string }).content;
+      expect(RAW.test(text), JSON.stringify(ch)).toBe(false);
+      expect(text).toContain(`"echo a${esc}b"`);
+      const steps = (parse(text) as { jobs: { t: { steps: { name: string; run: string }[] } } }).jobs.t.steps;
+      expect(steps[0]).toEqual({ name: `a${ch}b`, run: `echo a${ch}b` });
+      // the N1 check stays quiet on the copy: its names are known
+      expect(workflowSecretNames([{ content: text }]), JSON.stringify(ch)).toEqual([]);
+    }
+  });
+
+  it('escapeLineBreaks: a double-quoted value gets the escape; a character it can not escape (a plain or single-quoted value, a block); a comment gets the escape', () => {
+    const doc = (v: string, type: Scalar.Type): string => { const d = new Document({ a: v }); const n = d.get('a', true) as Scalar; n.type = type; return d.toString({ lineWidth: 0 }); };
+    for (const [ch, esc] of CHARS) {
+      const dq = doc(`x${ch}y`, Scalar.QUOTE_DOUBLE);
+      expect(RAW.test(dq), 'the yaml library writes it raw (else this test proves nothing)').toBe(true);
+      expect(escapeLineBreaks(dq)).toBe(`a: "x${esc}y"\n`);
+      expect(escapeLineBreaks(`a: 'x${ch}y'\n`)).toBeNull();
+      expect(escapeLineBreaks(`a: x${ch}y\n`)).toBeNull();
+      expect(escapeLineBreaks(`a: |\n  x${ch}y\n`)).toBeNull();
+      // in a comment the escape changes nothing a reader reads, and no raw character is left
+      expect(escapeLineBreaks(`a: 1 # c${ch}\n`)).toBe(`a: 1 # c${esc}\n`);
+      // a backslash right before: the escape still reads back as the character
+      expect(parse(escapeLineBreaks(doc(`x\\${ch}`, Scalar.QUOTE_DOUBLE)) as string)).toEqual({ a: `x\\${ch}` });
+    }
+    expect(escapeLineBreaks('a: "plain"\n')).toBe('a: "plain"\n');
   });
 });
 

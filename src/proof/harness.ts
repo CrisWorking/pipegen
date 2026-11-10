@@ -55,6 +55,7 @@ import { parseImageRef } from '../engine/names.js';
 import type { PlatformActions } from '../engine/pin.js';
 import { releaseInstallStep, renderStarterTestRun } from '../engine/render-cli.js';
 import { RenderError } from '../engine/render-error.js';
+import { escapeLineBreaks } from '../engine/yaml-breaks.js';
 import {
   PROOF_OVERRIDE_PATH, renderComposeUp, renderFindRunStep, renderJobPrelude, renderPlatformStep, renderRuntimeEnv, stepsToYaml, type RenderedStep,
 } from '../engine/render-step.js';
@@ -359,7 +360,9 @@ export function harnessWorkflow(draft: PipelineDraft, opts: HarnessOptions): Har
   doc.contents = root;
   doc.commentBefore = ' pipegen proof harness: runs only in the private scratch repo pipegen-proof-<repo>; never delivered (Plan E E3).';
   quoteStrings(doc);
-  const content = doc.toString({ lineWidth: 0 });
+  // G17-F1 round 3 (sec r2 M1): NEL, LS and PS as YAML escapes (every string is double-quoted here, so each one can be escaped)
+  const content = escapeLineBreaks(doc.toString({ lineWidth: 0 }));
+  if (content === null) throw new RenderError('The harness holds a line separator character pipegen can not write as an escape.');
   const back = parseYaml(content, 'strict');
   if ('problems' in back) throw new RenderError(`The harness does not parse back: ${back.problems[0] ?? ''}`);
   return {
@@ -526,7 +529,10 @@ function renderCompat(path: string, wf: Obj, jobs: [string, Obj][]): string {
   const doc = new Document(model, { version: '1.2', aliasDuplicateObjects: false });
   doc.commentBefore = ` pipegen compat copy of ${path} (scratch only, never delivered): read-only, pull_request only, no secret referenced.`;
   quoteStrings(doc);
-  const text = doc.toString({ lineWidth: 0 });
+  // G17-F1 round 3 (sec r2 M1): NEL, LS and PS as YAML escapes, so the copy reads the same to every reader (and the proof's secret
+  // names stay known); a character that can't be escaped makes these jobs not compared
+  const text = escapeLineBreaks(doc.toString({ lineWidth: 0 }));
+  if (text === null) throw new ProofStopError(`pipegen's compat copy of ${safeText(path, 120)} holds a line separator character it can not write as an escape.`);
   const back = parseYaml(text, 'strict');
   if ('problems' in back) throw new ProofStopError(`pipegen's compat copy of ${safeText(path, 120)} does not parse back (${back.problems[0] ?? ''}).`);
   if (!isDeepStrictEqual(back.parsed.js, model)) throw new ProofStopError(`pipegen's compat copy of ${safeText(path, 120)} does not read back as the model.`);
