@@ -79,6 +79,29 @@ const show = (s: string, n = 140): string => safeText(s, n);
 export class FinishError extends Error {
   constructor(message: string, options?: { cause?: unknown }) { super(message, options); this.name = 'FinishError'; }
 }
+/** G-COCASE-R1: a CODEOWNERS case variant is there; finish stops before its first write (the command exits 2). */
+export class CoCaseError extends FinishError {
+  readonly exitCode = 2;
+  constructor(message: string) { super(message); this.name = 'CoCaseError'; }
+}
+/**
+ * G-COCASE-R1: the stop message when a repo holds a path that is a CO_PLACES entry in another letter case, or null. GitHub may read such a
+ * file instead of the one pipegen writes, and the gate reads only the exact path, so finish and setup refuse (fail closed) rather than
+ * write a second file. `command` is the one to run again.
+ */
+export function coCaseProblem(repos: readonly { label: string; paths: Iterable<string> }[], command: string): string | null {
+  const parts: string[] = [];
+  for (const r of repos) {
+    const found: string[] = [];
+    for (const x of r.paths) {
+      const exact = CO_PLACES.find((p) => p.toLowerCase() === x.toLowerCase());
+      if (exact !== undefined && exact !== x) found.push(`${show(x)} (rename it to ${exact} (or remove it))`);
+    }
+    if (found.length > 0) parts.push(`${show(r.label)} has ${found.join(', ')}`);
+  }
+  if (parts.length === 0) return null;
+  return `pipegen stopped before changing anything: ${parts.join('; ')}. A CODEOWNERS whose name differs from the path GitHub reads only in letter case may be read instead of the file pipegen writes, and the gate reads only the exact path. Rename it as shown (or remove it), then run \`${command}\` again. exit code 2.`;
+}
 /** One step's own refusal (a read-back that doesn't match, an answer that can't be read): reported, the step not applied. */
 class StepError extends Error {}
 
@@ -1032,6 +1055,9 @@ async function finishHeld(gh: Octokit, app: RepoRef, opts: FinishOpts, deps: Fin
     if (appHead === null || centralHead === null) throw new FinishError('A default branch of the app or the central repo is missing, so pipegen applies nothing.');
     const appTree = (await readTree(gh, app, appHead, clock)).entries;
     const centralTree = (await readTree(gh, central, centralHead, clock)).entries;
+    // G-COCASE-R1: a CODEOWNERS case variant in either repo stops finish here, before its first write
+    const caseStop = coCaseProblem([{ label: `${app.owner}/${app.repo}`, paths: appTree.keys() }, { label: `${central.owner}/${central.repo}`, paths: centralTree.keys() }], 'npx pipegen finish');
+    if (caseStop !== null) throw new CoCaseError(caseStop);
     const appCo = await coFacts(gh, app, appTree, clock);
     const centralCo = await coFacts(gh, central, centralTree, clock);
     const files: CreatedFile[] = [];

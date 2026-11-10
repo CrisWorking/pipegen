@@ -9,7 +9,7 @@ import type { Octokit } from '@octokit/rest';
 // the real referee, watched: the fix loop's referee must judge AssembledFiles.draft, never the input draft (carry 25)
 vi.mock(import('../src/engine/referee.js'), async (orig) => { const m = await orig(); return { ...m, referee: vi.fn(m.referee) }; });
 import { referee as watchedReferee } from '../src/engine/referee.js';
-import { buildFiles, insertedBlock, judgeBuilt, proofBuildFor, readBuildFacts, readRegular, runCreators, workflowTexts, type BuildInput, type BuildFacts } from '../src/cli/run.js';
+import { buildFiles, coCaseOfRepos, insertedBlock, judgeBuilt, proofBuildFor, readBuildFacts, readRegular, runCreators, workflowTexts, type BuildInput, type BuildFacts } from '../src/cli/run.js';
 import { strictNeeds, warnFirstFor } from '../src/cli/run-parts.js';
 import { judgeAssembled } from '../src/layers/assemble.js';
 import { ADVISORY_TOOLS } from '../src/debate/builder.js';
@@ -540,4 +540,37 @@ describe('G17A-R3: --skip deploy lists each deploy workflow as a gap, through th
       expect(report.issues.map((x) => `${x.file}: ${x.message}`)).toEqual([]);
     });
   }
+});
+
+describe('G-COCASE-R1: setup refuses a CODEOWNERS case variant before any write', () => {
+  /** The app and central repos on a fake GitHub; every request that isn't a read is collected. */
+  const repos = (app: Record<string, string>, central: Record<string, string>): { i: BuildInput; writes: string[] } => {
+    const g = new FakeGitHub();
+    g.addRepo(`${OWN}/r`, { private: false, files: { 'README.md': 'hi\n', ...app } });
+    g.addRepo(`${OWN}/pipelines`, { private: true, files: { 'README.md': 'central\n', ...central } });
+    const writes: string[] = [];
+    g.hooks.push((call) => { if (!call.route.startsWith('GET ')) writes.push(call.route); return undefined; });
+    const first = input(false);
+    return { i: { ...first, facts: { ...first.facts, gh: g.octokit() } }, writes };
+  };
+
+  it('G-COCASE-R1: setup/run: the read-only stage names an app or central case variant (exit 2 message), and nothing for exact spellings', async () => {
+    const a = repos({ '.GitHub/CODEOWNERS': '* @x\n' }, {});
+    const m = await coCaseOfRepos(a.i.facts, a.i.draft.profile);
+    expect(m).toMatch(new RegExp(`${OWN}/r has \\.GitHub/CODEOWNERS \\(rename it to \\.github/CODEOWNERS \\(or remove it\\)\\)`));
+    expect(m).toMatch(/npx pipegen run/);
+    expect(m).toMatch(/exit code 2\.$/);
+    expect(a.writes).toEqual([]);
+    const c = repos({}, { 'docs/Codeowners': '* @x\n' });
+    expect(await coCaseOfRepos(c.i.facts, c.i.draft.profile)).toMatch(new RegExp(`${OWN}/pipelines has docs/Codeowners`));
+    expect(c.writes).toEqual([]);
+    const ok = repos({ CODEOWNERS: '* @x\n' }, { '.github/CODEOWNERS': '* @x\n' });
+    expect(await coCaseOfRepos(ok.i.facts, ok.i.draft.profile)).toBeNull();
+  });
+
+  it('G-COCASE-R1: setup/run: readBuildFacts refuses a case variant too (one that appeared after the early check), before anything is built or written', async () => {
+    const a = repos({}, { CodeOwners: '* @x\n' });
+    await expect(readBuildFacts(a.i)).rejects.toThrow(/pipelines has CodeOwners \(rename it to CODEOWNERS/);
+    expect(a.writes).toEqual([]);
+  });
 });

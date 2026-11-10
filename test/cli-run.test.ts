@@ -133,7 +133,7 @@ interface World {
   calls: string[]; got: Record<string, unknown[]>; vaults: SecretVault[]; builds: BuildInput[]; home: string;
   stages: Partial<RunStages>; deps: RunDeps;
 }
-function world(o: { local?: RepoProfile; facts?: GitHubFacts; debate?: DebateResult; who?: Record<string, unknown>; consent?: boolean; prState?: 'merged' | 'closed' | 'open'; built?: (i: BuildInput) => Built; record?: InstallRecord | null; central?: 'pinned' | 'central-pr'; gate?: boolean; missingRepos?: string[]; proof?: RunDeps['proof']; deps?: Partial<RunDeps>; found?: CodeBundle['found'] } = {}): World {
+function world(o: { local?: RepoProfile; facts?: GitHubFacts; debate?: DebateResult; who?: Record<string, unknown>; consent?: boolean; prState?: 'merged' | 'closed' | 'open'; built?: (i: BuildInput) => Built; record?: InstallRecord | null; central?: 'pinned' | 'central-pr'; gate?: boolean; missingRepos?: string[]; proof?: RunDeps['proof']; deps?: Partial<RunDeps>; found?: CodeBundle['found']; coCase?: string | null } = {}): World {
   const calls: string[] = [];
   const got: Record<string, unknown[]> = {};
   const vaults: SecretVault[] = [];
@@ -153,6 +153,7 @@ function world(o: { local?: RepoProfile; facts?: GitHubFacts; debate?: DebateRes
     state: async (p) => { rec('state', p); return StateStore.open(p, { home, env: {} }); },
     gateReachable: async () => { rec('gateReachable'); return o.gate ?? true; },
     helperRepos: async () => { rec('helperRepos'); return o.missingRepos ?? []; },
+    coCase: async () => { rec('coCase'); return o.coCase ?? null; },
     proofRepos: async (f, p, auth, store, runId, actions) => { rec('proofRepos', f, p, auth, store, runId, actions); return { ready: true, target: {} as never, repos: [], created: [] }; },
     needs: async (p, caps, b, aiP, writers) => { rec('needs', p, caps, b, aiP, writers); return { needs: [...NEEDS], notes: [], requireDeployApproval: true, layersSkipped: [], usage: [] } as never; },
     discover: async () => { rec('discover'); return candidatesFor(NEEDS, profile()); },
@@ -214,13 +215,24 @@ describe('G13: --skip', () => {
 // ---------- the order ----------
 
 describe('G13: the run, in order', () => {
+  it('G-COCASE-R1: run: a CODEOWNERS case variant stops setup right after the read-only checks, before consent and any write (exit 2)', async () => {
+    const msg = 'pipegen stopped before changing anything: o/r has .GitHub/CODEOWNERS (rename it to .github/CODEOWNERS (or remove it)). exit code 2.';
+    const w = world({ coCase: msg });
+    const i = io();
+    const code = await run(w, i);
+    expect(code).toBe(2);
+    expect(i.errs).toContain(msg);
+    expect(w.calls.at(-1)).toBe('coCase');
+    for (const later of ['activity', 'consent', 'state', 'signingEnv', 'needs', 'creators', 'build', 'proofRepos', 'deliverCentral', 'deliver', 'finish']) expect(w.calls).not.toContain(later);
+  });
+
   it('run: stages execute in order and save state', async () => {
     const w = world();
     const i = io();
     const code = await run(w, i);
     expect(code).toBe(0);
     // G14 (ruling G14-R0 1): the read-only helper-repo check before consent; the writing one (checkProofRepos) inside the proof
-    const order = ['readOrigin', 'localProject', 'getAuth', 'readProject', 'provider', 'bundle', 'helperRepos', 'activity', 'consent', 'state', 'needs', 'discover', 'debate', 'trusted', 'creators', 'secrets', 'credits', 'build', 'proofRepos', 'deliverCentral', 'readCentralFileList', 'build', 'preview', 'deliver', 'prState', 'finish'];
+    const order = ['readOrigin', 'localProject', 'getAuth', 'readProject', 'provider', 'bundle', 'helperRepos', 'coCase', 'activity', 'consent', 'state', 'needs', 'discover', 'debate', 'trusted', 'creators', 'secrets', 'credits', 'build', 'proofRepos', 'deliverCentral', 'readCentralFileList', 'build', 'preview', 'deliver', 'prState', 'finish'];
     expect(w.calls.filter((c) => order.includes(c))).toEqual(order);
     const store = await StateStore.open({ owner: OWN, repo: 'r' }, { home: w.home, env: {} });
     expect(store.load()?.stage).toBe('delivered');

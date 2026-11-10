@@ -43,7 +43,7 @@ import { decideTests } from '../debate/tests.js';
 import type { StarterDeps } from '../create/tests.js';
 import { deliver, deliverCentral, DeliverError, dropRunSigningEnvironment, makeRunSigningEnvironment, planDelivery, previewText, readCentralFileList, type DeliverResult, type DeliveryInput, type SigningKey, type CentralPr, type CentralResult } from '../deliver/deliver.js';
 import { pipegenDoc } from '../deliver/docs.js';
-import { coFacts, type CoFacts } from '../deliver/finish.js';
+import { coCaseProblem, coFacts, type CoFacts } from '../deliver/finish.js';
 import { readBlobText, readHead, readRepo, readTree } from '../deliver/git-data.js';
 import type { CreatedInputs } from '../engine/created-files.js';
 import { discover } from '../engine/discover.js';
@@ -246,6 +246,8 @@ export interface RunStages {
   proofRepos(f: GitHubFacts, p: RepoProfile, auth: Auth, store: StateStore, runId: string, actions: readonly string[]): Promise<ProofRepos>;
   /** Stage 8, read only (ruling G14-R0 1): the helper repos that don't exist yet (names). */
   helperRepos(f: GitHubFacts, p: RepoProfile): Promise<string[]>;
+  /** G-COCASE-R1, read only: the stop message when the app or central repo holds a CODEOWNERS case variant (coCaseOfRepos), or null. */
+  coCase(f: GitHubFacts, p: RepoProfile): Promise<string | null>;
   needs(p: RepoProfile, caps: Capabilities, bundle: CodeBundle, ai: ReturnType<typeof makeProvider>, writers: number, knownValues: string[]): Promise<NeedsPlan>;
   /** `ai` is the run's metered provider (sec I2); `onUsage` saves the meter after each call. */
   discover(needs: NeedsPlan['needs'], p: RepoProfile, f: GitHubFacts, reviewed: ReviewedTool[], ai: ReturnType<typeof makeProvider>, onUsage: () => void): Promise<Map<string, readonly Candidate[]>>;
@@ -439,6 +441,9 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
       err('pipegen stopped before anything was spent: the helper repositories above must exist first. exit code 2.');
       return 2;
     }
+    // G-COCASE-R1, read only: a CODEOWNERS case variant stops setup before consent and any write
+    const coStop = await st.coCase(facts, p);
+    if (coStop !== null) { err(safeText(coStop, 1500)); return 2; }
     const extra = notProvableNotes(p);
     const floor = floorNeeds(p, facts.caps);
     const activity = await st.activity(facts, p);
@@ -1121,6 +1126,18 @@ export const guardRecord = (prev: InstallRecord | null): GuardInstallRecord | nu
   files: prev.files.filter((x) => x.repo === 'app' && x.shas.length > 0).map((x) => ({ path: x.path, part: x.part, sha: x.shas[x.shas.length - 1] as string, created: x.adopted !== true && x.ownerEdited !== true })),
 });
 
+/** G-COCASE-R1, read only: coCaseProblem over the default-branch trees of the app and its central repo (a missing branch or repo: no paths). */
+export async function coCaseOfRepos(f: GitHubFacts, p: RepoProfile): Promise<string | null> {
+  const app = { owner: p.owner, repo: p.repo };
+  const central = { owner: p.owner, repo: CENTRAL_REPO };
+  const head = await readHead(f.gh, app, p.defaultBranch, f.clock);
+  const appPaths = head === null ? [] : [...(await readTree(f.gh, app, head, f.clock)).entries.keys()];
+  const centralRepo = await readRepo(f.gh, central, f.clock);
+  const cHead = centralRepo === null ? null : await readHead(f.gh, central, centralRepo.defaultBranch, f.clock);
+  const centralPaths = cHead === null ? [] : [...(await readTree(f.gh, central, cHead, f.clock)).entries.keys()];
+  return coCaseProblem([{ label: `${p.owner}/${p.repo}`, paths: appPaths }, { label: `${p.owner}/${CENTRAL_REPO}`, paths: centralPaths }], 'npx pipegen run');
+}
+
 export async function readBuildFacts(i: BuildInput): Promise<BuildFacts> {
   const { gh, clock } = i.facts;
   const p = i.draft.profile;
@@ -1138,6 +1155,9 @@ export async function readBuildFacts(i: BuildInput): Promise<BuildFacts> {
   if (centralRepo === null) throw new DeliverError(`pipegen can't see ${p.owner}/${CENTRAL_REPO}.`);
   const cHead = await readHead(gh, central, centralRepo.defaultBranch, clock);
   const cTree = cHead === null ? new Map() : (await readTree(gh, central, cHead, clock)).entries;
+  // G-COCASE-R1: the same refusal as the early check (a variant that appeared since), before anything is built
+  const caseStop = coCaseProblem([{ label: `${p.owner}/${p.repo}`, paths: tree.entries.keys() }, { label: `${p.owner}/${CENTRAL_REPO}`, paths: cTree.keys() }], 'npx pipegen run');
+  if (caseStop !== null) throw new DeliverError(caseStop);
   const appCo0 = await coFacts(gh, app, tree.entries, clock);
   const centralCo0 = await coFacts(gh, central, cTree, clock);
   const centralCaps = await probeCapabilities(gh, p.owner, CENTRAL_REPO, { plan: p.plan, ownerType: p.ownerType, private: centralRepo.private, defaultBranch: centralRepo.defaultBranch }, [], clock).catch(() => null);
@@ -1206,6 +1226,7 @@ function realStages(io: CliIO, deps: RunDeps): RunStages {
       if (sha === undefined) return false;
       try { await f.gh.request('GET /repos/{owner}/{repo}/commits/{ref}', { owner, repo, ref: sha }); return true; } catch { return false; }
     },
+    coCase: (f, p) => coCaseOfRepos(f, p),
     async helperRepos(f, p) {
       const out: string[] = [];
       for (const name of [CENTRAL_REPO, `pipegen-proof-${p.repo}`]) if ((await readRepo(f.gh, { owner: p.owner, repo: name }, f.clock)) === null) out.push(name);
