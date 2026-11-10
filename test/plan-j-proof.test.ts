@@ -9,6 +9,8 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { buildAudit, type AuditReport } from '../src/audit/model.js';
+import { PART_TITLE, partOf } from '../src/audit/parts.js';
+import { shortParts } from '../src/audit/render-short.js';
 import { renderTerminal } from '../src/audit/render.js';
 import { MINIMUM_CATEGORIES, STATIC_SKIP } from '../src/engine/needs.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
@@ -112,7 +114,7 @@ describe('Plan J proof set: static sites have no container or DAST rows', () => 
       expect(skip?.why).toBe(STATIC_SKIP);
       expect(skip?.categories).toEqual(expect.arrayContaining(['image-build', 'image-scan', 'dast']));
       const t = renderTerminal(r, { knownValues: [], now: () => NOW });
-      const asked = t.slice(0, t.indexOf('Already good'));
+      const asked = t.slice(0, t.indexOf('Not needed here'));
       expect(asked).not.toMatch(/image|DAST|Dockerfile|container/i);
     });
   }
@@ -322,23 +324,49 @@ describe('Plan J proof set: deploy gate and trivy-action by SHA (J3b)', () => {
 
 // ---------- 7. the short report ----------
 describe('Plan J proof set: the short report', () => {
-  // Controller ruling (J6 step B): the bound is 32 lines for every fixture (wrapping at 100 columns).
-  const SECTION = (t: string, from: RegExp, to: RegExp) => {
-    const ls = t.split('\n');
-    const a = ls.findIndex((l) => from.test(l));
-    if (a < 0) return [];
-    const rest = ls.slice(a + 1);
-    const b = rest.findIndex((l) => to.test(l));
-    return (b < 0 ? rest : rest.slice(0, b)).filter((l) => /^ {2}- [^:]+: /.test(l));   // items are "- Label: why"; a plan-limit line has no label
+  // PL-A4. Owner choice 3 asked for <= 20 lines (one service) and <= 30 (several) at 80 columns. With six populated parts
+  // (a header line each) plus the title, summary, type, cost and pointer lines, that cannot hold for a repo that has
+  // something to say in every part (see task-PL-A4-report.md); the bound kept here is the old one (32), now at 80 columns.
+  const LINE_BUDGET = 32;
+  /** The checks listed on one mark's lines of a part (wrapped lines joined), "and N more" counted as N. */
+  const countMarks = (t: string, mark: string): number => {
+    let n = 0;
+    for (const line of t.slice(0, t.indexOf('What now?')).replace(/\n {4}(?! )/g, ' ').split('\n')) {
+      if (!line.startsWith(`  ${mark} `)) continue;
+      const body = line.slice(4);
+      const more = /(?:^|; |, )and (\d+) more \(--verbose\)$/.exec(body);
+      const shown = more === null ? body : body.slice(0, more.index);
+      n += (shown === '' ? 0 : shown.split(mark === '✓' ? ', ' : '; ').length) + (more === null ? 0 : Number(more[1]));
+    }
+    return n;
   };
   for (const f of FIXTURES) {
-    it(`${f}: ≤ 32 lines; Fix first and Consider show at most 5 each`, async () => {
-      const t = renderTerminal(await audit(f), { knownValues: [], now: () => NOW });
-      const n = t.split('\n').length;
-      expect(n, t).toBeLessThanOrEqual(32);
-      expect(SECTION(t, /^Fix first/, /^Consider/).length).toBeLessThanOrEqual(5);
-      expect(SECTION(t, /^Consider/, /^Already good|^Not needed/).length).toBeLessThanOrEqual(5);
+    it(`${f}: every line ≤ 80 columns, within the line budget, the parts in order and none empty`, async () => {
+      const r = await audit(f);
+      const t = renderTerminal(r, { knownValues: [], now: () => NOW });
+      const ls = t.split('\n');
+      expect(ls.length, t).toBeLessThanOrEqual(LINE_BUDGET);
+      for (const l of ls) expect([...l].length, l).toBeLessThanOrEqual(80);
       expect(t).toMatch(/^Type: /m);
+      const ids = ls.map((l) => /^([1-6]) (\S.*)$/.exec(l)).filter((m) => m !== null && Object.values(PART_TITLE).includes(m[2] as string)).map((m) => Number(m?.[1]));
+      expect(ids).toEqual([...ids].sort((a, b) => a - b));
+      // an empty part is left out: every shown part has a ✗, ⚠, ✓ or Note line before the next header
+      const parts = shortParts(r);
+      expect(ids).toEqual(parts.filter((p) => p.fix.length + p.consider.length + p.good.length + p.notes.length > 0).map((p) => p.part));
+      expect(t).not.toMatch(/[\w./-]+\.(ya?ml|json|ts|js):\d+/);
+    });
+    it(`${f}: summary counts equal the lines of the parts`, async () => {
+      const r = await audit(f);
+      const t = renderTerminal(r, { knownValues: [], now: () => NOW });
+      const m = /^(\d+) to fix · (\d+) to consider · (\d+) already good/.exec(t.split('\n')[1] as string);
+      expect(m, t).not.toBeNull();
+      expect([countMarks(t, '✗'), countMarks(t, '⚠'), countMarks(t, '✓')]).toEqual([Number(m?.[1]), Number(m?.[2]), Number(m?.[3])]);
+      // every gap row is in a part: its part lists a check of the same category as a ✗ or ⚠ item
+      const parts = shortParts(r);
+      for (const c of r.coverage) if (c.status === 'missing' || c.status === 'partial') {
+        const p = parts.find((x) => x.part === partOf(c.need));
+        expect([...(p?.fix ?? []), ...(p?.consider ?? [])].some((g) => g.category === c.need.category), `${f} ${rowKey(c)}`).toBe(true);
+      }
     });
   }
 });

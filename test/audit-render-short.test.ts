@@ -6,7 +6,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { EXCLUDED_PATTERNS, GIT_EXCLUDED_LINES } from '../src/ai/redact.js';
 import { buildAudit, LIMIT, SECRET_CHECK, type AuditDeps, type AuditReport, type LocalAudit } from '../src/audit/model.js';
 import type { Coverage } from '../src/audit/coverage.js';
-import { buildShortDoc, LIMIT_CATEGORIES, rankGaps } from '../src/audit/render-short.js';
+import { buildShortDoc, LIMIT_CATEGORIES, rankGaps, shortParts } from '../src/audit/render-short.js';
+import { PART_TITLE, type PartId } from '../src/audit/parts.js';
 import { cantSeeFor, CANT_SEE, ctxFor, layerViews, renderJson, renderLocalTerminal, renderMarkdown, renderTerminal, type RenderOptions } from '../src/audit/render.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import type { Capabilities, ProjectType, RepoProfile, ServiceType } from '../src/types.js';
@@ -123,27 +124,25 @@ function listLines(t: string): string[] {
 }
 
 describe('short report: invented repos of different kinds', () => {
-  it('static-next-pages fixture → ≤ 30 lines', async () => {
+  it('static-next-pages fixture → within the line budget', async () => {
     const r = await auditOf(STATIC_NEXT_PAGES);
     const t = renderTerminal(r, SHORT);
-    expect(lines(t).length, t).toBeLessThanOrEqual(30);
+    expect(lines(t).length, t).toBeLessThanOrEqual(32);
     // the Type line carries the evidence
     const type = lines(t).find((l) => l.startsWith('Type:')) as string;
     expect(type).toContain('site: static-site');
     expect(t).toContain('output: "export"');
-    // what a static site doesn't need
-    const skipped = t.slice(t.indexOf('Not needed here:'));
-    expect(skipped).toMatch(/Dockerfile/);
-    expect(skipped).toMatch(/Container image/);
-    expect(skipped).toMatch(/DAST/);
-    // no row appears twice
-    const rows = listLines(t).map((l) => l.replace(/^ {2}- /, '').split(':')[0] as string);
-    expect(new Set(rows).size).toBe(rows.length);
+    // what a static site doesn't need: one line, the reasons are in --verbose
+    expect(lines(t).filter((l) => l.startsWith('Not needed here:'))).toHaveLength(1);
+    expect(flat(renderTerminal(r, FULL))).toMatch(/Container image build/);
+    // no check appears twice in the parts
+    const checks = shortParts(r).flatMap((p) => [...p.fix, ...p.consider].map((g) => `${g.check}|${g.services.join(',')}`));
+    expect(new Set(checks).size).toBe(checks.length);
     // the layout, in order
-    const at = ['Type:', 'Verdict:', 'Fix first', 'Consider', 'Already good:', 'Not needed here:', 'Full setup cost:', 'Details: pipegen --verbose'].map((s) => t.indexOf(s));
+    const at = ['Type:', '1 On your computer', '2 Every pull request', 'Not needed here:', 'What now?', '  Setup cost:', '  More: pipegen --verbose'].map((s) => t.indexOf(s));
     expect(at.every((i) => i >= 0), t).toBe(true);
     expect(at).toEqual([...at].sort((a, b) => a - b));
-    expect(lines(t)[lines(t).length - 1]).toBe('Details: pipegen --verbose · full report: --out report.md');
+    expect(lines(t)[lines(t).length - 1]).toBe('  More: pipegen --verbose (file, line, how to fix) · --out report.md');
     // nothing the full report says about the checks by layer or the caveats
     expect(t).not.toContain('Checks by layer');
     expect(t).not.toContain("What this audit can't see");
@@ -174,7 +173,9 @@ describe('short report: invented repos of different kinds', () => {
     for (const word of ['Kubernetes', 'Renovate', '.vue', 'ENTRYPOINT']) expect(caveats, word).not.toContain(word);
     const short = renderTerminal(r, SHORT);
     expect(lines(short).find((l) => l.startsWith('Type:'))).toMatch(/tool: library/);
-    expect(short).toMatch(/Not needed here:.*Container image/s);
+    // a library builds no image: no container check is asked for in any part
+    const asked = short.slice(0, short.indexOf('Not needed here:'));
+    expect(asked).not.toMatch(/Container image|Running-app scan/);
     expect(lines(short).length).toBeLessThanOrEqual(32);
   });
 
@@ -182,7 +183,7 @@ describe('short report: invented repos of different kinds', () => {
     const r = await auditOf(NODE_CONTAINER);
     const short = renderTerminal(r, SHORT);
     expect(lines(short).find((l) => l.startsWith('Type:'))).toMatch(/api: server, container/);
-    const skipped = short.slice(short.indexOf('Not needed here:'), short.indexOf('Full setup cost:'));
+    const skipped = lines(short).find((l) => l.startsWith('Not needed here:')) as string;
     expect(skipped).not.toMatch(/Dockerfile lint/);
     expect(skipped).not.toMatch(/Running-app scan/);
     const full = renderTerminal(r, FULL);
@@ -222,8 +223,8 @@ describe('short report: what must never be hidden (ruling B5)', () => {
     const t = flat(renderTerminal(r, SHORT));
     const at = (s: string) => t.indexOf(s);
     for (const s of [RATE.text, ANON.text, SWAP.text, SWAP.command, 'incomplete GitHub data', 'Secret-like text on disk: 2 files (.env, config/dev.json; --verbose for all)']) expect(at(s), s).toBeGreaterThan(-1);
-    // all of it before the type, the verdict and the lists
-    const firstList = Math.min(...['Verdict:', 'Fix first', 'Consider'].map(at));
+    // all of it before the type and the parts
+    const firstList = Math.min(...['Type:', '1 On your computer', '2 Every pull request'].map(at).filter((i) => i >= 0));
     for (const s of [RATE.text, ANON.text, SWAP.command, 'Secret-like text on disk', 'incomplete GitHub data']) expect(at(s), s).toBeLessThan(firstList);
     // the command stays on one line of its own, unwrapped
     expect(lines(renderTerminal(r, SHORT))).toContain(`    ${SWAP.command}`);
@@ -300,7 +301,7 @@ describe('short report: ranking, merging and plan limits', () => {
     const g = rankGaps({ ...r, coverage: rows, wouldAdd: [] });
     expect(g.fixFirst).toEqual([{ check: 'Lint', services: ['a'], why: 'missing on merge.', tool: null }]);
     const t = renderTerminal({ ...r, coverage: rows, wouldAdd: [] }, SHORT);
-    expect(t).toContain('- Lint for a: missing on merge.');
+    expect(t).toContain('✗ Lint for a');
     expect(t).not.toContain('(partial)');
   });
 
@@ -326,8 +327,8 @@ describe('short report: ranking, merging and plan limits', () => {
     const all = [...g.fixFirst, ...g.consider];
     expect(all.map((x) => `${x.services.join(',')}=${x.tool}`).sort()).toEqual(['api=ruff', 'web=eslint']);
     const t = renderTerminal({ ...r, coverage: rows, wouldAdd }, SHORT);
-    expect(t).toContain('Lint for web: No lint. [eslint]');
-    expect(t).toContain('Lint for api: No lint. [ruff]');
+    expect(t).toContain('Lint for web [eslint]');
+    expect(t).toContain('Lint for api [ruff]');
   });
 
   it('two node services, same tool → one line, one tool', () => {
@@ -343,21 +344,27 @@ describe('short report: ranking, merging and plan limits', () => {
     expect(t.split('\n').filter((l) => l.includes('eslint'))).toHaveLength(1);
   });
 
-  it('short: at most five in each list, with the count and --verbose for the rest', () => {
+  it('short: a part shows at most two lines of fix-first checks, with the count of the rest; the summary counts all', () => {
     const r = report();
-    const ids = ['secrets', 'sast', 'deps', 'unit-tests', 'full-tests', 'lint', 'hooks'];
+    const ids = ['secrets', 'sast', 'deps', 'unit-tests', 'full-tests', 'lint', 'coverage', 'dead-code', 'duplication', 'iac', 'licences', 'dockerfile-lint', 'workflow-lint'];
     const rows: Coverage[] = ids.map((id) => ({ need: need('push', id), status: 'missing', why: `No ${id}.` }));
     const t = renderTerminal({ ...r, coverage: rows, wouldAdd: [] }, SHORT);
-    expect(t).toContain('Fix first (5 of 7; the rest: --verbose)');
-    expect(listLines(t)).toHaveLength(5);
-    expect(t).toContain('Already good: nothing yet');
+    const part = lines(t).slice(lines(t).findIndex((l) => l.startsWith('2 Every pull request')) + 1);
+    const fixLines = part.slice(0, part.findIndex((l) => !l.startsWith('  ✗ ') && !l.startsWith('    ')));
+    expect(fixLines.length).toBeLessThanOrEqual(2);
+    const shown = fixLines.join(' ').match(/and (\d+) more \(--verbose\)/);
+    expect(shown, t).not.toBeNull();
+    const visible = fixLines.join(' ').replace(/ and \d+ more \(--verbose\)/, '').split('; ').length;
+    expect(visible + Number(shown?.[1])).toBe(rankGaps({ ...r, coverage: rows, wouldAdd: [] }).fixFirst.length);
+    expect(lines(t)[1]).toMatch(/^13 to fix /);
+    expect(shortParts({ ...r, coverage: rows, wouldAdd: [] })[1]?.fix).toHaveLength(ids.length);
   });
 
-  it('short: a check is "Already good" only when every row of it is covered (rate-stop shape, and one service covered but another missing)', () => {
+  it('short: a check is "already good" only when every row of it is covered (rate-stop shape, and one service covered but another missing)', () => {
     const r = report();
     const goodLine = (rows: Coverage[]) => {
       const t = flat(renderTerminal({ ...r, coverage: rows, wouldAdd: [] }, SHORT));
-      return { t, good: t.split('\n').find((l) => l.startsWith('Already good:')) ?? '' };
+      return { t, good: shortParts({ ...r, coverage: rows, wouldAdd: [] }).flatMap((p) => p.good) };
     };
     // shape 1: under a rate stop the push row of a check is unknown while the merge row is covered
     const rate = goodLine([
@@ -366,7 +373,7 @@ describe('short report: ranking, merging and plan limits', () => {
       { need: need('push', 'secrets'), status: 'covered', by: 'betterleaks', why: 'ok.' },
     ]);
     expect(rate.good).toContain('Secret scan');
-    expect(rate.good).not.toContain('Code scan');
+    expect(rate.good).not.toContain('Code scan (SAST)');
     expect(rate.t).toContain("Couldn't tell: 1 check");
     // shape 2: covered on one service, missing on another
     const two = goodLine([
@@ -375,13 +382,15 @@ describe('short report: ranking, merging and plan limits', () => {
       { need: need('push', 'lint', 'web'), status: 'covered', by: 'eslint', why: 'ok.' },
     ]);
     expect(two.good).toContain('Lint');
-    expect(two.good).not.toContain('Dependency');
+    expect(two.good).not.toContain('Dependency check');
     // shape 3: covered on one service, unknown on another
     const three = goodLine([
       { need: need('push', 'lint', 'web'), status: 'covered', by: 'eslint', why: 'ok.' },
       { need: need('push', 'lint', 'api'), status: 'unknown', why: 'Could not tell.' },
     ]);
-    expect(three.good).toBe('Already good: nothing yet');
+    expect(three.good).toEqual([]);
+    expect(lines(three.t)[1]).toMatch(/^0 to fix · 0 to consider · 0 already good · 1 couldn't tell$/);
+    expect(three.t).not.toContain('✓');
   });
 
   it('short: a plan limit is printed only when one of its checks is in Fix first', () => {
@@ -407,20 +416,14 @@ describe('short report: ranking, merging and plan limits', () => {
     });
   });
 
-  it('short: a credit note is a Consider line', () => {
-    const r = { ...report(), profile: { ...report().profile, private: true } };
-    const signed: Coverage = { need: need('deploy', 'signing', 'shop-api'), status: 'covered', by: 'cosign', why: 'ok.', credit: 'CI signs the release artifacts with cosign (sign-blob)', creditKind: 'signing' };
-    const t = renderTerminal({ ...r, coverage: [...r.coverage, signed] }, SHORT);
-    const consider = t.slice(t.indexOf('Consider'), t.indexOf('Already good'));
-    expect(consider).toContain('public Sigstore log');
-  });
-
   it('Type line: unsure and overridden services say so', () => {
     const r = report();
     const svc = r.profile.services[0] as RepoProfile['services'][number];
     const withType = (projectType: NonNullable<RepoProfile['services'][number]['projectType']>): AuditReport => ({ ...r, profile: { ...r.profile, services: [{ ...svc, projectType }] } });
     const unsure = renderTerminal(withType({ types: ['server'], unsure: true, evidence: ['looks like a static site, but it has the server signs above'] }), SHORT);
     expect(unsure).toContain('Type: shop-api: server (unsure:');
+    // one line per service, cut at the width (the whole text is in --verbose)
+    expect(lines(unsure).filter((l) => l.startsWith('Type:'))).toHaveLength(1);
     // an unsure library, or a folder that is not standalone, is not treated as a server, and the line must not say it is
     for (const types of [['library'], ['library', 'static-site']] as const) {
       const lib = renderTerminal(withType({ types: [...types], unsure: true, evidence: ['no run script'] }), SHORT);
@@ -545,5 +548,175 @@ describe('short report: severity by project type (PL-A2)', () => {
     expect(md(pt(['server']))).toHaveLength(2);
     expect(layerViews(only(pt(['static-site']))).some((v) => v.serious)).toBe(false);
     expect(layerViews(only(pt(['server']))).some((v) => v.serious)).toBe(true);
+  });
+});
+
+describe('short report by parts (PL-A4)', () => {
+  const report = () => freePrivateReport(EXCLUDED_PATTERNS);
+  const SUMMARY = /^(\d+) to fix · (\d+) to consider · (\d+) already good(?: · (\d+) couldn't tell)?$/;
+  /** The part blocks of a short report: title line, then the lines under it up to the next part or the footer. */
+  function blocks(t: string): { id: number; title: string; lines: string[] }[] {
+    const out: { id: number; title: string; lines: string[] }[] = [];
+    for (const l of lines(t)) {
+      const m = /^([1-6]) (\S.*)$/.exec(l);
+      if (m !== null && Object.values(PART_TITLE).includes(m[2] as string)) out.push({ id: Number(m[1]), title: m[2] as string, lines: [] });
+      else if (/^(What now\?|Not needed here:|Couldn't tell:)/.test(l)) out.push({ id: 0, title: l, lines: [] });
+      else out.at(-1)?.lines.push(l);
+    }
+    return out;
+  }
+  /** The items of one mark in a part block (wrapped lines joined; ✗ and ⚠ items are separated by "; ", ✓ by ", "). */
+  const itemsOf = (b: { lines: string[] }, mark: '✗' | '⚠' | '✓'): string[] => {
+    const joined = b.lines.join('\n').replace(/\n {4}/g, ' ');
+    const line = joined.split('\n').find((l) => l.startsWith(`  ${mark} `));
+    return line === undefined ? [] : line.slice(4).split(mark === '✓' ? ', ' : '; ');
+  };
+
+  it('summary counts equal the lines of the parts', () => {
+    const r = report();
+    const t = renderTerminal(r, SHORT);
+    const m = SUMMARY.exec(lines(t)[1] as string);
+    expect(m, lines(t)[1]).not.toBeNull();
+    const parts = blocks(t).filter((b) => b.id > 0);
+    const sum = (mark: '✗' | '⚠' | '✓') => parts.reduce((n, b) => n + itemsOf(b, mark).length, 0);
+    expect([sum('✗'), sum('⚠'), sum('✓')]).toEqual([Number(m?.[1]), Number(m?.[2]), Number(m?.[3])]);
+    // the model agrees, and nothing is cut: every gap of rankGaps is in a part
+    const g = rankGaps(r);
+    expect(Number(m?.[1])).toBe(g.fixFirst.length);
+    expect(Number(m?.[2])).toBe(g.consider.length);
+    expect(shortParts(r).reduce((n, p) => n + p.fix.length + p.consider.length, 0)).toBe(g.fixFirst.length + g.consider.length);
+  });
+
+  it('summary counts: the "couldn\'t tell" count is added only when a check is unknown', () => {
+    const t = renderTerminal(report(), SHORT);
+    expect(lines(t)[1]).toMatch(/ · 1 couldn't tell$/);
+    const none = renderTerminal({ ...report(), coverage: report().coverage.filter((c) => c.status !== 'unknown') }, SHORT);
+    expect(lines(none)[1]).not.toContain("couldn't tell");
+  });
+
+  it('layout: title and commit, the summary line, B5 warnings, Type, the parts, What now? last', () => {
+    const t = renderTerminal(report(), SHORT);
+    const ls = lines(t);
+    expect(ls[0]).toBe('pipegen audit: acme/shop-api (f4bcfab on main)');
+    expect(ls[1]).toMatch(SUMMARY);
+    const at = (s: string) => ls.findIndex((l) => l.startsWith(s));
+    const order = ['⚠ Secret-like text on disk', '1 On your computer', '2 Every pull request', 'What now?'].map(at);
+    expect(order.every((i) => i > 1), t).toBe(true);
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+    // What now? is the last block: no part title, no list item after it
+    const now = at('What now?');
+    expect(ls.slice(now + 1).every((l) => l.startsWith('  ') || l === ''), t).toBe(true);
+    expect(ls.slice(now + 1).join('\n')).toContain('pipegen --verbose');
+    expect(t).not.toMatch(/^Verdict:|^Fix first|^Consider|^Already good|^Details:/m);
+  });
+
+  it('parts in order 1–6, and a part holds only its own checks', () => {
+    const t = renderTerminal(report(), SHORT);
+    const ids = blocks(t).filter((b) => b.id > 0).map((b) => b.id);
+    expect(ids).toEqual([...ids].sort((a, b) => a - b));
+    expect(new Set(ids).size).toBe(ids.length);
+    const b = (id: number) => blocks(t).find((x) => x.id === id);
+    expect(itemsOf(b(1) as { lines: string[] }, '✗').some((x) => x.startsWith('Secret scan before each commit'))).toBe(true);
+    expect(itemsOf(b(2) as { lines: string[] }, '✗').some((x) => x.startsWith('Code scan (SAST)'))).toBe(true);
+    expect(itemsOf(b(3) as { lines: string[] }, '⚠').some((x) => x.startsWith('Merge gate (pipegen)'))).toBe(true);
+  });
+
+  it('empty part left out', () => {
+    const t = renderTerminal(report(), SHORT);
+    // the fixture has rows in parts 1 to 5 only (no scheduled or repo-setting check)
+    const shown = blocks(t).filter((b) => b.id > 0).map((b) => b.id);
+    expect(shown).toEqual([1, 2, 3, 4, 5]);
+    expect(t).not.toContain(PART_TITLE[6 as PartId]);
+    const nothing = renderTerminal({ ...report(), coverage: [], wouldAdd: [], warnings: [], secretsInTree: [] }, SHORT);
+    for (const title of Object.values(PART_TITLE)) expect(nothing).not.toContain(title);
+  });
+
+  it('every part has the checks of its own rows, nothing is dropped (all six parts)', () => {
+    const cats = ['hooks', 'secrets', 'gate', 'sbom', 'deploy-verify', 'scorecard'];
+    const rows: Coverage[] = cats.map((id) => ({ need: { ...need(id === 'hooks' ? 'pre-commit' : 'push', id), category: id } as Coverage['need'], status: 'missing', why: `No ${id}.` }));
+    const t = renderTerminal({ ...report(), coverage: rows, wouldAdd: [] }, SHORT);
+    expect(blocks(t).filter((b) => b.id > 0).map((b) => b.id)).toEqual([1, 2, 3, 4, 5, 6]);
+    const total = blocks(t).filter((b) => b.id > 0).reduce((n, b) => n + itemsOf(b, '✗').length + itemsOf(b, '⚠').length, 0);
+    expect(total).toBe(6);
+  });
+
+  it('already-good and consider checks take one line each; the rest is counted, and the summary still counts all', () => {
+    const r = report();
+    const good = ['secrets', 'sast', 'deps', 'unit-tests', 'full-tests', 'lint', 'coverage', 'dead-code', 'duplication', 'iac', 'licences', 'dockerfile-lint', 'workflow-lint'];
+    const warn = ['format', 'coverage', 'licences', 'dead-code', 'duplication', 'iac', 'sast', 'deps', 'lint', 'unit-tests', 'full-tests', 'workflow-lint'];
+    const rows: Coverage[] = [
+      ...good.map((id): Coverage => ({ need: need('push', id), status: 'covered', by: 'x', why: 'ok.' })),
+      ...warn.map((id): Coverage => ({ need: { ...need('merge', `w-${id}`), category: id, blocking: false } as Coverage['need'], status: 'missing', why: 'no.' })),
+    ];
+    const t = renderTerminal({ ...r, coverage: rows, wouldAdd: [], profile: { ...r.profile, services: [] } }, SHORT);
+    const block = lines(t).slice(lines(t).findIndex((l) => l.startsWith('2 Every pull request')) + 1);
+    const goodLine = block.filter((l) => l.startsWith('  ✓ '));
+    expect(goodLine).toHaveLength(1);
+    expect(goodLine[0]).toMatch(/and \d+ more \(--verbose\)$/);
+    const warnLine = block.filter((l) => l.startsWith('  ⚠ '));
+    expect(warnLine).toHaveLength(1);
+    expect(warnLine[0]).toMatch(/and \d+ more \(--verbose\)$/);
+    expect(block.slice(0, block.findIndex((l) => l.startsWith('What now?'))).filter((l) => /^ {4}\S/.test(l))).toEqual([]);
+    const parts = shortParts({ ...r, coverage: rows, wouldAdd: [], profile: { ...r.profile, services: [] } });
+    expect(parts[1]?.good).toHaveLength(good.length);
+    expect(parts[1]?.consider.length).toBeGreaterThan(5);
+    expect(lines(t)[1]).toMatch(new RegExp(`^0 to fix · ${parts[1]?.consider.length} to consider · ${good.length} already good`));
+  });
+
+  it('B5: every warning still shown', () => {
+    const RATE = { text: "GitHub's rate limit was reached, so pipegen couldn't read everything it needs from GitHub." };
+    const SWAP = { text: 'This repo could change which pipegen runs. Run pipegen from outside the repo with:', command: 'npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./repo' };
+    const r = { ...report(), warnings: [RATE, SWAP], wouldAddNote: 'These picks are based on incomplete GitHub data (rate limit).' };
+    const t = renderTerminal(r, SHORT);
+    const f = flat(t);
+    for (const s of [RATE.text, SWAP.text, 'incomplete GitHub data', 'Secret-like text on disk: 2 files (.env, config/dev.json; --verbose for all)']) expect(f, s).toContain(s);
+    expect(lines(t)).toContain(`    ${SWAP.command}`);
+    // all of it above the parts
+    const firstPart = lines(t).findIndex((l) => /^1 On your computer/.test(l));
+    for (const s of ['rate limit was reached', 'which pipegen runs', 'incomplete GitHub data', 'Secret-like text']) expect(lines(t).findIndex((l) => l.includes(s)), s).toBeLessThan(firstPart);
+  });
+
+  it('no file:line and no "how to fix" text in the short report', () => {
+    const r = report();
+    const t = renderTerminal(r, SHORT);
+    expect(t).not.toMatch(/[\w./-]+\.(ya?ml|json|ts|js|md):\d+/);
+    for (const c of r.coverage) if (c.why !== '') expect(flat(t)).not.toContain(c.why);
+    expect(t).not.toMatch(/Without a /);
+    // the full report still has them
+    expect(flat(renderTerminal(r, FULL))).toContain('Without a code scan');
+  });
+
+  it('a one-service repo does not repeat the service name on each line', () => {
+    const t = renderTerminal(report(), SHORT);
+    expect(blocks(t).filter((b) => b.id > 0).flatMap((b) => b.lines).join('\n')).not.toContain('for shop-api');
+    const rows: Coverage[] = ['a', 'b'].map((s) => ({ need: need('push', 'sast', s), status: 'missing', why: 'No code scan.' }));
+    expect(renderTerminal({ ...report(), coverage: rows, wouldAdd: [] }, SHORT)).toContain('Code scan (SAST) for a and b');
+  });
+
+  it('a partial check says so; the tool the setup names is in brackets', () => {
+    const t = renderTerminal(report(), SHORT);
+    expect(flat(t)).toContain('Dependency check (partial)');
+    expect(t).toContain('Code scan (SAST) [semgrep]');
+  });
+
+  it('a credit note sits under the part of its credit', () => {
+    const r = { ...report(), profile: { ...report().profile, private: true } };
+    const signed: Coverage = { need: { ...need('deploy', 'signing', 'shop-api'), category: 'signing' } as Coverage['need'], status: 'covered', by: 'cosign', why: 'ok.', credit: 'CI signs the release artifacts with cosign (sign-blob)', creditKind: 'signing' };
+    const t = renderTerminal({ ...r, coverage: [...r.coverage, signed] }, SHORT);
+    const four = blocks(t).find((b) => b.id === 4) as { lines: string[] };
+    expect(four.lines.join(' ')).toContain('public Sigstore log');
+    expect(itemsOf(four, '✓').some((x) => /signing/i.test(x))).toBe(true);
+  });
+
+  it('a plan limit is shown under What now? only when it blocks a fix-first check', () => {
+    const t = renderTerminal(report(), SHORT);
+    const now = lines(t).findIndex((l) => l.startsWith('What now?'));
+    expect(flat(lines(t).slice(now).join('\n'))).toContain(LIMIT.noCodeScanning);
+    expect(flat(lines(t).slice(0, now).join('\n'))).not.toContain(LIMIT.noCodeScanning);
+  });
+
+  it('every line is at most 80 columns (own commands excepted)', () => {
+    const r = { ...report(), warnings: [{ text: 'x '.repeat(120) }] };
+    for (const l of lines(renderTerminal(r, SHORT))) expect([...l].length, l).toBeLessThanOrEqual(80);
   });
 });

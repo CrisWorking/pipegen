@@ -689,8 +689,8 @@ export function buildDoc(r: AuditReport, c: Ctx): Doc {
 
 // ---------- terminal ----------
 
-/** Words wrapped to WIDTH code points; a word longer than a line is cut across lines. */
-export function wrap(s: string, first: string, rest: string = ' '.repeat([...first].length)): string[] {
+/** Words wrapped to `width` (default WIDTH) code points; a word longer than a line is cut across lines. */
+export function wrap(s: string, first: string, rest: string = ' '.repeat([...first].length), width: number = WIDTH): string[] {
   const out: string[] = [];
   let line = first;
   let len = [...first].length;
@@ -699,14 +699,14 @@ export function wrap(s: string, first: string, rest: string = ' '.repeat([...fir
   for (const word of s.split(' ')) {
     if (word === '') continue;
     let w = [...word];
-    if (!fresh && len + 1 + w.length > WIDTH) {
+    if (!fresh && len + 1 + w.length > width) {
       out.push(line);
       line = rest;
       len = restLen;
       fresh = true;
     }
-    while ((fresh ? 0 : 1) + w.length > WIDTH - len && WIDTH - len > 10) {
-      const take = WIDTH - len - (fresh ? 0 : 1);
+    while ((fresh ? 0 : 1) + w.length > width - len && width - len > 10) {
+      const take = width - len - (fresh ? 0 : 1);
       out.push(`${line}${fresh ? '' : ' '}${w.slice(0, take).join('')}`);
       w = w.slice(take);
       line = rest;
