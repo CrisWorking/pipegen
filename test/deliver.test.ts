@@ -2136,3 +2136,26 @@ describe('Plan V M5: deliver holds the app lease', () => {
     probe2.releaseLease();
   });
 });
+
+describe('G-COCASE-R2 M1: deliver refuses a CODEOWNERS case variant on its second tree reads', () => {
+  it('G-COCASE-R2 M1: deliver: a case variant added between the build and deliver (app or central) means no non-GET request goes out', async () => {
+    const w = world();
+    const p = profile();
+    const c = await deliverCentral(w.g.octokit(), p, centralFiles(), { clock: { budget: newRateBudget(), sleep: async () => {} }, ...cdeps(w) });
+    if (c.kind !== 'pinned') throw new Error('expected a pin');
+    const plan = planDelivery(input(p, c.sha, c.committed === true ? { centralCommitted: c.sha } : {}));
+    // the variant lands after the build, at a place delivery doesn't write (checkBase looks only at delivered paths)
+    w.g.commitOn('o/r', 'main', { 'docs/codeowners': '* @mallory\n' }, 'owner: edit');
+    const before = w.g.calls.length;
+    const e = await deliver(w.g.octokit(), p, plan, w.vault, deps(w)).then(() => null, (x: unknown) => x as Error);
+    expect(e?.message).toMatch(/o\/r has docs\/codeowners \(rename it to docs\/CODEOWNERS/);
+    expect(e?.message).not.toMatch(/before changing anything|exit code 2/);
+    expect(w.g.calls.slice(before).filter((x) => !x.route.startsWith('GET '))).toEqual([]);
+    // control: without the variant the same plan delivers
+    const w2 = world();
+    const c2 = await deliverCentral(w2.g.octokit(), p, centralFiles(), { clock: { budget: newRateBudget(), sleep: async () => {} }, ...cdeps(w2) });
+    if (c2.kind !== 'pinned') throw new Error('expected a pin');
+    const plan2 = planDelivery(input(p, c2.sha, c2.committed === true ? { centralCommitted: c2.sha } : {}));
+    await expect(deliver(w2.g.octokit(), p, plan2, w2.vault, deps(w2))).resolves.toBeDefined();
+  });
+});

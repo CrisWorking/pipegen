@@ -21,7 +21,8 @@ import type { Octokit } from '@octokit/rest';
 import { AiSpendMeter } from '../src/ai/spend-meter.js';
 import type { mapCoverage } from '../src/audit/coverage.js';
 import type { CodeBundle } from '../src/ai/redact.js';
-import { proofReposFor, onCreatedFor, scanCounted, provenDraft, NOT_IN_SCOPE, NO_MEMORY_FOLDER, SECRET_FOUND, notProvableNotes, auditCredits, createdInputsFor, dastWayPast, defaultProof, fullRun, judgeBuilt, NEVER_SKIPPED, parseSkip, runCreators, SCOPE_LINE, UNPINNED, WINDOWS_REFUSAL, GATE_UNREACHABLE, guardRecord, insertedBlock, type Built, type BuildInput, type GitHubFacts, type RunDeps, type RunStages } from '../src/cli/run.js';
+import { FakeGitHub } from './helpers/deliver-github.js';
+import { proofReposFor, onCreatedFor, scanCounted, provenDraft, NOT_IN_SCOPE, NO_MEMORY_FOLDER, SECRET_FOUND, notProvableNotes, auditCredits, createdInputsFor, dastWayPast, defaultProof, fullRun, judgeBuilt, NEVER_SKIPPED, parseSkip, runCreators, SCOPE_LINE, UNPINNED, WINDOWS_REFUSAL, GATE_UNREACHABLE, guardRecord, insertedBlock, readBuildFacts, type Built, type BuildInput, type GitHubFacts, type RunDeps, type RunStages } from '../src/cli/run.js';
 import { assembledJobs, consentJobs, docFor, draftFromDebate, isAiNote, parseStrictness, pickOwners, prWaitMinutes, proofAssembler, proofLayout, warnFirstFor, signingFor } from '../src/cli/run-parts.js';
 import { EXIT_UNSAFE_FOLDER, TYPE_CANCELLED } from '../src/cli/audit.js';
 import { run as main, type Commands } from '../src/cli/main.js';
@@ -215,6 +216,21 @@ describe('G13: --skip', () => {
 // ---------- the order ----------
 
 describe('G13: the run, in order', () => {
+  it('G-COCASE-R2 M2: run: a case variant the late check (readBuildFacts) finds stops the run with exit 1 and its own wording (no "before changing anything", no exit code 2)', async () => {
+    const g = new FakeGitHub();
+    g.addRepo(`${OWN}/r`, { private: true, files: { 'README.md': 'hi\n' } });
+    g.addRepo(`${OWN}/pipelines`, { private: true, files: { 'README.md': 'central\n', '.GitHub/CODEOWNERS': '* @x\n' } });
+    const w = world();
+    w.stages.build = async (bi) => { await readBuildFacts({ ...bi, facts: { ...bi.facts, gh: g.octokit() } }); throw new Error('readBuildFacts should have refused'); };
+    const i = io();
+    const code = await run(w, i);
+    expect(code).toBe(1);
+    const text = i.errs.join('\n');
+    expect(text).toMatch(/pipegen stopped: .*\.GitHub\/CODEOWNERS \(rename it to \.github\/CODEOWNERS/);
+    expect(text).not.toMatch(/before changing anything/);
+    expect(text).not.toMatch(/exit code 2/);
+  });
+
   it('G-COCASE-R1: run: a CODEOWNERS case variant stops setup right after the read-only checks, before consent and any write (exit 2)', async () => {
     const msg = 'pipegen stopped before changing anything: o/r has .GitHub/CODEOWNERS (rename it to .github/CODEOWNERS (or remove it)). exit code 2.';
     const w = world({ coCase: msg });

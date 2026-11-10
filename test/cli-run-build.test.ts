@@ -568,9 +568,12 @@ describe('G-COCASE-R1: setup refuses a CODEOWNERS case variant before any write'
     expect(await coCaseOfRepos(ok.i.facts, ok.i.draft.profile)).toBeNull();
   });
 
-  it('G-COCASE-R1: setup/run: readBuildFacts refuses a case variant too (one that appeared after the early check), before anything is built or written', async () => {
+  it('G-COCASE-R1: setup/run: readBuildFacts refuses a case variant on its own (the late check, with its own wording), before anything is built or written', async () => {
     const a = repos({}, { CodeOwners: '* @x\n' });
-    await expect(readBuildFacts(a.i)).rejects.toThrow(/pipelines has CodeOwners \(rename it to CODEOWNERS/);
+    const e = await readBuildFacts(a.i).then(() => null, (x: unknown) => x as Error);
+    expect(e?.message).toMatch(/pipelines has CodeOwners \(rename it to CODEOWNERS/);
+    // G-COCASE-R2 M2: the late check claims nothing it can't know (the proof and the central repo may have been written)
+    expect(e?.message).not.toMatch(/before changing anything|exit code 2/);
     expect(a.writes).toEqual([]);
   });
 });

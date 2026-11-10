@@ -28,7 +28,7 @@ import { protectedMatcher } from '../engine/protected-match.js';
 import { SIGNING_ENVIRONMENT } from '../engine/referee.js';
 import { pubKeySha256 } from '../engine/signing.js';
 import { clockOf } from '../github/client.js';
-import { CENTRAL_RULESET, CO_PLACES, GATE_RULESET, REVIEWS_RULESET } from '../layers/locks.js';
+import { CENTRAL_RULESET, CO_PLACES, coKey, GATE_RULESET, REVIEWS_RULESET } from '../layers/locks.js';
 import { GATE_CHECK_INTEGRATION_ID, GATE_CHECK_NAME, PROTECTED_PATHS_BASE, type InstallRecord } from '../types.js';
 import { safeText } from '../util/safe-text.js';
 import { readEnv, SETUP_BRANCH } from './deliver.js';
@@ -76,6 +76,11 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
   const body = prNumber === undefined ? null : await api.readOr404('GET /repos/{owner}/{repo}/pulls/{pull_number}', { owner: app.owner, repo: app.repo, pull_number: prNumber });
   const marker = isObj(body) ? recordMarkerOf(typeof body.body === 'string' ? body.body : '') : null;
   if (marker !== hash) drift.push({ what: 'install record hash (setup pull request body)', expected: hash, actual: marker });
+  // G-COCASE-R2 M4: the setup pull request merged but the record names no merge: finish never completed, so no lock it plans is checked
+  // below (they are judged only once finish ran) and none may be in force
+  if (r.mergedAt === undefined && isObj(body) && typeof body.merged_at === 'string' && body.merged_at !== '') {
+    drift.push({ what: 'finish (the locks after the merge)', expected: 'the install record names the setup pull request\'s merge (finish ran to the end)', actual: 'finish has not completed: run `pipegen finish`' });
+  }
 
   // the files and edits, on each default branch
   const trees: Record<'app' | 'central', Map<string, TreeEntry> | null> = { app: await treeOf(gh, app, clock), central: await treeOf(gh, central, clock) };
@@ -134,7 +139,7 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
     if (edited.size === 0) continue;
     // G-FINREC-R3 i-a: names compared in lower case (fail closed: a case variant GitHub might read first counts as present)
     const paths = [...(trees[repo]?.keys() ?? [])];
-    const at = CO_PLACES.map((p) => paths.filter((x) => x.toLowerCase() === p.toLowerCase())).find((m) => m.length > 0);
+    const at = CO_PLACES.map((p) => paths.filter((x) => coKey(x) === coKey(p))).find((m) => m.length > 0);
     const first = at?.find((x) => !edited.has(x));
     if (first === undefined) continue;
     const ours = [...edited].map((p) => show(p)).join(', ');
@@ -164,6 +169,10 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
         why = 'it can\'t be read';
       }
     }
+    // G-COCASE-R2 I1: a lone candidate that isn't exactly a CO_PLACES entry: a case-sensitive GitHub reads no CODEOWNERS there (its content
+    // is still checked below)
+    const exact = first === undefined ? undefined : CO_PLACES.find((p) => coKey(p) === coKey(first));
+    if (first !== undefined && exact !== first) drift.push({ what: `the central CODEOWNERS name (${show(first)})`, expected: `${exact ?? '.github/CODEOWNERS'}, exactly the name GitHub reads`, actual: `${show(first)} differs from ${exact ?? '.github/CODEOWNERS'} only in letter case (or by a look-alike letter), so GitHub may not read it: rename it to ${exact ?? '.github/CODEOWNERS'}` });
     const want = [...new Set(r.planned.owners.central.map((o) => o.replace(/^@/, '').toLowerCase()))].sort();
     const got = text === null ? [] : pipegenBlockOwners(text);
     const planned = `pipegen's block in ${where} with the planned owners ${want.map((o) => `@${o}`).join(' ')} (the central ruleset asks for code-owner review)`;
@@ -285,7 +294,7 @@ function coCandidates(paths: Iterable<string>): string[] {
   const all = [...paths];
   const out: string[] = [];
   for (const p of CO_PLACES) {
-    const m = all.filter((x) => x.toLowerCase() === p.toLowerCase());
+    const m = all.filter((x) => coKey(x) === coKey(p));
     out.push(...m);
     if (m.includes(p)) break;
   }

@@ -44,6 +44,7 @@ import type { StarterDeps } from '../create/tests.js';
 import { deliver, deliverCentral, DeliverError, dropRunSigningEnvironment, makeRunSigningEnvironment, planDelivery, previewText, readCentralFileList, type DeliverResult, type DeliveryInput, type SigningKey, type CentralPr, type CentralResult } from '../deliver/deliver.js';
 import { pipegenDoc } from '../deliver/docs.js';
 import { coCaseProblem, coFacts, type CoFacts } from '../deliver/finish.js';
+import { coCaseLate } from '../deliver/co-case.js';
 import { readBlobText, readHead, readRepo, readTree } from '../deliver/git-data.js';
 import type { CreatedInputs } from '../engine/created-files.js';
 import { discover } from '../engine/discover.js';
@@ -1156,7 +1157,8 @@ export async function readBuildFacts(i: BuildInput): Promise<BuildFacts> {
   const cHead = await readHead(gh, central, centralRepo.defaultBranch, clock);
   const cTree = cHead === null ? new Map() : (await readTree(gh, central, cHead, clock)).entries;
   // G-COCASE-R1: the same refusal as the early check (a variant that appeared since), before anything is built
-  const caseStop = coCaseProblem([{ label: `${p.owner}/${p.repo}`, paths: tree.entries.keys() }, { label: `${p.owner}/${CENTRAL_REPO}`, paths: cTree.keys() }], 'npx pipegen run');
+  // G-COCASE-R2 M2: the late wording (the proof and the central commit may be behind it: no "before changing anything", no exit code)
+  const caseStop = coCaseLate([{ label: `${p.owner}/${p.repo}`, paths: tree.entries.keys() }, { label: `${p.owner}/${CENTRAL_REPO}`, paths: cTree.keys() }], 'npx pipegen run');
   if (caseStop !== null) throw new DeliverError(caseStop);
   const appCo0 = await coFacts(gh, app, tree.entries, clock);
   const centralCo0 = await coFacts(gh, central, cTree, clock);

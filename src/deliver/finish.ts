@@ -54,6 +54,7 @@ import { emptyRepoFiles } from '../read/quality.js';
 import { MAX_WORKFLOWS, tagPinnedOf, WORKFLOW_FILE } from '../read/workflows.js';
 import { PROTECTED_PATHS_BASE, type Capabilities, type CreatedFile, type EnvSettings, type ExistingWorkflow, type InstallEdit, type InstallPlanned, type InstallRecord, type Plan, type RepoProfile } from '../types.js';
 import { safeText } from '../util/safe-text.js';
+import { coCaseProblem } from './co-case.js';
 import { generateCosignKeys } from '../layers/deploy.js';
 import type { CosignExec, CosignResolver } from './cosign-keys.js';
 import { ensureSigningEnvironment, pathClash, plannedOfLocks, readEnv, SETUP_BRANCH } from './deliver.js';
@@ -84,24 +85,8 @@ export class CoCaseError extends FinishError {
   readonly exitCode = 2;
   constructor(message: string) { super(message); this.name = 'CoCaseError'; }
 }
-/**
- * G-COCASE-R1: the stop message when a repo holds a path that is a CO_PLACES entry in another letter case, or null. GitHub may read such a
- * file instead of the one pipegen writes, and the gate reads only the exact path, so finish and setup refuse (fail closed) rather than
- * write a second file. `command` is the one to run again.
- */
-export function coCaseProblem(repos: readonly { label: string; paths: Iterable<string> }[], command: string): string | null {
-  const parts: string[] = [];
-  for (const r of repos) {
-    const found: string[] = [];
-    for (const x of r.paths) {
-      const exact = CO_PLACES.find((p) => p.toLowerCase() === x.toLowerCase());
-      if (exact !== undefined && exact !== x) found.push(`${show(x)} (rename it to ${exact} (or remove it))`);
-    }
-    if (found.length > 0) parts.push(`${show(r.label)} has ${found.join(', ')}`);
-  }
-  if (parts.length === 0) return null;
-  return `pipegen stopped before changing anything: ${parts.join('; ')}. A CODEOWNERS whose name differs from the path GitHub reads only in letter case may be read instead of the file pipegen writes, and the gate reads only the exact path. Rename it as shown (or remove it), then run \`${command}\` again. exit code 2.`;
-}
+/** G-COCASE-R1/R2: shared with setup and deliver (co-case.ts, no import cycle). */
+export { coCaseProblem } from './co-case.js';
 /** One step's own refusal (a read-back that doesn't match, an answer that can't be read): reported, the step not applied. */
 class StepError extends Error {}
 
