@@ -216,7 +216,8 @@ export function shortParts(r: AuditReport): PartView[] {
     fix: g.serious.filter((x) => x.part === part),
     consider: g.other.filter((x) => x.part === part),
     good: [...(good.get(part) ?? [])],
-    notes: creditNotes(r.coverage.filter((x) => partOf(x.need) === part), r.profile),
+    // the host-deploy Consider line (PL-B2) belongs to part 5, so it shows once
+    notes: creditNotes(r.coverage.filter((x) => partOf(x.need) === part), r.profile, part === 5 ? r.hostDeploys : []),
   }));
 }
 

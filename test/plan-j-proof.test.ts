@@ -395,3 +395,20 @@ describe('Plan J proof set: the short report', () => {
     });
   }
 });
+
+// ---------- 8. Plan P PL-B2: a host's Git-integration deploy ----------
+describe('Plan P PL-B2: a static site Netlify deploys from Git', () => {
+  it('static-netlify-git (invented: netlify.toml, CI on pull requests only, no deploy workflow) → one warning and one Consider line, minimum kept', async () => {
+    const dir = makeRepo('static-netlify-git', 'https://github.com/o/r.git');
+    const r = await buildAudit(dir, {
+      gh, anonymous: false, context: { private: false, ownerType: 'User', plan: 'free', defaultBranch: 'main' }, capabilities: bare,
+      permissions: [], reviewed: [], now: () => NOW, budget: newRateBudget(),
+    });
+    expect(r.profile.services.map((s) => s.projectType?.types)).toEqual([['static-site']]);
+    expect(r.hostDeploys).toEqual([{ host: 'Netlify', file: 'netlify.toml' }]);
+    const t = renderTerminal(r, { knownValues: [], now: () => NOW });
+    expect(t.split('\n').filter((l) => l.includes('Netlify deploys this site from Git')).length).toBe(1);
+    expect(t.slice(t.indexOf('5 Deploy')).split('\n').filter((l) => l.includes('Netlify deploy (netlify.toml)')).length).toBe(1);
+    for (const cat of MINIMUM_CATEGORIES) expect(r.coverage.some((x) => x.need.category === cat), cat).toBe(true);
+  });
+});

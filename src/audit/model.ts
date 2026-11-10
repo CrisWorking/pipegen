@@ -51,6 +51,7 @@ import { signingMode } from '../github/signing-mode.js';
 import { codeSecurityAvailable } from '../github/availability.js';
 import { readHeadCommit, type HeadCommit } from '../read/git-head.js';
 import { readGitIndexPaths } from '../read/git-index.js';
+import { hostDeployOf, type HostDeploy } from '../read/host-deploy.js';
 import { loadIgnore } from '../read/gitignore.js';
 import { IGNORED_DIRS, listFiles, READ_LIMITS, readTextLimited, readTextLimitedWithReason } from '../read/limits.js';
 import { readProject } from '../read/project.js';
@@ -161,6 +162,11 @@ export interface AuditReport {
    * them (private, plan unknown, the unread capabilities off): this plain note says so in every output. Else null.
    */
   wouldAddNote: string | null;
+  /**
+   * Plan P PL-B2: hosts that deploy a service straight from Git (their config file), when no workflow in the repo deploys;
+   * each gives one warning and one Consider line. Absent = none.
+   */
+  hostDeploys?: HostDeploy[];
   /** Only with --ai, after consent (Task 2b, addAiSuggestions); mention-only. */
   ai?: AuditAi;
 }
@@ -484,7 +490,8 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
   const signalsUnread: GitHubFact[] = [];
   coverage = await defaultSetupRows(deps, profile, coverage, signalsUnread);
   coverage = await lastRunRows(deps, profile, coverage, signalsUnread, notes);
-  for (const n of creditNotes(coverage, profile)) notes.add(n);
+  const hostDeploys = await hostDeploysOf(dir, profile);
+  for (const n of creditNotes(coverage, profile, hostDeploys)) notes.add(n);
   const wouldSet = wouldSetFor.map((x) => wouldSetSettings(x, coverage, skippedWf)).reduce((a, b) => same(a, b));
   const wouldAdd = wouldAddRows(profile, coverage, deps, caps);
 
@@ -536,8 +543,10 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
     warnings: [
       ...(stop === undefined ? [] : [{ text: rateLimitWarning(stop.resetAt, deps.now(), deps.anonymous, local.repo) }]),
       ...await warningsOf(dir, deps.anonymous),
+      ...hostDeploys.map((h) => ({ text: hostDeployWarning(h) })),
     ],
     notes: notes.all(),
+    hostDeploys,
     reviewedUnavailable: deps.reviewedUnavailable === true,
     githubIncomplete,
     wouldAddNote: githubIncomplete === null ? null : WOULD_ADD_INCOMPLETE,
@@ -620,10 +629,35 @@ async function defaultSetupRows(deps: AuditDeps, p: RepoProfile, rows: Coverage[
 
 /** The notes a credited row (DECISIONS #122) brings: what the credit leaves unchecked, and the private-repo signing warning (S17). */
 const KEYLESS_PRIVATE_NOTE = "If the release signing is keyless (no key given to cosign), it writes this private repo's and workflow's names to the public Sigstore log.";
-export function creditNotes(rows: readonly Coverage[], p: RepoProfile): string[] {
+export function creditNotes(rows: readonly Coverage[], p: RepoProfile, hostDeploys: readonly HostDeploy[] = []): string[] {
   const out: string[] = [];
   if (rows.some((r) => r.status === 'covered' && r.creditKind === 'push-default')) out.push(PUSH_CREDIT_WARNING);
   if (p.private && rows.some((r) => r.status === 'covered' && r.creditKind === 'signing')) out.push(KEYLESS_PRIVATE_NOTE);
+  for (const h of hostDeploys) out.push(hostDeployConsider(h));
+  return out;
+}
+
+/** Plan P PL-B2: the warning for a host's Git-integration deploy (host and file cleaned at output, like every warning). */
+export function hostDeployWarning(h: HostDeploy): string {
+  return `${h.host} deploys this site from Git (${h.file}); no workflow in the repo deploys it, so pipegen can't check a deploy before it happens.`;
+}
+
+/** Plan P PL-B2: the matching Consider line. */
+export function hostDeployConsider(h: HostDeploy): string {
+  return `${h.host} deploy (${h.file}): deploy from a workflow that runs after the checks pass, so pipegen can check each deploy first.`;
+}
+
+/**
+ * Plan P PL-B2: each service's host config (one per host and file), but only when no workflow in the repo deploys: a
+ * deploy workflow is the deploy pipegen checks, and the host config then most likely only sets the build.
+ */
+async function hostDeploysOf(dir: string, p: RepoProfile): Promise<HostDeploy[]> {
+  if (p.existingWorkflows.some((w) => w.deploys)) return [];
+  const out: HostDeploy[] = [];
+  for (const s of p.services) {
+    const h = await hostDeployOf(dir, s);
+    if (h !== null && !out.some((x) => x.host === h.host && x.file === h.file)) out.push(h);
+  }
   return out;
 }
 
@@ -1034,7 +1068,7 @@ async function folderWhy(folder: string, where: string, repo: { top: string; ind
   if ((await lstat(join(folder, 'node_modules')).catch(() => null)) === null) return null;
   const gitInfo = repo === null ? null : await lstat(join(repo.top, '.git')).catch(() => null);
   const noIndex = gitInfo?.isFile() === true
-    ? '.git is a file there (a git worktree or submodule), so pipegen can\'t read its git index'
+    ? '.git is a file there (a git worktree or submodule pipegen can\'t verify), so pipegen can\'t read its git index'
     : repo === null ? 'it is in no git repo' : 'pipegen found no git index it can read';
   return `a node_modules folder pipegen can't tell is not committed (${noIndex}), in ${where}`;
 }
