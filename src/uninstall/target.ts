@@ -1164,7 +1164,7 @@ export class UninstallApi {
   async openUninstallPr(where: Where, pr: { base: string; title: string; body: string }): Promise<{ number: number; url: string; opened: boolean }> {
     if (interrupting()) refuse('a stop has begun; uninstall sends nothing more.');
     await this.#verify(where);
-    return openOrUpdatePr(this.#stopping, this.repoOf(where), { head: uninstallBranch(this.app, where), base: checkBranch(pr.base), title: pr.title, body: pr.body }, this.clock);
+    return openOrUpdatePr(this.#stopping, this.repoOf(where), { head: uninstallBranch(this.app, where), base: checkBranch(pr.base), title: pr.title, body: pr.body }, this.clock, 'uninstall');
   }
 
   /** The repo delete; only deleteCentralRepo calls it, after its checks. */

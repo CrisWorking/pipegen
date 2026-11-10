@@ -651,6 +651,14 @@ describe('G11 finish: what it records (Plan V §5)', () => {
     expect((await recordOn(t)).orgRuleset).toEqual({ org: 'o', id: org?.id, name: 'pipegen-required--r', githubCreatedAt: org?.created_at, pinnedSha: (org?.body.rules as { parameters: { workflows: { sha: string }[] } }[])[0]?.parameters.workflows[0]?.sha });
   });
 
+  it('PL-F1 R1: a note planLocks raises while finish runs names `npx pipegen finish` (planLocks command wiring)', async () => {
+    const t = await seed({ org: true });
+    t.g.memberships.set('o', { state: 'active', role: 'member' });
+    const res = await finish(t.g.octokit(), { owner: 'o', repo: 'r' }, {}, t.deps());
+    const all = [...res.notes, ...res.skipped.map((x) => `${x.what}: ${x.why}`)].join('\n');
+    expect(all).toMatch(/an owner can run `npx pipegen finish` again to add it/);
+  });
+
   it('finish: an access level GitHub doesn\'t name is never recorded (V9a-R2: uninstall prints the recorded level in a step)', async () => {
     const s = await seed();
     s.g.x('o/pipelines').access = 'user_x';

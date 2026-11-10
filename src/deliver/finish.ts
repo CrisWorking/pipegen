@@ -288,7 +288,7 @@ async function finishHeld(gh: Octokit, app: RepoRef, opts: FinishOpts, deps: Fin
     // the central rule is on already (reused, or made by an earlier finish): the record goes through the central pull request; a new rule
     // is still switched off here, so the record commit goes straight to the default branch (a refused direct move falls back to the PR)
     const via = x.centralRec.rulesetId !== undefined && x.activate === undefined ? 'pr' : 'direct';
-    written = await writeRecord(gh, { record, setupPr: pr.number, via, files: x.centralFiles, base: x.centralHead, clock, ...(deps.now === undefined ? {} : { now: deps.now }), ...(deps.local === undefined ? {} : { local: deps.local }) });
+    written = await writeRecord(gh, { record, setupPr: pr.number, via, files: x.centralFiles, base: x.centralHead, clock, command: 'finish', ...(deps.now === undefined ? {} : { now: deps.now }), ...(deps.local === undefined ? {} : { local: deps.local }) });
   } catch (e) {
     report(x, deps.out, 'unrecorded', stopWhy(e));
     if (isStop(e)) throw e;

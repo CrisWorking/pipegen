@@ -5,6 +5,8 @@ import { hostname, tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { cleanupCommand } from '../src/cli/cleanup.js';
+import { openOrUpdatePr } from '../src/deliver/git-data.js';
+import { holdUninstallLease } from '../src/uninstall/apply.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { makeOctokit } from '../src/github/client.js';
 import { readWriters } from '../src/github/lock-probes.js';
@@ -79,5 +81,23 @@ describe('PL-F1: shared code takes the command from its caller', () => {
     const io = { ...quietIo, out: () => {}, err: (x: string) => errs.push(x), env: { XDG_CACHE_HOME: join(home, '.cache') }, cwd: repo } as CliIO;
     expect(await cleanupCommand(repo, io, { allowBroad: false }, { home })).toBe(1);
     expect(errs.join('\n')).toContain('then run `npx pipegen cleanup` again.');
+  });
+
+  it('uninstall: a state file that is a symbolic link stops with `npx pipegen uninstall` (the apply.ts wiring)', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'pl-f1-'));
+    const s = await StateStore.openForLease(APP, { home, env: {} });
+    symlinkSync(join(home, 'nowhere'), s.path);
+    const e = await holdUninstallLease(APP, { home, env: {} }).then(() => null, (x: unknown) => x);
+    expect((e as Error).message).toContain('then run `npx pipegen uninstall` again.');
+  });
+
+  it('openOrUpdatePr: two open pull requests stop with the caller command; the default is the setup run', async () => {
+    const pr = { number: 1, html_url: 'u', head: { ref: 'b' } };
+    const f = fakeFetch({ 'GET https://api.github.com/repos/o/r/pulls': { body: [pr, { ...pr, number: 2 }] } });
+    const gh = makeOctokit(fake.githubPat(), { fetch: f.fetch });
+    const clock = { budget: newRateBudget(), sleep: async () => {} };
+    const args = { head: 'b', base: 'main', title: 't', body: 'x' };
+    await expect(openOrUpdatePr(gh, APP, args, clock)).rejects.toThrow(/then run `npx pipegen run` again\./);
+    await expect(openOrUpdatePr(gh, APP, args, clock, 'update')).rejects.toThrow(/then run `npx pipegen update` again\./);
   });
 });

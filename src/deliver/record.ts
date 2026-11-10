@@ -28,6 +28,7 @@ import { CENTRAL_REPO } from '../proof/target.js';
 import type { InstallRecord } from '../types.js';
 import { cosignPubProblem, MAX_COSIGN_PUB_BYTES } from '../util/cosign-pem.js';
 import { prepareTrustedDir, type TrustedDirKind } from '../util/trusted-dir.js';
+import { pipegenCmd } from '../util/next-step.js';
 import { safeText } from '../util/safe-text.js';
 import { commitFiles, compareStatus, DeliverError, ghRead, ghWrite, ISO_RE, openOrUpdatePr, readBlobText, readHead, readRepo, readTree, refusedMove, setBranch, type RepoRef, type TreeEntry } from './git-data.js';
 
@@ -522,6 +523,8 @@ export interface WriteRecordArgs {
   clock?: RateClock; now?: () => Date; local?: LocalRecordDeps;
   /** The central pull request's title and body (G12: `pipegen update` says what its central change is); the record marker is always the body's last line. */
   pr?: { title: string; body: string };
+  /** The command whose "run it again" stops these name (PL-F1); the setup run when omitted. */
+  command?: string;
 }
 export interface WriteRecordResult { recordHash: string; commit: string; via: 'direct' | 'pr'; centralPr?: { number: number; url: string }; notes: string[] }
 
@@ -576,7 +579,7 @@ export async function writeRecord(gh: Octokit, args: WriteRecordArgs): Promise<W
   if (!repo.private) throw new DeliverError(`${safeText(`${central.owner}/${central.repo}`, 120)} is public; pipegen keeps install records only in a private repo.`);
   const head = await readHead(gh, central, repo.defaultBranch, clock);
   if (head === null) throw new DeliverError(`${safeText(`${central.owner}/${central.repo}`, 120)} has no default branch to write the install record on.`);
-  if (extra.length > 0 && args.base !== head) throw new DeliverError(`${safeText(`${central.owner}/${central.repo}`, 120)} changed while pipegen was delivering, so it doesn't write its central files onto the new head; run \`npx pipegen run\` again.`);
+  if (extra.length > 0 && args.base !== head) throw new DeliverError(`${safeText(`${central.owner}/${central.repo}`, 120)} changed while pipegen was delivering, so it doesn't write its central files onto the new head; run ${pipegenCmd(args.command)} again.`);
   const files = [...extra.map((f) => ({ path: f.path, content: f.content, mode: '100644' })), { path: recordPath(app.repo), content: text, mode: '100644' }];
   const message = `pipegen: install record for ${record.app.repo}`;
 
@@ -602,7 +605,7 @@ export async function writeRecord(gh: Octokit, args: WriteRecordArgs): Promise<W
     const body = args.pr === undefined
       ? `pipegen's install record for ${safeText(`${app.owner}/${app.repo}`, 140)} (what it wrote, and what \`pipegen finish\` applies after the setup pull request is merged).\n\nMerge this pull request so \`pipegen finish\`, \`verify\` and uninstall can read it.\n\n${recordMarker(hash)}`
       : withRecordMarker(args.pr.body, hash);
-    const pr = await openOrUpdatePr(gh, central, { head: branch, base: repo.defaultBranch, title, body }, clock);
+    const pr = await openOrUpdatePr(gh, central, { head: branch, base: repo.defaultBranch, title, body }, clock, args.command);
     centralPr = { number: pr.number, url: pr.url };
   }
 

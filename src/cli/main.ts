@@ -20,7 +20,7 @@ import { uninstallCommand } from './uninstall.js';
 import { parseTypeFlags } from './type-confirm.js';
 
 /**
- * The help text. `npx pipegen run` inside the project folder comes first (DECISIONS #124, ruling S10); the safe mode for a
+ * The help text. `npx pipegen` inside the project folder comes first (DECISIONS #124, ruling S10); the safe mode for a
  * repo you don't trust carries the running version, exactly (ruling S30), or no command at all (U18).
  */
 function usage(): string[] {

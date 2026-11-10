@@ -264,7 +264,7 @@ export interface AuditDeps {
 const AUDIT_TODAY = ' You can run `pipegen audit` today.';
 /**
  * Ruling U18: no runnable full-setup command in v0.1 output. The npm name `pipegen` isn't pipegen's yet (it was published
- * in 2019 and unpublished, so anyone can claim it), so `npx pipegen run` could run someone else's package. `command` stays
+ * in 2019 and unpublished, so anyone can claim it), so `npx pipegen` could run someone else's package. `command` stays
  * null until the package is published; then fill it here and accept it in isOwnCommand.
  */
 const NEXT_STEP: Readonly<Record<Milestone, Readonly<Record<'v0.2' | 'v0.4' | 'none', { text: string; command: string | null }>>>> = {
@@ -282,7 +282,7 @@ const SEMVER = /^\d{1,9}\.\d{1,9}\.\d{1,9}$/;
  * constants and `version` (pipegen's own package.json), which must be a plain x.y.z, else it is left out.
  */
 export function safeRunCommand(version: string | null): string | null {
-  // No exact version, no command: an unpinned `npx pipegen run` runs whatever owns the npm name today (ruling U18).
+  // No exact version, no command: an unpinned `npx pipegen` runs whatever owns the npm name today (ruling U18).
   if (version === null || !SEMVER.test(version)) return null;
   return `npx --registry=${NPM_REGISTRY} pipegen@${version} audit --dir ./repo`;
 }
@@ -970,7 +970,7 @@ const SWAP_WALK_MAX = 256;
 
 /**
  * Plan J J5 (DECISIONS #124, ruling S8; J5 review fix rounds 1 and 2): what in the folders npm reads could change which
- * pipegen `npx pipegen run` runs, in plain words (the thing and the folder it is in), or null. npm reads the project
+ * pipegen `npx pipegen` runs, in plain words (the thing and the folder it is in), or null. npm reads the project
  * `.npmrc` of the nearest folder from the current one up that has a package.json or a node_modules (it doesn't stop at
  * `.git`), and npx runs a local bin. Two chains of folders are checked, each from the current folder (by real path) up:
  * - **the audited repo**, when `cwd` is `dir` or inside it: every folder up to and including `dir`, with dir's git index;
@@ -1109,7 +1109,7 @@ function committedNodeModules(index: ReadonlySet<string>, rel: string): boolean 
   return parents.has(rel === '' ? '' : rel.split('/').map(foldSeg).join('/'));
 }
 
-/** True when swapRiskWhy has an answer: started from `cwd`, `npx pipegen run` could run something other than pipegen. */
+/** True when swapRiskWhy has an answer: started from `cwd`, `npx pipegen` could run something other than pipegen. */
 export async function swapRisk(cwd: string, dir: string): Promise<boolean> {
   return (await swapRiskWhy(cwd, dir)) !== null;
 }
