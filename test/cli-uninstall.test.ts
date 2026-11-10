@@ -57,7 +57,8 @@ function fakes(over: Partial<UninstallCommandDeps> = {}, home = tmp('pg-unin-hom
   const g = { gh: {} as Octokit, login: 'alice', local: { home, env: {} } };
   const loaded = { app: { owner: 'o', repo: 'shop', repoId: 7 } } as never;
   const deps: UninstallCommandDeps = {
-    dir: '/x', allowBroad: false, deleteRepos: false,
+    // V9a (V8 sec M4): the command takes the app's lease before the loader: in this test's own home, never the machine's
+    dir: '/x', allowBroad: false, deleteRepos: false, state: { home, env: {} },
     connect: (async (_io: unknown, _dir: unknown, o: unknown) => { calls.push(`connect ${JSON.stringify(o)}`); return { app: APP, g, [TK_KEY]: TK }; }) as never,
     load: (async () => { calls.push('load'); return loaded; }) as never,
     step: (async () => { calls.push('step'); return result('a-done'); }) as never,
@@ -267,7 +268,7 @@ describe('V7: exit codes and messages', () => {
     expect(stepArgs[1]).toEqual({ marker: 'loaded' });
     // there is no preview-only or dry path that loads the record: the command has no such option
     const src = readFileSync(join(import.meta.dirname, '..', 'src', 'cli', 'uninstall.ts'), 'utf8');
-    expect(src.match(/\bloadUninstallRecord\)\(/g)?.length).toBe(1);
+    expect(src.match(/\bloadUninstallRecord\(/g)?.length).toBe(1);
     expect(src.replace(/\/\/.*$/gm, '').replace(/\/\*[^]*?\*\//g, '')).not.toMatch(/\b(?:dry|preview|dryRun)\b/i);
   });
 
@@ -328,9 +329,10 @@ describe('V7: the second run 2 through the command (V6 carry)', () => {
     mergePr(w, w.central, BR);
     expect(w.g.filesAt('o/pipelines', w.g.head('o/pipelines')).has(recordPath('shop'))).toBe(false);
     const second = mkio({ prompt: t.p });
-    // the record is gone from central: rebuilt, not "No install record". The run finishes (b-done) with kept items (the scratch repo's default
-    // branch), which are leftovers: exit 2, as the V5-R1 carry says
-    expect(await uninstallCommand(second, deps)).toBe(2);
+    // the record is gone from central: rebuilt, not "No install record". The run finishes (b-done); the scratch repo's kept default branch
+    // is a note, not a leftover (V8 sec i6, V9a), so a complete uninstall exits 0
+    expect(await uninstallCommand(second, deps)).toBe(0);
+    expect(second.lines.join('\n')).toMatch(/^Notes:/m);
     expect(TEXT(second)).not.toMatch(/No install record/);
     expect(second.lines.join('\n')).toMatch(/pipegen is uninstalled from o\/shop/);
     expect(existsSync(localRecordPath(APP, local(w)))).toBe(false);
@@ -355,8 +357,8 @@ describe('V7: the docs say what was built', () => {
   it('docs: design §14 (the repo-deletion right, the secrets line, the two runs and why), the threat model row and the V-live checklist', () => {
     const design = read('docs/design.md');
     const s14 = design.slice(design.indexOf('## 14. Uninstall'), design.indexOf('## 15.'));
-    // #127: v0.2 prints the commands; the App's right is the planned path
-    expect(s14).toContain('In v0.2, `--delete-repos` prints the `gh repo delete` commands');
+    // #127, V8-R1 (sec M2): v0.2 deletes no repo the user created and prints no command for it; the App's right is the planned path
+    expect(s14).toContain('so uninstall never deletes them and never prints a `gh repo delete` command for them, with or without `--delete-repos`');
     expect(s14).toMatch(/Planned next, with pipegen's own GitHub App login: `--delete-repos` will use the repo-deletion right the App already has \(Administration: write\)/);
     expect(s14).not.toMatch(/asked for only then/);
     expect(s14).toContain('Secrets pipegen created are removed: `PIPEGEN_`-prefixed ones directly, the app\'s own names only after you type the name.');
@@ -381,11 +383,11 @@ describe('V7: the docs say what was built', () => {
     expect(sec.length).toBeGreaterThan(500);
     expect(sec).toMatch(/Two runs, and why/);
     expect(sec).toMatch(/Administration \(read and write\) is optional/);
-    expect(sec).toMatch(/Members: read is optional/);
+    expect(sec).toMatch(/uninstall doesn't need Members: read/);
     expect(sec).toMatch(/HTTPS_PROXY/);
     expect(sec).toMatch(/no App to remove/);
     expect(sec).toMatch(/--required\.yml.*unfinished until you remove the organisation rule/s);
-    expect(sec).toMatch(/pipegen\/update-<name>.*withholds the command/s);
+    expect(sec).toMatch(/pipegen\/update-<name>.*hold that delete back/s);
     expect(sec).toMatch(/needs a terminal/);
   });
 });
@@ -407,7 +409,7 @@ describe('V7 fold 3 (DECISIONS #127): v0.2 uses a fine-grained token; the App is
     const access = readme.slice(readme.indexOf('- **Access:**'), readme.indexOf('- **Shown before anything runs:**'));
     expect(access).toMatch(/in v0\.2 you use a \*\*fine-grained token\*\*/);
     expect(access).not.toMatch(/a GitHub App or fine-grained token/);
-    for (const part of [/gh repo create <owner>\/pipelines --private/, /pipegen-proof-<repo> --private/, /empties the scratch repo after the proof instead of deleting it/, /`gh repo delete` commands/, /GitHub App login \(which makes and deletes these repos itself\) is planned next\./]) expect(access, String(part)).toMatch(part);
+    for (const part of [/gh repo create <owner>\/pipelines --private/, /pipegen-proof-<repo> --private/, /empties the scratch repo after the proof instead of deleting it/, /never deletes these repos or prints a delete command for them/, /GitHub App login \(which makes and deletes these repos itself\) is planned next\./]) expect(access, String(part)).toMatch(part);
     const design = read('docs/design.md');
     const s12 = design.slice(design.indexOf('## 12. Access'), design.indexOf('## 13.'));
     expect(s12).toMatch(/\*\*v0\.2 uses a fine-grained token\*\*/);
@@ -424,9 +426,9 @@ describe('V7 fold 3 (DECISIONS #127): v0.2 uses a fine-grained token; the App is
         expect(/print|planned|deletes no|delete no|deletes none|never deletes/i.test(l), `${f}: ${l.slice(0, 140)}`).toBe(true);
       }
     }
-    expect(read('README.md')).toMatch(/--delete-repos\s+# the second run also prints the gh repo delete commands/);
-    expect(read('docs/design.md')).toMatch(/In v0\.2, `--delete-repos` prints the `gh repo delete` commands for the scratch repo/);
-    expect(read('src/uninstall/central.ts')).toMatch(/with --delete-repos, to print the `gh repo delete` commands/);
+    expect(read('README.md')).toMatch(/--delete-repos\s+# v0\.2: deletes no repo and prints no delete command/);
+    expect(read('docs/design.md')).toMatch(/In v0\.2 you create `pipelines` and `pipegen-proof-<repo>` yourself, so uninstall never deletes them/);
+    expect(read('src/uninstall/central.ts')).not.toMatch(/to print the `gh repo delete` commands|repos pipegen made/);
     expect(read('src/github/client.ts')).not.toMatch(/App installation\\?'?s? ?\)|\(or the App installation/);
     expect(read('docs/smoke-test.md')).not.toMatch(/created by the App or by hand|pipegen's GitHub App login works/);
   });
@@ -436,7 +438,7 @@ describe('V7 fold 3 (DECISIONS #127): v0.2 uses a fine-grained token; the App is
     expect(await main(['--help'], h)).toBe(0);
     const help = h.lines.join('\n');
     expect(help).toMatch(/in v0\.2 you use a fine-grained token/);
-    expect(help).toMatch(/--delete-repos\s+uninstall: also print the gh repo delete commands/);
+    expect(help).toMatch(/--delete-repos\s+uninstall: in v0\.2 deletes no repo and prints no delete command/);
     expect(help).toMatch(/GitHub App login \(which makes and deletes these repos itself\) is planned next/);
     expect(help).not.toMatch(/With the pipegen App it deletes/);
     // no message of src tells the user to log in with, or install, the pipegen App (the App's own code paths excepted)

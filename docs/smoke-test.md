@@ -256,7 +256,7 @@ From `task-G15a-report.md` ("Live items for G16" and the items added in each rou
 
 ## Uninstall (V-live)
 
-Plan V's live check, after the Task 8 Step 5 list. Steps only: nobody ran them. Use a private throwaway repo of `CrisWorking` and its own `pipelines`, with a fine-grained token (v0.2 has no App login, so `--delete-repos` prints the `gh repo delete` commands and deletes nothing). Write the **before** lists first (UN-2) and the **after** lists last (UN-8); the difference must be exactly what pipegen made.
+Plan V's live check, after the Task 8 Step 5 list. Steps only: nobody ran them. Use a private throwaway repo of `CrisWorking` and its own `pipelines`, with a fine-grained token (v0.2 has no App login: you create the helper repos, so uninstall deletes no repo and prints no delete command, with or without `--delete-repos`). Write the **before** lists first (UN-2) and the **after** lists last (UN-8); the difference must be exactly what pipegen made.
 
 | # | Check | Source | Result |
 |---|---|---|---|
@@ -266,9 +266,9 @@ Plan V's live check, after the Task 8 Step 5 list. Steps only: nobody ran them. 
 | UN-4 | first run (phase A): the preview names every file, edit and lock; one yes; the PR `pipegen/uninstall` opens; pipegen's own open PRs are closed; the rulesets, the org rule and the classic protection are gone or restored to `previous`; exit 0 with "merge it, then run again" | Plan V V7, V-B2 | not run |
 | UN-5 | merge the uninstall PR (the required gate does not block it, because the locks are off); running `pipegen uninstall` before the merge only says to merge | Plan V V7, V-B2 | not run |
 | UN-6 | second run (phase B) with `--delete-repos` and a fine-grained token: secrets (`PIPEGEN_` ones directly, an own-name one only after you type it), variables, environments, settings, the scratch repo emptied; the central PR opens; exit 0 | Plan V V7 | not run |
-| UN-7 | merge the central PR, run `pipegen uninstall --delete-repos` again: the install record is rebuilt from the saved blob (no "No install record"), the `gh repo delete` commands for the scratch repo and `pipelines` are printed (nothing is deleted by pipegen), the local files go, the final message says there is no App to remove (delete the token) | Plan V V7, V6 carry | not run |
-| UN-8 | the **after** lists, compared with UN-2: nothing pipegen didn't create is gone, nothing pipegen created is left except what the final message lists (the kept default branch of the scratch repo, the two repos until you run the printed `gh repo delete` commands) | Plan V V7 | not run |
-| UN-9 | the printed commands: pipegen prints `gh repo delete` only for a repo whose checks passed, and deletes no repo; a leftover `pipegen/update-<name>` branch on `pipelines` withholds the command until it is deleted | Plan V V7, V-S3 | not run |
+| UN-7 | merge the central PR, run `pipegen uninstall --delete-repos` again: the install record is rebuilt from the saved blob (no "No install record"), no `gh repo delete` command is printed and nothing is deleted; the final message's notes list the scratch repo and `pipelines` as yours to delete by hand (each holds nothing of pipegen's now), the local files go, the final message says there is no App to remove (delete the token); exit 0 | Plan V V7, V6 carry, V8-R1 | not run |
+| UN-8 | the **after** lists, compared with UN-2: nothing pipegen didn't create is gone, nothing pipegen created is left except what the final message lists (the kept default branch of the scratch repo, and the two repos you created, until you delete them by hand in UN-11) | Plan V V7 | not run |
+| UN-9 | the repos you created: no run prints `gh repo delete` or deletes a repo; `pipelines` is listed as yours to delete only once the central PR merged and no other project is left, the scratch repo only once it is emptied | Plan V V7, V-S3, V8-R1 | not run |
 | UN-10 | an object pipegen did not create: a secret or ruleset recreated by hand after the install (same name, new id and `created_at`) is kept and listed "not the one pipegen created" | Plan V V7, V-B6 | not run |
 | UN-11 | the throwaway repo, its `pipelines` and `pipegen-proof-<repo>` are deleted by hand at the end | Plan V V7 | not run |
 

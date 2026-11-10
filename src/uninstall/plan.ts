@@ -132,6 +132,16 @@ export interface UninstallPlan {
    * removing the record merged) or `command` (token mode: `gh repo delete` printed, nothing deleted). Any other repo is in skipped/manual.
    */
   deleteRepos: { repo: string; kind: 'scratch' | 'central'; how: 'delete' | 'command'; afterCentralPr?: true }[];
+  /**
+   * V9a (V8 sec M2): phase B, the helper repos the user created (the record doesn't say pipegen created them; every v0.2 token install).
+   * pipegen never deletes them or prints a command to; run 2's final message lists each as the user's to delete by hand once it has shown
+   * that it holds nothing of pipegen's (the scratch repo emptied; `pipelines` with this project's files and record gone, the last project).
+   */
+  yourRepos: { repo: string; kind: 'scratch' | 'central' }[];
+  /** V9a (V8 sec I1): the record's environment secrets whose typed name the user declined in this plan (still there after run 2). */
+  declinedSecrets: SecretEntry[];
+  /** V9a (V8 sec i1): the environments the record stores secrets in (run 1 says they stay usable until run 2). */
+  secretEnvs: string[];
   skipped: { what: string; why: string }[];
 }
 
@@ -162,6 +172,8 @@ const MAX_SCANNED = 200;
 const NOT_TYPED = 'kept: its name was not typed';
 const GONE = 'GitHub doesn\'t show it (already gone, or this login can\'t see it): nothing to do';
 const ORG_GONE = 'GitHub answers 404 for it: it is gone, or this login can\'t read the organisation\'s rulesets (pipegen can\'t tell which); check it in the organisation\'s settings';
+/** V9a (V8 sec M3): the scratch repo answering 404 (a fine-grained token that leaves it out answers 404 too). */
+export const SCRATCH_404 = 'GitHub answers 404 for it: it is gone, or this token can\'t see it. If it is there, it still holds the proof\'s copy of your code: check it and delete it by hand';
 const CANT_ASK = 'its name has characters (or a length) the terminal can\'t show exactly, so it can\'t be asked safely; pipegen leaves it';
 /** A name askTypedName can ask for exactly (V1: it refuses any name safeText would change or cut). */
 const askable = (name: unknown): boolean => typeof name === 'string' && name.trim() !== '' && safeText(name, 120) === name;
@@ -189,7 +201,7 @@ const TYPED_MANUAL: readonly { fields: readonly string[]; what: string; step: st
   { fields: ['classicProtection'], what: 'the branch protection pipegen set (if it set one)', step: 'Check Settings → Branches and put the protection back as you want it.' },
   { fields: ['orgRuleset'], what: 'the organisation required-workflow rule (if pipegen made one)', step: 'Check the organisation\'s rulesets and delete pipegen\'s required-workflow rule for this repo if it is there.' },
   { fields: ['central'], what: CENTRAL_MANUAL, step: 'Check the ruleset, CODEOWNERS and Actions access settings of your pipelines repo by hand.' },
-  { fields: ['scratch'], what: 'the scratch repo (if pipegen made one)', step: 'Check for a pipegen-proof-<repo> repo and delete it by hand if you don\'t need it.' },
+  { fields: ['scratch'], what: 'the scratch repo (if the proof used one)', step: 'Check for a pipegen-proof-<repo> repo and delete it by hand if you don\'t need it.' },
   { fields: ['repoSettings'], what: 'repo security settings pipegen turned on', step: 'Check Settings → Code security (secret scanning, push protection, Dependabot alerts) and Settings → Actions (the sha pin).' },
 ];
 
@@ -235,7 +247,8 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
     base: { appHead: '', appTree: '', centralHead: loaded.centralHead, recordBlobSha: loaded.blobSha },
     warnings: [...loaded.warnings], removeFiles: [], keepAsk: [], reverts: [], manual: [], deleteRulesets: [], deleteSecrets: [], deleteVariables: [],
     restoreVariables: [], deleteEnvironments: [], restoreEnvironments: [], settings: [], closePrs: [], deleteBranches: [], centralFiles: [], lastProject: false,
-    unfinished: false, skipped: [], proofCleanup: !inA && deps.proofState === true, deleteRepos: [],
+    unfinished: false, skipped: [], proofCleanup: !inA && deps.proofState === true, deleteRepos: [], yourRepos: [], declinedSecrets: [],
+    secretEnvs: [...new Set(loaded.record.secrets.map((x) => /^env:(.+)$/.exec(String(x.scope))?.[1]).filter((e): e is string => e !== undefined))],
   };
   const skip = (what: string, why: string): void => { u.skipped.push({ what, why }); };
   const manual = (what: string, why: string, step?: string): void => { u.manual.push({ what, why, ...(step === undefined ? {} : { step }) }); };
@@ -274,7 +287,7 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
    * `extra`: a name is needed besides the verdict (not pipegen-shaped, or a leftover); `check`: a reason to keep it found right before asking;
    * `when`: the run that sends it (V4-R1): another run's name is not asked here (`needsName`, no token); `gone`: the words for a 404.
    */
-  const classify = async (o: Owned, what: string, read: { route: string; params: Record<string, unknown> }, extra: boolean, opts: { why?: string; check?: () => Promise<string | null>; when: UninstallPhase; gone?: string }): Promise<Named | null> => {
+  const classify = async (o: Owned, what: string, read: { route: string; params: Record<string, unknown> }, extra: boolean, opts: { why?: string; check?: () => Promise<string | null>; when: UninstallPhase; gone?: string; declined?: () => void }): Promise<Named | null> => {
     const l = await live(read.route, read.params, opts.gone);
     if ('missing' in l) {
       if (l.manual) manual(what, l.missing, 'Check it on GitHub and remove it by hand if it is pipegen\'s.');
@@ -291,7 +304,7 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
     if (opts.when !== phase) return { confirmedByName: false, needsName: true };
     const reason = [opts.why, v.is === 'ask' ? `${v.why}.` : null, loaded.typedNames ? 'This run asks each name: the install record was trusted by typing, or its marker in the setup pull request differs.' : null].filter((x): x is string => x !== null && x !== undefined).join(' ');
     const t = await confirm(o, reason);
-    if (t === null) { skip(what, NOT_TYPED); return null; }
+    if (t === null) { skip(what, NOT_TYPED); opts.declined?.(); return null; }
     return { confirmedByName: true, typed: t };
   };
 
@@ -459,7 +472,8 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
     const what = `central ${show(f.path, 200)}`;
     if (rec.centralSha === null) manual(what, `a public app keeps no workflow in ${CENTRAL_REPO} (records only), so it is not one of this project's central files; pipegen leaves it`);
     else if (!own.includes(f.path) || createdPathProblem(f.path) !== null) manual(what, 'it is not one of this project\'s central files (the exact list), so pipegen leaves it');
-    else if (!centralTree.entries.has(f.path)) skip(what, `it is no longer in ${CENTRAL_REPO}: nothing to remove`);
+    // V8 sec i6: nothing to do there, for pipegen or the user: done, never a kept item
+    else if (!centralTree.entries.has(f.path)) markDone(`${what}: already gone from ${CENTRAL_REPO}, nothing to remove`);
     else claimed.add(f.path);
   }
   u.centralFiles = [...own.filter((p) => claimed.has(p)), rp];
@@ -516,7 +530,7 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
     if (s.created !== true) { skip(what, 'pipegen didn\'t create it, so it never deletes it'); return; }
     if (s.scope === 'central' && !u.lastProject) { skip(what, `other projects of ${CENTRAL_REPO} may use it; pipegen deletes a central secret only with the last project`); return; }
     const why = leftover ? 'pipegen stored it before a delivery stopped (this machine\'s leftovers file lists it); pipegen can\'t tell whether it created it or only replaced the value of one that was there.' : undefined;
-    const n = await classify({ kind: 'secret', entry: s }, what, secretRead(s), leftover || !s.name.startsWith('PIPEGEN_'), { when: 'B', ...(why === undefined ? {} : { why }) });
+    const n = await classify({ kind: 'secret', entry: s }, what, secretRead(s), leftover || !s.name.startsWith('PIPEGEN_'), { when: 'B', ...(why === undefined ? {} : { why }), declined: () => { u.declinedSecrets.push(s); } });
     if (n !== null) u.deleteSecrets.push({ secret: s, ...(leftover ? { fromLeftovers: true as const } : {}), ...n });
   };
   for (const s of rec.secrets) await planSecret(s, false);
@@ -739,41 +753,48 @@ async function build(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined
 
   /**
    * Phase B (M-r1-9, V-S3): the scratch repo run 2 empties (GitHub's answer now: the exact name and pipegen's marker; a typed trust doesn't
-   * vouch for the scratch facts, a manual step then) and, with --delete-repos, the repos it deletes or the commands it prints.
+   * vouch for the scratch facts, a manual step then) and, with --delete-repos, the repos it deletes or the commands it prints. V9a (V8 sec
+   * M2): a repo the record doesn't say pipegen created is the user's (every v0.2 token install): never deleted, no command printed, listed
+   * in `yourRepos`. V9a (V8 sec M3): a scratch repo the record names that answers 404 is named (gone, or the token can't see it).
    */
   async function planRepos(): Promise<void> {
     const scratchName = `${SCRATCH_PREFIX}${appRef.repo}`;
     const scratchFull = `${appRef.owner}/${scratchName}`;
     const app = deps.canDeleteRepos === true;
+    const sc = rec.scratch;
     if (!typedTrust) {
       let d: unknown = null;
       try { d = (await githubRead(gh, 'GET /repos/{owner}/{repo}', { owner: appRef.owner, repo: scratchName }, clock)).data; } catch (e) {
         if (isRateStop(e) || e instanceof GitHubAccessError || statusOf(e) === 401 || statusOf(e) === undefined) throw e;
-        if (statusOf(e) !== 404) manual(`scratch repo ${scratchFull}`, `GitHub refused to show it (HTTP ${statusOf(e)}), so pipegen can't tell it is the one it made`, 'Check it on GitHub and delete it by hand if pipegen made it.');
+        if (statusOf(e) !== 404) manual(`scratch repo ${scratchFull}`, `GitHub refused to show it (HTTP ${statusOf(e)}), so pipegen can't tell it is the one the proof used`, 'Check it on GitHub; it may still hold the proof\'s copy of your code.');
+        else if (sc !== undefined) skip(`scratch repo ${scratchFull}`, SCRATCH_404);
       }
       if (isObj(d)) {
         const id = d.id;
         if (d.full_name !== scratchFull || !isObj(d.owner) || d.owner.login !== appRef.owner || d.description !== SCRATCH_MARKER || !(typeof id === 'number' && Number.isSafeInteger(id) && id > 0)) {
           skip(`scratch repo ${scratchFull}`, 'it doesn\'t carry pipegen\'s marker (its description), so pipegen leaves it');
-        } else u.scratch = { repo: scratchFull, id };
+        } else {
+          u.scratch = { repo: scratchFull, id };
+          if (sc?.createdByPipegen !== true) u.yourRepos.push({ repo: scratchFull, kind: 'scratch' });
+        }
       }
-    }
-    if (deps.deleteRepos !== true) return;
-    const sc = rec.scratch;
-    // V6-R1 sec I1: token mode (the command only) passes the same gates as the App's delete
-    const how = app ? 'delete' as const : 'command' as const;
-    const check = 'Check it on GitHub; delete it by hand only if it is the one pipegen made.';
-    if (u.scratch !== undefined) {
-      if (sc?.createdByPipegen === true && sc.repoId === u.scratch.id) u.deleteRepos.push({ repo: scratchFull, kind: 'scratch', how });
-      else manual(`repo ${scratchFull}`, sc?.repoId === undefined ? 'the install record holds no id of the scratch repo pipegen created, so pipegen only empties it' : 'it is not the scratch repo pipegen created (GitHub\'s id differs from the recorded one), so pipegen only empties it', check);
     }
     const centralFull = `${appRef.owner}/${CENTRAL_REPO}`;
     const c = rec.central;
+    if (!typedTrust && c?.createdByPipegen !== true && u.lastProject) u.yourRepos.push({ repo: centralFull, kind: 'central' });
+    if (deps.deleteRepos !== true) return;
+    // V6-R1 sec I1: token mode (the command only) passes the same gates as the App's delete; only for a repo the record says pipegen created
+    const how = app ? 'delete' as const : 'command' as const;
+    const check = 'Check it on GitHub; delete it by hand only if it is the one the install record names.';
+    if (u.scratch !== undefined && sc?.createdByPipegen === true) {
+      if (sc.repoId === u.scratch.id) u.deleteRepos.push({ repo: scratchFull, kind: 'scratch', how });
+      else manual(`repo ${scratchFull}`, sc.repoId === undefined ? 'the install record holds no id of it, so pipegen can\'t prove it is the repo the record names; it only empties it' : 'it is not the repo the install record names (GitHub\'s id differs from the recorded one), so pipegen only empties it', check);
+    }
     if (!u.lastProject) { skip(`repo ${centralFull}`, 'other projects use it (or pipegen can\'t tell none does), so pipegen keeps it'); return; }
     if (typedTrust) return;   // TYPED_MANUAL: central facts are not granted
-    if (c?.createdByPipegen !== true) { skip(`repo ${centralFull}`, 'the install record doesn\'t say pipegen created it, so pipegen never deletes it'); return; }
-    if (c.repoId === undefined) { manual(`repo ${centralFull}`, 'the install record holds no id of it, so pipegen can\'t prove it is the repo it created; it keeps it', check); return; }
-    if (c.repoId !== loaded.centralRepoId) { skip(`repo ${centralFull}`, 'it is not the repo pipegen created (GitHub\'s id differs from the recorded one), so pipegen keeps it'); return; }
+    if (c?.createdByPipegen !== true) return;   // the user's repo (yourRepos): never deleted, no command
+    if (c.repoId === undefined) { manual(`repo ${centralFull}`, 'the install record holds no id of it, so pipegen can\'t prove it is the repo the record names; it keeps it', check); return; }
+    if (c.repoId !== loaded.centralRepoId) { skip(`repo ${centralFull}`, 'it is not the repo the install record names (GitHub\'s id differs from the recorded one), so pipegen keeps it'); return; }
     u.deleteRepos.push({ repo: centralFull, kind: 'central', how, afterCentralPr: true });
   }
 
@@ -943,7 +964,7 @@ export function previewUninstall(u: UninstallPlan): string {
     out.push(`This takes two runs. Now: pipegen opens the uninstall pull request (branch pipegen/uninstall), closes its own open pull requests and takes off the merge locks: ${TWO_RUNS}.`);
     out.push('Then, after you merge the uninstall pull request, run `pipegen uninstall` again: it asks the names below, deletes the secrets, variables and environments, turns off the settings you choose, and opens the central pull request.');
   }
-  list('Done in the first run:', u.done.map((d) => `  - ${show(d, 300)}`));
+  list('Already done:', u.done.map((d) => `  - ${show(d, 300)}`));
   // run 1: the uninstall PR, pipegen's pull requests, the merge locks
   const pr: string[] = [];
   for (const f of u.removeFiles) pr.push(`  - remove ${show(f.path, 200)}`);
@@ -997,6 +1018,9 @@ export function previewUninstall(u: UninstallPlan): string {
   if (!inA) {
     if (u.proofCleanup) later.push('  - clean up what the saved proof left in GitHub (as `pipegen cleanup` does; the scratch repo is not deleted there)');
     if (u.scratch !== undefined) later.push(`  - empty the scratch repo ${show(u.scratch.repo, 140)} (it carries pipegen's marker): its proof/ branches, secrets, variables, workflow runs and caches`);
+    for (const y of u.yourRepos) {
+      later.push(`  - ${show(y.repo, 140)}: you created it, so pipegen never deletes it or prints a command to; ${y.kind === 'scratch' ? 'once it is emptied' : 'once the central pull request removing this project merged'}, the final message lists it for you to delete by hand if you don't need it`);
+    }
     for (const d of u.deleteRepos) {
       later.push(d.how === 'delete'
         ? `  - delete the repo ${show(d.repo, 140)} (--delete-repos; you type its name then${d.afterCentralPr === true ? '; only once the central pull request removing the install record merged' : ''})`

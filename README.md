@@ -75,7 +75,7 @@ It protects four stages: **pre-commit → push → merge → deploy**.
 
 ## Permissions and cost (honest numbers before you start)
 
-- **Access:** in v0.2 you use a **fine-grained token** limited to the repos involved (set as `GITHUB_TOKEN`). Broad classic tokens are refused by default. pipegen prints the `gh repo create <owner>/pipelines --private` and `gh repo create <owner>/pipegen-proof-<repo> --private` commands for you to run, empties the scratch repo after the proof instead of deleting it, and `pipegen uninstall --delete-repos` prints the `gh repo delete` commands. pipegen's own GitHub App login (which makes and deletes these repos itself) is planned next.
+- **Access:** in v0.2 you use a **fine-grained token** limited to the repos involved (set as `GITHUB_TOKEN`). Broad classic tokens are refused by default. pipegen prints the `gh repo create <owner>/pipelines --private` and `gh repo create <owner>/pipegen-proof-<repo> --private` commands for you to run, empties the scratch repo after the proof instead of deleting it, and never deletes these repos or prints a delete command for them (you created them): `pipegen uninstall` lists them as yours to delete by hand once it has shown they hold nothing of pipegen's. pipegen's own GitHub App login (which makes and deletes these repos itself) is planned next.
   `pipegen audit` only reads: on a private repo, give the token just Metadata: read, Pull requests: read, Actions: read
   and Code scanning alerts: read (optional; without it pipegen can't confirm code scanning). A public repo works without a token.
   The full run (`pipegen run`, then `finish`, `verify` and `update`) needs, on the app repo and the private helper repos: Metadata: read,
@@ -142,8 +142,7 @@ before anything is sent (or gitleaks, the fallback, when `PIPEGEN_SECRET_SCANNER
 binaries exist for those systems only.
 
 Later versions add the full job (one PR), then `finish` (after you merge: merge rules, signing key and dates), `verify`
-(read-only: checks nobody weakened the pipeline files) and `uninstall`. Their exact commands will be shown here when
-they exist. No pipegen command, these included, is safe to run before the first release, because the npm name isn't
+(read-only: checks nobody weakened the pipeline files) and `uninstall` (its section is below). No pipegen command, these included, is safe to run before the first release, because the npm name isn't
 published yet.
 
 ## Uninstall (v0.2)
@@ -152,7 +151,7 @@ published yet.
 
 ```bash
 npx pipegen uninstall                  # first run, then (after you merge its pull request) the second run
-npx pipegen uninstall --delete-repos   # the second run also prints the gh repo delete commands for the repos pipegen made (v0.2: it deletes none)
+npx pipegen uninstall --delete-repos   # v0.2: deletes no repo and prints no delete command (you created the repos; see below)
 ```
 
 `pipegen uninstall` needs a terminal. It shows what it will do, asks **one** yes, and asks you to type a name before it deletes anything it can't be sure is pipegen's. With no terminal (CI, a pipe) it stops before it reads or sends anything. No flag or environment variable answers these questions.
@@ -161,11 +160,11 @@ npx pipegen uninstall --delete-repos   # the second run also prints the gh repo 
 
 **What it removes.** Only what the install record lists as created by pipegen **and** what GitHub shows with the same id and creation time as recorded. Anything else is kept and listed ("not the one pipegen created"). Files you took over (`adopted`) are kept unless you say yes; secrets named `PIPEGEN_...` that pipegen created are removed directly, a secret with your own name only after you type it; a secret pipegen overwrote is never deleted. Environments that existed before get their previous settings back.
 
-**Exit codes.** `0`: the run did what it set out to (first run done, waiting for you to merge, the uninstall is finished). `1`: you said no. `2`: it stopped, a step failed, or it finished with something left for you (a kept item, a manual step; the final message lists each). `4`: pipegen stopped before reading the repo because of the folder it was started in (see safe mode above).
+**Exit codes.** `0`: the run did what it set out to (first run done, waiting for you to merge, the uninstall is finished). `1`: you said no. `2`: it stopped, a step failed, or it finished with something left for you (a kept item, a manual step; the final message lists each). `4`: pipegen stopped before reading the repo because of the folder it was started in (see safe mode above). A note in the final message (something that needs nothing more, like the scratch repo's default branch it keeps, or a repo you created that holds nothing of pipegen's now) is not left for you: a finished uninstall with only notes exits `0`.
 
-**`--delete-repos`.** In v0.2 (a fine-grained token) pipegen deletes no repo: it prints the `gh repo delete` commands, for the scratch repo and for the central repo only when yours is the last project, the central pull request is merged and the repo holds nothing but pipegen's files. pipegen prints a delete command only after those checks, and never after a refusal. pipegen's own GitHub App login (which makes and deletes these repos itself) is planned next. With it, `--delete-repos` will use the repo-deletion right the App has (Administration: write) and delete them after you type their names. A pull request branch `pipegen/update-<name>` left on the central repo withholds the command (pipegen records no head for it, so it can't tell it from a teammate's work): delete that branch yourself, then run again.
+**`--delete-repos`.** In v0.2 you created `pipelines` and `pipegen-proof-<repo>` yourself (with the `gh repo create` commands pipegen printed), so pipegen never deletes them and prints no `gh repo delete` command for them, with or without `--delete-repos`. Once the second run has shown that a repo holds nothing of pipegen's (the scratch repo emptied; `pipelines` with this project's files and install record gone and no other project left), its final message lists it as yours to delete by hand. pipegen's own GitHub App login (which makes and deletes these repos itself) is planned next. With it, `--delete-repos` will use the repo-deletion right the App has (Administration: write) and delete the repos the App made after you type their names; a pull request branch `pipegen/update-<name>` left on the central repo will hold that delete back (pipegen records no head for it, so it can't tell it from a teammate's work).
 
-**Permissions.** The same write permissions as `pipegen run` on the app repo and the helper repos. For an organisation: Administration (read and write) is optional, for removing the organisation rule that made pipegen's required workflow run (without it pipegen tells you to remove the rule by hand), and Members: read is optional too (it checks that you own the organisation). `--delete-repos` needs no extra permission in v0.2 (it only prints commands; you run `gh repo delete` with your own login).
+**Permissions.** The same write permissions as `pipegen run` on the app repo and the helper repos. For an organisation: Administration (read and write) is optional, for removing the organisation rule that made pipegen's required workflow run (without it pipegen tells you to remove the rule by hand), uninstall doesn't need Members: read (that one is for `pipegen run` and `finish`). `--delete-repos` needs no extra permission in v0.2 (it deletes nothing; you delete the repos you created with your own login).
 
 **Known limits.**
 - A `<name>--required.yml` that pipegen keeps because the organisation rule still requires it leaves the second run unfinished until you remove the organisation rule; remove the rule, then the file, then run again.

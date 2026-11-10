@@ -130,7 +130,7 @@ function handedOn(tree: unknown, locals: ReadonlySet<string>): string[] {
  * A second src/cli file (G14) can't hand the file a proof or uninstall binding: only commands.ts and io.ts of src/cli are listed.
  */
 const CLI_UNINSTALL_ALLOWED: Readonly<Record<string, readonly string[]>> = {
-  'src/uninstall/apply.ts': ['uninstallStep'], 'src/uninstall/errors.ts': ['UninstallError', 'UninstallFinished'],
+  'src/uninstall/apply.ts': ['uninstallStep', 'holdUninstallLease'], 'src/uninstall/errors.ts': ['UninstallError', 'UninstallFinished'],
   'src/uninstall/progress.ts': ['MAX_PROGRESS_BYTES', 'uninstallProgressPath'], 'src/uninstall/record.ts': ['loadUninstallRecord'],
   'src/cli/commands.ts': ['interactiveRun'], 'src/cli/io.ts': [], 'src/deliver/record.ts': ['localRecordPath'],
   'src/engine/github-rate.ts': ['isRateStop'], 'src/github/client.ts': ['GitHubAccessError', 'hideToken'],
@@ -165,6 +165,8 @@ const ENTRY_ALLOWED: Readonly<Record<string, (file: string) => boolean>> = {
   UninstallApi: (f) => f === 'src/uninstall/plan.ts',
   planUninstall: (f) => f === 'src/uninstall/apply.ts', confirmPlan: (f) => f === 'src/uninstall/apply.ts',
   takeApi: (f) => f === 'src/uninstall/apply.ts', deleteCentralRepo: (f) => f === 'src/uninstall/apply.ts',
+  // V9a (V8 sec i2): the whole flow, the loader and the lease are the CLI command's only
+  uninstallStep: (f) => f === CLI_UNINSTALL_FILE, loadUninstallRecord: (f) => f === CLI_UNINSTALL_FILE, holdUninstallLease: (f) => f === CLI_UNINSTALL_FILE,
   ...Object.fromEntries(E_WRITERS.map((n) => [n, eAllowed])),
 };
 /**

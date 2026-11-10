@@ -1,11 +1,12 @@
 // v0.2 Plan V V7 (plan Task 3, CLI part; rulings V-S3, V-S12, V-S15): `pipegen uninstall [--delete-repos]`. main.ts runs unsafeFolderStop first (G13-R0 14);
 // this file then: (1) needs a terminal (typed names and the one yes are asked there, V-S13), before anything is read or sent; (2) connects as write mode
-// through G13's `connect` (no token: stop before planning); (3) loads the install record once (loadUninstallRecord: it is the one that rebuilds the record
-// for a second run 2 and finishes an uninstall whose central repo is gone); (4) runs one uninstallStep. Every stop those throw is one clear message.
+// through G13's `connect` (no token: stop before planning); (3) takes the app's lease (V9a, V8 sec M4: before the loader, which may write this machine's
+// local record file) and holds it to the end; (4) loads the install record once (loadUninstallRecord: it is the one that rebuilds the record for a second
+// run 2 and finishes an uninstall whose central repo is gone); (5) runs one uninstallStep with that lease. Every stop those throw is one clear message.
 //
 // Exit codes (V5-R1, V6-R3): 0 a run that did what it set out to (run 1 done, waiting for a merge, closed unmerged, run 2 done or waiting for the central
 // pull request, or an uninstall that finished: UninstallFinished); 1 declined; 2 stopped, failed, interrupted, a step the loader or the run refused, or done
-// with leftovers (a manual step, a kept item or a step not done). 4 (unsafe folder) comes from main.
+// with leftovers (a manual step, a kept item or a step not done; a note, V8 sec i6, is none). 4 (unsafe folder) comes from main.
 //
 // This file only imports a short list of names (test/helpers/import-scan.ts, CLI_UNINSTALL_ALLOWED): the one entry of apply.ts, the loader, and read-only
 // helpers. It sends nothing to GitHub itself, and reads (never writes) the progress file to name a crash.
@@ -15,7 +16,7 @@ import { isRateStop } from '../engine/github-rate.js';
 import { GitHubAccessError, hideToken } from '../github/client.js';
 import type { StateDeps } from '../proof/state.js';
 import { NotGitHubRepoError } from '../read/project.js';
-import { uninstallStep, type StepResult } from '../uninstall/apply.js';
+import { holdUninstallLease, uninstallStep, type StepResult } from '../uninstall/apply.js';
 import { UninstallError, UninstallFinished } from '../uninstall/errors.js';
 import { MAX_PROGRESS_BYTES, uninstallProgressPath } from '../uninstall/progress.js';
 import { loadUninstallRecord } from '../uninstall/record.js';
@@ -83,15 +84,21 @@ export async function uninstallCommand(io: CliIO, deps: UninstallCommandDeps): P
     stage = 'load';
     // Auth.canDeleteRepos as connect copied it (App login with Administration: write, write mode); anything else is token mode: print-only
     const canDeleteRepos = c.canDeleteRepos === true;
-    // the one place the record is loaded: no preview or dry mode exists that could remove the local files through it (V6-R4)
-    const loaded = await (deps.load ?? loadUninstallRecord)(c.g.gh, c.app, { io: io.prompt, interactive: true, local: localDeps, ...(c.g.clock === undefined ? {} : { clock: c.g.clock }) });
-    stage = 'step';
-    const r = await (deps.step ?? uninstallStep)(c.g.gh, loaded, io.prompt, {
-      out: say, interactive: true, deleteRepos: deps.deleteRepos, canDeleteRepos, local: localDeps, state: deps.state ?? { env: io.env },
-      ...(c.g.clock === undefined ? {} : { clock: c.g.clock }),
-    });
-    for (const l of r.lines) say(l);
-    return exitOf(r);
+    const state = deps.state ?? { env: io.env };
+    // V9a (V8 sec M4): the lease first; another pipegen on this repo is a stop before the record is read
+    const held = await holdUninstallLease(c.app, state);
+    try {
+      // the one place the record is loaded: no preview or dry mode exists that could remove the local files through it (V6-R4)
+      const loadDeps = { io: io.prompt, interactive: true, local: localDeps, ...(c.g.clock === undefined ? {} : { clock: c.g.clock }) };
+      const loaded = deps.load !== undefined ? await deps.load(c.g.gh, c.app, loadDeps) : await loadUninstallRecord(c.g.gh, c.app, loadDeps);
+      stage = 'step';
+      const stepDeps = { out: say, interactive: true, deleteRepos: deps.deleteRepos, canDeleteRepos, local: localDeps, state, lease: held.lease, ...(c.g.clock === undefined ? {} : { clock: c.g.clock }) };
+      const r = deps.step !== undefined ? await deps.step(c.g.gh, loaded, io.prompt, stepDeps) : await uninstallStep(c.g.gh, loaded, io.prompt, stepDeps);
+      for (const l of r.lines) say(l);
+      return exitOf(r);
+    } finally {
+      held.release();
+    }
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     // not a failure: the last run's delete of the central repo went through and GitHub says it is gone; the loader removed the local files

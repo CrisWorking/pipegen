@@ -13,6 +13,7 @@
 //   on `pipegen/uninstall-<name>`: this project's exact files (the plan's list, V-B4: never a glob), each only at a version pipegen wrote;
 //   when last, the central CODEOWNERS (removed when pipegen created it, else only pipegen's block taken out through V2); the install record
 //   LAST, only with nothing left over or the user's yes to the listed ones. A public app (records only, V-N13): only the record.
+//   V9a (V8 sec M1): in a typed-names run the Actions access goes back only after `pipelines` is typed for it (`central-access`).
 // V6-R1: central answering 404 is "can't tell" (never merged, never the last project); the central uninstall branch moves only while it is
 // where pipegen set it (sec M1); after the merge, a project that joined once the locks came off is named (sec M5); an org rule pipegen
 // can't read is still there (sec M3).
@@ -244,9 +245,21 @@ export async function runCentral(o: {
     }
     const prev = locks.actionsAccess?.previous;
     if (prev !== undefined) {
+      const accessStep = `Put the Actions access of ${full} back by hand (Settings → Actions → Access) if pipegen set it and no other project relies on it, or run \`pipegen uninstall\` again and type ${CENTRAL_REPO}.`;
       await o.outcome(`central Actions access of ${full}`, undefined, async () => {
+        // V9a (V8 sec M1): a typed-names run puts it back only after `pipelines` is typed for it (V1-R1: every restore asks then)
+        let typed: TypedName | undefined;
+        if (plan.typedNames) {
+          let t: TypedName | null;
+          try { t = await api.confirm({ kind: 'central-access' }); } catch (e) {
+            if (e instanceof UninstallRefusal) return { status: 'kept', why: `${NOT_TYPED} (${show(e.message, 200)})`, manual: accessStep };
+            throw e;
+          }
+          if (t === null) return { status: 'kept', why: NOT_TYPED, manual: accessStep };
+          typed = t;
+        }
         try {
-          return await api.write('PUT /repos/{owner}/{repo}/actions/permissions/access', { owner: app.owner, repo: CENTRAL_REPO, access_level: prev }, { pipegenSet: o.ownerType === 'Organization' ? 'organization' : 'user' });
+          return await api.write('PUT /repos/{owner}/{repo}/actions/permissions/access', { owner: app.owner, repo: CENTRAL_REPO, access_level: prev }, { pipegenSet: o.ownerType === 'Organization' ? 'organization' : 'user', ...(typed === undefined ? {} : { typed }) });
         } catch (e) {
           if (e instanceof UninstallRefusal) return { status: 'kept', why: `the recorded access level can't be put back (${show(e.message, 200)})`, manual: `Check Settings → Actions → Access of ${full}.` };
           throw e;
@@ -319,7 +332,7 @@ export async function runCentral(o: {
   const text = [
     `pipegen uninstall: this pull request removes ${show(`${app.owner}/${app.repo}`, 140)} from ${full}.`, '', ...body.slice(0, 300), '',
     ...(lp.last && !o.live ? [`This was the last project in ${full}, so pipegen took its central locks off. Merge it only while no other project uses ${full}; if one joined since, close this pull request and run \`pipegen uninstall\` again.`, ''] : []),
-    'After you merge it, run `pipegen uninstall` again to finish (and, with --delete-repos, to print the `gh repo delete` commands for the repos pipegen made).',
+    'After you merge it, run `pipegen uninstall` again to finish.',
   ].join('\n');
   const pr = await api.openUninstallPr('central', { base: now.defaultBranch, title: `pipegen: uninstall ${show(rec.name, 100)}`, body: text });
   report.done(`central pull request #${pr.number} in ${full}: ${pr.opened ? 'opened' : 'updated'}`);

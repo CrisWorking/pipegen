@@ -335,7 +335,9 @@ export type Confirmable =
   | { kind: 'classic'; branch: string }
   | { kind: 'environment-restore'; entry: EnvEntry }
   | { kind: 'variable-restore'; entry: VariableEntry }
-  | { kind: 'branch-policy'; entry: EnvEntry; id: number };
+  | { kind: 'branch-policy'; entry: EnvEntry; id: number }
+  /** V9a (V8 sec M1): the central Actions access level put back (a typed-names run): `pipelines` typed. */
+  | { kind: 'central-access' };
 /** A name the user typed at the terminal for one object of one UninstallApi, used up by the first call it is passed to. confirm() makes it. */
 export interface TypedName { readonly name: string }
 const tokens = new WeakMap<object, { api: object; key: string; used: boolean }>();
@@ -364,6 +366,7 @@ function askedFor(c: Confirmable, app: UninstallApp): { key: string; name: strin
     case 'environment-restore': return { key: `environment-restore:${lower(str(c.entry.name, 'an environment'))}`, name: c.entry.name, question: `Put the settings pipegen changed on the environment ${show(c.entry.name, 100)} of ${repo} back as they were before pipegen?` };
     case 'variable-restore': { const s = scoped(c.entry.scope); return { key: `variable-restore:${s.key}:${str(c.entry.name, 'a variable').toUpperCase()}`, name: c.entry.name, question: `Put the variable ${show(c.entry.name, 100)} ${s.text} back to the value it had before pipegen?` }; }
     case 'branch-policy': return { key: `branch-policy:${lower(str(c.entry.name, 'an environment'))}:${id(c.id)}`, name: c.entry.name, question: `Delete the deployment branch rule ${c.id} pipegen added to the environment ${show(c.entry.name, 100)} of ${repo}?` };
+    case 'central-access': return { key: `central-access:${lower(app.owner)}`, name: CENTRAL_REPO, question: `Put the Actions access level of ${central} back as it was before pipegen? It is shared by every project there.` };
   }
 }
 
@@ -581,10 +584,15 @@ export class UninstallApi {
    * access); every other route is refused before it is sent. Right before it, the setting is read from GitHub, and only what is still as
    * pipegen set it is put back (sec N-M5; #settingNow); anything else is kept with the manual step. `pipegenSet` is the central Actions
    * access level finish set (`organization` for an organisation's app, `user` for a user's). A failure is mapped through goneOr (spec M3).
+   * V9a (V8 sec M1): in a typed-names run the central Actions access goes back only with `typed`, confirm({ kind: 'central-access' }).
    */
-  async write(route: string, params: Record<string, unknown>, opts: { pipegenSet?: string } = {}): Promise<DeleteOutcome> {
+  async write(route: string, params: Record<string, unknown>, opts: { pipegenSet?: string; typed?: TypedName } = {}): Promise<DeleteOutcome> {
     if (DEDICATED.has(route)) refuse(`"${show(route)}" goes only through its own uninstall function (an identity read, a typed name or a branch rule first).`);
     this.#checked(route, params);
+    if (route === ROUTES.actionsAccess) {
+      const had = this.#take(opts.typed, { kind: 'central-access' });
+      if (this.#typedNames && !had) refuse(`putting the Actions access level of ${show(`${this.app.owner}/${CENTRAL_REPO}`)} back needs ${CENTRAL_REPO} typed at the terminal in this run.`);
+    } else if (opts.typed !== undefined) refuse('a typed name was given to a settings write that takes none.');
     const where = this.#whereOf(params) as Where;
     const pathKeys = PATH_KEYS(route);
     const path = Object.fromEntries(Object.entries(params).filter(([k]) => pathKeys.includes(k)));
@@ -899,8 +907,12 @@ export class UninstallApi {
    * V-N10 (sec M7): the fields pipegen changed on an environment that was there before, back to `previous`, after the typed environment
    * name and only while GitHub's settings are exactly `shown` (what the preview's diff showed) and the environment is the recorded one.
    * The other fields are sent as GitHub holds them now. Branch and tag rules have no route here: a manual step.
+   * V9a (V8 sec I1): `secrets` are the record's secrets of this environment (created or overwritten). Right before the PUT the
+   * environment's secrets are listed: one of them still there, or a list that can't be read whole, keeps the settings (a manual step), so
+   * an environment pipegen narrowed to the default branch is never widened while pipegen's signing key is still in it.
    */
-  async restoreEnvironment(entry: EnvEntry, shown: EnvForm, typed?: TypedName): Promise<DeleteOutcome> {
+  async restoreEnvironment(entry: EnvEntry, shown: EnvForm, secrets: readonly { name: string }[], typed?: TypedName): Promise<DeleteOutcome> {
+    if (!Array.isArray(secrets) || !secrets.every((x) => isObj(x) && typeof x.name === 'string')) return refuse('the record\'s secrets of the environment are not a list of names.');
     if (!isObj(entry) || typeof entry.name !== 'string' || !NAME_RE.test(entry.name)) return refuse('an environment name is not a plain name.');
     const params = { ...this.repoOf('app'), environment_name: entry.name };
     const manual = `gh api -X PUT ${ghPath(ROUTES.environmentPut, params)} --input <the settings before pipegen, from the install record>`;
@@ -916,6 +928,8 @@ export class UninstallApi {
     if (cur === null) return this.#outcome(Object.assign(new Error('HTTP 404'), { status: 404 }), 'app', what, manual);
     if (isoAt(entry.githubCreatedAt) && (cur.createdAt === null || Date.parse(cur.createdAt) !== Date.parse(entry.githubCreatedAt))) return { status: 'kept', why: `${what} is not the one pipegen changed (GitHub says it was created at another time)`, manual };
     if (canon(cur.settings) !== canon(shown)) return { status: 'kept', why: `${what} changed since the preview showed it, so pipegen leaves it; run pipegen uninstall again to see it`, manual };
+    const left = await this.#recordSecretsIn(entry.name, secrets, what, manual);
+    if (left !== null) return left;
     const body: Record<string, unknown> = { ...cur.settings };
     const previous = entry.previous as EnvSettings;
     for (const k of ENV_KEYS) if (entry.changed.includes(k)) body[k] = previous[k];
@@ -923,6 +937,32 @@ export class UninstallApi {
     return entry.changed.includes('branch_policies')
       ? { status: 'restored', manual: `the branch and tag rules ${what} had before pipegen are in the install record; add them back in the environment's settings` }
       : { status: 'restored' };
+  }
+
+  /**
+   * V9a (V8 sec I1): the environment's secrets, listed right before its settings go back: null when none of `secrets` (the record's
+   * names for it) is there and the list was read whole; else `kept` with the step (delete the secret first, then run uninstall again).
+   */
+  async #recordSecretsIn(env: string, secrets: readonly { name: string }[], what: string, manual: string): Promise<DeleteOutcome | null> {
+    const app = `${this.app.owner}/${this.app.repo}`;
+    const cant: DeleteOutcome = { status: 'kept', why: `pipegen couldn't list every secret of ${what}, so it doesn't put its earlier settings back (a secret pipegen stored may still be in it, and the earlier settings may let other branches use it)`, manual: `Check the secrets of ${what} in ${app}; delete the ones pipegen stored, then run \`pipegen uninstall\` again (or: ${manual})` };
+    let d: unknown;
+    try { d = (await this.read('GET /repos/{owner}/{repo}/environments/{environment_name}/secrets', { ...this.repoOf('app'), environment_name: env, per_page: 100 })).data; } catch (e) {
+      if (e instanceof UninstallRefusal) throw e;
+      hardStop(e);
+      return cant;
+    }
+    const list = isObj(d) && Array.isArray(d.secrets) ? (d.secrets as unknown[]).filter(isObj) : null;
+    if (list === null || !isObj(d) || typeof d.total_count !== 'number' || d.total_count > list.length) return cant;
+    const names = new Set(list.map((x) => (typeof x.name === 'string' ? x.name.toUpperCase() : '')));
+    const still = secrets.filter((x) => names.has(x.name.toUpperCase())).map((x) => show(x.name, 100));
+    if (still.length === 0) return null;
+    const one = still.length === 1;
+    return {
+      status: 'kept',
+      why: `pipegen's secret${one ? '' : 's'} ${listed(still)} ${one ? 'is' : 'are'} still in ${what}, and its earlier settings may let other branches use ${one ? 'it' : 'them'}, so pipegen doesn't put them back yet`,
+      manual: `Delete ${still.map((n) => `${n} (gh secret delete ${n} --env ${show(env, 100)} --repo ${app})`).join(' and ')}, then run \`pipegen uninstall\` again to put the earlier settings of ${what} back.`,
+    };
   }
 
   /**
