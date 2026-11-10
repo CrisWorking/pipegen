@@ -9,10 +9,13 @@
 //   - a zero checksum (`index.skipHash`) or a wrong SHA-1 checksum, a version other than 2, 3 or 4,
 //   - over 500,000 entries, a path over 4,096 bytes, a v4 strip count over the previous path, a path git itself
 //     would refuse (empty, absolute, `.`, `..` or `.git` parts).
-// `.git` must be a real folder in `dir` (ruling S11: no `gitdir:` file; worktrees and submodules give null).
+// `.git` is a real folder in `dir`, or (PL-B3) a linked worktree's `.git` file: a regular file of one line
+// `gitdir: <path>` whose target is a real folder (no link at any level) holding `commondir` (a submodule has none) and a
+// `gitdir` back-pointer that resolves to `<dir>/.git` exactly, so the file can't point the read at another checkout's
+// index. The index is `<gitdir>/index`, the config `<commondir>/config`. Anything else is null, as before.
 import { createHash } from 'node:crypto';
-import { lstat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { lstat, realpath } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
 import { readBytesLimited, readTextLimitedWithReason, regexLines } from './limits.js';
 
 export const GIT_INDEX_LIMITS = Object.freeze({ maxBytes: 64 * 1024 * 1024, maxEntries: 500_000, maxPathBytes: 4096 });
@@ -32,9 +35,46 @@ const MODE_DIR = 0o040000;
  */
 export async function readGitIndexPaths(dir: string): Promise<ReadonlySet<string> | null> {
   const gitDir = await lstat(join(dir, '.git')).catch(() => null);
-  if (gitDir === null || gitDir.isSymbolicLink() || !gitDir.isDirectory()) return null;
-  if (!(await sha1Repo(dir))) return null;
+  if (gitDir === null || gitDir.isSymbolicLink()) return null;
+  if (gitDir.isFile()) return readWorktreeIndex(dir);
+  if (!gitDir.isDirectory()) return null;
+  if (!(await sha1Repo(join(dir, '.git/config'), dir))) return null;
   const buf = await readBytesLimited(join(dir, '.git/index'), dir, GIT_INDEX_LIMITS.maxBytes);
+  return buf === null ? null : parseGitIndex(buf);
+}
+
+/** A real folder with no link at any level (its real path is the path itself), or null. */
+async function realFolder(path: string): Promise<string | null> {
+  const info = await lstat(path).catch(() => null);
+  if (info === null || !info.isDirectory()) return null;
+  return (await realpath(path).catch(() => null)) === path ? path : null;
+}
+
+/** One line of a small text file under `root` (a trailing newline allowed), or null. */
+async function oneLine(path: string, root: string): Promise<string | null> {
+  const r = await readTextLimitedWithReason(path, root, 4096);
+  if (!('text' in r)) return null;
+  const line = r.text.replace(/\r?\n$/, '');
+  return line === '' || /[\r\n\0]/.test(line) ? null : line;
+}
+
+/** The index of a linked worktree whose `.git` is a `gitdir:` file (see the file comment), or null. */
+async function readWorktreeIndex(dir: string): Promise<ReadonlySet<string> | null> {
+  const realDir = await realpath(dir).catch(() => null);
+  if (realDir === null) return null;
+  const pointer = await oneLine(join(dir, '.git'), dir);
+  const target = pointer === null ? null : /^gitdir: (.+)$/.exec(pointer)?.[1];
+  if (target === undefined || target === null) return null;
+  const gitdir = await realFolder(resolve(realDir, target));
+  if (gitdir === null) return null;
+  const common = await oneLine(join(gitdir, 'commondir'), gitdir);
+  if (common === null) return null; // a submodule's git folder has no commondir
+  const back = await oneLine(join(gitdir, 'gitdir'), gitdir);
+  if (back === null || resolve(gitdir, back) !== join(realDir, '.git')) return null;
+  const commondir = await realFolder(resolve(gitdir, common));
+  if (commondir === null) return null;
+  if (!(await sha1Repo(join(commondir, 'config'), commondir))) return null;
+  const buf = await readBytesLimited(join(gitdir, 'index'), gitdir, GIT_INDEX_LIMITS.maxBytes);
   return buf === null ? null : parseGitIndex(buf);
 }
 
@@ -43,10 +83,9 @@ export async function readGitIndexPaths(dir: string): Promise<ReadonlySet<string
  * A repo without a config file reads as SHA-1, git's default. Matched loosely (any `objectformat` key set to anything
  * but sha1, in any section), so a config written to look odd gives null, never a misread index.
  */
-async function sha1Repo(dir: string): Promise<boolean> {
-  const path = join(dir, '.git/config');
+async function sha1Repo(path: string, root: string): Promise<boolean> {
   if ((await lstat(path).catch(() => null)) === null) return true;
-  const r = await readTextLimitedWithReason(path, dir);
+  const r = await readTextLimitedWithReason(path, root);
   if (!('text' in r)) return false;
   for (const line of regexLines(r.text)) {
     const m = /^\s*objectformat\s*=\s*"?([^"\s;#]*)/i.exec(line);

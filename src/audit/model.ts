@@ -1068,7 +1068,7 @@ async function folderWhy(folder: string, where: string, repo: { top: string; ind
   if ((await lstat(join(folder, 'node_modules')).catch(() => null)) === null) return null;
   const gitInfo = repo === null ? null : await lstat(join(repo.top, '.git')).catch(() => null);
   const noIndex = gitInfo?.isFile() === true
-    ? '.git is a file there (a git worktree or submodule), so pipegen can\'t read its git index'
+    ? '.git is a file there (a git worktree or submodule pipegen can\'t verify), so pipegen can\'t read its git index'
     : repo === null ? 'it is in no git repo' : 'pipegen found no git index it can read';
   return `a node_modules folder pipegen can't tell is not committed (${noIndex}), in ${where}`;
 }

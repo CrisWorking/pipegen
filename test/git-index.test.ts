@@ -2,7 +2,7 @@
 // Real index files are written by `git` at test setup only (a test-only child process).
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { readFileSync, renameSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, symlinkSync, rmSync, truncateSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { GIT_INDEX_LIMITS, parseGitIndex, readGitIndexPaths } from '../src/read/git-index.js';
@@ -247,4 +247,71 @@ describe('parseGitIndex (hand-built indexes)', () => {
     expect(parseGitIndex(resign(buf))).toBeNull();
   });
 });
+
+/** A main repo with one commit (FILES) and a linked worktree made by `git worktree add`; returns both folders. */
+function worktree(extra: Record<string, string> = {}): { main: string; wt: string } {
+  const main = gitRepo();
+  for (const [f, body] of Object.entries(extra)) writeIn(main, f, body);
+  git(main, 'add', '-f', '--', '.');
+  git(main, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '--no-verify', '-m', 'init');
+  const wt = join(makeTempDir(), 'wt');
+  git(main, 'worktree', 'add', '-q', wt);
+  return { main, wt };
+}
+
+describe('readGitIndexPaths: linked worktrees (PL-B3)', () => {
+  it('worktree → index read through gitdir', async () => {
+    const { wt } = worktree();
+    expect([...((await readGitIndexPaths(wt)) ?? [])].sort()).toEqual([...FILES].sort());
+  });
+
+  it('gitdir whose back-pointer names another folder → null', async () => {
+    const { main, wt } = worktree();
+    const gitdir = /^gitdir: (.+)$/m.exec(readFileSync(join(wt, '.git'), 'utf8'))?.[1] as string;
+    // a second checkout points its .git file at the first worktree's git folder: the back-pointer names wt, not it
+    const other = makeTempDir();
+    writeIn(other, '.git', `gitdir: ${gitdir}\n`);
+    expect(await readGitIndexPaths(other)).toBeNull();
+    // a relative back-pointer that resolves elsewhere is refused too
+    writeFileSync(join(gitdir, 'gitdir'), '../../../../elsewhere/.git\n');
+    expect(await readGitIndexPaths(wt)).toBeNull();
+    expect(main).toBeTruthy();
+  });
+
+  it('submodule .git file → null', async () => {
+    // a submodule's git folder (modules/<name>) is a full git folder: an index, no commondir
+    const main = gitRepo();
+    const mod = join(main, '.git/modules/sub');
+    mkdirSync(mod, { recursive: true });
+    const sub = join(main, 'sub');
+    mkdirSync(sub);
+    for (const f of ['index', 'config', 'HEAD']) writeFileSync(join(mod, f), f === 'index' ? indexOf(main) : '\n');
+    writeFileSync(join(mod, 'gitdir'), `${join(sub, '.git')}\n`);
+    writeIn(sub, '.git', 'gitdir: ../.git/modules/sub\n');
+    expect(await readGitIndexPaths(sub)).toBeNull();
+  });
+
+  it('.git file is a symlink → null', async () => {
+    const { wt } = worktree();
+    const body = readFileSync(join(wt, '.git'));
+    const elsewhere = join(makeTempDir(), 'dotgit');
+    writeFileSync(elsewhere, body);
+    rmIn(wt, '.git');
+    symlinkSync(elsewhere, join(wt, '.git'));
+    expect(await readGitIndexPaths(wt)).toBeNull();
+  });
+
+  it('worktree gitdir reached through a symlinked folder → null', async () => {
+    const { wt } = worktree();
+    const gitdir = /^gitdir: (.+)$/m.exec(readFileSync(join(wt, '.git'), 'utf8'))?.[1] as string;
+    const link = join(makeTempDir(), 'link');
+    symlinkSync(gitdir, link);
+    writeFileSync(join(wt, '.git'), `gitdir: ${link}\n`);
+    expect(await readGitIndexPaths(wt)).toBeNull();
+  });
+});
+
+function rmIn(dir: string, f: string): void {
+  rmSync(join(dir, f));
+}
 

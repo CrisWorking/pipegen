@@ -1568,6 +1568,17 @@ describe('npx pipegen inside the folder: the safe-mode stop (J5, #124, S8, S15)'
     expect(await swapRiskWhy(wt, wt)).toContain('a git worktree or submodule');
   });
 
+  it('worktree → index read, local node_modules not committed → no stop', async () => {
+    const { wt } = gitWorktree({});
+    writeIn(wt, 'node_modules/a/index.js', '\n');
+    expect(await swapRiskWhy(wt, wt)).toBeNull();
+  });
+
+  it('worktree with a committed node_modules → stop', async () => {
+    const { wt } = gitWorktree({ 'node_modules/left-pad/index.js': 'module.exports = 1;\n' });
+    expect(await swapRiskWhy(wt, wt)).toContain('a committed node_modules folder');
+  });
+
   it('stop comes before the --ai checks (no Ollama call)', async () => {
     const dir = repo({ '.npmrc': UNSAFE_NPMRC });
     const r = await audit(['--ai', 'ollama', '--model', 'llama3'], { cwd: dir, env: { OLLAMA_HOST: 'http://127.0.0.1:11434' } });
@@ -1751,3 +1762,18 @@ describe('npx pipegen: no command, --help, --type, --verbose and the type questi
     expect((await audit(['--verbose', '--verbose'], { cwd: dir })).code).toBe(1);
   });
 });
+
+/** A real `git worktree add` checkout (test-only child process) of a one-commit repo holding `files` plus package.json. */
+function gitWorktree(files: Record<string, string>): { main: string; wt: string } {
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', HOME: '/nonexistent' };
+  const git = (cwd: string, ...args: string[]) => childProcess.execFileSync('git', args, { cwd, stdio: 'pipe', env });
+  const main = makeTempDir();
+  git(main, 'init', '-q');
+  for (const [f, body] of Object.entries({ 'package.json': '{}\n', ...files })) writeIn(main, f, body);
+  git(main, 'add', '-f', '--', '.');
+  git(main, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '--no-verify', '-m', 'init');
+  const wt = join(makeTempDir(), 'wt');
+  git(main, 'worktree', 'add', '-q', wt);
+  return { main, wt };
+}
+
