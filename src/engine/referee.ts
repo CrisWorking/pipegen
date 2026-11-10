@@ -37,6 +37,7 @@ import { FINDINGS_CATEGORIES, gateJobList, GateJobListError, jobIdFor, PIPEGEN_J
 import { GATE_JSON_INPUTS, gateStepInputs, NIGHTLY_JSON_INPUTS, nightlyStepInputs } from './gate-inputs.js';
 import { runLinters } from './linters.js';
 import { COMMIT_SHA_RE, parseImageRef } from './names.js';
+import { servicesByName } from './names.js';
 import { NEED_ID_CATEGORY, toolCoversNeed } from './need-ids.js';
 import { PLATFORM_ACTION_IDS, type PlatformActions } from './pin.js';
 import { APP_RUNNING_CATEGORIES, renderRangeScan, TRIVY_LAUNCH_RE } from './render-cli.js';
@@ -1240,7 +1241,7 @@ function judgeImageHandoff(fc: FileCtx, id: string, where: string, j: Obj, judge
       // G15a-R11 r5-2: bound to the PUBLISHED service (publishedImageServices: exactly one in v0.2), never to any root service whose
       // Dockerfile the build names: its Dockerfile, and (G15a-R10 r4-3) exactly its image, the one the sign job signs (the renderer's helper)
       const published = publishedImageServices(fc.draft.profile, fc.draft.capabilities);
-      const pubSvc = published.length === 1 ? fc.draft.profile.services.find((svc) => svc.name === published[0]) : undefined;
+      const pubSvc = published.length === 1 ? servicesByName(fc.draft.profile).get(published[0] as string) : undefined;
       if (pubSvc === undefined) {
         bad('template', `${at}: build-push in image-publish builds the Dockerfile of a service at the repository root that pipegen publishes, and this plan publishes ${published.length === 0 ? 'none' : 'more than one'}.`);
       } else {

@@ -1523,6 +1523,15 @@ describe('G10 fix round 1 (review-G10, ruling G10-R2)', () => {
     expect(w.vault.names()).toEqual([]);
   });
 
+  it('PL-F1 R1: writeRecord with central files and a stale base stops naming the caller command (setup run by default)', async () => {
+    const w = world();
+    const { res } = await firstRun(w);
+    const r = await record(w) as NonNullable<Awaited<ReturnType<typeof record>>>;
+    const args = { record: r, setupPr: res.prNumber, via: 'direct' as const, files: [{ path: '.github/workflows/x.yml', content: 'a\n' }], base: 'f'.repeat(40), local: { home: w.home, env: {} } };
+    await expect(writeRecord(w.g.octokit(), args)).rejects.toThrow(/run `npx pipegen run` again\./);
+    await expect(writeRecord(w.g.octokit(), { ...args, command: 'finish' })).rejects.toThrow(/run `npx pipegen finish` again\./);
+  });
+
   it('fix 1: the central CODEOWNERS is written only onto the head its original was checked against (m7)', async () => {
     const w = world();
     const p = profile();

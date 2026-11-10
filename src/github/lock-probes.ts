@@ -10,6 +10,7 @@
 import type { Octokit } from '@octokit/rest';
 import { isRateStop, withRateLimit, type RateClock } from '../engine/github-rate.js';
 import type { RepoProfile } from '../types.js';
+import { pipegenCmd } from '../util/next-step.js';
 import { safeText } from '../util/safe-text.js';
 import { checkRepoNames, clockOf, GitHubAccessError, githubTokenRejected, isAnonymousClient, isNoAnswer, listWriters } from './client.js';
 
@@ -89,9 +90,9 @@ export async function readRepoId(gh: Octokit, owner: string, repo: string, notes
  * listWriters reads every collaborator with `affiliation=all`, so direct, team and organisation-base access all count, with GitHub's
  * effective permission). Throws listWriters' error when either list can't be read.
  */
-export async function readWriters(gh: Octokit, owner: string, app: string, central: string, clock: RateClock = clockOf(gh)): Promise<{ app: string[]; central: string[] }> {
+export async function readWriters(gh: Octokit, owner: string, app: string, central: string, clock: RateClock = clockOf(gh), command?: string): Promise<{ app: string[]; central: string[] }> {
   // G8-R2 I1: an answer with nobody who can write (empty, or only bots and read-only users) is a stop, never "one writer"
-  const nobody = (repo: string) => new GitHubAccessError(`pipegen found nobody who can write to ${safeText(`${owner}/${repo}`, 140)} in GitHub's collaborator list (it held no user with write access), so it can't plan who approves changes. Check that the token can read the repo's collaborators, then run pipegen again.`);
+  const nobody = (repo: string) => new GitHubAccessError(`pipegen found nobody who can write to ${safeText(`${owner}/${repo}`, 140)} in GitHub's collaborator list (it held no user with write access), so it can't plan who approves changes. Check that the token can read the repo's collaborators, then run ${pipegenCmd(command)} again.`);
   const a = await listWriters(gh, owner, app, clock);
   if (a.length === 0) throw nobody(app);
   const c = await listWriters(gh, owner, central, clock);

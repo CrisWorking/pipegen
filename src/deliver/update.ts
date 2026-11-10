@@ -1017,7 +1017,7 @@ async function updateHeld(gh: Octokit, app: RepoRef, deps: UpdateDeps): Promise<
   if (appChanges.length > 0) {
     const c = await commitFiles(gh, app, { parent: appSt.head, baseTree: appSt.tree, files: appChanges.map((x) => ({ path: x.path, content: x.after, mode: x.mode })), message: `pipegen: update the gate to v${gate.version}` }, clock);
     await setBranch(gh, app, UPDATE_BRANCH, c.commit, true, clock);
-    const pr = await openOrUpdatePr(gh, app, { head: UPDATE_BRANCH, base: appSt.defaultBranch, title: `pipegen: update the gate to v${gate.version}`, body: appPrBody(plan) }, clock);
+    const pr = await openOrUpdatePr(gh, app, { head: UPDATE_BRANCH, base: appSt.defaultBranch, title: `pipegen: update the gate to v${gate.version}`, body: appPrBody(plan) }, clock, 'update');
     prUrl = pr.url;
   }
   // the record (and the central files, in the same central pull request commit): every blob sha written appended, through writeRecord
@@ -1027,7 +1027,7 @@ async function updateHeld(gh: Octokit, app: RepoRef, deps: UpdateDeps): Promise<
     written = await writeRecord(gh, {
     record: next, setupPr, via: centralOut.length > 0 ? 'pr' : 'direct',
     ...(centralOut.length > 0 ? { files: centralOut.map((x) => ({ path: x.path, content: x.after })), base: centralSt.head, pr: { title: central.length > 0 ? `pipegen: update the gate of ${record.name} to v${gate.version}` : `pipegen: move the org required workflow of ${record.name} to the new central commit`, body: centralPrBody(plan) } } : {}),
-    clock, ...(deps.now === undefined ? {} : { now: deps.now }), ...(deps.local === undefined ? {} : { local: deps.local }),
+    clock, command: 'update', ...(deps.now === undefined ? {} : { now: deps.now }), ...(deps.local === undefined ? {} : { local: deps.local }),
     });
   } catch (e) {
     // Spec M3: the app pull request is open; say so, and that the record was not written (its sha is missing: the safe side for uninstall)

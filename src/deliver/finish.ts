@@ -96,7 +96,7 @@ async function setupPr(x: { api: SettingsApi; app: RepoRef; branch: string }, lo
   const d = (await x.api.read('GET /repos/{owner}/{repo}/pulls/{pull_number}', { owner: x.app.owner, repo: x.app.repo, pull_number: num })).data;
   if (!isObj(d) || !isObj(d.head) || d.head.ref !== SETUP_BRANCH) throw new FinishError(`Pull request #${num} of ${show(`${x.app.owner}/${x.app.repo}`)} is not pipegen's setup pull request, so pipegen applies nothing.`);
   // m9: only a merge into the default branch is the merge finish waits for
-  if (!isObj(d.base) || d.base.ref !== x.branch) throw new FinishError(`The setup pull request #${num} of ${show(`${x.app.owner}/${x.app.repo}`)} is not merged into the default branch ${show(x.branch, 100)} (it targets ${isObj(d.base) && typeof d.base.ref === 'string' ? show(d.base.ref, 100) : 'another branch'}), so pipegen applies nothing. Run pipegen again to open a new one.`);
+  if (!isObj(d.base) || d.base.ref !== x.branch) throw new FinishError(`The setup pull request #${num} of ${show(`${x.app.owner}/${x.app.repo}`)} is not merged into the default branch ${show(x.branch, 100)} (it targets ${isObj(d.base) && typeof d.base.ref === 'string' ? show(d.base.ref, 100) : 'another branch'}), so pipegen applies nothing. Run \`npx pipegen run\` again to open a new one.`);
   const merged = isoAt(d.merged_at) ? d.merged_at : null;
   return { number: num, mergedAt: merged, state: typeof d.state === 'string' ? d.state : '' };
 }
@@ -168,24 +168,24 @@ async function finishHeld(gh: Octokit, app: RepoRef, opts: FinishOpts, deps: Fin
     const local = await readLocalRecord(app, deps.local ?? {}).catch((e: unknown) => { if (e instanceof RecordError) return null; throw e; });
     const typed = local?.typed === true;
     if (rec.app.repoId !== appRepo.id || rec.app.owner.toLowerCase() !== app.owner.toLowerCase() || rec.app.repo.toLowerCase() !== app.repo.toLowerCase()) throw new FinishError('The install record is not this repository\'s (another repo id or name), so pipegen applies nothing.');
-    if (rec.app.private !== appRepo.private || rec.app.defaultBranch !== appRepo.defaultBranch) throw new FinishError(`${show(`${app.owner}/${app.repo}`)} changed since pipegen set it up (${rec.app.private !== appRepo.private ? `it is ${appRepo.private ? 'private' : 'public'} now` : `its default branch is ${show(appRepo.defaultBranch, 100)} now`}), so pipegen applies nothing; run pipegen again.`);
+    if (rec.app.private !== appRepo.private || rec.app.defaultBranch !== appRepo.defaultBranch) throw new FinishError(`${show(`${app.owner}/${app.repo}`)} changed since pipegen set it up (${rec.app.private !== appRepo.private ? `it is ${appRepo.private ? 'private' : 'public'} now` : `its default branch is ${show(appRepo.defaultBranch, 100)} now`}), so pipegen applies nothing; run \`npx pipegen run\` again.`);
     // G10 re-review r2: a request pipegen never makes stops everything before anything is sent
     const badRoute = typed ? null : plannedRouteProblem(rec.planned);
-    if (badRoute !== null) throw new FinishError(`The install record plans a request pipegen never makes (${show(badRoute, 120)}), so pipegen applies nothing. The record was changed by someone else; run pipegen again to write a new one.`);
+    if (badRoute !== null) throw new FinishError(`The install record plans a request pipegen never makes (${show(badRoute, 120)}), so pipegen applies nothing. The record was changed by someone else; run \`npx pipegen run\` again to write a new one.`);
     if (opts.rotateKey === true && !typed && rec.planned.signingMode !== 'key-env') throw new FinishError('--rotate-key works only in key-env signing mode (a cosign key kept in the pipegen-signing environment); this repo signs another way, so pipegen applies nothing.');
 
     // 2. the setup pull request must be merged
     const p = await setupPr({ api, app, branch: appRepo.defaultBranch }, local?.setupPr);
     if (p.mergedAt === null) {
       throw new FinishError(p.state === 'closed'
-        ? `The setup pull request #${p.number} was closed without being merged, so pipegen applies nothing. Run pipegen again to open a new one.`
+        ? `The setup pull request #${p.number} was closed without being merged, so pipegen applies nothing. Run \`npx pipegen run\` again to open a new one.`
         : `The setup pull request #${p.number} is not merged yet, so pipegen applies nothing: the settings come after the merge, or the pull request could not merge. Merge it, then run \`npx pipegen finish\`.`);
     }
     pr = { number: p.number, mergedAt: p.mergedAt };
 
     // 3. re-probe (S10, G8 carry) and plan the locks again
     const probed = await deps.probe(gh, app, { private: appRepo.private, ownerType: appRepo.ownerType, defaultBranch: appRepo.defaultBranch, centralDefaultBranch: centralRepo.defaultBranch }, notes, clock);
-    const writers = await readWriters(gh, app.owner, app.repo, CENTRAL_REPO, clock);
+    const writers = await readWriters(gh, app.owner, app.repo, CENTRAL_REPO, clock, 'finish');
     const orgAdmin = await readOrgAdmin(gh, app.owner, appRepo.ownerType, notes, clock);
     const shaRead = await readShaPinning(gh, app.owner, app.repo, notes, clock);
     const appHead = await readHead(gh, app, appRepo.defaultBranch, clock);
@@ -219,13 +219,13 @@ async function finishHeld(gh: Octokit, app: RepoRef, opts: FinishOpts, deps: Fin
       central: { repo: `${central.owner}/${central.repo}`, sha: rec.centralSha ?? centralHead, branchProtection: probed.centralBranchProtection, codeowners: { path: centralCo.path, original: centralCo.text, isSymlink: centralCo.isSymlink, inserted: centralCo.block } },
       writers, owners, orgAdmin, shaPinning: shaRead, protectedPaths,
       appCodeowners: { original: appCo.text, isSymlink: appCo.isSymlink, inserted }, ids: { app: appRepo.id, central: centralRepo.id }, files,
-      version: rec.pipegenVersion,   // PL-D1-R1: the required workflow's header names the version that delivered it, so its text (and blob sha) is the one in the central repo
+      command: 'finish', version: rec.pipegenVersion,   // PL-D1-R1: the required workflow's header names the version that delivered it, so its text (and blob sha) is the one in the central repo
     });
     let planned = rec.planned;
     if (typed) {
       const mode = rec.secrets.some((s) => s.scope === SIGNING_SCOPE && s.name === COSIGN_KEY_SECRET) ? 'key-env' : signingMode(profile, { ...probed.caps, deploymentBranchPolicies: false });
       planned = plannedOfLocks(fresh, mode, []);
-      notes.push('The install record was confirmed by typing, so pipegen planned the locks again from GitHub (the code owners from the CODEOWNERS block on the default branch). pipegen couldn\'t re-derive the environments the setup planned (that record doesn\'t carry them): run pipegen again to set them up.');
+      notes.push('The install record was confirmed by typing, so pipegen planned the locks again from GitHub (the code owners from the CODEOWNERS block on the default branch). pipegen couldn\'t re-derive the environments the setup planned (that record doesn\'t carry them): run `npx pipegen run` again to set them up.');
     }
     if (opts.rotateKey === true && planned.signingMode !== 'key-env') throw new FinishError('--rotate-key works only in key-env signing mode (a cosign key kept in the pipegen-signing environment); this repo signs another way, so pipegen applies nothing.');
     // I1: what an earlier run saved before it stopped (an unreadable file stops here, nothing applied; it is never overwritten)
@@ -288,7 +288,7 @@ async function finishHeld(gh: Octokit, app: RepoRef, opts: FinishOpts, deps: Fin
     // the central rule is on already (reused, or made by an earlier finish): the record goes through the central pull request; a new rule
     // is still switched off here, so the record commit goes straight to the default branch (a refused direct move falls back to the PR)
     const via = x.centralRec.rulesetId !== undefined && x.activate === undefined ? 'pr' : 'direct';
-    written = await writeRecord(gh, { record, setupPr: pr.number, via, files: x.centralFiles, base: x.centralHead, clock, ...(deps.now === undefined ? {} : { now: deps.now }), ...(deps.local === undefined ? {} : { local: deps.local }) });
+    written = await writeRecord(gh, { record, setupPr: pr.number, via, files: x.centralFiles, base: x.centralHead, clock, command: 'finish', ...(deps.now === undefined ? {} : { now: deps.now }), ...(deps.local === undefined ? {} : { local: deps.local }) });
   } catch (e) {
     report(x, deps.out, 'unrecorded', stopWhy(e));
     if (isStop(e)) throw e;

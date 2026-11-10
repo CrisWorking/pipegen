@@ -33,13 +33,13 @@ import { AiError, completeValidated, type AiErrorKind } from '../ai/provider.js'
 import { aiSchema, type AiSchema } from '../ai/schema.js';
 import { safeText } from '../util/safe-text.js';
 import type {
-  AiProvider, AiUsage, Candidate, InstallSpec, Language, Need, NeedCategory, PackageManager, PipelineDraft, RepoProfile, ReviewedTool,
+  AiProvider, AiUsage, Candidate, InstallSpec, Language, Need, NeedCategory, PackageManager, PipelineDraft, RepoProfile, ReviewedTool, Service,
 } from '../types.js';
 import { CANDIDATES_MAX_OUTPUT_TOKENS, MAX_DISCOVERY_NEEDS } from './discovery-limits.js';
 import { GitHubRateLimitError, isRateStop, withRateLimit, type RateClock } from './github-rate.js';
 import { fetchAllowed, readJson } from './http.js';
 import type { MemoryStore } from './memory.js';
-import { githubRepoFromUrl, isFullSemver, isGitHubRepo, isNpmName, repoSegments } from './names.js';
+import { githubRepoFromUrl, isFullSemver, isGitHubRepo, isNpmName, repoSegments, servicesByName } from './names.js';
 import { cleanAiText, NEED_ID_CATEGORY } from './needs.js';
 import { checkQualityBar, type QualityBar } from './quality-bar.js';
 import { nearDuplicate, neverListed, reviewedFor } from './reviewed.js';
@@ -154,15 +154,21 @@ function shared<T extends string>(values: (T | undefined)[], allowed: readonly T
   return only !== undefined && allowed.includes(only) ? only : 'other';
 }
 
+/** The one service a need names (first of that name), as a list. */
+function serviceList(p: RepoProfile, name: string): Service[] {
+  const svc = servicesByName(p).get(name);
+  return svc === undefined ? [] : [svc];
+}
+
 /** Ruling S18: a need's language is its service's; a repo-wide need's is the one every service shares, else 'other'. */
 export function needLanguage(need: Need, p: RepoProfile): Language {
-  const services = need.service === undefined ? p.services : p.services.filter((s) => s.name === need.service).slice(0, 1);
+  const services = need.service === undefined ? p.services : serviceList(p, need.service);
   return shared(services.map((s) => s.language), LANGUAGES);
 }
 
 /** The package manager the same way (an enum for the prompt). */
 function needPackageManager(need: Need, p: RepoProfile): PackageManager {
-  const services = need.service === undefined ? p.services : p.services.filter((s) => s.name === need.service).slice(0, 1);
+  const services = need.service === undefined ? p.services : serviceList(p, need.service);
   return shared(services.map((s) => s.packageManager), PACKAGE_MANAGERS);
 }
 

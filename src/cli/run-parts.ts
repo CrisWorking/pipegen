@@ -123,9 +123,9 @@ const BOT_RE = /\[bot\]$|^dependabot$|^github-actions$/i;
 export function pickOwners(writers: { app: readonly string[]; central: readonly string[] }, login: string | null): OwnersPick {
   const central = new Set(writers.central.map((w) => w.toLowerCase()));
   const humans = writers.app.filter((w) => !BOT_RE.test(w));
-  if (humans.length === 0) return { stop: 'pipegen found no person with write access to this repository (only bots, or nobody), so it can\'t pick code owners or lock merging safely. Give at least one person write access, then run pipegen again.' };
+  if (humans.length === 0) return { stop: 'pipegen found no person with write access to this repository (only bots, or nobody), so it can\'t pick code owners or lock merging safely. Give at least one person write access, then run `npx pipegen run` again.' };
   // spec M7 (G8-R2 I1): the central list too, before anything costs money (planLocks would refuse it only at stage 15)
-  if (!writers.central.some((w) => !BOT_RE.test(w))) return { stop: 'pipegen found no person with write access to the central repository (pipelines): only bots, or nobody, so it can\'t pick code owners or lock merging safely. Give at least one person write access to pipelines, then run pipegen again.' };
+  if (!writers.central.some((w) => !BOT_RE.test(w))) return { stop: 'pipegen found no person with write access to the central repository (pipelines): only bots, or nobody, so it can\'t pick code owners or lock merging safely. Give at least one person write access to pipelines, then run `npx pipegen run` again.' };
   const both = [...new Set(humans.filter((w) => central.has(w.toLowerCase())))];
   if (both.length < 2) return { owners: [], writers: humans.length, note: 'Fewer than two people can write to both this repository and the central repository, so pipegen sets no code-owner rule and writes no CODEOWNERS block: a single writer can approve their own changes to the pipeline files.' };
   const first = login !== null ? both.find((w) => w.toLowerCase() === login.toLowerCase()) : undefined;

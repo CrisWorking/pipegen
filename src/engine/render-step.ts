@@ -20,6 +20,7 @@ import { DEPENDENCY_KINDS, type OutputFormat, type PipelineDraft, type RepoProfi
 import { APP_PREFIX, containerValue, DB_PASSWORD_BYTES, DB_PASSWORD_NAME, DB_USER, ENV_TABLE, isDepKey, VALUE_TABLE, VAR_KINDS } from '../create/compose-tables.js';
 import { COMMIT_SHA_RE } from './names.js';
 import { centralWorkflowPath } from './central-path.js';
+import { servicesByName } from './names.js';
 import { NEED_IDS, toolCoversNeed } from './need-ids.js';
 import type { PlatformActions } from './pin.js';
 import { tuningProblems } from './tuning.js';
@@ -100,7 +101,7 @@ export function validateSpec(spec: StepSpec, tool: ReviewedTool, ctx: RenderCont
   // a platform-only entry (checkout, setup, upload, login, ...) is a step helper, rendered by renderPlatformStep and never a check of a need; the referee refuses any spec that names one
   else if (!(tool.categories.length === 1 && tool.categories[0] === 'platform') && !toolCoversNeed(tool.categories, spec.needId)) problem('tool', `${show(tool.id)} does not cover the check ${show(spec.needId)} (its categories are ${tool.categories.map((c) => show(c)).join(', ')}).`);
 
-  const service = spec.service === undefined ? undefined : services.find((s) => s.name === spec.service);
+  const service = spec.service === undefined ? undefined : servicesByName({ services }).get(spec.service);
   if (spec.service !== undefined && service === undefined) problem('service', `${show(spec.service)} isn't a service of this repository.`);
 
   // choices: only the keys the entry offers, each at one of its listed values
@@ -349,7 +350,7 @@ export function renderStepWith(given: StepSpec, tool: ReviewedTool, platform: Pl
   }
   if (tool.candidate.kind !== 'action' || tool.step.action === undefined) {
     if (tool.step.cli === undefined) throw new RenderError(`${show(tool.id)} is neither an action nor a cli entry.`);
-    const service = spec.service === undefined ? undefined : ctx.profile.services.find((s) => s.name === spec.service);
+    const service = spec.service === undefined ? undefined : servicesByName(ctx.profile).get(spec.service);
     return renderCliTool({ spec, tool, service, ctx, hooks: cliHooks(platform), options });
   }
   const container = containerRefusal(tool, usesOf(tool).path);
@@ -358,7 +359,7 @@ export function renderStepWith(given: StepSpec, tool: ReviewedTool, platform: Pl
   if (tool.step.output.format !== 'none') throw new RenderError(`an action that writes a result (${show(tool.id)}) can't be rendered: its output would have to be moved under runner.temp first, and no reviewed action needs that yet.`);
 
   const { path } = usesOf(tool);
-  const service = spec.service === undefined ? undefined : ctx.profile.services.find((s) => s.name === spec.service);
+  const service = spec.service === undefined ? undefined : servicesByName(ctx.profile).get(spec.service);
   const step = actionStep(tool, actionStepName(path), textChoices(spec.choices), rendererFill(path, service, ctx, typeof spec.choices.registry === 'string' ? spec.choices.registry : tool.choices.registry?.[0]));
   const secrets = spec.secrets ?? [];
   if (secrets.length > 0) step.env = Object.fromEntries(secrets.map((n) => [n, `\${{ secrets.${n} }}`]));
@@ -790,7 +791,7 @@ export function scanFactOf(result: RenderResult, tool: string): { stepId: string
  * folder must be the service's own path, the runtime version is only mapped. The run step is a repo-code step.
  */
 export function renderProjectScript(step: ProjectScriptStep, platform: PlatformActions, ctx: RenderContext): RenderResult {
-  const svc = ctx.profile.services.find((s) => s.name === step.service);
+  const svc = servicesByName(ctx.profile).get(step.service);
   if (svc === undefined) throw new RenderError(`The project script is for ${show(step.service)}, which is not a service pipegen found.`);
   if (step.script !== 'test' && step.script !== 'lint') throw new RenderError(`${show(step.script)} is not a script pipegen runs (only test and lint).`);
   if (!svc.scripts.includes(step.script)) throw new RenderError(`The service ${show(svc.name)} has no ${step.script} script, so there is no script to run.`);
@@ -834,7 +835,7 @@ function repoCodeBase(svc: Service, workingDir: string | undefined, needId: stri
  * derives from the repository (the tool, the version, the folder): anything else is refused, so no caller can name another tool or folder.
  */
 export function renderRepoTool(step: RepoToolStep, platform: PlatformActions, ctx: RenderContext): RenderResult {
-  const svc = ctx.profile.services.find((s) => s.name === step.service);
+  const svc = servicesByName(ctx.profile).get(step.service);
   if (svc === undefined) throw new RenderError(`The repo tool is for ${show(step.service)}, which is not a service pipegen found.`);
   const want = repoToolFor({ id: step.needId, service: svc.name }, svc);
   if (want === null || !isDeepStrictEqual({ ...step }, want)) throw new RenderError(`The step for ${show(step.needId)} of ${show(svc.name)} is not the repository's own tool at its lockfile version, so pipegen does not run it.`);

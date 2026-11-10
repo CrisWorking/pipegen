@@ -73,7 +73,7 @@ describe('E1 repos (plan Task 1, preflight S1/S13/S19)', () => {
         { name: 'pipelines', exists: false, createCommand: createCommands(OWNER, ['pipelines'])[0] },
         { name: SCRATCH, exists: false, createCommand: createCommands(OWNER, [SCRATCH])[0] },
       ]);
-      expect(i.all()).toContain('Create these private repos, then run pipegen again');
+      expect(i.all()).toContain('Create these private repos, then run `npx pipegen run` again');
       expect(i.all()).toContain(`gh repo create ${OWNER}/pipelines --private --disable-wiki --description "pipegen central workflows and install records"`);
       expect(i.all()).toContain(`gh repo create ${OWNER}/${SCRATCH} --private --disable-wiki --description "pipegen proof runs (private scratch repo)"`);
       expect(g.writes()).toEqual([]);

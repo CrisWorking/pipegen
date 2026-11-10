@@ -36,6 +36,7 @@ import { ProofStopError, takeCreatePermitIssuer, validBranchName, type CreatePer
 
 /** The create-permit maker, taken once when this module loads (target.ts hands it out once). */
 const issuePermit = takeCreatePermitIssuer();
+import { pipegenCmd } from '../util/next-step.js';
 import type { ProofTransport } from './snapshot.js';
 
 export type Stage = 'consented' | 'planned' | 'debated' | 'created' | 'proving' | 'proven' | 'cleaned' | 'delivered' | 'interrupted' | 'stopped';
@@ -289,6 +290,8 @@ export interface StateDeps {
    * r2-L1). Default: LEASE_SETTLE_MS, slept synchronously.
    */
   leaseSettle?: () => void;
+  /** PL-F1: the command that opened the store; its stops say `npx pipegen <command>` where they tell the user to run it again (default: the setup run). */
+  command?: LeaseCommand;
 }
 
 const KIND: TrustedDirKind = {
@@ -373,13 +376,13 @@ export class StateStore {
     } catch (e) {
       const code = (e as { code?: unknown } | null)?.code;
       if (code === 'ENOENT') return null;
-      throw new StateError(code === 'ELOOP' ? `${this.path} is a symbolic link; pipegen won't read it. Remove the link, then run pipegen again.` : `pipegen couldn't open its state file ${this.path}. Check that you can read it (or delete it), then run pipegen again.`, { cause: e });
+      throw new StateError(code === 'ELOOP' ? `${this.path} is a symbolic link; pipegen won't read it. Remove the link, then run ${pipegenCmd(this.#deps.command)} again.` : `pipegen couldn't open its state file ${this.path}. Check that you can read it (or delete it), then run ${pipegenCmd(this.#deps.command)} again.`, { cause: e });
     }
     let raw: string;
     try {
       const st = fstatSync(fd);
-      if (!st.isFile()) throw new StateError(`${this.path} is not a regular file; pipegen won't read it. Remove it, then run pipegen again.`);
-      if (st.uid !== this.#deps.uid) throw new StateError(`${this.path} is not owned by you; pipegen won't read it. Check who wrote it; delete it (or make it yours with chown), then run pipegen again.`);
+      if (!st.isFile()) throw new StateError(`${this.path} is not a regular file; pipegen won't read it. Remove it, then run ${pipegenCmd(this.#deps.command)} again.`);
+      if (st.uid !== this.#deps.uid) throw new StateError(`${this.path} is not owned by you; pipegen won't read it. Check who wrote it; delete it (or make it yours with chown), then run ${pipegenCmd(this.#deps.command)} again.`);
       if ((st.mode & 0o077) !== 0) throw new StateError(`${this.path} can be read or changed by other users (mode ${(st.mode & 0o777).toString(8)}); pipegen won't trust it. Fix it with: chmod 600 '${this.path}'`);
       if (st.size > MAX_STATE_BYTES) throw new StateError(`${this.path} is larger than pipegen's limit; pipegen won't read it. Delete it to start again (run pipegen cleanup first if a proof left anything behind).`);
       const buf = Buffer.alloc(st.size + 1);
@@ -388,7 +391,7 @@ export class StateStore {
         const n = readSync(fd, buf, got, buf.length - got, null);
         if (n === 0) break;
         got += n;
-        if (got > st.size) throw new StateError(`${this.path} grew while pipegen read it; pipegen won't trust it. Run pipegen again once no other pipegen works on this repo.`);
+        if (got > st.size) throw new StateError(`${this.path} grew while pipegen read it; pipegen won't trust it. Run ${pipegenCmd(this.#deps.command)} again once no other pipegen works on this repo.`);
       }
       raw = buf.subarray(0, got).toString('utf8');
     } finally {
@@ -696,7 +699,7 @@ export class StateStore {
         // was a takeover or a fresh one. After every take, wait a moment and read the lease again: only the last writer goes on
         (this.#deps.leaseSettle ?? sleepSettle)();
         if (this.#readLease(file)?.token !== token) {
-          throw new ProofStopError(`Another pipegen took the lease ${file} at the same time. Wait for it to finish, then run pipegen again.`);
+          throw new ProofStopError(`Another pipegen took the lease ${file} at the same time. Wait for it to finish, then run ${pipegenCmd(command ?? this.#deps.command)} again.`);
         }
         this.#lease = { token, off: onExit(() => this.#dropLease(token)) };
         return;
@@ -707,11 +710,11 @@ export class StateStore {
         // Plan V M5: the message names the command that holds the lease (a lease written before then names none). G-LEASE-R1 (sec L2): the
         // process id may have been reused by another program since a pipegen died without giving the lease back
         const who = held.command === undefined ? `process ${held.pid}` : `\`pipegen ${held.command}\`, process ${held.pid}`;
-        throw new ProofStopError(`Another pipegen (${who}) is working on ${which} on this machine. Wait for it to finish, or stop it, then run pipegen again. If process ${held.pid} is not pipegen, remove ${file} and run pipegen again.`);
+        throw new ProofStopError(`Another pipegen (${who}) is working on ${which} on this machine. Wait for it to finish, or stop it, then run ${pipegenCmd(command ?? this.#deps.command)} again. If process ${held.pid} is not pipegen, remove ${file} and run ${pipegenCmd(command ?? this.#deps.command)} again.`);
       }
       // an unreadable lease (review M-2): never taken over (it can't be shown to be this machine's, or dead), a stop naming it
       if (held !== null && held.host === '') {
-        throw new ProofStopError(`The lease ${file} can't be read, so pipegen can't tell whether another pipegen works on this repo. If none runs, remove that file and run pipegen again.`);
+        throw new ProofStopError(`The lease ${file} can't be read, so pipegen can't tell whether another pipegen works on this repo. If none runs, remove that file and run ${pipegenCmd(command ?? this.#deps.command)} again.`);
       }
       if (held !== null && held.host !== hostname()) {
         throw new ProofStopError(`The lease ${file} was taken on another machine (${safeText(held.host, 80)}); pipegen won't share the scratch repo with it. Remove that file only if no pipegen runs there.`);
@@ -722,7 +725,7 @@ export class StateStore {
       if (again !== null && again.token !== held?.token) continue;
       try { unlinkSync(file); } catch { /* raced: try once more */ }
     }
-    throw new ProofStopError(`Another pipegen took the lease ${file} at the same time. Run pipegen again.`);
+    throw new ProofStopError(`Another pipegen took the lease ${file} at the same time. Run ${pipegenCmd(command ?? this.#deps.command)} again.`);
   }
 
   #alive(pid: number): boolean {

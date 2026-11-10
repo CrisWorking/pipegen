@@ -25,6 +25,7 @@ import { callsWorkflow, deployGating, deployTriggers, plainUbuntu, readsContents
 import { BUILD_PUSH_STEP_ID, HEAD_CHECK_STEP_ID, imageDigestArtifact, publishedImageRepo, PUBLISH_TAG, renderHeadCheckStep, renderPublishDigestStep } from '../engine/deploy-steps.js';
 import type { RateClock } from '../engine/github-rate.js';
 import { CALLER_WORKFLOW, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PUSH_WORKFLOW, type RenderedStep } from '../engine/job-rules.js';
+import { servicesByName } from '../engine/names.js';
 import { publishedImageServices } from '../engine/needs.js';
 import type { PlatformActions } from '../engine/pin.js';
 import { SIGNING_ENVIRONMENT, triggersOf } from '../engine/referee-shared.js';
@@ -135,7 +136,7 @@ export function insertVerify(original: string, deployJobs: readonly string[], ve
   if (needsOnly.some((id) => !deployJobs.includes(id))) refuse('a job that waits without the head check must be one it gates');
   if (deployJobs.length === 0) refuse('no job to gate');
   const { map } = parsedDoc(original);
-  if (pairOf(map, VERIFY_JOB) !== undefined) refuse(`it already has a job named ${VERIFY_JOB}; rename that job, then run pipegen again`);
+  if (pairOf(map, VERIFY_JOB) !== undefined) refuse(`it already has a job named ${VERIFY_JOB}; rename that job, then run \`npx pipegen run\` again`);
   const eol = eolOf(original);
   const nl = (t: string): string => t.replace(/\r?\n/g, eol);
   const head = headCheckOf(verify);
@@ -149,7 +150,7 @@ export function insertVerify(original: string, deployJobs: readonly string[], ve
   const headJobs: string[] = [];
   for (const id of [...new Set(deployJobs)]) {
     const p = pairOf(map, id);
-    if (p === undefined || !isMap(p.value) || p.value.flow === true || p.value.items.length === 0) refuse(`its job ${show(id)} is written in { } on one line; write it as an indented block, then run pipegen again`);
+    if (p === undefined || !isMap(p.value) || p.value.flow === true || p.value.items.length === 0) refuse(`its job ${show(id)} is written in { } on one line; write it as an indented block, then run \`npx pipegen run\` again`);
     const job = (p as Pair<YamlNode, YamlNode>).value as unknown as { items: Pair[] };
     const needs = pairOf(job, 'needs');
     if (needs === undefined) {
@@ -168,7 +169,7 @@ export function insertVerify(original: string, deployJobs: readonly string[], ve
         add(r[0], '[', NEEDS);
         add(r[1], `, ${VERIFY_JOB}]`, NEEDS);
       } else if (isSeq(v) && v.flow === true) {
-        if (/\r?\n/.test(original.slice(r[0], r[1]))) refuse(`its job ${show(id)} lists its needs over several lines inside [ ]; write them on one line, or as a - list, then run pipegen again`);
+        if (/\r?\n/.test(original.slice(r[0], r[1]))) refuse(`its job ${show(id)} lists its needs over several lines inside [ ]; write them on one line, or as a - list, then run \`npx pipegen run\` again`);
         const close = original.lastIndexOf(']', r[1] - 1);
         if (close < r[0]) return refuse(`the needs of its job ${show(id)} do not end with ]`);
         add(close, v.items.length === 0 ? VERIFY_JOB : `, ${VERIFY_JOB}`, NEEDS);
@@ -186,7 +187,7 @@ export function insertVerify(original: string, deployJobs: readonly string[], ve
     if (pairOf(job, 'uses') !== undefined || needsOnly.includes(id)) continue;
     const steps = pairOf(job, 'steps');
     const sv = steps?.value;
-    if (steps === undefined || !isSeq(sv) || sv.flow === true || sv.items.length === 0) refuse(`its job ${show(id)} has no block list of steps to start with pipegen's head check; write its steps as a - list, then run pipegen again`);
+    if (steps === undefined || !isSeq(sv) || sv.flow === true || sv.items.length === 0) refuse(`its job ${show(id)} has no block list of steps to start with pipegen's head check; write its steps as a - list, then run \`npx pipegen run\` again`);
     const item0 = (sv as unknown as { items: YamlNode[] }).items[0] as YamlNode;
     const dash = item0.range === undefined || item0.range === null ? -1 : original.lastIndexOf('-', item0.range[0] - 1);
     const col = dash < 0 ? null : spacesBefore(original, dash);
@@ -292,12 +293,12 @@ function insertHeadCheckStep(original: string, calledBy: readonly string[], head
   const ids: string[] = [];
   for (const pair of map.items as Pair<YamlNode, YamlNode>[]) {
     const id = isScalar(pair.key) && typeof pair.key.value === 'string' ? pair.key.value : null;
-    if (id === null || !isMap(pair.value) || pair.value.flow === true || pair.value.items.length === 0) refuse(`its job ${show(String(id))} is written in { } on one line; write it as an indented block, then run pipegen again`);
+    if (id === null || !isMap(pair.value) || pair.value.flow === true || pair.value.items.length === 0) refuse(`its job ${show(String(id))} is written in { } on one line; write it as an indented block, then run \`npx pipegen run\` again`);
     const job = pair.value as unknown as { items: Pair[] };
     if (pairOf(job, 'uses') !== undefined) refuse(`its job ${show(id as string)} calls another workflow in turn, which can't start with pipegen's head check`);
     const steps = pairOf(job, 'steps');
     const sv = steps?.value;
-    if (steps === undefined || !isSeq(sv) || sv.flow === true || sv.items.length === 0) refuse(`its job ${show(id as string)} has no block list of steps to start with pipegen's head check; write its steps as a - list, then run pipegen again`);
+    if (steps === undefined || !isSeq(sv) || sv.flow === true || sv.items.length === 0) refuse(`its job ${show(id as string)} has no block list of steps to start with pipegen's head check; write its steps as a - list, then run \`npx pipegen run\` again`);
     const item0 = (sv as unknown as { items: YamlNode[] }).items[0] as YamlNode;
     const dash = item0.range === undefined || item0.range === null ? -1 : original.lastIndexOf('-', item0.range[0] - 1);
     const col = dash < 0 ? null : spacesBefore(original, dash);
@@ -521,7 +522,7 @@ export function releaseJobs(draft: PipelineDraft, deps: { platform: PlatformActi
   if (services.length === 0) return {};
   if (services.length > 1) fail(`pipegen publishes one image per repository in v0.2, and this plan would publish ${services.length} (${services.map(show).join(', ')}).`);
   const name = services[0] as string;
-  const svc = draft.profile.services.find((s) => s.name === name);
+  const svc = servicesByName(draft.profile).get(name);
   if (svc === undefined || typeof svc.dockerfile !== 'string') return fail(`The service ${show(name)} has no Dockerfile to publish.`);
   let repo: string;
   try { repo = publishedImageRepo(draft.profile.owner, draft.profile.repo, name); } catch (e) { if (e instanceof RenderError) return fail(e.message); throw e; }

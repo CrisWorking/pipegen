@@ -651,6 +651,14 @@ describe('G11 finish: what it records (Plan V §5)', () => {
     expect((await recordOn(t)).orgRuleset).toEqual({ org: 'o', id: org?.id, name: 'pipegen-required--r', githubCreatedAt: org?.created_at, pinnedSha: (org?.body.rules as { parameters: { workflows: { sha: string }[] } }[])[0]?.parameters.workflows[0]?.sha });
   });
 
+  it('PL-F1 R1: a note planLocks raises while finish runs names `npx pipegen finish` (planLocks command wiring)', async () => {
+    const t = await seed({ org: true });
+    t.g.memberships.set('o', { state: 'active', role: 'member' });
+    const res = await finish(t.g.octokit(), { owner: 'o', repo: 'r' }, {}, t.deps());
+    const all = [...res.notes, ...res.skipped.map((x) => `${x.what}: ${x.why}`)].join('\n');
+    expect(all).toMatch(/an owner can run `npx pipegen finish` again to add it/);
+  });
+
   it('finish: an access level GitHub doesn\'t name is never recorded (V9a-R2: uninstall prints the recorded level in a step)', async () => {
     const s = await seed();
     s.g.x('o/pipelines').access = 'user_x';
@@ -706,7 +714,7 @@ describe('G11 finish: carries (G8, G10)', () => {
     expect(t.g.orgRulesets.size).toBe(0);
     expect(res.skipped.find((x) => /org required workflow/.test(x.what))?.why).toMatch(/doesn't hold/);
     // PL-D1 Fold R2 (security I4): both ways on: merge the open central pull request, or run pipegen again
-    expect(res.skipped.find((x) => /org required workflow/.test(x.what))?.why).toMatch(/central pull request.*still open, merge it.*otherwise run pipegen again/i);
+    expect(res.skipped.find((x) => /org required workflow/.test(x.what))?.why).toMatch(/central pull request.*still open, merge it.*otherwise run `npx pipegen run` again/i);
   });
 
   it('finish: sends only allow-listed routes; a route the record plans that pipegen never makes is refused, never sent', async () => {
@@ -2314,7 +2322,7 @@ describe('Plan V M5: finish holds the app lease', () => {
     const from = s.g.calls.length;
     const e = await finish(s.g.octokit(), app, {}, s.deps()).then(() => null, (x: unknown) => x);
     expect(e).toBeInstanceOf(FinishError);
-    expect((e as Error).message).toMatch(/^Another pipegen \(`pipegen uninstall`, process \d+\) is working on .* Wait for it to finish, or stop it, then run pipegen again\. If process \d+ is not pipegen, remove \S+lease\.json and run pipegen again\. Nothing was applied\.$/);
+    expect((e as Error).message).toMatch(/^Another pipegen \(`pipegen uninstall`, process \d+\) is working on .* Wait for it to finish, or stop it, then run `npx pipegen finish` again\. If process \d+ is not pipegen, remove \S+lease\.json and run `npx pipegen finish` again\. Nothing was applied\.$/);
     expect(s.g.calls.length).toBe(from);
     // --print too: it reads what the uninstall is changing
     await expect(finish(s.g.octokit(), app, { print: true }, s.deps())).rejects.toThrow(/`pipegen uninstall`/);

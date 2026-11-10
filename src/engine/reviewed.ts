@@ -1383,7 +1383,7 @@ export function bootstrapProofs(env: Env = process.env): boolean {
   const v = env[BOOTSTRAP_PROOFS_ENV];
   if (v === undefined || v === '') return false;
   if (isReleaseBuild()) {
-    throw new BootstrapProofsError(`${BOOTSTRAP_PROOFS_ENV} is for pipegen's own development runs; this release refuses it, so it offers only tools with a passed proof. Unset ${BOOTSTRAP_PROOFS_ENV} and run pipegen again.`);
+    throw new BootstrapProofsError(`${BOOTSTRAP_PROOFS_ENV} is for pipegen's own development runs; this release refuses it, so it offers only tools with a passed proof. Unset ${BOOTSTRAP_PROOFS_ENV} and run \`npx pipegen run\` again.`);
   }
   return v === '1';
 }

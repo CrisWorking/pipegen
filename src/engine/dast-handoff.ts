@@ -20,6 +20,7 @@ import {
   DAST_HANDOFF_STEP_ID, DAST_RAW_SHA_ENV, DAST_RAW_SHA_OUTPUT, dastAppStepId, dastCheckStepId, dastLaneOf, dastRawArtifact, dastRawShaRef, dastResultArtifact, ZAP_ACTIVE_LANE, type DastLane,
   IMAGE_ARCHIVE_FILE, imageArchiveArtifact, imageBuildJobId, IMAGE_BUILD_NEED, stepOutputForm, type RenderedStep, type ScanFact,
 } from './job-rules.js';
+import { servicesByName } from './names.js';
 import { PLATFORM_ACTION_IDS, type PlatformActions } from './pin.js';
 import { pipegenScriptStep } from './pipegen-script.js';
 import { RenderError } from './render-error.js';
@@ -82,7 +83,7 @@ const validPort = (n: unknown): n is number => typeof n === 'number' && Number.i
  * renderable image-build step) and the service has a port. Shared by the assembler and the referee, so both render the same steps.
  */
 export function dastStartOf(draft: PipelineDraft, service: string, baseImages: readonly BaseImage[] = loadBaseImages()): DastStart | { problem: string } {
-  const svc = draft.profile.services.find((s) => s.name === service);
+  const svc = servicesByName(draft.profile).get(service);
   if (svc === undefined) return { problem: 'it is not a service pipegen found' };
   const file = draft.created.find((f) => f.repo === 'app' && f.path === COMPOSE_PATH);
   if (file !== undefined) {
@@ -92,7 +93,7 @@ export function dastStartOf(draft: PipelineDraft, service: string, baseImages: r
   }
   const build = draft.steps.find((s) => s.needId === IMAGE_BUILD_NEED && s.service === service && s.tool.id === PLATFORM_ACTION_IDS['build-push']);
   // G17B-R0: a Dockerfile pipegen creates in this draft counts (imageProfile, the image build's own source)
-  const dockerfile = imageProfile(draft.profile, draft.created).services.find((s) => s.name === service)?.dockerfile;
+  const dockerfile = servicesByName(imageProfile(draft.profile, draft.created)).get(service)?.dockerfile;
   if (build === undefined || (dockerfile ?? '') === '') return { problem: 'it has no container image pipegen builds (a Dockerfile it builds, or pipegen\'s compose file), and pipegen starts the app for a scan in a container only' };
   if (!validPort(svc.port)) return { problem: 'pipegen found no port the app listens on, so there is nothing to scan' };
   return { kind: 'archive', port: svc.port, url: `http://127.0.0.1:${svc.port}` };

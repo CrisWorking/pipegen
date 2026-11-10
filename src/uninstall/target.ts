@@ -1164,7 +1164,7 @@ export class UninstallApi {
   async openUninstallPr(where: Where, pr: { base: string; title: string; body: string }): Promise<{ number: number; url: string; opened: boolean }> {
     if (interrupting()) refuse('a stop has begun; uninstall sends nothing more.');
     await this.#verify(where);
-    return openOrUpdatePr(this.#stopping, this.repoOf(where), { head: uninstallBranch(this.app, where), base: checkBranch(pr.base), title: pr.title, body: pr.body }, this.clock);
+    return openOrUpdatePr(this.#stopping, this.repoOf(where), { head: uninstallBranch(this.app, where), base: checkBranch(pr.base), title: pr.title, body: pr.body }, this.clock, 'uninstall');
   }
 
   /** The repo delete; only deleteCentralRepo calls it, after its checks. */
@@ -1351,8 +1351,8 @@ export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: Inst
     if (d.id !== repoId) return { why: `${full} is not the repo pipegen created (its id differs from the one recorded), so pipegen doesn't delete it` };
     if (d.forks_count !== 0) return { why: `${full} has forks (or GitHub doesn't say), and they belong to whoever made them, so pipegen doesn't delete it` };
     // V6-R3 sec M2: these ask the user to change something, then come back: a `retry` (the caller keeps its local files), never delete advice
-    if (d.has_wiki !== false) { retryable = true; return { why: `${full} has its wiki turned on, and pipegen can't see whether it holds pages: check the wiki, turn it off in the repo's settings, then run pipegen again` }; }
-    if (d.has_discussions !== false) { retryable = true; return { why: `${full} has Discussions turned on (or GitHub doesn't say), and they would go with the repo: check them, turn Discussions off in the repo's settings, then run pipegen again` }; }
+    if (d.has_wiki !== false) { retryable = true; return { why: `${full} has its wiki turned on, and pipegen can't see whether it holds pages: check the wiki, turn it off in the repo's settings, then run \`npx pipegen uninstall\` again` }; }
+    if (d.has_discussions !== false) { retryable = true; return { why: `${full} has Discussions turned on (or GitHub doesn't say), and they would go with the repo: check them, turn Discussions off in the repo's settings, then run \`npx pipegen uninstall\` again` }; }
     if (typeof d.default_branch !== 'string') return { why: `GitHub doesn't say which is the default branch of ${full}` };
     const def = d.default_branch;
     const br = await get('GET /repos/{owner}/{repo}/branches', { per_page: 100 }, 'the branches');
@@ -1427,10 +1427,10 @@ export async function deleteCentralRepo(gh: Octokit, central: RepoRef, rec: Inst
   // what changed while pipegen asked: a refusal a later run may not meet (V6-R2 sec I1)
   const again = await check();
   if ('why' in again) return notDeleted(`${again.why} (it changed while pipegen asked)`, 'retry');
-  if (again.head !== first.head) return notDeleted(`${full} changed while pipegen asked, so it doesn't delete it; run pipegen again`, 'retry');
-  if (again.unread.some((x) => !first.unread.includes(x))) return notDeleted(`pipegen could read less of ${full} than when it asked, so it doesn't delete it; run pipegen again`, 'retry');
-  if (again.prs.some((n) => !first.prs.includes(n))) return notDeleted(`${full} got a new pull request while pipegen asked, so it doesn't delete it; run pipegen again`, 'retry');
-  if (again.own.join('\n') !== first.own.join('\n')) return notDeleted(`a branch of pipegen's in ${full} moved while pipegen asked, so it doesn't delete it; run pipegen again`, 'retry');
+  if (again.head !== first.head) return notDeleted(`${full} changed while pipegen asked, so it doesn't delete it; run \`npx pipegen uninstall\` again`, 'retry');
+  if (again.unread.some((x) => !first.unread.includes(x))) return notDeleted(`pipegen could read less of ${full} than when it asked, so it doesn't delete it; run \`npx pipegen uninstall\` again`, 'retry');
+  if (again.prs.some((n) => !first.prs.includes(n))) return notDeleted(`${full} got a new pull request while pipegen asked, so it doesn't delete it; run \`npx pipegen uninstall\` again`, 'retry');
+  if (again.own.join('\n') !== first.own.join('\n')) return notDeleted(`a branch of pipegen's in ${full} moved while pipegen asked, so it doesn't delete it; run \`npx pipegen uninstall\` again`, 'retry');
   io.beforeDelete?.();
   try { await api.sendRepoDelete(REPO_DELETE_GUARD, api.central); } catch (e) {
     if (e instanceof UninstallRefusal) throw e;

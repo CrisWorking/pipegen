@@ -485,7 +485,7 @@ export async function createHelperRepo(gh: Octokit, r: GuardedRepo, login: strin
   if (typeof d.full_name !== 'string' || d.full_name.toLowerCase() !== r.fullName.toLowerCase() || d.private !== true
     || (visibility !== undefined && visibility !== 'private')) {
     throw new ProofStopError(`GitHub's answer to creating ${r.fullName} doesn't say it is that repo and private, so pipegen won't use it. `
-      + `Check ${r.fullName} on GitHub (make it private, or delete it if pipegen made it public), then run pipegen again.`);
+      + `Check ${r.fullName} on GitHub (make it private, or delete it if pipegen made it public), then run \`npx pipegen run\` again.`);
   }
   return d;
 }

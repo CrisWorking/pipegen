@@ -6,6 +6,7 @@ import type { Octokit } from '@octokit/rest';
 import { isRateStop, withRateLimit, type RateClock } from '../engine/github-rate.js';
 import { clockOf, githubTokenRejected, isAnonymousClient } from '../github/client.js';
 import { validDate } from '../../gate/src/date.js';
+import { pipegenCmd } from '../util/next-step.js';
 import { safeText } from '../util/safe-text.js';
 
 /** A delivery that stops: a plain reason, never a secret value or a server message. */
@@ -213,18 +214,18 @@ export async function compareStatus(gh: Octokit, r: RepoRef, base: string, head:
 }
 
 /** The open pull request from `branch` (this repo), or null. */
-export async function findOpenPr(gh: Octokit, r: RepoRef, branch: string, clock: RateClock): Promise<{ number: number; url: string } | null> {
+export async function findOpenPr(gh: Octokit, r: RepoRef, branch: string, clock: RateClock, command?: string): Promise<{ number: number; url: string } | null> {
   const d = await ghRead(gh, 'GET /repos/{owner}/{repo}/pulls', r, { head: `${r.owner}:${checkBranch(branch)}`, state: 'open', per_page: 10 }, clock);
   if (!Array.isArray(d)) throw new DeliverError('GitHub\'s list of pull requests could not be read.');
   const mine = d.map(obj).filter((p) => obj(p.head).ref === branch && Number.isSafeInteger(p.number));
-  if (mine.length > 1) throw new DeliverError(`More than one pull request is open from ${safeText(branch, 100)}; close the extra ones, then run pipegen again.`);
+  if (mine.length > 1) throw new DeliverError(`More than one pull request is open from ${safeText(branch, 100)}; close the extra ones, then run ${pipegenCmd(command)} again.`);
   const p = mine[0];
   return p === undefined ? null : { number: p.number as number, url: typeof p.html_url === 'string' ? p.html_url : '' };
 }
 
 /** Opens the pull request from `head`, or updates the open one (title and body): never a second one. */
-export async function openOrUpdatePr(gh: Octokit, r: RepoRef, pr: { head: string; base: string; title: string; body: string }, clock: RateClock): Promise<{ number: number; url: string; opened: boolean }> {
-  const open = await findOpenPr(gh, r, pr.head, clock);
+export async function openOrUpdatePr(gh: Octokit, r: RepoRef, pr: { head: string; base: string; title: string; body: string }, clock: RateClock, command?: string): Promise<{ number: number; url: string; opened: boolean }> {
+  const open = await findOpenPr(gh, r, pr.head, clock, command);
   if (open !== null) {
     await ghWrite(gh, 'PATCH /repos/{owner}/{repo}/pulls/{pull_number}', r, { pull_number: open.number, title: pr.title, body: pr.body }, clock);
     return { ...open, opened: false };

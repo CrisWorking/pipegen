@@ -1,9 +1,10 @@
 // The pure builders for the files Plan G writes and the D0b judges re-check (v0.2 Plan D, D0b; preflight 4.2). Plan G calls these to
 // produce a CODEOWNERS block and a dependabot entry; the judges call the same functions and compare byte for byte (or value for value),
-// so the producer and the referee can not drift. A leaf: types, the protected-path leaf and the gate's LOGIN_RE only.
+// so the producer and the referee can not drift. A leaf: types, the names and protected-path leaves and the gate's LOGIN_RE only.
 import { LOGIN_RE, MAX_LINE, PIPEGEN_BLOCK_BEGIN, PIPEGEN_BLOCK_END } from '../../gate/src/integrity.js';
 import type { PipelineDraft, ReviewedTool } from '../types.js';
 import { packageVersion } from '../util/package-data.js';
+import { servicesByName } from './names.js';
 import { effectiveProtectedPaths } from './protected-paths.js';
 import { isObj, parseYaml } from './yaml-parse.js';
 
@@ -253,9 +254,10 @@ export function hookCommands(draft: PipelineDraft, reviewed: readonly ReviewedTo
   if (draft.needs.some((n) => n.layer === 'pre-commit' && n.id === 'secrets') && reviewed.some((t) => t.id === 'gitleaks' && t.categories.includes('secrets'))) {
     out.push({ id: SECRETS_HOOK_ID, run: secretsHookRun(version) });
   }
+  const byName = servicesByName(draft.profile);
   for (const need of draft.needs) {
     if (need.layer !== 'pre-commit' || need.id !== 'format-lint') continue;
-    const svc = draft.profile.services.find((s) => s.name === need.service);
+    const svc = need.service === undefined ? undefined : byName.get(need.service);
     if (svc === undefined || !isRootPath(svc.path) || svc.language !== 'node' || svc.packageManager !== 'npm') continue;
     for (const spec of draft.steps) {
       if (spec?.needId !== need.id || spec.service !== need.service) continue;
