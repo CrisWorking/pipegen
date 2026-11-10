@@ -194,11 +194,11 @@ describe('choose: a note names only `also` tools the list has (m6)', () => {
     expect(bare.also).toEqual([]);
     expect(bare.note).not.toMatch(/poutine|actionlint/);
   });
-  it('choose: iac on Kubernetes without kube-linter → no "plus kube-linter"', () => {
-    expect(choose('iac', k8s).note).toContain('plus kube-linter');
-    const c = choose('iac', k8s, without('kube-linter'));
-    expect(alsoIds(c)).toEqual([]);
-    expect(c.note).toBe('Trivy config: scans Terraform and Kubernetes files');
+  it('choose: iac on Kubernetes never promises kube-linter: run never adds it (PL-C0 fold R1)', () => {
+    for (const c of [choose('iac', k8s), choose('iac', k8s, without('kube-linter'))]) {
+      expect(alsoIds(c)).toEqual([]);
+      expect(c.note).toBe('Trivy config: scans Terraform and Kubernetes files');
+    }
   });
 });
 
@@ -309,12 +309,15 @@ describe('choose: workflows, dependencies, licences', () => {
     const locked = choose('workflow-pin-check', profile([svc()], { repoFiles: { ...emptyRepoFiles(), actionsLock: true } }));
     expect(locked.note).toContain("won't rewrite its pins");
   });
-  it('choose: public → osv-scanner + dependency-review-action; user-owned private → osv-scanner only (R4)', () => {
+  it('choose: public → osv-scanner + dependency-review-action; any private repo → osv-scanner only (R4; PL-C0 fold R1 M1)', () => {
     expect(alsoIds(choose('dependency-review', profile()))).toEqual(['dependency-review-action']);
     const userPrivate = choose('dependency-review', profile([svc()], { private: true, ownerType: 'User' }), LIST, caps);
     expect(idOf(userPrivate.tool)).toBe('osv-scanner');
     expect(userPrivate.also).toEqual([]);
-    expect(alsoIds(choose('dependency-review', profile([svc()], { private: true, ownerType: 'Organization' }), LIST, caps))).toEqual(['dependency-review-action']);
+    const orgPrivate = choose('dependency-review', profile([svc()], { private: true, ownerType: 'Organization' }), LIST, caps);
+    expect(orgPrivate.also).toEqual([]);   // run never offers the action on a private repo, so the audit never promises it
+    expect(orgPrivate.note).not.toContain('dependency review');
+    for (const v of [null, undefined, 'internal']) expect(choose('dependency-review', profile([svc()], { private: v as never }), LIST, caps).also).toEqual([]);
     expect(choose('dependency-review', profile([svc()], { private: true, ownerType: 'Organization' }), LIST, bareCaps).also).toEqual([]);
   });
   it('choose: deny.toml → cargo-deny suggestion; .fossa.yml → keep FOSSA; else trivy-licence', () => {
@@ -336,8 +339,8 @@ describe('choose: workflows, dependencies, licences', () => {
 });
 
 describe('choose: iac, secrets, update config, publishing, the scheduled checks', () => {
-  it('choose: k8s → iac also kube-linter', () => {
-    expect(alsoIds(choose('iac', profile([svc()], { repoFiles: { ...emptyRepoFiles(), kubernetes: true } })))).toEqual(['kube-linter']);
+  it('choose: k8s → iac is trivy-config alone, never also kube-linter (PL-C0 fold R1)', () => {
+    expect(alsoIds(choose('iac', profile([svc()], { repoFiles: { ...emptyRepoFiles(), kubernetes: true } })))).toEqual([]);
     expect(choose('iac', profile()).also).toEqual([]);
     expect(idOf(choose('iac', profile()).tool)).toBe('trivy-config');
   });

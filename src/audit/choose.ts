@@ -13,7 +13,7 @@
 //
 // Also here: `skippedGroups` (the checks that don't apply, one line per reason) and `wouldSetSettings` (the GitHub
 // settings `finish` would turn on).
-import { codeSecurityAvailable } from '../github/availability.js';
+import { dependencyReviewActionUsable } from '../github/availability.js';
 import { needLanguage } from '../engine/discover.js';
 import { riskyTriggersOf, skippedChecks, type SkippedCheck } from '../engine/needs.js';
 import { neverImage, neverListed, nodeTypeChecker, repoToolStep, reviewedFor, type RepoToolStep, type WouldAddTool } from '../engine/reviewed.js';
@@ -212,7 +212,8 @@ function hooksCiRule(c: Ctx): Choice {
 }
 
 function dependencyReviewRule(c: Ctx): Choice {
-  const available = codeSecurityAvailable(c.p, c.caps);
+  // PL-C0 fold R1 (M1): only what run really adds; run offers dependency-review-action on a public repo only
+  const available = dependencyReviewActionUsable(c.p);
   return reviewed(c, T.osvScanner, `OSV-Scanner: checks new dependencies against known vulnerabilities${available ? ', plus GitHub dependency review' : ''}`, available ? [T.dependencyReviewAction] : []);
 }
 
@@ -268,8 +269,9 @@ const RULES: Readonly<Record<string, Rule>> = {
   'api-dast': apiDastRule,
   iac: (c) => reviewed(
     c, T.trivyConfig,
-    (found) => (c.p.repoFiles.kubernetes ? `Trivy config: scans Terraform and Kubernetes files${found.has(T.kubeLinter) ? ', plus kube-linter' : ''}` : 'Trivy config: scans Terraform files'),
-    c.p.repoFiles.kubernetes ? [T.kubeLinter] : [],
+    // PL-C0 fold R1: run never offers kube-linter for iac, so the audit never promises it
+    () => (c.p.repoFiles.kubernetes ? 'Trivy config: scans Terraform and Kubernetes files' : 'Trivy config: scans Terraform files'),
+    [],
   ),
   secrets: (c) => reviewed(c, T.betterleaks, 'Betterleaks: scans for committed secrets', [], c.p.repoFiles.secretsBaseline ? '; a .secrets.baseline exists, so detect-secrets also runs' : ''),
   'update-config': updateConfigRule,
