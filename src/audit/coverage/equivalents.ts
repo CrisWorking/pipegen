@@ -9,8 +9,8 @@
 //   Pushes to other branches without a pull request are still not checked (the report says so).
 // - hooks-ci: the pre-commit config is readable, non-empty and every hook in it is recognised, and every tool the
 //   hooks run also runs in CI, unconditionally and in the same folder, on this row's own trigger.
-// - signing: a release (no image) signed in CI by cosign. ciCoverage already covers the row from the `cosign sign` and
-//   `cosign sign-blob` signatures; this only says so in the report.
+// - signing: a release (no image) signed in CI by `cosign sign-blob`. ciCoverage already covers the row, from a
+//   sign-blob run only (PL-B1: an image `cosign sign` never covers a no-image row); this only says so in the report.
 // - deploy-verify (J3b, ruling B3): every workflow that deploys passes deployGateOf (./deploy-gate.ts: a guarded
 //   workflow_run deploy with a commit check, or a deploy job inside the CI workflow that needs every CI job and runs only
 //   on a push to the default branch), and no workflow was unreadable. Worked out once by deployGates (it reads files),
@@ -95,7 +95,7 @@ function hooksCiCredit(r: Coverage, d: Decide, hooks: Hooks): Coverage | undefin
   };
 }
 
-/** Credit 4. The row is covered already (cosign sign / sign-blob); this adds the report line. */
+/** Credit 4. The row is covered already (cosign sign-blob, the only run a no-image row reads); this adds the report line. */
 function signingCredit(r: Coverage, d: Decide): Coverage | undefined {
   if (r.need.category !== 'signing' || r.status !== 'covered' || r.by !== 'cosign' || r.credit !== undefined || !d.noImage(r.need)) return undefined;
   return { ...r, credit: 'CI signs the release artifacts with cosign (sign-blob)', creditKind: 'signing' };

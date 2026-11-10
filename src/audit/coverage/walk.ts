@@ -217,6 +217,7 @@ function addFound(ctx: Ctx, found: Found[], c: StepCtx): void {
       ...(f.langs === undefined ? {} : { langs: f.langs }), ...(f.pathArgs === undefined ? {} : { pathArgs: f.pathArgs }),
       ...(f.hookSkip === undefined ? {} : { hookSkip: f.hookSkip }), ...(f.unplaced === undefined ? {} : { unplaced: f.unplaced }),
       ...(f.langFiles === undefined ? {} : { langFiles: f.langFiles }), ...(f.coveredNote === undefined ? {} : { coveredNote: f.coveredNote }),
+      ...(f.releaseSign === true ? { releaseSign: true } : {}),
     });
   }
 }

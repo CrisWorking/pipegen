@@ -332,6 +332,7 @@ export function unplacedRun(f: Found): Found {
   return { ...f, unplaced: `${f.subject} is given a path pipegen can't place (a variable, an expression, a glob or a path outside the repo), so it can't tell which services it checks.` };
 }
 const NPM_PROVENANCE_ID = 'npm-provenance';
+const COSIGN_ID = 'cosign';
 /** P60 (m3): prek run's `--skip <hook>` / `--skip=<hook>` words taken out (each value a hook id or alias), and what they skip. */
 function prekSkipArgs(words: readonly string[]): { words: string[]; skip: SkipSet | null } {
   const out: string[] = [];
@@ -675,6 +676,8 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
           if (b !== null) f.dockerBuild = b;
         }
         if (r.tool.id === NPM_PROVENANCE_ID) f.envGate = 'npm';
+        // PL-B1: only `cosign sign-blob` signs a release's files; `cosign sign` signs an image
+        if (r.tool.id === COSIGN_ID && r.rest.length === 1 && r.rest[0] === 'sign-blob') f.releaseSign = true;
         // P60 (R2): semgrep checks the languages of the rules its config names
         if (r.tool.id === SEMGREP_ID || r.tool.id === SEMGREP_SCAN_ID) Object.assign(f, semgrepLangs(semgrepConfigValues(args.slice(r.rest.length)), cwd));
         // P57 (C1): path arguments scope the run to the services under them (scopeToPaths, once the repo can be checked)

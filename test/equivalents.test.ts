@@ -322,6 +322,43 @@ describe('signing credit: cosign sign-blob on a release without an image', () =>
     const image = await sign(run('cosign sign-blob x'), '\n  release:\n    types: [published]', false);
     expect(image.credit).toBeUndefined();
   });
+  // PL-B1: an image `cosign sign` proves nothing about a release without an image (U23: never a false covered)
+  it('static site + root-level cosign sign of an image → static service\'s signing row not covered', async () => {
+    const dir = makeTempDir();
+    wf(dir, 'release.yml', `on:\n  push:\n    tags: ['v*']\n${job(`${run('docker build -t ghcr.io/o/api:1 api')}${run('cosign sign --yes ghcr.io/o/api@sha256:abc')}`, 'publish')}`);
+    const p = await profileOf(dir, { services: [svc({ name: 'site', path: 'site' }), svc({ name: 'api', path: 'api' })] });
+    const needs: Need[] = ['site', 'api'].map((s) => ({ id: `signing-${s}`, layer: 'deploy', category: 'signing', service: s, why: '', blocking: false, floor: false }));
+    const [site, api] = await mapCoverage(p, needs, dir, { noImage: (n) => n.service === 'site' }) as [Coverage, Coverage];
+    expect(site.status).not.toBe('covered');
+    expect(site.credit).toBeUndefined();
+    expect(api).toMatchObject({ status: 'covered', by: 'cosign' });
+  });
+  it('signing: cosign sign of an image in two invented YAML shapes → no-image row not covered', async () => {
+    for (const [steps, on] of [
+      [run('cosign sign --yes ghcr.io/o/r@sha256:abc'), "\n  push:\n    tags: ['v*']"],
+      [`${run('make dist')}${run('cosign sign --key env://K --yes ghcr.io/o/web@sha256:def')}`, '\n  release:\n    types: [published]'],
+    ] as [string, string][]) {
+      const r = await sign(steps, on, true);
+      expect(r.status).not.toBe('covered');
+      expect(r.credit).toBeUndefined();
+    }
+  });
+  it('sign-blob → covered, credit says sign-blob', async () => {
+    const r = await sign(run('cosign sign-blob --yes dist/pkg.tgz'), '\n  release:\n    types: [published]', true);
+    expect(r).toMatchObject({ status: 'covered', by: 'cosign', creditKind: 'signing' });
+    expect(r.credit).toContain('sign-blob');
+  });
+  it('image service + cosign sign → covered, no sign-blob wording', async () => {
+    for (const [steps, on] of [
+      [run('cosign sign --yes ghcr.io/o/r@sha256:abc'), "\n  push:\n    tags: ['v*']"],
+      [`${run('docker push x')}${run('cosign sign --key env://K --yes ghcr.io/o/web@sha256:def')}`, '\n  release:\n    types: [published]'],
+    ] as [string, string][]) {
+      const r = await sign(steps, on, false);
+      expect(r).toMatchObject({ status: 'covered', by: 'cosign' });
+      expect(r.credit).toBeUndefined();
+      expect(JSON.stringify(r)).not.toContain('sign-blob');
+    }
+  });
   it('signing credit: cosign verify or a help call is not a signature → no credit', async () => {
     const r = await sign(run('cosign verify-blob --key k --signature s f'), '\n  release:\n    types: [published]', true);
     expect(r.status).not.toBe('covered');

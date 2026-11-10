@@ -148,6 +148,13 @@ const NF = 3;
 const LAYER_SLOT: Readonly<Record<Slot, number>> = { push: 0, merge: 4, deploy: 8, scheduled: 12 };
 const SLOTS: readonly Slot[] = ['push', 'merge', 'deploy', 'scheduled'];
 const OPAQUE_KEY = '\0opaque'; // not a category: the opaque runs (they have none)
+/**
+ * PL-B1: not a category: the signing runs that sign files (`cosign sign-blob`). A service with no image reads this key
+ * instead of `signing`, so an image `cosign sign` never covers (nor makes partial) a release's signing row (U23).
+ */
+const RELEASE_SIGN_KEY = '\0signing-release';
+/** The table key a CI need reads its runs under. */
+const ciKey = (need: Need, d: Pick<Decide, 'noImage'>): string => (need.category === 'signing' && d.noImage(need) ? RELEASE_SIGN_KEY : need.category);
 
 /**
  * P57 (C1): the language tag a per-service table key carries. A run is filed under its category plus each language it
@@ -176,7 +183,7 @@ export class Firsts {
       // P59 (3): a run given a path pipegen can't place, that would cover, is unknown for the services under its folder
       // (it still counts for repo-wide rows); one with a reason already is only partial there, never covered
       const unplaced = h.unplaced !== undefined && h.reason === null;
-      for (const key of h.opaque ? [OPAQUE_KEY] : h.categories) {
+      for (const key of h.opaque ? [OPAQUE_KEY] : h.releaseSign === true && h.categories.includes('signing') ? [...h.categories, RELEASE_SIGN_KEY] : h.categories) {
         this.put(key, ALL, h, i);
         const here = unplaced && !key.startsWith(UNKNOWN_PREFIX) ? `${UNKNOWN_PREFIX}${key}` : key;
         if (d >= 0) for (const lang of langs) this.put(langKey(here, lang), d, h, i);
@@ -340,7 +347,7 @@ export function ciCoverage(need: Need, ciLayer: CiLayer, d: Decide): Coverage {
   const dirs = d.scope.dirsOf(need.service);
   // P57 (C1): only runs of a tool that checks the service's language count; one whose languages pipegen can't tell is partial
   const lang = d.scope.languageOf(need.service);
-  const cat = matchKeys(need.category, lang);
+  const cat = matchKeys(ciKey(need, d), lang);
   const cover = d.ci.first(cat, dirs, layer, coverKinds(need));
   if (cover) return { need, status: 'covered', ...located(cover), why: `${cover.subject} runs ${LAYER_DONE[layer]}.${cover.coveredNote === undefined ? '' : ` ${cover.coveredNote}`}` };
   const unknownRun = d.ci.first([...matchKeys(`${UNKNOWN_PREFIX}${need.category}`, lang), ...unsureKeys(`${UNKNOWN_PREFIX}${need.category}`, lang)], dirs, layer, [FN, FC, FO]);
@@ -376,7 +383,7 @@ export function ciCoverage(need: Need, ciLayer: CiLayer, d: Decide): Coverage {
 
 /** Plan P Task 4: the run behind a CI row that is partial (the first of its kind ciCoverage picks), for the coverage minimum check. */
 export function firstPartialHit(need: Need, ciLayer: CiLayer, d: Decide): Hit | undefined {
-  return d.ci.first(matchKeys(need.category, d.scope.languageOf(need.service)), d.scope.dirsOf(need.service), ciLayer, partialKinds(need));
+  return d.ci.first(matchKeys(ciKey(need, d), d.scope.languageOf(need.service)), d.scope.dirsOf(need.service), ciLayer, partialKinds(need));
 }
 
 export function hookCoverage(need: Need, hooks: Hooks, d: Decide): Coverage {
