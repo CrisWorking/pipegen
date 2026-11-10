@@ -634,6 +634,40 @@ describe('6b: snapshots', () => {
     await expect(yamlOf(render('vitest-coverage', { service: 'web', workingDir: 'apps/web' }, c).steps)).toMatchFileSnapshot('__snapshots__/steps/cli-npm-repo-code.yml');
   });
 
+  describe('PL-D3: JSON env values are written as readable YAML blocks', () => {
+    const c = ctxFor([service({ name: 'web', path: 'apps/web', runtimeVersion: '24' })]);
+    const npmSteps = (): RenderedStep[] => [...render('prettier', { service: 'web', workingDir: 'apps/web' }, c).steps, ...render('vitest-coverage', { service: 'web', workingDir: 'apps/web' }, c).steps];
+    it('PIPEGEN_NPM_EXPECT parses to the same object', () => {
+      const docs = parse(yamlOf(npmSteps())) as RenderedStep[];
+      const withPins = docs.filter((s) => s.env?.PIPEGEN_NPM_EXPECT !== undefined);
+      expect(withPins.length).toBeGreaterThanOrEqual(2);
+      for (const s of withPins) {
+        const text = s.env?.PIPEGEN_NPM_EXPECT as string;
+        expect(text).toContain('\n');
+        const pins = JSON.parse(text) as { name: string; version: string; integrity: string; resolved: string }[];
+        expect(Object.keys(pins[0] ?? {})).toEqual(['name', 'version', 'integrity', 'resolved']);
+        expect(pins[0]?.resolved).toBe(`https://registry.npmjs.org/${pins[0]?.name}/-/${pins[0]?.name}-${pins[0]?.version}.tgz`);
+        expect(pins[0]?.integrity).toMatch(/^sha512-/);
+      }
+      for (const key of ['PIPEGEN_NPM_LOCK', 'PIPEGEN_NPM_PACKAGE']) {
+        const s = docs.find((d) => d.env?.[key] !== undefined) as RenderedStep;
+        expect(JSON.parse(s.env?.[key] as string)).toBeTypeOf('object');
+      }
+    });
+    it('no env value line over 120 characters in the fixtures', () => {
+      const lines = yamlOf(npmSteps()).split('\n');
+      const at = lines.findIndex((l) => /^\s+PIPEGEN_NPM_EXPECT: \|/.test(l));
+      expect(at).toBeGreaterThan(-1);
+      for (const f of ['cli-npm.yml', 'cli-npm-repo-code.yml']) {
+        const docs = parse(readFileSync(join('test/__snapshots__/steps', f), 'utf8')) as RenderedStep[];
+        const json = docs.flatMap((s) => Object.entries(s.env ?? {})).filter(([, v]) => /^[[{]/.test(String(v)));
+        expect(json.length, f).toBeGreaterThan(0);
+        const long = json.flatMap(([k, v]) => String(v).split('\n').filter((l) => l.length > 120).map((l) => `${k}: ${l}`));
+        expect(long, f).toEqual([]);
+      }
+    });
+  });
+
   it('snapshot: a pip tool with a fixture closure (mypy)', async () => {
     const t = entry('mypy');
     const closureText = `mypy==2.4.0 --hash=sha256:${'a'.repeat(64)}\ntyping-extensions==4.12.2 --hash=sha256:${'b'.repeat(64)}\n`;

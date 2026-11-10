@@ -213,7 +213,7 @@ describe('6c fix round 1: dedupe keeps the guarded repo npm ci (finding 5)', () 
   });
   it('two guarded installs with different pins of one package are refused', () => {
     const a = steps('vitest-coverage');
-    const b = steps('vitest-coverage').map((s) => (s.id?.startsWith('pipegen-npm-ci-') ? { ...s, env: { ...s.env, PIPEGEN_NPM_EXPECT: (s.env?.PIPEGEN_NPM_EXPECT as string).replace(/"version":"[^"]+"/, '"version":"0.0.1"') } } : s));
+    const b = steps('vitest-coverage').map((s) => (s.id?.startsWith('pipegen-npm-ci-') ? { ...s, env: { ...s.env, PIPEGEN_NPM_EXPECT: (s.env?.PIPEGEN_NPM_EXPECT as string).replace(/"version": ?"[^"]+"/, '"version": "0.0.1"') } } : s));
     expect(() => dedupeJobSteps([...a, ...b], { scans: NO_SCANS })).toThrow(RenderError);
   });
 });

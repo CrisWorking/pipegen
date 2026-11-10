@@ -59,7 +59,21 @@
   env:
     BASH_ENV: ""
     ENV: ""
-    PIPEGEN_NPM_EXPECT: "[{\"name\":\"vitest\",\"version\":\"5.0.5\",\"integrity\":\"sha512-cPODOMF8YnkiiYtDdHo6n4wWmBrOBBbOIYH2d33M4l3CdNn72h+qMmO6uXffUN6A5AZFXNND/d+krS9mgkXRfg==\",\"resolved\":\"https://registry.npmjs.org/vitest/-/vitest-5.0.5.tgz\"},{\"name\":\"@vitest/coverage-v8\",\"version\":\"5.0.5\",\"integrity\":\"sha512-4KpkGdIrSqBihx/JyP/e+S+IKB98etg1XDQiLAxksLfcShnwi1VReGeOT9NI43hLHbknosKp/1CCLn9Zgcs8mg==\",\"resolved\":\"https://registry.npmjs.org/@vitest/coverage-v8/-/coverage-v8-5.0.5.tgz\"}]"
+    PIPEGEN_NPM_EXPECT: |-
+      [
+        {
+          "name": "vitest",
+          "version": "5.0.5",
+          "integrity": "sha512-cPODOMF8YnkiiYtDdHo6n4wWmBrOBBbOIYH2d33M4l3CdNn72h+qMmO6uXffUN6A5AZFXNND/d+krS9mgkXRfg==",
+          "resolved": "https://registry.npmjs.org/vitest/-/vitest-5.0.5.tgz"
+        },
+        {
+          "name": "@vitest/coverage-v8",
+          "version": "5.0.5",
+          "integrity": "sha512-4KpkGdIrSqBihx/JyP/e+S+IKB98etg1XDQiLAxksLfcShnwi1VReGeOT9NI43hLHbknosKp/1CCLn9Zgcs8mg==",
+          "resolved": "https://registry.npmjs.org/@vitest/coverage-v8/-/coverage-v8-5.0.5.tgz"
+        }
+      ]
 - name: Check the installed tool against the lockfile
   run: |-
     set -euo pipefail
@@ -119,7 +133,21 @@
   env:
     BASH_ENV: ""
     ENV: ""
-    PIPEGEN_NPM_EXPECT: "[{\"name\":\"vitest\",\"version\":\"5.0.5\",\"integrity\":\"sha512-cPODOMF8YnkiiYtDdHo6n4wWmBrOBBbOIYH2d33M4l3CdNn72h+qMmO6uXffUN6A5AZFXNND/d+krS9mgkXRfg==\",\"resolved\":\"https://registry.npmjs.org/vitest/-/vitest-5.0.5.tgz\"},{\"name\":\"@vitest/coverage-v8\",\"version\":\"5.0.5\",\"integrity\":\"sha512-4KpkGdIrSqBihx/JyP/e+S+IKB98etg1XDQiLAxksLfcShnwi1VReGeOT9NI43hLHbknosKp/1CCLn9Zgcs8mg==\",\"resolved\":\"https://registry.npmjs.org/@vitest/coverage-v8/-/coverage-v8-5.0.5.tgz\"}]"
+    PIPEGEN_NPM_EXPECT: |-
+      [
+        {
+          "name": "vitest",
+          "version": "5.0.5",
+          "integrity": "sha512-cPODOMF8YnkiiYtDdHo6n4wWmBrOBBbOIYH2d33M4l3CdNn72h+qMmO6uXffUN6A5AZFXNND/d+krS9mgkXRfg==",
+          "resolved": "https://registry.npmjs.org/vitest/-/vitest-5.0.5.tgz"
+        },
+        {
+          "name": "@vitest/coverage-v8",
+          "version": "5.0.5",
+          "integrity": "sha512-4KpkGdIrSqBihx/JyP/e+S+IKB98etg1XDQiLAxksLfcShnwi1VReGeOT9NI43hLHbknosKp/1CCLn9Zgcs8mg==",
+          "resolved": "https://registry.npmjs.org/@vitest/coverage-v8/-/coverage-v8-5.0.5.tgz"
+        }
+      ]
 - id: repocode-ecda9a59c1361e7c
   name: Run vitest
   run: |-

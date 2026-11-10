@@ -23,7 +23,7 @@ import { centralWorkflowPath } from './central-path.js';
 import { NEED_IDS, toolCoversNeed } from './need-ids.js';
 import type { PlatformActions } from './pin.js';
 import { tuningProblems } from './tuning.js';
-import { APP_RUNNING_CATEGORIES, projectScriptSteps, renderCliTool, renderRangeScan, repoToolSteps, sha16, type CliHooks, type RenderOptions } from './render-cli.js';
+import { APP_RUNNING_CATEGORIES, projectScriptSteps, readableJson, renderCliTool, renderRangeScan, repoToolSteps, sha16, type CliHooks, type RenderOptions } from './render-cli.js';
 import { ArtifactNameError, resultArtifactName, SECRETS_HISTORY_ARTIFACT, SECRETS_RANGE_ARTIFACT } from './artifact-names.js';
 import { argvPolicyProblems, repoToolFor, type ProjectScriptStep, type RepoToolStep, type ReviewedEntry } from './reviewed.js';
 import { own, RenderError, show } from './render-error.js';
@@ -438,6 +438,7 @@ export function sameDedupeContent(a: RenderedStep, b: RenderedStep): boolean {
 /** The union of two lists of pinned packages (JSON, as in PIPEGEN_NPM_EXPECT); one package at two different pins is refused. */
 function mergePins(a: string | undefined, b: string | undefined): string {
   const out = new Map<string, string>();
+  const kept: unknown[] = [];
   for (const text of [a, b]) {
     let list: unknown;
     try { list = JSON.parse(text ?? '[]'); } catch { throw new RenderError('A dependency install step carries a pin list that is not JSON.'); }
@@ -446,10 +447,11 @@ function mergePins(a: string | undefined, b: string | undefined): string {
       const name = typeof p?.name === 'string' ? p.name : '';
       const line = JSON.stringify(p);
       if (name === '' || (out.has(name) && out.get(name) !== line)) throw new RenderError(`Two steps of one job install ${show(name)} at different pins.`);
+      if (!out.has(name)) kept.push(p);
       out.set(name, line);
     }
   }
-  return `[${[...out.values()].join(',')}]`;
+  return readableJson(kept);
 }
 
 /** The renderer-filled inputs of an action for this service and context (the others are set by the helpers that own them). */
@@ -923,6 +925,12 @@ export function jobSettings(spec: StepSpec): { 'cache-mode': 'none' } {
 
 const NEEDS_QUOTES = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]|\$\{\{|^\s|\s$|\s#|:\s|^[-?:,[\]{}#&*!|>'"%@`]/;
 
+/** PL-D3: an env value that is indented JSON (an object or a list over several lines); only these are written as a literal block. */
+function isJsonBlock(value: string): boolean {
+  if (!/^[[{]\n/.test(value)) return false;
+  try { return typeof JSON.parse(value) === 'object'; } catch { return false; }
+}
+
 /** A string scalar that can't be read as anything else: quoted whenever it has control characters, an expression or YAML syntax. */
 function str(value: string, block = false): Scalar {
   const s = new Scalar(value);
@@ -950,7 +958,8 @@ export function stepsToYaml(steps: readonly RenderedStep[]): YAMLSeq {
         map.set(key, node);
       } else if (typeof value === 'object') {
         const inner = new YAMLMap();
-        for (const [k, v] of Object.entries(value)) inner.set(new Scalar(k), str(v));
+        // PL-D3: a multi-line env value (indented JSON) is a literal block when it can be one, else a quoted string as before
+        for (const [k, v] of Object.entries(value)) inner.set(new Scalar(k), str(v, key === 'env' && isJsonBlock(v)));
         map.set(key, inner);
       } else map.set(key, new Scalar(value));
     }

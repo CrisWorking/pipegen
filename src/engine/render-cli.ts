@@ -631,7 +631,7 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
       const inst = checkerInstall(tool, pins, options);
       installLines.push(...inst.lines);
       Object.assign(env, inst.env);
-      env.PIPEGEN_NPM_EXPECT = JSON.stringify(pins);
+      env.PIPEGEN_NPM_EXPECT = readableJson(pins);
       // variables for the tool that name a helper inside the install folder (never one the repo could supply)
       for (const [name, rel] of Object.entries(pol.closureEnv ?? {})) {
         if (!NAME_RE.test(name) || !/^node_modules\/[A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)*$/.test(rel) || rel.includes('..')) return refuse(`The closure variable ${show(name)} of ${show(tool.id)} is not a plain path inside the install folder.`);
@@ -1104,6 +1104,12 @@ function imageOf(tool: ReviewedTool, install: InstallSpec): string {
 // passes `--git=/usr/bin/git` (G4b-R1 m1): a repo .npmrc `git=./x.sh` would otherwise run x.sh for a git dependency during
 // the install, scripts off or not (NPM_CI_GIT).
 
+/**
+ * PL-D3: a JSON env value as indented JSON, so the workflow shows it as a YAML block, one key per line, not one escaped line of
+ * thousands of characters. Same parsed value: every reader (the step's node script, the referee, the dedupe merge) JSON.parses it.
+ */
+export const readableJson = (value: unknown): string => JSON.stringify(value, null, 2);
+
 const NPM_VERSION_RE = /^\d{1,9}\.\d{1,9}\.\d{1,9}(?:-[0-9A-Za-z.-]{1,40})?$/;
 const REGISTRY_URL = 'https://registry.npmjs.org/';
 /** G4b-R1 m1: the git npm runs for a git dependency, on the command line so a repo .npmrc `git=` can't name a repo file. */
@@ -1208,7 +1214,7 @@ function checkerInstall(tool: ReviewedTool, pins: readonly (NpmPin & { resolved:
   }
   const compact = JSON.stringify(JSON.parse(lock));
   if (compact.length > MAX_LOCK_BYTES) return refuse(`The npm closure lock of ${show(tool.id)} is too large to carry in a workflow.`);
-  const pkg = JSON.stringify({ name: 'pipegen-closure', version: '0.0.0', private: true, dependencies: closureRootDependencies(lock) });
+  const pkg = readableJson({ name: 'pipegen-closure', version: '0.0.0', private: true, dependencies: closureRootDependencies(lock) });
   const lines = [
     'mkdir -p "$RUNNER_TEMP/pipegen-npm"',
     'mkdir "$npmdir"',
@@ -1220,7 +1226,7 @@ function checkerInstall(tool: ReviewedTool, pins: readonly (NpmPin & { resolved:
     ...allowlist(`$nodebin:${FIXED_PATH}`, []),
     `( cd -- "$npmdir" && "\${pg_env[@]}" "$nodebin/npm" ci --ignore-scripts --no-audit --no-fund --userconfig "$npmdir/user.npmrc" --globalconfig "$npmdir/global.npmrc" --workspaces=false ${NPM_CI_GIT} --registry=${REGISTRY_URL} )`,
   ];
-  return { lines, env: { PIPEGEN_NPM_LOCK: compact, PIPEGEN_NPM_PACKAGE: pkg } };
+  return { lines, env: { PIPEGEN_NPM_LOCK: readableJson(JSON.parse(compact)), PIPEGEN_NPM_PACKAGE: pkg } };
 }
 
 /** The id hash of a folder's guarded `npm ci` and the marker file it leaves (one per job and folder). */
@@ -1233,7 +1239,7 @@ function installMarker(workingDir: string | undefined): { hash: string; marker: 
 /** For a tool that runs repo code: the guarded `npm ci` of the repo (ids deduped per job and folder) and the verification step that needs its marker. */
 function repoInstall(pins: readonly (NpmPin & { resolved: string })[], artifact: string, nodeMajor: string, workingDir: string | undefined): RenderedStep[] {
   const { hash, marker } = installMarker(workingDir);
-  const expect = { PIPEGEN_NPM_EXPECT: JSON.stringify(pins) };
+  const expect = { PIPEGEN_NPM_EXPECT: readableJson(pins) };
   const common = [...prologue(artifact, { nodeMajor }), ...cdLines(workingDir), ...allowlist(`$nodebin:${FIXED_PATH}`, [])];
   const ci = runStep('Install the project dependencies (npm ci, no scripts)', script([
     ...common,

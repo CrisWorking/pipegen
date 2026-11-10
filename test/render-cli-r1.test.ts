@@ -105,7 +105,7 @@ describe('R-A: npm checkers install from pipegen\'s closure lock (DECISIONS #107
     expect(all).not.toMatch(/npx/);
     expect(all).not.toMatch(/package-lock\.json[^"]*"\$PWD|\.\/package-lock|\.\/\.npmrc|node_modules\/\.bin/);
     const install = r.steps[1] as RenderedStep;
-    expect(install.env?.PIPEGEN_NPM_LOCK).toBe(JSON.stringify(JSON.parse(closureText('eslint'))));
+    expect(install.env?.PIPEGEN_NPM_LOCK).toBe(JSON.stringify(JSON.parse(closureText('eslint')), null, 2)); // PL-D3: the same lock, readable
     const pkg = JSON.parse(install.env?.PIPEGEN_NPM_PACKAGE as string) as { dependencies: Record<string, string>; private: boolean };
     expect(pkg.dependencies).toEqual(closureRootDependencies(closureText('eslint')));
     expect(pkg.private).toBe(true);
