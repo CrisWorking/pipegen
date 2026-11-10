@@ -363,6 +363,31 @@ describe('G8: merge locks, central locks, required workflow, CODEOWNERS', () => 
     expect(link.notes.join('\n')).toMatch(/symbolic link/);
   });
 
+  it('CODEOWNERS line of 4,097 characters → note', () => {
+    const prof = orgPriv({ repoFiles: { ...emptyRepoFiles(), codeowners: '.github/CODEOWNERS' } });
+    const long = (n: number): string => `/docs/ ${'@x'.repeat(Math.ceil((n - 7) / 2))}`.slice(0, n);
+    const run = (original: string, over: Partial<LockInputs> = {}) => planLocks(inputs({ profile: prof, appCodeowners: { original, isSymlink: false, inserted: null }, ...over }));
+    const over = run(`* @carol\n${long(4097)}\n`);
+    expect(over.notes.join('\n')).toContain('Line 2 of .github/CODEOWNERS is over 4,096 characters; the gate does not read it, so nobody can approve changes to the paths it covers. Shorten or split it.');
+    // the file is still planned
+    expect(over.codeowners).toBeDefined();
+    // CRLF endings do not count toward the length
+    expect(run(`${long(4096)}\r\n`).notes.join('\n')).not.toMatch(/over 4,096/);
+    // a comment line is not a rule: the gate ignores it
+    expect(run(`# ${'x'.repeat(4100)}\n`).notes.join('\n')).not.toMatch(/over 4,096/);
+    // the central repo's own file too
+    const central = planLocks(inputs({ central: { repo: 'o/pipelines', sha: SHA, branchProtection: true, codeowners: { path: '.github/CODEOWNERS', original: `\n\n${long(4100)}\n`, isSymlink: false, inserted: null } } }));
+    expect(central.notes.join('\n')).toMatch(/Line 3 of \.github\/CODEOWNERS is over 4,096/);
+  });
+
+  it('CODEOWNERS line of 4,096 characters → no note', () => {
+    const prof = orgPriv({ repoFiles: { ...emptyRepoFiles(), codeowners: '.github/CODEOWNERS' } });
+    const line = `/docs/ ${'@x'.repeat(2045)}`.slice(0, 4096);
+    expect(line.length).toBe(4096);
+    const plan = planLocks(inputs({ profile: prof, appCodeowners: { original: `${line}\n`, isSymlink: false, inserted: null } }));
+    expect(plan.notes.join('\n')).not.toMatch(/over 4,096/);
+  });
+
   it('codeowners: team names refused, user logins only', () => {
     for (const bad of [['@o/team', '@bob'], ['alice', '@bob'], ['@alice', 'a@b.example'], ['@alice', '@dependabot[bot]'], ['@alice', '']]) {
       expect(() => planLocks(inputs({ owners: bad })), bad.join(' ')).toThrow(LockError);
