@@ -26,7 +26,7 @@
     "build:gate": "tsup --config tsup.gate.config.ts && node scripts/notices.ts --gate .build/gate-meta.json gate/dist/THIRD_PARTY_NOTICES",
     "notices": "node scripts/notices.ts",
     "base-images": "esbuild scripts/base-images.ts --bundle --platform=node --format=esm --packages=external --outfile=.build/base-images.mjs && node .build/base-images.mjs",
-    "prepare": "npm run build && npx tsup --config tsup.dev.config.ts",
+    "prepare": "npm run build && tsup --config tsup.dev.config.ts",
     "prepack": "npm run build && npm run notices",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
