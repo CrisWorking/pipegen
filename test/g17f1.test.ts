@@ -130,6 +130,8 @@ describe('G17-F1 round 3 (sec r2 M1): pipegen writes NEL, LS and PS as the YAML 
       expect(parse(escapeLineBreaks(doc(`x\\${ch}`, Scalar.QUOTE_DOUBLE)) as string)).toEqual({ a: `x\\${ch}` });
     }
     expect(escapeLineBreaks('a: "plain"\n')).toBe('a: "plain"\n');
+    // a text that doesn't parse is never passed on (mutant E4)
+    expect(escapeLineBreaks('a: "x\u2028y"\nb: [\n')).toBeNull();
   });
 });
 
