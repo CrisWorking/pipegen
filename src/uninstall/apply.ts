@@ -41,7 +41,7 @@ import { clockOf, GitHubAccessError } from '../github/client.js';
 import { VERIFY_JOB_ID } from '../layers/assemble.js';
 import { cleanupLeftovers, type CleanupResult } from '../proof/cleanup.js';
 import { StateError, StateStore, type StateDeps } from '../proof/state.js';
-import { cleanupWrite, deleteScratchRepo, deleteScratchSecret, ProofStopError, type CleanupOp, type GuardedRepo, type RepoDeleteResult } from '../proof/target.js';
+import { CENTRAL_REPO, cleanupWrite, deleteScratchRepo, deleteScratchSecret, ProofStopError, type CleanupOp, type GuardedRepo, type RepoDeleteResult } from '../proof/target.js';
 import type { InstallRecord, RecordApiRequest } from '../types.js';
 import { interrupting, onInterrupt } from '../util/exit-hooks.js';
 import { safeText } from '../util/safe-text.js';
@@ -259,6 +259,14 @@ export class PhaseApi {
     this.#only('B', 'a typed name at apply time');
     if (String(c?.kind) !== 'central-ruleset' && String(c?.kind) !== 'central-access') throw new UninstallRefusal('run 2 asks a typed name at apply time only for the central ruleset and the central Actions access; the plan asked the others.');
     return this.#api.confirm(c);
+  }
+  /**
+   * PL-F5 (V9a R2-i3): after `pipelines` was not typed for the central Actions access, whether the owner types `keep` (the level pipegen
+   * set stays, as the owner's choice). The question is built here; it sends nothing.
+   */
+  async keepCentralAccess(): Promise<boolean> {
+    this.#only('B', 'a typed keep at apply time');
+    return this.#api.ask('keep', `Keep the Actions access level of ${this.#api.app.owner}/${CENTRAL_REPO} as pipegen set it? It is shared by every project there, and pipegen won't call it a leftover again.`);
   }
   /**
    * The central repo delete (deleteCentralRepo's every check, the typed numbers and `pipelines` typed at this run's terminal). The caller

@@ -27,7 +27,7 @@
 // - PR closes and branch deletes only touch pipegen's own branches by exact name (`pipegen/setup`, `pipegen/update`, `pipegen/uninstall` on
 //   the app; this project's `pipegen/update-<name>` and `pipegen/uninstall-<name>` on central); a PR's head (branch and repo id) is read
 //   from GitHub, never taken from the caller.
-// - The uninstall PRs' files go through the git data API of src/deliver/git-data.ts (ghWrite, setBranch, openOrUpdatePr), on the one branch
+// - The uninstall PRs' files go through the git data API of src/deliver/git-data.ts (commitFiles, setBranch, openOrUpdatePr), on the one branch
 //   each: `pipegen/uninstall` (app), `pipegen/uninstall-<name>` (central, and only this project's central files, record and CODEOWNERS).
 // - goneOr (V-S11): a 404 is "gone" only after a read of the parent succeeds (GitHub answers 404 for "no access" on a private repo); a 403 is
 //   a leftover with the exact manual step; a 401 stops.
@@ -39,12 +39,12 @@
 import type { Octokit } from '@octokit/rest';
 import { gitBlobSha } from '../create/guard.js';
 import { readEnv, SETUP_BRANCH } from '../deliver/deliver.js';
-import { checkBranch, ghWrite, isoAt, openOrUpdatePr, readTree, setBranch, statusOf, type RepoRef, type TreeEntry } from '../deliver/git-data.js';
+import { checkBranch, commitFiles, DeliverError, isoAt, openOrUpdatePr, readTree, setBranch, statusOf, type RepoRef, type TreeEntry } from '../deliver/git-data.js';
 import { centralUpdateBranch, editWritesChained, recordPath, type RecordedEdit } from '../deliver/record.js';
 import { centralFilesOf, UPDATE_BRANCH } from '../deliver/update.js';
 import { centralProjectName, centralWorkflowFile } from '../engine/central-path.js';
-import { isRateStop, withRateLimit, type RateClock } from '../engine/github-rate.js';
-import { clockOf, githubTokenRejected, isAnonymousClient } from '../github/client.js';
+import { GitHubRateLimitError, isRateStop, withRateLimit, type RateClock } from '../engine/github-rate.js';
+import { clockOf, GitHubAccessError, githubTokenRejected, isAnonymousClient } from '../github/client.js';
 import { CENTRAL_RULESET, GATE_RULESET, REVIEWS_RULESET, requiredRulesetName } from '../layers/locks.js';
 import { CENTRAL_REPO, helperDescription } from '../proof/target.js';
 import { classicPutForm, isObj } from '../deliver/settings-api.js';
@@ -398,7 +398,7 @@ export async function goneOr(e: unknown, parentRead: () => Promise<unknown>, wha
 }
 
 export type DeleteOutcome =
-  | { status: 'deleted' } | { status: 'gone' } | { status: 'restored'; manual?: string } | { status: 'done' } | { status: 'closed' } | { status: 'not-open' }
+  | { status: 'deleted' } | { status: 'gone' } | { status: 'restored'; manual?: string } | { status: 'done'; words?: string } | { status: 'closed' } | { status: 'not-open' }
   | { status: 'kept'; why: string; manual?: string } | { status: 'ask'; why: string } | { status: 'leftover'; why: string; manual: string };
 
 /** A value GitHub reports when a switch or a list is off (null, false, 0, empty), at any depth. */
@@ -929,21 +929,54 @@ export class UninstallApi {
     if (isoAt(entry.githubCreatedAt) && (cur.createdAt === null || Date.parse(cur.createdAt) !== Date.parse(entry.githubCreatedAt))) return { status: 'kept', why: `${what} is not the one pipegen changed (GitHub says it was created at another time)`, manual };
     if (canon(cur.settings) !== canon(shown)) return { status: 'kept', why: `${what} changed since the preview showed it, so pipegen leaves it; run pipegen uninstall again to see it`, manual };
     const left = await this.#recordSecretsIn(entry.name, secrets, what, manual);
-    if (left !== null) return left;
+    if (left !== null) return left.outcome;
     const body: Record<string, unknown> = { ...cur.settings };
     const previous = entry.previous as EnvSettings;
     for (const k of ENV_KEYS) if (entry.changed.includes(k)) body[k] = previous[k];
     try { await this.#dedicated(ROUTES.environmentPut, { ...body, ...params }); } catch (e) { return this.#outcome(e, 'app', what, manual); }
     // V9a-R2 (sec N5): GitHub has no conditional PUT, so the list is read once more: a secret the record names that appeared in between
-    // (another pipegen, on another machine) → the settings the preview showed go back at once (narrowed again), and a manual step
-    const after = await this.#recordSecretsIn(entry.name, secrets, what, manual);
+    // (another pipegen, on another machine), or a list that can't be read again → the settings the preview showed go back at once
+    // (narrowed again), and a manual step. PL-F5 (R2-i2): a 401 or a rate stop on that list narrows it again too, then stops the run.
+    const narrowAgain = async (): Promise<unknown> => {
+      try { await this.#dedicated(ROUTES.environmentPut, { ...shown, ...params }); return null; } catch (e) {
+        // PL-F5 R1: a Ctrl-C between the two PUTs refuses this write; it is reported as not narrowed (a leftover with the step)
+        if (e instanceof UninstallRefusal && !interrupting()) throw e;
+        return e;
+      }
+    };
+    /** PL-F5 R1: a rate stop or a 401 rethrown as the same kind of stop, its text followed by `extra`; anything else returns. */
+    const stopWith = (e: unknown, extra: string): void => {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (isRateStop(e)) {
+        const r = e instanceof GitHubRateLimitError ? e : undefined;
+        throw new GitHubRateLimitError(`${msg}\n${extra}`, { cause: e, budgetSpent: r?.budgetSpent ?? false, resetAt: r?.resetAt ?? null });
+      }
+      if (statusOf(e) === 401 || (e instanceof Error && e.name === 'GitHubAccessError')) {
+        const a = e instanceof Error && e.name === 'GitHubAccessError' ? e : githubTokenRejected();
+        throw new GitHubAccessError(`${a.message}\n${extra}`, { status: 401 });
+      }
+    };
+    const rightNow = `put ${what} back to the default branch only (Settings → Environments → ${show(entry.name, 100)} → Deployment branches)`;
+    let after: { outcome: DeleteOutcome; unread: boolean } | null;
+    try { after = await this.#recordSecretsIn(entry.name, secrets, what, manual); } catch (e) {
+      if (e instanceof UninstallRefusal) throw e;
+      const failed = await narrowAgain();
+      const extra = failed === null
+        ? `pipegen couldn't read the secrets of ${what} again after its earlier settings went back, so it narrowed it again (as the preview showed it). Run \`pipegen uninstall\` again.`
+        : `pipegen couldn't read the secrets of ${what} again after its earlier settings went back, and couldn't narrow it again: other branches may use it now. Right now: ${rightNow}, then run \`pipegen uninstall\` again.`;
+      stopWith(e, extra);
+      throw e;
+    }
     if (after !== null) {
-      const step = 'manual' in after && typeof after.manual === 'string' ? after.manual : manual;
-      const again = `pipegen's secret appeared in ${what} while its earlier settings went back`;
-      try { await this.#dedicated(ROUTES.environmentPut, { ...shown, ...params }); } catch (e) {
-        if (e instanceof UninstallRefusal) throw e;
-        hardStop(e);
-        return { status: 'leftover', why: `${again}, and pipegen couldn't narrow it again (${statusOf(e) === undefined ? 'no answer' : `HTTP ${statusOf(e)}`}): other branches may use it now`, manual: `Right now: put ${what} back to the default branch only (Settings → Environments → ${show(entry.name, 100)} → Deployment branches), then ${step}` };
+      const step = 'manual' in after.outcome && typeof after.outcome.manual === 'string' ? after.outcome.manual : manual;
+      const again = after.unread
+        ? `the secrets of ${what} could not be read again after its earlier settings went back, so pipegen can't tell none of its secrets is in it`
+        : `pipegen's secret appeared in ${what} while its earlier settings went back`;
+      const failed = await narrowAgain();
+      if (failed !== null) {
+        stopWith(failed, `${again}, and pipegen couldn't narrow it again: other branches may use it now. Right now: ${rightNow}, then ${step}`);
+        const how = failed instanceof UninstallRefusal ? 'pipegen was stopped before it could narrow it again (Ctrl-C)' : `pipegen couldn't narrow it again (${statusOf(failed) === undefined ? 'no answer' : `HTTP ${statusOf(failed)}`})`;
+        return { status: 'leftover', why: `${again}, and ${how}: other branches may use it now`, manual: `Right now: ${rightNow}, then ${step}` };
       }
       return { status: 'kept', why: `${again}, so pipegen narrowed it again (as the preview showed it)`, manual: step };
     }
@@ -956,26 +989,26 @@ export class UninstallApi {
    * V9a (V8 sec I1): the environment's secrets, listed right before its settings go back: null when none of `secrets` (the record's
    * names for it) is there and the list was read whole; else `kept` with the step (delete the secret first, then run uninstall again).
    */
-  async #recordSecretsIn(env: string, secrets: readonly { name: string }[], what: string, manual: string): Promise<DeleteOutcome | null> {
+  async #recordSecretsIn(env: string, secrets: readonly { name: string }[], what: string, manual: string): Promise<{ outcome: DeleteOutcome; unread: boolean } | null> {
     const app = `${this.app.owner}/${this.app.repo}`;
     const cant: DeleteOutcome = { status: 'kept', why: `pipegen couldn't list every secret of ${what}, so it doesn't put its earlier settings back (a secret pipegen stored may still be in it, and the earlier settings may let other branches use it)`, manual: `Check the secrets of ${what} in ${app}; delete the ones pipegen stored, then run \`pipegen uninstall\` again (or: ${manual})` };
     let d: unknown;
     try { d = (await this.read('GET /repos/{owner}/{repo}/environments/{environment_name}/secrets', { ...this.repoOf('app'), environment_name: env, per_page: 100 })).data; } catch (e) {
       if (e instanceof UninstallRefusal) throw e;
       hardStop(e);
-      return cant;
+      return { outcome: cant, unread: true };
     }
     const list = isObj(d) && Array.isArray(d.secrets) ? (d.secrets as unknown[]).filter(isObj) : null;
-    if (list === null || !isObj(d) || typeof d.total_count !== 'number' || d.total_count > list.length) return cant;
+    if (list === null || !isObj(d) || typeof d.total_count !== 'number' || d.total_count > list.length) return { outcome: cant, unread: true };
     const names = new Set(list.map((x) => (typeof x.name === 'string' ? x.name.toUpperCase() : '')));
     const still = secrets.filter((x) => names.has(x.name.toUpperCase())).map((x) => show(x.name, 100));
     if (still.length === 0) return null;
     const one = still.length === 1;
-    return {
+    return { unread: false, outcome: {
       status: 'kept',
       why: `pipegen's secret${one ? '' : 's'} ${listed(still)} ${one ? 'is' : 'are'} still in ${what}, and its earlier settings may let other branches use ${one ? 'it' : 'them'}, so pipegen doesn't put them back yet`,
       manual: `Delete ${still.map((n) => `${n} (gh secret delete ${n} --env ${show(env, 100)} --repo ${app})`).join(' and ')}, then run \`pipegen uninstall\` again to put the earlier settings of ${what} back.`,
-    };
+    } };
   }
 
   /**
@@ -1068,9 +1101,9 @@ export class UninstallApi {
       ...c.files.map((f) => {
         if (f.mode !== '100644' && f.mode !== '100755') refuse(`${show(String(f.path), 100)} has a mode uninstall doesn't write.`);
         if (typeof f.content !== 'string') refuse('a file\'s content is not text.');
-        return { path: plain(f.path), mode: f.mode, type: 'blob', content: f.content };
+        return { path: plain(f.path), content: f.content, mode: f.mode };
       }),
-      ...c.deletes.map((p) => ({ path: plain(p), mode: '100644', type: 'blob', sha: null })),
+      ...c.deletes.map((p) => ({ path: plain(p), sha: null as null })),
     ];
     if (where === 'central') {
       const removable = new Set([...centralFilesOf(this.app.repo), recordPath(this.app.repo)]);
@@ -1111,11 +1144,13 @@ export class UninstallApi {
       const written = codeownersEdit !== undefined && Array.isArray(codeownersEdit.writtenShas) ? codeownersEdit.writtenShas : [];
       if (!isObj(e) || e.type !== 'blob' || typeof e.sha !== 'string' || !written.includes(e.sha)) refuse(`${show(ownersGone, 100)} on ${show(`${r.owner}/${r.repo}`)} is not a version pipegen wrote (changed since, or GitHub's file list could not be read), so uninstall doesn't remove it.`);
     }
-    const t = (await ghWrite(this.#stopping, 'POST /repos/{owner}/{repo}/git/trees', r, { base_tree: c.baseTree, tree }, this.clock) as Body | null)?.sha;
-    if (typeof t !== 'string' || !SHA_RE.test(t)) throw new UninstallRefusal('GitHub\'s answer to the new file tree could not be read.');
-    const commit = (await ghWrite(this.#stopping, 'POST /repos/{owner}/{repo}/git/commits', r, { message: c.message, tree: t, parents: [c.parent] }, this.clock) as Body | null)?.sha;
-    if (typeof commit !== 'string' || !SHA_RE.test(commit)) throw new UninstallRefusal('GitHub\'s answer to the new commit could not be read.');
-    return { commit, tree: t };
+    // PL-E6: the one commit writer (deliver's): it refuses a delete of a path the base tree doesn't hold
+    try {
+      return await commitFiles(this.#stopping, r, { parent: c.parent, baseTree: c.baseTree, files: tree, message: c.message }, this.clock);
+    } catch (e) {
+      if (e instanceof DeliverError) throw new UninstallRefusal(e.message);
+      throw e;
+    }
   }
 
   /** Points the uninstall branch of `where` at `sha` (created, or moved: pipegen's own branch). */
