@@ -440,6 +440,20 @@ describe('E4 scratch keys: E2 seam and the source', () => {
     expect(keys.stored()).toEqual({});
   });
 
+  it('a case pair with control and bidi characters: the refusal names both, cleaned', async () => {
+    // PL-F2 fold R1: the two names in the refusal pass through safeText (defence in depth)
+    const { g, s } = keysWorld();
+    const keys = keysFor(g);
+    const before = g.calls.length;
+    const err = await keys.setup(['a\u001b[31m\u202e', 'A\u001b[31M\u202e']).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(ScratchKeysError);
+    expect((err as Error).message).toMatch(/differ only in case/);
+    expect((err as Error).message).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/);
+    expect(g.calls.length).toBe(before);
+    expect(g.writes()).toEqual([]);
+    expect(s.values.size).toBe(0);
+  });
+
   it('the E2 seam (scratchSecretStore) is the real store for pushProofSetup, only for its own scratch repo', async () => {
     const { g, s } = keysWorld();
     const keys = keysFor(g);
