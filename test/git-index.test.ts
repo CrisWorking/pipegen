@@ -308,6 +308,11 @@ describe('readGitIndexPaths: linked worktrees (PL-B3)', () => {
     symlinkSync(gitdir, link);
     writeFileSync(join(wt, '.git'), `gitdir: ${link}\n`);
     expect(await readGitIndexPaths(wt)).toBeNull();
+    // a link higher up: the main repo's .git reached through a linked folder, the worktree's git folder under it
+    const up = join(makeTempDir(), 'up');
+    symlinkSync(join(gitdir, '../..'), up);
+    writeFileSync(join(wt, '.git'), `gitdir: ${join(up, 'worktrees/wt')}\n`);
+    expect(await readGitIndexPaths(wt)).toBeNull();
   });
 });
 
