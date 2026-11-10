@@ -621,6 +621,7 @@ async function runWorld(o: { private?: boolean; results?: import('../src/types.j
     activity: async () => ({ pushes: 1, prs: 1, capped: false }), consent: async () => { rec('consent'); return {} as never; },
     state: async (pp, g) => StateStore.open(pp, { home, env: {}, ...g }), gateReachable: async () => true,
     helperRepos: async () => { rec('helperRepos'); return o.missing ?? []; },
+    coCase: async () => null,
     proofRepos: async (_f, _p, auth, store) => { rec('proofRepos', auth, store.armed); return { ready: true, target: {} as never, repos: [], created: [] }; },
     needs: async () => ({ needs: [...NEEDS2], notes: [], requireDeployApproval: false, layersSkipped: [], usage: [] } as never),
     discover: async () => candidatesFor(NEEDS2, p),

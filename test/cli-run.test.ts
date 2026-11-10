@@ -21,7 +21,8 @@ import type { Octokit } from '@octokit/rest';
 import { AiSpendMeter } from '../src/ai/spend-meter.js';
 import type { mapCoverage } from '../src/audit/coverage.js';
 import type { CodeBundle } from '../src/ai/redact.js';
-import { proofReposFor, onCreatedFor, scanCounted, provenDraft, NOT_IN_SCOPE, NO_MEMORY_FOLDER, SECRET_FOUND, notProvableNotes, auditCredits, createdInputsFor, dastWayPast, defaultProof, fullRun, judgeBuilt, NEVER_SKIPPED, parseSkip, runCreators, SCOPE_LINE, UNPINNED, WINDOWS_REFUSAL, GATE_UNREACHABLE, guardRecord, insertedBlock, type Built, type BuildInput, type GitHubFacts, type RunDeps, type RunStages } from '../src/cli/run.js';
+import { FakeGitHub } from './helpers/deliver-github.js';
+import { proofReposFor, onCreatedFor, scanCounted, provenDraft, NOT_IN_SCOPE, NO_MEMORY_FOLDER, SECRET_FOUND, notProvableNotes, auditCredits, createdInputsFor, dastWayPast, defaultProof, fullRun, judgeBuilt, NEVER_SKIPPED, parseSkip, runCreators, SCOPE_LINE, UNPINNED, WINDOWS_REFUSAL, GATE_UNREACHABLE, guardRecord, insertedBlock, readBuildFacts, type Built, type BuildInput, type GitHubFacts, type RunDeps, type RunStages } from '../src/cli/run.js';
 import { assembledJobs, consentJobs, docFor, draftFromDebate, isAiNote, parseStrictness, pickOwners, prWaitMinutes, proofAssembler, proofLayout, warnFirstFor, signingFor } from '../src/cli/run-parts.js';
 import { EXIT_UNSAFE_FOLDER, TYPE_CANCELLED } from '../src/cli/audit.js';
 import { run as main, type Commands } from '../src/cli/main.js';
@@ -133,7 +134,7 @@ interface World {
   calls: string[]; got: Record<string, unknown[]>; vaults: SecretVault[]; builds: BuildInput[]; home: string;
   stages: Partial<RunStages>; deps: RunDeps;
 }
-function world(o: { local?: RepoProfile; facts?: GitHubFacts; debate?: DebateResult; who?: Record<string, unknown>; consent?: boolean; prState?: 'merged' | 'closed' | 'open'; built?: (i: BuildInput) => Built; record?: InstallRecord | null; central?: 'pinned' | 'central-pr'; gate?: boolean; missingRepos?: string[]; proof?: RunDeps['proof']; deps?: Partial<RunDeps>; found?: CodeBundle['found'] } = {}): World {
+function world(o: { local?: RepoProfile; facts?: GitHubFacts; debate?: DebateResult; who?: Record<string, unknown>; consent?: boolean; prState?: 'merged' | 'closed' | 'open'; built?: (i: BuildInput) => Built; record?: InstallRecord | null; central?: 'pinned' | 'central-pr'; gate?: boolean; missingRepos?: string[]; proof?: RunDeps['proof']; deps?: Partial<RunDeps>; found?: CodeBundle['found']; coCase?: string | null } = {}): World {
   const calls: string[] = [];
   const got: Record<string, unknown[]> = {};
   const vaults: SecretVault[] = [];
@@ -153,6 +154,7 @@ function world(o: { local?: RepoProfile; facts?: GitHubFacts; debate?: DebateRes
     state: async (p) => { rec('state', p); return StateStore.open(p, { home, env: {} }); },
     gateReachable: async () => { rec('gateReachable'); return o.gate ?? true; },
     helperRepos: async () => { rec('helperRepos'); return o.missingRepos ?? []; },
+    coCase: async () => { rec('coCase'); return o.coCase ?? null; },
     proofRepos: async (f, p, auth, store, runId, actions) => { rec('proofRepos', f, p, auth, store, runId, actions); return { ready: true, target: {} as never, repos: [], created: [] }; },
     needs: async (p, caps, b, aiP, writers) => { rec('needs', p, caps, b, aiP, writers); return { needs: [...NEEDS], notes: [], requireDeployApproval: true, layersSkipped: [], usage: [] } as never; },
     discover: async () => { rec('discover'); return candidatesFor(NEEDS, profile()); },
@@ -214,13 +216,39 @@ describe('G13: --skip', () => {
 // ---------- the order ----------
 
 describe('G13: the run, in order', () => {
+  it('G-COCASE-R2 M2: run: a case variant the late check (readBuildFacts) finds stops the run with exit 1 and its own wording (no "before changing anything", no exit code 2)', async () => {
+    const g = new FakeGitHub();
+    g.addRepo(`${OWN}/r`, { private: true, files: { 'README.md': 'hi\n' } });
+    g.addRepo(`${OWN}/pipelines`, { private: true, files: { 'README.md': 'central\n', '.GitHub/CODEOWNERS': '* @x\n' } });
+    const w = world();
+    w.stages.build = async (bi) => { await readBuildFacts({ ...bi, facts: { ...bi.facts, gh: g.octokit() } }); throw new Error('readBuildFacts should have refused'); };
+    const i = io();
+    const code = await run(w, i);
+    expect(code).toBe(1);
+    const text = i.errs.join('\n');
+    expect(text).toMatch(/pipegen stopped: .*\.GitHub\/CODEOWNERS \(rename it to \.github\/CODEOWNERS/);
+    expect(text).not.toMatch(/before changing anything/);
+    expect(text).not.toMatch(/exit code 2/);
+  });
+
+  it('G-COCASE-R1: run: a CODEOWNERS case variant stops setup right after the read-only checks, before consent and any write (exit 2)', async () => {
+    const msg = 'pipegen stopped before changing anything: o/r has .GitHub/CODEOWNERS (rename it to .github/CODEOWNERS (or remove it)). exit code 2.';
+    const w = world({ coCase: msg });
+    const i = io();
+    const code = await run(w, i);
+    expect(code).toBe(2);
+    expect(i.errs).toContain(msg);
+    expect(w.calls.at(-1)).toBe('coCase');
+    for (const later of ['activity', 'consent', 'state', 'signingEnv', 'needs', 'creators', 'build', 'proofRepos', 'deliverCentral', 'deliver', 'finish']) expect(w.calls).not.toContain(later);
+  });
+
   it('run: stages execute in order and save state', async () => {
     const w = world();
     const i = io();
     const code = await run(w, i);
     expect(code).toBe(0);
     // G14 (ruling G14-R0 1): the read-only helper-repo check before consent; the writing one (checkProofRepos) inside the proof
-    const order = ['readOrigin', 'localProject', 'getAuth', 'readProject', 'provider', 'bundle', 'helperRepos', 'activity', 'consent', 'state', 'needs', 'discover', 'debate', 'trusted', 'creators', 'secrets', 'credits', 'build', 'proofRepos', 'deliverCentral', 'readCentralFileList', 'build', 'preview', 'deliver', 'prState', 'finish'];
+    const order = ['readOrigin', 'localProject', 'getAuth', 'readProject', 'provider', 'bundle', 'helperRepos', 'coCase', 'activity', 'consent', 'state', 'needs', 'discover', 'debate', 'trusted', 'creators', 'secrets', 'credits', 'build', 'proofRepos', 'deliverCentral', 'readCentralFileList', 'build', 'preview', 'deliver', 'prState', 'finish'];
     expect(w.calls.filter((c) => order.includes(c))).toEqual(order);
     const store = await StateStore.open({ owner: OWN, repo: 'r' }, { home: w.home, env: {} });
     expect(store.load()?.stage).toBe('delivered');

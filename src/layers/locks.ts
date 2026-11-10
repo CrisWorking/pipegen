@@ -35,6 +35,7 @@ import { COMMIT_SHA_RE, isGitHubRepo } from '../engine/names.js';
 import type { ShaPinningRead } from '../github/lock-probes.js';
 import { GATE_CHECK_INTEGRATION_ID, GATE_CHECK_NAME, type Capabilities, type CreatedFile, type RepoProfile } from '../types.js';
 import { safeText } from '../util/safe-text.js';
+import { CO_PLACES, coKey } from './co-places.js';
 import { MERGE_CALLER_JOB } from './assemble.js';
 
 /** A plan pipegen refuses to make (an owner that is not a user login or can't write to both repos, an inconsistent input). */
@@ -52,8 +53,8 @@ export const requiredRulesetName = (project: string): string => `pipegen-require
 export { REQUIRED_JOB };
 /** GitHub's name for the default branch in a ruleset condition: the rule follows a renamed default branch. */
 const DEFAULT_BRANCH = '~DEFAULT_BRANCH';
-/** The CODEOWNERS places GitHub reads, in the order it reads them (finish and verify read the same list). */
-export const CO_PLACES: readonly string[] = ['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS'];
+/** The CODEOWNERS places GitHub reads, in order, and the one name key (G-COCASE-R2 M3): a leaf module, re-exported here. */
+export { CO_PLACES, coKey };
 const NEW_CODEOWNERS = '.github/CODEOWNERS';
 const ALLOWED_ACTIONS: ReadonlySet<string> = new Set(['all', 'local_only', 'selected']);
 const MARKER_RE = /pipegen:(?:begin|end)/;

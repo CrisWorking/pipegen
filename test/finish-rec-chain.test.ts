@@ -13,7 +13,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { gitBlobSha } from '../src/create/guard.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { plannedOfLocks, SETUP_BRANCH } from '../src/deliver/deliver.js';
-import { finish, type FinishDeps, type FinishProbe } from '../src/deliver/finish.js';
+import { CoCaseError, coCaseProblem, finish, type FinishDeps, type FinishProbe } from '../src/deliver/finish.js';
+import { pathClash } from '../src/deliver/deliver.js';
+import { coKey } from '../src/layers/locks.js';
+import { finishCommand } from '../src/cli/commands.js';
+import type { CliIO } from '../src/cli/io.js';
 import { checkRecord, editWritesChained, readRecord, writeRecord, type RecordedEdit } from '../src/deliver/record.js';
 import { overridingRules, verify } from '../src/deliver/verify.js';
 import { CENTRAL_PROTECTED_PATHS, codeownersBlock, codeownersFile, codeownersReplace } from '../src/engine/created-builders.js';
@@ -448,7 +452,6 @@ describe('G-FINREC-R1 sec M2: finish writes the central CODEOWNERS only over a b
 
   for (const [name, files] of [
     ['a folder at the path (.github/CODEOWNERS/notes.md)', { '.github/CODEOWNERS/notes.md': 'mine\n' }],
-    ['another letter case (.github/codeowners, probe P4)', { '.github/codeowners': '/docs/ @writers\n' }],
   ] as [string, Record<string, string>][]) {
     it(`G-FINREC-R1 M2: a created write that clashes with ${name} is skipped, nothing written or recorded`, async () => {
       const s = await seed({ centralFiles: files });
@@ -463,6 +466,23 @@ describe('G-FINREC-R1 sec M2: finish writes the central CODEOWNERS only over a b
       expect(r.central?.codeowners).toBeUndefined();
     });
   }
+
+  // G-COCASE-R1 supersedes the skip for a letter-case clash: finish now stops before its first write (exit 2)
+  it('G-FINREC-R1 M2 (G-COCASE-R1): a central CODEOWNERS in another letter case (.github/codeowners, probe P4) stops finish before any write, nothing written or recorded', async () => {
+    const files = { '.github/codeowners': '/docs/ @writers\n' };
+    const s = await seed({ centralFiles: files });
+    const before = new Map(s.g.filesAt('o/pipelines', s.g.head('o/pipelines')));
+    const headBefore = { app: s.g.head('o/r'), central: s.g.head('o/pipelines') };
+    await expect(finish(s.g.octokit(), { owner: 'o', repo: 'r' }, {}, s.deps())).rejects.toBeInstanceOf(CoCaseError);
+    const after = s.g.filesAt('o/pipelines', s.g.head('o/pipelines'));
+    expect(after.has(CO)).toBe(false);
+    for (const [p, t] of Object.entries(files)) expect(after.get(p)).toBe(before.get(p) ?? t);
+    expect({ app: s.g.head('o/r'), central: s.g.head('o/pipelines') }).toEqual(headBefore);
+    const r = await recordOn(s);
+    expect(centralCoOf(r)).toEqual([]);
+    expect(r.central?.codeowners).toBeUndefined();
+    expect(r.mergedAt).toBeUndefined();
+  });
 });
 
 // ---------- Fold R2 (G-FINREC-R2) ----------
@@ -748,5 +768,223 @@ describe('G-FINREC-R3: verify and finish fold (m1, m2, i-a, i-b)', () => {
     await runFinish(u);
     setMode(u, 'o/r', 'CODEOWNERS', '100755');
     expect(await coDrift(u)).toEqual([]);
+  });
+});
+
+// ---------- G-COCASE: the i1 lookup of the central CODEOWNERS in lower case, like N2 (fail closed) ----------
+
+describe('G-COCASE: i1 finds the central CODEOWNERS by lower-case name (a reused block, no recorded central edit)', () => {
+  const BLOCK = codeownersBlock(CENTRAL_PROTECTED_PATHS, ['@a', '@b']);
+  const I1 = 'pipegen\'s block in the central CODEOWNERS';
+  const i1 = async (s: Seed) => (await coDrift(s)).filter((x) => x.what === I1);
+  /** A reused central block (finish records no central CODEOWNERS edit), then `files` committed on the central default branch. */
+  const reused = async (files: Record<string, string | null>): Promise<Seed> => {
+    const s = await seed({ centralFiles: { [CO]: BLOCK } });
+    const r = await runFinish(s);
+    expect(r.edits.some((e) => e.repo === 'central' && e.kind === 'codeowners')).toBe(false);
+    expect(r.files.some((f) => f.repo === 'central' && f.part === 'codeowners')).toBe(false);
+    expect(await coDrift(s)).toEqual([]);
+    s.g.commitOn('o/pipelines', 'main', files, 'owner: edit');
+    return s;
+  };
+
+  it('G-COCASE: two case variants of the central CODEOWNERS with no recorded central edit: drift naming both, GitHub may read either', async () => {
+    const s = await reused({ '.GitHub/CODEOWNERS': '* @mallory\n' });
+    const d = await i1(s);
+    expect(d).toHaveLength(1);
+    expect(d[0]?.actual).toMatch(/\.github\/CODEOWNERS/);
+    expect(d[0]?.actual).toMatch(/\.GitHub\/CODEOWNERS/);
+    expect(d[0]?.actual).toMatch(/GitHub may read either/);
+    // both variants holding pipegen's block is still two files GitHub may pick from
+    const t = await reused({ '.github/codeowners': BLOCK });
+    expect(await i1(t)).toHaveLength(1);
+  });
+
+  it('G-COCASE-R2 I1: a variant-only central CODEOWNERS is drift even with a correct block: it names the variant and the exact path, and says to rename it', async () => {
+    const s = await reused({ [CO]: null, '.GitHub/CODEOWNERS': BLOCK });
+    const d = await coDrift(s);
+    expect(d).toHaveLength(1);
+    expect(d[0]?.what).toMatch(/CODEOWNERS/);
+    expect(`${d[0]?.expected} ${d[0]?.actual}`).toMatch(/\.GitHub\/CODEOWNERS/);
+    expect(d[0]?.actual).toMatch(/rename it to \.github\/CODEOWNERS/);
+    // the content checks still run: the block itself is fine, so no i1 drift
+    expect(await i1(s)).toEqual([]);
+    // docs/codeowners alone (the last place GitHub reads)
+    const t = await reused({ [CO]: null, 'docs/codeowners': BLOCK });
+    const e = await coDrift(t);
+    expect(e).toHaveLength(1);
+    expect(e[0]?.what).toMatch(/CODEOWNERS/);
+    expect(e[0]?.actual).toMatch(/docs\/codeowners/);
+    expect(e[0]?.actual).toMatch(/rename it to docs\/CODEOWNERS/);
+  });
+
+  it('G-COCASE-R2 info: a submodule at a variant path is drift (not a plain file, and its name)', async () => {
+    const s = await reused({ [CO]: null, '.GitHub/CODEOWNERS': BLOCK });
+    const r = s.g.repo('o/pipelines');
+    const ent = r.trees.get(r.commits.get(s.g.head('o/pipelines'))?.tree as string)?.get('.GitHub/CODEOWNERS') as { type: string; mode: string };
+    ent.type = 'commit';
+    ent.mode = '160000';
+    const d = await coDrift(s);
+    expect(d.some((x) => x.what === I1 && /link or not a plain file/.test(String(x.actual)))).toBe(true);
+    expect(d.some((x) => x.what !== I1 && /rename it to \.github\/CODEOWNERS/.test(String(x.actual)))).toBe(true);
+  });
+
+  it('G-COCASE: a variant-only path with wrong owners gives drift', async () => {
+    const s = await reused({ [CO]: null, '.GitHub/CODEOWNERS': codeownersBlock(CENTRAL_PROTECTED_PATHS, ['@a', '@mallory']) });
+    const d = await i1(s);
+    expect(d).toHaveLength(1);
+    expect(d[0]?.actual).toMatch(/@mallory/);
+    expect(d[0]?.expected).toMatch(/\.GitHub\/CODEOWNERS/);
+  });
+
+  it('G-COCASE: a variant-only path keeps every check (no block, an override after it, a link, not UTF-8)', async () => {
+    const a = await reused({ [CO]: null, '.GitHub/CODEOWNERS': '/docs/ @writers\n' });
+    expect((await i1(a))[0]?.actual).toMatch(/no pipegen block/);
+    const b = await reused({ [CO]: null, '.GitHub/CODEOWNERS': `${BLOCK}/installs/ @mallory\n` });
+    expect((await coDrift(b)).some((x) => /rule after pipegen's block in central file \.GitHub\/CODEOWNERS/.test(x.what) && /\/installs\/ @mallory/.test(String(x.actual)))).toBe(true);
+    const c = await reused({ [CO]: null, '.GitHub/CODEOWNERS': BLOCK });
+    const rc = c.g.repo('o/pipelines');
+    (rc.trees.get(rc.commits.get(c.g.head('o/pipelines'))?.tree as string)?.get('.GitHub/CODEOWNERS') as { mode: string }).mode = '120000';
+    expect((await i1(c))[0]?.actual).toMatch(/link or not a plain file/);
+    const e = await reused({ [CO]: null, '.GitHub/CODEOWNERS': BLOCK });
+    const sha = e.g.repo('o/pipelines').trees.get(e.g.repo('o/pipelines').commits.get(e.g.head('o/pipelines'))?.tree as string)?.get('.GitHub/CODEOWNERS')?.sha as string;
+    e.g.hooks.push((call) => (call.route === 'GET /repos/{owner}/{repo}/git/blobs/{file_sha}' && call.params.file_sha === sha ? { status: 200, data: { sha, encoding: 'base64', content: Buffer.concat([Buffer.from(BLOCK), Buffer.from([0xc9])]).toString('base64'), size: BLOCK.length + 1 } } : undefined));
+    expect((await i1(e))[0]?.actual).toMatch(/can't be read as UTF-8 text/);
+  });
+
+  it('G-COCASE: a variant-only first place and a later exact place: GitHub may read either, drift naming both', async () => {
+    const s = await reused({ [CO]: null, '.GitHub/CODEOWNERS': BLOCK, CODEOWNERS: '* @mallory\n' });
+    const d = await i1(s);
+    expect(d).toHaveLength(1);
+    expect(d[0]?.actual).toMatch(/\.GitHub\/CODEOWNERS/);
+    expect(d[0]?.actual).toMatch(/CODEOWNERS, /);
+    // an exact first place: a later file is never read, no drift
+    const t = await reused({ CODEOWNERS: '* @mallory\n', 'docs/codeowners': '* @mallory\n' });
+    expect(await coDrift(t)).toEqual([]);
+  });
+
+  it('G-COCASE: G29 reads a case-variant app CODEOWNERS too (team-only rules warned)', async () => {
+    const s = await seed();
+    await runFinish(s);
+    expect((await verifyOf(s)).warnings).toEqual([]);
+    tamper(s, 'o/r', '.GitHub/CODEOWNERS', '/.github/workflows/ @o/team\n');
+    const v = await verifyOf(s);
+    expect(v.warnings.some((w) => /^\.GitHub\/CODEOWNERS: .*names only teams/.test(w))).toBe(true);
+  });
+});
+
+// ---------- G-COCASE-R1: finish refuses a CODEOWNERS case variant before any write ----------
+
+describe('G-COCASE-R1: finish stops before its first write when a CODEOWNERS case variant is there (exit 2)', () => {
+  /** Every request that isn't a read, from now on. */
+  const writesOf = (s: Seed): string[] => {
+    const w: string[] = [];
+    s.g.hooks.push((call) => { if (!call.route.startsWith('GET ')) w.push(call.route); return undefined; });
+    return w;
+  };
+
+  it('G-COCASE-R1: finish: a case variant of the central CODEOWNERS stops it before any write, naming the variant and the exact path', async () => {
+    const s = await seed({ centralFiles: { '.GitHub/CODEOWNERS': '* @x\n' } });
+    const w = writesOf(s);
+    const err = await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, {}, s.deps()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CoCaseError);
+    expect((err as Error).message).toMatch(/\.GitHub\/CODEOWNERS/);
+    expect((err as Error).message).toMatch(/rename it to \.github\/CODEOWNERS \(or remove it\)/);
+    expect((err as Error).message).toMatch(/npx pipegen finish/);
+    expect(w).toEqual([]);
+    expect((await recordOn(s)).mergedAt).toBeUndefined();
+  });
+
+  it('G-COCASE-R1: finish: a case variant in the app repo (any CO_PLACES entry, even past the exact one) stops it before any write', async () => {
+    const s = await seed();
+    s.g.commitOn('o/r', 'main', { 'docs/codeowners': '* @x\n' }, 'owner: edit');
+    const w = writesOf(s);
+    const err = await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, { print: true }, s.deps()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CoCaseError);
+    expect((err as Error).message).toMatch(/o\/r has docs\/codeowners/);
+    expect((err as Error).message).toMatch(/rename it to docs\/CODEOWNERS/);
+    expect(w).toEqual([]);
+  });
+
+  it('G-COCASE-R1: finish command: exit 2 with the message; exact spellings only finish as before', async () => {
+    const s = await seed({ centralFiles: { 'codeowners': '* @x\n' } });
+    const errs: string[] = [];
+    const io = { out: () => {}, err: (l: string) => { errs.push(l); }, env: {}, prompt: {} } as unknown as CliIO;
+    const code = await finishCommand(io, { owner: 'o', repo: 'r' }, {}, { gh: s.g.octokit(), login: 'a', lease: undefined }, (gh, a, o) => finish(gh, a, o, s.deps()));
+    expect(code).toBe(2);
+    expect(errs.join('\n')).toMatch(/codeowners.*rename it to CODEOWNERS/);
+    expect(errs.join('\n')).toMatch(/exit code 2/);
+    // control: the exact spellings (app CODEOWNERS, central .github/CODEOWNERS) finish
+    const t = await seed();
+    expect((await runFinish(t)).mergedAt).toBeDefined();
+  });
+
+  it('G-COCASE-R1: coCaseProblem names each variant with its exact path, and nothing for exact spellings or other files', () => {
+    expect(coCaseProblem([{ label: 'o/r', paths: ['CODEOWNERS', '.github/CODEOWNERS', 'docs/CODEOWNERS', 'src/codeowners', 'CODEOWNERS.md'] }], 'npx pipegen run')).toBeNull();
+    const m = coCaseProblem([{ label: 'o/r', paths: ['Codeowners'] }, { label: 'o/pipelines', paths: ['.GITHUB/codeowners', 'Docs/CODEOWNERS'] }], 'npx pipegen run') as string;
+    expect(m).toMatch(/o\/r has Codeowners \(rename it to CODEOWNERS/);
+    expect(m).toMatch(/o\/pipelines has \.GITHUB\/codeowners \(rename it to \.github\/CODEOWNERS/);
+    expect(m).toMatch(/Docs\/CODEOWNERS \(rename it to docs\/CODEOWNERS/);
+    expect(m).toMatch(/then run `npx pipegen run` again\. exit code 2\.$/);
+  });
+});
+
+// ---------- G-COCASE-R2 (security review fold) ----------
+
+describe('G-COCASE-R2: one name key (M3), finish not completed (M4), submodule variant (info)', () => {
+  const BLOCK = codeownersBlock(CENTRAL_PROTECTED_PATHS, ['@a', '@b']);
+
+  it('G-COCASE-R2 M3: coKey folds NFKC, then upper and lower case: long s, dotless i and fullwidth letters', () => {
+    expect(coKey('CODEOWNER\u017f')).toBe('codeowners');
+    expect(coKey('.g\u0131thub/CODEOWNERS')).toBe('.github/codeowners');
+    expect(coKey('\uff23\uff2f\uff24\uff25\uff2f\uff37\uff2e\uff25\uff32\uff33')).toBe('codeowners');
+    expect(coKey('docs/CODEOWNERS')).toBe(coKey('Docs/codeowners'));
+    expect(coKey('CODEOWNERS.md')).not.toBe(coKey('CODEOWNERS'));
+  });
+
+  it('G-COCASE-R2 M3: coCaseProblem and pathClash use the key (long s, dotless i, fullwidth)', () => {
+    const FW = '\uff23\uff2f\uff24\uff25\uff2f\uff37\uff2e\uff25\uff32\uff33';
+    expect(coCaseProblem([{ label: 'o/r', paths: ['CODEOWNER\u017f'] }], 'npx pipegen run')).toMatch(/rename it to CODEOWNERS/);
+    expect(coCaseProblem([{ label: 'o/r', paths: ['.g\u0131thub/CODEOWNERS'] }], 'npx pipegen run')).toMatch(/rename it to \.github\/CODEOWNERS/);
+    expect(coCaseProblem([{ label: 'o/r', paths: [`docs/${FW}`] }], 'npx pipegen run')).toMatch(/rename it to docs\/CODEOWNERS/);
+    const t = (k: string): Map<string, { sha: string; type: string; mode: string }> => new Map([[k, { sha: 'x', type: 'blob', mode: '100644' }]]);
+    expect(pathClash('.github/CODEOWNERS', t('.g\u0131thub/CODEOWNERS') as never)).toBe(true);
+    expect(pathClash('CODEOWNERS', t(FW) as never)).toBe(true);
+    expect(pathClash('CODEOWNERS', t('CODEOWNER\u017f') as never)).toBe(true);
+    expect(pathClash('CODEOWNERS', t('README.md') as never)).toBe(false);
+  });
+
+  it('G-COCASE-R2 M3: verify (i1 candidates and N2) finds a look-alike name', async () => {
+    const s = await seed({ centralFiles: { [CO]: BLOCK } });
+    await runFinish(s);
+    s.g.commitOn('o/pipelines', 'main', { [CO]: null, '.g\u0131thub/CODEOWNERS': BLOCK }, 'owner: edit');
+    expect((await coDrift(s)).some((x) => /rename it to \.github\/CODEOWNERS/.test(String(x.actual)))).toBe(true);
+    const t = await seed();
+    await runFinish(t);
+    tamper(t, 'o/r', '.github/CODEOWNER\u017f', '* @mallory\n');
+    expect((await coDrift(t)).some((x) => /app/.test(x.what) && /is the CODEOWNERS GitHub reads/.test(String(x.actual)))).toBe(true);
+  });
+
+  it('G-COCASE-R2 M4: the setup pull request merged but finish never completed (no mergedAt in the record) is drift; after finish, it is not', async () => {
+    const s = await seed();
+    expect((await recordOn(s)).mergedAt).toBeUndefined();
+    const d = (await verifyOf(s)).drift.filter((x) => /finish has not completed/.test(String(x.actual)));
+    expect(d).toHaveLength(1);
+    expect(d[0]?.actual).toMatch(/finish has not completed, or the install record it wrote waits in the central pull request `pipegen\/update-r`: merge it, else run `npx pipegen finish`/);
+    const t = await seed();
+    await runFinish(t);
+    expect((await verifyOf(t)).drift.filter((x) => /finish has not completed/.test(String(x.actual)))).toEqual([]);
+  });
+
+  it('G-COCASE-R2 info: finish: a submodule at a variant path stops it before any write', async () => {
+    const s = await seed({ centralFiles: { '.GitHub/CODEOWNERS': 'x\n' } });
+    const r = s.g.repo('o/pipelines');
+    const ent = r.trees.get(r.commits.get(s.g.head('o/pipelines'))?.tree as string)?.get('.GitHub/CODEOWNERS') as { type: string; mode: string };
+    ent.type = 'commit';
+    ent.mode = '160000';
+    const w: string[] = [];
+    s.g.hooks.push((call) => { if (!call.route.startsWith('GET ')) w.push(call.route); return undefined; });
+    await expect(finish(s.g.octokit(), { owner: 'o', repo: 'r' }, {}, s.deps())).rejects.toBeInstanceOf(CoCaseError);
+    expect(w).toEqual([]);
   });
 });

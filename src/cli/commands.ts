@@ -3,7 +3,7 @@
 // G13-R0 14). One local record folder for all of them (carry 17: `local`, from the CLI's environment), and `interactive` only for a terminal
 // outside CI (carry 18). Exit codes: 0 done; 1 a stop, an error, or (verify) drift.
 import type { Octokit } from '@octokit/rest';
-import { finish, githubFinishProbe, type FinishOpts } from '../deliver/finish.js';
+import { CoCaseError, finish, githubFinishProbe, type FinishOpts } from '../deliver/finish.js';
 import type { LocalRecordDeps } from '../deliver/record.js';
 import { update } from '../deliver/update.js';
 import { verify } from '../deliver/verify.js';
@@ -47,11 +47,18 @@ const show = (s: string, n = 300): string => safeText(s, n);
 
 /** `pipegen finish [--print] [--rotate-key]` (carry 59): prints FinishResult; 0 done (a skipped step is printed, not a failure). */
 export async function finishCommand(io: CliIO, app: RepoRef, opts: FinishOpts, g: CommandGitHub, run: typeof finish = finish): Promise<number> {
-  const res = await run(g.gh, app, opts, {
-    out: (l) => { io.out(l); }, probe: githubFinishProbe(g.login), cosignBin: () => ensurePinnedBinary('cosign'),
-    ...(g.clock === undefined ? {} : { clock: g.clock }), local: g.local ?? {}, io: io.prompt, interactive: interactiveRun(io),
-    ...(g.lease === undefined ? {} : { lease: g.lease }),
-  });
+  let res: Awaited<ReturnType<typeof finish>>;
+  try {
+    res = await run(g.gh, app, opts, {
+      out: (l) => { io.out(l); }, probe: githubFinishProbe(g.login), cosignBin: () => ensurePinnedBinary('cosign'),
+      ...(g.clock === undefined ? {} : { clock: g.clock }), local: g.local ?? {}, io: io.prompt, interactive: interactiveRun(io),
+      ...(g.lease === undefined ? {} : { lease: g.lease }),
+    });
+  } catch (e) {
+    // G-COCASE-R1: a CODEOWNERS case variant stopped finish before its first write: exit 2
+    if (e instanceof CoCaseError) { io.err(safeText(e.message, 1500)); return 2; }
+    throw e;
+  }
   for (const a of res.applied) io.out(`applied: ${show(a)}`);
   for (const s of res.skipped) io.out(`skipped: ${show(s.what)} (${show(s.why, 600)})`);
   for (const n of res.notes) io.out(show(n, 1000));

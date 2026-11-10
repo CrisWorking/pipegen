@@ -389,6 +389,24 @@ describe('G11 finish: print, rotate, the signing key', () => {
     expect(r.blockFrom).toBe(BLOCK_FROM);
   });
 
+  it('G-COCASE-R3 N1: finish whose record waits in the central pull request: verify says to merge it, else run finish', async () => {
+    const s = await seed();
+    const res = await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, { print: true }, s.deps());
+    for (const cmd of res.commands ?? []) await runPrinted(s.g, cmd);
+    await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, {}, s.deps());
+    // the central ruleset is on, so the record went to the central pull request; the default branch still holds no merge
+    expect((await recordOn(s, 'pipegen/update-r')).mergedAt).toBeDefined();
+    expect((await recordOn(s)).mergedAt).toBeUndefined();
+    const v = await verify(s.g.octokit(), { owner: 'o', repo: 'r' }, { local: { home: s.home, env: {} } });
+    const d = v.drift.filter((x) => /finish has not completed/.test(String(x.actual)));
+    expect(d).toHaveLength(1);
+    expect(d[0]?.actual).toBe('finish has not completed, or the install record it wrote waits in the central pull request `pipegen/update-r`: merge it, else run `npx pipegen finish`');
+    // merged: the record names the merge, no such drift
+    s.g.merge('o/pipelines', 'pipegen/update-r');
+    const v2 = await verify(s.g.octokit(), { owner: 'o', repo: 'r' }, { local: { home: s.home, env: {} } });
+    expect(v2.drift.filter((x) => /finish has not completed/.test(String(x.actual)))).toEqual([]);
+  });
+
   it('finish --rotate-key: new key pair, env secrets and PIPEGEN_COSIGN_PUB replaced, cosignPubSha256 updated', async () => {
     const s = await seed({ keyEnv: true });
     await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, {}, s.deps());

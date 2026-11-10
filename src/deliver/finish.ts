@@ -54,6 +54,7 @@ import { emptyRepoFiles } from '../read/quality.js';
 import { MAX_WORKFLOWS, tagPinnedOf, WORKFLOW_FILE } from '../read/workflows.js';
 import { PROTECTED_PATHS_BASE, type Capabilities, type CreatedFile, type EnvSettings, type ExistingWorkflow, type InstallEdit, type InstallPlanned, type InstallRecord, type Plan, type RepoProfile } from '../types.js';
 import { safeText } from '../util/safe-text.js';
+import { coCaseProblem } from './co-case.js';
 import { generateCosignKeys } from '../layers/deploy.js';
 import type { CosignExec, CosignResolver } from './cosign-keys.js';
 import { ensureSigningEnvironment, pathClash, plannedOfLocks, readEnv, SETUP_BRANCH } from './deliver.js';
@@ -79,6 +80,13 @@ const show = (s: string, n = 140): string => safeText(s, n);
 export class FinishError extends Error {
   constructor(message: string, options?: { cause?: unknown }) { super(message, options); this.name = 'FinishError'; }
 }
+/** G-COCASE-R1: a CODEOWNERS case variant is there; finish stops before its first write (the command exits 2). */
+export class CoCaseError extends FinishError {
+  readonly exitCode = 2;
+  constructor(message: string) { super(message); this.name = 'CoCaseError'; }
+}
+/** G-COCASE-R1/R2: shared with setup and deliver (co-case.ts, no import cycle). */
+export { coCaseProblem } from './co-case.js';
 /** One step's own refusal (a read-back that doesn't match, an answer that can't be read): reported, the step not applied. */
 class StepError extends Error {}
 
@@ -1032,6 +1040,9 @@ async function finishHeld(gh: Octokit, app: RepoRef, opts: FinishOpts, deps: Fin
     if (appHead === null || centralHead === null) throw new FinishError('A default branch of the app or the central repo is missing, so pipegen applies nothing.');
     const appTree = (await readTree(gh, app, appHead, clock)).entries;
     const centralTree = (await readTree(gh, central, centralHead, clock)).entries;
+    // G-COCASE-R1: a CODEOWNERS case variant in either repo stops finish here, before its first write
+    const caseStop = coCaseProblem([{ label: `${app.owner}/${app.repo}`, paths: appTree.keys() }, { label: `${central.owner}/${central.repo}`, paths: centralTree.keys() }], 'npx pipegen finish');
+    if (caseStop !== null) throw new CoCaseError(caseStop);
     const appCo = await coFacts(gh, app, appTree, clock);
     const centralCo = await coFacts(gh, central, centralTree, clock);
     const files: CreatedFile[] = [];

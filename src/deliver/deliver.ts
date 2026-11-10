@@ -47,6 +47,8 @@ import type { CreatedFile, EnvSettings, InstallEdit, InstallPlanned, InstallReco
 import { cosignKeyProblem, cosignPubProblem } from '../util/cosign-pem.js';
 import { packageVersion } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
+import { coKey } from '../layers/co-places.js';
+import { coCaseLate } from './co-case.js';
 import {
   commitFiles, compareStatus, DeliverError, ghRead, ghWrite, isoAt, openOrUpdatePr, readHead, readRepo, readTree, refusedMove, sameInstant, setBranch, statusOf, type RepoRef, type TreeEntry,
 } from './git-data.js';
@@ -899,8 +901,9 @@ async function checkPinnedOwn(gh: Octokit, c: RepoRef, pin: string, pinned: read
  * folder of that name (a blob under it). Only for a path the tree doesn't hold as such. Shared with finish's central CODEOWNERS (G-FINREC-R1).
  */
 export function pathClash(path: string, entries: ReadonlyMap<string, TreeEntry>): boolean {
-  const lower = path.toLowerCase();
-  return [...entries.keys()].some((key) => { const k = key.toLowerCase(); return k === lower || lower.startsWith(`${k}/`) || k.startsWith(`${lower}/`); });
+  // G-COCASE-R2 M3: names compared by coKey (letter case and look-alike letters), fail closed
+  const lower = coKey(path);
+  return [...entries.keys()].some((key) => { const k = coKey(key); return k === lower || lower.startsWith(`${k}/`) || k.startsWith(`${lower}/`); });
 }
 
 /** Base-tree checks of the app files (step 2): what changes, and the mode each file keeps. Throws before anything is written. */
@@ -1058,6 +1061,9 @@ async function deliverHeld(gh: Octokit, p: RepoProfile, d: DeliveryPlan, vault: 
     const base = await readHead(gh, app, appRepo.defaultBranch, clock);
     if (base === null) throw new DeliverError(`${show(`${p.owner}/${p.repo}`)} has no default branch to open the setup pull request on.`);
     const baseTree = await readTree(gh, app, base, clock);
+    // G-COCASE-R2 M1: a CODEOWNERS case variant anywhere in either tree (checkBase looks only at delivered paths), before any write
+    const late = coCaseLate([{ label: `${p.owner}/${p.repo}`, paths: baseTree.entries.keys() }, { label: `${p.owner}/${CENTRAL_REPO}`, paths: centralTree.entries.keys() }], 'npx pipegen run');
+    if (late !== null) throw new DeliverError(late);
     const changed = checkBase(appFiles, baseTree.entries, prev, 'app', adopted);
     const commits = d.appCommits.map((c) => ({ part: c.part, message: c.message, files: c.files.filter((f) => changed.has(f)) })).filter((c) => c.files.length > 0);
     if (commits.length === 0) throw new DeliverError('Every file pipegen would deliver is already on the default branch, so there is no setup pull request to open. Run `npx pipegen finish` if you haven\'t.');
