@@ -326,6 +326,19 @@ describe('e2e', () => {
     expect(seeded.w.io.asked.find((q) => /Go ahead\?/.test(q))).not.toMatch(/pipegen creates the environment pipegen-signing/);
   }, 240_000);
 
+  // G17-F1-R2 (sec I1): the scratch keys of the e2e world apply ScratchKeys' own name rules (placeholderName); the run's vault holds the
+  // fingerprint key (run.ts generateFpKey) and the real assembled workflows read GITHUB_TOKEN and PIPEGEN_FP_KEY, so without the filter in
+  // run-proof.ts the setup would throw and the run stop. Both layouts reach delivery with placeholders for stored names only
+  it('e2e: G17-F1-R2 the public and the private run store scratch placeholders through the real name rules and set the repository up', async () => {
+    for (const [layout, ran] of [['private', await PLAIN()], ['public', await PUBLIC()]] as const) {
+      expect(ran.code, `${layout}: ${ran.w.io.errs.join('\n')}`).toBe(0);
+      const setups = ran.w.tl.filter((x) => x.startsWith('keys.setup:'));
+      expect(setups.length, layout).toBe(1);
+      expect(setups[0], layout).not.toMatch(/GITHUB_|PIPEGEN_/);
+      expect(ran.w.io.lines.at(-1), layout).toBe('pipegen set up this repository.');
+    }
+  }, 480_000);
+
   // G17-F1 (sec M1): `--skip deploy` signs nothing (assembly drops the signing plan), so the run makes no signing environment, says
   // nothing about signing with a key pair, asks no consent for it, makes no key pair, and needs no memory folder
   it('e2e: G17-F1 --skip deploy on a first private run makes no signing environment, prints no "this run signs" note and asks no consent for it', async () => {

@@ -79,6 +79,20 @@ describe('G17-F1 sec I1: workflowSecretNames counts `secrets` only as the contex
   });
 });
 
+describe('G17-F1-R2 N1: a YAML 1.1 line break the YAML 1.2 parser reads as content', () => {
+  it('keys: workflowSecretNames is null when the raw text holds U+0085, U+2028 or U+2029 (a YAML 1.1 reader ends a comment there)', () => {
+    for (const ch of ['\u0085', '\u2028', '\u2029']) {
+      // the reviewer's probe P8: in a comment, then a reference a YAML 1.1 reader sees on its own line
+      expect(read(`env:\n  A: x # c${ch}  B: ${ref('ORG_H')}\n`), JSON.stringify(ch)).toBeNull();
+      // anywhere else in the text too (a quoted value), and as bytes
+      expect(read(`env:\n  A: "x${ch}y"\n  B: ${ref('ORG_H')}\n`), JSON.stringify(ch)).toBeNull();
+      expect(workflowSecretNames([{ content: Buffer.from(`env:\n  A: x # c${ch}\n`, 'utf8') }]), JSON.stringify(ch)).toBeNull();
+    }
+    // the control: without them, the names
+    expect(read(`env:\n  A: x # c\n  B: ${ref('ORG_H')}\n`)).toEqual(['ORG_H']);
+  });
+});
+
 describe('G17-F1 sec M2: "Verify before deploy" of a published but unsigned service', () => {
   const USED = ['sec', 'retsUsed'].join('');
   const deployWf = { path: '.github/workflows/deploy.yml', triggers: ['push'], deploys: true, [USED]: [], jobs: ['deploy'] } as unknown as ExistingWorkflow;

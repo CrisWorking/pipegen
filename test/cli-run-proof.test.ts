@@ -29,6 +29,7 @@ import type { CliIO } from '../src/cli/io.js';
 import type { CreatedFile, PipelineDraft } from '../src/types.js';
 import { cleanHomes, failOn, PASS, proofWorld, RUN_ID, TYPED } from './helpers/proof-world.js';
 import { isWorkflowFile, realAssembled } from './helpers/real-workflows.js';
+import { workflowSecretNames } from '../src/proof/keys.js';
 
 afterAll(cleanHomes);
 const GATE_TOOL = REVIEWED.find((x) => x.id === 'pipegen-gate') as ReviewedTool;
@@ -1267,11 +1268,15 @@ describe('G14fix: a private app through the real proof harness', () => {
       const asm = w.input.assembleFor;
       w.input.assembleFor = async (d) => { const a = await asm(d); return async (mode, sha) => [...(await a(mode, sha)).filter((f) => f.repo === 'app'), ...central]; };
     };
-    // the control: the same files after the setup, no stop for the names
+    // the control: the same files after the setup, no stop for the names; G17-F1-R2 (sec I1): the proof passes, and the placeholders
+    // (through the real name rules, recordingKeys) are only the names ScratchKeys stores, never GITHUB_TOKEN or the vault's PIPEGEN_FP_KEY
     const same = await proofWorld({ private: true });
     realCentral(same);
     const ok = await same.run();
-    expect(ok.stopped ?? '').not.toContain('other secrets than the ones the scratch keys were made for');
+    expect(ok.stopped ?? '').toBe('');
+    expect(ok.ok).toBe(true);
+    expect(same.vault.names()).toContain('PIPEGEN_FP_KEY');
+    expect(same.tl.filter((x) => x.startsWith('keys.setup:'))).toEqual(['keys.setup:API_TOKEN']);
     // the scratch keys were made for the names the files read (readByWorkflows given), not for every organisation secret
     const made = same.tl.find((x) => x.startsWith('keys.new:'));
     expect(made).toBeDefined();
@@ -1289,6 +1294,18 @@ describe('G14fix: a private app through the real proof harness', () => {
     expect(r.ok).toBe(false);
     expect(r.stopped).toContain('other secrets than the ones the scratch keys were made for');
     expect(w.tl.some((x) => x === 'secretStore' || x.startsWith('keys.setup:') || x.startsWith('push:') || x.startsWith('pushBranch:'))).toBe(false);
+  });
+
+  it('run: G17-F1-R2 a public app with the real assembled workflows passes its proof; the placeholders hold no GITHUB_ or PIPEGEN_ name', async () => {
+    const app = realAssembled().public.filter((f) => f.repo === 'app' && isWorkflowFile(f));
+    expect(workflowSecretNames(app.map((f) => ({ content: f.content })))).toEqual(expect.arrayContaining(['PIPEGEN_FP_KEY']));
+    const w = await proofWorld({});
+    w.input.assembleFor = async () => async () => app;
+    const r = await w.run();
+    expect(r.stopped ?? '').toBe('');
+    expect(r.ok).toBe(true);
+    expect(w.tl.find((x) => x.startsWith('keys.new:'))).toContain('PIPEGEN_FP_KEY');
+    expect(w.tl.filter((x) => x.startsWith('keys.setup:'))).toEqual(['keys.setup:API_TOKEN']);
   });
 
   it('run: a private app whose assembled workflows break a proof rule is refused before any GitHub write (G14fix-R1 F2)', async () => {

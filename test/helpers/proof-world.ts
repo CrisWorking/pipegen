@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Octokit } from '@octokit/rest';
 import { AiSpendMeter } from '../../src/ai/spend-meter.js';
-import { SecretVault } from '../../src/create/secrets.js';
+import { generateFpKey, SecretVault } from '../../src/create/secrets.js';
+import { placeholderName } from '../../src/proof/keys.js';
 import type { DebateResult } from '../../src/debate/debate.js';
 import { armProofCleanup } from '../../src/proof/cleanup.js';
 import type { FixKeys } from '../../src/proof/fix.js';
@@ -57,13 +58,17 @@ export interface KeysEffects {
   deleteLine?: string | null;
 }
 
-/** A ScratchKeys stand-in that records on `tl`: the scratch secrets are placeholders until the user says yes, and deleteAll removes them. */
+/**
+ * A ScratchKeys stand-in that records on `tl`: the scratch secrets are placeholders until the user says yes, and deleteAll removes them.
+ * G17-F1-R2 (sec I1): setup and placeholders apply ScratchKeys' own name rules (placeholderName, the real validator), so a name the real
+ * store refuses (GITHUB_*, PIPEGEN_*, an invalid one) throws here too.
+ */
 export function recordingKeys(tl: string[], fx: KeysEffects = {}): FixKeys & { readonly mode: FixKeys['mode'] } {
   let mode: 'none' | 'placeholder' | 'real' = 'none';
   return {
     get mode() { return mode; }, lastRefusal: undefined,
-    setup: async (n: readonly string[]) => { tl.push(`keys.setup:${[...n].join(',')}`); if (mode === 'none') mode = 'placeholder'; await fx.store?.(n); },
-    placeholders: async (n: readonly string[]) => { tl.push(`keys.placeholders:${[...n].join(',')}`); if (mode === 'none') mode = 'placeholder'; await fx.store?.(n); },
+    setup: async (n: readonly string[]) => { for (const x of n) placeholderName(x); tl.push(`keys.setup:${[...n].join(',')}`); if (mode === 'none') mode = 'placeholder'; await fx.store?.(n); },
+    placeholders: async (n: readonly string[]) => { for (const x of n) placeholderName(x); tl.push(`keys.placeholders:${[...n].join(',')}`); if (mode === 'none') mode = 'placeholder'; await fx.store?.(n); },
     real: async (n: readonly string[]) => { tl.push(`keys.real:${[...n].join(',')}`); mode = 'real'; await fx.store?.(n); },
     deleteAll: async () => {
       if (fx.deleteLine !== null) tl.push(fx.deleteLine ?? 'keys.deleteAll');
@@ -130,6 +135,8 @@ export async function proofWorld(o: WorldOpts = {}): Promise<World> {
   for (const s of ['planned', 'debated', 'created'] as const) store.setStage(s);
   const vault = new SecretVault();
   vault.set('API_TOKEN', TYPED);
+  // G17-F1-R2 (sec I1): the run's vault holds the fingerprint key (run.ts generateFpKey) before the proof, as in production
+  generateFpKey(vault);
   const meter = new AiSpendMeter(scripted(() => ({})).ai, 5);
   const t = proofTarget(store.state?.app as never, { runId: RUN_ID });
   const asked: string[] = [];

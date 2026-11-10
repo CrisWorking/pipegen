@@ -76,6 +76,28 @@ export const SCRATCH_FP_KEY = 'PIPEGEN_FP_KEY';
 /** Secrets listed per page, and the most pages deleteAll reads (1,000 secrets; GitHub allows 100 per repo). */
 export const SECRET_LIST_PAGES = 10;
 const NAME_RE = /^[A-Z_][A-Z0-9_]{0,199}$/;
+
+/** A secret name ScratchKeys stores (upper-cased); GITHUB_* is GitHub's. Throws ScratchKeysError otherwise. */
+export function storedName(n: unknown): string {
+  const up = typeof n === 'string' ? n.toUpperCase() : '';
+  if (!NAME_RE.test(up) || up.startsWith('GITHUB_')) throw new ScratchKeysError(`${safeText(String(n), 80)} is not a secret name pipegen stores.`);
+  return up;
+}
+
+/**
+ * G17-F1-R2 (sec I1): the name rules of ScratchKeys' placeholder store (setup, placeholders): a stored name, and never PIPEGEN_* (pipegen's
+ * own: the throwaway fingerprint key is stored apart). The upper-cased name, or a ScratchKeysError. Test worlds call this real validator.
+ */
+export function placeholderName(n: unknown): string {
+  const up = storedName(n);
+  if (/^PIPEGEN_/.test(up)) throw new ScratchKeysError(`${up} is pipegen's own; it gets no placeholder.`);
+  return up;
+}
+
+/** G17-F1-R2: whether a name gets a placeholder (placeholderName accepts it as written); the fix loop's and the setup's filter. */
+export function placeable(n: string): boolean {
+  try { return placeholderName(n) === n; } catch { return false; }
+}
 /** A secret or variable name as GitHub lists it. */
 const PLAIN_NAME_RE = /^[A-Za-z0-9_]{1,200}$/;
 /** An environment name as GitHub lists it: up to 255 characters, no control character. */
@@ -545,15 +567,12 @@ export class ScratchKeys {
   }
 
   #name(n: unknown): string {
-    const up = typeof n === 'string' ? n.toUpperCase() : '';
-    if (!NAME_RE.test(up) || up.startsWith('GITHUB_')) throw new ScratchKeysError(`${safeText(String(n), 80)} is not a secret name pipegen stores.`);
-    return up;
+    return storedName(n);
   }
 
   #placeholderEntries(names: readonly string[]): { name: string; kind: 'placeholder'; value: string }[] {
     return names.map((n) => {
-      const up = this.#name(n);
-      if (/^PIPEGEN_/.test(up)) throw new ScratchKeysError(`${up} is pipegen's own; it gets no placeholder.`);
+      const up = placeholderName(n);
       const value = placeholderValue(up);
       if (this.#vault.containsKnownValue(value)) throw new ScratchKeysError(`the placeholder for ${up} is a value you typed; pipegen won't store it.`);
       return { name: up, kind: 'placeholder' as const, value };
@@ -697,6 +716,7 @@ const isTokenRejected = (gh: Octokit, e: unknown): boolean => (e as { status?: u
  * context appears without a name (`secrets[expr]`, `toJSON(secrets)`, the word in a quoted string of an expression), or when a
  * `secrets:` key passes anything but a map (`secrets: inherit` passes them all). The key `secrets:` of a reusable-workflow call
  * itself reads nothing: its values are scanned like any scalar.
+ * G17-F1-R2 N1: null too when the raw text holds U+0085, U+2028 or U+2029 (a YAML 1.1 reader breaks a line there; this parser doesn't).
  * Plan G G0 (E-F2 m2): an empty list (or no list) is null too. A proof always pushes at least one workflow, so an empty list
  * can only be a caller that passed the wrong set; read as "reads no secret" it would let an org secret through the brand.
  */
@@ -705,6 +725,8 @@ export function workflowSecretNames(workflows: readonly { content: string | Uint
   const names = new Set<string>();
   for (const w of workflows) {
     const text = typeof w.content === 'string' ? w.content : Buffer.from(w.content).toString('utf8');
+    // G17-F1-R2 N1: NEL, LS and PS are content to this YAML 1.2 parser but line breaks to a YAML 1.1 reader (a comment could end there)
+    if (/[\u0085\u2028\u2029]/u.test(text)) return null;
     const r = parseYaml(text, 'user');
     if (!('parsed' in r)) return null;
     if (passesAllSecrets(r.parsed.js)) return null;
