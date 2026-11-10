@@ -18,6 +18,9 @@
 // members, so the gate can't check those approvals), and says (G26) that a key rotation resets the baseline.
 import type { Octokit } from '@octokit/rest';
 import { validDate } from '../../gate/src/date.js';
+import picomatch from 'picomatch';
+import { codeOwners, ownersLookup, PIPEGEN_BLOCK_BEGIN, PIPEGEN_BLOCK_END, pipegenBlockOwners, type CodeownersRule } from '../../gate/src/integrity.js';
+import { gitBlobSha } from '../create/guard.js';
 import { centralWorkflowFile } from '../engine/central-path.js';
 import { CENTRAL_PROTECTED_PATHS, CODEOWNERS_END } from '../engine/created-builders.js';
 import type { RateClock } from '../engine/github-rate.js';
@@ -84,12 +87,92 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
   }
   for (const ed of r.edits) {
     const e = trees[ed.repo]?.get(ed.path);
+    const readText = async (): Promise<string> => (e === undefined || e.type !== 'blob' ? '' : await readBlobText(gh, ed.repo === 'app' ? app : central, e.sha, MAX_TEXT, clock));
+    // G-FINREC-R1 (sec M1): in every CODEOWNERS pipegen created or edited (app or central, its own write included), a rule after pipegen's
+    // block wins over it; one that takes a protected path from the block's owners is drift (inserted text alone can't show that)
+    // G-FINREC-R3 i-b: a CODEOWNERS that isn't a plain file (a link, a submodule) is drift even when its sha is the one pipegen wrote
+    if (ed.kind === 'codeowners' && e !== undefined && (e.type !== 'blob' || (e.mode !== '100644' && e.mode !== '100755'))) {
+      drift.push({ what: `pipegen's lines in ${label(ed.repo, ed.path)}`, expected: 'pipegen\'s inserted text, once', actual: 'it is a link or not a plain file, so it can\'t be read' });
+      continue;
+    }
+    let coText: string | null = null;
+    if (ed.kind === 'codeowners' && e !== undefined && e.type === 'blob' && e.mode !== '120000') {
+      try { coText = await readText(); } catch (err) {
+        // an unreadable CODEOWNERS is drift, never a crash (G-FINREC-R2 i1 review)
+        if (!(err instanceof DeliverError) && statusOf(err) !== 404 && statusOf(err) !== 422) throw err;
+        drift.push({ what: `pipegen's lines in ${label(ed.repo, ed.path)}`, expected: 'pipegen\'s inserted text, once', actual: 'it can\'t be read' });
+        continue;
+      }
+      // the text must be the blob GitHub reads: a file that isn't UTF-8 decodes with replacements, and nothing is judged on that text
+      if (gitBlobSha(coText) !== e.sha) {
+        drift.push({ what: `pipegen's lines in ${label(ed.repo, ed.path)}`, expected: 'pipegen\'s inserted text, once', actual: 'it can\'t be read as UTF-8 text, so pipegen can\'t check it' });
+        continue;
+      }
+    }
+    if (coText !== null) {
+      const over = overrides(coText, ed.repo === 'app' ? [...new Set([...protectedListOf(r, 'app'), ...PROTECTED_PATHS_BASE])] : CENTRAL_PROTECTED_PATHS);
+      // markers missing with the inserted text gone too: the check below names it once
+      if (over === null ? coText.split((ed as { inserted: string }).inserted).length === 2 : over.length > 0) {
+        // G-FINREC-R2 N3: what to do, and what each rule takes
+        drift.push(over === null
+          ? { what: `a CODEOWNERS rule after pipegen's block in ${label(ed.repo, ed.path)}`, expected: 'keep exactly one `# pipegen:begin` and one `# pipegen:end` line', actual: 'pipegen\'s begin or end line is missing or repeated, so nothing can say where its block ends' }
+          : { what: `a CODEOWNERS rule after pipegen's block in ${label(ed.repo, ed.path)}`, expected: 'rules after `# pipegen:end` win over pipegen\'s block: move them above `# pipegen:begin`, or give them only pipegen\'s owners', actual: show(over.map((o) => `${o.line} (${o.covers})`).join(' | '), 600) });
+      }
+    }
     if (e !== undefined && ed.writtenShas.includes(e.sha)) continue;
     if (ed.kind === 'codeowners' || ed.kind === 'hooks' || ed.kind === 'dependabot') {
-      const text = e === undefined || e.type !== 'blob' ? '' : await readBlobText(gh, ed.repo === 'app' ? app : central, e.sha, MAX_TEXT, clock);
+      const text = coText ?? await readText();
       if (text.split(ed.inserted).length !== 2) drift.push({ what: `pipegen's lines in ${label(ed.repo, ed.path)}`, expected: 'pipegen\'s inserted text, once', actual: e === undefined ? null : 'changed or missing' });
     } else {
       drift.push({ what: label(ed.repo, ed.path), expected: ed.writtenShas.at(-1) ?? 'the file pipegen wrote', actual: e?.sha ?? null });
+    }
+  }
+
+  // G-FINREC-R2 N2: GitHub (and the gate) read the first of CO_PLACES that is there; one ahead of the file pipegen edited shadows its block
+  for (const repo of ['app', 'central'] as const) {
+    const edited = new Set([...r.edits.filter((e) => e.repo === repo && e.kind === 'codeowners').map((e) => e.path), ...r.files.filter((f) => f.repo === repo && f.part === 'codeowners').map((f) => f.path)]);
+    if (edited.size === 0) continue;
+    // G-FINREC-R3 i-a: names compared in lower case (fail closed: a case variant GitHub might read first counts as present)
+    const paths = [...(trees[repo]?.keys() ?? [])];
+    const at = CO_PLACES.map((p) => paths.filter((x) => x.toLowerCase() === p.toLowerCase())).find((m) => m.length > 0);
+    const first = at?.find((x) => !edited.has(x));
+    if (first === undefined) continue;
+    const ours = [...edited].map((p) => show(p)).join(', ');
+    drift.push({ what: `the CODEOWNERS GitHub reads in the ${repo === 'app' ? 'app' : 'central'} repo`, expected: `${ours} (the file with pipegen's block) read first`, actual: `${show(first)} is the CODEOWNERS GitHub reads, so pipegen's block in ${ours} has no effect: take ${show(first)} out, or move its rules into ${ours} above \`# pipegen:begin\`` });
+  }
+  // G-FINREC-R2 i1 (and its review): code-owner review planned on central (finish ran) needs, in the CODEOWNERS central reads, pipegen's
+  // block with exactly the planned owners and no rule after it that takes a protected path (finish may have skipped writing it, or reused a
+  // block it recorded no edit for). Unreadable is drift too.
+  if (r.mergedAt !== undefined && r.planned.owners.central.length > 0 && trees.central !== null) {
+    const what = 'pipegen\'s block in the central CODEOWNERS';
+    const first = CO_PLACES.find((p) => trees.central?.has(p) === true);
+    const e = first === undefined ? undefined : trees.central.get(first);
+    const where = show(first ?? '.github/CODEOWNERS');
+    let text: string | null = null;
+    let why: string | null = null;
+    if (first === undefined) why = null;
+    else if (e === undefined || e.type !== 'blob' || e.mode === '120000') why = 'it is a link or not a plain file, so it can\'t be read';
+    else {
+      try {
+        text = await readBlobText(gh, central, e.sha, MAX_TEXT, clock);
+        if (gitBlobSha(text) !== e.sha) { text = null; why = 'it can\'t be read as UTF-8 text'; }
+      } catch (err) {
+        if (!(err instanceof DeliverError) && statusOf(err) !== 404 && statusOf(err) !== 422) throw err;
+        why = 'it can\'t be read';
+      }
+    }
+    const want = [...new Set(r.planned.owners.central.map((o) => o.replace(/^@/, '').toLowerCase()))].sort();
+    const got = text === null ? [] : pipegenBlockOwners(text);
+    const planned = `pipegen's block in ${where} with the planned owners ${want.map((o) => `@${o}`).join(' ')} (the central ruleset asks for code-owner review)`;
+    if (first === undefined) drift.push({ what, expected: planned, actual: null });
+    else if (text === null) drift.push({ what, expected: planned, actual: why });
+    else if (got.length === 0) drift.push({ what, expected: planned, actual: 'no pipegen block: run `npx pipegen finish` again (it says why it left the file)' });
+    else if (got.join(' ') !== want.join(' ')) drift.push({ what, expected: planned, actual: `the block names ${got.map((o) => `@${o}`).join(' ')}: another project's block is in force with other owners; give every project sharing this central repo the same code owners, then run \`npx pipegen finish\` in each` });
+    // an override after the block: the per-edit check already read a file pipegen recorded an edit for
+    if (text !== null && got.length > 0 && !r.edits.some((x) => x.repo === 'central' && x.kind === 'codeowners' && x.path === first)) {
+      const over = overrides(text, CENTRAL_PROTECTED_PATHS);
+      if (over === null) drift.push({ what: `a CODEOWNERS rule after pipegen's block in ${label('central', first as string)}`, expected: 'keep exactly one `# pipegen:begin` and one `# pipegen:end` line', actual: 'pipegen\'s begin or end line is missing or repeated, so nothing can say where its block ends' });
+      else if (over.length > 0) drift.push({ what: `a CODEOWNERS rule after pipegen's block in ${label('central', first as string)}`, expected: 'rules after `# pipegen:end` win over pipegen\'s block: move them above `# pipegen:begin`, or give them only pipegen\'s owners', actual: show(over.map((o) => `${o.line} (${o.covers})`).join(' | '), 600) });
     }
   }
 
@@ -167,7 +250,19 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
   for (const path of CO_PLACES) {
     const e = tree?.get(path);
     if (e === undefined) continue;
-    if (e.type === 'blob' && e.mode !== '120000') warnings.push(...teamOnly(await readBlobText(gh, app, e.sha, MAX_TEXT, clock), r, path));
+    if (e.type === 'blob' && e.mode !== '120000') {
+      const named = r.edits.some((x) => x.repo === 'app' && x.kind === 'codeowners' && x.path === path);
+      let text: string;
+      try { text = await readBlobText(gh, app, e.sha, MAX_TEXT, clock); } catch (err) {
+        // G-FINREC-R3 m2: unreadable is drift like the other two reads, never a crash (the per-edit check already named a file pipegen edited)
+        if (!(err instanceof DeliverError) && statusOf(err) !== 404 && statusOf(err) !== 422) throw err;
+        if (!named) drift.push({ what: `the CODEOWNERS GitHub reads in the app repo (${label('app', path)})`, expected: 'UTF-8 text pipegen can check', actual: 'it can\'t be read' });
+        break;
+      }
+      // G-FINREC-R2: only text that hashes back to the blob is judged; the per-edit check already named a file pipegen edited
+      if (gitBlobSha(text) === e.sha) warnings.push(...teamOnly(text, r, path));
+      else if (!named) drift.push({ what: `the CODEOWNERS GitHub reads in the app repo (${label('app', path)})`, expected: 'UTF-8 text pipegen can check', actual: 'it can\'t be read as UTF-8 text, so pipegen can\'t check it' });
+    }
     break;
   }
   // G26
@@ -445,6 +540,104 @@ async function findSetupPr(api: SettingsApi, app: RepoRef): Promise<number | und
   const d = await api.readOr404('GET /repos/{owner}/{repo}/pulls', { owner: app.owner, repo: app.repo, head: `${app.owner}:${SETUP_BRANCH}`, state: 'all', per_page: 100 });
   const list = Array.isArray(d) ? d.filter(isObj).filter((p) => isObj(p.head) && p.head.ref === SETUP_BRANCH && Number.isSafeInteger(p.number)) : [];
   return list.map((p) => p.number as number).sort((a, b) => b - a)[0];
+}
+
+const WILD = /[*?[\\]/;
+const fixedPrefix = (p: string): string => { const i = p.search(WILD); return (i < 0 ? p : p.slice(0, i)).toLowerCase(); };
+const globMatch = (glob: string, name: string): boolean => { try { return picomatch(glob, { nocase: true, dot: true })(name); } catch { return true; } };
+
+/**
+ * G-FINREC-R1 (sec M1, review): whether a CODEOWNERS rule can match a path a protected pattern (the gate's form) stands for, decided at the
+ * pattern level and failing closed (anything undecided covers):
+ * - a folder rule (the gate's `ancestors`: a trailing '/', or a last part with no wildcard) can name a folder holding any file;
+ * - a rule with no '/' but a trailing one matches by name at any depth: it covers every protected folder, a protected file whose name (or
+ *   folder name) it matches, and (a folder rule) any protected file named anywhere;
+ * - an anchored rule covers a protected folder when its fixed prefix (before the first wildcard) and the folder overlap, either way; an
+ *   anchored protected file by the gate's own lookup; a protected name at any depth unless its last part is a wildcard glob that doesn't
+ *   match the name.
+ * A protected pattern with a wildcard outside a trailing `/**` is compared by its fixed prefix the same way. Returns the protected pattern
+ * covered (G-FINREC-R2 N3: named in the drift), or null.
+ */
+function ruleCovers(rule: CodeownersRule, protectedPaths: readonly string[]): string | null {
+  // the gate's `ancestors`: a trailing '/', or a last part with no (unescaped) wildcard, can name a folder and so every file under it
+  const folderRule = rule.pattern.endsWith('/') || !/(^|[^\\])[*?]/.test(rule.pattern.replace(/\/$/, '').split('/').at(-1) as string);
+  const body = rule.pattern.replace(/^\//, '').replace(/\/$/, '');
+  if (body === '') return 'every path';
+  const anchored = rule.pattern.startsWith('/') || body.includes('/');
+  const last = body.split('/').at(-1) as string;
+  const prefix = fixedPrefix(body);
+  const overlaps = (dir: string): boolean => prefix.startsWith(dir) || dir.startsWith(prefix);
+  for (const raw of protectedPaths) {
+    const rooted = /^\.?\//.test(raw);
+    let q = raw.replace(/^\.?\//, '');
+    const anyDepth = !rooted && (!q.includes('/') || q.startsWith('**/'));
+    q = q.replace(/^\*\*\//, '');
+    const at = anyDepth ? `${q} at any depth` : raw.replace(/^\.\//, '/');
+    if (q === '' || q.split('/').some((x) => x === '..')) return at;
+    const subtree = q.endsWith('/**');
+    const target = subtree ? q.slice(0, -3) : q;
+    if (WILD.test(target)) {
+      // a wildcard inside the protected pattern: by its fixed prefix (folder part), any-depth names always
+      if (!anchored || anyDepth) return at;
+      const fixed = fixedPrefix(target);
+      if (overlaps(fixed.slice(0, fixed.lastIndexOf('/') + 1))) return at;
+      continue;
+    }
+    if (subtree) {
+      if (!anchored || anyDepth) return at;
+      if (overlaps(`${target.toLowerCase()}/`)) return at;
+      continue;
+    }
+    const name = target.split('/').at(-1) as string;
+    if (!anchored) {
+      if (folderRule && anyDepth) return at;
+      if (globMatch(body, name) || target.split('/').slice(0, -1).some((d) => globMatch(body, d))) return at;
+      continue;
+    }
+    if (anyDepth) {
+      if (folderRule || globMatch(last, name)) return at;
+      continue;
+    }
+    const m = ownersLookup([rule], target);
+    if ('unresolved' in m || m.owners !== undefined) return at;
+    const ml = ownersLookup([{ ...rule, pattern: rule.pattern.toLowerCase() }], target.toLowerCase());
+    if ('unresolved' in ml || ml.owners !== undefined) return at;
+  }
+  return null;
+}
+
+/**
+ * G-FINREC-R1 (sec M1): the rules after pipegen's block (they win over it: the last matching rule counts) that cover a protected path and
+ * name no owner, or an owner outside the block's (a team, an e-mail, another login). "Covers" is decided at the pattern level (ruleCovers,
+ * failing closed). A line
+ * GitHub skips owns nothing; a line the gate can't read counts. Lines before the block lose to it. null: not exactly one begin line and one
+ * end line after it (nothing can say where the block ends). pipegen's own output has nothing after its block but what the owner wrote.
+ */
+export function overridingRules(text: string, protectedPaths: readonly string[]): string[] | null {
+  return overrides(text, protectedPaths)?.map((o) => o.line) ?? null;
+}
+
+/** overridingRules with what each rule covers (G-FINREC-R2 N3), or why it counts without one (N1: a line the gate's parser can't read). */
+function overrides(text: string, protectedPaths: readonly string[]): { line: string; covers: string }[] | null {
+  const lines = text.split(/\r?\n/);
+  const begins = lines.flatMap((l, i) => (l === PIPEGEN_BLOCK_BEGIN ? [i] : []));
+  const ends = lines.flatMap((l, i) => (l === PIPEGEN_BLOCK_END ? [i] : []));
+  if (begins.length !== 1 || ends.length !== 1 || (ends[0] as number) < (begins[0] as number)) return null;
+  const owners = new Set(pipegenBlockOwners(text));
+  const out: { line: string; covers: string }[] = [];
+  const unreadable = "a line the gate can't read: fix it or take it out";
+  for (const raw of lines.slice((ends[0] as number) + 1)) {
+    const line = raw.trim();
+    if (line === '' || line.startsWith('#')) continue;
+    // G-FINREC-R2 N1: a line the gate's parser drops (or a lone CR GitHub may split on) may still be read by GitHub's own parser: it counts
+    const rule = raw.includes('\r') ? undefined : codeOwners(raw)[0];
+    if (rule === undefined || rule.unreadable !== undefined) { out.push({ line: line.slice(0, 200), covers: unreadable }); continue; }
+    const named = line.split(/\s+/).length - 1;
+    if (named > 0 && rule.owners.length === named && rule.owners.every((o) => owners.has(o))) continue;
+    const covers = ruleCovers(rule, protectedPaths);
+    if (covers !== null) out.push({ line, covers: `covers ${covers}` });
+  }
+  return out;
 }
 
 /**

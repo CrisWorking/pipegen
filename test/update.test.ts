@@ -11,12 +11,14 @@ import { updatePatch } from '../gate/src/pin-patch.js';
 import type { Prompter } from '../src/cli/io.js';
 import { gitBlobSha } from '../src/create/guard.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
-import { centralUpdateBranch, guardRecordOf, localRecordPath, ownWholeFile, readLocalRecord, readRecord, recordFileText, recordHash, recordMarkerOf, recordPath, writeLocalRecord } from '../src/deliver/record.js';
+import { centralUpdateBranch, editWritesChained, guardRecordOf, localRecordPath, ownWholeFile, readLocalRecord, readRecord, recordFileText, recordHash, recordMarkerOf, recordPath, writeLocalRecord } from '../src/deliver/record.js';
 import { TYPED_VIEW_FIELDS } from '../src/deliver/trust.js';
 import {
-  applyUnifiedDiff, centralSwaps, changeProblem, deriveNotProven, gateSwaps, merge3, notProvenProblem, promptOf, swapPins, update, UPDATE_BRANCH, UpdateError, type UpdateDeps,
+  applyUnifiedDiff, centralSwaps, changeProblem, deriveNotProven, gateSwaps, merge3, notProvenProblem, promptOf, recordAfter, swapPins, update, UPDATE_BRANCH, UpdateError, type UpdateDeps,
 } from '../src/deliver/update.js';
-import type { InstallRecord, ReviewedTool } from '../src/types.js';
+import type { InstallEdit, InstallRecord, ReviewedTool } from '../src/types.js';
+import type { RecordedEdit } from '../src/deliver/record.js';
+import { revertEdits } from '../src/uninstall/revert.js';
 import { FakeGitHub } from './helpers/deliver-github.js';
 import { StateStore } from '../src/proof/state.js';
 
@@ -1068,5 +1070,94 @@ describe('Plan V M5: update holds the app lease', () => {
     await update(w.g.octokit(), app, deps(w, { lease: held }));
     expect(held.holdsLeaseFor(app)).toBe(true);
     held.releaseLease();
+  });
+});
+
+// ---------- G-FINREC (V6b-R1, Plan G carry): update appends the base of each write ----------
+
+describe('G-FINREC update: each write of an edit goes with the blob update read live (baseShas)', () => {
+  const ORIG = 'name: deploy\non: { push: { branches: [main] } }\npermissions: {}\njobs:\n  deploy:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: ./deploy.sh\n';
+  const deployOf = (w: { c0: string }): string => `name: deploy\non: { push: { branches: [main] } }\npermissions: {}\njobs:\n  pipegen-verify:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: crisworking/pipegen/gate@${OLD} # gate-v${OLD_V}\n        with:\n          mode: find-run\n          central-sha: ${w.c0}\n  deploy:\n    needs: [pipegen-verify]\n    runs-on: ubuntu-24.04\n    steps:\n      - run: ./deploy.sh\n`;
+  const verifyEdit = (deploy: string, bases: (string | null)[] | undefined): InstallEdit => {
+    const e = { repo: 'app', path: '.github/workflows/deploy.yml', kind: 'verify-job', jobs: ['pipegen-verify'], needs: [{ job: 'deploy', added: ['pipegen-verify'] }], originalSha: gitBlobSha(ORIG), writtenShas: [gitBlobSha(deploy)] } as InstallEdit & { baseShas?: (string | null)[] };
+    if (bases !== undefined) e.baseShas = bases;
+    return e;
+  };
+  /** Delivered (the record's verify job, `onApp` live on the app), then update twice: the central PR (merged), then the app re-pin. */
+  async function updated(bases: (string | null)[] | undefined, onApp: (deploy: string) => string = (d) => d): Promise<{ edit: RecordedEdit; deploy: string; live: string; out: string }> {
+    const w = await privateWorld();
+    const deploy = deployOf(w);
+    const live = onApp(deploy);
+    w.g.commitOn('o/r', 'main', { '.github/workflows/deploy.yml': deploy }, 'deploy');
+    if (live !== deploy) w.g.commitOn('o/r', 'main', { '.github/workflows/deploy.yml': live }, 'the owner\'s edit');
+    await vouch(w, { ...w.record, edits: [verifyEdit(deploy, bases)] });
+    await update(w.g.octokit(), app, deps(w));
+    const branch = centralUpdateBranch('r');
+    w.g.commitOn('o/pipelines', 'main', { [C_MERGE]: centralFile(w, C_MERGE, branch) as string, [recordPath('r')]: centralFile(w, recordPath('r'), branch) as string }, 'merge');
+    await update(w.g.octokit(), app, deps(w));
+    const out = appFile(w, '.github/workflows/deploy.yml', UPDATE_BRANCH) as string;
+    const after = (await readRecord(w.g.octokit(), { owner: 'o', repo: 'pipelines' }, 'r'))?.record as InstallRecord;
+    return { edit: after.edits[0] as RecordedEdit, deploy, live, out };
+  }
+
+  const restoreOf = (edit: RecordedEdit, live: string, texts: string[]): { kind: string; text?: string } => {
+    const blobs = new Map(texts.map((t) => [gitBlobSha(t), t]));
+    const r = revertEdits([edit as InstallEdit], () => ({ text: live, sha: gitBlobSha(live) }), (sha) => blobs.get(sha) ?? null, { defaultBranch: 'main' })[0]?.result as { kind: string; text?: string };
+    return r.kind === 'restore' || r.kind === 'strip' ? { kind: r.kind, text: r.text } : { kind: r.kind };
+  };
+
+  it('G-FINREC: update after deliver appends the live base, so an unbroken pipegen chain stays chained', async () => {
+    const { edit, deploy, out } = await updated([gitBlobSha(ORIG)]);
+    expect(edit.writtenShas).toEqual([gitBlobSha(deploy), gitBlobSha(out)]);
+    expect(edit.baseShas).toEqual([gitBlobSha(ORIG), gitBlobSha(deploy)]);
+    expect(editWritesChained(edit)).toBe(true);
+    // uninstall: the first original comes back over the two writes
+    expect(restoreOf(edit, out, [ORIG, deploy, out])).toEqual({ kind: 'restore', text: ORIG });
+  });
+
+  it('G-FINREC: an owner write between pipegen\'s writes breaks the chain (the base update read is not pipegen\'s last write)', async () => {
+    const { edit, deploy, live, out } = await updated([gitBlobSha(ORIG)], (d) => `${d}      - run: ./notify.sh  # the owner's step\n`);
+    expect(edit.writtenShas[0]).toBe(gitBlobSha(deploy));
+    expect(edit.baseShas).toEqual([gitBlobSha(ORIG), gitBlobSha(live)]);
+    expect(editWritesChained(edit)).toBe(false);
+    // uninstall never writes the first original over the owner's step
+    const r = restoreOf(edit, out, [ORIG, deploy, live, out]);
+    expect(r.kind).not.toBe('restore');
+    if (r.kind === 'strip') expect(r.text).toMatch(/notify\.sh/);
+  });
+
+  it('G-FINREC: an older record without bases stays without them (proves nothing, never chained)', async () => {
+    const { edit, deploy, out } = await updated(undefined);
+    expect(edit.writtenShas).toEqual([gitBlobSha(deploy), gitBlobSha(out)]);
+    expect(edit.baseShas).toBeUndefined();
+    expect(editWritesChained(edit)).toBe(false);
+  });
+
+  it('G-FINREC recordAfter: a base goes with each new write only while the chain is whole; no new write, no new base', () => {
+    const W0 = 'a\n';
+    const W1 = 'b\n';
+    const L = 'c\n';
+    const g = new FakeGitHub();
+    g.addRepo('o/r', { private: true, files: { 'README.md': 'x\n' } });
+    const rec = (bases: (string | null)[] | undefined): InstallRecord => ({ ...baseRecord(g, true, OTHER, []), edits: [{ ...(verifyEdit(W0, bases) as object), writtenShas: [gitBlobSha(W0)] } as InstallEdit] });
+    const change = (current: string, after: string, ownerEdited = false) => ({ repo: 'app' as const, path: '.github/workflows/deploy.yml', entry: 'edit' as const, currentSha: gitBlobSha(current), mode: '100644', current, after, ownerEdited });
+    const edit = (r: InstallRecord): RecordedEdit => r.edits[0] as RecordedEdit;
+    // chain whole: the live blob read goes with the write
+    expect(edit(recordAfter(rec([null]), [change(W0, W1)], null)).baseShas).toEqual([null, gitBlobSha(W0)]);
+    expect(editWritesChained(edit(recordAfter(rec([gitBlobSha(ORIG)]), [change(W0, W1)], null)))).toBe(true);
+    // the live blob was not pipegen's last write: recorded as it was, the chain fails
+    const broken = edit(recordAfter(rec([gitBlobSha(ORIG)]), [change(L, W1)], null));
+    expect(broken.baseShas).toEqual([gitBlobSha(ORIG), gitBlobSha(L)]);
+    expect(editWritesChained(broken)).toBe(false);
+    // no write (the sha pipegen wrote last): nothing appended
+    expect(edit(recordAfter(rec([null]), [change(W1, W0)], null))).toMatchObject({ writtenShas: [gitBlobSha(W0)], baseShas: [null] });
+    // a chain already short (an older update) or absent stays as it is
+    const two = { ...(verifyEdit(W0, [null]) as object), writtenShas: [gitBlobSha(W0), gitBlobSha(L)] } as InstallEdit;
+    expect(edit(recordAfter({ ...rec(undefined), edits: [two] }, [change(L, W1)], null)).baseShas).toEqual([null]);
+    expect(edit(recordAfter(rec(undefined), [change(W0, W1)], null)).baseShas).toBeUndefined();
+    // the input record is never changed
+    const r0 = rec([null]);
+    recordAfter(r0, [change(W0, W1)], null);
+    expect(edit(r0).baseShas).toEqual([null]);
   });
 });

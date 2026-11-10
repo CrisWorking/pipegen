@@ -60,8 +60,9 @@ const PART = z.enum(['pipeline', 'precommit', 'docker', 'compose', 'tests', 'tes
 const REPO_KIND = z.enum(['app', 'central']);
 const SHAS = z.array(SHA).max(200);
 /**
- * G17 row 22: the blob each write started from, one per `writtenShas` entry in the same order (null: the file wasn't there). Absent in an
- * older record; shorter than `writtenShas` when a write recorded none (`pipegen update`). Only editWritesChained reads it.
+ * G17 row 22: the blob each write started from, one per `writtenShas` entry in the same order (null: the file wasn't there). deliver, finish
+ * (its central CODEOWNERS) and update (G-FINREC) record one with each write. Absent in an older record; shorter than `writtenShas` when an
+ * older write recorded none (`pipegen update` before G-FINREC). Only editWritesChained reads it.
  */
 const BASES = z.array(SHA.nullable()).max(200);
 /** Keys that could reach an object's prototype: refused in every free-form record (fix round 1, m1), never silently dropped. */

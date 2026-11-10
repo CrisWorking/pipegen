@@ -310,7 +310,10 @@ describe('G11 finish: inputs and the merge', () => {
     const r = await recordOn(s);
     const cr = rulesetsOf(s, 'o/pipelines')[0];
     expect(r.central).toMatchObject({ repoId: s.g.repo('o/pipelines').id, createdByPipegen: true, rulesetId: cr?.id, rulesetCreatedAt: cr?.created_at, codeowners: { path: '.github/CODEOWNERS', created: true } });
-    expect(r.files.find((f) => f.repo === 'central' && f.path === '.github/CODEOWNERS')?.shas.length).toBe(1);
+    // G-FINREC: recorded as one edit chained from null (never a files entry), so uninstall can prove it is pipegen's whole file
+    const made = s.g.filesAt('o/pipelines', s.g.head('o/pipelines')).get('.github/CODEOWNERS') as string;
+    expect(r.files.find((f) => f.repo === 'central' && f.path === '.github/CODEOWNERS')).toBeUndefined();
+    expect(r.edits.filter((e) => e.repo === 'central' && e.path === '.github/CODEOWNERS')).toEqual([{ repo: 'central', path: '.github/CODEOWNERS', kind: 'codeowners', inserted: made, originalSha: null, writtenShas: [gitBlobSha(made)], baseShas: [null] }]);
 
     // another project already set the central repo up: its ruleset and CODEOWNERS are reused, not applied twice
     const t = await seed();
