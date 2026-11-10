@@ -20,7 +20,7 @@ import { renderVerifySteps } from '../src/engine/signing.js';
 import { assemble, judgeAssembled, keylessVerifyNote, verifyPermissions, verifyTail, type AssembledFiles } from '../src/layers/assemble.js';
 import { EGRESS_DOMAIN_SETS, KEYLESS_VERIFY_SETS, renderEgressStep } from '../src/engine/egress.js';
 import {
-  deployTriggers, environmentPlan, generateCosignKeys, insertVerify, isMemoryFolder, MEMORY_DIR, planVerifyInserts, releaseJobs, renewVerifyJob, verifyJobYaml, type VerifyPlan,
+  deployGating, deployTriggers, environmentPlan, generateCosignKeys, INSERT_REFUSED_GAP, insertRefusedGap, insertVerify, isMemoryFolder, MEMORY_DIR, planVerifyInserts, releaseJobs, renewVerifyJob, verifyJobYaml, type VerifyPlan,
 } from '../src/layers/deploy.js';
 import { JOB_MINUTES, RELEASE_ONLY_NOTES, type Job } from '../src/layers/jobs.js';
 import type { Capabilities, CreatedFile, ExistingWorkflow, PipelineDraft, RepoProfile, ReviewedTool, Service, SigningPlan } from '../src/types.js';
@@ -1663,6 +1663,20 @@ describe('G17A-R3: the gap list is re-derived, never trusted', () => {
     // the skip reason only when the deploy part is skipped
     const skipWhy = await judge(plain, [], plain.texts, [{ path: A, triggers: ['push'], why: 'you skipped the deploy part (--skip deploy), so pipegen adds no check before its deploy' }]);
     expect(skipWhy.issues.some((i) => forgedGap(A).test(i.message)), shown(skipWhy)).toBe(true);
+  });
+  it('PL-F3 R1: the planner\'s own refusal reason is the one the referee re-derives (planner -> doc.deployGaps -> referee)', async () => {
+    const quoted = DEPLOY_A.replace('needs: build', 'needs: "build"');
+    for (const kind of ['keyless', 'key-env', 'none'] as const) {
+      const w = world(kind, [[A, quoted]]);
+      expect(w.v.inserts, kind).toEqual([]);
+      expect(w.v.gaps[0]?.why.startsWith(INSERT_REFUSED_GAP), kind).toBe(true);
+      expect(shown(await judge(w)), kind).toBe('');
+      const ok = world(kind, [[A, DEPLOY_A]]);
+      expect(ok.v.inserts.length, kind).toBe(1);
+      const g = deployGating(parse(DEPLOY_A) as Obj, 'main');
+      if ('gap' in g) throw new Error('gated');
+      expect(insertRefusedGap(DEPLOY_A, g, 'main'), kind).toBeNull();
+    }
   });
   it('G17A-R3 r3-M1: a workflow both edited and listed as a gap is refused (probe FG3)', async () => {
     const w = world('keyless', [[A, DEPLOY_A]]);
