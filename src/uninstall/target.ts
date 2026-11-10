@@ -27,7 +27,7 @@
 // - PR closes and branch deletes only touch pipegen's own branches by exact name (`pipegen/setup`, `pipegen/update`, `pipegen/uninstall` on
 //   the app; this project's `pipegen/update-<name>` and `pipegen/uninstall-<name>` on central); a PR's head (branch and repo id) is read
 //   from GitHub, never taken from the caller.
-// - The uninstall PRs' files go through the git data API of src/deliver/git-data.ts (ghWrite, setBranch, openOrUpdatePr), on the one branch
+// - The uninstall PRs' files go through the git data API of src/deliver/git-data.ts (commitFiles, setBranch, openOrUpdatePr), on the one branch
 //   each: `pipegen/uninstall` (app), `pipegen/uninstall-<name>` (central, and only this project's central files, record and CODEOWNERS).
 // - goneOr (V-S11): a 404 is "gone" only after a read of the parent succeeds (GitHub answers 404 for "no access" on a private repo); a 403 is
 //   a leftover with the exact manual step; a 401 stops.
@@ -39,7 +39,7 @@
 import type { Octokit } from '@octokit/rest';
 import { gitBlobSha } from '../create/guard.js';
 import { readEnv, SETUP_BRANCH } from '../deliver/deliver.js';
-import { checkBranch, commitFiles, DeliverError, ghWrite, isoAt, openOrUpdatePr, readTree, setBranch, statusOf, type RepoRef, type TreeEntry } from '../deliver/git-data.js';
+import { checkBranch, commitFiles, DeliverError, isoAt, openOrUpdatePr, readTree, setBranch, statusOf, type RepoRef, type TreeEntry } from '../deliver/git-data.js';
 import { centralUpdateBranch, editWritesChained, recordPath, type RecordedEdit } from '../deliver/record.js';
 import { centralFilesOf, UPDATE_BRANCH } from '../deliver/update.js';
 import { centralProjectName, centralWorkflowFile } from '../engine/central-path.js';

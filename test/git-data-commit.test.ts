@@ -55,4 +55,32 @@ describe('PL-E6 commitFiles takes deletes', () => {
     await commitFiles(f.gh, R, { parent: SHA, baseTree: SHA, files: [{ path: 'a.txt', content: 'x', mode: '100644' }], message: 'm' }, clock());
     expect(f.calls.map((c) => c.route)).toEqual(['POST /repos/{owner}/{repo}/git/trees', 'POST /repos/{owner}/{repo}/git/commits']);
   });
+  it('commitFiles: two deletes, the second missing → refused, nothing sent', async () => {
+    const f = fake([{ path: 'a.yml' }]);
+    await expect(commitFiles(f.gh, R, { parent: SHA, baseTree: SHA, files: [{ path: 'a.yml', sha: null }, { path: 'b.yml', sha: null }], message: 'm' }, clock())).rejects.toBeInstanceOf(DeliverError);
+    expect(writes(f.calls)).toEqual([]);
+  });
+
+  it('commitFiles: a delete matches the path exactly (case too) → refused, nothing sent', async () => {
+    const f = fake([{ path: '.github/workflows/pipegen.yml' }]);
+    await expect(commitFiles(f.gh, R, { parent: SHA, baseTree: SHA, files: [{ path: '.github/workflows/Pipegen.yml', sha: null }], message: 'm' }, clock())).rejects.toBeInstanceOf(DeliverError);
+    expect(writes(f.calls)).toEqual([]);
+  });
+
+  it('commitFiles: only a file (blob) is removed, never a submodule (commit) → refused, nothing sent', async () => {
+    const f = fake([{ path: 'vendor/x', type: 'commit' }]);
+    await expect(commitFiles(f.gh, R, { parent: SHA, baseTree: SHA, files: [{ path: 'vendor/x', sha: null }], message: 'm' }, clock())).rejects.toBeInstanceOf(DeliverError);
+    expect(writes(f.calls)).toEqual([]);
+  });
+
+  it('commitFiles: a path twice (written and removed, or written twice) → refused, nothing sent', async () => {
+    for (const files of [
+      [{ path: 'a.yml', content: 'x', mode: '100644' }, { path: 'a.yml', sha: null }],
+      [{ path: 'a.yml', content: 'x', mode: '100644' }, { path: 'a.yml', content: 'y', mode: '100644' }],
+    ] as const) {
+      const f = fake([{ path: 'a.yml' }]);
+      await expect(commitFiles(f.gh, R, { parent: SHA, baseTree: SHA, files, message: 'm' }, clock())).rejects.toBeInstanceOf(DeliverError);
+      expect(f.calls).toEqual([]);
+    }
+  });
 });

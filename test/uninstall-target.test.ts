@@ -1620,3 +1620,39 @@ describe('V3 fix round 2', () => {
     });
   });
 });
+
+// PL-E6 fold R1: a 401 or a rate stop on the base-tree read of a delete passes through commitUninstall as it is (not an UninstallRefusal).
+describe('PL-E6 R1 commitUninstall passes 401 and rate stops through', async () => {
+  const { GitHubAccessError } = await import('../src/github/client.js');
+  const { isRateStop } = await import('../src/engine/github-rate.js');
+  const S = 'a'.repeat(40);
+  const httpErr = (status: number, headers: Record<string, string> = {}): Error => Object.assign(new Error(`HTTP ${status}`), { status, response: { data: { message: 'x' }, headers } });
+  const mk = (treeErr: Error) => {
+    const calls: string[] = [];
+    const gh = { request: async (route: string) => {
+      calls.push(route);
+      if (route === 'GET /repos/{owner}/{repo}') return { status: 200, data: { id: 101, full_name: 'acme/shop', default_branch: 'main' }, headers: {} };
+      if (route === 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}') return { status: 200, data: { sha: S, tree: { sha: S } }, headers: {} };
+      if (route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}') throw treeErr;
+      if (route.startsWith('POST')) return { status: 201, data: { sha: S }, headers: {} };
+      throw new Error(`unexpected ${route}`);
+    } } as unknown as Octokit;
+    const api = new UninstallApi(gh, APP, { clock: { budget: newRateBudget(), sleep: async () => {}, now: () => 0 }, askName: async () => true, centralRepoId: 202 });
+    const run = () => api.commitUninstall('app', { parent: S, baseTree: S, files: [], deletes: ['a.yml'], message: 'm' }).catch((e: unknown) => e);
+    return { run, posts: () => calls.filter((r) => r.startsWith('POST')) };
+  };
+  it('commitUninstall: a 401 on the base-tree read → GitHubAccessError, nothing POSTed', async () => {
+    const f = mk(httpErr(401));
+    const e = await f.run();
+    expect(e).toBeInstanceOf(GitHubAccessError);
+    expect(e).not.toBeInstanceOf(UninstallRefusal);
+    expect(f.posts()).toEqual([]);
+  });
+  it('commitUninstall: a rate stop on the base-tree read → a rate stop, nothing POSTed', async () => {
+    const f = mk(httpErr(403, { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '999999999' }));
+    const e = await f.run();
+    expect(isRateStop(e)).toBe(true);
+    expect(e).not.toBeInstanceOf(UninstallRefusal);
+    expect(f.posts()).toEqual([]);
+  });
+});
