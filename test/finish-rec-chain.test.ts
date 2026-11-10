@@ -346,6 +346,8 @@ describe('G-FINREC-R1 sec M1 / spec I1: verify reports a rule after pipegen\'s b
     const over = (rule: string, paths: readonly string[] = CENTRAL_PROTECTED_PATHS): string[] | null => overridingRules(`${codeownersBlock(paths, ['@a', '@b'])}${rule}\n`, paths);
     // a name with no '/' (or only a trailing one) matches at any depth: it can take a file inside every protected folder
     for (const rule of ['*.sh @bob', 'deploy.sh @bob', '*.ts @bob', 'notes.txt', 'docs/ @bob', 'x.py @o/team']) expect(over(rule), rule).toEqual([rule]);
+    // ... a protected folder alone, no protected name to match: still covered (the file can sit at any depth inside it)
+    for (const rule of ['deploy.sh @bob', 'svc @bob', 'notes.txt']) expect(over(rule, ['.github/workflows/**']), rule).toEqual([rule]);
     // anchored: a fixed prefix (before the first wildcard) that overlaps a protected folder, either way
     for (const rule of ['**/foo @bob', '/.github/** @bob', '/.git* @bob', '/.github/workflows @bob', '/installs/sub/** @bob', '/* @bob', '/**/x.yml @bob']) expect(over(rule), rule).toEqual([rule]);
     // a protected file named anywhere (a bare name): a folder rule, or a last part that matches the name
