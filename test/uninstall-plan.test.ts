@@ -1208,7 +1208,7 @@ describe('uninstall plan: reads, terminal and preview (V4)', () => {
     expect(done).not.toMatch(/deleted/);
     expect(done).toMatch(/\.github\/dependabot\.yml: pipegen's exact text is no longer in it/);
     expect(u.deleteSecrets.map((s) => s[SK].name)).toEqual(['PIPEGEN_FP_KEY']);
-    expect(previewUninstall(u)).toMatch(/Done in the first run:[^]*CODEOWNERS/);
+    expect(previewUninstall(u)).toMatch(/Already done:[^]*CODEOWNERS/);
     // what run 1 didn't take out is still a manual step, never "done"
     w.g.commitOn('o/shop', 'main', { CODEOWNERS: `${original}# pipegen:begin\n/.github/ @o\n# pipegen:end\n` });
     w.app.rulesets.set(41, liveRs(w));

@@ -1113,20 +1113,22 @@ describe('V3 fix round 1', () => {
     const env = (live: unknown) => api((route) => {
       if (route === 'GET /repos/{owner}/{repo}/environments/{environment_name}') return live;
       if (route === 'GET /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies') return { total_count: 1, branch_policies: [{ id: 41, name: 'main', type: 'branch' }] };
+      // V9a (V8 sec I1): the environment's secrets, listed right before the PUT: none of the record's left
+      if (route === `GET /repos/{owner}/{repo}/environments/{environment_name}/${['sec', 'rets'].join('')}`) return { total_count: 0, [['sec', 'rets'].join('')]: [] };
       return {};
     });
     const er = { kind: 'environment-restore' as const, entry };
     // no typed environment name → refused
     const a = env(liveEnv(narrowed));
-    await expect(a.api.restoreEnvironment(entry, shown)).rejects.toBeInstanceOf(UninstallRefusal);
+    await expect(a.api.restoreEnvironment(entry, shown, [])).rejects.toBeInstanceOf(UninstallRefusal);
     // as shown → the changed field back, the others as they are now
-    expect((await a.api.restoreEnvironment(entry, shown, await typedOn(a.api, er))).status).toBe('restored');
+    expect((await a.api.restoreEnvironment(entry, shown, [], await typedOn(a.api, er))).status).toBe('restored');
     expect(a.writes()).toEqual([{ route: 'PUT /repos/{owner}/{repo}/environments/{environment_name}', params: { owner: OWNER, repo: 'shop', environment_name: 'pipegen-signing', ...shown, deployment_branch_policy: null } }]);
     // changed since the diff, or another environment of that name → kept
     const b = env(liveEnv({ protected_branches: true, custom_branch_policies: false }));
-    expect((await b.api.restoreEnvironment(entry, shown, await typedOn(b.api, er))).status).toBe('kept');
+    expect((await b.api.restoreEnvironment(entry, shown, [], await typedOn(b.api, er))).status).toBe('kept');
     const c = env(liveEnv(narrowed, '2026-11-05T00:00:00Z'));
-    expect((await c.api.restoreEnvironment(entry, shown, await typedOn(c.api, er))).status).toBe('kept');
+    expect((await c.api.restoreEnvironment(entry, shown, [], await typedOn(c.api, er))).status).toBe('kept');
     expect([...b.writes(), ...c.writes()]).toEqual([]);
 
     // variable: PATCH previous only while GitHub holds pipegen's value

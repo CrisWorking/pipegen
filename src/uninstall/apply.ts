@@ -70,6 +70,11 @@ export interface StepResult {
   failed: ProgressItem[];
   skipped: { what: string; why: string }[];
   manual: { what: string; why: string; step?: string }[];
+  /**
+   * V9a (V8 sec i6, M2): what needs nothing from pipegen and no step from the user to finish the uninstall (the scratch repo's default
+   * branch kept, a repo the user created that holds nothing of pipegen's now). Never a leftover: a run with only notes is a clean exit 0.
+   */
+  notes?: string[];
   /** The final message (names only). */
   lines: string[];
 }
@@ -89,6 +94,11 @@ export interface StepDeps extends PlanDeps {
   out?: (line: string) => void;
   /** The lease's state folder (tests). */
   state?: StateDeps;
+  /**
+   * V9a (V8 sec M4): the app's lease the caller took before it loaded the record (src/cli/uninstall.ts, holdUninstallLease): used, never
+   * taken a second time, and given back by the caller. Absent: uninstallStep takes the lease itself.
+   */
+  lease?: StateStore;
   /** Phase B (V6). Absent: phase-b.ts's applyPhaseB. */
   phaseB?: PhaseBRunner;
 }
@@ -222,9 +232,9 @@ export class PhaseApi {
     this.#where(where, 'the uninstall pull request');
     return this.#api.openUninstallPr(where, pr);
   }
-  async restoreEnvironment(entry: EnvEntry, shown: EnvForm, typed?: TypedName): Promise<DeleteOutcome> {
+  async restoreEnvironment(entry: EnvEntry, shown: EnvForm, secrets: readonly { name: string }[], typed?: TypedName): Promise<DeleteOutcome> {
     this.#only('B', 'an environment restore');
-    return this.#api.restoreEnvironment(entry, shown, typed);
+    return this.#api.restoreEnvironment(entry, shown, secrets, typed);
   }
   async restoreVariable(entry: VariableEntry, pipegenValue: string | undefined, typed?: TypedName): Promise<DeleteOutcome> {
     this.#only('B', 'a variable restore');
@@ -234,17 +244,20 @@ export class PhaseApi {
     this.#only('B', 'a deployment branch rule delete');
     return this.#api.deleteBranchPolicy(entry, id, typed);
   }
-  async write(route: string, params: Record<string, unknown>, opts: { pipegenSet?: string } = {}): Promise<DeleteOutcome> {
+  async write(route: string, params: Record<string, unknown>, opts: { pipegenSet?: string; typed?: TypedName } = {}): Promise<DeleteOutcome> {
     this.#only('B', 'a settings write');
     return this.#api.write(route, params, opts);
   }
 
   // ---------- phase B's own routes (V6, V5-R1 carry) ----------
 
-  /** A typed name at apply time for an object the plan couldn't ask about (the central ruleset with no creation date): its token. */
+  /**
+   * A typed name at apply time for an object the plan couldn't ask about (the central ruleset with no creation date; V9a: the central
+   * Actions access of a typed-names run, asked only once central is known to be the last project's): its token.
+   */
   async confirm(c: Confirmable): Promise<TypedName | null> {
     this.#only('B', 'a typed name at apply time');
-    if (String(c?.kind) !== 'central-ruleset') throw new UninstallRefusal('run 2 asks a typed name at apply time only for the central ruleset; the plan asked the others.');
+    if (String(c?.kind) !== 'central-ruleset' && String(c?.kind) !== 'central-access') throw new UninstallRefusal('run 2 asks a typed name at apply time only for the central ruleset and the central Actions access; the plan asked the others.');
     return this.#api.confirm(c);
   }
   /**
@@ -297,9 +310,12 @@ export class PhaseApi {
 export async function uninstallStep(gh: Octokit, loaded: LoadedRecord, io: Prompter | undefined, deps: StepDeps = {}): Promise<StepResult> {
   const app: RepoRef = { owner: loaded.app.owner, repo: loaded.app.repo };
   const out = deps.out ?? printLine;
-  const { out: _out, state: _state, phaseB: _phaseB, ...planDeps } = deps;
+  const { out: _out, state: _state, phaseB: _phaseB, lease: _lease, ...planDeps } = deps;
   const clock = deps.clock ?? clockOf(gh);
-  const lease = await takeLease(app, deps.state);
+  // V9a (V8 sec M4): the caller's lease, taken before the record was loaded; it must be this app's, and the caller gives it back
+  if (deps.lease !== undefined && !deps.lease.holdsLeaseFor(app)) throw new UninstallError(`pipegen uninstall was handed a lease it doesn't hold for ${show(`${app.owner}/${app.repo}`, 140)}, so it changes nothing. Nothing was changed.`);
+  const own = deps.lease === undefined;
+  const lease = deps.lease ?? await takeLease(app, deps.state);
   try {
     const progress = await ProgressFile.open(app, loaded.app.repoId, deps.local ?? {});
     const ctx: Ctx = { gh, loaded, io, deps, planDeps, out, clock, progress, store: lease };
@@ -354,8 +370,8 @@ export async function uninstallStep(gh: Octokit, loaded: LoadedRecord, io: Promp
       }
     }
   } finally {
-    // G-LEASE-R1 (sec M1): kept while a stop is under way; the exit hook drops it after the interrupt hooks
-    if (!interrupting()) lease.releaseLease();
+    // G-LEASE-R1 (sec M1): kept while a stop is under way; the exit hook drops it after the interrupt hooks. A caller's lease is the caller's.
+    if (own && !interrupting()) lease.releaseLease();
   }
 }
 
@@ -378,7 +394,7 @@ async function runA(c: Ctx): Promise<StepResult> {
     if (r.status === 'a-done' && plan.unfinished) {
       for (const l of r.lines) c.out(l);
       const b = await runB(c, (await liveWorkflow(c.gh, c.loaded, c.clock)) !== null);
-      return { ...b, done: [...r.done, ...b.done], skipped: [...r.skipped, ...b.skipped], manual: [...r.manual, ...b.manual] };
+      return { ...b, done: [...r.done, ...b.done], skipped: [...r.skipped, ...b.skipped], manual: [...r.manual, ...b.manual], notes: [...(r.notes ?? []), ...(b.notes ?? [])] };
     }
     return r;
   }
@@ -573,11 +589,14 @@ const DONE_WORDS: Readonly<Record<string, string>> = { deleted: 'deleted', gone:
 function nextOf(plan: PhasePlan, r: StepResult, finished: boolean, kept: readonly string[], progressPath: string): string[] {
   if (!finished) return ['Some steps were not done (above). Run `pipegen uninstall` again: it plans the first run again and does what is left.'];
   if (plan.unfinished) return ['The first part is done.'];
+  // V9a (V8 sec i1): the merge locks are off from now on, while the environments the record stores secrets in keep them until run 2
+  const envs = plan.secretEnvs.map((e) => show(e, 100));
+  const open = envs.length === 0 ? [] : [`Do the second run soon: until the second run, anyone who can push to ${show(plan.app.defaultBranch, 100)} can use pipegen's environment${envs.length === 1 ? '' : 's'} ${envs.join(', ')} and the secrets pipegen stored there (the merge locks are off now; the second run deletes them).`];
   if (r.pr === undefined && kept.length > 0) {
-    return [`${show(`${plan.app.owner}/${plan.app.repo}`, 140)} needed no uninstall pull request. You kept ${kept.map((k) => show(k, 200)).join(', ')} on ${show(plan.app.defaultBranch, 100)}: pipegen leaves ${kept.length === 1 ? 'it' : 'them'} as ${kept.length === 1 ? 'it is' : 'they are'}, and its merge locks are off now. Run \`pipegen uninstall\` again for the second run (secrets, variables, environments, settings, central); its preview warns that pipegen's workflow is still there. What this run did is saved in ${progressPath}.`];
+    return [`${show(`${plan.app.owner}/${plan.app.repo}`, 140)} needed no uninstall pull request. You kept ${kept.map((k) => show(k, 200)).join(', ')} on ${show(plan.app.defaultBranch, 100)}: pipegen leaves ${kept.length === 1 ? 'it' : 'them'} as ${kept.length === 1 ? 'it is' : 'they are'}, and its merge locks are off now. Run \`pipegen uninstall\` again for the second run (secrets, variables, environments, settings, central); its preview warns that pipegen's workflow is still there. What this run did is saved in ${progressPath}.`, ...open];
   }
-  if (r.pr === undefined) return [`${show(`${plan.app.owner}/${plan.app.repo}`, 140)} needed no uninstall pull request. Run \`pipegen uninstall\` again for the second run (secrets, variables, environments, settings, central).`];
-  return [`Merge the uninstall pull request #${r.pr.number} (${show(r.pr.url, 300)}), then run \`pipegen uninstall\` again for the second run (secrets, variables, environments, settings, central). The merge locks are off now: until you merge it, run \`pipegen finish\` to lock again.`];
+  if (r.pr === undefined) return [`${show(`${plan.app.owner}/${plan.app.repo}`, 140)} needed no uninstall pull request. Run \`pipegen uninstall\` again for the second run (secrets, variables, environments, settings, central).`, ...open];
+  return [`Merge the uninstall pull request #${r.pr.number} (${show(r.pr.url, 300)}), then run \`pipegen uninstall\` again for the second run (secrets, variables, environments, settings, central). The merge locks are off now: until you merge it, run \`pipegen finish\` to lock again.`, ...open];
 }
 
 /** Done, not done, kept and manual steps, as lines (names only). */
@@ -588,6 +607,7 @@ function summary(r: StepResult): string[] {
   list('Not done (the next run tries again):', r.failed.map((f) => `  - ${show(f.what, 200)}: ${show(f.why, 400)}${f.manual === undefined ? '' : `\n    ${show(f.manual, 300)}`}`));
   list('Kept:', r.skipped.map((s) => `  - ${show(s.what, 200)}: ${show(s.why, 400)}`));
   list('Manual steps (pipegen doesn\'t do these):', r.manual.map((m) => `  - ${show(m.what, 200)}: ${show(m.why, 400)}${m.step === undefined ? '' : `\n    ${show(m.step, 400)}`}`));
+  list('Notes:', (r.notes ?? []).map((n) => `  - ${show(n, 600)}`));
   return out;
 }
 
@@ -739,6 +759,16 @@ async function liveWorkflow(gh: Octokit, loaded: LoadedRecord, clock: RateClock,
     if (text.includes(VERIFY_JOB_ID) || text.includes(HEAD_CHECK_STEP_ID)) return p;
   }
   return null;
+}
+
+/**
+ * V9a (V8 sec M4): the app's lease for `pipegen uninstall` (src/cli/uninstall.ts), taken before the record is loaded (the loader may write
+ * this machine's local record file), and handed to uninstallStep (`deps.lease`). `release` gives it back, unless a stop is under way (the
+ * exit hook drops it then, after the interrupt hooks). Another pipegen holding it → UninstallError, nothing read or sent.
+ */
+export async function holdUninstallLease(app: RepoRef, state: StateDeps | undefined): Promise<{ lease: StateStore; release: () => void }> {
+  const lease = await takeLease({ owner: app.owner, repo: app.repo }, state);
+  return { lease, release: () => { if (!interrupting()) lease.releaseLease(); } };
 }
 
 /** The app's lease (the proof's state folder): another pipegen run on this repo → a stop, nothing read or sent. */

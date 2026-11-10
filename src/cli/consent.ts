@@ -34,6 +34,7 @@ import { refusalFallbackNoteFor } from '../ai/provider.js';
 import { BundleSummary, excludedSummaryLines, type SecretScanner } from '../ai/redact.js';
 import { claimTokenMinter, CountingSummary, type ConsentMode, type ConsentTerms, type ConsentToken } from '../audit/consent-token.js';
 import type { AiCost, AuditAiEstimate, Estimates, PricedFor } from '../estimate/estimate.js';
+import { createCommands } from '../proof/repos.js';
 import type { AiProvider, RepoProfile } from '../types.js';
 import { plural, size, usd } from '../util/format.js';
 import { hostPlace } from '../util/local-host.js';
@@ -135,6 +136,11 @@ function costSection(title: string, cost: AiCost | 'local', cap: number | null, 
   ];
 }
 
+/** createCommands' line for one repo; a name GitHub refuses can't be created, so it is only shown (made safe). */
+function createLine(owner: string, name: string): string {
+  try { return safeText(createCommands(owner, [name])[0] as string, 400); } catch { return `(${safeText(`${owner}/${name}`, 200)} is not a valid GitHub repo name)`; }
+}
+
 function reposSection(p: RepoProfile, repos: HelperRepo[], app: boolean): string[] {
   if (repos.length === 0) return [];
   const full = (name: string) => safeText(`${p.owner}/${name}`, 200);
@@ -151,7 +157,8 @@ function reposSection(p: RepoProfile, repos: HelperRepo[], app: boolean): string
   } else {
     if (missing.length > 0) {
       lines.push(`${INDENT}Create the missing ${missing.length === 1 ? 'repo' : 'repos'} with:`);
-      for (const r of missing) lines.push(`${INDENT}${INDENT}gh repo create ${full(r.name)} --private`);
+      // V8 spec minor (V9a): the very command checkProofRepos prints (no wiki, pipegen's marker as the description: uninstall needs the marker)
+      for (const r of missing) lines.push(`${INDENT}${INDENT}${createLine(p.owner, r.name)}`);
     }
     lines.push(`${INDENT}With a token, pipegen never creates or deletes repos${scratch === undefined ? '.' : `; after the proof it empties the scratch repo ${full(scratch.name)}.`}`);
     lines.push(`${INDENT}pipegen's own GitHub App login (which makes and deletes these repos itself) is planned next.`);

@@ -632,6 +632,14 @@ describe('G11 finish: what it records (Plan V §5)', () => {
     expect((await recordOn(t)).orgRuleset).toEqual({ org: 'o', id: org?.id, name: 'pipegen-required--r', githubCreatedAt: org?.created_at, pinnedSha: (org?.body.rules as { parameters: { workflows: { sha: string }[] } }[])[0]?.parameters.workflows[0]?.sha });
   });
 
+  it('finish: an access level GitHub doesn\'t name is never recorded (V9a-R2: uninstall prints the recorded level in a step)', async () => {
+    const s = await seed();
+    s.g.x('o/pipelines').access = 'user_x';
+    await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, {}, s.deps());
+    expect((await recordOn(s)).central?.actionsAccess).toBeUndefined();
+    expect(s.g.x('o/pipelines').access).toBe('user');
+  });
+
   it('finish: settings pipegen turns on record their previous value', async () => {
     const s = await seed();
     const res = await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, {}, s.deps());

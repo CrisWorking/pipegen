@@ -788,7 +788,7 @@ describe('uninstall apply: the four conditions of the V4 security review and the
       () => A.deleteIfPipegens({ kind: 'variable', entry: { name: 'PIPEGEN_V', scope: 'repo', created: true, githubCreatedAt: AT } }),
       () => A.deleteIfPipegens({ kind: 'environment', entry: env }),
       () => A.deleteIfPipegens({ kind: 'central-ruleset', id: 3, createdAt: AT }),
-      () => A.restoreEnvironment(prior, { wait_timer: 0, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: null }),
+      () => A.restoreEnvironment(prior, { wait_timer: 0, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: null }, []),
       () => A.restoreVariable({ name: 'PIPEGEN_BLOCK_FROM', scope: 'repo', created: false, previous: 'p' }, 'v'),
       () => A.deleteBranchPolicy(env, 5),
       () => A.write('DELETE /repos/{owner}/{repo}/vulnerability-alerts', { owner: 'o', repo: 'shop' }),

@@ -130,7 +130,7 @@ function handedOn(tree: unknown, locals: ReadonlySet<string>): string[] {
  * A second src/cli file (G14) can't hand the file a proof or uninstall binding: only commands.ts and io.ts of src/cli are listed.
  */
 const CLI_UNINSTALL_ALLOWED: Readonly<Record<string, readonly string[]>> = {
-  'src/uninstall/apply.ts': ['uninstallStep'], 'src/uninstall/errors.ts': ['UninstallError', 'UninstallFinished'],
+  'src/uninstall/apply.ts': ['uninstallStep', 'holdUninstallLease'], 'src/uninstall/errors.ts': ['UninstallError', 'UninstallFinished'],
   'src/uninstall/progress.ts': ['MAX_PROGRESS_BYTES', 'uninstallProgressPath'], 'src/uninstall/record.ts': ['loadUninstallRecord'],
   'src/cli/commands.ts': ['interactiveRun'], 'src/cli/io.ts': [], 'src/deliver/record.ts': ['localRecordPath'],
   'src/engine/github-rate.ts': ['isRateStop'], 'src/github/client.ts': ['GitHubAccessError', 'hideToken'],
@@ -155,7 +155,8 @@ function cliUninstallProblems(refs: ModuleRef[], exported: string[]): string[] {
 }
 
 /** The uninstall modules whose entry points are guarded (paths from the repo root). */
-const GUARDED = ['src/uninstall/target.ts', 'src/uninstall/plan.ts', 'src/uninstall/apply.ts'];
+// V9a-R2 (sec N4): record.ts too (loadUninstallRecord): no namespace, dynamic or export-all form of it either
+const GUARDED = ['src/uninstall/target.ts', 'src/uninstall/plan.ts', 'src/uninstall/apply.ts', 'src/uninstall/record.ts'];
 /** E's scratch secret delete, its name spelled at run time (test/no-secret-literals.test.ts). */
 const SCRATCH_SD = ['deleteScratch', 'Secret'].join('');
 const E_WRITERS = ['cleanupWrite', SCRATCH_SD, 'deleteScratchRepo', 'cleanupLeftovers'];
@@ -165,6 +166,8 @@ const ENTRY_ALLOWED: Readonly<Record<string, (file: string) => boolean>> = {
   UninstallApi: (f) => f === 'src/uninstall/plan.ts',
   planUninstall: (f) => f === 'src/uninstall/apply.ts', confirmPlan: (f) => f === 'src/uninstall/apply.ts',
   takeApi: (f) => f === 'src/uninstall/apply.ts', deleteCentralRepo: (f) => f === 'src/uninstall/apply.ts',
+  // V9a (V8 sec i2): the whole flow, the loader and the lease are the CLI command's only
+  uninstallStep: (f) => f === CLI_UNINSTALL_FILE, loadUninstallRecord: (f) => f === CLI_UNINSTALL_FILE, holdUninstallLease: (f) => f === CLI_UNINSTALL_FILE,
   ...Object.fromEntries(E_WRITERS.map((n) => [n, eAllowed])),
 };
 /**

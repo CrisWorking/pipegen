@@ -13,6 +13,7 @@ import { BundleSummary, bundleCode, bundleSummary, EXCLUDED_KEPT, EXCLUDED_PATTE
 import { floorNeeds, jobCategories } from '../src/engine/needs.js';
 import { estimate, estimateAuditAi, type Estimates } from '../src/estimate/estimate.js';
 import { permissionsTable } from '../src/github/client.js';
+import { createCommands } from '../src/proof/repos.js';
 import { DEFAULT_MODEL, type AiProvider, type Capabilities, type RepoProfile, type Service } from '../src/types.js';
 import { hostileNames } from './fixtures/hostile-names.js';
 import { betterleaksFacts, CLEAN, gitleaksAt, gitleaksFacts, makeStub, scanWith } from './helpers/gitleaks-stub.js';
@@ -121,6 +122,13 @@ describe('consentText (full)', () => {
     expect(both).toContain('gh repo create acme/pipegen-proof-shop --private');
     const none = full({ exists: [true, true], app: false }).text;
     expect(none).not.toContain('gh repo create');
+  });
+
+  it('consent: the create command of the consent screen is the one checkProofRepos prints (--disable-wiki and the marker; V8 spec minor)', () => {
+    const both = full({ exists: [false, false], app: false }).text;
+    const lines = both.split('\n').map((l) => l.trim()).filter((l) => l.startsWith('gh repo create'));
+    expect(lines).toEqual(createCommands('acme', ['pipelines', 'pipegen-proof-shop']));
+    for (const l of lines) expect(l).toMatch(/--private --disable-wiki --description "/);
   });
 
   it("consent: App mode — pipegen's App creates the missing repos (DECISIONS #87), no gh commands", () => {
