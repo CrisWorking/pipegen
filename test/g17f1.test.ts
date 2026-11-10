@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { docFor, isAiNote as runIsAiNote } from '../src/cli/run-parts.js';
 import { isAiNote as docsIsAiNote, pipegenDoc } from '../src/deliver/docs.js';
 import { workflowSecretNames } from '../src/proof/keys.js';
+import { publishedImageRepo } from '../src/engine/deploy-steps.js';
 import type { ExistingWorkflow, PipelineDoc } from '../src/types.js';
 import { node, planned, profileOf, SEC } from './helpers/assemble.js';
 import { REVIEWED } from './helpers/debate-fixtures.js';
@@ -95,6 +96,51 @@ describe('G17-F1 sec M2: "Verify before deploy" of a published but unsigned serv
     expect(verify[0]?.endsWith(UNSIGNED_VERIFY), verify[0]).toBe(true);
     // a signing line, where the plan lists one, keeps the plain "signs nothing" text
     for (const l of lines.filter((x) => /^- (?:Image signing|Build attestation), service "app"/.test(x))) expect(l.endsWith(UNSIGNED), l).toBe(true);
+  });
+});
+
+describe('G17-F1 (coordinator): the description before "Verify before deploy" names a signature only when the service is signed', () => {
+  const USED = ['sec', 'retsUsed'].join('');
+  const deployWf = { path: '.github/workflows/deploy.yml', triggers: ['push'], deploys: true, [USED]: [], jobs: ['deploy'] } as unknown as ExistingWorkflow;
+  const DOC: PipelineDoc = { transcript: [], deployGaps: [], lockNotes: [], estimates: { monthlyMinutes: 120, includedMinutes: 3000 }, setupCommand: '', testNotes: [], uncoveredMinimum: [], notes: [] };
+  const SIGNED_WHY = 'Checks that the commit being deployed passed the gate and that the image is the signed one.';
+  const UNSIGNED_WHY = 'Checks that the commit being deployed passed the gate and that the head is the one the gate checked; pipegen signs nothing in this setup, so no image signature is checked.';
+  const UNPUBLISHED_WHY = 'Checks that the commit being deployed passed the gate and that the head is the one the gate checked; pipegen publishes no image of this service, so no image is checked.';
+  const verifyLine = (draft: Parameters<typeof pipegenDoc>[0]): string => {
+    const lines = pipegenDoc({ ...draft, doc: DOC }, REVIEWED).content.split('\n').filter((l) => /^- Verify before deploy, service "app"/.test(l));
+    expect(lines.length).toBe(1);
+    return lines[0] as string;
+  };
+  const web = () => node({ dockerfile: 'Dockerfile', port: 3000 });
+
+  it('docs: a published and signed service: the description says the image is the signed one', () => {
+    const x = planned(profileOf([web()], { existingWorkflows: [deployWf] }), { over: { signing: { mode: 'keyless', images: [{ service: 'app', repo: publishedImageRepo('o', 'r', 'app') }] } } });
+    const l = verifyLine(x.draft);
+    expect(l).toContain(SIGNED_WHY);
+    expect(l).not.toContain(UNSIGNED_WHY);
+  });
+
+  it('docs: a published but unsigned service: the description names no signature and says the gate pass and the head are checked', () => {
+    const x = planned(profileOf([web()], { private: true, plan: 'free', existingWorkflows: [deployWf] }), { over: { centralPin: { repo: 'o/pipelines', sha: 'c'.repeat(40) } } });
+    expect(x.draft.signing).toBeUndefined();
+    const l = verifyLine(x.draft);
+    expect(l).toContain(UNSIGNED_WHY);
+    expect(l).not.toContain('the signed one');
+  });
+
+  it('docs: an unpublished service (no Dockerfile of its own, or the deploy part skipped): the description names no image', () => {
+    const none = planned(profileOf([node({ port: 3000 })], { existingWorkflows: [deployWf] }));
+    const signed = planned(profileOf([web()], { existingWorkflows: [deployWf] }), { over: { signing: { mode: 'keyless', images: [{ service: 'app', repo: publishedImageRepo('o', 'r', 'app') }] }, skipped: [{ part: 'deploy', reason: 't' }] } });
+    for (const d of [none.draft, signed.draft]) {
+      const l = verifyLine(d);
+      expect(l).toContain(UNPUBLISHED_WHY);
+      expect(l).not.toContain('the signed one');
+    }
+  });
+
+  it('docs: the glossary says the verify job checks the signed image only where pipegen signs it', () => {
+    const doc = pipegenDoc({ ...planned(profileOf()).draft, doc: DOC }, REVIEWED).content;
+    expect(doc).toContain('- Verify-first: A job that runs before a deploy and checks the commit passed the gate and, where pipegen signs the image, that the image is the signed one.');
   });
 });
 

@@ -510,6 +510,16 @@ function publishedHere(draft: PipelineDraft): string[] {
   try { return publishedImageServices(draft.profile, draft.capabilities); } catch { return []; }
 }
 
+/** G17-F1 (coordinator): the verify check's description names a signature only for a service pipegen publishes and signs; else what it checks. */
+const VERIFY_WHY_UNSIGNED = 'Checks that the commit being deployed passed the gate and that the head is the one the gate checked; pipegen signs nothing in this setup, so no image signature is checked.';
+const VERIFY_WHY_UNPUBLISHED = 'Checks that the commit being deployed passed the gate and that the head is the one the gate checked; pipegen publishes no image of this service, so no image is checked.';
+function verifyWhy(draft: PipelineDraft, n: Need, cat: string): string | undefined {
+  if (cat !== 'deploy-verify') return undefined;
+  if (n.service === undefined || !publishedHere(draft).includes(n.service)) return VERIFY_WHY_UNPUBLISHED;
+  if (draft.signing === undefined || draft.signing === null) return VERIFY_WHY_UNSIGNED;
+  return undefined;   // published and signed: the category text ("the image is the signed one") is true
+}
+
 /** The mode line of one check, from facts the builder derived (the gate's job list, the hook file, the lock), never from the need's flags alone. */
 function modeOf(draft: PipelineDraft, reviewed: readonly ReviewedTool[], f: Facts, n: Need): string {
   const cat = categoryOf(n.id, n.category);
@@ -574,7 +584,8 @@ function layersSection(d: Doc, draft: PipelineDraft, data: DocData, reviewed: re
     if (needs.length === 0) { d.p('No check of this layer is set up here.'); continue; }
     for (const n of needs) {
       const cat = categoryOf(n.id, n.category);
-      const [label, why] = Object.hasOwn(CATEGORY_TEXT, cat) ? (CATEGORY_TEXT[cat] as readonly [string, string]) : ['A check pipegen added', 'See the tool name.'];
+      const [label, why0] = Object.hasOwn(CATEGORY_TEXT, cat) ? (CATEGORY_TEXT[cat] as readonly [string, string]) : ['A check pipegen added', 'See the tool name.'];
+      const why = verifyWhy(draft, n, cat) ?? why0;
       const tools = [...new Set(stepsOf(draft, n.id, n.service).map((s) => fit(s.tool.name, 80)))];
       const mode = modeOf(draft, reviewed, facts, n);
       const tool = cat === 'gate' ? 'tool the pipegen gate action' : tools.length === 0 ? 'no tool listed (see the notes below)' : `tool ${tools.join(', ')}`;
@@ -912,7 +923,7 @@ const GLOSSARY: readonly (readonly [string, string])[] = [
   ['Code owner', 'A person named in CODEOWNERS whose review is required for the files they own.'],
   ['Ruleset', 'GitHub\'s rules for a branch, such as a required check or a required review.'],
   ['Not proven', 'A check pipegen could not prove on your repository yet. It warns and does not block.'],
-  ['Verify-first', 'A job that runs before a deploy and checks the commit passed the gate and the image is the signed one.'],
+  ['Verify-first', 'A job that runs before a deploy and checks the commit passed the gate and, where pipegen signs the image, that the image is the signed one.'],
   ['Signing', 'A signature on an image that shows which workflow made it.'],
   ['Digest', 'The checksum that names one exact image. A digest never changes; a tag can move.'],
   ['Suggestion', 'A tool pipegen mentions but does not run.'],

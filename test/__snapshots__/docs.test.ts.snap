@@ -293,7 +293,7 @@ VERSION is the exact pipegen version that wrote the hook. The first commit trust
 - Code owner: A person named in CODEOWNERS whose review is required for the files they own.
 - Ruleset: GitHub's rules for a branch, such as a required check or a required review.
 - Not proven: A check pipegen could not prove on your repository yet. It warns and does not block.
-- Verify-first: A job that runs before a deploy and checks the commit passed the gate and the image is the signed one.
+- Verify-first: A job that runs before a deploy and checks the commit passed the gate and, where pipegen signs the image, that the image is the signed one.
 - Signing: A signature on an image that shows which workflow made it.
 - Digest: The checksum that names one exact image. A digest never changes; a tag can move.
 - Suggestion: A tool pipegen mentions but does not run.
@@ -535,7 +535,7 @@ pipegen wrote no hook file, so there is no setup command. The notes in The four 
 - Code owner: A person named in CODEOWNERS whose review is required for the files they own.
 - Ruleset: GitHub's rules for a branch, such as a required check or a required review.
 - Not proven: A check pipegen could not prove on your repository yet. It warns and does not block.
-- Verify-first: A job that runs before a deploy and checks the commit passed the gate and the image is the signed one.
+- Verify-first: A job that runs before a deploy and checks the commit passed the gate and, where pipegen signs the image, that the image is the signed one.
 - Signing: A signature on an image that shows which workflow made it.
 - Digest: The checksum that names one exact image. A digest never changes; a tag can move.
 - Suggestion: A tool pipegen mentions but does not run.
