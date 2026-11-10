@@ -21,13 +21,13 @@ import { statfsSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import type { Octokit } from '@octokit/rest';
 import { Document, isMap, isScalar, isSeq, parseDocument, type Node as YamlNode, type Pair } from 'yaml';
-import { callsWorkflow, plainUbuntu, readsContents, strongReason, weakReason } from '../engine/deploy-gating.js';
+import { callsWorkflow, deployGating, deployTriggers, plainUbuntu, readsContents, stepsGated, userTopProblem, type DeployGating } from '../engine/deploy-gating.js';
 import { BUILD_PUSH_STEP_ID, HEAD_CHECK_STEP_ID, imageDigestArtifact, publishedImageRepo, PUBLISH_TAG, renderHeadCheckStep, renderPublishDigestStep } from '../engine/deploy-steps.js';
 import type { RateClock } from '../engine/github-rate.js';
-import { CALLER_WORKFLOW, isDangerousName, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PUSH_WORKFLOW, type RenderedStep } from '../engine/job-rules.js';
+import { CALLER_WORKFLOW, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PUSH_WORKFLOW, type RenderedStep } from '../engine/job-rules.js';
 import { publishedImageServices } from '../engine/needs.js';
 import type { PlatformActions } from '../engine/pin.js';
-import { gatedIfAllowed, SIGNING_ENVIRONMENT, triggersOf } from '../engine/referee.js';
+import { SIGNING_ENVIRONMENT, triggersOf } from '../engine/referee-shared.js';
 import { RenderError } from '../engine/render-error.js';
 import { renderJobPrelude, renderPlatformStep, stepsToYaml } from '../engine/render-step.js';
 import { parseYaml } from '../engine/yaml-parse.js';
@@ -35,15 +35,12 @@ import { clockOf } from '../github/client.js';
 import { makeCosignKeyPair, type CosignExec, type CosignResolver } from '../deliver/cosign-keys.js';
 import { readEnv } from '../deliver/deliver.js';
 import { DeliverError } from '../deliver/git-data.js';
-import { jobDeploys } from '../read/workflows.js';
 import type { Capabilities, CreatedFile, EnvSettings, ExistingWorkflow, NotProven, PipegenInserted, PipelineDraft, RepoProfile } from '../types.js';
 import { safeText } from '../util/safe-text.js';
 import { AssembleError, egressStepFor, JOB_MINUTES, JOB_RUNNER, packageSets, type Job } from './jobs.js';
 
 // ---------- types ----------
 
-/** How a deploy workflow is started: push, workflow_run, or anything else (any trigger that is not push or workflow_run makes it `other`). */
-export type DeployTrigger = 'push' | 'workflow_run' | 'other';
 /** A deploy workflow pipegen does not protect, with why: listed in PIPEGEN.md as unprotected (G9 renders it). */
 export interface DeployGap { path: string; triggers: string[]; why: string }
 /** One insertion into the user's file: the bytes pipegen added at an offset of the original (offsets of the original, ascending). */
@@ -59,9 +56,6 @@ export interface EnvironmentPlan { name: string; created: boolean; previous?: En
 const VERIFY_JOB = 'pipegen-verify';
 /** pipegen's own workflows: never a user's deploy workflow to edit. */
 const OWN_WORKFLOWS: ReadonlySet<string> = new Set([CALLER_WORKFLOW, PUSH_WORKFLOW, NIGHTLY_WORKFLOW, LOCAL_MERGE_WORKFLOW]);
-/** The permissions a user's workflow may set at the top without refusing the insert (the referee's judgeUserTop: the verify job's ceiling). */
-const VERIFY_CEILING: Readonly<Record<string, number>> = Object.freeze({ contents: 1, actions: 1, packages: 1, attestations: 1 });
-const LEVEL: Readonly<Record<string, number>> = Object.freeze({ none: 0, read: 1, write: 2 });
 
 type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -72,27 +66,6 @@ class EditRefused extends Error {}
 const refuse = (m: string): never => { throw new EditRefused(m); };
 
 // ---------- triggers ----------
-
-/** 'push' when push is the only trigger, 'workflow_run' when that is the only one, else 'other' (plan Task 4). */
-export function deployTriggers(wf: Pick<ExistingWorkflow, 'triggers'>): DeployTrigger {
-  const t = Array.isArray(wf.triggers) ? [...new Set(wf.triggers)] : [];
-  if (t.length === 1 && t[0] === 'push') return 'push';
-  if (t.length === 1 && t[0] === 'workflow_run') return 'workflow_run';
-  return 'other';
-}
-
-/** Why a push trigger is not "the default branch only" (a filter of exactly that branch, no tags), or null. */
-function pushBranchProblem(on: unknown, defaultBranch: string): string | null {
-  const fix = `; pipegen's check passes only on the default branch, so limit its push to \`branches: [${safeText(defaultBranch, 100)}]\``;
-  const push = isObj(on) ? on.push : undefined;
-  if (!isObj(push)) return `its push runs on every branch and tag${fix}`;
-  if (push['branches-ignore'] !== undefined || push.tags !== undefined || push['tags-ignore'] !== undefined) return `its push also runs on tags or on other branches${fix}`;
-  const b = push.branches;
-  const list = typeof b === 'string' ? [b] : Array.isArray(b) ? b : null;
-  if (list === null || list.length === 0) return `its push runs on every branch${fix}`;
-  if (!list.every((x) => x === defaultBranch)) return `its push runs on other branches too${fix}`;
-  return null;
-}
 
 // ---------- the byte-level edit ----------
 
@@ -345,35 +318,8 @@ function insertHeadCheckStep(original: string, calledBy: readonly string[], head
 
 // ---------- the plan per deploy workflow ----------
 
-/**
- * Why the parts of a user's workflow that apply to pipegen's job too refuse the insert (the referee's judgeUserTop, asked first so the
- * workflow is a gap and not a refused delivery), or null.
- */
-function userTopProblem(js: Obj, opts: { permissions?: boolean } = {}): string | null {
-  const env = js.env;
-  if (env !== undefined && (!isObj(env) || Object.entries(env).some(([k, v]) => isDangerousName(k) || (typeof v === 'string' && v.includes('${{'))))) return 'its workflow-wide env would reach pipegen\'s job (a name that changes how tools run, or an expression)';
-  const d = js.defaults;
-  if (d !== undefined) {
-    const run = isObj(d) ? d.run : undefined;
-    const ok = isObj(d) && Object.keys(d).every((k) => k === 'run') && isObj(run) && Object.keys(run).every((k) => k === 'shell') && (run.shell === undefined || run.shell === 'bash' || run.shell === 'sh');
-    if (!ok) return 'its defaults would change how pipegen\'s steps run';
-  }
-  const p = js.permissions;
-  // G13: a called workflow gets no job of pipegen's, so its permissions are not held to pipegen's job ceiling
-  if (p !== undefined && opts.permissions !== false) {
-    if (!isObj(p)) return 'it sets one permission level for every job (read-all or write-all), more than pipegen\'s job may have';
-    for (const [k, v] of Object.entries(p)) {
-      const level = typeof v === 'string' && Object.hasOwn(LEVEL, v) ? LEVEL[v] as number : undefined;
-      if (level === undefined || level > (Object.hasOwn(VERIFY_CEILING, k) ? VERIFY_CEILING[k] as number : 0)) return 'its workflow-wide permissions are more than pipegen\'s job may have';
-    }
-  }
-  return null;
-}
-
 /** The jobs an insert started with the head check. */
 const headCheckJobs = (mark: PipegenInserted): string[] => mark.headCheck ?? [];
-/** G7-R-sec1: every step's if: of a job runs only when the steps before it passed (the job-level rule, gatedIfAllowed, per step). */
-const stepsGated = (job: unknown): boolean => isObj(job) && (!Array.isArray(job.steps) || job.steps.every((st) => !isObj(st) || gatedIfAllowed(st.if)));
 
 /** The jobs of every workflow text that call `path` (`uses: ./<path>`), as `<workflow>:<job>`; a text pipegen can't read that names the path counts as one unknown call. */
 function callersOf(path: string, texts: ReadonlyMap<string, string>): string[] {
@@ -449,79 +395,6 @@ function calledHeadChecks(draft: PipelineDraft, texts: ReadonlyMap<string, strin
   }
 }
 
-/** G17 row 4 (sec r3 M3): the reason of a job when the detector names no job of the workflow and the job has no STRONG reason of its own. */
-export const COULD_NOT_TELL = 'pipegen could not tell which job deploys, so every job waits';
-
-/** Which jobs of a user's push deploy workflow wait for pipegen-verify, and how (deployGating). */
-export interface DeployGating {
-  /** the jobs the deploy detector names (none: every job waits) */
-  found: string[];
-  /** why each STRONG job waits (with the head check; the workflow-level gap rules apply to it) */
-  strong: Map<string, string>;
-  /** why each WEAK job may deploy (its runner or vars, or COULD_NOT_TELL) */
-  weak: Map<string, string>;
-  /** WEAK jobs whose own if: defeats needs: left out, with a note */
-  weakOut: string[];
-  /** gated jobs that wait with needs only (no head check) */
-  needsOnly: string[];
-  /** every job that waits for pipegen-verify, in the file's order */
-  deployJobs: string[];
-  /** jobs that do not wait (no reason of either kind) */
-  left: string[];
-}
-
-/**
- * G17 rows 2-4 (probe R9; sec r3 M2, M3): the one derivation of what pipegen's verify insert gates in a user's deploy workflow, from its
- * parsed text and the default branch. planVerifyInserts builds the insert from it and the referee (judgeEdited) re-derives it from the mark's
- * original, so a mark never decides which jobs wait, which wait without the head check, or whether the workflow is a gap.
- * - a gap: triggers other than one push (workflow_run, or anything else), a push beyond the default branch, or a top level that would reach
- *   pipegen's job; then the per-job gap rules for STRONG jobs (an if: that defeats needs, a step if: that runs after a failure, no contents read);
- * - S15 per job (src/engine/deploy-gating.ts): STRONG jobs wait with the head check; WEAK jobs wait (head check only when they can take it) or
- *   are left out when their own if: defeats needs. When the detector names no job, each job keeps its own STRONG reason, and a job without one
- *   waits as COULD_NOT_TELL: like a WEAK job (needs, and the head check when it can take it), except that its own if: defeating needs still
- *   makes the workflow a gap (every job waits, so none may run past the check).
- */
-export function deployGating(js: Obj, defaultBranch: string): DeployGating | { gap: string } {
-  const triggers = triggersOf(js.on);
-  if (triggers === null) return { gap: 'its triggers can not be read; write `on:` as a name, a list or a map of events' };
-  const kind = deployTriggers({ triggers });
-  if (kind === 'workflow_run') return { gap: 'it deploys after another workflow run (workflow_run), which runs with full rights on what that run produced, so pipegen adds no check to it; to have the check, deploy from a push to the default branch' };
-  if (kind === 'other') return { gap: `it is started by ${triggers.filter((t) => t !== 'push').map((t) => safeText(t, 40)).join(', ') || 'no push'}, not only by a push, so pipegen adds no check to it; to have the check, start it only on a push to the default branch` };
-  const branch = pushBranchProblem(js.on, defaultBranch);
-  if (branch !== null) return { gap: branch };
-  const top = userTopProblem(js);
-  if (top !== null) return { gap: `pipegen can not add its job: ${top}` };
-  const jobs = isObj(js.jobs) ? js.jobs : {};
-  const ids = Object.keys(jobs);
-  const found = ids.filter((id) => jobDeploys(jobs[id]));
-  const strong = new Map<string, string>();
-  const weak = new Map<string, string>();
-  for (const id of ids) {
-    const sr = strongReason(jobs[id], js.permissions);
-    if (sr !== null) { strong.set(id, sr); continue; }
-    const wr = found.length === 0 ? COULD_NOT_TELL : weakReason(jobs[id]);
-    if (wr !== null) weak.set(id, wr);
-  }
-  const why = (id: string): string => `${show(id)} (${strong.get(id) ?? weak.get(id) ?? ''})`;
-  const strongIds = [...strong.keys()];
-  const jobIf = (id: string): boolean => gatedIfAllowed(isObj(jobs[id]) ? (jobs[id] as Obj).if : undefined);
-  // a COULD_NOT_TELL job whose own if: defeats needs makes the workflow a gap, as a STRONG one does
-  const ungated = ids.filter((id) => (strong.has(id) || weak.get(id) === COULD_NOT_TELL) && !jobIf(id));
-  if (ungated.length > 0) return { gap: `its job ${ungated.map(why).join(', ')} has an if: that could run it even when pipegen's check fails (always(), failure(), or a top-level ||); change it to success() && <your condition>` };
-  // G7-R-sec1: a later step whose if: can run when an earlier step failed (always(), failure(), cancelled(), a top-level ||) would still
-  // deploy after pipegen's head check failed, so such a job is not protected: the workflow is a gap
-  const stepIfs = strongIds.filter((id) => !callsWorkflow(jobs[id]) && !stepsGated(jobs[id]));
-  if (stepIfs.length > 0) return { gap: `a step of its job ${stepIfs.map(why).join(', ')} has an if: that could run it after pipegen's head check failed (always(), failure(), cancelled(), or a top-level ||); change it to success() && <your condition>` };
-  const noContents = strongIds.filter((id) => !callsWorkflow(jobs[id]) && !readsContents(jobs[id], js.permissions));
-  if (noContents.length > 0) return { gap: `its job ${noContents.map(why).join(', ')} sets permissions without contents: read, which pipegen's head check in that job needs to read the branch; add contents: read to that job's permissions` };
-  // G7-R3 1: a WEAK job whose own if: defeats needs is left out (said so); else it waits, with the head check only when it can take it
-  const weakOut = [...weak.keys()].filter((id) => !jobIf(id));
-  const weakIn = [...weak.keys()].filter((id) => !weakOut.includes(id));
-  const needsOnly = weakIn.filter((id) => !(plainUbuntu(jobs[id]) && stepsGated(jobs[id]) && readsContents(jobs[id], js.permissions)));
-  const deployJobs = ids.filter((id) => strong.has(id) || weakIn.includes(id));
-  const left = ids.filter((id) => !strong.has(id) && !weak.has(id));
-  return { found, strong, weak, weakOut, needsOnly, deployJobs, left };
-}
 
 /**
  * The workflows planVerifyInserts handles: the reader found a deploy in them and they are not pipegen's own. Each ends as an edit (the verify

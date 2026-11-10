@@ -61,8 +61,10 @@ import { slotProblem, type SlotKind } from './slots.js';
 import { expectedSigningSteps, signedImageOwner } from './signing.js';
 import { NO_IMAGE_CATEGORIES, noImageServices, publishedImageServices, WORKFLOW_LINT_TOOL } from './needs.js';
 import { FIND_RUN_STEP_ID, PUBLISH_TAG, publishedImageRepo, renderDigestStep, renderHeadCheckStep, renderPublishDigestStep } from './deploy-steps.js';
-import { callsWorkflow, strongReason } from './deploy-gating.js';
-import { calledHeadCheckEdit, deployGating, INSERT_REFUSED_GAP, insertRefusedGap, isDeployWorkflow, localCallOf, SKIP_DEPLOY_GAP } from '../layers/deploy.js';
+import { callsWorkflow, deployGating, strongReason } from './deploy-gating.js';
+import { gatedIfAllowed, SIGNING_ENVIRONMENT, triggersOf } from './referee-shared.js';
+export { gatedIfAllowed, SIGNING_ENVIRONMENT, triggersOf };
+import { calledHeadCheckEdit, INSERT_REFUSED_GAP, insertRefusedGap, isDeployWorkflow, localCallOf, SKIP_DEPLOY_GAP } from '../layers/deploy.js';
 import { ARCHIVE_TOOL_IDS, imageBuildTag, imageProfile, renderImageArchiveScan, renderImageBuild } from './image-handoff.js';
 import { dastStartOf, nightlyDastSpec, NIGHTLY_DAST_TOOL, renderDastRun, renderDastScrub, zapActiveSpec, ZAP_ACTIVE_LANE, ZAP_ACTIVE_TOOL } from './dast-handoff.js';
 import { ATTEST_VERIFY_SETS, KEYLESS_VERIFY_SETS, SHARED_CDN_SETS } from './egress.js';
@@ -124,8 +126,6 @@ export const JOB_PERMISSIONS: Readonly<Record<string, Readonly<Record<string, Le
   notify: { 'pull-requests': 'read', checks: 'read' },
   'merged-red': { 'pull-requests': 'read', checks: 'read' },
 });
-/** The environment `pipegen-verify` runs in when the plan has environments (design §19): only default-branch deploys pass. */
-export const SIGNING_ENVIRONMENT = 'pipegen-signing';
 /** pipegen's own secrets (gate fingerprint key, cosign key, Slack webhook) and the workflow token: allowed besides the draft's declared ones (S9). */
 export const PIPEGEN_SECRETS: readonly string[] = ['PIPEGEN_FP_KEY', 'PIPEGEN_COSIGN_KEY', 'PIPEGEN_COSIGN_PASSWORD', 'PIPEGEN_SLACK_WEBHOOK', 'GITHUB_TOKEN'];
 /** G2 (B3 b): the cosign key and its password (the signing environment's secrets) reach only a sign step, recognised by content (signing.ts). */
@@ -214,73 +214,6 @@ const TRIGGERS: ReadonlySet<string> = new Set(['push', 'pull_request', 'merge_gr
 const HOSTED_RUNNERS: ReadonlySet<string> = new Set(['ubuntu-latest', 'ubuntu-24.04', 'ubuntu-22.04', 'ubuntu-24.04-arm', 'ubuntu-22.04-arm']);
 /** GitHub's owner name rule (the same pattern as src/github/client.ts), checked again here: the central prefix is built from it. */
 const OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
-/**
- * Any status-function call (success(), always(), failure(), cancelled()): GitHub adds its implicit `success() && (…)` only when
- * an if holds none. Over-approximated on purpose (review-7a-r2): no \b, so `x-success(` matches; a name inside a string literal
- * matches too (refusing it is only stricter, and a quote stripper that lexes differently from GitHub's could hide a real call).
- * Non-ASCII is refused before this runs, so JS \s covers every whitespace GitHub's lexer skips.
- */
-const STATUS_CALL_RE = /(?:success|always|failure|cancelled)\s*\(/i;
-
-/** Parentheses never below zero and back to zero at the end, and every single-quoted string closed ('' is an escape). */
-function balanced(e: string): boolean {
-  let depth = 0;
-  for (let i = 0; i < e.length; i++) {
-    const c = e[i];
-    if (c === "'") {
-      let closed = false;
-      for (i++; i < e.length; i++) if (e[i] === "'") { if (e[i + 1] === "'") i++; else { closed = true; break; } }
-      if (!closed) return false;
-    } else if (c === '(') depth++;
-    else if (c === ')' && --depth < 0) return false;
-  }
-  return depth === 0;
-}
-
-/** Whether an expression holds `||` outside parentheses and quoted strings. */
-function topLevelOr(e: string): boolean {
-  let depth = 0;
-  for (let i = 0; i < e.length; i++) {
-    const c = e[i];
-    if (c === "'") {
-      for (i++; i < e.length; i++) if (e[i] === "'") { if (e[i + 1] === "'") i++; else break; }
-    } else if (c === '(') depth++;
-    else if (c === ')') depth--;
-    else if (c === '|' && e[i + 1] === '|' && depth === 0) return true;
-  }
-  return false;
-}
-
-/**
- * Ruling 1 (fix round 2), loosened after review-7a-r2: the `if:` of a user job pipegen gated with `needs:` may be absent, an
- * expression with no status-function call at all (GitHub runs it as `success() && (…)`, so it still respects the needs),
- * exactly `success()`, or `success() && <expr>` where <expr> holds no status call and no `||` at its top level. Anything else
- * can run the job although pipegen's job failed (`success() || …`, `!success()`, `always()`, `!cancelled()`).
- * Refused first: non-ASCII (U+0085 is whitespace to GitHub's .NET lexer but not to JS \s; U+017F folds to 'S' in .NET only),
- * more than one `${{ }}` or text outside it, whitespace included (read by GitHub as a truthy string; a value with no `${{` may be trimmed), any `{` or `}` left after the unwrap (GitHub
- * ends the expression at the first `}}`, so `${{ x }}}` is a truthy string template; expressions have no brace syntax, so braces
- * inside string literals are refused too, which is only stricter), an empty condition, and unbalanced
- * parentheses or quotes (GitHub refuses the workflow; the referee says so itself). A YAML boolean is not a string: refused.
- */
-export function gatedIfAllowed(cond: unknown): boolean {
-  if (cond === undefined) return true;
-  if (typeof cond !== 'string' || !/^[\t\n\r\x20-\x7e]*$/.test(cond)) return false;
-  let e = cond;
-  if (cond.includes(EXPR)) {
-    // the wrapper is judged on the untrimmed value: whitespace outside it is literal text, which GitHub reads as a (truthy) string template
-    const wrapped = /^\$\{\{([\s\S]*)\}\}$/.exec(cond);
-    if (wrapped === null) return false;
-    e = (wrapped[1] as string).trim();
-  } else e = cond.trim();
-  if (e === '' || e.includes(EXPR) || /[{}]/.test(e) || !balanced(e)) return false;
-  if (!STATUS_CALL_RE.test(e)) return true;
-  if (/^success\(\s*\)$/i.test(e)) return true;
-  const m = /^success\(\s*\)\s*&&([\s\S]+)$/i.exec(e);
-  if (m === null) return false;
-  const rest = m[1] as string;
-  return rest.trim() !== '' && !STATUS_CALL_RE.test(rest) && !topLevelOr(rest);
-}
-
 const LEVEL: Readonly<Record<string, number>> = { none: 0, read: 1, write: 2 };
 const JOB_ID_RE = /^[A-Za-z_][A-Za-z0-9_-]{0,99}$/;
 const STEP_KEYS: ReadonlySet<string> = new Set(STEP_KEY_LIST);
@@ -843,14 +776,6 @@ interface FileCtx {
 }
 
 const issueFor = (fc: FileCtx) => (check: RefereeCheck, message: string): void => fc.add(fc.file.path, check, message);
-
-/** The event names of an `on:` value (a name, a list of names, or a map by name); null when it is none of those. */
-export function triggersOf(on: unknown): string[] | null {
-  if (typeof on === 'string') return [on];
-  if (Array.isArray(on)) return on.every((x) => typeof x === 'string') ? (on as string[]) : null;
-  if (isObj(on)) return Object.keys(on);
-  return null;
-}
 
 /**
  * The central `<owner>/pipelines/` prefix and the one commit pipegen recorded for it (ruling 2), or null: the owner must

@@ -15,12 +15,13 @@ import { checkExpressions, isFindRunStep, isKnownHarmless } from '../src/engine/
 import { githubHosted } from '../src/engine/deploy-gating.js';
 import { deployGateOf } from '../src/audit/coverage/deploy-gate.js';
 import { floorNeeds } from '../src/engine/needs.js';
+import { deployGating, deployTriggers } from '../src/engine/deploy-gating.js';
 import { RenderError } from '../src/engine/render-error.js';
 import { renderVerifySteps } from '../src/engine/signing.js';
 import { assemble, judgeAssembled, keylessVerifyNote, verifyPermissions, verifyTail, type AssembledFiles } from '../src/layers/assemble.js';
 import { EGRESS_DOMAIN_SETS, KEYLESS_VERIFY_SETS, renderEgressStep } from '../src/engine/egress.js';
 import {
-  deployGating, deployTriggers, environmentPlan, generateCosignKeys, INSERT_REFUSED_GAP, insertRefusedGap, insertVerify, isMemoryFolder, MEMORY_DIR, planVerifyInserts, releaseJobs, renewVerifyJob, verifyJobYaml, type VerifyPlan,
+  environmentPlan, generateCosignKeys, INSERT_REFUSED_GAP, insertRefusedGap, insertVerify, isMemoryFolder, MEMORY_DIR, planVerifyInserts, releaseJobs, renewVerifyJob, verifyJobYaml, type VerifyPlan,
 } from '../src/layers/deploy.js';
 import { JOB_MINUTES, RELEASE_ONLY_NOTES, type Job } from '../src/layers/jobs.js';
 import type { Capabilities, CreatedFile, ExistingWorkflow, PipelineDraft, RepoProfile, ReviewedTool, Service, SigningPlan } from '../src/types.js';
