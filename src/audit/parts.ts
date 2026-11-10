@@ -1,5 +1,5 @@
 // Plan P Task PL-A1: the six parts of the audit report. A need lands in exactly one part, by when its check runs.
-import type { Need, NeedCategory } from '../types.js';
+import type { Need, NeedCategory, RepoProfile, ServiceType } from '../types.js';
 
 export type PartId = 1 | 2 | 3 | 4 | 5 | 6;
 
@@ -27,4 +27,22 @@ const PART_OF_CATEGORY: Readonly<Record<NeedCategory, PartId>> = {
 export function partOf(need: Pick<Need, 'category' | 'layer'>): PartId {
   if (need.layer === 'pre-commit') return 1;
   return (PART_OF_CATEGORY as Record<string, PartId | undefined>)[need.category] ?? 2;
+}
+
+// Plan P Task PL-A2 (owner choices 1 and 2): the quality checks a small project may treat as "consider" in the report.
+// The report's ranking only: need.blocking and the pipeline are untouched. Never a floor need (#121).
+export const QUALITY_FOR_SMALL: ReadonlySet<NeedCategory> = new Set<NeedCategory>(['format', 'format-lint', 'coverage', 'licences', 'dependency-review']);
+
+const SMALL_TYPES: ReadonlySet<ServiceType> = new Set<ServiceType>(['static-site', 'library', 'cli']);
+
+/**
+ * A small project: at least one service, and every service has a known, sure type made only of static-site, library
+ * and cli, with no container (nor a hint that the folder is built into an image). Anything unknown is not small.
+ */
+export function isSmallProject(p: Pick<RepoProfile, 'services'>): boolean {
+  if (p.services.length === 0) return false;
+  return p.services.every((s) => {
+    const t = s.projectType;
+    return t !== undefined && !t.unsure && s.containerHint === undefined && t.types.length > 0 && t.types.every((x) => SMALL_TYPES.has(x));
+  });
 }

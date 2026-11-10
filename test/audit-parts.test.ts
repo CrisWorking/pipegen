@@ -1,7 +1,7 @@
 // Plan P Task PL-A1: the six report parts. partOf puts every need in exactly one part.
 import { describe, expect, it } from 'vitest';
-import { NEED_CATEGORIES, type Layer, type NeedCategory } from '../src/types.js';
-import { PART_TITLE, partOf, type PartId } from '../src/audit/parts.js';
+import { FLOOR_NEEDS, NEED_CATEGORIES, type Layer, type NeedCategory, type RepoProfile, type ServiceType } from '../src/types.js';
+import { isSmallProject, PART_TITLE, partOf, QUALITY_FOR_SMALL, type PartId } from '../src/audit/parts.js';
 
 const LAYERS: Layer[] = ['pre-commit', 'push', 'merge', 'deploy'];
 const part = (category: NeedCategory, layer: Layer = 'push'): PartId => partOf({ category, layer });
@@ -36,5 +36,26 @@ describe('audit parts', () => {
   it('dependency-review → part 3', () => { expect(part('dependency-review')).toBe(3); });
   it('an unknown category falls back to part 2, never dropped', () => {
     expect(partOf({ category: 'not-a-category', layer: 'push' })).toBe(2);
+  });
+});
+
+describe('isSmallProject and QUALITY_FOR_SMALL (PL-A2)', () => {
+  const svc = (types: ServiceType[], unsure = false, name = 's') => ({ name, projectType: { types, evidence: [], unsure } });
+  const prof = (...services: object[]) => ({ services } as unknown as RepoProfile);
+
+  it('static-site, library and cli only → small', () => {
+    expect(isSmallProject(prof(svc(['static-site']), svc(['library'], false, 'b'), svc(['cli'], false, 'c')))).toBe(true);
+  });
+  it('unsure static → not small', () => { expect(isSmallProject(prof(svc(['static-site'], true)))).toBe(false); });
+  it('static + container → not small', () => { expect(isSmallProject(prof(svc(['static-site', 'container'])))).toBe(false); });
+  it('one server among static services → not small', () => { expect(isSmallProject(prof(svc(['static-site']), svc(['server'], false, 'b')))).toBe(false); });
+  it('no service, an empty type or no known type → not small', () => {
+    expect(isSmallProject(prof())).toBe(false);
+    expect(isSmallProject(prof(svc([])))).toBe(false);
+    expect(isSmallProject(prof({ name: 'x' }))).toBe(false);
+  });
+  it('QUALITY_FOR_SMALL is exactly the owner list and holds no floor need', () => {
+    expect([...QUALITY_FOR_SMALL].sort()).toEqual(['coverage', 'dependency-review', 'format', 'format-lint', 'licences']);
+    for (const f of FLOOR_NEEDS) expect(QUALITY_FOR_SMALL.has(f as NeedCategory)).toBe(false);
   });
 });

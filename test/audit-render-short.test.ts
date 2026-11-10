@@ -9,7 +9,7 @@ import type { Coverage } from '../src/audit/coverage.js';
 import { buildShortDoc, LIMIT_CATEGORIES, rankGaps } from '../src/audit/render-short.js';
 import { cantSeeFor, CANT_SEE, ctxFor, renderJson, renderLocalTerminal, renderMarkdown, renderTerminal, type RenderOptions } from '../src/audit/render.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
-import type { Capabilities, RepoProfile } from '../src/types.js';
+import type { Capabilities, ProjectType, RepoProfile, ServiceType } from '../src/types.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 import { CHECK, freePrivateReport, need, TREE } from './fixtures/audit-report.js';
 
@@ -463,5 +463,48 @@ describe('full report plumbing (S7, Owner choice 6)', () => {
     const l: LocalAudit = { profile, commit: null, [TREE]: [], [CHECK]: { ...SECRET_CHECK }, aiBundle: r.aiBundle, warnings: [], notes: [] } as LocalAudit;
     const t = renderLocalTerminal(l, SHORT);
     expect(t).toContain('Type: shop-api: static-site — output: "export" in next.config.mjs');
+  });
+});
+
+describe('short report: severity by project type (PL-A2)', () => {
+  const pt = (types: ServiceType[], unsure = false): ProjectType => ({ types, evidence: [], unsure });
+  const withType = (r: AuditReport, projectType: ProjectType): AuditReport =>
+    ({ ...r, profile: { ...r.profile, services: [{ ...r.profile.services[0], name: 'site', projectType }] } });
+  const rows = (): Coverage[] => [
+    { need: need('push', 'format', 'site'), status: 'missing', why: 'no format.' },
+    { need: need('push', 'coverage', 'site'), status: 'missing', why: 'no coverage.' },
+    { need: need('push', 'secrets'), status: 'missing', why: 'no secrets.' },
+  ];
+  const rank = (projectType: ProjectType) => {
+    const r = withType(freePrivateReport(EXCLUDED_PATTERNS), projectType);
+    const g = rankGaps({ ...r, coverage: rows(), wouldAdd: [] });
+    return { fix: g.fixFirst.map((x) => x.check), consider: g.consider.map((x) => x.check) };
+  };
+
+  it('small static site: missing format and coverage → Consider', () => {
+    const g = rank(pt(['static-site']));
+    expect(g.consider.some((c) => /format/i.test(c))).toBe(true);
+    expect(g.consider.some((c) => /coverage/i.test(c))).toBe(true);
+    expect(g.fix.some((c) => /format|coverage/i.test(c))).toBe(false);
+  });
+
+  it('small static site: missing secrets stays fix first', () => {
+    const g = rank(pt(['static-site']));
+    expect(g.fix.some((c) => c.startsWith('Secret scan'))).toBe(true);
+    expect(g.consider.some((c) => c.startsWith('Secret scan'))).toBe(false);
+  });
+
+  it('server repo: missing coverage stays fix first', () => {
+    const g = rank(pt(['server']));
+    expect(g.fix.some((c) => /coverage/i.test(c))).toBe(true);
+    expect(g.fix.some((c) => /format/i.test(c))).toBe(true);
+  });
+
+  it('unsure static → not small', () => {
+    expect(rank(pt(['static-site'], true)).fix.some((c) => /coverage/i.test(c))).toBe(true);
+  });
+
+  it('static + container → not small', () => {
+    expect(rank(pt(['static-site', 'container'])).fix.some((c) => /coverage/i.test(c))).toBe(true);
   });
 });

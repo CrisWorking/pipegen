@@ -28,7 +28,8 @@ import { excludedSummaryLines, GIT_EXCLUDED_LINES, type ScanFound } from '../ai/
 import { SCHEDULED_CATEGORIES } from '../engine/need-ids.js';
 import { ACTIVITY_CAPPED_PREFIX } from '../estimate/estimate.js';
 import type { RepoToolStep } from '../engine/reviewed.js';
-import type { Layer, Need, Part, RepoProfile, ReviewedTool } from '../types.js';
+import type { Layer, Need, NeedCategory, Part, RepoProfile, ReviewedTool } from '../types.js';
+import { isSmallProject, QUALITY_FOR_SMALL } from './parts.js';
 import type { SkippedGroup, WouldSet } from './choose.js';
 import { num, plural, size, usd as money } from '../util/format.js';
 import { makeSafeOutput, OUTPUT_CAP, type OutputTarget } from '../util/safe-output.js';
@@ -213,6 +214,8 @@ export interface RenderCtx {
   mergeLock: boolean;
   /** The check's service builds no image (buildsNoImage): signing is named "Release signing" (final review M4). */
   noImage(need: Pick<Need, 'service'>): boolean;
+  /** PL-A2: the profile's services, so the full report ranks a row as the short report does (isSerious). */
+  services: AuditReport['profile']['services'];
 }
 
 type Ctx = RenderCtx;
@@ -221,6 +224,7 @@ export function ctxFor(target: OutputTarget, opts: RenderOptions, mergeLock: boo
   return {
     target,
     mergeLock,
+    services,
     noImage: noImageCheck({ services }), // G17-R2 (F10): services indexed once
     v: (s, max = OUTPUT_CAP.name) => clean(s, { target, max }),
     own: (s, max = OUTPUT_CAP.text) => clean(s, { target, max, redact: false }),
@@ -251,7 +255,9 @@ export interface LayerView { layer: Group; rows: Coverage[]; needed: boolean; ga
  * A blocking floor need (every coverage row is a floor need) that is missing or partial, and that a tool or the
  * project's own script should cover: pipegen's own checks are gaps pipegen fills, never serious (ruling U16).
  */
-export const isSerious = (c: Coverage) => c.need.blocking === true && !isBuiltInNeed(c.need) && (c.status === 'missing' || c.status === 'partial');
+export const isSerious = (c: Coverage, profile?: Pick<RepoProfile, 'services'>) => c.need.blocking === true && !isBuiltInNeed(c.need) && (c.status === 'missing' || c.status === 'partial')
+  // PL-A2: on a small project the quality checks are "consider" (the report only; the pipeline still blocks on them)
+  && !(profile !== undefined && QUALITY_FOR_SMALL.has(c.need.category as NeedCategory) && isSmallProject(profile));
 
 export function layerViews(r: AuditReport): LayerView[] {
   return GROUPS.map((layer) => {
@@ -260,7 +266,7 @@ export function layerViews(r: AuditReport): LayerView[] {
     return {
       layer, rows, needed: rows.length > 0,
       gaps: rows.some((c) => c.status === 'missing' || c.status === 'partial'),
-      serious: rows.some(isSerious),
+      serious: rows.some((c) => isSerious(c, r.profile)),
       unknown: rows.some((c) => c.status === 'unknown'),
       covered: rows.filter((c) => c.status === 'covered').length,
     };
@@ -300,7 +306,7 @@ function row(c: Ctx, cov: Coverage, services: readonly string[] = []): Row {
   const where = cov.where === undefined ? null : c.v(cov.where, OUTPUT_CAP.path);
   const label = services.length > 1 ? groupLabel(c, cov.need, services) : checkLabel(c, cov.need);
   return {
-    serious: isSerious(cov), status: cov.status, check: `${label}${cov.need.blocking ? '' : ` (${WARNING_ONLY})`}`, why: c.v(cov.credit ?? cov.why, OUTPUT_CAP.text),
+    serious: isSerious(cov, c), status: cov.status, check: `${label}${cov.need.blocking ? '' : ` (${WARNING_ONLY})`}`, why: c.v(cov.credit ?? cov.why, OUTPUT_CAP.text),
     found: by !== null && where !== null ? `${by} in ${where}` : by ?? where,
   };
 }

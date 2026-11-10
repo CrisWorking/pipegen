@@ -79,7 +79,7 @@ function gapsOf(r: AuditReport): { serious: Gap[]; other: Gap[] } {
     if (!isGap(cov)) continue;
     const key = `${cov.need.id}\u0000${groupOf(cov)}\u0000${cov.need.service ?? ''}`;
     const prev = perService.get(key);
-    perService.set(key, { cov: prev === undefined ? cov : worse(prev.cov, cov), serious: (prev?.serious ?? false) || isSerious(cov) });
+    perService.set(key, { cov: prev === undefined ? cov : worse(prev.cov, cov), serious: (prev?.serious ?? false) || isSerious(cov, r.profile) });
   }
   const lines = new Map<string, Gap>();
   for (const { cov, serious } of perService.values()) {
