@@ -2164,14 +2164,30 @@ describe('PL-F6 pathClash keys once per tree', () => {
   const blob = { sha: 'x', mode: '100644', type: 'blob' };
   const tree = (...names: string[]): Map<string, typeof blob> => new Map(names.map((n) => [n, blob]));
 
-  it('pathClash: 10,000 entries x 50 files under 200 ms', () => {
-    const entries = tree(...Array.from({ length: 10_000 }, (_, i) => `src/dir${i % 100}/file${i}.ts`));
+  it('pathClash: 50,000 entries x 50 files under 200 ms', () => {
+    const entries = tree(...Array.from({ length: 50_000 }, (_, i) => `src/dir${i % 100}/file${i}.ts`));
     const files = Array.from({ length: 50 }, (_, i) => `new/dir${i}/f.ts`);
     const t0 = performance.now();
     const index = clashIndex(entries);
     const hits = files.map((f) => pathClash(f, entries, index));
     expect(performance.now() - t0).toBeLessThan(200);
     expect(hits.every((h) => h === false)).toBe(true);
+  });
+
+  it('pathClash: with a passed index the entries are never walked again (one walk per tree)', () => {
+    let walks = 0;
+    class Counting extends Map<string, typeof blob> {
+      override [Symbol.iterator](): MapIterator<[string, typeof blob]> { walks++; return super[Symbol.iterator](); }
+      override keys(): MapIterator<string> { walks++; return super.keys(); }
+      override entries(): MapIterator<[string, typeof blob]> { walks++; return super.entries(); }
+      override forEach(...a: Parameters<Map<string, typeof blob>['forEach']>): void { walks++; super.forEach(...a); }
+    }
+    const entries = new Counting(Array.from({ length: 100 }, (_, i) => [`src/f${i}.ts`, blob] as [string, typeof blob]));
+    const index = clashIndex(entries);
+    const built = walks;
+    expect(built).toBeGreaterThan(0);
+    for (let i = 0; i < 50; i++) pathClash(`new/f${i}.ts`, entries, index);
+    expect(walks).toBe(built);
   });
 
   it('pathClash: a passed index answers like the one built per call (case variant, file under a folder, folder over a file)', () => {
