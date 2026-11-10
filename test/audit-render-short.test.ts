@@ -7,7 +7,7 @@ import { EXCLUDED_PATTERNS, GIT_EXCLUDED_LINES } from '../src/ai/redact.js';
 import { buildAudit, LIMIT, SECRET_CHECK, type AuditDeps, type AuditReport, type LocalAudit } from '../src/audit/model.js';
 import type { Coverage } from '../src/audit/coverage.js';
 import { buildShortDoc, LIMIT_CATEGORIES, rankGaps } from '../src/audit/render-short.js';
-import { cantSeeFor, CANT_SEE, ctxFor, renderJson, renderLocalTerminal, renderMarkdown, renderTerminal, type RenderOptions } from '../src/audit/render.js';
+import { cantSeeFor, CANT_SEE, ctxFor, layerViews, renderJson, renderLocalTerminal, renderMarkdown, renderTerminal, type RenderOptions } from '../src/audit/render.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import type { Capabilities, ProjectType, RepoProfile, ServiceType } from '../src/types.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
@@ -506,5 +506,14 @@ describe('short report: severity by project type (PL-A2)', () => {
 
   it('static + container → not small', () => {
     expect(rank(pt(['static-site', 'container'])).fix.some((c) => /coverage/i.test(c))).toBe(true);
+  });
+
+  it('small static site: the full report and its layer verdict agree (no ⚠ on format and coverage)', () => {
+    const only = (projectType: ProjectType) => ({ ...withType(freePrivateReport(EXCLUDED_PATTERNS), projectType), coverage: rows().slice(0, 2), wouldAdd: [] });
+    const md = (projectType: ProjectType) => renderMarkdown(only(projectType), FULL).split('\n').filter((l) => /^\| ⚠ \| missing/.test(l));
+    expect(md(pt(['static-site']))).toEqual([]);
+    expect(md(pt(['server']))).toHaveLength(2);
+    expect(layerViews(only(pt(['static-site']))).some((v) => v.serious)).toBe(false);
+    expect(layerViews(only(pt(['server']))).some((v) => v.serious)).toBe(true);
   });
 });
