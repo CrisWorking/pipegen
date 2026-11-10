@@ -424,3 +424,91 @@ describe('G-FINREC-R1 sec M2: finish writes the central CODEOWNERS only over a b
     });
   }
 });
+
+// ---------- Fold R2 (G-FINREC-R2) ----------
+
+/** A finish over a central .github/CODEOWNERS that is not UTF-8 (finish skips it: sec M2). */
+async function lossySeed(): Promise<Seed> {
+  const raw = Buffer.concat([Buffer.from('# ', 'utf8'), Buffer.from([0xc9]), Buffer.from('quipe\n/docs/ @writers\n', 'utf8')]);
+  const real = rawBlobSha(raw);
+  const s = await seed({ centralFiles: { [CO]: 'placeholder\n' } });
+  const c = s.g.repo('o/pipelines');
+  (c.trees.get(c.commits.get(s.g.head('o/pipelines'))?.tree as string)?.get(CO) as { sha: string }).sha = real;
+  s.g.hooks.push((call) => (call.route === 'GET /repos/{owner}/{repo}/git/blobs/{file_sha}' && call.params.file_sha === real ? { status: 200, data: { sha: real, encoding: 'base64', content: raw.toString('base64'), size: raw.length } } : undefined));
+  return s;
+}
+
+describe('G-FINREC-R2: verify fold (N1, N2, N3, i1)', () => {
+  const central = codeownersFile('', codeownersBlock(CENTRAL_PROTECTED_PATHS, ['@a', '@b']));
+  const app = codeownersFile('* @someone\n', codeownersBlock(PROTECTED_PATHS_BASE, ['@a', '@b']));
+  const DROPPED = ['!/installs/ @mallory', '\\#installs/ @mallory', '/.github/workflow[s]/ @mallory', '/installs/[r].json @mallory', '/installs/ @mallory @bad!x', '/installs/ @mallory#c', '/src/*.c @bob\r/installs/ @mallory', '//installs/ @mallory', '/ @mallory'];
+
+  it('G-FINREC-R2 N1: every non-comment line after the block the gate\'s parser drops is an override (central and app lists)', () => {
+    for (const line of DROPPED) {
+      expect(overridingRules(`${central}${line}\n`, CENTRAL_PROTECTED_PATHS), JSON.stringify(line)).toHaveLength(1);
+      expect(overridingRules(`${app}${line.replace('/installs/', '/.github/workflows/')}\n`, PROTECTED_PATHS_BASE), JSON.stringify(line)).toHaveLength(1);
+    }
+    // comments and blank lines still never count
+    expect(overridingRules(`${central}# /installs/ @mallory\n\n   \n`, CENTRAL_PROTECTED_PATHS)).toEqual([]);
+  });
+
+  it('G-FINREC-R2 N1: through verify, a dropped line after a finish-created central block is drift', async () => {
+    const s = await seed();
+    await runFinish(s);
+    tamper(s, 'o/pipelines', CO, `${liveCo(s) as string}/installs/ @mallory @bad!x\n`);
+    expect(await coDrift(s)).toHaveLength(1);
+  });
+
+  it('G-FINREC-R2 N2: a CODEOWNERS GitHub reads first shadows the one pipegen edited: drift, app and central', async () => {
+    const s = await seed();
+    await runFinish(s);
+    expect(await coDrift(s)).toEqual([]);
+    tamper(s, 'o/r', '.github/CODEOWNERS', '* @mallory\n');
+    const d = await coDrift(s);
+    expect(d.some((x) => /app/.test(x.what) && /\.github\/CODEOWNERS is the CODEOWNERS GitHub reads/.test(String(x.actual)) && /CODEOWNERS/.test(x.expected ?? ''))).toBe(true);
+    const t = await seed({ centralFiles: { CODEOWNERS: '/docs/ @writers\n' } });
+    const r = await runFinish(t);
+    expect(r.edits.filter((e) => e.repo === 'central').map((e) => e.path)).toEqual(['CODEOWNERS']);
+    expect(await coDrift(t)).toEqual([]);
+    tamper(t, 'o/pipelines', '.github/CODEOWNERS', '* @mallory\n');
+    expect((await coDrift(t)).some((x) => /central/.test(x.what) && /\.github\/CODEOWNERS is the CODEOWNERS GitHub reads/.test(String(x.actual)))).toBe(true);
+    // docs/CODEOWNERS comes after the edited root file: GitHub doesn't read it, no drift
+    const u = await seed({ centralFiles: { CODEOWNERS: '/docs/ @writers\n' } });
+    await runFinish(u);
+    tamper(u, 'o/pipelines', 'docs/CODEOWNERS', '* @mallory\n');
+    expect(await coDrift(u)).toEqual([]);
+  });
+
+  it('G-FINREC-R2 N3: the drift says what to do and names the protected pattern each rule covers', async () => {
+    const s = await seed();
+    await runFinish(s);
+    tamper(s, 'o/pipelines', CO, `${liveCo(s) as string}/src/ @bob\n`);
+    const d = await coDrift(s);
+    expect(d).toHaveLength(1);
+    expect(d[0]?.expected).toMatch(/win over pipegen's block: move them above `# pipegen:begin`, or give them only pipegen's owners/);
+    expect(d[0]?.actual).toMatch(/\/src\/ @bob \(covers CODEOWNERS at any depth\)/);
+    const t = await seed();
+    await runFinish(t);
+    tamper(t, 'o/pipelines', CO, `${liveCo(t) as string}/installs/ @mallory\n`);
+    expect((await coDrift(t))[0]?.actual).toMatch(/\/installs\/ @mallory \(covers installs\/\*\*\)/);
+    const u = await seed();
+    await runFinish(u);
+    tamper(u, 'o/pipelines', CO, `${liveCo(u) as string}# pipegen:end\n`);
+    expect((await coDrift(u))[0]?.expected).toMatch(/keep exactly one `# pipegen:begin` and one `# pipegen:end` line/);
+    const v = await seed();
+    await runFinish(v);
+    tamper(v, 'o/pipelines', CO, `${liveCo(v) as string}/installs/ @mallory @bad!x\n`);
+    expect((await coDrift(v))[0]?.actual).toMatch(/a line the gate can't read/);
+  });
+
+  it('G-FINREC-R2 i1: central code-owner review planned but the CODEOWNERS central reads has no pipegen block (finish skipped it): drift', async () => {
+    const s = await lossySeed();
+    const res = await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, {}, s.deps());
+    expect(res.skipped.some((x) => /central CODEOWNERS/.test(x.what))).toBe(true);
+    expect((await coDrift(s)).some((x) => /central/.test(x.what) && /pipegen's block/.test(`${x.what} ${x.expected}`))).toBe(true);
+    // control: the block is there
+    const t = await seed();
+    await runFinish(t);
+    expect(await coDrift(t)).toEqual([]);
+  });
+});
