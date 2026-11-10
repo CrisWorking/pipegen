@@ -970,7 +970,7 @@ describe('G-COCASE-R2: one name key (M3), finish not completed (M4), submodule v
     expect((await recordOn(s)).mergedAt).toBeUndefined();
     const d = (await verifyOf(s)).drift.filter((x) => /finish has not completed/.test(String(x.actual)));
     expect(d).toHaveLength(1);
-    expect(d[0]?.actual).toMatch(/finish has not completed: run `pipegen finish`/);
+    expect(d[0]?.actual).toMatch(/finish has not completed, or the install record it wrote waits in the central pull request `pipegen\/update-r`: merge it, else run `npx pipegen finish`/);
     const t = await seed();
     await runFinish(t);
     expect((await verifyOf(t)).drift.filter((x) => /finish has not completed/.test(String(x.actual)))).toEqual([]);

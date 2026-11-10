@@ -2138,7 +2138,7 @@ describe('Plan V M5: deliver holds the app lease', () => {
 });
 
 describe('G-COCASE-R2 M1: deliver refuses a CODEOWNERS case variant on its second tree reads', () => {
-  it('G-COCASE-R2 M1: deliver: a case variant added between the build and deliver (app or central) means no non-GET request goes out', async () => {
+  it('G-COCASE-R2 M1: deliver: a case variant added to the app repo between the build and deliver means no non-GET request goes out', async () => {
     const w = world();
     const p = profile();
     const c = await deliverCentral(w.g.octokit(), p, centralFiles(), { clock: { budget: newRateBudget(), sleep: async () => {} }, ...cdeps(w) });

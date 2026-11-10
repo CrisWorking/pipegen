@@ -34,7 +34,7 @@ import { safeText } from '../util/safe-text.js';
 import { readEnv, SETUP_BRANCH } from './deliver.js';
 import { parseYamlLimited } from '../read/limits.js';
 import { compareStatus, DeliverError, readBlobText, readHead, readRepo, readTree, statusOf, type RepoRef, type TreeEntry } from './git-data.js';
-import { centralOf, protectedPathsOfRecord, readLocalRecord, readRecord, RecordError, recordMarkerOf, recordPath, type LocalRecordDeps } from './record.js';
+import { centralUpdateBranch, centralOf, protectedPathsOfRecord, readLocalRecord, readRecord, RecordError, recordMarkerOf, recordPath, type LocalRecordDeps } from './record.js';
 import { classicPutForm, holdsWanted, isObj, SettingsApi } from './settings-api.js';
 
 export interface VerifyDrift { what: string; expected: string; actual: string | null }
@@ -77,9 +77,10 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
   const marker = isObj(body) ? recordMarkerOf(typeof body.body === 'string' ? body.body : '') : null;
   if (marker !== hash) drift.push({ what: 'install record hash (setup pull request body)', expected: hash, actual: marker });
   // G-COCASE-R2 M4: the setup pull request merged but the record names no merge: finish never completed, so no lock it plans is checked
-  // below (they are judged only once finish ran) and none may be in force
+  // below (they are judged only once finish ran) and none may be in force. G-COCASE-R3 N1: or finish ran with the central ruleset on, and
+  // its record waits in the central pull request until someone merges it
   if (r.mergedAt === undefined && isObj(body) && typeof body.merged_at === 'string' && body.merged_at !== '') {
-    drift.push({ what: 'finish (the locks after the merge)', expected: 'the install record names the setup pull request\'s merge (finish ran to the end)', actual: 'finish has not completed: run `pipegen finish`' });
+    drift.push({ what: 'finish (the locks after the merge)', expected: 'the install record names the setup pull request\'s merge (finish ran to the end)', actual: `finish has not completed, or the install record it wrote waits in the central pull request \`${centralUpdateBranch(app.repo)}\`: merge it, else run \`npx pipegen finish\`` });
   }
 
   // the files and edits, on each default branch
@@ -137,7 +138,8 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
   for (const repo of ['app', 'central'] as const) {
     const edited = new Set([...r.edits.filter((e) => e.repo === repo && e.kind === 'codeowners').map((e) => e.path), ...r.files.filter((f) => f.repo === repo && f.part === 'codeowners').map((f) => f.path)]);
     if (edited.size === 0) continue;
-    // G-FINREC-R3 i-a: names compared in lower case (fail closed: a case variant GitHub might read first counts as present)
+    // G-FINREC-R3 i-a, G-COCASE-R2 M3: names compared by coKey (letter case and look-alike letters; fail closed: a variant GitHub might
+    // read first counts as present)
     const paths = [...(trees[repo]?.keys() ?? [])];
     const at = CO_PLACES.map((p) => paths.filter((x) => coKey(x) === coKey(p))).find((m) => m.length > 0);
     const first = at?.find((x) => !edited.has(x));
@@ -150,7 +152,8 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
   // block it recorded no edit for). Unreadable is drift too.
   if (r.mergedAt !== undefined && r.planned.owners.central.length > 0 && trees.central !== null) {
     const what = 'pipegen\'s block in the central CODEOWNERS';
-    // G-COCASE: names compared in lower case, like N2 (fail closed): two files GitHub might read is drift, a lone case variant is read
+    // G-COCASE: names compared by coKey, like N2 (fail closed): two files GitHub might read is drift; a lone variant (not exactly a
+    // CO_PLACES entry) is drift too (G-COCASE-R2 I1), and its content is still checked
     const cands = coCandidates(trees.central.keys());
     const first = cands.length === 1 ? cands[0] : undefined;
     const e = first === undefined ? undefined : trees.central.get(first);
@@ -259,7 +262,7 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
   }
 
   // G29: team-only CODEOWNERS rules that override pipegen's block
-  // G-COCASE: every file GitHub might read (names compared in lower case, fail closed)
+  // G-COCASE: every file GitHub might read (names compared by coKey, fail closed)
   const tree = trees.app;
   for (const path of coCandidates(tree?.keys() ?? [])) {
     const e = tree?.get(path);
@@ -286,9 +289,10 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
 }
 
 /**
- * G-COCASE: the CODEOWNERS paths in `paths` GitHub might read, names compared in lower case (fail closed, like N2): each CO_PLACES entry's
- * case-insensitive matches in order, up to the first entry there in its exact spelling (GitHub reads that one or a variant of it, never a
- * later one). One path: the file; more: GitHub may read any of them.
+ * G-COCASE: the CODEOWNERS paths in `paths` GitHub might read, names compared by coKey (letter case and look-alike letters; fail closed,
+ * like N2): each CO_PLACES entry's matches in order, up to the first entry there in its exact spelling (GitHub reads that one or a variant
+ * of it, never a later one). More than one: GitHub may read any of them (drift). One that isn't exactly a CO_PLACES entry: a
+ * case-sensitive GitHub may read none (drift, G-COCASE-R2 I1).
  */
 function coCandidates(paths: Iterable<string>): string[] {
   const all = [...paths];
