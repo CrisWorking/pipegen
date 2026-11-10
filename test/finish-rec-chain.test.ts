@@ -566,3 +566,65 @@ describe('G-FINREC-R2 i1 (review): the central CODEOWNERS central reads holds pi
     expect(d[0]?.actual).toMatch(/can't be read/);
   });
 });
+
+describe('G-FINREC-R2 (review): verify judges a CODEOWNERS only on text that hashes back to its blob', () => {
+  const RAW = (lead: string): Buffer => Buffer.concat([Buffer.from(lead, 'utf8'), Buffer.from('# ', 'utf8'), Buffer.from([0xc9]), Buffer.from('quipe\n', 'utf8')]);
+  /** Puts `raw` (not UTF-8) at `path` on the default branch of `repo`, as GitHub would serve its blob. */
+  function rawAt(s: Seed, repo: string, path: string, raw: Buffer): void {
+    s.g.commitOn(repo, 'main', { [path]: 'placeholder\n' }, 'owner: bytes');
+    const r = s.g.repo(repo);
+    const real = rawBlobSha(raw);
+    (r.trees.get(r.commits.get(s.g.head(repo))?.tree as string)?.get(path) as { sha: string }).sha = real;
+    s.g.hooks.push((call) => (call.route === 'GET /repos/{owner}/{repo}/git/blobs/{file_sha}' && call.params.file_sha === real ? { status: 200, data: { sha: real, encoding: 'base64', content: raw.toString('base64'), size: raw.length } } : undefined));
+  }
+
+  it('G-FINREC-R2: the per-edit path (app CODEOWNERS pipegen edited) not UTF-8: one "can\'t be read as UTF-8 text" drift, nothing judged on the decoded text', async () => {
+    const s = await seed();
+    await runFinish(s);
+    rawAt(s, 'o/r', 'CODEOWNERS', RAW(`${appCo(s)}* @mallory\n`));
+    const d = (await coDrift(s)).filter((x) => /app file CODEOWNERS/.test(x.what));
+    expect(d).toHaveLength(1);
+    expect(d[0]?.actual).toMatch(/can't be read as UTF-8 text/);
+  });
+
+  it('G-FINREC-R2: the per-edit path (central CODEOWNERS pipegen created) not UTF-8: "can\'t be read as UTF-8 text"', async () => {
+    const s = await seed();
+    await runFinish(s);
+    rawAt(s, 'o/pipelines', CO, RAW(liveCo(s) as string));
+    const d = await coDrift(s);
+    expect(d.some((x) => /central file \.github\/CODEOWNERS/.test(x.what) && /can't be read as UTF-8 text/.test(String(x.actual)))).toBe(true);
+    expect(d.some((x) => /rule after pipegen's block/.test(x.what))).toBe(false);
+  });
+
+  it('G-FINREC-R2: the i1 path (central CODEOWNERS finish left as it was, not UTF-8): "can\'t be read as UTF-8 text"', async () => {
+    const s = await lossySeed();
+    await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, {}, s.deps());
+    const d = (await coDrift(s)).filter((x) => x.what === 'pipegen\'s block in the central CODEOWNERS');
+    expect(d).toHaveLength(1);
+    expect(d[0]?.actual).toMatch(/can't be read as UTF-8 text/);
+  });
+
+  it('G-FINREC-R2: the G29 read (an app CODEOWNERS GitHub reads first that pipegen didn\'t edit) not UTF-8: drift, never warnings from decoded text', async () => {
+    const s = await seed();
+    await runFinish(s);
+    rawAt(s, 'o/r', '.github/CODEOWNERS', RAW('* @o/team\n'));
+    const v = await verifyOf(s);
+    expect(v.drift.some((x) => /\.github\/CODEOWNERS/.test(`${x.what} ${x.actual}`) && /can't be read as UTF-8 text/.test(String(x.actual)))).toBe(true);
+    expect(v.warnings).toEqual([]);
+  });
+});
+
+describe('G-FINREC-R2 (mutant follow-ups)', () => {
+  it('G-FINREC-R2 N1: a lone CR the gate reads as one rule with pipegen\'s owners still counts (GitHub may split it: `@b` alone would own everything)', () => {
+    const central = codeownersFile('', codeownersBlock(CENTRAL_PROTECTED_PATHS, ['@a', '@b']));
+    expect(overridingRules(`${central}/src/*.c @a\r@b\n`, CENTRAL_PROTECTED_PATHS)).toHaveLength(1);
+    // the same text on two lines is drift too: the ownerless `@b` covers every protected folder
+    expect(overridingRules(`${central}/src/*.c @a\n@b\n`, CENTRAL_PROTECTED_PATHS)).toEqual(['@b']);
+  });
+
+  it('G-FINREC-R2 i1: before finish ran, a central CODEOWNERS without pipegen\'s block is not drift (finish writes it)', async () => {
+    const s = await seed();
+    expect((await recordOn(s)).mergedAt).toBeUndefined();
+    expect((await coDrift(s)).filter((x) => x.what === 'pipegen\'s block in the central CODEOWNERS')).toEqual([]);
+  });
+});
