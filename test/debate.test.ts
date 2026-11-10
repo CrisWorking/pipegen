@@ -743,3 +743,47 @@ describe('debate (final review fixes)', () => {
     expect(pipegenDocProblems(`# PIPEGEN\n\n- ${line}\n`, DOC_OPTS)).toEqual([]);
   });
 });
+// ---------- reviewer R1 proposal: an accepted choice value is applied (a test-only list where a two-tool key has an AI choice) ----------
+describe('debate (reviewer R1 proposal)', () => {
+  /** The real list, but dependency-review-action offers fail-on-severity low or moderate (its input policy allows the input: tool-flags.ts). */
+  const RV = REVIEWED.map((t) => (t.id === 'dependency-review-action' ? { ...t, choices: { 'fail-on-severity': ['low', 'moderate'] } } : t));
+  const cands = () => candidatesFor(DN, PT, { 'sast--api': [discovered('cool-sast', 'acme/cool-sast', 'sast')] }, RV);
+  const drOffer = () => builderOffers(DN, cands(), PT, builderDeps({ reviewed: RV })).offers.get('dependency-review')!.find((o) => o.entry.id === 'dependency-review-action')!;
+
+  it('debate: an accepted counter applies the builder\'s choice value; a rebutted one and the judge option keep the template\'s first value', async () => {
+    expect(drOffer().aiChoices).toEqual({ 'fail-on-severity': ['low', 'moderate'] });   // the fixture really offers the AI a choice
+    const f = routed({
+      builder: [built({ picks: { 'dependency-review': 'osv-scanner' } })],
+      judge: [critiqued([{ key: 'dependency-review', counter: 'dependency-review-action' }])],
+      'debate-builder': [replies({ o1: { accept: true, choices: { 'fail-on-severity': 'moderate' } } })],
+    });
+    const r = await run(f.ai, { cands: cands(), deps: ddeps({ reviewed: RV }) });
+    const dr = byKey(r, 'dependency-review');
+    expect(dr.chosen.tool.id).toBe('dependency-review-action');
+    expect(dr.chosen.choices['fail-on-severity']).toBe('moderate');   // the accepted pick, offered for this key
+    expect(dr.chosen).toEqual(specFor(refOf(DN, PT, 'dependency-review'), drOffer(), PT, { choices: { 'fail-on-severity': 'moderate' } }));
+
+    // a valid choice beside a tuning value the tool doesn't have → the whole pick is dropped (ruling S7): the template's first value
+    // (the lint--web counter puts eslint's tuning option skip-generated into the reply schema)
+    const g = routed({
+      builder: [built({ picks: { 'dependency-review': 'osv-scanner' } })],
+      judge: [critiqued([{ key: 'dependency-review', counter: 'dependency-review-action' }, { key: 'lint--web', counter: 'eslint' }])],
+      'debate-builder': [replies({ o1: { accept: true, choices: { 'fail-on-severity': 'moderate' }, tuning: { 'skip-generated': ['web/dist'] } }, o2: 'accept' })],
+    });
+    expect(byKey(await run(g.ai, { cands: cands(), deps: ddeps({ reviewed: RV }) }), 'dependency-review').chosen.choices['fail-on-severity']).toBe('low');
+
+    // rebutted and kept: the judge's option is the template's first value, never a value an AI named
+    const h = routed({
+      builder: [built({ picks: { 'dependency-review': 'osv-scanner' } })],
+      judge: [critiqued([{ key: 'dependency-review', counter: 'dependency-review-action' }])],
+      'debate-builder': [(req) => {
+        const a = replies()(req);
+        a.answers = a.answers.map((x) => ({ ...x, choices: nulls(props(req, 'answers').choices, { 'fail-on-severity': 'moderate' }) }));
+        return a;
+      }],
+      'debate-judge': [verdicts()],
+    });
+    const judge = (await run(h.ai, { cands: cands(), deps: ddeps({ reviewed: RV }) })).disputes[0]!.options.find((o) => o.label === 'judge')!;
+    expect(judge.choice.chosen.choices['fail-on-severity']).toBe('low');
+  });
+});

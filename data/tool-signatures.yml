@@ -502,11 +502,17 @@ tools:
   # reports recommendations ... and returns a non-zero exit code"). Action:
   # https://github.com/stackrox/kube-linter-action/blob/main/action.yml (runs `kube-linter … lint … | tee` in a bash
   # step, whose pipefail keeps kube-linter's exit code)
+  # PL-C0 fold R2 (ruling P-R3): kube-linter reads Kubernetes manifests only, and pipegen can't prove a repo has no other IaC,
+  # so a run never marks iac covered: it is partial with a Kubernetes-manifests note (commandFails/actionFails `never` are
+  # used only to carry that note; kube-linter itself does fail on findings, per the sources above)
   - id: kube-linter
     categories: [iac]
     languages: [any]
     actions: [stackrox/kube-linter-action]
     commands: [kube-linter lint]
+    commandFails: never
+    actionFails: never
+    partialWhy: "Kube-linter checks Kubernetes manifests only, so Terraform and other IaC stay unscanned; pipegen counts it only as a note on the Kubernetes manifests, never as the IaC check (add trivy config)."
   # Plan P Task 3: https://github.com/open-policy-agent/conftest/blob/master/docs/options.md ("By default, Conftest only
   # returns an exit code of 1 when a policy has failed") and
   # https://github.com/open-policy-agent/conftest/blob/master/internal/commands/test.go (--no-fail: "Return an exit
