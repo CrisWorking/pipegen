@@ -241,6 +241,15 @@ describe('V9a sec M2: the record says pipegen created the repos (App-shaped reco
     expect(notes).not.toMatch(/you created it/);
     expect(notes).toMatch(/the default branch main of scratch repo o\/pipegen-proof-shop keeps the copy of your code/);
     expect(r.skipped.some((x) => /default branch/.test(x.what))).toBe(false);
+    // without --delete-repos too (no repo step there): pipelines the record says pipegen created is not "yours"
+    const w2 = world();
+    await afterRun1(w2);
+    const rec2 = sampleRecord(w2, { central: { repoId: w2.central.id, createdByPipegen: true }, scratch: { createdByPipegen: true, repoId: w2.scratch?.id ?? 0 } });
+    await run(w2, rec2);
+    mergePr(w2, w2.central, 'pipegen/uninstall-shop');
+    const r2 = await run(w2, rec2);
+    expect(r2.status).toBe('b-done');
+    expect((r2.notes ?? []).join('\n')).not.toMatch(/you created it/);
   });
 });
 
