@@ -22,7 +22,7 @@ const COSIGN = REVIEWED.find((t) => t.id === 'cosign') as ReviewedTool;
 const KE_CAPS: Capabilities = { ...CAPS, environments: true, deploymentBranchPolicies: true, envRequiredReviewers: true };
 const PIN = { repo: 'o/pipelines', sha: 'c'.repeat(40) };
 const PUB_SHA = createHash('sha256').update(cosignPub(3), 'utf8').digest('hex');
-const IMG = { service: 'app', repo: 'ghcr.io/o/r-app' };
+const IMG = { service: 'app', repo: 'ghcr.io/o/r/pipegen-app' };
 const SERVER: Service = node({ dockerfile: 'Dockerfile', port: 3000 });
 const JD = { platform: p, reviewed: REVIEWED, linters: LINTERS, [['gh', 'Tok' + 'en'].join('')]: null, refereeDeps: { runLinters: async () => [] } } as unknown as Omit<Parameters<typeof judgeAssembled>[1], 'extra'>;
 const SIGSTORE_HOSTS = ['rekor.sigstore.dev', 'tuf-repo-cdn.sigstore.dev'];

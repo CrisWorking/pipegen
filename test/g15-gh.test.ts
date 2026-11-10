@@ -134,7 +134,7 @@ describe('G15a carry 8: attest verify binds the deployed commit', () => {
     const { renderVerifySteps } = await import('../src/engine/signing.js');
     const { planned, profileOf, node } = await import('./helpers/assemble.js');
     const gh = loadReviewed().find((t) => t.id === GH_ID)!;
-    const img = { service: 'app', repo: 'ghcr.io/o/r-app' };
+    const img = { service: 'app', repo: 'ghcr.io/o/r/pipegen-app' };
     const prof = profileOf([node({ dockerfile: 'Dockerfile', port: 3000 })], { private: true });
     const draft = planned(prof, { over: { centralPin: { repo: 'o/pipelines', sha: 'c'.repeat(40) }, signing: { mode: 'attest', images: [img] } } }).draft;
     const run = String(renderVerifySteps(gh, draft, img)[1]?.run);

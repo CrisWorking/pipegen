@@ -21,7 +21,7 @@ const GATE = REVIEWED.find((t) => t.id === 'pipegen-gate') as ReviewedTool;
 const PIN = { repo: 'o/pipelines', sha: 'c'.repeat(40) };
 const MODES = ['attest', 'key-env', 'keyless'] as const;
 type Mode = (typeof MODES)[number];
-function signWorld(mode: Mode, svcs: Service[] = [web()], images = [{ service: 'app', repo: 'ghcr.io/o/r-app' }]) {
+function signWorld(mode: Mode, svcs: Service[] = [web()], images = [{ service: 'app', repo: 'ghcr.io/o/r/pipegen-app' }]) {
   const priv = mode !== 'keyless';
   const caps: Capabilities = mode === 'attest' ? { ...CAPS, attestations: true, environments: true }
     : mode === 'key-env' ? { ...CAPS, environments: true, deploymentBranchPolicies: true, envRequiredReviewers: true } : { ...CAPS, keylessSigningAllowed: true };
@@ -49,17 +49,17 @@ const strip = ({ usesComment: _c, ...rest }: Obj): Obj => rest;
 
 describe('G15a-R11 r5-1: the publish digest step proves the digest is the image this job built', () => {
   it('render: the step reads the build\'s imageid too and checks the daemon\'s RepoDigests of that image for <repo>@<digest> before writing', () => {
-    const step = renderPublishDigestStep('app', 'ghcr.io/o/r-app');
+    const step = renderPublishDigestStep('app', 'ghcr.io/o/r/pipegen-app');
     expect(PUBLISH_DIGEST_ENV).toEqual({ PIPEGEN_IMAGE_DIGEST: `\${{ steps.${BUILD_PUSH_STEP_ID}.outputs.digest }}`, PIPEGEN_IMAGE_ID: `\${{ steps.${BUILD_PUSH_STEP_ID}.outputs.imageid }}` });
     expect(step.env).toMatchObject(PUBLISH_DIGEST_ENV);
     const run = String(step.run);
     expect(run).toContain(`docker image inspect --format '{{json .RepoDigests}}' -- "$image_id"`);
-    expect(run).toContain("repo='ghcr.io/o/r-app'\nwant=\"$repo@$digest\"");
+    expect(run).toContain("repo='ghcr.io/o/r/pipegen-app'\nwant=\"$repo@$digest\"");
     // the check comes before anything is written for the upload
     expect(run.indexOf('RepoDigests')).toBeGreaterThan(-1);
     expect(run.indexOf('RepoDigests')).toBeLessThan(run.indexOf('mkdir'));
     // a repository that is not pipegen's plain ghcr.io form is never written into the script
-    for (const bad of ["ghcr.io/o/r-app'; id; '", 'docker.io/o/r-app', 'ghcr.io/o/r-app:pipegen', '']) expect(() => renderPublishDigestStep('app', bad), bad).toThrow();
+    for (const bad of ["ghcr.io/o/r/pipegen-app'; id; '", 'docker.io/o/r/app', 'ghcr.io/o/r/pipegen-app:pipegen', '', 'ghcr.io/o/r', 'ghcr.io/o/r/pipegen-app/x', 'ghcr.io//r/app']) expect(() => renderPublishDigestStep('app', bad), bad).toThrow();
   });
 
   it('referee: pipegen\'s own files pass in every mode; the digest step without the RepoDigests check (the G7 form) is refused', async () => {
@@ -85,11 +85,11 @@ describe('G15a-R11 r5-2: image-publish bound to the published service', () => {
   it('own output passes with api first (its own Dockerfile.api, or the shared Dockerfile); a publish of api\'s image is refused', async () => {
     for (const mode of MODES) {
       for (const df of ['Dockerfile.api', 'Dockerfile']) {
-        const a = signWorld(mode, [api(df), web('web', 3000, '.', 'Dockerfile')], [{ service: 'web', repo: 'ghcr.io/o/r-web' }]);
+        const a = signWorld(mode, [api(df), web('web', 3000, '.', 'Dockerfile')], [{ service: 'web', repo: 'ghcr.io/o/r/pipegen-web' }]);
         expect(shown(await judgeAssembled(a, JD)), `${mode} ${df} own`).toBe('');
-        const r = await judgeAssembled(editPub(a, (s) => { const w = (s[bpAt(s)] as Obj).with as Obj; w.file = df; w.tags = 'ghcr.io/o/r-api:pipegen'; }), JD);
+        const r = await judgeAssembled(editPub(a, (s) => { const w = (s[bpAt(s)] as Obj).with as Obj; w.file = df; w.tags = 'ghcr.io/o/r/pipegen-api:pipegen'; }), JD);
         expect(r.ok, `${mode} ${df} api`).toBe(false);
-        expect(shown(r), `${mode} ${df} api`).toMatch(/tags must be exactly ghcr\.io\/o\/r-web:pipegen/);
+        expect(shown(r), `${mode} ${df} api`).toMatch(/tags must be exactly ghcr\.io\/o\/r\/pipegen-web:pipegen/);
         if (df === 'Dockerfile.api') expect(shown(r), `${mode} ${df} api`).toMatch(/Dockerfile of a service at the repository root that pipegen publishes/);
       }
     }
@@ -98,7 +98,7 @@ describe('G15a-R11 r5-2: image-publish bound to the published service', () => {
 
 describe('G15a-R11 r5-3: no registry step in a composite action', () => {
   const login = renderPlatformStep('docker-login', p, { username: '${{ github.actor }}', [['pass', 'word'].join('')]: `${'$'}{{ secrets.${['GITHUB', 'TOK' + 'EN'].join('_')} }}` }, { registry: 'ghcr.io' });
-  const push = renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: 'ghcr.io/o/r-other:pipegen' }, { push: 'true' });
+  const push = renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: 'ghcr.io/o/r/pipegen-other:pipegen' }, { push: 'true' });
   const buildx = renderPlatformStep('setup-buildx', p);
   const action = (repo: 'app' | 'central', steps: Obj[]): CreatedFile => {
     const doc = new Document();
@@ -108,7 +108,7 @@ describe('G15a-R11 r5-3: no registry step in a composite action', () => {
   };
   it('build-push, docker login, setup-buildx and the publish digest step in a composite action are refused, in the central and the app repository', async () => {
     const a = signWorld('attest');
-    const digest = renderPublishDigestStep('app', 'ghcr.io/o/r-app');
+    const digest = renderPublishDigestStep('app', 'ghcr.io/o/r/pipegen-app');
     for (const repo of ['central', 'app'] as const) {
       for (const [name, steps] of [['build-push', [push]], ['docker-login', [login]], ['setup-buildx', [buildx]], ['login and push', [login, push]], ['publish-digest', [digest]]] as const) {
         const r = await judgeAssembled({ ...a, files: [...a.files, action(repo, steps as unknown as Obj[])] }, JD);

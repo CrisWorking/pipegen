@@ -34,17 +34,19 @@ export const imageDigestArtifact = (service: string): string => resultArtifactNa
 export const PUBLISH_TAG = 'pipegen';
 
 /**
- * The image repository pipegen publishes a service's image to (no tag, no digest): `ghcr.io/<owner>/<repo>-<service slug>`, lower case, always.
- * G17B-R1 (sec I1; open question 13 closed as won't fix): the double name (`acme-shop-acme-shop`) stays, because `ghcr.io/<owner>/<repo>` is
- * the package a repository's own release workflow pushes to (pipegen never writes into a package it did not make), and the short form would
- * collide across repositories (acme/acme-shop "acme-shop" and acme/acme "shop").
+ * The image repository pipegen publishes a service's image to (no tag, no digest): `ghcr.io/<owner>/<repo>/pipegen-<service slug>`, lower case, always.
+ * PL-F4: a `/` separates repo and service, because a `/` can appear in neither a repository name nor a service slug, so two
+ * (repo, service) pairs never share a name (the old `<repo>-<service>` made acme/shop-web + web and acme/shop + web-web the same package).
+ * Fold R1 m1: the `pipegen-` marker keeps it off the common monorepo name `ghcr.io/<owner>/<repo>/<service>` (and off `ghcr.io/<owner>/<repo>`)
+ * that a repository's own release workflow pushes to. What is enforced is only the name pipegen picks: a user workflow that itself pushes
+ * to a `pipegen-` name would share the package, since the same GITHUB_TOKEN has packages: write (threat-model residual). GHCR accepts nested names.
  */
-const IMAGE_REPO_RE = /^ghcr\.io(?:\/[a-z0-9]+(?:[._-][a-z0-9]+)*){2}$/;
+const IMAGE_REPO_RE = /^ghcr\.io(?:\/[a-z0-9]+(?:[._-][a-z0-9]+)*){3}$/;
 export function publishedImageRepo(owner: string, repo: string, service: string): string {
   let s: string;
   try { s = slug(service); } catch { throw new RenderError('A published image belongs to a service with letters or digits in its name.'); }
-  const r = `ghcr.io/${String(owner).toLowerCase()}/${String(repo).toLowerCase()}-${s}`;
-  if (!IMAGE_REPO_RE.test(r) || r.length > 255) throw new RenderError(`The image repository ${show(r)} is not a plain ghcr.io repository (lower-case letters and digits, single . _ or - between them).`);
+  const r = `ghcr.io/${String(owner).toLowerCase()}/${String(repo).toLowerCase()}/pipegen-${s}`;
+  if (!IMAGE_REPO_RE.test(r) || r.length > 255) throw new RenderError(`The image repository ${show(r)} is not a plain ghcr.io repository (owner, repository and service: lower-case letters and digits, single . _ or - between them).`);
   return r;
 }
 
