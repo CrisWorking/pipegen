@@ -264,6 +264,9 @@ export interface PipelineDoc {
   credits?: { text: string; kind: 'push-default' | 'hooks-ci' | 'signing' | 'deploy-gate' }[];
   /** G13-R1 spec I5: the hook file that already held pipegen's block (PrecommitResult.inPlace): set up, not written again; `runs` are pipegen's hook commands in it. */
   hooksInPlace?: { path: string; runs: string[] }[];
+  /** Plan P PL-D6: the pipegen version and the day (YYYY-MM-DD) shown under the title of PIPEGEN.md. They come from the run, never from the clock inside the builder (the referee builds the file again). */
+  version?: string;
+  date?: string;
 }
 /**
  * The signing of a draft (G2): `mode` from signingMode (Plan A; `none` is no plan); `images` the repositories pipegen publishes and signs,

@@ -3,7 +3,9 @@
 // pipegen writes this file itself, so the judge accepts a RESTRICTED MARKDOWN SUBSET by a line allowlist and fails closed on all else
 // (a denylist always leaks: Markdown renderers differ on fences, reference definitions and HTML). Outside a fence every line is exactly one of:
 //   empty | heading `#{1,4} text` | list item `- text` or `  - text` | table row `| ... |` or a separator row of `| - :` and spaces |
-//   a fence opener (exactly three backticks at column 0, then nothing or one of yaml sh bash json text) | plain text.
+//   a fence opener (exactly three backticks at column 0, then nothing or one of yaml sh bash json text) | plain text |
+//   one of three fixed HTML lines (Plan P PL-D6), `<details>`, `<summary>` + DOC_SUMMARY + `</summary>` and `</details>`, each exactly and alone on its line,
+//   so a section can be folded away. No attribute, no other tag, no text of the repo can be in them, and they must open and close in pairs.
 // `text` has only letters, digits, space and  . , ; : ! ? ' " ( ) / - _ + = % * ~  (no `&`: character references can decode into forbidden
 // characters), plus inline code (`...`, same characters) and inline links [label](url) whose url is this repository, docs.github.com or
 // pipegen's repository. A bare URL (any scheme:// , found as "://" so the scan is linear, or www.) is refused: a link is always inline. `<` `>` `[` `]` `\` `@` `${{` `#` `|` `$` and
@@ -16,6 +18,11 @@ import type { CreatedFile } from '../../types.js';
 import type { CreatedCtx } from '../created-files.js';
 
 export const PIPEGEN_DOC_MAX_BYTES = 256 * 1024;
+/** The one summary text a folded section may have (PL-D6). The three HTML lines are matched exactly: no other text, attribute or tag passes. */
+export const DOC_SUMMARY = 'Show the words used';
+const DETAILS_OPEN = '<details>';
+const DETAILS_SUMMARY = `<summary>${DOC_SUMMARY}</summary>`;
+const DETAILS_CLOSE = '</details>';
 /** pipegen's own repository, lower case (package.json `repository`). */
 export const PIPEGEN_REPO = 'crisworking/pipegen';
 
@@ -90,6 +97,7 @@ function grammarProblems(text: string, o: PipegenDocOpts): string[] {
   const found = new Set<string>();
   const say = (m: string) => found.add(`PIPEGEN.md holds ${m}`);
   let inFence = false;
+  let folded: 'closed' | 'open' | 'summarised' = 'closed';   // the state of the one folded section: its summary comes right after its opening line, and it closes before the file ends
   for (const line of text.split(/\r\n|\r|\n/)) {
     if (inFence) {
       if (line === '```') inFence = false;
@@ -97,6 +105,9 @@ function grammarProblems(text: string, o: PipegenDocOpts): string[] {
       continue;
     }
     if (line === '') continue;
+    if (line === DETAILS_OPEN) { if (folded !== 'closed') say('a <details> line inside a folded section'); folded = 'open'; continue; }
+    if (line === DETAILS_SUMMARY) { if (folded !== 'open') say('a <summary> line that does not follow a <details> line'); folded = 'summarised'; continue; }
+    if (line === DETAILS_CLOSE) { if (folded !== 'summarised') say('a </details> line with no <details> and <summary> above it'); folded = 'closed'; continue; }
     if (OPENER_RE.test(line)) { inFence = true; continue; }
     if (FENCE_START_RE.test(line)) { say('a code fence in a form pipegen does not write (it must be exactly three backticks at the start of a line, with no info string or one of yaml, sh, bash, json, text)'); continue; }
     let why: string | null;
@@ -117,6 +128,7 @@ function grammarProblems(text: string, o: PipegenDocOpts): string[] {
     if (why !== null) say(why);
   }
   if (inFence) say('a code fence that is never closed, so what follows it can not be checked');
+  if (folded !== 'closed') say('a <details> line that is never closed');
   return [...found];
 }
 

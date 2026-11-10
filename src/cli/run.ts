@@ -88,6 +88,7 @@ import { safeText } from '../util/safe-text.js';
 import { pubKeySha256 } from '../engine/signing.js';
 import type { InstallRecord } from '../types.js';
 import { withActiveVault } from '../util/known-values.js';
+import { packageVersion } from '../util/package-data.js';
 import { TYPE_CANCELLED } from './audit.js';
 import { askConsent, consentScreen } from './consent.js';
 import { tokenLogin } from './inspect.js';
@@ -221,6 +222,8 @@ export interface BuildInput {
   credits: NonNullable<PipelineDraft['doc']>['credits'];
   /** The earlier install record pipegen trusts (trustedPrevious), or null. */
   prev: InstallRecord | null;
+  /** PL-D6: the pipegen version and the day of the run, printed under the title of PIPEGEN.md (they come from here, never from a clock inside the builder). */
+  version?: string | null; today?: string;
 }
 type DebateDraftPlan = ReturnType<typeof draftFromDebate>['plan'];
 
@@ -629,7 +632,7 @@ export async function fullRun(dir: string, io: CliIO, deps: RunDeps = {}): Promi
     const transcript = debated?.transcript ?? [];
     const inputs = (d: PipelineDraft, centralFiles?: readonly string[]): BuildInput => ({
       dir, draft: d, plan: { ...plan, needs: d.needs }, facts, vault: known, reviewed, platform: plat, owners: pick.owners, strictness: level, transcript, testNotes, est, auth,
-      credits, prev: trusted.record, ...(centralFiles === undefined ? {} : { centralFiles }),
+      credits, prev: trusted.record, version: packageVersion(), today, ...(centralFiles === undefined ? {} : { centralFiles }),
     });
     let built = await st.build(inputs(draft));
     if (!judgedClean(built)) return 2;
@@ -1092,7 +1095,7 @@ export async function buildFiles(i: BuildInput, f: Pick<BuildFacts, 'texts' | 'a
   const doc = docFor({
     transcript: i.transcript, verify, locks: { notes: locks.notes, gateRequired: locks.rulesets !== undefined || locks.classic !== undefined }, precommit,
     jobs: { notes: jobs.notes, uncoveredMinimum: jobs.uncoveredMinimum }, assembledNotes: [...a0.notes, ...envNotes, ...hookNotes, ...adoptedNotes], testNotes: i.testNotes, credits: i.credits ?? [],
-    estimates: i.est, prWaitMinutes: prWait, strictness: i.strictness,
+    estimates: i.est, prWaitMinutes: prWait, strictness: i.strictness, ...(i.version === undefined || i.version === null ? {} : { version: i.version }), ...(i.today === undefined ? {} : { date: i.today }),
   });
   const finalDraft: PipelineDraft = { ...a0.draft, doc };
   const assembled: AssembledFiles = { ...a0, draft: finalDraft };

@@ -20,13 +20,14 @@ import { PUSH_CREDIT_WARNING } from '../audit/coverage/equivalents.js';
 import { cleanForDoc, CLEAN_DOC_MAX, CLEAN_DOC_PLACEHOLDER } from '../debate/clean.js';
 import { centralProjectName } from '../engine/central-path.js';
 import { CALLER_WORKFLOW, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PUSH_WORKFLOW } from '../engine/job-rules.js';
-import { pipegenDocProblems } from '../engine/created-judges/pipegen-doc.js';
+import { DOC_SUMMARY, pipegenDocProblems } from '../engine/created-judges/pipegen-doc.js';
 import { BOOTSTRAP_PROOFS_NOTE } from '../engine/reviewed.js';
 import { floorNeeds, MINIMUM_CATEGORIES, publishedImageServices, WORKFLOW_LINT_TOOL } from '../engine/needs.js';
 import { dastStartOf, NIGHTLY_DAST_TOOL, ZAP_ACTIVE_TOOL } from '../engine/dast-handoff.js';
 import { codeSecurityAvailable } from '../github/availability.js';
 import { describeTuning } from '../engine/tuning.js';
 import { HUSKY_NO_CI_NOTE, SETUP_COMMANDS } from '../layers/precommit.js';
+import { partOf, PART_TITLE, type PartId } from '../audit/parts.js';
 import { FLOOR_NEEDS, GATE_CHECK_NAME, type CreatedFile, type Need, type PipelineDraft, type ReviewedTool, type Service, type StepSpec } from '../types.js';
 import { scrubActive, withActiveVault } from '../util/known-values.js';
 import type { KnownValueCheck } from '../types.js';
@@ -48,8 +49,9 @@ export const ZAP_JSON_VERIFIED = true;
 /** The start of GJ's hooks-ci note for husky (src/layers/jobs.ts HOOKS_CI_NOTES.husky): it says what G6's husky note says, so only one of them is printed. */
 const GJ_HUSKY_NOTE_START = "husky's hooks are shell scripts";
 
-/** The titles of the 18 sections, in order (plan Task 6; the first one comes first so that no limit is hidden). */
+/** The titles of the 19 sections, in order (plan Task 6; PL-D6: "What runs when" opens the file, the plan limits come right after it so that no limit is hidden). */
 export const SECTION_TITLES: readonly string[] = Object.freeze([
+  'What runs when',
   'What your GitHub plan allows',
   'What pipegen set up',
   'Fix a blocked pull request',
@@ -77,56 +79,58 @@ export const WARN_MODE_TEXT = 'Warn mode lasts until 7 days after you merge (the
 
 /**
  * One row for each reason the gate can block or warn (gate/src/decide.ts header, rules 1-9, and gate/src/integrity.ts). `id` is for tests and never printed.
+ * `part` (PL-D6) is the part of the report the row is grouped under in PIPEGEN.md: the checks of every pull request (2), the gate's own rules and settings (3), the image scan (4).
  * `message` is the stable leading text the gate's summary shows (or the rule id of an integrity finding): a test finds each one in the gate's source, so
  * a user can copy a line of the summary and find its row. `means` says what it means, `todo` what to do.
  */
-export const GATE_REASONS: readonly { id: string; message: string; means: string; todo: string }[] = Object.freeze([
-  { id: 'new-finding', message: 'a new critical, high or secret finding blocks in any mode', means: 'A check found a serious problem or a secret that the base branch did not have.', todo: 'Fix it in the pull request. A false alarm is for a code owner to judge; adding a suppression comment is flagged itself. Treat a secret as leaked and rotate it: a secret that was ever pushed stays in the history.' },
-  { id: 'secret-in-range', message: 'secret added in this PR\'s history', means: 'A scan of the commits of this pull request found a secret. A commit that added a secret still counts after a later commit took it out. Any finding in the commit range blocks.', todo: 'Rotate the secret now. Then rewrite the branch so the commits no longer hold it, and push again.' },
-  { id: 'range-unproven', message: 'the pull request\'s commits are not proven free of secrets', means: 'The scan of the commits of this pull request could not run or gave no result, so nothing is proven. It blocks on a pull request.', todo: 'Run the job again.' },
-  { id: 'dependency-review', message: 'a new vulnerability in dependency review', means: 'A package added by the pull request has a known vulnerability that the base did not have.', todo: 'Pick another package or version.' },
-  { id: 'malicious', message: 'a malicious package advisory (MAL-): blocks even when old', means: 'A dependency matches a malicious-package advisory. It blocks even when it is old.', todo: 'Remove the package and rotate anything it could have read.' },
-  { id: 'licence', message: 'an unknown licence: needs a human, never blocks', means: 'A package has a licence the check does not know. It only warns.', todo: 'Have a person check the licence.' },
-  { id: 'protected-path', message: 'integrity:protected-path', means: 'The pull request changes a workflow, a tool config or an ignore file (a file that is part of the pipeline), and no code owner approved this exact commit. An approval counts only for the commit it was given on, so a code owner who approved an older commit has to approve the latest one.', todo: 'Ask a code owner to approve the latest commit. After a new push the approval has to be given again.' },
-  { id: 'suppression', message: 'integrity:suppression', means: 'Added lines turn a check off for that code (a suppression comment).', todo: 'Remove the suppression, or ask a code owner to approve this exact commit.' },
-  { id: 'incomplete-list', message: 'integrity:incomplete-list', means: 'The pull request is too large to check (3,000 or more files), or GitHub did not give the whole file list, so the gate can not see every change.', todo: 'Split the pull request into smaller ones, or run the checks again if the branch moved.' },
-  { id: 'no-patch', message: 'integrity:no-patch', means: 'GitHub gave no readable change for that file, so the gate can not check it for suppressions.', todo: 'Make the change smaller or split the file change into its own pull request. A code owner can approve the exact commit.' },
-  { id: 'case-extension', message: 'integrity:case-extension', means: 'A new file has a scanned language\'s extension in another letter case, so the scanners would skip it while a runtime may still load it.', todo: 'Rename the file to the lower-case extension.' },
-  { id: 'integrity-banner', message: 'pipeline files changed or suppressions added without code-owner approval on the current commit', means: 'This heading of the summary comes with the integrity findings above. The pull request is blocked until a code owner approves the current commit.', todo: 'Ask a code owner to approve the latest commit.' },
-  { id: 'installing', message: 'installing pipegen: review these files', means: 'This is the pull request that installs pipegen, so the pipeline files are new. It warns and does not block.', todo: 'Read the files, then merge.' },
-  { id: 'tool-error', message: 'tool error in', means: 'A check could not finish (it crashed, ran out of time or its result could not be read). A required check that errors blocks; a not proven check only warns.', todo: 'Read the check\'s log, fix the cause and run the job again.' },
-  { id: 'did-not-report', message: 'did not report', means: 'A scanner finished without a result. A required one blocks; a not proven or non-blocking one only warns or notes it.', todo: 'Run the job again.' },
-  { id: 'fork-not-run', message: 'not run on a fork PR (no secrets)', means: 'GitHub gives no secrets to a pull request from a fork, so a check that needs one did not run. If the check is required, the pull request is blocked.', todo: 'A maintainer can push the branch into this repository and open the pull request from there.' },
-  { id: 'not-proven', message: 'not-proven check', means: 'pipegen could not prove the check on your repository yet (see Not proven yet). It warns and does not block.', todo: 'Set the secret names listed under Not proven yet. The nightly run then opens an issue and `npx pipegen update` applies the change.' },
-  { id: 'non-blocking', message: 'non-blocking check', means: 'A check that never blocks. The summary notes its result.', todo: 'Read the note; nothing is required.' },
-  { id: 'warn-first', message: 'warn-first check', means: 'A check judged by its job status, in its own warn period: a failed job is a warning until a reviewed pull request makes the check blocking.', todo: 'Fix the failure before the period ends (see Warn mode).' },
-  { id: 'warn-first-finding', message: 'warn-first: a warning until a reviewed pull request makes the check blocking', means: 'A finding of a check that reads findings, in its own warn period, is a warning. A new critical, high or secret finding still blocks, and so does a failed job of such a check (an image scan or a Dockerfile lint, for example).', todo: 'Fix the findings before the period ends (see Warn mode).' },
-  { id: 'not-proven-finding', message: 'not proven: never blocks', means: 'A finding of a check that is not proven yet is a warning and never blocks.', todo: 'Make the check proven (see Not proven yet).' },
-  { id: 'non-blocking-finding', message: 'a non-blocking check: never blocks', means: 'A finding of a check that is not meant to block is shown and never blocks.', todo: 'Read it; nothing is required.' },
-  { id: 'failed-check', message: 'required check', means: 'A required check failed, so the pull request is blocked.', todo: 'Open the job\'s log, fix the failure and push again.' },
-  { id: 'missing-check', message: 'is not in the job list (missing)', means: 'The gate expects a check that did not run, so the pull request can not merge.', todo: 'Run the workflow again. With the org required workflow, re-run the `pipegen required` run after a code owner approves.' },
-  { id: 'empty-list', message: 'the job list is empty', means: 'No check ran, so nothing is proven and the gate blocks.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
-  { id: 'tampered', message: 'result tampered or missing', means: 'The result file of a check is missing, or its checksum differs from the one its job reported. The gate does not trust it and blocks.', todo: 'Run the checks again. If it keeps happening, someone changed the pipeline: run `npx pipegen verify`.' },
-  { id: 'no-coverage', message: 'no coverage for', means: 'A check ran but could not look (for example a scan that reported nothing because it had nothing to read). A required one blocks, because nothing was proven.', todo: 'Fix what the check could not read, then run the checks again.' },
-  { id: 'no-base', message: 'no base:', means: 'The base scan could not be used for this event, so every finding compared with it counts as new. A new critical or high finding therefore blocks, and so does a new secret. Only a scanner that could not run on the base commit of the pull request that installs pipegen warns instead (the next row).', todo: 'Run the checks again. On a new install, merge the setup pull request and the next pull request has a base.' },
-  { id: 'image-no-base', message: 'no base: the scanner couldn\'t run on the base commit (installing pipegen)', means: 'Image findings have no earlier scan to compare with yet: on the pull request that installs pipegen they warn, and on every other pull request they block.', todo: 'Fix the finding in the image or its base image.' },
-  { id: 'settings-input-refused', message: 'input is refused', means: 'One of the gate\'s own inputs (the job list, the policy, the service roots, the protected paths, a date) is not one the gate accepts. The gate blocks, because it can not trust its own settings.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
-  { id: 'settings-input-missing', message: 'input is missing', means: 'One of the gate\'s own inputs (the job list, the GitHub token, the service roots) is missing. The gate blocks.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
-  { id: 'settings-jobs', message: 'the jobs input (toJSON(needs)) is', means: 'The results of the jobs the gate reads are missing, too large or not an object. The gate blocks.', todo: 'Run the workflow again. If it keeps happening, run `npx pipegen verify`.' },
-  { id: 'settings-mode-name', message: 'the mode input is not gate', means: 'The gate was started in a mode other than gate. The gate blocks.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
-  { id: 'settings-mode', message: 'does not take the input', means: 'The gate was given an input it does not know, or the wrong mode. The gate blocks.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
-  { id: 'settings-policy', message: 'the policy is refused', means: 'The gate\'s own settings are wrong, so it uses the default policy and blocks.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
-  { id: 'settings-floor', message: 'not-proven can\'t include floor need', means: 'A check every repository needs is listed as not proven, which the gate does not allow.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
-  { id: 'settings-skip', message: 'can never be skipped', means: 'A check that can never be skipped is listed as skipped.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
-  { id: 'settings-warn-first', message: 'warn-first can\'t be set on floor need', means: 'A check every repository needs was put in warn-first mode, which the gate does not allow.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
-  { id: 'skipped', message: 'skipped,', means: 'You skipped that part with --skip, so it has no job and gives no protection. The summary lists it under Skipped.', todo: 'Run pipegen again without the skip if you want the part.' },
-  { id: 'warn-mode', message: '(warn mode)', means: 'The summary heading says warn mode: old findings and medium ones warn, and a new critical, high or secret finding still blocks.', todo: 'Fix the warnings before warn mode ends (see Warn mode).' },
-  { id: 'warn-ended', message: '(block mode)', means: 'The summary heading says block mode: the warn period is over, so what used to warn now blocks.', todo: 'Fix the finding. Nothing else changed.' },
+export const GATE_REASONS: readonly { id: string; part: PartId; message: string; means: string; todo: string }[] = Object.freeze([
+  { id: 'new-finding', part: 2, message: 'a new critical, high or secret finding blocks in any mode', means: 'A check found a serious problem or a secret that the base branch did not have.', todo: 'Fix it in the pull request. A false alarm is for a code owner to judge; adding a suppression comment is flagged itself. Treat a secret as leaked and rotate it: a secret that was ever pushed stays in the history.' },
+  { id: 'secret-in-range', part: 2, message: 'secret added in this PR\'s history', means: 'A scan of the commits of this pull request found a secret. A commit that added a secret still counts after a later commit took it out. Any finding in the commit range blocks.', todo: 'Rotate the secret now. Then rewrite the branch so the commits no longer hold it, and push again.' },
+  { id: 'range-unproven', part: 2, message: 'the pull request\'s commits are not proven free of secrets', means: 'The scan of the commits of this pull request could not run or gave no result, so nothing is proven. It blocks on a pull request.', todo: 'Run the job again.' },
+  { id: 'dependency-review', part: 3, message: 'a new vulnerability in dependency review', means: 'A package added by the pull request has a known vulnerability that the base did not have.', todo: 'Pick another package or version.' },
+  { id: 'malicious', part: 2, message: 'a malicious package advisory (MAL-): blocks even when old', means: 'A dependency matches a malicious-package advisory. It blocks even when it is old.', todo: 'Remove the package and rotate anything it could have read.' },
+  { id: 'licence', part: 2, message: 'an unknown licence: needs a human, never blocks', means: 'A package has a licence the check does not know. It only warns.', todo: 'Have a person check the licence.' },
+  { id: 'protected-path', part: 3, message: 'integrity:protected-path', means: 'The pull request changes a workflow, a tool config or an ignore file (a file that is part of the pipeline), and no code owner approved this exact commit. An approval counts only for the commit it was given on, so a code owner who approved an older commit has to approve the latest one.', todo: 'Ask a code owner to approve the latest commit. After a new push the approval has to be given again.' },
+  { id: 'suppression', part: 3, message: 'integrity:suppression', means: 'Added lines turn a check off for that code (a suppression comment).', todo: 'Remove the suppression, or ask a code owner to approve this exact commit.' },
+  { id: 'incomplete-list', part: 3, message: 'integrity:incomplete-list', means: 'The pull request is too large to check (3,000 or more files), or GitHub did not give the whole file list, so the gate can not see every change.', todo: 'Split the pull request into smaller ones, or run the checks again if the branch moved.' },
+  { id: 'no-patch', part: 3, message: 'integrity:no-patch', means: 'GitHub gave no readable change for that file, so the gate can not check it for suppressions.', todo: 'Make the change smaller or split the file change into its own pull request. A code owner can approve the exact commit.' },
+  { id: 'case-extension', part: 3, message: 'integrity:case-extension', means: 'A new file has a scanned language\'s extension in another letter case, so the scanners would skip it while a runtime may still load it.', todo: 'Rename the file to the lower-case extension.' },
+  { id: 'integrity-banner', part: 3, message: 'pipeline files changed or suppressions added without code-owner approval on the current commit', means: 'This heading of the summary comes with the integrity findings above. The pull request is blocked until a code owner approves the current commit.', todo: 'Ask a code owner to approve the latest commit.' },
+  { id: 'installing', part: 3, message: 'installing pipegen: review these files', means: 'This is the pull request that installs pipegen, so the pipeline files are new. It warns and does not block.', todo: 'Read the files, then merge.' },
+  { id: 'tool-error', part: 2, message: 'tool error in', means: 'A check could not finish (it crashed, ran out of time or its result could not be read). A required check that errors blocks; a not proven check only warns.', todo: 'Read the check\'s log, fix the cause and run the job again.' },
+  { id: 'did-not-report', part: 2, message: 'did not report', means: 'A scanner finished without a result. A required one blocks; a not proven or non-blocking one only warns or notes it.', todo: 'Run the job again.' },
+  { id: 'fork-not-run', part: 2, message: 'not run on a fork PR (no secrets)', means: 'GitHub gives no secrets to a pull request from a fork, so a check that needs one did not run. If the check is required, the pull request is blocked.', todo: 'A maintainer can push the branch into this repository and open the pull request from there.' },
+  { id: 'not-proven', part: 2, message: 'not-proven check', means: 'pipegen could not prove the check on your repository yet (see Not proven yet). It warns and does not block.', todo: 'Set the secret names listed under Not proven yet. The nightly run then opens an issue and `npx pipegen update` applies the change.' },
+  { id: 'non-blocking', part: 2, message: 'non-blocking check', means: 'A check that never blocks. The summary notes its result.', todo: 'Read the note; nothing is required.' },
+  { id: 'warn-first', part: 2, message: 'warn-first check', means: 'A check judged by its job status, in its own warn period: a failed job is a warning until a reviewed pull request makes the check blocking.', todo: 'Fix the failure before the period ends (see Warn mode).' },
+  { id: 'warn-first-finding', part: 2, message: 'warn-first: a warning until a reviewed pull request makes the check blocking', means: 'A finding of a check that reads findings, in its own warn period, is a warning. A new critical, high or secret finding still blocks, and so does a failed job of such a check (an image scan or a Dockerfile lint, for example).', todo: 'Fix the findings before the period ends (see Warn mode).' },
+  { id: 'not-proven-finding', part: 2, message: 'not proven: never blocks', means: 'A finding of a check that is not proven yet is a warning and never blocks.', todo: 'Make the check proven (see Not proven yet).' },
+  { id: 'non-blocking-finding', part: 2, message: 'a non-blocking check: never blocks', means: 'A finding of a check that is not meant to block is shown and never blocks.', todo: 'Read it; nothing is required.' },
+  { id: 'failed-check', part: 2, message: 'required check', means: 'A required check failed, so the pull request is blocked.', todo: 'Open the job\'s log, fix the failure and push again.' },
+  { id: 'missing-check', part: 3, message: 'is not in the job list (missing)', means: 'The gate expects a check that did not run, so the pull request can not merge.', todo: 'Run the workflow again. With the org required workflow, re-run the `pipegen required` run after a code owner approves.' },
+  { id: 'empty-list', part: 3, message: 'the job list is empty', means: 'No check ran, so nothing is proven and the gate blocks.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
+  { id: 'tampered', part: 3, message: 'result tampered or missing', means: 'The result file of a check is missing, or its checksum differs from the one its job reported. The gate does not trust it and blocks.', todo: 'Run the checks again. If it keeps happening, someone changed the pipeline: run `npx pipegen verify`.' },
+  { id: 'no-coverage', part: 2, message: 'no coverage for', means: 'A check ran but could not look (for example a scan that reported nothing because it had nothing to read). A required one blocks, because nothing was proven.', todo: 'Fix what the check could not read, then run the checks again.' },
+  { id: 'no-base', part: 3, message: 'no base:', means: 'The base scan could not be used for this event, so every finding compared with it counts as new. A new critical or high finding therefore blocks, and so does a new secret. Only a scanner that could not run on the base commit of the pull request that installs pipegen warns instead (the next row).', todo: 'Run the checks again. On a new install, merge the setup pull request and the next pull request has a base.' },
+  { id: 'image-no-base', part: 4, message: 'no base: the scanner couldn\'t run on the base commit (installing pipegen)', means: 'Image findings have no earlier scan to compare with yet: on the pull request that installs pipegen they warn, and on every other pull request they block.', todo: 'Fix the finding in the image or its base image.' },
+  { id: 'settings-input-refused', part: 3, message: 'input is refused', means: 'One of the gate\'s own inputs (the job list, the policy, the service roots, the protected paths, a date) is not one the gate accepts. The gate blocks, because it can not trust its own settings.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
+  { id: 'settings-input-missing', part: 3, message: 'input is missing', means: 'One of the gate\'s own inputs (the job list, the GitHub token, the service roots) is missing. The gate blocks.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
+  { id: 'settings-jobs', part: 3, message: 'the jobs input (toJSON(needs)) is', means: 'The results of the jobs the gate reads are missing, too large or not an object. The gate blocks.', todo: 'Run the workflow again. If it keeps happening, run `npx pipegen verify`.' },
+  { id: 'settings-mode-name', part: 3, message: 'the mode input is not gate', means: 'The gate was started in a mode other than gate. The gate blocks.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
+  { id: 'settings-mode', part: 3, message: 'does not take the input', means: 'The gate was given an input it does not know, or the wrong mode. The gate blocks.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
+  { id: 'settings-policy', part: 3, message: 'the policy is refused', means: 'The gate\'s own settings are wrong, so it uses the default policy and blocks.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
+  { id: 'settings-floor', part: 3, message: 'not-proven can\'t include floor need', means: 'A check every repository needs is listed as not proven, which the gate does not allow.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
+  { id: 'settings-skip', part: 3, message: 'can never be skipped', means: 'A check that can never be skipped is listed as skipped.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
+  { id: 'settings-warn-first', part: 3, message: 'warn-first can\'t be set on floor need', means: 'A check every repository needs was put in warn-first mode, which the gate does not allow.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
+  { id: 'skipped', part: 2, message: 'skipped,', means: 'You skipped that part with --skip, so it has no job and gives no protection. The summary lists it under Skipped.', todo: 'Run pipegen again without the skip if you want the part.' },
+  { id: 'warn-mode', part: 3, message: '(warn mode)', means: 'The summary heading says warn mode: old findings and medium ones warn, and a new critical, high or secret finding still blocks.', todo: 'Fix the warnings before warn mode ends (see Warn mode).' },
+  { id: 'warn-ended', part: 3, message: '(block mode)', means: 'The summary heading says block mode: the warn period is over, so what used to warn now blocks.', todo: 'Fix the finding. Nothing else changed.' },
 ]);
 
 // ---------- the four layers ----------
 
 const LAYERS = ['pre-commit', 'push', 'merge', 'deploy'] as const;
+const PARTS: readonly PartId[] = [1, 2, 3, 4, 5, 6];
 const LAYER_TEXT: Readonly<Record<(typeof LAYERS)[number], string>> = Object.freeze({
   'pre-commit': 'Runs on your machine before each commit.',
   push: 'Runs on a push to a branch that has no open pull request.',
@@ -239,6 +243,9 @@ const q = (raw: unknown, max = 120): string => {
   return c === '' || c === CLEAN_DOC_PLACEHOLDER ? '(unnamed)' : `"${c}"`;
 };
 
+/** The longest bullet of the file (PL-D6): a reader takes in one or two sentences, not a paragraph. */
+const LI_MAX = 300;
+
 class Doc {
   readonly lines: string[] = [];
   /** A list is open (so the next paragraph needs a blank line before it). */
@@ -246,6 +253,16 @@ class Doc {
   h(level: 1 | 2 | 3, text: string): void { this.close(); this.lines.push(`${'#'.repeat(level)} ${text}`, ''); }
   p(text: string): void { this.close(); this.lines.push(text, ''); }
   li(text: string): void { this.open = true; this.lines.push(`- ${text}`); }
+  /** PL-D6: a long fixed text as several bullets, cut between sentences so none is over LI_MAX characters (one bullet when it fits). Fixed text only. */
+  lis(text: string): void {
+    let cur = '';
+    for (const sentence of text.split(/(?<=\.) (?=[A-Z`])/)) {
+      if (cur !== '' && cur.length + 1 + sentence.length > LI_MAX) { this.li(cur); cur = sentence; } else cur = cur === '' ? sentence : `${cur} ${sentence}`;
+    }
+    if (cur !== '') this.li(cur);
+  }
+  /** A fixed line written as it is (the folding lines of the judge; never repo text). */
+  raw(line: string): void { this.close(); this.lines.push(line); }
   /** A fenced block (the judge's text info string). */
   fence(info: 'sh' | 'text', body: readonly string[]): void { this.close(); this.lines.push(`\`\`\`${info}`, ...body, '```', ''); }
   row(cells: readonly string[]): void { this.open = true; this.lines.push(`| ${cells.join(' | ')} |`); }
@@ -291,6 +308,8 @@ type DocData = {
   transcript: string[]; deployGaps: { path: string; triggers: string[]; why: string }[]; lockNotes: string[]; est: { monthlyMinutes: number; includedMinutes: number | null; prWaitMinutes?: number; strictness?: string } | null;
   gateRequired: boolean | undefined; setupCommand: string; testNotes: string[]; uncoveredMinimum: { category: string; why: string; service?: string }[]; notes: string[]; credits: { text: string; kind: string }[];
   hooksInPlace: { path: string; runs: string[] }[];
+  /** PL-D6: the pipegen version and the day, only when they are plain (see VERSION_RE, plainDay); else left out. */
+  version?: string; date?: string;
   bad: Record<'transcript' | 'deployGaps' | 'lockNotes' | 'testNotes' | 'uncoveredMinimum' | 'notes' | 'credits', number>;
 };
 const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -305,6 +324,8 @@ export function docShapeProblem(doc: unknown): string | null {
   if (!isStr(doc.setupCommand)) return 'the draft\'s doc data has no setupCommand text';
   if (!isObj(doc.estimates)) return 'the draft\'s doc data has no estimates';
   if (doc.credits !== undefined && !Array.isArray(doc.credits)) return 'the draft\'s doc credits are not a list';
+  if (doc.version !== undefined && !isStr(doc.version)) return 'the draft\'s doc version is not text';
+  if (doc.date !== undefined && !isStr(doc.date)) return 'the draft\'s doc date is not text';
   if (doc.gateRequired !== undefined && typeof doc.gateRequired !== 'boolean') return 'the draft\'s doc gateRequired is not true or false';
   if (doc.hooksInPlace !== undefined && (!Array.isArray(doc.hooksInPlace) || !doc.hooksInPlace.every((h) => isObj(h) && isStr(h.path) && Array.isArray(h.runs) && h.runs.every(isStr)))) return 'the draft\'s doc hooksInPlace is not a list of hook files';
   return null;
@@ -335,9 +356,18 @@ function dataOf(draft: PipelineDraft): DocData {
     credits: cred.map((c) => ({ text: c.text as string, kind: isStr(c.kind) ? c.kind : '' })),
     // spec I5: only a hook file name pipegen writes to, with pipegen's own hook commands (a bad entry counts as no file: fail closed)
     hooksInPlace: (Array.isArray(o.hooksInPlace) ? o.hooksInPlace : []).filter(isObj).filter((h) => isStr(h.path) && (Object.values(HOOK_FILES) as string[]).includes(h.path)).map((h) => ({ path: h.path as string, runs: strs(h.runs) })),
+    ...(isStr(o.version) && VERSION_RE.test(o.version) ? { version: o.version } : {}),
+    ...(isStr(o.date) && plainDay(o.date) ? { date: o.date } : {}),
     bad,
   };
 }
+/** A plain release version (the same shape package-data.ts accepts) and a real calendar day YYYY-MM-DD: nothing else is printed under the title. */
+const VERSION_RE = /^\d{1,6}\.\d{1,6}\.\d{1,6}(?:-[0-9A-Za-z.-]{1,40})?$/;
+const plainDay = (v: string): boolean => {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
+  const t = new Date(`${v}T00:00:00Z`).getTime();
+  return Number.isFinite(t) && new Date(t).toISOString().slice(0, 10) === v;
+};
 const STRICTNESS: ReadonlySet<string> = new Set(['Starter', 'Standard', 'Strict']);
 /** The line that stands where entries of a list could not be read (a gap or a limit must never vanish without a trace). */
 const unreadable = (d: Doc, n: number): void => { if (n > 0) d.li(n === 1 ? 'An entry could not be read, so it is not shown here.' : `${n} entries could not be read, so they are not shown here.`); };
@@ -363,8 +393,8 @@ function secretsLink(owner: string, repo: string): string | null {
 function planSection(d: Doc, draft: PipelineDraft, data: DocData): void {
   const p = draft.profile;
   const c = draft.capabilities;
-  d.h(2, SECTION_TITLES[0] as string);
-  d.p('This section comes first so that no limit is hidden.');
+  d.h(2, SECTION_TITLES[1] as string);
+  d.p('This section comes right after the list of what runs, so that no limit is hidden.');
   d.li(`This repository is ${p.private ? 'private' : 'public'}. Your GitHub plan: ${planWord(p.plan)}.`);
   d.li(c.branchProtection ? `Branch rules: available, so the check \`${GATE_CHECK_NAME}\` can be required before a pull request merges.` : `Branch rules: not available on this plan, so GitHub can not require the check \`${GATE_CHECK_NAME}\` or a review before a merge. The gate still runs and reports, but nothing forces it.`);
   const keyMode = draft.signing?.mode === 'key-env';
@@ -390,12 +420,12 @@ function planSection(d: Doc, draft: PipelineDraft, data: DocData): void {
 
 function setupSection(d: Doc, draft: PipelineDraft, data: DocData): void {
   const p = draft.profile;
-  d.h(2, SECTION_TITLES[1] as string);
+  d.h(2, SECTION_TITLES[2] as string);
   d.li('pipegen v0.2 is for repositories owned by CrisWorking. A public repository uses the gate in the normal way.');
   d.li(p.private
     ? `This repository is private, so its checks run from central workflows in the pipelines repository of the same owner, pinned to one commit. The caller file in this repository is \`${CALLER_WORKFLOW}\`.`
     : `This repository is public, so its checks are written inline in this repository: \`${CALLER_WORKFLOW}\`, \`${LOCAL_MERGE_WORKFLOW}\`, \`${PUSH_WORKFLOW}\` and \`${NIGHTLY_WORKFLOW}\`. Its install record is kept in a private pipelines repository.`);
-  d.li('pipegen does not change what or how you deploy. It adds a verify job, `needs` entries on your existing deploy jobs, and its head check as the first step of each of those jobs (so a deploy that waited for an approval, or a re-run, stops once a newer commit is on the default branch), and nothing else in them. Two kinds of deploy job get no head check: a job that calls another workflow (it has no steps of its own), and one pipegen gates only for its runner or vars that can not start with the check; the notes below say which jobs and what that leaves open.');
+  d.lis('pipegen does not change what or how you deploy. It adds a verify job, `needs` entries on your existing deploy jobs, and its head check as the first step of each of those jobs (so a deploy that waited for an approval, or a re-run, stops once a newer commit is on the default branch), and nothing else in them. Two kinds of deploy job get no head check: a job that calls another workflow (it has no steps of its own), and one pipegen gates only for its runner or vars that can not start with the check; the notes below say which jobs and what that leaves open.');
   d.li(`pipegen offers three strictness levels, Starter, Standard (the default) and Strict. They decide which checks block a pull request and which only warn.${data.est?.strictness === undefined ? '' : ` This setup uses ${data.est.strictness}.`}`);
   if (data.est !== null) {
     const incl = p.private ? (data.est.includedMinutes === null ? ' pipegen could not tell how many minutes your plan includes.' : ` Your plan includes ${data.est.includedMinutes} minutes a month for private repositories.`) : ' Actions minutes on a public repository are free.';
@@ -425,13 +455,19 @@ function setupSection(d: Doc, draft: PipelineDraft, data: DocData): void {
 }
 
 function tableSection(d: Doc, f: Facts): void {
-  d.h(2, SECTION_TITLES[2] as string);
+  d.h(2, SECTION_TITLES[3] as string);
+  const find = 'The last column holds the start of the message as the gate writes it (or the rule name of an integrity finding), so you can find your line. The rows are grouped by the part of the pipeline they belong to.';
   d.p(f.gateRequired
-    ? `The required check is \`${GATE_CHECK_NAME}\`. When it fails, or only warns, its summary on the run gives messages. The first column holds the start of the message as the gate writes it (or the rule name of an integrity finding), so you can find your line.`
-    : `The check is \`${GATE_CHECK_NAME}\`. Nothing requires it to pass on this repository, so a failed gate does not stop a merge: the rows below say what the gate reports. When it fails, or only warns, its summary on the run gives messages. The first column holds the start of the message as the gate writes it (or the rule name of an integrity finding), so you can find your line.`);
-  d.row(['Message', 'What it means', 'What to do']);
-  d.row(['---', '---', '---']);
-  for (const r of GATE_REASONS) d.row([r.message, soft(r.means, f), soft(r.todo, f)]);
+    ? `The required check is \`${GATE_CHECK_NAME}\`. When it fails, or only warns, its summary on the run gives messages. ${find}`
+    : `The check is \`${GATE_CHECK_NAME}\`. Nothing requires it to pass on this repository, so a failed gate does not stop a merge: the rows below say what the gate reports. When it fails, or only warns, its summary on the run gives messages. ${find}`);
+  for (const part of PARTS) {
+    const rows = GATE_REASONS.filter((r) => r.part === part);
+    if (rows.length === 0) continue;
+    d.h(3, PART_TITLE[part]);
+    d.row(['What it means', 'What to do', 'The gate says']);
+    d.row(['---', '---', '---']);
+    for (const r of rows) d.row([soft(r.means, f), soft(r.todo, f), r.message]);
+  }
 }
 
 /** The builder refuses a draft whose facts contradict each other (a label that does not fit the checks): G13 fixes the input. */
@@ -572,8 +608,35 @@ function modeOf(draft: PipelineDraft, reviewed: readonly ReviewedTool[], f: Fact
   return 'Blocks a pull request.';
 }
 
+/** The tool of a check as the file says it: the gate action, "tool <names>", or that none is listed. */
+function toolOf(draft: PipelineDraft, n: Need, cat: string): string {
+  const tools = [...new Set(stepsOf(draft, n.id, n.service).map((s) => fit(s.tool.name, 80)))];
+  return cat === 'gate' ? 'tool the pipegen gate action' : tools.length === 0 ? 'no tool listed (see the notes below)' : `tool ${tools.join(', ')}`;
+}
+/** A mode shortened to its first words for the "What runs when" lists ("Not set up: no tool was chosen..." becomes "Not set up."): the whole reason stays under The four layers. */
+const briefMode = (mode: string): string => `${(mode.split(':')[0] as string).replace(/\.$/, '')}.`;
+
+/**
+ * PL-D6: the file opens with what runs when, in the six parts of the report (src/audit/parts.ts partOf), each check once with its tool and its mode in a
+ * few words. A check that is not set up says so here too; the long reasons stay in The four layers.
+ */
+function whatRunsSection(d: Doc, draft: PipelineDraft, reviewed: readonly ReviewedTool[], facts: Facts): void {
+  d.h(2, SECTION_TITLES[0] as string);
+  d.p('Every check pipegen set up, in the order it meets your code. Each line says what the check is, its tool and whether it blocks or only warns. The reasons are further down, under The four layers.');
+  for (const part of PARTS) {
+    d.h(3, PART_TITLE[part]);
+    const needs = draft.needs.filter((n) => partOf({ category: categoryOf(n.id, n.category), layer: n.layer }) === part);
+    if (needs.length === 0) { d.li('No check of this part is set up here.'); continue; }
+    for (const n of needs) {
+      const cat = categoryOf(n.id, n.category);
+      const [label] = Object.hasOwn(CATEGORY_TEXT, cat) ? (CATEGORY_TEXT[cat] as readonly [string, string]) : ['A check pipegen added'];
+      d.li(`${label}${n.layer === 'push' ? ' (on a push, no pull request)' : ''}${n.service === undefined ? '' : `, service ${q(n.service)}`}, ${toolOf(draft, n, cat)}. ${briefMode(modeOf(draft, reviewed, facts, n))}`);
+    }
+  }
+}
+
 function layersSection(d: Doc, draft: PipelineDraft, data: DocData, reviewed: readonly ReviewedTool[], facts: Facts): void {
-  d.h(2, SECTION_TITLES[3] as string);
+  d.h(2, SECTION_TITLES[4] as string);
   d.p('Each check has a tool, a reason and a mode. The mode is worked out from what pipegen wrote and from the gate\'s own rules, not only from what the plan asked for.');
   for (const layer of LAYERS) {
     const needs = draft.needs.filter((n) => n.layer === layer);
@@ -586,10 +649,8 @@ function layersSection(d: Doc, draft: PipelineDraft, data: DocData, reviewed: re
       const cat = categoryOf(n.id, n.category);
       const [label, why0] = Object.hasOwn(CATEGORY_TEXT, cat) ? (CATEGORY_TEXT[cat] as readonly [string, string]) : ['A check pipegen added', 'See the tool name.'];
       const why = verifyWhy(draft, n, cat) ?? why0;
-      const tools = [...new Set(stepsOf(draft, n.id, n.service).map((s) => fit(s.tool.name, 80)))];
       const mode = modeOf(draft, reviewed, facts, n);
-      const tool = cat === 'gate' ? 'tool the pipegen gate action' : tools.length === 0 ? 'no tool listed (see the notes below)' : `tool ${tools.join(', ')}`;
-      d.li(`${label}${n.service === undefined ? '' : `, service ${q(n.service)}`}, ${tool}. ${why} ${mode}`);
+      d.li(`${label}${n.service === undefined ? '' : `, service ${q(n.service)}`}, ${toolOf(draft, n, cat)}. ${why} ${mode}`);
     }
   }
   limitsSection(d, draft);
@@ -615,7 +676,7 @@ const hasComposeFile = (draft: PipelineDraft): boolean => Array.isArray(draft.cr
 function limitsSection(d: Doc, draft: PipelineDraft): void {
   const has = (c: string): boolean => hasCat(draft, c);
   d.h(3, 'Limits of these checks');
-  if (has('type-check')) d.li('The type-check follows your own tsconfig.json. The repo\'s tsconfig decides what tsc checks and how strictly, and a pull request can edit it (`exclude`, `skipLibCheck`, `extends`, a `ts-nocheck` comment). pipegen refuses only the plain no-op layouts: no file selected, `noCheck`, and a missing or linked tsconfig.json. It is not a protected path.');
+  if (has('type-check')) d.lis('The type-check follows your own tsconfig.json. The repo\'s tsconfig decides what tsc checks and how strictly, and a pull request can edit it (`exclude`, `skipLibCheck`, `extends`, a `ts-nocheck` comment). pipegen refuses only the plain no-op layouts: no file selected, `noCheck`, and a missing or linked tsconfig.json. It is not a protected path.');
   if (has('dast')) {
     d.li('The raw result of the running app scan travels unscrubbed between the job that runs the app and the job that reads the result. It holds only what an app without secrets answered. A hostile app can always answer a scanner cleanly.');
     d.li('The running app scan has no earlier scan to compare with, so its findings warn on the pull request that installs pipegen and count as new after it.');
@@ -624,7 +685,7 @@ function limitsSection(d: Doc, draft: PipelineDraft): void {
     if (hasComposeFile(draft)) d.li('With pipegen\'s compose file, the running app scan builds the app\'s image itself, in its own job: a second build of the same Dockerfile. The image scan reads the other build.');
   }
   // G17B-R0 concern 3: the hardening of pipegen's compose file, said where people read it (compose up's fixed failure message points here)
-  if (hasComposeFile(draft)) d.li('The app containers in pipegen\'s compose file run with no Linux capability and no privilege gain, and the database and queue containers with no privilege gain. An app image that needs a capability (a root entrypoint that switches users or changes file owners) does not start: run the app as a non-root user.');
+  if (hasComposeFile(draft)) d.lis('The app containers in pipegen\'s compose file run with no Linux capability and no privilege gain, and the database and queue containers with no privilege gain. An app image that needs a capability (a root entrypoint that switches users or changes file owners) does not start: run the app as a non-root user.');
   if (has('image-scan') || has('image-build')) {
     d.li('Image findings have no base yet: there is no earlier scan of the base commit to compare with, so image findings warn on the pull request that installs pipegen and block on every other.');
     // G17B-R2: only when there is a publish job
@@ -632,8 +693,8 @@ function limitsSection(d: Doc, draft: PipelineDraft): void {
   }
   if (has('licences')) d.li('The licence scan reads lockfiles only.');
   if (has('sast')) d.li('The code scan runs Semgrep with a pinned copy of the semgrep-rules repository. Those rules have their own licence (the Semgrep Rules License v1.0). It lets you use them to check your own code, but not to sell them or offer them as a service. Read it before you use the rules anywhere else.');
-  if (has('publishing')) d.li('Publishing uses a trusted publisher, so no token is stored. Set it up once: on npmjs.com open the package settings and add a trusted publisher for GitHub Actions with this repository and the publish workflow file name; on PyPI open the project, then Publishing, and add a trusted publisher with the same details. The publish job needs npm 11.5.1 or newer and Node 22.14.0 or newer, and it is the only job that gets the `id-token` permission.');
-  if (has('duplication')) d.li('The copy-paste check warns only, at first: it reports new copy-paste in changed code, and old copies are not counted. A repository can make it blocking. The mode of a check is part of the pipeline files, which are protected paths, so that change goes through a pull request that a code owner approves.');
+  if (has('publishing')) d.lis('Publishing uses a trusted publisher, so no token is stored. Set it up once: on npmjs.com open the package settings and add a trusted publisher for GitHub Actions with this repository and the publish workflow file name; on PyPI open the project, then Publishing, and add a trusted publisher with the same details. The publish job needs npm 11.5.1 or newer and Node 22.14.0 or newer, and it is the only job that gets the `id-token` permission.');
+  if (has('duplication')) d.lis('The copy-paste check warns only, at first: it reports new copy-paste in changed code, and old copies are not counted. A repository can make it blocking. The mode of a check is part of the pipeline files, which are protected paths, so that change goes through a pull request that a code owner approves.');
   if (draft.signing?.mode === 'keyless') d.li('The keyless signing job runs without a network block: it needs a per-run token host that can not be listed exactly. Only pipegen\'s own steps run there.');
   if (draft.profile.services.some((s) => s.packageManager === 'npm')) d.li('Each service installs with `npm ci`, which needs a `package-lock.json` in that service\'s folder. A lock file at the workspace root is not enough: the check then fails closed, it does not pass.');
   if (has('unit-tests') || has('full-tests') || has('lint') || has('format-lint') || has('coverage')) d.li('Project scripts that pipegen runs get no declared secrets yet. A test that needs a secret can get it only through the coverage check.');
@@ -700,7 +761,7 @@ function tuningSection(d: Doc, draft: PipelineDraft): void {
 }
 
 function suggestionsSection(d: Doc, draft: PipelineDraft): void {
-  d.h(2, SECTION_TITLES[4] as string);
+  d.h(2, SECTION_TITLES[5] as string);
   d.p('A suggestion is a tool that pipegen does not run for you. It may be a tool pipegen has not reviewed, or a reviewed tool that had nothing to run on in this repository (its reason says which). Suggestions are mention-only: they never run. A tool can join the reviewed list only through a reviewed pull request to pipegen.');
   if (draft.suggestions.length === 0) { d.p('There are no suggestions.'); return; }
   for (const sg of draft.suggestions) d.li(`${q(sg.name, 80)} (repository ${fit(sg.repo, 100)}): ${fit(sg.why)}`);
@@ -708,11 +769,11 @@ function suggestionsSection(d: Doc, draft: PipelineDraft): void {
 
 function filesSection(d: Doc, draft: PipelineDraft, data: DocData): void {
   const p = draft.profile;
-  d.h(2, SECTION_TITLES[5] as string);
+  d.h(2, SECTION_TITLES[6] as string);
   d.li('`PIPEGEN.md`: this file.');
   d.li(`\`${CALLER_WORKFLOW}\`: the workflow that starts the pipeline.${p.private ? '' : ` Its jobs sit beside it in \`${LOCAL_MERGE_WORKFLOW}\`, \`${PUSH_WORKFLOW}\` and \`${NIGHTLY_WORKFLOW}\`.`}`);
   if (p.private) d.li(`In the pipelines repository: the central workflows \`${centralProjectName(p.repo)}--push.yml\`, \`${centralProjectName(p.repo)}--merge.yml\`, \`${centralProjectName(p.repo)}--nightly.yml\` and the shared signing workflow, with the install record.`);
-  d.li('Dependabot, in `.github/dependabot.yml` when pipegen adds an entry: it keeps the pinned actions up to date, each update at least 7 days old. The entry ignores the central repository, because Dependabot can not read it, so Dependabot does not bump the central commit. pipegen keeps that pin fresh: `npx pipegen update` opens the pull request and the nightly run warns when the pin is old. There are two opt-ins, not on by default: an organisation grant through the API, or a git registry entry with a read-only token you make yourself. A repository that uses Renovate keeps it and gets no Dependabot file (set `minimumReleaseAge` to 7 days in Renovate).');
+  d.lis('Dependabot, in `.github/dependabot.yml` when pipegen adds an entry: it keeps the pinned actions up to date, each update at least 7 days old. The entry ignores the central repository, because Dependabot can not read it, so Dependabot does not bump the central commit. pipegen keeps that pin fresh: `npx pipegen update` opens the pull request and the nightly run warns when the pin is old. There are two opt-ins, not on by default: an organisation grant through the API, or a git registry entry with a read-only token you make yourself. A repository that uses Renovate keeps it and gets no Dependabot file (set `minimumReleaseAge` to 7 days in Renovate).');
   for (const f of draft.created) {
     if (f.path === 'PIPEGEN.md') continue;
     d.li(`${q(f.path, 160)}: ${f.aiEdited === true ? cleanForDoc(scrubActive(f.reason), CAP) : fit(f.reason)}`);
@@ -723,7 +784,7 @@ function filesSection(d: Doc, draft: PipelineDraft, data: DocData): void {
 }
 
 function testsSection(d: Doc, draft: PipelineDraft): void {
-  d.h(2, SECTION_TITLES[6] as string);
+  d.h(2, SECTION_TITLES[7] as string);
   d.p('Starter tests describe what your code does today. They are a coverage floor, not proof: they can lock in today\'s bugs, so review them. App code runs with full power (process, network and files), so the CI job that runs it has no secrets, a read-only token and no network except the registry.');
   if (hasCat(draft, 'coverage')) d.p('If a coverage waiver is needed, the owners in pipegen\'s CODEOWNERS block can approve it, also for a file whose own CODEOWNERS rule names no user.');
   if (draft.testDecisions.length === 0) { d.p('No test decision was recorded.'); return; }
@@ -734,7 +795,7 @@ function testsSection(d: Doc, draft: PipelineDraft): void {
 }
 
 function skippedSection(d: Doc, draft: PipelineDraft): void {
-  d.h(2, SECTION_TITLES[7] as string);
+  d.h(2, SECTION_TITLES[8] as string);
   if (draft.skipped.length === 0 && draft.layersSkipped.length === 0) { d.p('Nothing was skipped.'); return; }
   for (const s of draft.skipped) {
     const missing = Object.hasOwn(SKIP_MISSING, s.part) ? (SKIP_MISSING[s.part] as string) : 'The protection of this part is missing.';
@@ -745,7 +806,7 @@ function skippedSection(d: Doc, draft: PipelineDraft): void {
 
 function signingSection(d: Doc, draft: PipelineDraft): void {
   const s = draft.signing;
-  d.h(2, SECTION_TITLES[8] as string);
+  d.h(2, SECTION_TITLES[9] as string);
   if (s === undefined) {
     d.p('pipegen signs nothing in this setup.');
     if (draft.skipped.some((x) => x.part === 'deploy')) d.li('You skipped the deploy part.');
@@ -763,7 +824,7 @@ function signingSection(d: Doc, draft: PipelineDraft): void {
 }
 
 function deploysSection(d: Doc, draft: PipelineDraft, data: DocData): void {
-  d.h(2, SECTION_TITLES[9] as string);
+  d.h(2, SECTION_TITLES[10] as string);
   const edited = draft.created.filter((f) => f.inserted !== undefined);
   if (edited.length > 0) {
     d.p('These deploy workflows got the verify job, and their deploy jobs wait for it:');
@@ -801,7 +862,7 @@ function missingMinimum(draft: PipelineDraft, f: Facts): { category: string; ser
 
 function notProvenSection(d: Doc, draft: PipelineDraft, data: DocData, reviewed: readonly ReviewedTool[], facts: Facts): void {
   const p = draft.profile;
-  d.h(2, SECTION_TITLES[10] as string);
+  d.h(2, SECTION_TITLES[11] as string);
   // every file pipegen edited is not proven by design: derived here, so a "proven" line can never stand next to one
   const edits = draft.created.filter((f) => f.inserted !== undefined);
   const proofless = draft.steps.some((s) => reviewed.some((t) => t.id === s.tool.id && t.proofs === 0));
@@ -814,7 +875,7 @@ function notProvenSection(d: Doc, draft: PipelineDraft, data: DocData, reviewed:
     const secrets = names.length === 0 ? '' : ` Secret names to set: ${names.map((x) => (SECRET_NAME_RE.test(x) ? `\`${x}\`` : fit(x, 60))).join(', ')}.`;
     d.li(`Part ${fit(n.part, 40)}${label === '' ? '' : `, ${label}`}: ${fit(n.reason)}${secrets}`);
   }
-  for (const f of edits) d.li(`Part deploy-verify: pipegen edited ${q(f.path, 160)} (it added the verify job, \`needs\` entries and its head check as the first step of each deploy job, except a job that calls another workflow, or one pipegen gates only for its runner or vars and can not start with the check (see the notes)). Check the edit by hand before you rely on it.`);
+  for (const f of edits) d.lis(`Part deploy-verify: pipegen edited ${q(f.path, 160)} (it added the verify job, \`needs\` entries and its head check as the first step of each deploy job, except a job that calls another workflow, or one pipegen gates only for its runner or vars and can not start with the check (see the notes)). Check the edit by hand before you rely on it.`);
   const link = secretsLink(p.owner, p.repo);
   d.p(`Set a missing secret in the repository settings: Settings, Secrets and variables, Actions${link === null ? '' : ` (${link})`}. When the key exists, the nightly run opens an issue with the exact patch: run \`npx pipegen update\` and it applies the change as a pull request. CI never edits workflow files itself.`);
   const where = p.private ? `\`.github/workflows/${centralProjectName(p.repo)}--merge.yml\` in the pipelines repository` : `\`${LOCAL_MERGE_WORKFLOW}\``;
@@ -840,7 +901,7 @@ function notProvenSection(d: Doc, draft: PipelineDraft, data: DocData, reviewed:
 }
 
 function integritySection(d: Doc, draft: PipelineDraft, f: Facts): void {
-  d.h(2, SECTION_TITLES[11] as string);
+  d.h(2, SECTION_TITLES[12] as string);
   d.li(f.gateRequired
     ? 'The gate protects the files that define the pipeline: workflows, tool configs, ignore files and the hook files. A pull request that changes one is blocked unless a code owner approved the exact head commit.'
     : 'The gate watches the files that define the pipeline: workflows, tool configs, ignore files and the hook files. It reports a pull request that changes one unless a code owner approved the exact head commit, but nothing requires it to pass, so it does not stop the merge.');
@@ -855,7 +916,7 @@ function integritySection(d: Doc, draft: PipelineDraft, f: Facts): void {
 }
 
 function warnSection(d: Doc, draft: PipelineDraft, f: Facts): void {
-  d.h(2, SECTION_TITLES[12] as string);
+  d.h(2, SECTION_TITLES[13] as string);
   d.p(WARN_MODE_TEXT);
   d.p(soft('In warn mode old findings and medium ones warn, and a new critical, high or secret finding still blocks.', f) + (f.gateRequired ? '' : ' Nothing requires it to pass here.'));
   d.p(soft('There are two timers. The first (7 days after you merge) is for the whole gate: it warns until then and blocks after. The second is for one check: a new blocking check can start in its own warn mode for about 14 days, and then the nightly run opens an issue to switch it to blocking.', f)
@@ -869,12 +930,12 @@ function warnSection(d: Doc, draft: PipelineDraft, f: Facts): void {
 }
 
 function retentionSection(d: Doc): void {
-  d.h(2, SECTION_TITLES[13] as string);
+  d.h(2, SECTION_TITLES[14] as string);
   d.p('Runs past the retention period can not be verified, so re-run the pipeline first before you deploy an old commit. GitHub Actions keeps runs and artifacts 90 days by default. On private repositories you can raise it to 400 days (Settings, Actions, General).');
 }
 
 function debateSection(d: Doc, draft: PipelineDraft, data: DocData): void {
-  d.h(2, SECTION_TITLES[14] as string);
+  d.h(2, SECTION_TITLES[15] as string);
   d.p('pipegen chose its tools in a short debate between AI models. The code, not the AI, checks every choice against pipegen\'s reviewed list.');
   const board = draft.scoreboard.filter((l) => !isAiNote(l));
   if (board.length > 0) { d.h(3, 'Scoreboard'); for (const l of board) d.li(fit(l)); }
@@ -883,7 +944,7 @@ function debateSection(d: Doc, draft: PipelineDraft, data: DocData): void {
 }
 
 function hooksSection(d: Doc, f: Facts): void {
-  d.h(2, SECTION_TITLES[15] as string);
+  d.h(2, SECTION_TITLES[16] as string);
   // everything here is about the file pipegen wrote: its manager's command, and the secrets hook only when the file holds it
   if (f.manager === null) { d.p('pipegen wrote no hook file, so there is no setup command. The notes in The four layers say why.'); return; }
   d.p(`After you clone the repository, run \`${SETUP_COMMANDS[f.manager]}\` once, so the hooks pipegen wrote in \`${HOOK_FILES[f.manager]}\` are active on your machine.`);
@@ -903,7 +964,7 @@ function hooksSection(d: Doc, f: Facts): void {
 }
 
 function commandsSection(d: Doc): void {
-  d.h(2, SECTION_TITLES[16] as string);
+  d.h(2, SECTION_TITLES[17] as string);
   d.li('Run the pipegen setup again at any time. It updates the same pull request `pipegen/setup` and opens central changes through a central pull request, so there are no duplicates.');
   d.li('A re-run with `--yes`, or in CI, needs the local record file. Without it pipegen shows what the install record claims and you type `owner/repo` to confirm.');
   d.li('`npx pipegen finish` runs after you merge the setup pull request. It turns on the merge locks and the settings pipegen planned. None of them is turned on before the merge, or the setup pull request could not merge.');
@@ -929,8 +990,12 @@ const GLOSSARY: readonly (readonly [string, string])[] = [
   ['Suggestion', 'A tool pipegen mentions but does not run.'],
 ];
 function glossarySection(d: Doc): void {
-  d.h(2, SECTION_TITLES[17] as string);
+  d.h(2, SECTION_TITLES[18] as string);
+  d.raw('<details>');
+  d.raw(`<summary>${DOC_SUMMARY}</summary>`);
+  d.raw('');
   for (const [w, m] of GLOSSARY) d.li(`${w}: ${m}`);
+  d.raw('</details>');
 }
 
 // ---------- the builder ----------
@@ -949,7 +1014,10 @@ export function pipegenDoc(draft: PipelineDraft, reviewed: readonly ReviewedTool
   const facts = factsOf(draft, reviewed, data);
   const d = new Doc();
   d.h(1, 'What pipegen set up in this repository');
+  const stamp = [data.version === undefined ? '' : ` ${data.version}`, data.date === undefined ? '' : ` on ${data.date}`].join('');
+  if (stamp !== '') d.p(`Written by pipegen${stamp}.`);
   d.p('pipegen wrote this file in plain English. If you edit it, pipegen keeps your edits and never replaces the file.');
+  whatRunsSection(d, draft, reviewed, facts);
   planSection(d, draft, data);
   setupSection(d, draft, data);
   tableSection(d, facts);

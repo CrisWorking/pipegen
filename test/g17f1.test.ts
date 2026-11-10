@@ -21,6 +21,14 @@ const ref = (name: string): string => `\${{ ${SEC}.${name} }}`;
 /** An independent oracle: every `${{ secrets.NAME }}` written in a file's raw text. */
 const refsIn = (text: string): string[] => [...text.matchAll(new RegExp(`\\$\\{\\{\\s*${SEC}\\.([A-Za-z_][A-Za-z0-9_]*)\\s*\\}\\}`, 'g'))].map((m) => (m[1] as string).toUpperCase());
 
+/** The lines of the section "The four layers" (PL-D6: "What runs when" lists the same checks in brief, so a search over the whole file finds two lines). */
+const layersOf = (content: string): string[] => {
+  const lines = content.split('\n');
+  const at = lines.indexOf('## The four layers');
+  const next = lines.findIndex((l, k) => k > at && /^## /.test(l));
+  return lines.slice(at, next < 0 ? undefined : next);
+};
+
 describe('G17-F1 sec I1: workflowSecretNames counts `secrets` only as the context of an expression', () => {
   it('keys: workflowSecretNames gives the names (never null) for every real assembled merge, push, nightly and sign workflow, the names each one writes', () => {
     const seen: string[] = [];
@@ -146,7 +154,7 @@ describe('G17-F1 sec M2: "Verify before deploy" of a published but unsigned serv
     const x = planned(profileOf([node({ dockerfile: 'Dockerfile', port: 3000 })], { private: true, plan: 'free', existingWorkflows: [deployWf] }), { over: { centralPin: { repo: 'o/pipelines', sha: 'c'.repeat(40) } } });
     expect(x.draft.signing).toBeUndefined();
     expect(x.draft.capabilities.environments).toBe(false);
-    const lines = pipegenDoc({ ...x.draft, doc: DOC }, REVIEWED).content.split('\n');
+    const lines = layersOf(pipegenDoc({ ...x.draft, doc: DOC }, REVIEWED).content);
     const verify = lines.filter((l) => /^- Verify before deploy, service "app"/.test(l));
     expect(verify.length).toBe(1);
     expect(verify[0]?.endsWith(UNSIGNED_VERIFY), verify[0]).toBe(true);
@@ -163,7 +171,7 @@ describe('G17-F1 (coordinator): the description before "Verify before deploy" na
   const UNSIGNED_WHY = 'Checks that the commit being deployed passed the gate and that the head is the one the gate checked; pipegen signs nothing in this setup, so no image signature is checked.';
   const UNPUBLISHED_WHY = 'Checks that the commit being deployed passed the gate and that the head is the one the gate checked; pipegen publishes no image of this service, so no image is checked.';
   const verifyLine = (draft: Parameters<typeof pipegenDoc>[0]): string => {
-    const lines = pipegenDoc({ ...draft, doc: DOC }, REVIEWED).content.split('\n').filter((l) => /^- Verify before deploy, service "app"/.test(l));
+    const lines = layersOf(pipegenDoc({ ...draft, doc: DOC }, REVIEWED).content).filter((l) => /^- Verify before deploy, service "app"/.test(l));
     expect(lines.length).toBe(1);
     return lines[0] as string;
   };
