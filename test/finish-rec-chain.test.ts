@@ -750,3 +750,81 @@ describe('G-FINREC-R3: verify and finish fold (m1, m2, i-a, i-b)', () => {
     expect(await coDrift(u)).toEqual([]);
   });
 });
+
+// ---------- G-COCASE: the i1 lookup of the central CODEOWNERS in lower case, like N2 (fail closed) ----------
+
+describe('G-COCASE: i1 finds the central CODEOWNERS by lower-case name (a reused block, no recorded central edit)', () => {
+  const BLOCK = codeownersBlock(CENTRAL_PROTECTED_PATHS, ['@a', '@b']);
+  const I1 = 'pipegen\'s block in the central CODEOWNERS';
+  const i1 = async (s: Seed) => (await coDrift(s)).filter((x) => x.what === I1);
+  /** A reused central block (finish records no central CODEOWNERS edit), then `files` committed on the central default branch. */
+  const reused = async (files: Record<string, string | null>): Promise<Seed> => {
+    const s = await seed({ centralFiles: { [CO]: BLOCK } });
+    const r = await runFinish(s);
+    expect(r.edits.some((e) => e.repo === 'central' && e.kind === 'codeowners')).toBe(false);
+    expect(r.files.some((f) => f.repo === 'central' && f.part === 'codeowners')).toBe(false);
+    expect(await coDrift(s)).toEqual([]);
+    s.g.commitOn('o/pipelines', 'main', files, 'owner: edit');
+    return s;
+  };
+
+  it('G-COCASE: two case variants of the central CODEOWNERS with no recorded central edit: drift naming both, GitHub may read either', async () => {
+    const s = await reused({ '.GitHub/CODEOWNERS': '* @mallory\n' });
+    const d = await i1(s);
+    expect(d).toHaveLength(1);
+    expect(d[0]?.actual).toMatch(/\.github\/CODEOWNERS/);
+    expect(d[0]?.actual).toMatch(/\.GitHub\/CODEOWNERS/);
+    expect(d[0]?.actual).toMatch(/GitHub may read either/);
+    // both variants holding pipegen's block is still two files GitHub may pick from
+    const t = await reused({ '.github/codeowners': BLOCK });
+    expect(await i1(t)).toHaveLength(1);
+  });
+
+  it('G-COCASE: a variant-only path holding a correct block is read and passes', async () => {
+    const s = await reused({ [CO]: null, '.GitHub/CODEOWNERS': BLOCK });
+    expect(await coDrift(s)).toEqual([]);
+  });
+
+  it('G-COCASE: a variant-only path with wrong owners gives drift', async () => {
+    const s = await reused({ [CO]: null, '.GitHub/CODEOWNERS': codeownersBlock(CENTRAL_PROTECTED_PATHS, ['@a', '@mallory']) });
+    const d = await i1(s);
+    expect(d).toHaveLength(1);
+    expect(d[0]?.actual).toMatch(/@mallory/);
+    expect(d[0]?.expected).toMatch(/\.GitHub\/CODEOWNERS/);
+  });
+
+  it('G-COCASE: a variant-only path keeps every check (no block, an override after it, a link, not UTF-8)', async () => {
+    const a = await reused({ [CO]: null, '.GitHub/CODEOWNERS': '/docs/ @writers\n' });
+    expect((await i1(a))[0]?.actual).toMatch(/no pipegen block/);
+    const b = await reused({ [CO]: null, '.GitHub/CODEOWNERS': `${BLOCK}/installs/ @mallory\n` });
+    expect((await coDrift(b)).some((x) => /rule after pipegen's block in central file \.GitHub\/CODEOWNERS/.test(x.what) && /\/installs\/ @mallory/.test(String(x.actual)))).toBe(true);
+    const c = await reused({ [CO]: null, '.GitHub/CODEOWNERS': BLOCK });
+    const rc = c.g.repo('o/pipelines');
+    (rc.trees.get(rc.commits.get(c.g.head('o/pipelines'))?.tree as string)?.get('.GitHub/CODEOWNERS') as { mode: string }).mode = '120000';
+    expect((await i1(c))[0]?.actual).toMatch(/link or not a plain file/);
+    const e = await reused({ [CO]: null, '.GitHub/CODEOWNERS': BLOCK });
+    const sha = e.g.repo('o/pipelines').trees.get(e.g.repo('o/pipelines').commits.get(e.g.head('o/pipelines'))?.tree as string)?.get('.GitHub/CODEOWNERS')?.sha as string;
+    e.g.hooks.push((call) => (call.route === 'GET /repos/{owner}/{repo}/git/blobs/{file_sha}' && call.params.file_sha === sha ? { status: 200, data: { sha, encoding: 'base64', content: Buffer.concat([Buffer.from(BLOCK), Buffer.from([0xc9])]).toString('base64'), size: BLOCK.length + 1 } } : undefined));
+    expect((await i1(e))[0]?.actual).toMatch(/can't be read as UTF-8 text/);
+  });
+
+  it('G-COCASE: a variant-only first place and a later exact place: GitHub may read either, drift naming both', async () => {
+    const s = await reused({ [CO]: null, '.GitHub/CODEOWNERS': BLOCK, CODEOWNERS: '* @mallory\n' });
+    const d = await i1(s);
+    expect(d).toHaveLength(1);
+    expect(d[0]?.actual).toMatch(/\.GitHub\/CODEOWNERS/);
+    expect(d[0]?.actual).toMatch(/CODEOWNERS, /);
+    // an exact first place: a later file is never read, no drift
+    const t = await reused({ CODEOWNERS: '* @mallory\n', 'docs/codeowners': '* @mallory\n' });
+    expect(await coDrift(t)).toEqual([]);
+  });
+
+  it('G-COCASE: G29 reads a case-variant app CODEOWNERS too (team-only rules warned)', async () => {
+    const s = await seed();
+    await runFinish(s);
+    expect((await verifyOf(s)).warnings).toEqual([]);
+    tamper(s, 'o/r', '.GitHub/CODEOWNERS', '/.github/workflows/ @o/team\n');
+    const v = await verifyOf(s);
+    expect(v.warnings.some((w) => /^\.GitHub\/CODEOWNERS: .*names only teams/.test(w))).toBe(true);
+  });
+});

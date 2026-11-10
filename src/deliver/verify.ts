@@ -145,12 +145,15 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
   // block it recorded no edit for). Unreadable is drift too.
   if (r.mergedAt !== undefined && r.planned.owners.central.length > 0 && trees.central !== null) {
     const what = 'pipegen\'s block in the central CODEOWNERS';
-    const first = CO_PLACES.find((p) => trees.central?.has(p) === true);
+    // G-COCASE: names compared in lower case, like N2 (fail closed): two files GitHub might read is drift, a lone case variant is read
+    const cands = coCandidates(trees.central.keys());
+    const first = cands.length === 1 ? cands[0] : undefined;
     const e = first === undefined ? undefined : trees.central.get(first);
     const where = show(first ?? '.github/CODEOWNERS');
     let text: string | null = null;
     let why: string | null = null;
-    if (first === undefined) why = null;
+    if (cands.length > 1) why = `the central repo holds ${cands.map((p) => show(p)).join(', ')}: GitHub may read either, so pipegen's block may have no effect: keep only the one with pipegen's block`;
+    else if (first === undefined) why = null;
     else if (e === undefined || e.type !== 'blob' || e.mode === '120000') why = 'it is a link or not a plain file, so it can\'t be read';
     else {
       try {
@@ -164,7 +167,8 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
     const want = [...new Set(r.planned.owners.central.map((o) => o.replace(/^@/, '').toLowerCase()))].sort();
     const got = text === null ? [] : pipegenBlockOwners(text);
     const planned = `pipegen's block in ${where} with the planned owners ${want.map((o) => `@${o}`).join(' ')} (the central ruleset asks for code-owner review)`;
-    if (first === undefined) drift.push({ what, expected: planned, actual: null });
+    if (cands.length > 1) drift.push({ what, expected: `one CODEOWNERS file in the central repo: ${planned}`, actual: show(why as string, 600) });
+    else if (first === undefined) drift.push({ what, expected: planned, actual: null });
     else if (text === null) drift.push({ what, expected: planned, actual: why });
     else if (got.length === 0) drift.push({ what, expected: planned, actual: 'no pipegen block: run `npx pipegen finish` again (it says why it left the file)' });
     else if (got.join(' ') !== want.join(' ')) drift.push({ what, expected: planned, actual: `the block names ${got.map((o) => `@${o}`).join(' ')}: another project's block is in force with other owners; give every project sharing this central repo the same code owners, then run \`npx pipegen finish\` in each` });
@@ -246,8 +250,9 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
   }
 
   // G29: team-only CODEOWNERS rules that override pipegen's block
+  // G-COCASE: every file GitHub might read (names compared in lower case, fail closed)
   const tree = trees.app;
-  for (const path of CO_PLACES) {
+  for (const path of coCandidates(tree?.keys() ?? [])) {
     const e = tree?.get(path);
     if (e === undefined) continue;
     if (e.type === 'blob' && e.mode !== '120000') {
@@ -257,19 +262,34 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
         // G-FINREC-R3 m2: unreadable is drift like the other two reads, never a crash (the per-edit check already named a file pipegen edited)
         if (!(err instanceof DeliverError) && statusOf(err) !== 404 && statusOf(err) !== 422) throw err;
         if (!named) drift.push({ what: `the CODEOWNERS GitHub reads in the app repo (${label('app', path)})`, expected: 'UTF-8 text pipegen can check', actual: 'it can\'t be read' });
-        break;
+        continue;
       }
       // G-FINREC-R2: only text that hashes back to the blob is judged; the per-edit check already named a file pipegen edited
       if (gitBlobSha(text) === e.sha) warnings.push(...teamOnly(text, r, path));
       else if (!named) drift.push({ what: `the CODEOWNERS GitHub reads in the app repo (${label('app', path)})`, expected: 'UTF-8 text pipegen can check', actual: 'it can\'t be read as UTF-8 text, so pipegen can\'t check it' });
     }
-    break;
   }
   // G26
   if (r.planned.signingMode === 'key-env' || r.cosignPubSha256 !== undefined) {
     notes.push('A signing key rotation (`npx pipegen finish --rotate-key`) resets the baseline: images signed with the old key no longer verify, and the gate\'s marker and baseline start again from the next default-branch run.');
   }
   return out();
+}
+
+/**
+ * G-COCASE: the CODEOWNERS paths in `paths` GitHub might read, names compared in lower case (fail closed, like N2): each CO_PLACES entry's
+ * case-insensitive matches in order, up to the first entry there in its exact spelling (GitHub reads that one or a variant of it, never a
+ * later one). One path: the file; more: GitHub may read any of them.
+ */
+function coCandidates(paths: Iterable<string>): string[] {
+  const all = [...paths];
+  const out: string[] = [];
+  for (const p of CO_PLACES) {
+    const m = all.filter((x) => x.toLowerCase() === p.toLowerCase());
+    out.push(...m);
+    if (m.includes(p)) break;
+  }
+  return out;
 }
 
 type Obj = Record<string, unknown>;
