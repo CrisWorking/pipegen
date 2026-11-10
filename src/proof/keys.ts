@@ -244,6 +244,16 @@ export class ScratchKeys {
 
   /** E2's first store (pushProofSetup's seam): the placeholders and the throwaway key in one batch, so one access check. */
   async setup(names: readonly string[]): Promise<void> {
+    // PL-F2: GitHub upper-cases secret names, so two names that differ only in case are one secret; refuse before any request, naming both
+    const seen = new Map<string, unknown>();
+    for (const n of names) {
+      const key = String(n).toUpperCase();
+      const first = seen.get(key);
+      if (seen.has(key) && first !== n) {
+        throw new ScratchKeysError(`${safeText(String(first), 80)} and ${safeText(String(n), 80)} differ only in case; GitHub keeps one secret for both, so pipegen won't store either.`);
+      }
+      seen.set(key, n);
+    }
     const ph = this.#placeholderEntries(names);
     await this.#store([...ph, await this.#throwawayEntry()]);
   }

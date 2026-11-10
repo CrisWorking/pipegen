@@ -424,6 +424,36 @@ describe('E4 excerpt evidence (DECISIONS #113)', () => {
 });
 
 describe('E4 scratch keys: E2 seam and the source', () => {
+  it('vault STRIPE_KEY and read stripe_key → one refusal, nothing written', async () => {
+    // PL-F2: names that differ only in case are one secret on GitHub; setup refuses before any request, naming both
+    const up = ['STRIPE', 'KEY'].join('_');
+    const low = up.toLowerCase();
+    const { g, s } = keysWorld();
+    const keys = keysFor(g, vaultWith({ [up]: TYPED }));
+    const before = g.calls.length;
+    const err = await keys.setup([up, low]).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(ScratchKeysError);
+    expect((err as Error).message).toBe(`${up} and ${low} differ only in case; GitHub keeps one secret for both, so pipegen won't store either.`);
+    expect(g.calls.length).toBe(before);
+    expect(g.writes()).toEqual([]);
+    expect(s.values.size).toBe(0);
+    expect(keys.stored()).toEqual({});
+  });
+
+  it('a case pair with control and bidi characters: the refusal names both, cleaned', async () => {
+    // PL-F2 fold R1: the two names in the refusal pass through safeText (defence in depth)
+    const { g, s } = keysWorld();
+    const keys = keysFor(g);
+    const before = g.calls.length;
+    const err = await keys.setup(['a\u001b[31m\u202e', 'A\u001b[31M\u202e']).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(ScratchKeysError);
+    expect((err as Error).message).toMatch(/differ only in case/);
+    expect((err as Error).message).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/);
+    expect(g.calls.length).toBe(before);
+    expect(g.writes()).toEqual([]);
+    expect(s.values.size).toBe(0);
+  });
+
   it('the E2 seam (scratchSecretStore) is the real store for pushProofSetup, only for its own scratch repo', async () => {
     const { g, s } = keysWorld();
     const keys = keysFor(g);
