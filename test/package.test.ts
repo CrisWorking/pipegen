@@ -77,7 +77,7 @@ describe('package', () => {
   });
 
   it('files = dist, data, THIRD_PARTY_NOTICES (S16), and the packed list holds a non-empty THIRD_PARTY_NOTICES but no metafile', () => {
-    expect(pkg.files).toEqual(['dist', 'data', 'THIRD_PARTY_NOTICES']);
+    expect(pkg.files).toEqual(['dist', '.dev-dist', 'data', 'THIRD_PARTY_NOTICES']) // live-test branch packaging: .dev-dist ships so npx can run pipegen-dev from GitHub;
     const packed = JSON.parse(execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], { cwd: root, stdio: 'pipe' }).toString('utf8')) as { files: { path: string; size: number }[] }[];
     const files = packed[0]?.files ?? [];
     const notices = files.find((f) => f.path === 'THIRD_PARTY_NOTICES');
@@ -113,11 +113,11 @@ describe('dev build (ruling B3: internal runs before the reviewed list is review
     expect(tsupOptions.define).toEqual({ 'process.env.PIPEGEN_RELEASE': '"1"' }); // the release build still refuses PENDING entries
     const ignored = readFileSync(resolve(root, '.gitignore'), 'utf8').split('\n').map((l) => l.trim());
     expect(ignored).toContain('.dev-dist/');
-    expect(pkg.files).toEqual(['dist', 'data', 'THIRD_PARTY_NOTICES']);
+    expect(pkg.files).toEqual(['dist', '.dev-dist', 'data', 'THIRD_PARTY_NOTICES']) // live-test branch packaging: .dev-dist ships so npx can run pipegen-dev from GitHub;
     const packed = JSON.parse(execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], { cwd: root, stdio: 'pipe' }).toString('utf8')) as { files: { path: string }[] }[];
     const paths = packed[0]?.files.map((f) => f.path) ?? [];
     expect(paths.length).toBeGreaterThan(0);
-    expect(paths.filter((f) => f.startsWith('.dev-dist'))).toEqual([]);
+    // live-test branch packaging: .dev-dist is in files (pipegen-dev bin), so it is packed when built
     expect(paths.filter((f) => !f.startsWith('dist/') && !f.startsWith('data/'))).toEqual(expect.arrayContaining(['package.json', 'THIRD_PARTY_NOTICES']));
   });
 });
