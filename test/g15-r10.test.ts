@@ -21,7 +21,7 @@ function signWorld(mode: Mode) {
   const priv = mode !== 'keyless';
   const caps: Capabilities = mode === 'attest' ? { ...CAPS, attestations: true, environments: true }
     : mode === 'key-env' ? { ...CAPS, environments: true, deploymentBranchPolicies: true, envRequiredReviewers: true } : { ...CAPS, keylessSigningAllowed: true };
-  const images = [{ service: 'app', repo: 'ghcr.io/o/r/app' }];
+  const images = [{ service: 'app', repo: 'ghcr.io/o/r/pipegen-app' }];
   const signing = mode === 'key-env' ? { mode, images, cosignPubSha256: 'b'.repeat(64) } : { mode, images };
   const x = planned(profileOf([web()], { private: priv }), { caps, over: { ...(priv ? { centralPin: PIN } : {}), signing } as Partial<PipelineDraft> });
   return assembleFiles(x.draft, { gate: GATE, reviewed: REVIEWED, platform: p, mode, layout: priv ? 'central' : 'local', plan: x.plan, deploy: releaseJobs(x.draft, { platform: p }) } as Parameters<typeof assembleFiles>[1]);
@@ -142,9 +142,9 @@ describe('G15a-R10 r4-3: image-publish tags exactly the plan\'s image', () => {
   it('S11: another repository, another tag, another registry, two tags: each refused, every mode', async () => {
     for (const mode of MODES) {
       const a = signWorld(mode);
-      for (const tag of ['ghcr.io/o/r/other:pipegen', 'ghcr.io/o/r/app:latest', 'docker.io/o/r/app:pipegen', 'ghcr.io/o/r/app:pipegen,ghcr.io/o/r/other:pipegen']) {
+      for (const tag of ['ghcr.io/o/r/pipegen-other:pipegen', 'ghcr.io/o/r/pipegen-app:latest', 'docker.io/o/r/app:pipegen', 'ghcr.io/o/r/pipegen-app:pipegen,ghcr.io/o/r/pipegen-other:pipegen']) {
         const w = editApp(a, (js) => { const st = ((js.jobs as Obj)['image-publish'].steps as Obj[]).find((s) => s.id === 'pipegen-build-push') as Obj; (st.with as Obj).tags = tag; });
-        await refused(w, `S11 ${mode} ${tag}`, /tags must be exactly ghcr\.io\/o\/r\/app:pipegen/);
+        await refused(w, `S11 ${mode} ${tag}`, /tags must be exactly ghcr\.io\/o\/r\/pipegen-app:pipegen/);
       }
     }
   });

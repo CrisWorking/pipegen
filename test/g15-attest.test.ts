@@ -23,7 +23,7 @@ const OIDC = ['id', 'token'].join('-');
 const LINTERS: Linters = { actionlint: async () => '/stub', zizmor: async () => '/stub' };
 const deps = { reviewed: reviewedList(), platform: p };
 const SHA = 'a'.repeat(40);
-const IMG = { service: 'app', repo: 'ghcr.io/o/r/app' };
+const IMG = { service: 'app', repo: 'ghcr.io/o/r/pipegen-app' };
 const NEEDS = ['gate', 'image-publish'];
 const CAPS_BASE: Capabilities = { branchProtection: true, environments: false, envRequiredReviewers: false, deploymentBranchPolicies: false, attestations: false, codeScanning: true, keylessSigningAllowed: false };
 const ATTEST_CAPS: Capabilities = { ...CAPS_BASE, attestations: true, environments: true };
@@ -93,7 +93,7 @@ describe('G15a carries 10-12: the attest sign job', () => {
     const [file, caller] = attestSet(d) as [CreatedFile, CreatedFile];
     // the input table: the run-time form of the digest step of the same image, never a literal or another step's output
     expect(rendererInputProblems('actions/attest', { 'subject-name': IMG.repo, 'subject-digest': digestRef(IMG.repo) })).toEqual([]);
-    for (const bad of [`sha256:${'b'.repeat(64)}`, '${{ steps.other.outputs.digest }}', '${{ steps.pipegen-digest.outputs.digest }}', digestRef('ghcr.io/o/r/web'), '${{ env.DIGEST }}']) {
+    for (const bad of [`sha256:${'b'.repeat(64)}`, '${{ steps.other.outputs.digest }}', '${{ steps.pipegen-digest.outputs.digest }}', digestRef('ghcr.io/o/r/pipegen-web'), '${{ env.DIGEST }}']) {
       expect(rendererInputProblems('actions/attest', { 'subject-name': IMG.repo, 'subject-digest': bad }).length, bad).toBeGreaterThan(0);
       expect(() => renderPlatformStep('attest', p, { 'subject-name': IMG.repo, 'subject-digest': bad }), bad).toThrow(RenderError);
     }
@@ -112,7 +112,7 @@ describe('G15a carries 10-12: the attest sign job', () => {
     // the digest step gone (a step id that is not in the job)
     await refused((j) => { j.steps = [j.steps[0], j.steps[2]]; }, 'missing digest step');
     // another image name than the plan's
-    await refused((j) => { j.steps[2].with['subject-name'] = 'ghcr.io/o/r/other'; }, 'other image');
+    await refused((j) => { j.steps[2].with['subject-name'] = 'ghcr.io/o/r/pipegen-other'; }, 'other image');
     // the attestation kept out of the registry, or push-to-registry left to its default
     await refused((j) => { j.steps[2].with['push-to-registry'] = 'false'; }, 'push-to-registry false');
     await refused((j) => { delete j.steps[2].with['push-to-registry']; }, 'push-to-registry missing');
@@ -154,7 +154,7 @@ describe('G15a carries 10-12: the attest sign job', () => {
   it('referee: attest-mode image publishing needs the attest sign job', async () => {
     const d = at();
     const publish = { 'runs-on': 'ubuntu-24.04', 'timeout-minutes': 30, permissions: { contents: 'read', packages: 'write' }, 'cache-mode': 'none', if: DEPLOY_PUSH_IF, needs: ['gate'],
-      steps: [renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: 'ghcr.io/o/r/app:pipegen' }, { push: 'true' })] };
+      steps: [renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: 'ghcr.io/o/r/pipegen-app:pipegen' }, { push: 'true' })] };
     const base = appCaller(d, signCallerJob(d, 'attest', NEEDS) as Record<string, unknown>);
     const withPublish = (f: CreatedFile): CreatedFile => {
       const doc = parseDocument(f.content);

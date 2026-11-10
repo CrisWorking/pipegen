@@ -194,7 +194,7 @@ describe('GJ: G2/G3, G4 and G5 follow Plan J (a project type per service, fewer 
     }
     // a plan that still lists the site's image is narrowed the same way: nothing signs it (G3's functions agree)
     const k = cases[1]?.x as ReturnType<typeof planned>;
-    const withPlan: PipelineDraft = { ...k.draft, signing: { mode: 'key-env', images: [{ service: 'app', repo: 'ghcr.io/o/r/app' }], cosignPubSha256: 'a'.repeat(64) } };
+    const withPlan: PipelineDraft = { ...k.draft, signing: { mode: 'key-env', images: [{ service: 'app', repo: 'ghcr.io/o/r/pipegen-app' }], cosignPubSha256: 'a'.repeat(64) } };
     const deps = { reviewed: REVIEWED, platform: p };
     expect(sharedWorkflows(withPlan, 'key-env', deps)).toEqual([]);
     expect(signCallerJob(withPlan, 'key-env', ['gate', 'image-publish'])).toBeNull();
@@ -216,11 +216,11 @@ describe('GJ: G2/G3, G4 and G5 follow Plan J (a project type per service, fewer 
     const prof = profileOf([api, site], { existingWorkflows: [DEPLOY_WF] });
     // the API's DAST is left out here (its start is jobs-dast.test.ts's subject)
     const needs = floorNeeds(prof, CAPS).filter((n) => n.id !== 'dast');
-    const x = planned(prof, { needs, over: { signing: { mode: 'keyless', images: [{ service: 'api', repo: 'ghcr.io/o/r/api' }, { service: 'site', repo: 'ghcr.io/o/r/site' }] } } });
+    const x = planned(prof, { needs, over: { signing: { mode: 'keyless', images: [{ service: 'api', repo: 'ghcr.io/o/r/pipegen-api' }, { service: 'site', repo: 'ghcr.io/o/r/pipegen-site' }] } } });
     expect(x.draft.needs.filter((n) => n.layer === 'deploy' && n.id === 'signing').map((n) => n.service).sort()).toEqual(['api', 'site']);
     const a = assemble(x, 'keyless');
-    expect(a.draft.signing?.images).toEqual([{ service: 'api', repo: 'ghcr.io/o/r/api' }]);
-    expect(JSON.stringify(a.sign?.steps)).toContain('ghcr.io/o/r/api');
+    expect(a.draft.signing?.images).toEqual([{ service: 'api', repo: 'ghcr.io/o/r/pipegen-api' }]);
+    expect(JSON.stringify(a.sign?.steps)).toContain('ghcr.io/o/r/pipegen-api');
     expect(JSON.stringify(a.sign?.steps)).not.toContain('r-site');
     expect(a.notes.join('\n')).toMatch(/"site" builds no image, so its signing is report-only/);
     expect(a.notes.join('\n')).not.toMatch(/"api" builds no image/);
@@ -249,7 +249,7 @@ describe('GJ: the referee refuses a job, a check or a signature without its need
     const x = deployed(profileOf([site], { existingWorkflows: [DEPLOY_WF] }));
     const a = assemble(x, 'keyless');
     expect(shown(await judge(files(a), a.draft))).toBe('');
-    const signed = { ...a.draft, signing: { mode: 'keyless' as const, images: [{ service: 'app', repo: 'ghcr.io/o/r/app' }] } };
+    const signed = { ...a.draft, signing: { mode: 'keyless' as const, images: [{ service: 'app', repo: 'ghcr.io/o/r/pipegen-app' }] } };
     const r = await judge(files(a), signed);
     expect(r.issues.some((i) => i.check === 'permissions' && /signs the image of "app", but the plan builds no image for it/.test(i.message)), shown(r)).toBe(true);
   });
@@ -328,8 +328,8 @@ describe('GJ-R1: fix round 1 (reviews GJ security and spec)', () => {
     const api = node({ name: 'api', path: '.', dockerfile: 'Dockerfile', port: 3000, projectType: type('server') });
     const prof = profileOf([api, site], { existingWorkflows: [DEPLOY_WF] });
     const needs = floorNeeds(prof, CAPS).filter((n) => n.id !== 'dast');
-    const API = { service: 'api', repo: 'ghcr.io/o/r/api' };
-    for (const [label, img] of [['another spelling of the static site', { service: 'Site', repo: 'ghcr.io/o/r/site' }], ['no such service', { service: 'ghost', repo: 'ghcr.io/o/r/ghost' }]] as const) {
+    const API = { service: 'api', repo: 'ghcr.io/o/r/pipegen-api' };
+    for (const [label, img] of [['another spelling of the static site', { service: 'Site', repo: 'ghcr.io/o/r/pipegen-site' }], ['no such service', { service: 'ghost', repo: 'ghcr.io/o/r/pipegen-ghost' }]] as const) {
       const x = planned(prof, { needs, over: { signing: { mode: 'keyless', images: [API, img] } } });
       // the jobs: the other spelling of the static site is report-only; a service the profile does not have is refused
       if (img.service === 'ghost') expect(() => assemble(x, 'keyless'), label).toThrow(/signs the image of "ghost", which is no service of the repository/);

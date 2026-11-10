@@ -23,7 +23,7 @@ const lay = (x: Planned, over: Partial<AssembleOpts> = {}): CreatedFile[] => ass
 function keyEnv(): Planned {
   const plain = profileOf([node()], { private: true });
   const prof = profileOf([node({ dockerfile: 'Dockerfile' })], { private: true });
-  const plan: SigningPlan = { mode: 'key-env', images: [{ service: 'app', repo: 'ghcr.io/o/r/app' }], cosignPubSha256: createHash('sha256').update('a public key', 'utf8').digest('hex') };
+  const plan: SigningPlan = { mode: 'key-env', images: [{ service: 'app', repo: 'ghcr.io/o/r/pipegen-app' }], cosignPubSha256: createHash('sha256').update('a public key', 'utf8').digest('hex') };
   return planned(prof, { caps: KE_CAPS, needs: floorNeeds(plain, KE_CAPS), over: { centralPin: REAL_PIN, signing: plan } });
 }
 

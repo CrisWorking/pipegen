@@ -37,8 +37,8 @@ const LINTERS: Linters = { actionlint: async () => '/stub', zizmor: async () => 
 const deps = { reviewed: reviewedList(), platform: p };
 const PUB_SHA = createHash('sha256').update('a public key', 'utf8').digest('hex');
 const SHA = 'a'.repeat(40);
-const IMG = { service: 'app', repo: 'ghcr.io/o/r/app' };
-const IMG2 = { service: 'web', repo: 'ghcr.io/o/r/web' };
+const IMG = { service: 'app', repo: 'ghcr.io/o/r/pipegen-app' };
+const IMG2 = { service: 'web', repo: 'ghcr.io/o/r/pipegen-web' };
 /** The sign caller's real needs: the job holding the gate, and image-publish, whose digest it signs (G3-R2 M4). */
 const NEEDS = ['gate', 'image-publish'];
 
@@ -312,7 +312,7 @@ describe('G3: central shared files (Plan G Task 1)', () => {
 describe('G3 fix round 1 (G3-R2)', () => {
   const attestStep = (): Obj => {
     // (G15a: the subject-digest is the output of the image's digest step, never a literal)
-    const { usesComment: _c, ...rest } = renderPlatformStep('attest', p, { 'subject-name': 'ghcr.io/o/r/app', 'subject-digest': attestDigestRef('ghcr.io/o/r/app') }) as Obj;
+    const { usesComment: _c, ...rest } = renderPlatformStep('attest', p, { 'subject-name': 'ghcr.io/o/r/pipegen-app', 'subject-digest': attestDigestRef('ghcr.io/o/r/pipegen-app') }) as Obj;
     return rest;
   };
   const WIDE = { contents: 'read', packages: 'write', [OIDC]: 'write', attestations: 'write' };

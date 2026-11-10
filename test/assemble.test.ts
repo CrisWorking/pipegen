@@ -40,7 +40,7 @@ const OIDC = ['id', 'token'].join('-');
 const ref = (name: string): string => `\${{ ${SEC}.${name} }}`;
 const KE_CAPS: Capabilities = { ...CAPS, environments: true, deploymentBranchPolicies: true };
 const PUB_SHA = createHash('sha256').update('a public key', 'utf8').digest('hex');
-const IMG = { service: 'app', repo: 'ghcr.io/o/r/app' };
+const IMG = { service: 'app', repo: 'ghcr.io/o/r/pipegen-app' };
 
 type Planned = ReturnType<typeof planned>;
 const optsOf = (x: Planned, over: Partial<AssembleOpts> = {}): AssembleOpts => ({

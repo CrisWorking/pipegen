@@ -233,7 +233,7 @@ describe('G4 fix round 1: the referee egress backstop (G4-R1)', () => {
       expect((await judge([moved], a.draft)).issues.some((i) => /egress step/.test(i.message)), `${id} moved`).toBe(true);
     }
     // the keyless sign job runs without one (documented: its Sigstore and OIDC hosts are in no reviewed set)
-    const pub = planned(profileOf([web()]), { caps: { ...CAPS, keylessSigningAllowed: true }, over: { signing: { mode: 'keyless', images: [{ service: 'app', repo: 'ghcr.io/o/r/app' }] } } });
+    const pub = planned(profileOf([web()]), { caps: { ...CAPS, keylessSigningAllowed: true }, over: { signing: { mode: 'keyless', images: [{ service: 'app', repo: 'ghcr.io/o/r/pipegen-app' }] } } });
     const k = assemble(pub, 'keyless');
     const sign = { ...(k.sign as Obj), if: "github.event_name == 'push'", needs: ['gate'] };
     const r = await judge([wf({ ...k.merge, sign }, '.github/workflows/pipegen.yml', { push: { branches: ['main'] }, pull_request: null })], k.draft);

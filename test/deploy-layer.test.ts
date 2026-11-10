@@ -42,7 +42,7 @@ const KE_CAPS: Capabilities = { ...CAPS, environments: true, deploymentBranchPol
 const PIN = { repo: 'o/pipelines', sha: 'c'.repeat(40) };
 const PUB_TEXT = cosignPub(3);
 const PUB_SHA = createHash('sha256').update(PUB_TEXT, 'utf8').digest('hex');
-const IMG = { service: 'app', repo: 'ghcr.io/o/r/app' };
+const IMG = { service: 'app', repo: 'ghcr.io/o/r/pipegen-app' };
 const SERVER: Service = node({ dockerfile: 'Dockerfile', port: 3000 });
 const JD = { platform: p, reviewed: REVIEWED, linters: LINTERS, [['gh', 'Tok' + 'en'].join('')]: null, refereeDeps: { runLinters: async () => [] } } as unknown as Omit<Parameters<typeof judgeAssembled>[1], 'extra'>;
 
@@ -499,7 +499,7 @@ describe('G7: the release jobs, the referee and the carries', () => {
       expect(job.permissions).toEqual({ contents: 'read', packages: 'write' });
       const ids = job.steps.map((s) => s.id ?? '');
       expect(ids.slice(-3)).toEqual(['pipegen-build-push', PUBLISH_DIGEST_STEP_ID, '']);
-      expect(job.steps.at(-3)?.with).toMatchObject({ push: 'true', file: 'Dockerfile', tags: 'ghcr.io/o/r/app:pipegen' });
+      expect(job.steps.at(-3)?.with).toMatchObject({ push: 'true', file: 'Dockerfile', tags: 'ghcr.io/o/r/pipegen-app:pipegen' });
       // row 22: no publish token is mapped in v0.2; the only secret is the workflow token of the ghcr.io login
       const mapped = [...JSON.stringify(job).matchAll(/secrets\.([A-Z_]+)/g)].map((m) => m[1]);
       expect(new Set(mapped), kind).toEqual(new Set([TOK]));

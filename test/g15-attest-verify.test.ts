@@ -19,7 +19,7 @@ import { loadReviewed } from '../src/engine/reviewed.js';
 const GATE = REVIEWED.find((t) => t.id === 'pipegen-gate') as ReviewedTool;
 const AT_CAPS: Capabilities = { ...CAPS, attestations: true, environments: true };
 const PIN = { repo: 'o/pipelines', sha: 'c'.repeat(40) };
-const IMG = { service: 'app', repo: 'ghcr.io/o/r/app' };
+const IMG = { service: 'app', repo: 'ghcr.io/o/r/pipegen-app' };
 const SERVER: Service = node({ dockerfile: 'Dockerfile', port: 3000 });
 const JD = { platform: p, reviewed: REVIEWED, linters: LINTERS, [['gh', 'Tok' + 'en'].join('')]: null, refereeDeps: { runLinters: async () => [] } } as unknown as Omit<Parameters<typeof judgeAssembled>[1], 'extra'>;
 const HOSTS = ['tmaproduction.blob.core.windows.net', 'tuf-repo.github.com'];

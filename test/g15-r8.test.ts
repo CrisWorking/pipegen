@@ -61,7 +61,7 @@ function signWorld(mode: Mode, services: string[] = ['app']) {
   const caps: Capabilities = mode === 'attest' ? { ...CAPS, attestations: true, environments: true }
     : mode === 'key-env' ? { ...CAPS, environments: true, deploymentBranchPolicies: true, envRequiredReviewers: true } : { ...CAPS, keylessSigningAllowed: true };
   const svcs = services.map((s, i) => web(s, 3000 + i, i === 0 ? '.' : s));
-  const images = services.map((s) => ({ service: s, repo: `ghcr.io/o/r/${s}` }));
+  const images = services.map((s) => ({ service: s, repo: `ghcr.io/o/r/pipegen-${s}` }));
   const signing = mode === 'key-env' ? { mode, images, cosignPubSha256: 'b'.repeat(64) } : { mode, images };
   const x = planned(profileOf(svcs, { private: priv }), { caps, over: { ...(priv ? { centralPin: PIN } : {}), signing } as Partial<PipelineDraft> });
   const a = assembleFiles(x.draft, { gate: GATE, reviewed: REVIEWED, platform: p, mode, layout: priv ? 'central' : 'local', plan: x.plan, deploy: releaseJobs(x.draft, { platform: p }) } as Parameters<typeof assembleFiles>[1]);
@@ -80,7 +80,7 @@ function editSignNeeds(a: ReturnType<typeof signWorld>, needs: string[]): Return
 describe('G15a-R8 sec m3, m4: the sign job', () => {
   it('central: the attest sign job of two images holds every download first, then each image\'s digest and attest; the referee passes it, and one image\'s attest removed is published unsigned', async () => {
     // (v0.2 publishes one image per repository, publishedImageServices: the two-image job is the central file and its caller, as the reviewer's probe B0/B1)
-    const d = draftOf({ profile: { ...imageProf, private: true }, capabilities: { ...CAPS, attestations: true, environments: true }, centralPin: PIN, signing: { mode: 'attest', images: [{ service: 'app', repo: 'ghcr.io/o/r/app' }, { service: 'web', repo: 'ghcr.io/o/r/web' }] } });
+    const d = draftOf({ profile: { ...imageProf, private: true }, capabilities: { ...CAPS, attestations: true, environments: true }, centralPin: PIN, signing: { mode: 'attest', images: [{ service: 'app', repo: 'ghcr.io/o/r/pipegen-app' }, { service: 'web', repo: 'ghcr.io/o/r/pipegen-web' }] } });
     const central = sharedWorkflows(d, 'attest', { reviewed: reviewedList(), platform: GP })[0] as CreatedFile;
     const steps = ((parse(central.content) as Obj).jobs.sign as Obj).steps as Obj[];
     const kinds = steps.map((s) => (/download-artifact/.test(String(s.uses)) ? 'download' : /actions\/attest/.test(String(s.uses)) ? 'attest' : 'digest'));
@@ -90,7 +90,7 @@ describe('G15a-R8 sec m3, m4: the sign job', () => {
       const doc = parseDocument(base.content);
       doc.setIn(['jobs', SIGN_JOB_ID], doc.createNode(signCallerJob(d, 'attest', ['gate', 'image-publish'])));
       doc.setIn(['jobs', 'image-publish'], doc.createNode({ 'runs-on': 'ubuntu-24.04', 'timeout-minutes': 30, permissions: { contents: 'read', packages: 'write' }, 'cache-mode': 'none', if: DEPLOY_PUSH_IF, needs: ['gate'],
-        steps: [renderPlatformStep('build-push', GP, { file: 'Dockerfile', tags: 'ghcr.io/o/r/app:pipegen' }, { push: 'true' })] }));
+        steps: [renderPlatformStep('build-push', GP, { file: 'Dockerfile', tags: 'ghcr.io/o/r/pipegen-app:pipegen' }, { push: 'true' })] }));
       return { ...base, content: doc.toString({ lineWidth: 0 }) };
     };
     const run = (files: CreatedFile[]) => referee(files, d, GP, reviewedList(), LINTERS, 'tok', { runLinters: async () => [] });
