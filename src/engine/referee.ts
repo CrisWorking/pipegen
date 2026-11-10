@@ -27,6 +27,7 @@
 // - The gate's check name comes from GATE_CHECK_NAME; the blocking rule (B7) demotes a findings check whose tool writes no
 //   SARIF; findSecretLike runs over every file (S18). The workflow linters (actionlint, zizmor) run through `deps.runLinters`
 //   (default: linters.ts runLinters, 7b), which tests replace with a stub.
+import { servicesByName } from './names.js';
 import { isDeepStrictEqual } from 'node:util';
 import { isMap, isScalar, isSeq, LineCounter, visit, type Document, type Node as YamlNode, type Pair } from 'yaml';
 import { findSecretLike } from '../ai/redact.js';
@@ -1240,7 +1241,7 @@ function judgeImageHandoff(fc: FileCtx, id: string, where: string, j: Obj, judge
       // G15a-R11 r5-2: bound to the PUBLISHED service (publishedImageServices: exactly one in v0.2), never to any root service whose
       // Dockerfile the build names: its Dockerfile, and (G15a-R10 r4-3) exactly its image, the one the sign job signs (the renderer's helper)
       const published = publishedImageServices(fc.draft.profile, fc.draft.capabilities);
-      const pubSvc = published.length === 1 ? fc.draft.profile.services.find((svc) => svc.name === published[0]) : undefined;
+      const pubSvc = published.length === 1 ? servicesByName(fc.draft.profile).get(published[0] as string) : undefined;
       if (pubSvc === undefined) {
         bad('template', `${at}: build-push in image-publish builds the Dockerfile of a service at the repository root that pipegen publishes, and this plan publishes ${published.length === 0 ? 'none' : 'more than one'}.`);
       } else {

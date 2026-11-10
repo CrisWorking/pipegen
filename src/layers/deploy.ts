@@ -17,6 +17,7 @@
 //   flag, B-T1a: only environments a deploy job really uses) and pipegen-signing whenever the repository has environments; existing ones
 //   are read first (created false, their previous settings kept for uninstall).
 // - generateCosignKeys: the key pair made by the pinned cosign in a memory-backed folder only (never on disk), removed after.
+import { servicesByName } from '../engine/names.js';
 import { statfsSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import type { Octokit } from '@octokit/rest';
@@ -521,7 +522,7 @@ export function releaseJobs(draft: PipelineDraft, deps: { platform: PlatformActi
   if (services.length === 0) return {};
   if (services.length > 1) fail(`pipegen publishes one image per repository in v0.2, and this plan would publish ${services.length} (${services.map(show).join(', ')}).`);
   const name = services[0] as string;
-  const svc = draft.profile.services.find((s) => s.name === name);
+  const svc = servicesByName(draft.profile).get(name);
   if (svc === undefined || typeof svc.dockerfile !== 'string') return fail(`The service ${show(name)} has no Dockerfile to publish.`);
   let repo: string;
   try { repo = publishedImageRepo(draft.profile.owner, draft.profile.repo, name); } catch (e) { if (e instanceof RenderError) return fail(e.message); throw e; }

@@ -10,6 +10,7 @@
 // - No base twin: the base commit's app is not started (C-MUST-1); the gate reads "couldn't run on the base".
 // Residual (PIPEGEN.md): the raw result is uploaded unscrubbed between the two jobs of one run; it holds only what an app with no secret
 // answered. A hostile app can always answer a scanner cleanly: DAST finds honest mistakes, it does not judge a hostile pull request.
+import { servicesByName } from './names.js';
 import { planCompose, COMPOSE_PATH } from '../create/compose.js';
 import type { PipelineDraft, ReviewedTool, RuntimeEnv, StepSpec } from '../types.js';
 import { slug } from './artifact-names.js';
@@ -82,7 +83,7 @@ const validPort = (n: unknown): n is number => typeof n === 'number' && Number.i
  * renderable image-build step) and the service has a port. Shared by the assembler and the referee, so both render the same steps.
  */
 export function dastStartOf(draft: PipelineDraft, service: string, baseImages: readonly BaseImage[] = loadBaseImages()): DastStart | { problem: string } {
-  const svc = draft.profile.services.find((s) => s.name === service);
+  const svc = servicesByName(draft.profile).get(service);
   if (svc === undefined) return { problem: 'it is not a service pipegen found' };
   const file = draft.created.find((f) => f.repo === 'app' && f.path === COMPOSE_PATH);
   if (file !== undefined) {
@@ -92,7 +93,7 @@ export function dastStartOf(draft: PipelineDraft, service: string, baseImages: r
   }
   const build = draft.steps.find((s) => s.needId === IMAGE_BUILD_NEED && s.service === service && s.tool.id === PLATFORM_ACTION_IDS['build-push']);
   // G17B-R0: a Dockerfile pipegen creates in this draft counts (imageProfile, the image build's own source)
-  const dockerfile = imageProfile(draft.profile, draft.created).services.find((s) => s.name === service)?.dockerfile;
+  const dockerfile = servicesByName(imageProfile(draft.profile, draft.created)).get(service)?.dockerfile;
   if (build === undefined || (dockerfile ?? '') === '') return { problem: 'it has no container image pipegen builds (a Dockerfile it builds, or pipegen\'s compose file), and pipegen starts the app for a scan in a container only' };
   if (!validPort(svc.port)) return { problem: 'pipegen found no port the app listens on, so there is nothing to scan' };
   return { kind: 'archive', port: svc.port, url: `http://127.0.0.1:${svc.port}` };

@@ -1,6 +1,8 @@
 // Patterns for tool identifiers that come from the network or the AI (Plan B ruling S14). Every one is checked
 // before it is used in a request, and path segments are still encoded with encodeURIComponent after the check.
 
+import type { Service } from '../types.js';
+
 /** GitHub `owner/name`: owner as GitHub allows it (max 39), name of letters, digits, `.`, `_`, `-` (never `.` or `..`). */
 const GITHUB_REPO_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9._-]{1,100}$/;
 /** npm package name, as the registry accepts new names: lower case, optional @scope/, max 214. */
@@ -132,4 +134,14 @@ export function advisoryVersion(v: string, shape: 'semver' | 'pep440'): string |
   if (typeof v !== 'string' || v.length > 64) return null;
   const bare = /^[vV]\d/.test(v) ? v.slice(1) : v;
   return (shape === 'pep440' ? PEP440_RE : SEMVER_RE).test(bare) ? bare : null;
+}
+
+/**
+ * A profile's services by name, built once per call site. When two services share a name the first wins, exactly as
+ * `services.find((s) => s.name === name)` did.
+ */
+export function servicesByName(profile: { readonly services: readonly Service[] }): ReadonlyMap<string, Service> {
+  const map = new Map<string, Service>();
+  for (const s of profile.services) if (!map.has(s.name)) map.set(s.name, s);
+  return map;
 }

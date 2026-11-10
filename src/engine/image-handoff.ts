@@ -8,6 +8,7 @@
 //   BEFORE anything reads it, then scans it with `--input` (trivy) or `docker-archive:` (syft). The scan step is the reviewed tool's own
 //   rendered step with its image target replaced by the archive (one transform, used by the renderer and the referee alike).
 // - No base twin of an archive scan exists (B6: there is no base build yet); the gate reads "couldn't run on the base".
+import { servicesByName } from './names.js';
 import { slug } from './artifact-names.js';
 import {
   IMAGE_ARCHIVE_FILE, IMAGE_ARCHIVE_STEP_ID, IMAGE_SHA_ENV, IMAGE_SHA_OUTPUT, imageArchiveArtifact, imageCheckStepId, imageShaRef, stepOutputForm, type RenderedStep,
@@ -49,7 +50,7 @@ const bash = pipegenScriptStep;
 /** The service of a spec, with a slug (an image is per service). */
 function serviceOf(spec: StepSpec, ctx: RenderContext): string {
   const name = spec.service;
-  if (name === undefined || !ctx.profile.services.some((s) => s.name === name)) throw new RenderError('An image build or scan belongs to one service of this repository.');
+  if (name === undefined || !servicesByName(ctx.profile).has(name)) throw new RenderError('An image build or scan belongs to one service of this repository.');
   slug(name);
   return name;
 }
@@ -77,7 +78,7 @@ export function renderImageArchiveStep(service: string): RenderedStep {
 export function renderImageBuild(spec: StepSpec, buildPush: ReviewedTool, platform: PlatformActions, ctx: RenderContext): { steps: RenderedStep[]; outputs: Record<string, string> } {
   if (spec.needId !== 'image-build') throw new RenderError(`An image build renders the image-build check, not ${show(spec.needId)}.`);
   const service = serviceOf(spec, ctx);
-  const svc = ctx.profile.services.find((s) => s.name === service);
+  const svc = servicesByName(ctx.profile).get(service);
   if (svc?.dockerfile === undefined || svc.dockerfile === '') throw new RenderError(`The service ${show(service)} has no Dockerfile to build.`);
   if (spec.choices.push !== undefined && spec.choices.push !== 'false') throw new RenderError('An image build for a check never pushes (B6): the scanners get the image as an archive.');
   // a build for a check is always blocking-safe: push false, whatever the need says
