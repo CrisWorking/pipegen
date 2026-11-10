@@ -271,7 +271,7 @@ describe('G-FINREC-R1 sec M1 / spec I1: verify reports a rule after pipegen\'s b
     const s = await seed();
     await runFinish(s);
     expect(await coDrift(s)).toEqual([]);
-    tamper(s, 'o/pipelines', CO, `${liveCo(s) as string}/src/main.c @bob\n`);
+    tamper(s, 'o/pipelines', CO, `${liveCo(s) as string}/src/*.c @bob\n`);
     expect(await coDrift(s)).toEqual([]);
   });
 
@@ -331,7 +331,7 @@ describe('G-FINREC-R1 sec M1 / spec I1: verify reports a rule after pipegen\'s b
     for (const bad of ['*', '* @bob', '** @bob', '/installs/', '/installs/** @a @bob', '.github/ @bob', '/.github/workflows/*.yml @bob', '*.yaml @bob', '*.json @bob', 'installs/ @o/team', 'CODEOWNERS @bob', '/.github/ @a @o/team', 'docs/CODEOWNERS @bob', '/docs/ @bob']) {
       expect(after(`${bad}\n`), bad).toEqual([bad]);
     }
-    for (const ok of ['/src/main.c @bob', '/installs/ @a', '* @A @b', '# a comment', '', '/README.md', '/.github/workflows/ @a @b']) {
+    for (const ok of ['/src/*.c @bob', '/docs/*.md @bob', '/installs/ @a', '* @A @b', '# a comment', '', '/.github/workflows/ @a @b']) {
       expect(after(`${ok}\n`), ok).toEqual([]);
     }
     // before the block: the block wins (last match), never drift
@@ -350,6 +350,11 @@ describe('G-FINREC-R1 sec M1 / spec I1: verify reports a rule after pipegen\'s b
     for (const rule of ['**/foo @bob', '/.github/** @bob', '/.git* @bob', '/.github/workflows @bob', '/installs/sub/** @bob', '/* @bob', '/**/x.yml @bob']) expect(over(rule), rule).toEqual([rule]);
     // a protected file named anywhere (a bare name): a folder rule, or a last part that matches the name
     for (const rule of ['/src/ @bob', '/src/** @bob', '/a/b/CODEOWNERS @bob', '/a/*OWNERS @bob']) expect(over(rule), rule).toEqual([rule]);
+    // a literal last part can name a folder (the gate's `ancestors`): a name that may hold an any-depth protected file covers it
+    const names = ['lefthook.yml', '**/.gitleaks.toml'];
+    for (const rule of ['docs @bob', '/src @bob', '/a/foo @bob', 'svc @bob', '/src/main.c @bob', 'a\\*b @bob']) expect(over(rule, names), rule).toEqual([rule]);
+    for (const rule of ['/src/*.c @bob', '*.c @bob', '/a/*.md @bob']) expect(over(rule, names), rule).toEqual([]);
+    expect(over('/docs/*.yml @bob', names)).toEqual(['/docs/*.yml @bob']);
     // no overlap
     const dirs = ['.github/workflows/**', 'installs/**', '.github/CODEOWNERS'];
     for (const rule of ['/docs/ @bob', '/src/*.ts @bob', '/.github/workflows.bak/x @bob', '/README.md', '/.github/dependabot.yml @bob']) expect(over(rule, dirs), rule).toEqual([]);
