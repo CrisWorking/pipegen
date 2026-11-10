@@ -263,7 +263,7 @@ describe('G15a round 6: the nightly ZAP AF pair', () => {
   it('referee: the AF scan is recognised only for a DAST check of the merge layer', async () => {
     const { a, fs } = world();
     const draft = { ...a.draft, needs: a.draft.needs.map((n) => (n.id === 'dast' ? { ...n, layer: 'push' as const } : n)) };
-    expect(shown(await judge(fs, draft))).toMatch(/"pipegen: pull the zap\.sh image" is not a step pipegen renders|zap\.sh/);
+    expect(shown(await judge(fs, draft))).toMatch(/"Pull the zap\.sh image" is not a step pipegen renders|zap\.sh/);
   });
 
   it('referee: a draft that picks the AF entry for the merge-layer DAST check is refused (nightly only)', async () => {

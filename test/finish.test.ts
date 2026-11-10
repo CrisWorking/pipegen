@@ -112,6 +112,7 @@ async function seed(o: SeedOpts = {}): Promise<Seed> {
     writers: { app: ['a', 'b'], central: ['a', 'b'] }, owners: ['@a', '@b'], orgAdmin: o.org === true ? true : false,
     shaPinning: { state: 'read', enabled: true, allowedActions: 'all', required: false }, protectedPaths: PROTECTED,
     appCodeowners: { original: CO_ORIG, isSymlink: false, inserted: null }, ids: { app: app.id, central: central.id }, files,
+    version: '0.2.0',   // PL-D1-R1: the version of the record below (not the package's 0.1.0): finish plans the required workflow again with the record's version, so the central file's sha still matches
   });
   const co = locks.codeowners?.file.content as string;
   app.refs.set(`heads/${SETUP_BRANCH}`, g.head('o/r'));
@@ -704,6 +705,8 @@ describe('G11 finish: carries (G8, G10)', () => {
     const res = await finish(t.g.octokit(), { owner: 'o', repo: 'r' }, {}, t.deps());
     expect(t.g.orgRulesets.size).toBe(0);
     expect(res.skipped.find((x) => /org required workflow/.test(x.what))?.why).toMatch(/doesn't hold/);
+    // PL-D1 Fold R2 (security I4): both ways on: merge the open central pull request, or run pipegen again
+    expect(res.skipped.find((x) => /org required workflow/.test(x.what))?.why).toMatch(/central pull request.*still open, merge it.*otherwise run pipegen again/i);
   });
 
   it('finish: sends only allow-listed routes; a route the record plans that pipegen never makes is refused, never sent', async () => {

@@ -91,7 +91,7 @@ const CURL = "printf 'Authorization: Bearer %s\\n' \"$TOKEN\" | curl -fsS --prot
  */
 export function renderHeadCheckStep(defaultBranch: string): RenderedStep {
   const branch = branchOf(defaultBranch);
-  const step = pipegenScriptStep(HEAD_CHECK_STEP_ID, 'pipegen: the deployed commit is the head of the default branch', [
+  const step = pipegenScriptStep(HEAD_CHECK_STEP_ID, 'Check the deployed commit is the head of the default branch', [
     // G7-R2 1b: the check runs on the user's own runner or container too (the first step of each gated deploy job), so it says plainly which
     // tool is missing rather than failing with "command not found"
     'for t in curl jq; do command -v "$t" > /dev/null || pg_fail "this job\'s runner or container has no $t, which pipegen\'s head check needs; install $t there, or run this deploy job on ubuntu-latest"; done',
@@ -118,7 +118,7 @@ export function renderHeadCheckStep(defaultBranch: string): RenderedStep {
  */
 export function renderDigestStep(service: string): RenderedStep {
   const artifact = artifactOf(service);
-  return pipegenScriptStep(DIGEST_STEP_ID, `pipegen: the image digest of ${slug(service)} from the gated run`, [
+  return pipegenScriptStep(DIGEST_STEP_ID, `Read the image digest of ${slug(service)} from the gated run`, [
     'run_id="$PIPEGEN_RUN_ID"',
     idCheck('run_id', 'find-run gave no run id, so there is no gated run to read the digest from'),
     'TOKEN="$PIPEGEN_DIGEST_TOKEN"',
@@ -157,7 +157,7 @@ export function renderDigestStep(service: string): RenderedStep {
 export function renderPublishDigestStep(service: string, imageRepo: string): RenderedStep {
   const artifact = artifactOf(service);
   if (typeof imageRepo !== 'string' || !IMAGE_REPO_RE.test(imageRepo) || imageRepo.length > 255) throw new RenderError(`The published image repository ${show(String(imageRepo))} is not pipegen's plain ghcr.io form, so its digest can not be checked.`);
-  return pipegenScriptStep(PUBLISH_DIGEST_STEP_ID, `pipegen: the digest of the published image of ${slug(service)}`, [
+  return pipegenScriptStep(PUBLISH_DIGEST_STEP_ID, `Read the digest of the published image of ${slug(service)}`, [
     'digest="$PIPEGEN_IMAGE_DIGEST"',
     'image_id="$PIPEGEN_IMAGE_ID"',
     'if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then pg_fail "the image build gave no sha256:<64 hex> digest"; fi',

@@ -37,6 +37,7 @@ import { RenderError, show } from '../engine/render-error.js';
 import { renderPlatformStep, stepsToYaml } from '../engine/render-step.js';
 import { COSIGN_ID, imageDigestArtifact, renderAttestDigestStep, renderSignSteps, SIGN_REGISTRY, signedImageOwner, type SignedImage } from '../engine/signing.js';
 import { egressSetsForTool, renderEgressStep } from '../engine/egress.js';
+import { lookOf, workflowHeader } from './workflow-look.js';
 import { signingMode, type SigningMode } from '../github/signing-mode.js';
 import type { Capabilities, CreatedFile, PipelineDraft, RepoProfile, ReviewedTool, SigningPlan } from '../types.js';
 
@@ -182,7 +183,7 @@ export function signJob(draft: PipelineDraft, mode: SigningMode, deps: { reviewe
   const install = rendered[0]?.[0] as RenderedStep;
   for (const r of rendered) if (r.length !== 2 || JSON.stringify(r[0]) !== JSON.stringify(install)) throw new RenderError('The cosign install differs between images, so the sign job can not be written.');
   const job: SignJob = {
-    name: 'pipegen sign', 'runs-on': SIGN_RUNNER, 'timeout-minutes': SIGN_JOB_MINUTES, permissions: signPermissions(plan.mode),
+    name: 'Sign the images', 'runs-on': SIGN_RUNNER, 'timeout-minutes': SIGN_JOB_MINUTES, permissions: signPermissions(plan.mode),
     'cache-mode': 'none', steps: [...downloads, install, ...rendered.map((r) => r[1] as RenderedStep)],
   };
   // G4 (carry G3 ruling 5): key-env's egress block first; keyless has none (see the header)
@@ -212,7 +213,7 @@ function attestJob(plan: SigningPlan & { mode: SignMode }, platform: PlatformAct
     const digest = renderAttestDigestStep(i);
     return [digest, renderPlatformStep('attest', platform, { 'subject-name': i.repo, 'subject-digest': `\${{ steps.${digest.id as string}.outputs.digest }}` })];
   })];
-  return { name: 'pipegen sign', 'runs-on': SIGN_RUNNER, 'timeout-minutes': SIGN_JOB_MINUTES, permissions: signPermissions('attest'), 'cache-mode': 'none', steps };
+  return { name: 'Sign the images', 'runs-on': SIGN_RUNNER, 'timeout-minutes': SIGN_JOB_MINUTES, permissions: signPermissions('attest'), 'cache-mode': 'none', steps };
 }
 
 /** The project's central sign workflow path (central-path.ts), from the draft's repository name. */
@@ -229,7 +230,7 @@ const recordsOnly = (draft: PipelineDraft): boolean => draft.profile.private !==
  * The central files of the project that are not per layer: its sign workflow, `.github/workflows/<project>--sign.yml` (workflow_call only,
  * no input, the one job `sign`), or nothing for mode none, the proof, a records-only `pipelines`, and a plan whose services build no image (GJ). Throws as signJob does.
  */
-export function sharedWorkflows(draft: PipelineDraft, mode: SigningMode, deps: { reviewed: readonly ReviewedTool[]; platform: PlatformActions }): CreatedFile[] {
+export function sharedWorkflows(draft: PipelineDraft, mode: SigningMode, deps: { reviewed: readonly ReviewedTool[]; platform: PlatformActions; /** PL-D1: the version the header names (null or absent: none) */ version?: string | null }): CreatedFile[] {
   if (recordsOnly(draft)) return [];
   if (planFor(draft, mode) === null) return [];
   const job = signJob(draft, mode, deps);
@@ -238,7 +239,9 @@ export function sharedWorkflows(draft: PipelineDraft, mode: SigningMode, deps: {
   const { steps, ...rest } = job;
   doc.contents = doc.createNode({ name: 'pipegen sign', on: { workflow_call: {} }, permissions: {}, jobs: { [SIGN_JOB_ID]: rest } });
   doc.setIn(['jobs', SIGN_JOB_ID, 'steps'], stepsToYaml(steps));
-  doc.commentBefore = ` pipegen: signs ${draft.profile.repo}'s images (${job.environment === undefined ? '' : `environment ${SIGNING_ENVIRONMENT}, `}${mode}); called only by its deploy job, written by pipegen.`;
+  const comment = `pipegen: signs ${draft.profile.repo}'s images (${job.environment === undefined ? '' : `environment ${SIGNING_ENVIRONMENT}, `}${mode}); called only by its deploy job.`;
+  // PL-D1: the same header and banner as every pipegen workflow (the sign job is "build and release")
+  lookOf(doc, [{ id: SIGN_JOB_ID, part: 4 }], workflowHeader({ comment, runs: 'when pipegen.yml calls it (after the images are published, on a push to the default branch)', version: deps.version ?? null }));
   return [{ path, content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: `Signs the images of ${draft.profile.repo} after a push to its default branch (${mode}).`, repo: 'central' }];
 }
 
@@ -261,5 +264,5 @@ export function signCallerJob(draft: PipelineDraft, mode: SigningMode, needs: re
   if (pin === undefined || typeof pin.repo !== 'string' || typeof pin.sha !== 'string' || typeof owner !== 'string' || pin.repo.toLowerCase() !== `${owner.toLowerCase()}/pipelines` || !isGitHubRepo(pin.repo) || !COMMIT_SHA_RE.test(pin.sha)) {
     throw new RenderError('The sign workflow is called from the central <owner>/pipelines repo at the commit pipegen recorded, and the draft has no such central pin.');
   }
-  return { uses: `${pin.repo}/${signFilePath(draft)}@${pin.sha}`, if: DEPLOY_PUSH_IF, needs: [...needs], permissions: signPermissions(plan.mode) };
+  return { name: 'Sign the images', uses: `${pin.repo}/${signFilePath(draft)}@${pin.sha}`, if: DEPLOY_PUSH_IF, needs: [...needs], permissions: signPermissions(plan.mode) };
 }

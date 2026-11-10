@@ -5,7 +5,7 @@
     package-manager-cache: "false"
     node-version: "24"
 - id: repocode-c283698d8c9e3537
-  name: "pipegen: run prettier"
+  name: Run prettier
   run: |-
     set -euo pipefail
     unset CDPATH
@@ -85,6 +85,52 @@
     BASH_ENV: ""
     ENV: ""
     PIPEGEN_CONFIG: "# pipegen's pinned prettier ignore file: nothing is ignored here, so a .gitignore in the checkout hides no file\n"
-    PIPEGEN_NPM_LOCK: "{\"name\":\"pipegen-closure\",\"version\":\"0.0.0\",\"lockfileVersion\":3,\"requires\":true,\"packages\":{\"\":{\"name\":\"pipegen-closure\",\"version\":\"0.0.0\",\"dependencies\":{\"prettier\":\"3.9.10\"}},\"node_modules/prettier\":{\"version\":\"3.9.10\",\"resolved\":\"https://registry.npmjs.org/prettier/-/prettier-3.9.10.tgz\",\"integrity\":\"sha512-skGHTH1Yb9QvaTC4hWnRTzEYtCpApF0UMBPz+t/0ZPzP8ihefo/btKd+QA7pUE0fEwA1SbS/NmhyEcstdXOIdA==\",\"license\":\"MIT\",\"bin\":{\"prettier\":\"bin/prettier.cjs\"},\"engines\":{\"node\":\">=14\"},\"funding\":{\"url\":\"https://github.com/prettier/prettier?sponsor=1\"}}}}"
-    PIPEGEN_NPM_PACKAGE: "{\"name\":\"pipegen-closure\",\"version\":\"0.0.0\",\"private\":true,\"dependencies\":{\"prettier\":\"3.9.10\"}}"
-    PIPEGEN_NPM_EXPECT: "[{\"name\":\"prettier\",\"version\":\"3.9.10\",\"integrity\":\"sha512-skGHTH1Yb9QvaTC4hWnRTzEYtCpApF0UMBPz+t/0ZPzP8ihefo/btKd+QA7pUE0fEwA1SbS/NmhyEcstdXOIdA==\",\"resolved\":\"https://registry.npmjs.org/prettier/-/prettier-3.9.10.tgz\"}]"
+    PIPEGEN_NPM_LOCK: |-
+      {
+        "name": "pipegen-closure",
+        "version": "0.0.0",
+        "lockfileVersion": 3,
+        "requires": true,
+        "packages": {
+          "": {
+            "name": "pipegen-closure",
+            "version": "0.0.0",
+            "dependencies": {
+              "prettier": "3.9.10"
+            }
+          },
+          "node_modules/prettier": {
+            "version": "3.9.10",
+            "resolved": "https://registry.npmjs.org/prettier/-/prettier-3.9.10.tgz",
+            "integrity": "sha512-skGHTH1Yb9QvaTC4hWnRTzEYtCpApF0UMBPz+t/0ZPzP8ihefo/btKd+QA7pUE0fEwA1SbS/NmhyEcstdXOIdA==",
+            "license": "MIT",
+            "bin": {
+              "prettier": "bin/prettier.cjs"
+            },
+            "engines": {
+              "node": ">=14"
+            },
+            "funding": {
+              "url": "https://github.com/prettier/prettier?sponsor=1"
+            }
+          }
+        }
+      }
+    PIPEGEN_NPM_PACKAGE: |-
+      {
+        "name": "pipegen-closure",
+        "version": "0.0.0",
+        "private": true,
+        "dependencies": {
+          "prettier": "3.9.10"
+        }
+      }
+    PIPEGEN_NPM_EXPECT: |-
+      [
+        {
+          "name": "prettier",
+          "version": "3.9.10",
+          "integrity": "sha512-skGHTH1Yb9QvaTC4hWnRTzEYtCpApF0UMBPz+t/0ZPzP8ihefo/btKd+QA7pUE0fEwA1SbS/NmhyEcstdXOIdA==",
+          "resolved": "https://registry.npmjs.org/prettier/-/prettier-3.9.10.tgz"
+        }
+      ]

@@ -38,27 +38,32 @@
 import { isDeepStrictEqual } from 'node:util';
 import { Document, isMap, isScalar, isSeq, parse, type Scalar } from 'yaml';
 import { centralWorkflowFile, centralWorkflowPath, type CentralLayer } from '../engine/central-path.js';
+import { partOf, type PartId } from '../audit/parts.js';
 import { dependabotFile } from '../engine/created-builders.js';
 import {
-  CALLER_WORKFLOW, createdPathProblem, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, jobOutputsFor, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PR_CHECK_IF, PR_CHECK_JOB, SCORECARD_CRON, SCORECARD_IF, SCORECARD_JOB,
+  BASE_SCAN_JOB, BASELINE_CHECK_JOB, CALLER_WORKFLOW, CODE_SCANNING_JOB, createdPathProblem, dastLaneOf, dastRunJobId, GATE_JOB, IMAGE_BUILD_NEED, imageBuildJobId, defaultPushTrigger, DEPLOY_PUSH_IF, featurePushTrigger, jobOutputsFor, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PR_CHECK_IF, PR_CHECK_JOB, SCORECARD_CRON, SCORECARD_IF, SCORECARD_JOB,
   PR_REVIEW_TRIGGER, PUSH_WORKFLOW, renderPrCheckStep, WORKFLOW_CONCURRENCY, type RenderedStep,
 } from '../engine/job-rules.js';
 import { COMMIT_SHA_RE, isGitHubRepo } from '../engine/names.js';
 import type { PlatformActions } from '../engine/pin.js';
+import { byPart, lookOf, workflowHeader } from './workflow-look.js';
 import { signingMode, type SigningMode } from '../github/signing-mode.js';
 import { JOB_PERMISSIONS, referee, SIGNING_ENVIRONMENT, type Linters, type RefereeDeps, type RefereeReport } from '../engine/referee.js';
 import { RenderError } from '../engine/render-error.js';
 import { renderFindRunStep, stepsToYaml } from '../engine/render-step.js';
 import { FIND_RUN_STEP_ID, renderDigestStep, renderHeadCheckStep } from '../engine/deploy-steps.js';
 import { slug } from '../engine/artifact-names.js';
+import { jobIdFor } from '../engine/gate-job-list.js';
 import { ATTEST_VERIFY_SETS, EGRESS_DOMAIN_SETS, egressSetsForTool, KEYLESS_VERIFY_SETS } from '../engine/egress.js';
 import type { EgressSet } from '../engine/egress-sets.js';
 import { publishedImageServices } from '../engine/needs.js';
 import { COSIGN_ID, GH_ID, renderVerifySteps, type SignedImage } from '../engine/signing.js';
 import type { BaseImage } from '../engine/base-images.js';
+import { jobName } from './job-names.js';
 import { IMAGE_PUBLISH_JOB, sharedWorkflows, signCallerJob, signPermissions, SIGN_JOB_ID } from './central.js';
 import { AssembleError, assembleJobs, egressStepFor, JOB_RUNNER, type Job, type JobsPlan, type UncoveredMinimum } from './jobs.js';
 import type { CreatedFile, PipelineDraft, ReviewedTool } from '../types.js';
+import { packageVersion, PLAIN_VERSION_RE } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
 
 // ---------- constants ----------
@@ -149,6 +154,8 @@ export type Layout = 'central' | 'local';
 export interface AssembleOpts {
   gate: ReviewedTool; reviewed: readonly ReviewedTool[]; platform: PlatformActions; mode: SigningMode; layout: Layout; plan: JobsPlan;
   deploy?: Readonly<Record<string, Job>>; dependabot?: string; baseImages?: readonly BaseImage[];
+  /** PL-D1: the pipegen version the file headers name (a plain version, or null for none). Absent: the running package's version. Never a date. */
+  version?: string | null;
 }
 /** A reusable-workflow caller job as pipegen writes it. */
 export interface CallerJob { name?: string; uses: string; needs?: string[]; if?: string; permissions: Record<string, 'read' | 'write'>; secrets?: Record<string, string> }
@@ -257,17 +264,46 @@ function ordered(j: Job): Job {
   return out as unknown as Job;
 }
 
-interface WorkflowSpec { path: string; repo: CreatedFile['repo']; name: string; on: Obj; concurrency?: boolean; jobs: Readonly<Record<string, Job | CallerJob>>; reason: string; comment: string }
+interface WorkflowSpec {
+  path: string; repo: CreatedFile['repo']; name: string; on: Obj; concurrency?: boolean; jobs: Readonly<Record<string, Job | CallerJob>>; reason: string; comment: string;
+  /** PL-D1: when the file runs (finishes "When it runs:", no trailing full stop), and the part each job belongs to (PL-A1 `partOf`). */
+  runs: string; version: string | null; partOfJob: (id: string) => PartId | undefined;
+}
 
-/** A workflow file: `permissions: {}`, the jobs (steps through stepsToYaml), the not-proven mark on the gate step's not-proven line. */
+/** A workflow file: `permissions: {}`, the jobs (steps through stepsToYaml) by part with a banner per part and a blank line between jobs, the not-proven mark on the gate step's not-proven line. */
 function workflowFile(w: WorkflowSpec): CreatedFile {
   const doc = new Document();
-  const plain = Object.fromEntries(Object.entries(w.jobs).map(([id, j]) => { const { steps: _s, ...rest } = j as Job; return [id, rest]; }));
+  const order = byPart(Object.keys(w.jobs), w.partOfJob);
+  const plain = Object.fromEntries(order.map(({ id }) => { const { steps: _s, ...rest } = w.jobs[id] as Job; return [id, rest]; }));
   doc.contents = doc.createNode({ name: w.name, on: w.on, permissions: {}, ...(w.concurrency === true ? { concurrency: { ...WORKFLOW_CONCURRENCY } } : {}), jobs: plain });
   for (const [id, j] of Object.entries(w.jobs)) if (Array.isArray((j as Job).steps)) doc.setIn(['jobs', id, 'steps'], stepsToYaml((j as Job).steps));
   markNotProven(doc);
-  doc.commentBefore = ` ${w.comment}`;
+  lookOf(doc, order, workflowHeader(w));
   return { path: w.path, content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: w.reason, repo: w.repo };
+}
+
+/**
+ * PL-D1: the part (PL-A1) of each job pipegen writes, read from the draft's own needs: a check's job is its need's part, the image build and the
+ * DAST run job are their need's, the gate and its two base jobs are "before merge", the nightly jobs "scheduled", the callers the part of the layer
+ * they call. The deploy jobs the caller gave are "deploy" (the image publish and the sign job: "build and release"). Anything else has no part here.
+ */
+function jobPartsOf(draft: PipelineDraft, deploy: Readonly<Record<string, Job>>): (id: string) => PartId | undefined {
+  const parts = new Map<string, PartId>([
+    [GATE_JOB, 3], [BASE_SCAN_JOB, 3], [BASELINE_CHECK_JOB, 3], [MERGE_CALLER_JOB, 3], [PR_CHECK_JOB, 2], [PUSH_CALLER_JOB, 2],
+    ['nightly', 6], [NIGHTLY_CALLER_JOB, 6], [SCORECARD_JOB, 6], [CODE_SCANNING_JOB, 6],
+    [IMAGE_PUBLISH_JOB, 4], [SIGN_JOB_ID, 4],
+  ]);
+  for (const id of Object.keys(deploy)) if (!parts.has(id)) parts.set(id, 5);
+  for (const n of draft.needs) {
+    if (n.layer === 'pre-commit') continue;   // a hook, not a job: its id may equal a CI job's id (hooks-ci, secrets) with another part
+    const part = partOf(n);
+    try {
+      if (n.service !== undefined && n.id === IMAGE_BUILD_NEED) parts.set(imageBuildJobId(n.service), part);
+      if (n.service !== undefined && n.category === 'dast') parts.set(dastRunJobId(n.service, dastLaneOf(n.id)), part);
+      parts.set(jobIdFor(n.id, n.service), part);
+    } catch { /* a name no job id can be made of has no job */ }
+  }
+  return (id) => parts.get(id);
 }
 
 /** The gate step's `not-proven` value gets the trailing `# pipegen:not-proven` comment (the job gate, the step in mode gate). */
@@ -286,7 +322,7 @@ function markNotProven(doc: Document): void {
 /** The pr-check job (BP-6): the egress step and the one lookup step; `pull-requests: read`; its output has-pr. */
 function prCheckJob(): Job {
   const steps: RenderedStep[] = [egressStepFor([], { userSecret: false, dockerNetworks: false, job: PR_CHECK_JOB }), renderPrCheckStep()];
-  return { 'runs-on': JOB_RUNNER, 'timeout-minutes': PR_CHECK_MINUTES, permissions: { contents: 'read', 'pull-requests': 'read' }, 'cache-mode': 'none', outputs: jobOutputsFor(steps), steps };
+  return { name: jobName(PR_CHECK_JOB), 'runs-on': JOB_RUNNER, 'timeout-minutes': PR_CHECK_MINUTES, permissions: { contents: 'read', 'pull-requests': 'read' }, 'cache-mode': 'none', outputs: jobOutputsFor(steps), steps };
 }
 
 /** The central pin of a private draft, checked (C8r1): `<owner>/pipelines` at a 40-character commit. */
@@ -321,6 +357,9 @@ export function assemble(input: PipelineDraft, opts: AssembleOpts): AssembledFil
   if (typeof prof.owner !== 'string' || typeof project !== 'string' || !isGitHubRepo(`${prof.owner}/${project}`)) fail(`The repository ${show(`${String(prof.owner)}/${String(project)}`)} is not a plain GitHub owner/name.`);
   const pin = layout === 'central' ? centralPinOf(input) : null;
   if (layout === 'local' && input.centralPin !== undefined) fail('A public repository keeps its workflows in the app (its central repo holds records only), so its draft carries no central pin: with one, its find-run step would look for a central workflow that is not there.');
+  // PL-D1: the version the file headers name: a plain version, never a caller's free text (it lands in a comment line of every workflow)
+  const version = opts.version === undefined ? packageVersion() : opts.version;
+  if (version !== null && (typeof version !== 'string' || !PLAIN_VERSION_RE.test(version))) fail(`${show(version)} is not a plain pipegen version (like 1.2.3), so the workflow headers can not name it.`);
   // 2. the gate is the reviewed entry
   const gateEntry = opts.reviewed.find((t) => t.id === 'pipegen-gate');
   if (gateEntry === undefined || !isDeepStrictEqual(gateEntry, opts.gate)) fail('The gate entry is not the reviewed pipegen-gate entry of the reviewed list.');
@@ -328,6 +367,7 @@ export function assemble(input: PipelineDraft, opts: AssembleOpts): AssembledFil
   const a = assembleJobs(input, opts.plan, { reviewed: opts.reviewed, platform: opts.platform, mode: opts.mode, ...(opts.baseImages === undefined ? {} : { baseImages: opts.baseImages }) });
   const draft = a.draft;
   const notes = [...a.notes];
+  const partOfJob = jobPartsOf(draft, opts.deploy ?? {});
   const deploySkipped = input.skipped.some((s) => s.part === 'deploy');
   const def = draft.profile.defaultBranch;
   const files: CreatedFile[] = [];
@@ -338,8 +378,9 @@ export function assemble(input: PipelineDraft, opts: AssembleOpts): AssembledFil
   const mergeCaller = callerOf(CALLER_NAME.merge, pin === null ? `./${LOCAL_MERGE_WORKFLOW}` : centralUses(pin, project, 'merge'), a.merge);
   files.push(workflowFile({
     path: mergePath, repo: mergeRepo, name: 'pipegen merge', on: callTrigger(mergeCaller.secrets ?? {}), jobs: orderedAll(a.merge),
+    runs: 'when pipegen.yml calls it (on pull requests and pull request reviews, and on pushes to the default branch)', version, partOfJob,
     reason: `The merge layer of ${project}: every check, the base scan and the gate (the required check ${CALLER_NAME.merge} / gate).`,
-    comment: `pipegen: the merge layer of ${project}, called by its pipegen.yml only; written by pipegen. The not-proven list, when there is one, is the gate step's marked line.`,
+    comment: `pipegen: the merge layer of ${project}, called by its pipegen.yml only; the not-proven list, when there is one, is the gate step's marked line.`,
   }));
   const appJobs: Record<string, Job | CallerJob> = { [MERGE_CALLER_JOB]: mergeCaller };
   // the deploy jobs (G7) run on a push to the default branch only, after the gate
@@ -370,7 +411,7 @@ export function assemble(input: PipelineDraft, opts: AssembleOpts): AssembledFil
     if (!Object.hasOwn(deploy, IMAGE_PUBLISH_JOB)) fail(`The images are signed after the job ${IMAGE_PUBLISH_JOB} pushes them (the deploy layer); without it there is nothing to sign, so pipegen writes no sign job.`);
     const needs = [MERGE_CALLER_JOB, IMAGE_PUBLISH_JOB];
     if (layout === 'central') {
-      const shared = guard(() => sharedWorkflows(draft, opts.mode, { reviewed: opts.reviewed, platform: opts.platform }));
+      const shared = guard(() => sharedWorkflows(draft, opts.mode, { reviewed: opts.reviewed, platform: opts.platform, version }));
       files.push(...shared);
       const caller = guard(() => signCallerJob(draft, opts.mode, needs)) as unknown as CallerJob | null;
       if (caller === null || shared.length !== 1) return fail('The central sign workflow or its caller could not be written.');
@@ -385,8 +426,9 @@ export function assemble(input: PipelineDraft, opts: AssembleOpts): AssembledFil
   const callerOn = { push: guard(() => defaultPushTrigger(def)), pull_request: null, pull_request_review: { types: [...PR_REVIEW_TRIGGER.types] } };
   files.push(workflowFile({
     path: CALLER_WORKFLOW, repo: 'app', name: 'pipegen', on: callerOn, concurrency: true, jobs: appJobs,
+    runs: 'on pull requests, on pull request reviews and on pushes to the default branch', version, partOfJob,
     reason: 'Runs the merge layer on pull requests, reviews and pushes to the default branch (the required check), then the deploy jobs on the default branch.',
-    comment: 'pipegen: the merge layer and the gate for pull requests and the default branch; written by pipegen (code-owner protected).',
+    comment: 'pipegen: the merge layer and the gate for pull requests and the default branch; code-owner protected.',
   }));
 
   // 5. push: pr-check and the push-layer checks, each skipped when the branch has an open pull request
@@ -397,13 +439,14 @@ export function assemble(input: PipelineDraft, opts: AssembleOpts): AssembledFil
       pushJobs[id] = ordered({ ...j, needs: uniq([PR_CHECK_JOB, ...(j.needs ?? [])]), if: PR_CHECK_IF });
     }
     const pushOn = { push: guard(() => featurePushTrigger(def)) };
-    const comment = 'pipegen: the push layer for every branch but the default (its checks skip when the branch has an open pull request); written by pipegen.';
+    const comment = 'pipegen: the push layer for every branch but the default (its checks skip when the branch has an open pull request).';
     const reason = 'Runs the push layer on pushes to other branches than the default, unless the branch has an open pull request.';
-    if (pin === null) files.push(workflowFile({ path: PUSH_WORKFLOW, repo: 'app', name: 'pipegen push', on: pushOn, concurrency: true, jobs: pushJobs, reason, comment }));
+    const runs = 'on pushes to every branch but the default one, and its checks skip when the branch has an open pull request';
+    if (pin === null) files.push(workflowFile({ path: PUSH_WORKFLOW, repo: 'app', name: 'pipegen push', on: pushOn, concurrency: true, jobs: pushJobs, reason, comment, runs, version, partOfJob }));
     else {
       const caller = callerOf(CALLER_NAME.push, centralUses(pin, project, 'push'), pushJobs);
-      files.push(workflowFile({ path: centralWorkflowFile(project, 'push'), repo: 'central', name: 'pipegen push', on: callTrigger(caller.secrets ?? {}), jobs: pushJobs, reason, comment: `pipegen: the push layer of ${project}, called by its pipegen-push.yml only; written by pipegen.` }));
-      files.push(workflowFile({ path: PUSH_WORKFLOW, repo: 'app', name: 'pipegen push', on: pushOn, concurrency: true, jobs: { [PUSH_CALLER_JOB]: caller }, reason, comment }));
+      files.push(workflowFile({ path: centralWorkflowFile(project, 'push'), repo: 'central', name: 'pipegen push', on: callTrigger(caller.secrets ?? {}), jobs: pushJobs, reason, comment: `pipegen: the push layer of ${project}, called by its pipegen-push.yml only.`, runs: 'when pipegen-push.yml calls it (on pushes to every branch but the default one)', version, partOfJob }));
+      files.push(workflowFile({ path: PUSH_WORKFLOW, repo: 'app', name: 'pipegen push', on: pushOn, concurrency: true, jobs: { [PUSH_CALLER_JOB]: caller }, reason, comment, runs, version, partOfJob }));
     }
   }
 
@@ -412,13 +455,14 @@ export function assemble(input: PipelineDraft, opts: AssembleOpts): AssembledFil
     // G15a round 3 (PF-3): the weekly Scorecard entry, only when the scorecard job is written (its job runs on that entry alone)
     const nightlyOn = { schedule: [{ cron: NIGHTLY_CRON }, ...(Object.hasOwn(a.nightly, SCORECARD_JOB) ? [{ cron: SCORECARD_CRON }] : [])] };
     const nightlyJobs = orderedAll(a.nightly);
-    const comment = 'pipegen: the nightly issues (warn-ending, finish-missing, updates); written by pipegen. It never pushes a file.';
+    const comment = 'pipegen: the nightly issues (warn-ending, finish-missing, updates). It never pushes a file.';
     const reason = 'Opens the nightly issues: the warning period ending, finish not run, pipegen updates.';
-    if (pin === null) files.push(workflowFile({ path: NIGHTLY_WORKFLOW, repo: 'app', name: 'pipegen nightly', on: nightlyOn, jobs: nightlyJobs, reason, comment }));
+    const runs = 'every night on a schedule (never on a push or a pull request)';
+    if (pin === null) files.push(workflowFile({ path: NIGHTLY_WORKFLOW, repo: 'app', name: 'pipegen nightly', on: nightlyOn, jobs: nightlyJobs, reason, comment, runs, version, partOfJob }));
     else {
       const caller = callerOf(CALLER_NAME.nightly, centralUses(pin, project, 'nightly'), nightlyJobs);
-      files.push(workflowFile({ path: centralWorkflowFile(project, 'nightly'), repo: 'central', name: 'pipegen nightly', on: callTrigger(caller.secrets ?? {}), jobs: nightlyJobs, reason, comment: `pipegen: the nightly job of ${project}, called by its pipegen-nightly.yml only; written by pipegen.` }));
-      files.push(workflowFile({ path: NIGHTLY_WORKFLOW, repo: 'app', name: 'pipegen nightly', on: nightlyOn, jobs: { [NIGHTLY_CALLER_JOB]: caller }, reason, comment }));
+      files.push(workflowFile({ path: centralWorkflowFile(project, 'nightly'), repo: 'central', name: 'pipegen nightly', on: callTrigger(caller.secrets ?? {}), jobs: nightlyJobs, reason, comment: `pipegen: the nightly job of ${project}, called by its pipegen-nightly.yml only.`, runs: 'when pipegen-nightly.yml calls it (every night)', version, partOfJob }));
+      files.push(workflowFile({ path: NIGHTLY_WORKFLOW, repo: 'app', name: 'pipegen nightly', on: nightlyOn, jobs: { [NIGHTLY_CALLER_JOB]: caller }, reason, comment, runs, version, partOfJob }));
     }
   }
 
@@ -482,7 +526,7 @@ export function verifyJob(draft: PipelineDraft, deps: { gate: ReviewedTool; revi
   // the verified digest (G22): the job output of the digest step, when there is an image (a static deploy has none)
   const outputs = jobOutputsFor(steps);
   return {
-    'runs-on': JOB_RUNNER, 'timeout-minutes': wait + VERIFY_MARGIN_MINUTES, permissions: verifyPermissions(draft),
+    name: jobName(VERIFY_JOB_ID), 'runs-on': JOB_RUNNER, 'timeout-minutes': wait + VERIFY_MARGIN_MINUTES, permissions: verifyPermissions(draft),
     ...(draft.capabilities.environments === true ? { environment: SIGNING_ENVIRONMENT } : {}), 'cache-mode': 'none',
     ...(Object.keys(outputs).length > 0 ? { outputs } : {}), steps,
   };

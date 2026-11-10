@@ -1,0 +1,201 @@
+{
+ "public": {
+  "app:.github/workflows/pipegen-merge.yml": [
+   ["hooks-ci", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-f7764ea885e5483f", "repocode-f7764ea885e5483f"]],
+   ["secrets", ["bullfrogsec/bullfrog", "actions/checkout", "stage-878e929c771bcb3d", "tool-install-878e929c771bcb3d", "tool-run-878e929c771bcb3d", "scrub-878e929c771bcb3d", "actions/upload-artifact", "checker-run-5b6e02fce9c77384", "tool-install-7d93b267a0bdeb0a", "checker-run-7d93b267a0bdeb0a", "scrub-7d93b267a0bdeb0a", "actions/upload-artifact"]],
+   ["sast--app", ["bullfrogsec/bullfrog", "actions/checkout", "tool-pull-cbbdce47523a8b4d", "tool-install-4da6a2b3100a43c7", "tool-run-cbbdce47523a8b4d", "scrub-cbbdce47523a8b4d", "actions/upload-artifact"]],
+   ["deps--app", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-5a9d3bc2f258f817", "tool-run-5a9d3bc2f258f817", "scrub-5a9d3bc2f258f817", "actions/upload-artifact"]],
+   ["unit-tests--app", ["bullfrogsec/bullfrog", "pipegen-checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "repocode-e151bb9b0a416b38"]],
+   ["lint--app", ["bullfrogsec/bullfrog", "pipegen-checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "repocode-dc7f7c644957997b"]],
+   ["full-tests--app", ["bullfrogsec/bullfrog", "pipegen-checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "repocode-aceb6c91b080e91b"]],
+   ["format--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "checker-run-f5d613ca2338cbf7"]],
+   ["coverage--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "(run)", "repocode-c832cf09ba0f430f"]],
+   ["dead-code--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "repocode-b081eb32f692c3dd"]],
+   ["duplication", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-e762f36ac5f61f04", "tool-run-e762f36ac5f61f04"]],
+   ["workflow-lint", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-e6e48e67b3bdb064", "tool-run-e6e48e67b3bdb064"]],
+   ["licences", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-685063f399e44684", "tool-run-685063f399e44684", "scrub-685063f399e44684", "actions/upload-artifact"]],
+   ["dependency-review", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-d8c25f7fe909ba8a", "tool-run-d8c25f7fe909ba8a", "scrub-d8c25f7fe909ba8a", "actions/upload-artifact"]],
+   ["baseline-check", ["bullfrogsec/bullfrog", "pipegen-baseline-check"]],
+   ["base-scan", ["bullfrogsec/bullfrog", "pipegen-checkout", "tool-install-3fa37a299ddf5d70", "tool-run-3fa37a299ddf5d70", "scrub-3fa37a299ddf5d70", "actions/upload-artifact", "tool-install-1955e79020675a73", "tool-run-1955e79020675a73", "scrub-1955e79020675a73", "actions/upload-artifact", "tool-install-3fe14122e0d54877", "tool-run-3fe14122e0d54877", "scrub-3fe14122e0d54877", "actions/upload-artifact", "stage-3f73ab8bddfa3fea", "tool-install-3f73ab8bddfa3fea", "tool-run-3f73ab8bddfa3fea", "scrub-3f73ab8bddfa3fea", "actions/upload-artifact", "tool-pull-479884fad1491549", "tool-install-5ee7ade8f6bde646", "tool-run-479884fad1491549", "scrub-479884fad1491549", "actions/upload-artifact"]],
+   ["gate", ["bullfrogsec/bullfrog", "crisworking/pipegen/gate", "actions/upload-artifact", "actions/upload-artifact", "actions/upload-artifact"]],
+   ["workflow-pin-check", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-cfc41c6428c50207", "repocode-cfc41c6428c50207"]]
+  ],
+  "app:.github/workflows/pipegen.yml": [
+   ["pipegen", []]
+  ],
+  "app:.github/workflows/pipegen-push.yml": [
+   ["pr-check", ["bullfrogsec/bullfrog", "pipegen-pr-check"]],
+   ["hooks-ci", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-f7764ea885e5483f", "repocode-f7764ea885e5483f"]],
+   ["secrets", ["bullfrogsec/bullfrog", "actions/checkout", "stage-878e929c771bcb3d", "tool-install-878e929c771bcb3d", "tool-run-878e929c771bcb3d", "scrub-878e929c771bcb3d", "actions/upload-artifact"]],
+   ["sast--app", ["bullfrogsec/bullfrog", "actions/checkout", "tool-pull-cbbdce47523a8b4d", "tool-install-4da6a2b3100a43c7", "tool-run-cbbdce47523a8b4d", "scrub-cbbdce47523a8b4d", "actions/upload-artifact"]],
+   ["deps--app", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-5a9d3bc2f258f817", "tool-run-5a9d3bc2f258f817", "scrub-5a9d3bc2f258f817", "actions/upload-artifact"]],
+   ["unit-tests--app", ["bullfrogsec/bullfrog", "pipegen-checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "repocode-e151bb9b0a416b38"]],
+   ["lint--app", ["bullfrogsec/bullfrog", "pipegen-checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "repocode-dc7f7c644957997b"]],
+   ["format--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "checker-run-f5d613ca2338cbf7"]],
+   ["coverage--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "(run)", "repocode-c832cf09ba0f430f"]],
+   ["dead-code--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "repocode-b081eb32f692c3dd"]],
+   ["workflow-lint", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-e6e48e67b3bdb064", "tool-run-e6e48e67b3bdb064"]],
+   ["workflow-pin-check", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-cfc41c6428c50207", "repocode-cfc41c6428c50207"]]
+  ],
+  "app:.github/workflows/pipegen-nightly.yml": [
+   ["nightly", ["bullfrogsec/bullfrog", "crisworking/pipegen/gate"]],
+   ["scorecard", ["bullfrogsec/bullfrog", "docker://ghcr.io/ossf/scorecard-action", "checker-run-140b51ca51b67c44", "scrub-140b51ca51b67c44", "actions/upload-artifact"]],
+   ["code-scanning", ["bullfrogsec/bullfrog", "actions/download-artifact", "github/codeql-action/upload-sarif"]],
+   ["secrets-history", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-dfb76d5c291a85be", "checker-run-dfb76d5c291a85be", "scrub-dfb76d5c291a85be", "actions/upload-artifact"]],
+   ["code-scanning-history", ["bullfrogsec/bullfrog", "actions/download-artifact", "github/codeql-action/upload-sarif"]],
+   ["workflow-lint-online", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-f9abf765b6991c7c", "tool-run-f9abf765b6991c7c"]]
+  ]
+ },
+ "private": {
+  "central:.github/workflows/r--merge.yml": [
+   ["hooks-ci", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-f7764ea885e5483f", "repocode-f7764ea885e5483f"]],
+   ["secrets", ["bullfrogsec/bullfrog", "actions/checkout", "stage-878e929c771bcb3d", "tool-install-878e929c771bcb3d", "tool-run-878e929c771bcb3d", "scrub-878e929c771bcb3d", "actions/upload-artifact", "checker-run-5b6e02fce9c77384", "tool-install-7d93b267a0bdeb0a", "checker-run-7d93b267a0bdeb0a", "scrub-7d93b267a0bdeb0a", "actions/upload-artifact"]],
+   ["sast--app", ["bullfrogsec/bullfrog", "actions/checkout", "tool-pull-cbbdce47523a8b4d", "tool-install-4da6a2b3100a43c7", "tool-run-cbbdce47523a8b4d", "scrub-cbbdce47523a8b4d", "actions/upload-artifact"]],
+   ["deps--app", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-5a9d3bc2f258f817", "tool-run-5a9d3bc2f258f817", "scrub-5a9d3bc2f258f817", "actions/upload-artifact"]],
+   ["unit-tests--app", ["bullfrogsec/bullfrog", "pipegen-checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "repocode-e151bb9b0a416b38"]],
+   ["lint--app", ["bullfrogsec/bullfrog", "pipegen-checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "repocode-dc7f7c644957997b"]],
+   ["full-tests--app", ["bullfrogsec/bullfrog", "pipegen-checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "repocode-aceb6c91b080e91b"]],
+   ["format--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "checker-run-f5d613ca2338cbf7"]],
+   ["coverage--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "(run)", "repocode-c832cf09ba0f430f"]],
+   ["dead-code--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "repocode-b081eb32f692c3dd"]],
+   ["duplication", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-e762f36ac5f61f04", "tool-run-e762f36ac5f61f04"]],
+   ["workflow-lint", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-e6e48e67b3bdb064", "tool-run-e6e48e67b3bdb064"]],
+   ["licences", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-685063f399e44684", "tool-run-685063f399e44684", "scrub-685063f399e44684", "actions/upload-artifact"]],
+   ["dependency-review", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-d8c25f7fe909ba8a", "tool-run-d8c25f7fe909ba8a", "scrub-d8c25f7fe909ba8a", "actions/upload-artifact"]],
+   ["baseline-check", ["bullfrogsec/bullfrog", "pipegen-baseline-check"]],
+   ["base-scan", ["bullfrogsec/bullfrog", "pipegen-checkout", "tool-install-3fa37a299ddf5d70", "tool-run-3fa37a299ddf5d70", "scrub-3fa37a299ddf5d70", "actions/upload-artifact", "tool-install-1955e79020675a73", "tool-run-1955e79020675a73", "scrub-1955e79020675a73", "actions/upload-artifact", "tool-install-3fe14122e0d54877", "tool-run-3fe14122e0d54877", "scrub-3fe14122e0d54877", "actions/upload-artifact", "stage-3f73ab8bddfa3fea", "tool-install-3f73ab8bddfa3fea", "tool-run-3f73ab8bddfa3fea", "scrub-3f73ab8bddfa3fea", "actions/upload-artifact", "tool-pull-479884fad1491549", "tool-install-5ee7ade8f6bde646", "tool-run-479884fad1491549", "scrub-479884fad1491549", "actions/upload-artifact"]],
+   ["gate", ["bullfrogsec/bullfrog", "crisworking/pipegen/gate", "actions/upload-artifact", "actions/upload-artifact", "actions/upload-artifact"]],
+   ["workflow-pin-check", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-cfc41c6428c50207", "repocode-cfc41c6428c50207"]]
+  ],
+  "app:.github/workflows/pipegen.yml": [
+   ["pipegen", []]
+  ],
+  "central:.github/workflows/r--push.yml": [
+   ["pr-check", ["bullfrogsec/bullfrog", "pipegen-pr-check"]],
+   ["hooks-ci", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-f7764ea885e5483f", "repocode-f7764ea885e5483f"]],
+   ["secrets", ["bullfrogsec/bullfrog", "actions/checkout", "stage-878e929c771bcb3d", "tool-install-878e929c771bcb3d", "tool-run-878e929c771bcb3d", "scrub-878e929c771bcb3d", "actions/upload-artifact"]],
+   ["sast--app", ["bullfrogsec/bullfrog", "actions/checkout", "tool-pull-cbbdce47523a8b4d", "tool-install-4da6a2b3100a43c7", "tool-run-cbbdce47523a8b4d", "scrub-cbbdce47523a8b4d", "actions/upload-artifact"]],
+   ["deps--app", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-5a9d3bc2f258f817", "tool-run-5a9d3bc2f258f817", "scrub-5a9d3bc2f258f817", "actions/upload-artifact"]],
+   ["unit-tests--app", ["bullfrogsec/bullfrog", "pipegen-checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "repocode-e151bb9b0a416b38"]],
+   ["lint--app", ["bullfrogsec/bullfrog", "pipegen-checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "repocode-dc7f7c644957997b"]],
+   ["format--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "checker-run-f5d613ca2338cbf7"]],
+   ["coverage--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "(run)", "repocode-c832cf09ba0f430f"]],
+   ["dead-code--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "repocode-b081eb32f692c3dd"]],
+   ["workflow-lint", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-e6e48e67b3bdb064", "tool-run-e6e48e67b3bdb064"]],
+   ["workflow-pin-check", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-cfc41c6428c50207", "repocode-cfc41c6428c50207"]]
+  ],
+  "app:.github/workflows/pipegen-push.yml": [
+   ["pipegen-push", []]
+  ],
+  "central:.github/workflows/r--nightly.yml": [
+   ["nightly", ["bullfrogsec/bullfrog", "crisworking/pipegen/gate"]],
+   ["workflow-lint-online", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-f9abf765b6991c7c", "tool-run-f9abf765b6991c7c"]]
+  ],
+  "app:.github/workflows/pipegen-nightly.yml": [
+   ["pipegen-nightly", []]
+  ]
+ },
+ "public keyless": {
+  "app:.github/workflows/pipegen-merge.yml": [
+   ["hooks-ci", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-f7764ea885e5483f", "repocode-f7764ea885e5483f"]],
+   ["secrets", ["bullfrogsec/bullfrog", "actions/checkout", "stage-878e929c771bcb3d", "tool-install-878e929c771bcb3d", "tool-run-878e929c771bcb3d", "scrub-878e929c771bcb3d", "actions/upload-artifact", "checker-run-5b6e02fce9c77384", "tool-install-7d93b267a0bdeb0a", "checker-run-7d93b267a0bdeb0a", "scrub-7d93b267a0bdeb0a", "actions/upload-artifact"]],
+   ["sast--app", ["bullfrogsec/bullfrog", "actions/checkout", "tool-pull-cbbdce47523a8b4d", "tool-install-4da6a2b3100a43c7", "tool-run-cbbdce47523a8b4d", "scrub-cbbdce47523a8b4d", "actions/upload-artifact"]],
+   ["deps--app", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-5a9d3bc2f258f817", "tool-run-5a9d3bc2f258f817", "scrub-5a9d3bc2f258f817", "actions/upload-artifact"]],
+   ["unit-tests--app", ["bullfrogsec/bullfrog", "pipegen-checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "repocode-e151bb9b0a416b38"]],
+   ["lint--app", ["bullfrogsec/bullfrog", "pipegen-checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "repocode-dc7f7c644957997b"]],
+   ["full-tests--app", ["bullfrogsec/bullfrog", "pipegen-checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "repocode-aceb6c91b080e91b"]],
+   ["format--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "checker-run-f5d613ca2338cbf7"]],
+   ["coverage--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "(run)", "repocode-c832cf09ba0f430f"]],
+   ["dead-code--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "repocode-b081eb32f692c3dd"]],
+   ["duplication", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-e762f36ac5f61f04", "tool-run-e762f36ac5f61f04"]],
+   ["workflow-lint", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-e6e48e67b3bdb064", "tool-run-e6e48e67b3bdb064"]],
+   ["licences", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-685063f399e44684", "tool-run-685063f399e44684", "scrub-685063f399e44684", "actions/upload-artifact"]],
+   ["dependency-review", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-d8c25f7fe909ba8a", "tool-run-d8c25f7fe909ba8a", "scrub-d8c25f7fe909ba8a", "actions/upload-artifact"]],
+   ["baseline-check", ["bullfrogsec/bullfrog", "pipegen-baseline-check"]],
+   ["base-scan", ["bullfrogsec/bullfrog", "pipegen-checkout", "tool-install-3fa37a299ddf5d70", "tool-run-3fa37a299ddf5d70", "scrub-3fa37a299ddf5d70", "actions/upload-artifact", "tool-install-1955e79020675a73", "tool-run-1955e79020675a73", "scrub-1955e79020675a73", "actions/upload-artifact", "tool-install-3fe14122e0d54877", "tool-run-3fe14122e0d54877", "scrub-3fe14122e0d54877", "actions/upload-artifact", "stage-3f73ab8bddfa3fea", "tool-install-3f73ab8bddfa3fea", "tool-run-3f73ab8bddfa3fea", "scrub-3f73ab8bddfa3fea", "actions/upload-artifact", "tool-pull-479884fad1491549", "tool-install-5ee7ade8f6bde646", "tool-run-479884fad1491549", "scrub-479884fad1491549", "actions/upload-artifact"]],
+   ["gate", ["bullfrogsec/bullfrog", "crisworking/pipegen/gate", "actions/upload-artifact", "actions/upload-artifact", "actions/upload-artifact"]],
+   ["workflow-pin-check", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-cfc41c6428c50207", "repocode-cfc41c6428c50207"]]
+  ],
+  "app:.github/workflows/pipegen.yml": [
+   ["pipegen", []],
+   ["image-publish", ["bullfrogsec/bullfrog", "actions/checkout", "docker/login-action", "pipegen-build-push", "pipegen-publish-digest", "actions/upload-artifact"]],
+   ["sign", ["actions/download-artifact", "tool-install-719eb1362acde8c2", "pipegen-sign-22c28d4b27aa7b7f"]]
+  ],
+  "app:.github/workflows/pipegen-push.yml": [
+   ["pr-check", ["bullfrogsec/bullfrog", "pipegen-pr-check"]],
+   ["hooks-ci", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-f7764ea885e5483f", "repocode-f7764ea885e5483f"]],
+   ["secrets", ["bullfrogsec/bullfrog", "actions/checkout", "stage-878e929c771bcb3d", "tool-install-878e929c771bcb3d", "tool-run-878e929c771bcb3d", "scrub-878e929c771bcb3d", "actions/upload-artifact"]],
+   ["sast--app", ["bullfrogsec/bullfrog", "actions/checkout", "tool-pull-cbbdce47523a8b4d", "tool-install-4da6a2b3100a43c7", "tool-run-cbbdce47523a8b4d", "scrub-cbbdce47523a8b4d", "actions/upload-artifact"]],
+   ["deps--app", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-5a9d3bc2f258f817", "tool-run-5a9d3bc2f258f817", "scrub-5a9d3bc2f258f817", "actions/upload-artifact"]],
+   ["unit-tests--app", ["bullfrogsec/bullfrog", "pipegen-checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "repocode-e151bb9b0a416b38"]],
+   ["lint--app", ["bullfrogsec/bullfrog", "pipegen-checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "repocode-dc7f7c644957997b"]],
+   ["format--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "checker-run-f5d613ca2338cbf7"]],
+   ["coverage--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "(run)", "repocode-c832cf09ba0f430f"]],
+   ["dead-code--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "repocode-b081eb32f692c3dd"]],
+   ["workflow-lint", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-e6e48e67b3bdb064", "tool-run-e6e48e67b3bdb064"]],
+   ["workflow-pin-check", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-cfc41c6428c50207", "repocode-cfc41c6428c50207"]]
+  ],
+  "app:.github/workflows/pipegen-nightly.yml": [
+   ["nightly", ["bullfrogsec/bullfrog", "crisworking/pipegen/gate"]],
+   ["scorecard", ["bullfrogsec/bullfrog", "docker://ghcr.io/ossf/scorecard-action", "checker-run-140b51ca51b67c44", "scrub-140b51ca51b67c44", "actions/upload-artifact"]],
+   ["code-scanning", ["bullfrogsec/bullfrog", "actions/download-artifact", "github/codeql-action/upload-sarif"]],
+   ["secrets-history", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-dfb76d5c291a85be", "checker-run-dfb76d5c291a85be", "scrub-dfb76d5c291a85be", "actions/upload-artifact"]],
+   ["code-scanning-history", ["bullfrogsec/bullfrog", "actions/download-artifact", "github/codeql-action/upload-sarif"]],
+   ["workflow-lint-online", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-f9abf765b6991c7c", "tool-run-f9abf765b6991c7c"]]
+  ]
+ },
+ "private key-env": {
+  "central:.github/workflows/r--merge.yml": [
+   ["hooks-ci", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-f7764ea885e5483f", "repocode-f7764ea885e5483f"]],
+   ["secrets", ["bullfrogsec/bullfrog", "actions/checkout", "stage-878e929c771bcb3d", "tool-install-878e929c771bcb3d", "tool-run-878e929c771bcb3d", "scrub-878e929c771bcb3d", "actions/upload-artifact", "checker-run-5b6e02fce9c77384", "tool-install-7d93b267a0bdeb0a", "checker-run-7d93b267a0bdeb0a", "scrub-7d93b267a0bdeb0a", "actions/upload-artifact"]],
+   ["sast--app", ["bullfrogsec/bullfrog", "actions/checkout", "tool-pull-cbbdce47523a8b4d", "tool-install-4da6a2b3100a43c7", "tool-run-cbbdce47523a8b4d", "scrub-cbbdce47523a8b4d", "actions/upload-artifact"]],
+   ["deps--app", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-5a9d3bc2f258f817", "tool-run-5a9d3bc2f258f817", "scrub-5a9d3bc2f258f817", "actions/upload-artifact"]],
+   ["unit-tests--app", ["bullfrogsec/bullfrog", "pipegen-checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "repocode-e151bb9b0a416b38"]],
+   ["lint--app", ["bullfrogsec/bullfrog", "pipegen-checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "repocode-dc7f7c644957997b"]],
+   ["full-tests--app", ["bullfrogsec/bullfrog", "pipegen-checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "repocode-aceb6c91b080e91b"]],
+   ["format--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "checker-run-f5d613ca2338cbf7"]],
+   ["coverage--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "(run)", "repocode-c832cf09ba0f430f"]],
+   ["dead-code--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "repocode-b081eb32f692c3dd"]],
+   ["duplication", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-e762f36ac5f61f04", "tool-run-e762f36ac5f61f04"]],
+   ["workflow-lint", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-e6e48e67b3bdb064", "tool-run-e6e48e67b3bdb064"]],
+   ["licences", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-685063f399e44684", "tool-run-685063f399e44684", "scrub-685063f399e44684", "actions/upload-artifact"]],
+   ["dependency-review", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-d8c25f7fe909ba8a", "tool-run-d8c25f7fe909ba8a", "scrub-d8c25f7fe909ba8a", "actions/upload-artifact"]],
+   ["baseline-check", ["bullfrogsec/bullfrog", "pipegen-baseline-check"]],
+   ["base-scan", ["bullfrogsec/bullfrog", "pipegen-checkout", "tool-install-3fa37a299ddf5d70", "tool-run-3fa37a299ddf5d70", "scrub-3fa37a299ddf5d70", "actions/upload-artifact", "tool-install-1955e79020675a73", "tool-run-1955e79020675a73", "scrub-1955e79020675a73", "actions/upload-artifact", "tool-install-3fe14122e0d54877", "tool-run-3fe14122e0d54877", "scrub-3fe14122e0d54877", "actions/upload-artifact", "stage-3f73ab8bddfa3fea", "tool-install-3f73ab8bddfa3fea", "tool-run-3f73ab8bddfa3fea", "scrub-3f73ab8bddfa3fea", "actions/upload-artifact", "tool-pull-479884fad1491549", "tool-install-5ee7ade8f6bde646", "tool-run-479884fad1491549", "scrub-479884fad1491549", "actions/upload-artifact"]],
+   ["gate", ["bullfrogsec/bullfrog", "crisworking/pipegen/gate", "actions/upload-artifact", "actions/upload-artifact", "actions/upload-artifact"]],
+   ["workflow-pin-check", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-cfc41c6428c50207", "repocode-cfc41c6428c50207"]]
+  ],
+  "central:.github/workflows/r--sign.yml": [
+   ["sign", ["bullfrogsec/bullfrog", "actions/download-artifact", "tool-install-719eb1362acde8c2", "pipegen-sign-22c28d4b27aa7b7f"]]
+  ],
+  "app:.github/workflows/pipegen.yml": [
+   ["pipegen", []],
+   ["image-publish", ["bullfrogsec/bullfrog", "actions/checkout", "docker/login-action", "pipegen-build-push", "pipegen-publish-digest", "actions/upload-artifact"]],
+   ["sign", []]
+  ],
+  "central:.github/workflows/r--push.yml": [
+   ["pr-check", ["bullfrogsec/bullfrog", "pipegen-pr-check"]],
+   ["hooks-ci", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-f7764ea885e5483f", "repocode-f7764ea885e5483f"]],
+   ["secrets", ["bullfrogsec/bullfrog", "actions/checkout", "stage-878e929c771bcb3d", "tool-install-878e929c771bcb3d", "tool-run-878e929c771bcb3d", "scrub-878e929c771bcb3d", "actions/upload-artifact"]],
+   ["sast--app", ["bullfrogsec/bullfrog", "actions/checkout", "tool-pull-cbbdce47523a8b4d", "tool-install-4da6a2b3100a43c7", "tool-run-cbbdce47523a8b4d", "scrub-cbbdce47523a8b4d", "actions/upload-artifact"]],
+   ["deps--app", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-5a9d3bc2f258f817", "tool-run-5a9d3bc2f258f817", "scrub-5a9d3bc2f258f817", "actions/upload-artifact"]],
+   ["unit-tests--app", ["bullfrogsec/bullfrog", "pipegen-checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "repocode-e151bb9b0a416b38"]],
+   ["lint--app", ["bullfrogsec/bullfrog", "pipegen-checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "repocode-dc7f7c644957997b"]],
+   ["format--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "checker-run-f5d613ca2338cbf7"]],
+   ["coverage--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "pipegen-npm-ci-cdb4ee2aea69cc6a", "(run)", "repocode-c832cf09ba0f430f"]],
+   ["dead-code--app", ["bullfrogsec/bullfrog", "actions/checkout", "pipegen-setup-node-24", "repocode-b081eb32f692c3dd"]],
+   ["workflow-lint", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-e6e48e67b3bdb064", "tool-run-e6e48e67b3bdb064"]],
+   ["workflow-pin-check", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-cfc41c6428c50207", "repocode-cfc41c6428c50207"]]
+  ],
+  "app:.github/workflows/pipegen-push.yml": [
+   ["pipegen-push", []]
+  ],
+  "central:.github/workflows/r--nightly.yml": [
+   ["nightly", ["bullfrogsec/bullfrog", "crisworking/pipegen/gate"]],
+   ["workflow-lint-online", ["bullfrogsec/bullfrog", "actions/checkout", "tool-install-f9abf765b6991c7c", "tool-run-f9abf765b6991c7c"]]
+  ],
+  "app:.github/workflows/pipegen-nightly.yml": [
+   ["pipegen-nightly", []]
+  ]
+ }
+}

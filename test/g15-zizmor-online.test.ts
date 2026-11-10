@@ -78,7 +78,7 @@ describe('G15a round 5 (b2): zizmor online, nightly', () => {
   it('render: zizmor online is the reviewed entry without --offline, the job token passed as GH_TOKEN, under its own artifact and step ids', () => {
     const r = renderZizmorOnline(ZIZMOR, P, CTX);
     expect(r.output).toBeNull();
-    expect(r.steps.map((s) => s.name)).toEqual(['pipegen: install zizmor', 'pipegen: run zizmor']);
+    expect(r.steps.map((s) => s.name)).toEqual(['Install zizmor', 'Run zizmor']);
     const run = r.steps[1] as RenderedStep;
     expect(run.id).toBe(zizmorOnlineStepId);
     expect(run.env).toMatchObject({ [GHT]: TOK_REF });
@@ -89,7 +89,7 @@ describe('G15a round 5 (b2): zizmor online, nightly', () => {
     expect(() => checkExpressions(run)).not.toThrow();
     // the offline render of the same entry (the PR and merge jobs) is unchanged: --offline, no token
     const spec: StepSpec = { needId: 'workflow-lint', tool: ZIZMOR.candidate, choices: {}, output: ZIZMOR.step.output } as unknown as StepSpec;
-    const off = renderStep(spec, ZIZMOR, P, CTX).steps.find((s) => s.name === 'pipegen: run zizmor') as RenderedStep;
+    const off = renderStep(spec, ZIZMOR, P, CTX).steps.find((s) => s.name === 'Run zizmor') as RenderedStep;
     expect(off.run).toContain('--offline .github/workflows');
     expect(off.run).not.toContain('GH_TOKEN');
     expect(Object.keys(off.env ?? {})).not.toContain('GH_TOKEN');
@@ -147,7 +147,7 @@ describe('G15a round 5 (b2): zizmor online, nightly', () => {
     expect(job.if).toBe(NIGHTLY_IF); // G15a-R7 spec 2: the nightly cron only (no Monday double run)
     expect(job.needs).toBeUndefined();
     const steps = stepsOf(w.doc);
-    expect(steps.map((s) => s.name)).toEqual(['Limit network egress', 'Check out the repository', 'pipegen: install zizmor', 'pipegen: run zizmor']);
+    expect(steps.map((s) => s.name)).toEqual(['Limit network egress', 'Check out the repository', 'Install zizmor', 'Run zizmor']);
     const domains = String((steps[0]!.with as Obj)['allowed-domains']).split('\n');
     expect(domains).toEqual(expect.arrayContaining(['api.github.com', 'github.com']));
     expect((steps[1]!.with as Obj)['persist-credentials']).toBe('false');

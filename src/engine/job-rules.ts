@@ -575,7 +575,7 @@ const PR_CHECK_RUN = [
 ].join('\n');
 /** The one pr-check lookup step pipegen renders (BP-6: a shared renderer, so the referee recognises it by its exact content). */
 export function renderPrCheckStep(): RenderedStep {
-  return { id: PR_CHECK_STEP_ID, name: 'pipegen: does this branch have an open pull request', run: PR_CHECK_RUN, shell: 'bash', env: { ...PR_CHECK_STEP_ENV } };
+  return { id: PR_CHECK_STEP_ID, name: 'Check whether this branch has an open pull request', run: PR_CHECK_RUN, shell: 'bash', env: { ...PR_CHECK_STEP_ENV } };
 }
 /** Whether a step is exactly the pr-check lookup step (every field that runs; the name aside). */
 export function isPrCheckStep(s: RenderedStep): boolean {
@@ -655,7 +655,7 @@ const RANGE_FETCH_RUN = [
 ].join('\n');
 /** The one pre-push head fetch step pipegen renders (C9r1), before the range scan in the secrets job; the referee recognises it by its exact content. */
 export function renderRangeFetchStep(): RenderedStep {
-  return { id: RANGE_FETCH_STEP_ID, name: 'pipegen: fetch the head this push replaced (for the commit-range scan)', run: RANGE_FETCH_RUN, shell: 'bash', env: { BASH_ENV: '', ENV: '', ...RANGE_FETCH_STEP_ENV } };
+  return { id: RANGE_FETCH_STEP_ID, name: 'Fetch the head this push replaced (for the commit-range scan)', run: RANGE_FETCH_RUN, shell: 'bash', env: { BASH_ENV: '', ENV: '', ...RANGE_FETCH_STEP_ENV } };
 }
 
 // ---------- Plan G G2: signing, verification and the image hand-off (rulings B3 b, B6; carries C0c, F-4) ----------

@@ -57,7 +57,7 @@ function serviceOf(spec: StepSpec, ctx: RenderContext): string {
 /** The archive step of a service's image-build job: saves the built tag, checks the file and writes its sha256 (the job output image-sha256). */
 export function renderImageArchiveStep(service: string): RenderedStep {
   const artifact = imageArchiveArtifact(service);
-  return bash(IMAGE_ARCHIVE_STEP_ID, `pipegen: save the image of ${slug(service)} as an archive`, [
+  return bash(IMAGE_ARCHIVE_STEP_ID, `Save the image of ${slug(service)} as an archive`, [
     `dir="$RUNNER_TEMP/pipegen-out/${artifact}"`,
     'mkdir -p "$RUNNER_TEMP/pipegen-out"',
     'mkdir "$dir"',
@@ -92,7 +92,7 @@ export function renderImageBuild(spec: StepSpec, buildPush: ReviewedTool, platfo
 
 /** The scanner job's hash check: the downloaded archive must have exactly the sha256 its image-build job wrote, before anything reads it. */
 export function renderImageCheckStep(service: string): RenderedStep {
-  return bash(imageCheckStepId(service), `pipegen: check the image archive of ${slug(service)}`, [
+  return bash(imageCheckStepId(service), `Check the image archive of ${slug(service)}`, [
     `file="${archivePath(service)}"`,
     `if ! [[ "$${IMAGE_SHA_ENV}" =~ ^[0-9a-f]{64}$ ]]; then pg_fail "the image build gave no sha256 for its archive"; fi`,
     'if [ ! -f "$file" ] || [ -L "$file" ]; then pg_fail "the image archive is missing or not a regular file"; fi',

@@ -225,7 +225,7 @@ describe('G4b: the type-check through the repo\'s own tsc (ruling G4-R3)', () =>
       ['the install without --git', (j) => { ciOf(j).run = String(ciOf(j).run).replace(' --git=/usr/bin/git', ''); }, differs('pipegen-npm-ci-[0-9a-f]{16}')],
       ['an env added', (j) => { runOf(j).env = { ...runOf(j).env, NODE_OPTIONS: '--require ./x.js' }; }, RUN],
       ['a working directory', (j) => { runOf(j)['working-directory'] = 'src'; }, RUN],
-      ['another id', (j) => { runOf(j).id = 'repocode-0000000000000000'; }, ['unreviewed', /In the job "type-check--app", step \d+: the run step "pipegen: run the repository's own tsc \(its lockfile version\)" is not a step pipegen renders/]],
+      ['another id', (j) => { runOf(j).id = 'repocode-0000000000000000'; }, ['unreviewed', /In the job "type-check--app", step \d+: the run step "Run the repository's own tsc \(its lockfile version\)" is not a step pipegen renders/]],
       ['a trailing command', (j) => { runOf(j).run = `${String(runOf(j).run)}\ncurl https://example.com`; }, RUN],
     ];
     expect(shown(await judge([editJob(f, 'type-check--app', () => {}), ...files(a).slice(1)], a.draft)), 'identity control').toBe('');

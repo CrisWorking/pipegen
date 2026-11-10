@@ -380,6 +380,7 @@ describe('harness: tests-repeat (S6, D7-R7)', () => {
     expect(up.with!.name).toBe('pipegen-out-junit-repeat-api');
     expect(up.with!.path).toBe('${{ runner.temp }}/pipegen-out/pipegen-out-junit-repeat-api');
     expect(up.if).toBe('always()');
+    expect(up.name).toBe('Upload the repeated test results of api');   // PL-D2 fold R1: a verb phrase, not the artifact id
     expect(text).toContain('"$RUNNER_TEMP/pipegen-out/pipegen-out-junit-repeat-api/junit.xml"');
   });
 
@@ -398,7 +399,7 @@ describe('harness: tests-repeat (S6, D7-R7)', () => {
     expect(text).not.toMatch(/--passWithNoTests|--allowOnly/);
     // the reviewed vitest version is checked in the lockfile before npm ci
     const vitest = reviewed.find((t) => t.id === 'vitest-coverage')!;
-    expect(JSON.stringify(wfOf(withFiles, opts({ createdTests: true })).jobs['tests-repeat'])).toContain(`\\"version\\":\\"${vitest.step.cli!.install.version}\\"`);
+    expect(JSON.stringify(wfOf(withFiles, opts({ createdTests: true })).jobs['tests-repeat'])).toContain(`\\"version\\": \\"${vitest.step.cli!.install.version}\\"`);
   });
 
   it('harness: created tests run with --network none or an internal network', () => {

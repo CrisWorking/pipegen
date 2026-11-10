@@ -105,7 +105,7 @@ describe('R-A: npm checkers install from pipegen\'s closure lock (DECISIONS #107
     expect(all).not.toMatch(/npx/);
     expect(all).not.toMatch(/package-lock\.json[^"]*"\$PWD|\.\/package-lock|\.\/\.npmrc|node_modules\/\.bin/);
     const install = r.steps[1] as RenderedStep;
-    expect(install.env?.PIPEGEN_NPM_LOCK).toBe(JSON.stringify(JSON.parse(closureText('eslint'))));
+    expect(install.env?.PIPEGEN_NPM_LOCK).toBe(JSON.stringify(JSON.parse(closureText('eslint')), null, 2)); // PL-D3: the same lock, readable
     const pkg = JSON.parse(install.env?.PIPEGEN_NPM_PACKAGE as string) as { dependencies: Record<string, string>; private: boolean };
     expect(pkg.dependencies).toEqual(closureRootDependencies(closureText('eslint')));
     expect(pkg.private).toBe(true);
@@ -453,7 +453,7 @@ describe('R-F: hardening (findings 6, 8, 9, 10)', () => {
     expect(own({ a: 1 }, 'toString')).toBeUndefined();
     expect(EXPR).toBe('${{');
     expect(() => refuse('x')).toThrow(RenderError);
-    expect(lastRun(render('eslint')).name).toBe('pipegen: run eslint');
+    expect(lastRun(render('eslint')).name).toBe('Run eslint');
   });
 });
 
@@ -537,6 +537,17 @@ describe('round 2: lock size and order (rulings 5 and 7)', () => {
     const fine = JSON.parse(closureText('eslint')) as { packages: Record<string, Record<string, unknown>> };
     (fine.packages['node_modules/eslint'] as Record<string, unknown>).description = 'x'.repeat(10 * 1024);
     expect(() => renderStepWith(spec(t), t, platform(), ctx, { npmClosures: { eslint: JSON.stringify(fine) } })).not.toThrow();
+  });
+
+  it('a closure under 120 KiB compact but over it as the indented JSON the step carries is refused', () => {
+    const t = entry('eslint');
+    const big = JSON.parse(closureText('eslint')) as { packages: Record<string, Record<string, unknown>> };
+    const pad: Record<string, number> = {};
+    for (let i = 0; JSON.stringify(big).length + JSON.stringify(pad).length < 118 * 1024; i++) pad[`k${i}`] = i;
+    (big.packages['node_modules/eslint'] as Record<string, unknown>).pad = pad;
+    const text = JSON.stringify(big);
+    expect(text.length).toBeLessThan(120 * 1024);
+    expect(() => renderStepWith(spec(t), t, platform(), ctx, { npmClosures: { eslint: text } })).toThrow(/too large/);
   });
 
   it2('a finished result folder is read-only', () => {

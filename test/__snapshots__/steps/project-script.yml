@@ -12,7 +12,7 @@
     package-manager-cache: "false"
     node-version: "22"
 - id: pipegen-npm-ci-3b4e3efd29cd131b
-  name: "pipegen: install the project dependencies (npm ci, no scripts)"
+  name: Install the project dependencies (npm ci, no scripts)
   run: |-
     set -euo pipefail
     unset CDPATH
@@ -68,7 +68,7 @@
     ENV: ""
     PIPEGEN_NPM_EXPECT: "[]"
 - id: repocode-fa2feb431f44fae6
-  name: "pipegen: run the project's test script"
+  name: Run the project's test script
   run: |-
     set -euo pipefail
     unset CDPATH

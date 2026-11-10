@@ -24,7 +24,7 @@ export function packageDataPath(rel: string): string {
 }
 
 /** A plain release version (1.2.3, or 1.2.3-rc.1): safe to put in a command people copy. */
-const VERSION_RE = /^\d{1,6}\.\d{1,6}\.\d{1,6}(?:-[0-9A-Za-z.-]{1,40})?$/;
+export const PLAIN_VERSION_RE = /^\d{1,6}\.\d{1,6}\.\d{1,6}(?:-[0-9A-Za-z.-]{1,40})?$/;
 
 /**
  * The running pipegen's version, from its own package.json (found like packageDataPath finds data/), or null when
@@ -34,7 +34,7 @@ export function packageVersion(): string | null {
   const dir = packageRoot();
   if (dir === null) return null;
   const version = readPackage(join(dir, 'package.json'))?.version;
-  return typeof version === 'string' && VERSION_RE.test(version) ? version : null;
+  return typeof version === 'string' && PLAIN_VERSION_RE.test(version) ? version : null;
 }
 
 /** The nearest folder above this module whose package.json is pipegen's (src/util/ in dev, dist/cli/ once bundled). */

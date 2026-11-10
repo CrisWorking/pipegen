@@ -160,6 +160,12 @@ describe('6b: docker (S26)', () => {
     expect(() => render('registry')).toThrow(/service/);
   });
 
+  it('PL-D2 fold R1: the rules fetch step has no doubled word ("semgrep-rules rules")', () => {
+    const names = render('semgrep').steps.map((s) => s.name ?? '');
+    expect(names.some((n) => /^Fetch the semgrep-rules\b/.test(n))).toBe(true);
+    expect(names.filter((n) => /\brules rules\b/.test(n) || /-rules rules\b/.test(n))).toEqual([]);
+  });
+
   it('docker: a docker entry without a reviewed mount is refused', () => {
     const t = entry('zap-baseline');
     expect(() => renderStepWith(spec(t), t, platform(), ctx, withPolicy('zap-baseline', ['slots', 'mount']))).toThrow(/mount/);
@@ -618,7 +624,7 @@ describe('6b: snapshots', () => {
     await expect(yamlOf(render('zap-baseline', {}, ctx, withPolicy('zap-baseline', ['slots'])).steps)).toMatchFileSnapshot('__snapshots__/steps/cli-docker.yml');
   });
 
-  it('snapshot: an npm checker (prettier, installed from pipegen\'s closure lock, in a service folder; the snapshot is small because a big lock would be one very long line)', async () => {
+  it('snapshot: an npm checker (prettier, installed from pipegen\'s closure lock, in a service folder; the lock is a multi-line readable JSON block)', async () => {
     const c = ctxFor([service({ name: 'web', path: 'apps/web', runtimeVersion: '24' })]);
     await expect(yamlOf(render('prettier', { service: 'web', workingDir: 'apps/web' }, c).steps)).toMatchFileSnapshot('__snapshots__/steps/cli-npm.yml');
   });
@@ -626,6 +632,47 @@ describe('6b: snapshots', () => {
   it('snapshot: an npm tool that runs the repo\'s code (vitest coverage)', async () => {
     const c = ctxFor([service({ name: 'web', path: 'apps/web', runtimeVersion: '24' })]);
     await expect(yamlOf(render('vitest-coverage', { service: 'web', workingDir: 'apps/web' }, c).steps)).toMatchFileSnapshot('__snapshots__/steps/cli-npm-repo-code.yml');
+  });
+
+  describe('PL-D3: JSON env values are written as readable YAML blocks', () => {
+    const c = ctxFor([service({ name: 'web', path: 'apps/web', runtimeVersion: '24' })]);
+    const npmSteps = (): RenderedStep[] => [...render('prettier', { service: 'web', workingDir: 'apps/web' }, c).steps, ...render('vitest-coverage', { service: 'web', workingDir: 'apps/web' }, c).steps];
+    it('PIPEGEN_NPM_EXPECT parses to the same object', () => {
+      const docs = parse(yamlOf(npmSteps())) as RenderedStep[];
+      const withPins = docs.filter((s) => s.env?.PIPEGEN_NPM_EXPECT !== undefined);
+      expect(withPins.length).toBeGreaterThanOrEqual(2);
+      for (const s of withPins) {
+        const text = s.env?.PIPEGEN_NPM_EXPECT as string;
+        expect(text).toContain('\n');
+        const pins = JSON.parse(text) as { name: string; version: string; integrity: string; resolved: string }[];
+        expect(Object.keys(pins[0] ?? {})).toEqual(['name', 'version', 'integrity', 'resolved']);
+        expect(pins[0]?.resolved).toBe(`https://registry.npmjs.org/${pins[0]?.name}/-/${pins[0]?.name}-${pins[0]?.version}.tgz`);
+        expect(pins[0]?.integrity).toMatch(/^sha512-/);
+      }
+      const rendered = npmSteps();
+      expect(docs.length).toBe(rendered.length);
+      let compared = 0;
+      docs.forEach((d, i) => {
+        for (const [k, v] of Object.entries(rendered[i]?.env ?? {})) {
+          if (!/^[[{]/.test(String(v))) continue;
+          expect(d.env?.[k], k).toBe(v);
+          compared++;
+        }
+      });
+      expect(compared).toBeGreaterThanOrEqual(4);
+    });
+    it('no JSON env value line over 120 characters in the fixtures (measured on the parsed value)', () => {
+      const lines = yamlOf(npmSteps()).split('\n');
+      const at = lines.findIndex((l) => /^\s+PIPEGEN_NPM_EXPECT: \|/.test(l));
+      expect(at).toBeGreaterThan(-1);
+      for (const f of ['cli-npm.yml', 'cli-npm-repo-code.yml']) {
+        const docs = parse(readFileSync(join('test/__snapshots__/steps', f), 'utf8')) as RenderedStep[];
+        const json = docs.flatMap((s) => Object.entries(s.env ?? {})).filter(([, v]) => /^[[{]/.test(String(v)));
+        expect(json.length, f).toBeGreaterThan(0);
+        const long = json.flatMap(([k, v]) => String(v).split('\n').filter((l) => l.length > 120).map((l) => `${k}: ${l}`));
+        expect(long, f).toEqual([]);
+      }
+    });
   });
 
   it('snapshot: a pip tool with a fixture closure (mypy)', async () => {

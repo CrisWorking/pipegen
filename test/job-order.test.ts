@@ -76,7 +76,7 @@ describe('C2: every rendered step has a recognised id, and a checker is one step
       try { r = renderStepWith(specFor(t, { needId: needFor(t) }), t, platform(), ctx); } catch (e) { if (e instanceof RenderError) continue; throw e; }
       rendered++;
       // the check of a repo-code tool's install has no id on purpose: it follows the repo's own `npm ci`, so it is repo code
-      for (const s of r.steps.filter((x) => x.run !== undefined && !x.name.includes('check the installed tool'))) expect(s.id, `${t.id}: ${s.name}`).toMatch(RECOGNISED);
+      for (const s of r.steps.filter((x) => x.run !== undefined && !x.name.includes('Check the installed tool'))) expect(s.id, `${t.id}: ${s.name}`).toMatch(RECOGNISED);
       expect(new Set(r.steps.map((s) => s.id).filter((i) => i !== undefined)).size, t.id).toBe(r.steps.filter((s) => s.id !== undefined).length);
       expect(checkJobOrder(dedupeJobSteps(r.steps, { scans: NO_SCANS })), t.id).toEqual([]);
     }
@@ -211,9 +211,15 @@ describe('6c fix round 1: dedupe keeps the guarded repo npm ci (finding 5)', () 
     expect(both.filter((s) => s.id?.startsWith('pipegen-npm-ci-'))).toHaveLength(1);
     expect(both.filter((s) => s.id?.startsWith('repocode-'))).toHaveLength(2);
   });
+  it('PL-D3: a merged npm ci keeps its pins readable (indented JSON, the same pins)', () => {
+    const vitest = steps('vitest-coverage');
+    const own = vitest.find((s) => s.id?.startsWith('pipegen-npm-ci-'))?.env?.PIPEGEN_NPM_EXPECT as string;
+    const merged = guarded([...script(), ...vitest]).env?.PIPEGEN_NPM_EXPECT as string;
+    expect(merged).toBe(JSON.stringify(JSON.parse(own), null, 2));
+  });
   it('two guarded installs with different pins of one package are refused', () => {
     const a = steps('vitest-coverage');
-    const b = steps('vitest-coverage').map((s) => (s.id?.startsWith('pipegen-npm-ci-') ? { ...s, env: { ...s.env, PIPEGEN_NPM_EXPECT: (s.env?.PIPEGEN_NPM_EXPECT as string).replace(/"version":"[^"]+"/, '"version":"0.0.1"') } } : s));
+    const b = steps('vitest-coverage').map((s) => (s.id?.startsWith('pipegen-npm-ci-') ? { ...s, env: { ...s.env, PIPEGEN_NPM_EXPECT: (s.env?.PIPEGEN_NPM_EXPECT as string).replace(/"version": ?"[^"]+"/, '"version": "0.0.1"') } } : s));
     expect(() => dedupeJobSteps([...a, ...b], { scans: NO_SCANS })).toThrow(RenderError);
   });
 });

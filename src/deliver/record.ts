@@ -20,6 +20,7 @@ import { z } from 'zod';
 import { validDate } from '../../gate/src/date.js';
 import type { GuardInstallRecord } from '../create/guard.js';
 import { centralProjectName } from '../engine/central-path.js';
+import { PLAIN_VERSION_RE } from '../util/package-data.js';
 import type { RateClock } from '../engine/github-rate.js';
 import { createdPathProblem } from '../engine/job-rules.js';
 import { clockOf } from '../github/client.js';
@@ -123,7 +124,7 @@ const EDIT = z.discriminatedUnion('kind', [
 /** The install record (schema 2): strict, capped, validated. Anything else is refused, never read loosely. */
 export const InstallRecordSchema = z.strictObject({
   schema: z.literal(RECORD_SCHEMA),
-  pipegenVersion: z.string().regex(/^\d{1,6}\.\d{1,6}\.\d{1,6}(?:-[0-9A-Za-z.-]{1,40})?$/),
+  pipegenVersion: z.string().regex(PLAIN_VERSION_RE),   // PL-D1 Fold R2 (I1): the one regex the header check uses
   createdAt: ISO, mergedAt: ISO.optional(),
   centralSha: SHA.nullable(),
   app: z.strictObject({ owner: OWNER, repo: REPO, repoId: ID, defaultBranch: BRANCH, private: z.boolean(), ownerType: z.enum(['User', 'Organization']) }),

@@ -1,5 +1,5 @@
 - id: tool-pull-5ca176964f22c29a
-  name: "pipegen: pull the zap-baseline.py image"
+  name: Pull the zap-baseline.py image
   run: |-
     set -euo pipefail
     unset CDPATH
@@ -19,7 +19,7 @@
     ENV: ""
     PIPEGEN_IMAGE: zaproxy/zap-stable@sha256:5ccfff9a411743ab2615136a2edd7416bec9ce41572fa94e935df38c14adb2b6
 - id: tool-run-5ca176964f22c29a
-  name: "pipegen: run zap-baseline.py"
+  name: Run zap-baseline.py
   run: |-
     set -euo pipefail
     unset CDPATH

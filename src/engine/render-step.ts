@@ -23,7 +23,7 @@ import { centralWorkflowPath } from './central-path.js';
 import { NEED_IDS, toolCoversNeed } from './need-ids.js';
 import type { PlatformActions } from './pin.js';
 import { tuningProblems } from './tuning.js';
-import { APP_RUNNING_CATEGORIES, projectScriptSteps, renderCliTool, renderRangeScan, repoToolSteps, sha16, type CliHooks, type RenderOptions } from './render-cli.js';
+import { APP_RUNNING_CATEGORIES, projectScriptSteps, readableJson, renderCliTool, renderRangeScan, repoToolSteps, sha16, type CliHooks, type RenderOptions } from './render-cli.js';
 import { ArtifactNameError, resultArtifactName, SECRETS_HISTORY_ARTIFACT, SECRETS_RANGE_ARTIFACT } from './artifact-names.js';
 import { argvPolicyProblems, repoToolFor, type ProjectScriptStep, type RepoToolStep, type ReviewedEntry } from './reviewed.js';
 import { own, RenderError, show } from './render-error.js';
@@ -248,6 +248,19 @@ function chosenInputs(tool: ReviewedTool, given: Readonly<Record<string, string>
  * the chosen ones, then the renderer-filled ones. A key is set once. Every template or chosen value must be plain
  * words; a filled value passes its own RENDERER_INPUTS checker.
  */
+/**
+ * PL-D2: the display name of an action step, in plain words ("Download the artifact", not the action's path). An action nobody listed is named
+ * by what pipegen does with it, "Run <path>". The name is a label: the step's `uses`, its pin and its inputs say what runs.
+ */
+const ACTION_STEP_NAMES: Readonly<Record<string, string>> = Object.freeze({
+  'actions/checkout': 'Check out the repository', 'actions/setup-node': 'Set up Node.js', 'actions/setup-python': 'Set up Python',
+  'actions/upload-artifact': 'Upload the artifact', 'actions/download-artifact': 'Download the artifact',
+  'github/codeql-action/upload-sarif': 'Upload the result to code scanning', 'actions/attest': 'Attest the image',
+  'docker/login-action': 'Log in to the registry', 'docker/setup-buildx-action': 'Set up Docker Buildx', 'docker/build-push-action': 'Build the image',
+  'actions/dependency-review-action': 'Review the dependencies', 'pypa/gh-action-pypi-publish': 'Publish to PyPI',
+});
+export const actionStepName = (path: string): string => (Object.hasOwn(ACTION_STEP_NAMES, path) ? (ACTION_STEP_NAMES as Record<string, string>)[path] as string : `Run ${path}`);
+
 function actionStep(tool: ReviewedTool, name: string, choices: Readonly<Record<string, string>>, filled: Readonly<Record<string, string>>): RenderedStep {
   const { path, uses } = usesOf(tool);
   const fixed = tool.fixedInputs.with ?? {};
@@ -297,7 +310,7 @@ export function renderPlatformStep(key: keyof PlatformActions, platform: Platfor
     const offered = own(tool.choices, k);
     if (offered === undefined || !offered.includes(choices[k] as string)) throw new RenderError(`${key} has no choice ${show(k)} = ${show(choices[k])}.`);
   }
-  return actionStep(tool, `pipegen: ${usesOf(tool).path}`, choices, filled);
+  return actionStep(tool, actionStepName(usesOf(tool).path), choices, filled);
 }
 
 // ---------- renderStep ----------
@@ -346,7 +359,7 @@ export function renderStepWith(given: StepSpec, tool: ReviewedTool, platform: Pl
 
   const { path } = usesOf(tool);
   const service = spec.service === undefined ? undefined : ctx.profile.services.find((s) => s.name === spec.service);
-  const step = actionStep(tool, `pipegen: ${path}`, textChoices(spec.choices), rendererFill(path, service, ctx, typeof spec.choices.registry === 'string' ? spec.choices.registry : tool.choices.registry?.[0]));
+  const step = actionStep(tool, actionStepName(path), textChoices(spec.choices), rendererFill(path, service, ctx, typeof spec.choices.registry === 'string' ? spec.choices.registry : tool.choices.registry?.[0]));
   const secrets = spec.secrets ?? [];
   if (secrets.length > 0) step.env = Object.fromEntries(secrets.map((n) => [n, `\${{ secrets.${n} }}`]));
   return { steps: [step], output: null };
@@ -425,6 +438,7 @@ export function sameDedupeContent(a: RenderedStep, b: RenderedStep): boolean {
 /** The union of two lists of pinned packages (JSON, as in PIPEGEN_NPM_EXPECT); one package at two different pins is refused. */
 function mergePins(a: string | undefined, b: string | undefined): string {
   const out = new Map<string, string>();
+  const kept: unknown[] = [];
   for (const text of [a, b]) {
     let list: unknown;
     try { list = JSON.parse(text ?? '[]'); } catch { throw new RenderError('A dependency install step carries a pin list that is not JSON.'); }
@@ -433,10 +447,11 @@ function mergePins(a: string | undefined, b: string | undefined): string {
       const name = typeof p?.name === 'string' ? p.name : '';
       const line = JSON.stringify(p);
       if (name === '' || (out.has(name) && out.get(name) !== line)) throw new RenderError(`Two steps of one job install ${show(name)} at different pins.`);
+      if (!out.has(name)) kept.push(p);
       out.set(name, line);
     }
   }
-  return `[${[...out.values()].join(',')}]`;
+  return readableJson(kept);
 }
 
 /** The renderer-filled inputs of an action for this service and context (the others are set by the helpers that own them). */
@@ -524,7 +539,7 @@ export function renderScrub(artifact: string, rawPath: string, tool: string, for
   const staged: Record<string, string> = isStagedTool(tool) && artifact !== SECRETS_RANGE_ARTIFACT && artifact !== SECRETS_HISTORY_ARTIFACT ? { stage: stagePath(artifact) } : {};
   // G15a-R7 sec 3: no key for a key-free scrub (Scorecard): its job then names no secret at all
   const key: Record<string, string> = NO_KEY_SCRUB_TOOLS.has(tool) ? {} : { 'fp-key': '${{ secrets.PIPEGEN_FP_KEY }}' };
-  const step = actionStep(gate, 'pipegen: scrub the result', {}, { mode: 'scrub', artifact, tool, format, raw: rawPath, out, ...key, ...staged });
+  const step = actionStep(gate, 'Scrub the result', {}, { mode: 'scrub', artifact, tool, format, raw: rawPath, out, ...key, ...staged });
   return { id: scrubStepId(artifact), ...step, if: 'always()' };
 }
 
@@ -537,7 +552,7 @@ export function renderScrub(artifact: string, rawPath: string, tool: string, for
 export function renderStage(artifact: string, tool: string, gate: ReviewedTool): RenderedStep {
   checkGateEntry(gate);
   if (!isStagedTool(tool)) throw new RenderError(`${show(tool)} does not scan a stage folder, so it has no stage step.`);
-  const step = actionStep(gate, 'pipegen: stage the files for the secrets scan', {}, { mode: 'stage', artifact, tool, stage: stagePath(artifact) });
+  const step = actionStep(gate, 'Stage the files for the secrets scan', {}, { mode: 'stage', artifact, tool, stage: stagePath(artifact) });
   return { id: stageStepId(artifact), ...step };
 }
 
@@ -631,7 +646,7 @@ export function renderDockerActionStep(tool: ReviewedTool): RenderedStep {
   if (Object.keys(tool.choices).length > 0) throw new RenderError(`${show(tool.id)} has choices; a docker step takes only its fixed inputs.`);
   const fixed = tool.fixedInputs.with ?? {};
   if (!same(tool.step.action.with ?? {}, fixed)) throw new RenderError(`The reviewed entry ${show(tool.id)} has a step template that disagrees with its fixed inputs.`);
-  const step: RenderedStep = { name: `pipegen: ${path} (its image, by digest)`, uses: `docker://${image}@${w.digest}`, with: { ...fixed, ...(own(DOCKER_STEP_INPUTS, path) ?? {}) } };
+  const step: RenderedStep = { name: `Run the ${path.split('/').at(-1) ?? path} image by digest`, uses: `docker://${image}@${w.digest}`, with: { ...fixed, ...(own(DOCKER_STEP_INPUTS, path) ?? {}) } };
   checkExpressions(step);
   return step;
 }
@@ -646,7 +661,7 @@ export function renderScorecardBlock(tool: ReviewedTool, platform: PlatformActio
   const docker = renderDockerActionStep(tool);
   const raw = `\${{ runner.temp }}/pipegen-raw/${SCORECARD_ARTIFACT}/scorecard.sarif`;
   const move: RenderedStep = {
-    id: SCORECARD_MOVE_STEP_ID, name: 'pipegen: move the Scorecard result under the runner temp folder',
+    id: SCORECARD_MOVE_STEP_ID, name: 'Move the Scorecard result under the runner temp folder',
     run: [
       'set -euo pipefail',
       'src="$GITHUB_WORKSPACE/scorecard.sarif"',
@@ -672,6 +687,9 @@ export function renderUpload(artifact: string, path: string, platform: PlatformA
   return { ...step, name: 'Upload the result', if: 'always()' };
 }
 
+/** The step name of each gate upload: what it ships, not its artifact id. */
+const GATE_UPLOAD_STEP_NAMES: Readonly<Record<string, string>> = Object.freeze({ 'pipegen-gate-result': 'Upload the gate result', 'pipegen-baseline': 'Upload the baseline', 'pipegen-clean-run': 'Upload the clean-run marker' });
+
 /**
  * The gate job's uploads (C5b ruling 2), rendered after its gate step: `pipegen-gate-result` from `${{ runner.temp }}/pipegen-gate/result.json`
  * (always written, a missing file is an error), then `pipegen-baseline` and `pipegen-clean-run` from `baseline.json` and `marker.json`, which
@@ -684,7 +702,7 @@ export function renderGateUploads(platform: PlatformActions): RenderedStep[] {
     const step = renderPlatformStep('upload-artifact', platform, { name, path: gateUploadPath(name) });
     // fix round 1 (ruling 2): a failed baseline or marker upload is never a gate failure (C3); the result upload stays strict
     const optional = uploadIfNoFiles(name) === 'ignore';
-    return { ...step, name: `Upload ${name}`, if: 'always()', with: { ...step.with, 'if-no-files-found': uploadIfNoFiles(name) }, ...(optional ? { 'continue-on-error': true } : {}) };
+    return { ...step, name: GATE_UPLOAD_STEP_NAMES[name] ?? 'Upload the gate file', if: 'always()', with: { ...step.with, 'if-no-files-found': uploadIfNoFiles(name) }, ...(optional ? { 'continue-on-error': true } : {}) };
   });
 }
 
@@ -703,7 +721,7 @@ export function renderGateStep(gate: ReviewedTool, draft: PipelineDraft): Render
     if (e instanceof GateJobListError || e instanceof ArtifactNameError) throw new RenderError(e.message);
     throw e;
   }
-  return actionStep(gate, 'pipegen: the merge gate', {}, filled);
+  return actionStep(gate, 'Run the merge gate', {}, filled);
 }
 
 /**
@@ -720,7 +738,7 @@ export function renderNightlyStep(gate: ReviewedTool, draft: PipelineDraft): Ren
     if (e instanceof GateJobListError || e instanceof ArtifactNameError) throw new RenderError(e.message);
     throw e;
   }
-  return actionStep(gate, 'pipegen: nightly issues', {}, filled);
+  return actionStep(gate, 'Open the nightly issues', {}, filled);
 }
 
 /**
@@ -737,7 +755,7 @@ export function renderFindRunStep(gate: ReviewedTool, opts: { central?: { repo: 
   };
   if (opts.central !== undefined) { filled['central-workflow'] = centralWorkflowPath(opts.central.repo, opts.central.project); filled['central-sha'] = opts.central.sha; }
   if (opts.timeoutMinutes !== undefined) filled['timeout-minutes'] = String(opts.timeoutMinutes);
-  return actionStep(gate, 'pipegen: find the gated run', {}, filled);
+  return actionStep(gate, 'Find the gated run', {}, filled);
 }
 
 /**
@@ -748,7 +766,7 @@ export function renderFindRunStep(gate: ReviewedTool, opts: { central?: { repo: 
 export function renderBaselineCheckStep(gate: ReviewedTool): RenderedStep {
   checkGateEntry(gate);
   // G1 (G22): the step's id is BASELINE_CHECK_STEP_ID, so the job's `found` output is its output (jobOutputsFor / jobOutputsProblems)
-  return { id: BASELINE_CHECK_STEP_ID, ...actionStep(gate, 'pipegen: check the stored baseline', {}, {
+  return { id: BASELINE_CHECK_STEP_ID, ...actionStep(gate, 'Check the stored baseline', {}, {
     mode: 'baseline-check', 'github-token': '${{ secrets.GITHUB_TOKEN }}', 'fp-key': '${{ secrets.PIPEGEN_FP_KEY }}',
   }) };
 }
@@ -868,7 +886,7 @@ export function renderRuntimeEnv(rt: RuntimeEnv): RenderedStep {
     lines.push(`printf '%s=%s\\n' '${APP_PREFIX}${name}' "${containerValue(dep, kind)}" >> "$GITHUB_ENV"`);
   }
   const id = `runtime-env-${sha16(JSON.stringify(rt.vars.map((v) => [v.name, v.kind, v.dep])))}`;
-  return bashStep('pipegen: set the test database environment', lines.join('\n'), id);
+  return bashStep('Set the test database environment', lines.join('\n'), id);
 }
 
 /** Where the proof harness's app-start writes its compose override (E3, ruling B7): in runner temp, never in the checkout. */
@@ -891,11 +909,11 @@ export const COMPOSE_UP_FAILED = '|| { echo "::error::pipegen: the containers di
 
 export function renderComposeUp(opts: { proofOverride?: true } = {}): RenderedStep {
   if (opts.proofOverride === true) {
-    return bashStep('pipegen: start the services with docker compose (proof images, no build)',
+    return bashStep('Start the services with docker compose (proof images, no build)',
       `set -euo pipefail\ndocker compose --env-file /dev/null -f docker-compose.pipegen.yml -f "${PROOF_OVERRIDE_PATH}" up -d --wait --no-build ${COMPOSE_UP_FAILED}`, `repocode-${sha16('compose-up-proof')}`);
   }
   if (opts.proofOverride !== undefined) throw new RenderError('proofOverride is true or absent.');
-  return bashStep('pipegen: start the services with docker compose', `set -euo pipefail\ndocker compose --env-file /dev/null -f docker-compose.pipegen.yml up -d --wait ${COMPOSE_UP_FAILED}`, `repocode-${sha16('compose-up')}`);
+  return bashStep('Start the services with docker compose', `set -euo pipefail\ndocker compose --env-file /dev/null -f docker-compose.pipegen.yml up -d --wait ${COMPOSE_UP_FAILED}`, `repocode-${sha16('compose-up')}`);
 }
 
 /** Put on every job that feeds the gate, builds, signs or verifies (Plan G): no cache of any kind. */
@@ -906,6 +924,12 @@ export function jobSettings(spec: StepSpec): { 'cache-mode': 'none' } {
 // ---------- YAML ----------
 
 const NEEDS_QUOTES = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]|\$\{\{|^\s|\s$|\s#|:\s|^[-?:,[\]{}#&*!|>'"%@`]/;
+
+/** PL-D3: an env value that is indented JSON (an object or a list over several lines); only these are written as a literal block. */
+function isJsonBlock(value: string): boolean {
+  if (!/^[[{]\n/.test(value)) return false;
+  try { return typeof JSON.parse(value) === 'object'; } catch { return false; }
+}
 
 /** A string scalar that can't be read as anything else: quoted whenever it has control characters, an expression or YAML syntax. */
 function str(value: string, block = false): Scalar {
@@ -934,7 +958,8 @@ export function stepsToYaml(steps: readonly RenderedStep[]): YAMLSeq {
         map.set(key, node);
       } else if (typeof value === 'object') {
         const inner = new YAMLMap();
-        for (const [k, v] of Object.entries(value)) inner.set(new Scalar(k), str(v));
+        // PL-D3: a multi-line env value (indented JSON) is a literal block when it can be one, else a quoted string as before
+        for (const [k, v] of Object.entries(value)) inner.set(new Scalar(k), str(v, key === 'env' && isJsonBlock(v)));
         map.set(key, inner);
       } else map.set(key, new Scalar(value));
     }

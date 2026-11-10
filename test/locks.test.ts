@@ -455,6 +455,25 @@ describe('G8: merge locks, central locks, required workflow, CODEOWNERS', () => 
       }
     });
 
+    it('PL-D1-R1: the org required workflow has the pipegen header and the part banner (version injected, default, or refused)', () => {
+      const { a } = assembledPrivate();
+      const base = { orgAdmin: true, ids: { app: 11, central: 22 }, files: a.files };
+      const text = planLocks(inputs({ ...base, version: '9.8.7' })).orgRequiredWorkflow?.file.content as string;
+      const head = text.split('\n').filter((l, i, all) => all.slice(0, i + 1).every((x) => x.startsWith('#'))).join('\n');
+      expect(head).toMatch(/written by pipegen 9\.8\.7\./i);
+      expect(head.match(/written by pipegen/gi)).toHaveLength(1);
+      expect(head).toContain('PIPEGEN.md');
+      expect(head).toContain('npx pipegen update');
+      expect(head).toMatch(/When it runs: on every pull request/);
+      expect(head).not.toMatch(/\d{4}-\d{2}-\d{2}/);
+      expect(text).toContain('  # --- Before merge ---\n  pipegen-required:\n');
+      // comments only: the data is the exact form the referee holds the file to
+      expect(parse(text)).toEqual(parse(planLocks(inputs({ ...base, version: null })).orgRequiredWorkflow?.file.content as string));
+      expect((planLocks(inputs({ ...base, version: null })).orgRequiredWorkflow?.file.content as string)).toMatch(/Written by pipegen\.\n/);
+      expect((planLocks(inputs(base)).orgRequiredWorkflow?.file.content as string)).toMatch(/Written by pipegen \d+\.\d+\.\d+/);
+      for (const bad of ['1.2', 'latest', '1.2.3\n# x: y', '1.2.3 $(id)', '']) expect(() => planLocks(inputs({ ...base, version: bad })), JSON.stringify(bad)).toThrow(LockError);
+    });
+
     it('I2 + m7: a planned org required workflow comes with the re-run note and the minutes note', () => {
       const { a } = assembledPrivate();
       const plan = planLocks(inputs({ orgAdmin: true, ids: { app: 11, central: 22 }, files: a.files }));
