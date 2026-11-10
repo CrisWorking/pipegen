@@ -574,7 +574,7 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
       ? { ...found0, categories: found0.categories.map((c) => (c.startsWith(UNKNOWN_PREFIX) ? c : `${UNKNOWN_PREFIX}${c}`)), reason: null,
         partialWhy: `${found0.subject} runs after a \`set\` whose options pipegen can't read, so it can't tell whether it runs.` }
       : found0;
-    const key = `${f.by}\u0000${f.dir ?? ''}\u0000${f.reason ?? ''}\u0000${f.hookRun === true ? 1 : f.hookRun === 'changed' ? 2 : 0}\u0000${f.dockerBuild?.file ?? ''}\u0000${f.composeRun?.service ?? ''}\u0000${f.composeBuild?.services?.join(',') ?? ''}`;
+    const key = `${f.by}\u0000${f.dir ?? ''}\u0000${f.reason ?? ''}\u0000${f.hookRun === true ? 1 : f.hookRun === 'changed' ? 2 : 0}\u0000${f.dockerBuild?.file ?? ''}\u0000${f.composeRun?.service ?? ''}\u0000${f.composeBuild?.services?.join(',') ?? ''}\u0000${f.releaseSign === true ? 1 : 0}`; // PL-B1 fold R1: a sign-blob next to an image sign
     if (!seen.has(key)) {
       seen.add(key);
       found.push(f);

@@ -4,7 +4,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { mapCoverage, type Coverage } from '../src/audit/coverage.js';
 import { floorNeeds } from '../src/engine/needs.js';
-import { creditNotes } from '../src/audit/model.js';
+import { creditNotes, noImageCheck } from '../src/audit/model.js';
 import { applyLastRuns } from '../src/audit/github-signals.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
 import { readPrecommit, readWorkflows } from '../src/read/workflows.js';
@@ -358,6 +358,47 @@ describe('signing credit: cosign sign-blob on a release without an image', () =>
       expect(r.credit).toBeUndefined();
       expect(JSON.stringify(r)).not.toContain('sign-blob');
     }
+  });
+  // PL-B1 fold R1: one finding per tool and folder per text must keep a sign-blob after an image sign apart
+  it('cosign sign of an image, then sign-blob in one step → covered', async () => {
+    for (const steps of [
+      run("cosign sign --yes ghcr.io/o/r@sha256:abc && cosign sign-blob --yes dist/pkg.tgz"),
+      '      - run: |\n          cosign sign --yes ghcr.io/o/r@sha256:abc\n          cosign sign-blob --yes dist/pkg.tgz\n',
+    ]) {
+      const r = await sign(steps, '\n  release:\n    types: [published]', true);
+      expect(r).toMatchObject({ status: 'covered', by: 'cosign', creditKind: 'signing' });
+      expect(r.credit).toContain('sign-blob');
+    }
+  });
+  // PL-B1 fold R1: a sign-blob after a `set` pipegen can't read may not run (U23: never a false covered)
+  it("sign-blob after a set pipegen can't read → unknown, never covered, no credit", async () => {
+    for (const set of ['set $OPTS', 'set -- $ARGS']) {
+      const r = await sign(`      - run: |\n          ${set}\n          cosign sign-blob --yes dist/pkg.tgz\n`, '\n  release:\n    types: [published]', true);
+      expect(r.status).toBe('unknown');
+      expect(r.credit).toBeUndefined();
+    }
+  });
+  // PL-B1 fold R1 (mirror rule): a file signature proves nothing about an image
+  it('image service + only sign-blob → not covered', async () => {
+    for (const [steps, on] of [
+      [run('cosign sign-blob --yes dist/pkg.tgz'), "\n  push:\n    tags: ['v*']"],
+      [`${run('make dist')}${run('cosign sign-blob --key env://K --yes out/artifact.zip')}`, '\n  release:\n    types: [published]'],
+    ] as [string, string][]) {
+      const r = await sign(steps, on, false);
+      expect(r.status).not.toBe('covered');
+      expect(r.credit).toBeUndefined();
+    }
+  });
+  it("static site + root-level cosign sign of an image → static service's signing row not covered (real noImageCheck)", async () => {
+    const dir = makeTempDir();
+    wf(dir, 'release.yml', `on:\n  push:\n    tags: ['v*']\n${job(`${run('docker build -t ghcr.io/o/api:1 api')}${run('cosign sign --yes ghcr.io/o/api@sha256:abc')}`, 'publish')}`);
+    const pt = (types: string[]) => ({ types }) as unknown as Service['projectType'];
+    const p = await profileOf(dir, { services: [svc({ name: 'site', path: 'site', scripts: ['build'], projectType: pt(['static-site']) }), svc({ name: 'api', path: 'api', projectType: pt(['server']) })] });
+    const needs: Need[] = ['site', 'api'].map((s) => ({ id: `signing-${s}`, layer: 'deploy', category: 'signing', service: s, why: '', blocking: false, floor: false }));
+    const [site, api] = await mapCoverage(p, needs, dir, { noImage: noImageCheck(p) }) as [Coverage, Coverage];
+    expect(site.status).not.toBe('covered');
+    expect(site.credit).toBeUndefined();
+    expect(api).toMatchObject({ status: 'covered', by: 'cosign' });
   });
   it('signing credit: cosign verify or a help call is not a signature → no credit', async () => {
     const r = await sign(run('cosign verify-blob --key k --signature s f'), '\n  release:\n    types: [published]', true);

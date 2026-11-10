@@ -154,7 +154,10 @@ const OPAQUE_KEY = '\0opaque'; // not a category: the opaque runs (they have non
  */
 const RELEASE_SIGN_KEY = '\0signing-release';
 /** The table key a CI need reads its runs under. */
-const ciKey = (need: Need, d: Pick<Decide, 'noImage'>): string => (need.category === 'signing' && d.noImage(need) ? RELEASE_SIGN_KEY : need.category);
+/** PL-B1 fold R1 (mirror rule): not a category: the signing runs that don't sign files. A service with an image reads this key, so `cosign sign-blob` alone never covers it. */
+const IMAGE_SIGN_KEY = '\0signing-image';
+const ciKey = (need: Need, d: Pick<Decide, 'noImage'>): string =>
+  need.category !== 'signing' ? need.category : d.noImage(need) ? RELEASE_SIGN_KEY : need.service !== undefined ? IMAGE_SIGN_KEY : need.category;
 
 /**
  * P57 (C1): the language tag a per-service table key carries. A run is filed under its category plus each language it
@@ -183,7 +186,7 @@ export class Firsts {
       // P59 (3): a run given a path pipegen can't place, that would cover, is unknown for the services under its folder
       // (it still counts for repo-wide rows); one with a reason already is only partial there, never covered
       const unplaced = h.unplaced !== undefined && h.reason === null;
-      for (const key of h.opaque ? [OPAQUE_KEY] : h.releaseSign === true && h.categories.includes('signing') ? [...h.categories, RELEASE_SIGN_KEY] : h.categories) {
+      for (const key of h.opaque ? [OPAQUE_KEY] : !h.categories.includes('signing') ? h.categories : [...h.categories, h.releaseSign === true ? RELEASE_SIGN_KEY : IMAGE_SIGN_KEY]) {
         this.put(key, ALL, h, i);
         const here = unplaced && !key.startsWith(UNKNOWN_PREFIX) ? `${UNKNOWN_PREFIX}${key}` : key;
         if (d >= 0) for (const lang of langs) this.put(langKey(here, lang), d, h, i);
