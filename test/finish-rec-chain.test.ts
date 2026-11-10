@@ -617,6 +617,8 @@ describe('G-FINREC-R2 (review): verify judges a CODEOWNERS only on text that has
 describe('G-FINREC-R2 (mutant follow-ups)', () => {
   it('G-FINREC-R2 N1: a lone CR the gate reads as one rule with pipegen\'s owners still counts (GitHub may split it: `@b` alone would own everything)', () => {
     const central = codeownersFile('', codeownersBlock(CENTRAL_PROTECTED_PATHS, ['@a', '@b']));
+    // the gate reads `/src/\r*.c` as one pattern owned by @a @b; GitHub may read an ownerless `/src/` (an override) and `*.c @a @b`
+    expect(overridingRules(`${central}/src/\r*.c @a @b\n`, CENTRAL_PROTECTED_PATHS)).toHaveLength(1);
     expect(overridingRules(`${central}/src/*.c @a\r@b\n`, CENTRAL_PROTECTED_PATHS)).toHaveLength(1);
     // the same text on two lines is drift too: the ownerless `@b` covers every protected folder
     expect(overridingRules(`${central}/src/*.c @a\n@b\n`, CENTRAL_PROTECTED_PATHS)).toEqual(['@b']);
@@ -626,5 +628,16 @@ describe('G-FINREC-R2 (mutant follow-ups)', () => {
     const s = await seed();
     expect((await recordOn(s)).mergedAt).toBeUndefined();
     expect((await coDrift(s)).filter((x) => x.what === 'pipegen\'s block in the central CODEOWNERS')).toEqual([]);
+  });
+});
+
+describe('G-FINREC-R2 i1 (mutant follow-up)', () => {
+  it('G-FINREC-R2 i1: a readable central CODEOWNERS with no pipegen block after finish: "no pipegen block"', async () => {
+    const s = await seed();
+    await runFinish(s);
+    tamper(s, 'o/pipelines', CO, '/docs/ @writers\n');
+    const d = (await coDrift(s)).filter((x) => x.what === 'pipegen\'s block in the central CODEOWNERS');
+    expect(d).toHaveLength(1);
+    expect(d[0]?.actual).toMatch(/no pipegen block/);
   });
 });
