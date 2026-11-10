@@ -838,7 +838,13 @@ function centralCodeowners(x: Ctx): void {
   if (c.block !== null && c.path !== null) {
     const was = x.rec.central?.codeowners;
     x.centralRec.codeowners = { path: c.path, created: was?.path === c.path ? was.created : false };
-    x.applied.push(`the central CODEOWNERS (${show(c.path)}, reused)`);
+    // G-FINREC-R3 m1: a block another project wrote with other owners stays in force; say so and what to do (verify reports it as drift)
+    const norm = (l: readonly string[]): string => [...new Set(l.map((o) => o.replace(/^@/, '').toLowerCase()))].sort().join(' ');
+    const got = ownersOf(c.block);
+    const differs = x.planned.owners.central.length > 0 && norm(got) !== norm(x.planned.owners.central);
+    x.applied.push(differs
+      ? `the central CODEOWNERS (${show(c.path)}, reused: another project's block is in force with other owners; give every project sharing this central repo the same code owners, then run \`npx pipegen finish\` in each. It names ${got.join(' ')}; this project planned ${x.planned.owners.central.join(' ')})`
+      : `the central CODEOWNERS (${show(c.path)}, reused)`);
     return;
   }
   if (x.print) {

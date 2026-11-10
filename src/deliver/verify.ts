@@ -90,6 +90,11 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
     const readText = async (): Promise<string> => (e === undefined || e.type !== 'blob' ? '' : await readBlobText(gh, ed.repo === 'app' ? app : central, e.sha, MAX_TEXT, clock));
     // G-FINREC-R1 (sec M1): in every CODEOWNERS pipegen created or edited (app or central, its own write included), a rule after pipegen's
     // block wins over it; one that takes a protected path from the block's owners is drift (inserted text alone can't show that)
+    // G-FINREC-R3 i-b: a CODEOWNERS that isn't a plain file (a link, a submodule) is drift even when its sha is the one pipegen wrote
+    if (ed.kind === 'codeowners' && e !== undefined && (e.type !== 'blob' || (e.mode !== '100644' && e.mode !== '100755'))) {
+      drift.push({ what: `pipegen's lines in ${label(ed.repo, ed.path)}`, expected: 'pipegen\'s inserted text, once', actual: 'it is a link or not a plain file, so it can\'t be read' });
+      continue;
+    }
     let coText: string | null = null;
     if (ed.kind === 'codeowners' && e !== undefined && e.type === 'blob' && e.mode !== '120000') {
       try { coText = await readText(); } catch (err) {
@@ -127,8 +132,11 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
   for (const repo of ['app', 'central'] as const) {
     const edited = new Set([...r.edits.filter((e) => e.repo === repo && e.kind === 'codeowners').map((e) => e.path), ...r.files.filter((f) => f.repo === repo && f.part === 'codeowners').map((f) => f.path)]);
     if (edited.size === 0) continue;
-    const first = CO_PLACES.find((p) => trees[repo]?.has(p) === true);
-    if (first === undefined || edited.has(first)) continue;
+    // G-FINREC-R3 i-a: names compared in lower case (fail closed: a case variant GitHub might read first counts as present)
+    const paths = [...(trees[repo]?.keys() ?? [])];
+    const at = CO_PLACES.map((p) => paths.filter((x) => x.toLowerCase() === p.toLowerCase())).find((m) => m.length > 0);
+    const first = at?.find((x) => !edited.has(x));
+    if (first === undefined) continue;
     const ours = [...edited].map((p) => show(p)).join(', ');
     drift.push({ what: `the CODEOWNERS GitHub reads in the ${repo === 'app' ? 'app' : 'central'} repo`, expected: `${ours} (the file with pipegen's block) read first`, actual: `${show(first)} is the CODEOWNERS GitHub reads, so pipegen's block in ${ours} has no effect: take ${show(first)} out, or move its rules into ${ours} above \`# pipegen:begin\`` });
   }
@@ -159,7 +167,7 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
     if (first === undefined) drift.push({ what, expected: planned, actual: null });
     else if (text === null) drift.push({ what, expected: planned, actual: why });
     else if (got.length === 0) drift.push({ what, expected: planned, actual: 'no pipegen block: run `npx pipegen finish` again (it says why it left the file)' });
-    else if (got.join(' ') !== want.join(' ')) drift.push({ what, expected: planned, actual: `the block names ${got.map((o) => `@${o}`).join(' ')}` });
+    else if (got.join(' ') !== want.join(' ')) drift.push({ what, expected: planned, actual: `the block names ${got.map((o) => `@${o}`).join(' ')}: another project's block is in force with other owners; give every project sharing this central repo the same code owners, then run \`npx pipegen finish\` in each` });
     // an override after the block: the per-edit check already read a file pipegen recorded an edit for
     if (text !== null && got.length > 0 && !r.edits.some((x) => x.repo === 'central' && x.kind === 'codeowners' && x.path === first)) {
       const over = overrides(text, CENTRAL_PROTECTED_PATHS);
@@ -243,10 +251,17 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
     const e = tree?.get(path);
     if (e === undefined) continue;
     if (e.type === 'blob' && e.mode !== '120000') {
-      const text = await readBlobText(gh, app, e.sha, MAX_TEXT, clock);
+      const named = r.edits.some((x) => x.repo === 'app' && x.kind === 'codeowners' && x.path === path);
+      let text: string;
+      try { text = await readBlobText(gh, app, e.sha, MAX_TEXT, clock); } catch (err) {
+        // G-FINREC-R3 m2: unreadable is drift like the other two reads, never a crash (the per-edit check already named a file pipegen edited)
+        if (!(err instanceof DeliverError) && statusOf(err) !== 404 && statusOf(err) !== 422) throw err;
+        if (!named) drift.push({ what: `the CODEOWNERS GitHub reads in the app repo (${label('app', path)})`, expected: 'UTF-8 text pipegen can check', actual: 'it can\'t be read' });
+        break;
+      }
       // G-FINREC-R2: only text that hashes back to the blob is judged; the per-edit check already named a file pipegen edited
       if (gitBlobSha(text) === e.sha) warnings.push(...teamOnly(text, r, path));
-      else if (!r.edits.some((x) => x.repo === 'app' && x.kind === 'codeowners' && x.path === path)) drift.push({ what: `the CODEOWNERS GitHub reads in the app repo (${label('app', path)})`, expected: 'UTF-8 text pipegen can check', actual: 'it can\'t be read as UTF-8 text, so pipegen can\'t check it' });
+      else if (!named) drift.push({ what: `the CODEOWNERS GitHub reads in the app repo (${label('app', path)})`, expected: 'UTF-8 text pipegen can check', actual: 'it can\'t be read as UTF-8 text, so pipegen can\'t check it' });
     }
     break;
   }

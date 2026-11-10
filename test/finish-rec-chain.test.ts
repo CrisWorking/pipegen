@@ -641,3 +641,72 @@ describe('G-FINREC-R2 i1 (mutant follow-up)', () => {
     expect(d[0]?.actual).toMatch(/no pipegen block/);
   });
 });
+
+// ---------- Fold R3 (G-FINREC-R3) ----------
+
+describe('G-FINREC-R3: verify and finish fold (m1, m2, i-a, i-b)', () => {
+  const BLOCK = codeownersBlock(CENTRAL_PROTECTED_PATHS, ['@a', '@b']);
+  const OTHER = codeownersBlock(CENTRAL_PROTECTED_PATHS, ['@x', '@y']);
+  const ADVICE = /another project's block is in force with other owners; give every project sharing this central repo the same code owners, then run `npx pipegen finish` in each/;
+  const setMode = (s: Seed, repo: string, path: string, mode: string): void => {
+    const r = s.g.repo(repo);
+    (r.trees.get(r.commits.get(s.g.head(repo))?.tree as string)?.get(path) as { mode: string }).mode = mode;
+  };
+
+  it('G-FINREC-R3 m1: a reused central block with other owners: verify says why and what to do; finish prints that note, not just "reused"', async () => {
+    const s = await seed({ centralFiles: { [CO]: OTHER } });
+    const res = await finish(s.g.octokit(), { owner: 'o', repo: 'r' }, {}, s.deps());
+    const line = res.applied.find((a) => /the central CODEOWNERS/.test(a)) as string;
+    expect(line).toMatch(ADVICE);
+    expect(line).toMatch(/@x @y/);
+    const d = (await coDrift(s)).filter((x) => x.what === 'pipegen\'s block in the central CODEOWNERS');
+    expect(d).toHaveLength(1);
+    expect(d[0]?.actual).toMatch(ADVICE);
+    // the same owners: plain "reused", no note
+    const t = await seed({ centralFiles: { [CO]: BLOCK } });
+    const r2 = await finish(t.g.octokit(), { owner: 'o', repo: 'r' }, {}, t.deps());
+    const l2 = r2.applied.find((a) => /the central CODEOWNERS/.test(a)) as string;
+    expect(l2).toMatch(/, reused\)$/);
+  });
+
+  it('G-FINREC-R3 m2: an unreadable app CODEOWNERS GitHub reads first (not edited by pipegen): drift, no throw', async () => {
+    const s = await seed();
+    await runFinish(s);
+    s.g.commitOn('o/r', 'main', { '.github/CODEOWNERS': '* @o/team\n' }, 'owner: edit');
+    const r = s.g.repo('o/r');
+    const sha = r.trees.get(r.commits.get(s.g.head('o/r'))?.tree as string)?.get('.github/CODEOWNERS')?.sha as string;
+    s.g.hooks.push((call) => (call.route === 'GET /repos/{owner}/{repo}/git/blobs/{file_sha}' && call.params.file_sha === sha ? { status: 404, data: { message: 'Not Found' } } : undefined));
+    const v = await verifyOf(s);
+    expect(v.drift.some((x) => /\.github\/CODEOWNERS/.test(`${x.what}`) && x.actual === 'it can\'t be read')).toBe(true);
+  });
+
+  it('G-FINREC-R3 i-a: a case-variant CODEOWNERS earlier in GitHub\'s lookup is reported; pipegen\'s own output is not', async () => {
+    const s = await seed();
+    await runFinish(s);
+    expect(await coDrift(s)).toEqual([]);
+    tamper(s, 'o/r', '.github/codeowners', '* @mallory\n');
+    const d = await coDrift(s);
+    expect(d.some((x) => /app/.test(x.what) && /\.github\/codeowners is the CODEOWNERS GitHub reads/.test(String(x.actual)))).toBe(true);
+    const t = await seed({ centralFiles: { CODEOWNERS: '/docs/ @writers\n' } });
+    await runFinish(t);
+    tamper(t, 'o/pipelines', '.github/codeowners', '* @mallory\n');
+    expect((await coDrift(t)).some((x) => /central/.test(x.what) && /\.github\/codeowners is the CODEOWNERS GitHub reads/.test(String(x.actual)))).toBe(true);
+  });
+
+  it('G-FINREC-R3 i-b: a CODEOWNERS pipegen edited that became a link to the same blob is drift, app and central', async () => {
+    const s = await seed();
+    await runFinish(s);
+    expect(await coDrift(s)).toEqual([]);
+    setMode(s, 'o/r', 'CODEOWNERS', '120000');
+    expect((await coDrift(s)).some((x) => /app file CODEOWNERS/.test(x.what) && /link or not a plain file/.test(String(x.actual)))).toBe(true);
+    const t = await seed();
+    await runFinish(t);
+    setMode(t, 'o/pipelines', CO, '120000');
+    expect((await coDrift(t)).some((x) => /central file \.github\/CODEOWNERS/.test(x.what) && /link or not a plain file/.test(String(x.actual)))).toBe(true);
+    // an executable plain file is still a file
+    const u = await seed();
+    await runFinish(u);
+    setMode(u, 'o/r', 'CODEOWNERS', '100755');
+    expect(await coDrift(u)).toEqual([]);
+  });
+});
