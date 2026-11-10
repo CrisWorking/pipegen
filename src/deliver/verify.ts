@@ -91,10 +91,13 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
     // block wins over it; one that takes a protected path from the block's owners is drift (inserted text alone can't show that)
     const coText = ed.kind === 'codeowners' && e !== undefined && e.type === 'blob' && e.mode !== '120000' ? await readText() : null;
     if (coText !== null) {
-      const over = overridingRules(coText, ed.repo === 'app' ? [...new Set([...protectedListOf(r, 'app'), ...PROTECTED_PATHS_BASE])] : CENTRAL_PROTECTED_PATHS);
+      const over = overrides(coText, ed.repo === 'app' ? [...new Set([...protectedListOf(r, 'app'), ...PROTECTED_PATHS_BASE])] : CENTRAL_PROTECTED_PATHS);
       // markers missing with the inserted text gone too: the check below names it once
       if (over === null ? coText.split((ed as { inserted: string }).inserted).length === 2 : over.length > 0) {
-        drift.push({ what: `a CODEOWNERS rule after pipegen's block in ${label(ed.repo, ed.path)}`, expected: 'no rule after pipegen\'s block that takes a protected path from its owners', actual: over === null ? 'pipegen\'s begin or end line is missing or repeated' : show(over.join(' | '), 600) });
+        // G-FINREC-R2 N3: what to do, and what each rule takes
+        drift.push(over === null
+          ? { what: `a CODEOWNERS rule after pipegen's block in ${label(ed.repo, ed.path)}`, expected: 'keep exactly one `# pipegen:begin` and one `# pipegen:end` line', actual: 'pipegen\'s begin or end line is missing or repeated, so nothing can say where its block ends' }
+          : { what: `a CODEOWNERS rule after pipegen's block in ${label(ed.repo, ed.path)}`, expected: 'rules after `# pipegen:end` win over pipegen\'s block: move them above `# pipegen:begin`, or give them only pipegen\'s owners', actual: show(over.map((o) => `${o.line} (${o.covers})`).join(' | '), 600) });
       }
     }
     if (e !== undefined && ed.writtenShas.includes(e.sha)) continue;
@@ -103,6 +106,26 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
       if (text.split(ed.inserted).length !== 2) drift.push({ what: `pipegen's lines in ${label(ed.repo, ed.path)}`, expected: 'pipegen\'s inserted text, once', actual: e === undefined ? null : 'changed or missing' });
     } else {
       drift.push({ what: label(ed.repo, ed.path), expected: ed.writtenShas.at(-1) ?? 'the file pipegen wrote', actual: e?.sha ?? null });
+    }
+  }
+
+  // G-FINREC-R2 N2: GitHub (and the gate) read the first of CO_PLACES that is there; one ahead of the file pipegen edited shadows its block
+  for (const repo of ['app', 'central'] as const) {
+    const edited = new Set([...r.edits.filter((e) => e.repo === repo && e.kind === 'codeowners').map((e) => e.path), ...r.files.filter((f) => f.repo === repo && f.part === 'codeowners').map((f) => f.path)]);
+    if (edited.size === 0) continue;
+    const first = CO_PLACES.find((p) => trees[repo]?.has(p) === true);
+    if (first === undefined || edited.has(first)) continue;
+    const ours = [...edited].map((p) => show(p)).join(', ');
+    drift.push({ what: `the CODEOWNERS GitHub reads in the ${repo === 'app' ? 'app' : 'central'} repo`, expected: `${ours} (the file with pipegen's block) read first`, actual: `${show(first)} is the CODEOWNERS GitHub reads, so pipegen's block in ${ours} has no effect: take ${show(first)} out, or move its rules into ${ours} above \`# pipegen:begin\`` });
+  }
+  // G-FINREC-R2 i1: code-owner review planned on central (finish ran) needs pipegen's block in the CODEOWNERS central reads (finish may have
+  // skipped writing it: not UTF-8, a clash, lines it couldn't append)
+  if (r.mergedAt !== undefined && r.planned.owners.central.length > 0 && trees.central !== null) {
+    const first = CO_PLACES.find((p) => trees.central?.has(p) === true);
+    const e = first === undefined ? undefined : trees.central.get(first);
+    const text = e === undefined || e.type !== 'blob' || e.mode === '120000' ? null : await readBlobText(gh, central, e.sha, MAX_TEXT, clock);
+    if (text === null || pipegenBlockOwners(text).length === 0) {
+      drift.push({ what: 'pipegen\'s block in the central CODEOWNERS', expected: `pipegen's block in ${show(first ?? '.github/CODEOWNERS')} (the central ruleset asks for code-owner review)`, actual: first === undefined ? null : 'no pipegen block: run `npx pipegen finish` again (it says why it left the file)' });
     }
   }
 
@@ -473,13 +496,14 @@ const globMatch = (glob: string, name: string): boolean => { try { return picoma
  * - an anchored rule covers a protected folder when its fixed prefix (before the first wildcard) and the folder overlap, either way; an
  *   anchored protected file by the gate's own lookup; a protected name at any depth unless its last part is a wildcard glob that doesn't
  *   match the name.
- * A protected pattern with a wildcard outside a trailing `/**` is compared by its fixed prefix the same way.
+ * A protected pattern with a wildcard outside a trailing `/**` is compared by its fixed prefix the same way. Returns the protected pattern
+ * covered (G-FINREC-R2 N3: named in the drift), or null.
  */
-function ruleCovers(rule: CodeownersRule, protectedPaths: readonly string[]): boolean {
+function ruleCovers(rule: CodeownersRule, protectedPaths: readonly string[]): string | null {
   // the gate's `ancestors`: a trailing '/', or a last part with no (unescaped) wildcard, can name a folder and so every file under it
   const folderRule = rule.pattern.endsWith('/') || !/(^|[^\\])[*?]/.test(rule.pattern.replace(/\/$/, '').split('/').at(-1) as string);
   const body = rule.pattern.replace(/^\//, '').replace(/\/$/, '');
-  if (body === '') return true;
+  if (body === '') return 'every path';
   const anchored = rule.pattern.startsWith('/') || body.includes('/');
   const last = body.split('/').at(-1) as string;
   const prefix = fixedPrefix(body);
@@ -489,37 +513,38 @@ function ruleCovers(rule: CodeownersRule, protectedPaths: readonly string[]): bo
     let q = raw.replace(/^\.?\//, '');
     const anyDepth = !rooted && (!q.includes('/') || q.startsWith('**/'));
     q = q.replace(/^\*\*\//, '');
-    if (q === '' || q.split('/').some((x) => x === '..')) return true;
+    const at = anyDepth ? `${q} at any depth` : raw.replace(/^\.\//, '/');
+    if (q === '' || q.split('/').some((x) => x === '..')) return at;
     const subtree = q.endsWith('/**');
     const target = subtree ? q.slice(0, -3) : q;
     if (WILD.test(target)) {
       // a wildcard inside the protected pattern: by its fixed prefix (folder part), any-depth names always
-      if (!anchored || anyDepth) return true;
+      if (!anchored || anyDepth) return at;
       const fixed = fixedPrefix(target);
-      if (overlaps(fixed.slice(0, fixed.lastIndexOf('/') + 1))) return true;
+      if (overlaps(fixed.slice(0, fixed.lastIndexOf('/') + 1))) return at;
       continue;
     }
     if (subtree) {
-      if (!anchored || anyDepth) return true;
-      if (overlaps(`${target.toLowerCase()}/`)) return true;
+      if (!anchored || anyDepth) return at;
+      if (overlaps(`${target.toLowerCase()}/`)) return at;
       continue;
     }
     const name = target.split('/').at(-1) as string;
     if (!anchored) {
-      if (folderRule && anyDepth) return true;
-      if (globMatch(body, name) || target.split('/').slice(0, -1).some((d) => globMatch(body, d))) return true;
+      if (folderRule && anyDepth) return at;
+      if (globMatch(body, name) || target.split('/').slice(0, -1).some((d) => globMatch(body, d))) return at;
       continue;
     }
     if (anyDepth) {
-      if (folderRule || globMatch(last, name)) return true;
+      if (folderRule || globMatch(last, name)) return at;
       continue;
     }
     const m = ownersLookup([rule], target);
-    if ('unresolved' in m || m.owners !== undefined) return true;
+    if ('unresolved' in m || m.owners !== undefined) return at;
     const ml = ownersLookup([{ ...rule, pattern: rule.pattern.toLowerCase() }], target.toLowerCase());
-    if ('unresolved' in ml || ml.owners !== undefined) return true;
+    if ('unresolved' in ml || ml.owners !== undefined) return at;
   }
-  return false;
+  return null;
 }
 
 /**
@@ -530,21 +555,28 @@ function ruleCovers(rule: CodeownersRule, protectedPaths: readonly string[]): bo
  * end line after it (nothing can say where the block ends). pipegen's own output has nothing after its block but what the owner wrote.
  */
 export function overridingRules(text: string, protectedPaths: readonly string[]): string[] | null {
+  return overrides(text, protectedPaths)?.map((o) => o.line) ?? null;
+}
+
+/** overridingRules with what each rule covers (G-FINREC-R2 N3), or why it counts without one (N1: a line the gate's parser can't read). */
+function overrides(text: string, protectedPaths: readonly string[]): { line: string; covers: string }[] | null {
   const lines = text.split(/\r?\n/);
   const begins = lines.flatMap((l, i) => (l === PIPEGEN_BLOCK_BEGIN ? [i] : []));
   const ends = lines.flatMap((l, i) => (l === PIPEGEN_BLOCK_END ? [i] : []));
   if (begins.length !== 1 || ends.length !== 1 || (ends[0] as number) < (begins[0] as number)) return null;
   const owners = new Set(pipegenBlockOwners(text));
-  const out: string[] = [];
+  const out: { line: string; covers: string }[] = [];
+  const unreadable = "a line the gate can't read: fix it or take it out";
   for (const raw of lines.slice((ends[0] as number) + 1)) {
     const line = raw.trim();
     if (line === '' || line.startsWith('#')) continue;
-    const rule = codeOwners(raw)[0];
-    if (rule === undefined) continue;
-    if (rule.unreadable !== undefined) { out.push(line.slice(0, 200)); continue; }
+    // G-FINREC-R2 N1: a line the gate's parser drops (or a lone CR GitHub may split on) may still be read by GitHub's own parser: it counts
+    const rule = raw.includes('\r') ? undefined : codeOwners(raw)[0];
+    if (rule === undefined || rule.unreadable !== undefined) { out.push({ line: line.slice(0, 200), covers: unreadable }); continue; }
     const named = line.split(/\s+/).length - 1;
     if (named > 0 && rule.owners.length === named && rule.owners.every((o) => owners.has(o))) continue;
-    if (ruleCovers(rule, protectedPaths)) out.push(line);
+    const covers = ruleCovers(rule, protectedPaths);
+    if (covers !== null) out.push({ line, covers: `covers ${covers}` });
   }
   return out;
 }
