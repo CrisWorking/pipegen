@@ -189,6 +189,8 @@ export async function runCentral(o: {
   outcome: (what: string, manual: string | undefined, fn: () => Promise<DeleteOutcome>) => Promise<boolean>;
   /** V6-R1 sec M1: the head pipegen last set the central uninstall branch to (the progress file), and where to save a new one. */
   branch: { head: string | undefined; set: (sha: string) => void };
+  /** PL-F5 (V9a R2-i3): the Actions access level the owner typed `keep` for in an earlier run (the progress file), and where to save it. */
+  access?: { kept: 'user' | 'organization' | undefined; keep: (level: 'user' | 'organization') => void };
 }): Promise<CentralOutcome> {
   const { api, plan, rec, report } = o;
   const app: RepoRef = { owner: plan.app.owner, repo: plan.app.repo };
@@ -258,7 +260,16 @@ export async function runCentral(o: {
             if (e instanceof UninstallRefusal) return { status: 'kept', why: `${NOT_TYPED} (${show(e.message, 200)})`, manual: accessStep };
             throw e;
           }
-          if (t === null) return { status: 'kept', why: NOT_TYPED, manual: accessStep };
+          if (t === null) {
+            // PL-F5 (V9a R2-i3): `keep` typed → the owner's choice, recorded: the level stays, and it is no leftover (the run can exit 0)
+            let keep = false;
+            try { keep = await api.keepCentralAccess(); } catch (e) {
+              if (!(e instanceof UninstallRefusal)) throw e;
+            }
+            if (!keep) return { status: 'kept', why: NOT_TYPED, manual: accessStep };
+            o.access?.keep(o.ownerType === 'Organization' ? 'organization' : 'user');
+            return { status: 'done', words: 'kept as pipegen set it (you typed keep)' };
+          }
           typed = t;
         }
         try {
@@ -389,7 +400,9 @@ export async function runCentral(o: {
         level = undefined;
       }
       // another level than pipegen's is not pipegen's any more (the owner set it): only pipegen's level, or no answer, is left over
-      if (level === set || typeof level !== 'string') {
+      // PL-F5 (V9a R2-i3): pipegen's level that the owner typed `keep` for in an earlier run is the owner's choice, not a leftover
+      if (level === set && o.access?.kept === set) report.done(`central Actions access of ${full}: kept as pipegen set it (you typed keep)`);
+      else if (level === set || typeof level !== 'string') {
         fail(`central Actions access of ${full}`, level === set ? 'it is still the level pipegen set after the central pull request merged' : 'pipegen can\'t tell it is back to the level before pipegen', (accessLevel(prev) === null
           ? `Check Settings → Actions → Access of ${full}: put it back to the level it had before pipegen by hand if no other project relies on it, then run \`pipegen uninstall\` again.`
           : `Check Settings → Actions → Access of ${full}: put it back to ${accessLevel(prev)} by hand if no other project relies on it (gh api -X PUT repos/${full}/actions/permissions/access -f access_level=${accessLevel(prev)}), then run \`pipegen uninstall\` again.`));

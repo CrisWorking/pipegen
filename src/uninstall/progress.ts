@@ -41,6 +41,9 @@ export interface UninstallProgress {
    * `confirmed: false` right before the request, `true` once GitHub accepted it (2xx); cleared on every other way out of that step.
    */
   centralDeleteSent?: { repoId: number; recordHash: string; confirmed: boolean };
+  /** PL-F5 (V9a R2-i3): the owner typed `keep` for the central Actions access level pipegen set (this level): a later run doesn't call it
+   *  a leftover while GitHub still holds exactly that level. */
+  centralAccessKept?: { level: 'user' | 'organization' };
   /** Run 1 needed no pull request and these workflows of pipegen's stay because the user kept them (V5-R1 sec M4): the next run's check
    *  for a live pipegen workflow passes them over (the run-2 preview still warns). */
   keptWorkflows?: string[];
@@ -62,6 +65,7 @@ const PROGRESS = z.strictObject({
   uninstallHead: SHA.optional(),
   centralUninstallHead: SHA.optional(),
   centralDeleteSent: z.strictObject({ repoId: z.number().int().positive(), recordHash: z.string().regex(/^[0-9a-f]{64}$/), confirmed: z.boolean() }).optional(),
+  centralAccessKept: z.strictObject({ level: z.enum(['user', 'organization']) }).optional(),
   keptWorkflows: z.array(z.string().max(300).regex(/^\.github\/workflows\/[^/]+\.ya?ml$/)).max(200).optional(),
   done: z.array(TEXT).max(2000), leftovers: z.array(ITEM).max(2000), updatedAt: z.string().max(40),
 });
@@ -113,6 +117,7 @@ export class ProgressFile {
       ...(p.uninstallHead === undefined ? {} : { uninstallHead: p.uninstallHead }),
       ...(p.centralUninstallHead === undefined ? {} : { centralUninstallHead: p.centralUninstallHead }),
       ...(p.centralDeleteSent === undefined ? {} : { centralDeleteSent: { ...p.centralDeleteSent } }),
+      ...(p.centralAccessKept === undefined ? {} : { centralAccessKept: { level: p.centralAccessKept.level } }),
       ...(p.keptWorkflows === undefined || p.keptWorkflows.length === 0 ? {} : { keptWorkflows: [...p.keptWorkflows] }),
       done: p.done.slice(-2000).map(text),
       leftovers: p.leftovers.slice(-2000).map((x) => ({ what: text(x.what), why: text(x.why), ...(x.manual === undefined ? {} : { manual: text(x.manual) }) })),

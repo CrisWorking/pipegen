@@ -70,6 +70,8 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
   let centralHead = prior?.phase === 'B' ? prior.centralUninstallHead : undefined;
   // V6-R3 sec M1: set right before pipegen's own repo DELETE of central (a later run that finds central gone can finish)
   let deleteSent = prior?.phase === 'B' ? prior.centralDeleteSent : undefined;
+  // PL-F5 (V9a R2-i3): the central Actions access level the owner typed `keep` for in an earlier run 2
+  let accessKept = prior?.phase === 'B' ? prior.centralAccessKept : undefined;
 
   // V-S9: the record as the preview read it (or this project's central PR that removed it, merged), before anything is sent
   await recheck();
@@ -81,6 +83,7 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
       ...(prior?.unfinished === true ? { unfinished: true as const } : {}),
       ...(centralHead === undefined ? {} : { centralUninstallHead: centralHead }),
       ...(deleteSent === undefined ? {} : { centralDeleteSent: deleteSent }),
+      ...(accessKept === undefined ? {} : { centralAccessKept: accessKept }),
       done: [...r.done], leftovers: [...r.failed, ...r.manual.map((m) => ({ what: m.what, why: m.why, ...(m.step === undefined ? {} : { manual: m.step }) }))],
     });
   };
@@ -103,7 +106,7 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
     }
     switch (o.status) {
       case 'deleted': case 'gone': case 'restored': case 'closed': case 'not-open': case 'done':
-        r.done.push(`${what}: ${DONE_WORDS[o.status]}`);
+        r.done.push(`${what}: ${o.status === 'done' && o.words !== undefined ? o.words : DONE_WORDS[o.status]}`);
         if (o.status === 'restored' && o.manual !== undefined) r.manual.push({ what, why: 'put back, but one part needs your hand', step: o.manual });
         return o.status;
       case 'kept':
@@ -223,6 +226,7 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
         gh, api, plan, rec, centralRepoId: rec.central?.repoId ?? loaded.centralRepoId, ownerType: loaded.app.ownerType, live, io: ctx.io, interactive, report,
         outcome: (what, manual, fn) => attempt(what, manual, fn),
         branch: { head: centralHead, set: (sha) => { centralHead = sha; save(); } },
+        access: { kept: accessKept?.level, keep: (level) => { accessKept = { level }; save(); } },
       });
     } catch (e) {
       if (isRateStop(e) || e instanceof GitHubAccessError || statusOf(e) === 401) throw e;
