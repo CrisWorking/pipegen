@@ -13,7 +13,7 @@ import { centralProjectName } from '../src/engine/central-path.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { pubKeySha256 } from '../src/engine/signing.js';
 import { PromptCancelledError, type Prompter } from '../src/cli/io.js';
-import { deliver, deliverCentral, dropRunSigningEnvironment, makeRunSigningEnvironment, PART_ORDER, planDelivery, previewText, SETUP_BRANCH, type DeliveryInput, type DeliverDeps, type SigningKey } from '../src/deliver/deliver.js';
+import { clashIndex, deliver, deliverCentral, pathClash, dropRunSigningEnvironment, makeRunSigningEnvironment, PART_ORDER, planDelivery, previewText, SETUP_BRANCH, type DeliveryInput, type DeliverDeps, type SigningKey } from '../src/deliver/deliver.js';
 import { DELIVER_WRITE_ROUTES, DeliverError, ghRead, ghWrite } from '../src/deliver/git-data.js';
 import { confirmView, TYPED_VIEW_FIELDS } from '../src/deliver/trust.js';
 import { InstallRecordSchema, readRecord, recordFileText, recordHash, recordMarker, recordPath, writeLocalRecord, writeRecord } from '../src/deliver/record.js';
@@ -2157,5 +2157,50 @@ describe('G-COCASE-R2 M1: deliver refuses a CODEOWNERS case variant on its secon
     if (c2.kind !== 'pinned') throw new Error('expected a pin');
     const plan2 = planDelivery(input(p, c2.sha, c2.committed === true ? { centralCommitted: c2.sha } : {}));
     await expect(deliver(w2.g.octokit(), p, plan2, w2.vault, deps(w2))).resolves.toBeDefined();
+  });
+});
+
+describe('PL-F6 pathClash keys once per tree', () => {
+  const blob = { sha: 'x', mode: '100644', type: 'blob' };
+  const tree = (...names: string[]): Map<string, typeof blob> => new Map(names.map((n) => [n, blob]));
+
+  it('pathClash: 50,000 entries x 50 files under 200 ms', () => {
+    const entries = tree(...Array.from({ length: 50_000 }, (_, i) => `src/dir${i % 100}/file${i}.ts`));
+    const files = Array.from({ length: 50 }, (_, i) => `new/dir${i}/f.ts`);
+    const t0 = performance.now();
+    const index = clashIndex(entries);
+    const hits = files.map((f) => pathClash(f, entries, index));
+    expect(performance.now() - t0).toBeLessThan(200);
+    expect(hits.every((h) => h === false)).toBe(true);
+  });
+
+  it('pathClash: with a passed index the entries are never walked again (one walk per tree)', () => {
+    let walks = 0;
+    class Counting extends Map<string, typeof blob> {
+      override [Symbol.iterator](): MapIterator<[string, typeof blob]> { walks++; return super[Symbol.iterator](); }
+      override keys(): MapIterator<string> { walks++; return super.keys(); }
+      override entries(): MapIterator<[string, typeof blob]> { walks++; return super.entries(); }
+      override forEach(...a: Parameters<Map<string, typeof blob>['forEach']>): void { walks++; super.forEach(...a); }
+    }
+    const entries = new Counting(Array.from({ length: 100 }, (_, i) => [`src/f${i}.ts`, blob] as [string, typeof blob]));
+    const index = clashIndex(entries);
+    const built = walks;
+    expect(built).toBeGreaterThan(0);
+    for (let i = 0; i < 50; i++) pathClash(`new/f${i}.ts`, entries, index);
+    expect(walks).toBe(built);
+  });
+
+  it('pathClash: a passed index answers like the one built per call (case variant, file under a folder, folder over a file)', () => {
+    const entries = tree('Docs/Readme.md', 'a/b', 'x/y/z.txt', '.g\u0131thub/CODEOWNERS');
+    const index = clashIndex(entries);
+    for (const p of ['docs/readme.md', 'a/b/c', 'x/y', 'x', 'x/y/z.txt/q', '.github/CODEOWNERS', 'a/c', 'x/yy', 'other.txt']) {
+      expect(pathClash(p, entries, index), p).toBe(pathClash(p, entries));
+    }
+    expect(pathClash('docs/readme.md', entries, index)).toBe(true);
+    expect(pathClash('a/b/c', entries, index)).toBe(true);
+    expect(pathClash('x/y', entries, index)).toBe(true);
+    expect(pathClash('.github/CODEOWNERS', entries, index)).toBe(true);
+    expect(pathClash('a/c', entries, index)).toBe(false);
+    expect(pathClash('x/yy', entries, index)).toBe(false);
   });
 });
