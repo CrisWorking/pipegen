@@ -61,7 +61,7 @@ import { ensureSigningEnvironment, pathClash, plannedOfLocks, readEnv, SETUP_BRA
 import { compareStatus, DeliverError, isoAt, readBlobText, readHead, readRepo, readTree, statusOf, type RepoRef, type TreeEntry } from './git-data.js';
 import { holdAppLease, isLeaseStop, stateDepsOf, type ReleaseLease } from '../proof/lease.js';
 import type { StateStore } from '../proof/state.js';
-import { ACCESS_LEVELS, centralOf, centralUpdateBranch, localFinishPendingPath, protectedPathsOfRecord, readFinishPending, readLocalRecord, RecordError, writeFinishPending, type RecordedEdit, writeRecord, type FinishPending, type LocalRecordDeps } from './record.js';
+import { ACCESS_LEVELS, centralOf, centralUpdateBranch, recordPath, localFinishPendingPath, protectedPathsOfRecord, readFinishPending, readLocalRecord, RecordError, writeFinishPending, type RecordedEdit, writeRecord, type FinishPending, type LocalRecordDeps } from './record.js';
 import { classicPutForm, holdsWanted, isObj, PLANNED_ROUTES, refusedAsUnavailable, SettingsApi } from './settings-api.js';
 import { trustedPrevious } from './trust.js';
 
@@ -1009,6 +1009,8 @@ async function finishHeld(gh: Octokit, app: RepoRef, opts: FinishOpts, deps: Fin
     const updateExists = await readHead(gh, central, update, clock) !== null;
     const trusted = await trustedPrevious(gh, app, central, centralRepo.defaultBranch, updateExists ? update : null, deps.local ?? {}, clock, notes, deps.io === undefined ? undefined : { io: deps.io, interactive: deps.interactive === true });
     if (trusted.record === null) {
+      // PL-E7: a hand-committed record whose block date is no real day: name the date and the file to fix
+      if (trusted.badBlockDate !== undefined) throw new FinishError(`The install record's block date ${show(trusted.badBlockDate)} is not a real day (a day looks like 2026-11-08, and the gate reads no other), so finish stops and applies nothing; fix the date in ${recordPath(app.repo)} on the default branch of ${show(`${central.owner}/${central.repo}`)}, then run \`npx pipegen finish\` again.`);
       throw new FinishError(`${trusted.exists ? `pipegen found no install record for ${show(`${app.owner}/${app.repo}`)} that it trusts` : `There is no install record for ${show(`${app.owner}/${app.repo}`)}`}, so it applies nothing: finish reads what to apply only from the record. ${!trusted.exists ? 'Run pipegen first.' : trusted.why === 'unreadable' ? 'Remove or fix that local record file, then run `npx pipegen finish` again at a terminal to confirm the record by typing the repo name.' : 'Run finish on the machine that set it up, or interactively to confirm the record by typing the repo name.'}${notes.length > 0 ? ` ${notes.join(' ')}` : ''}`);
     }
     const rec = trusted.record;

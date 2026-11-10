@@ -36,6 +36,8 @@ export const MAX_RECORD_BYTES = 1024 * 1024;
 
 /** A record pipegen won't read or write: a plain reason. */
 export class RecordError extends Error {
+  /** PL-E7: set when the only thing wrong is a `blockFrom` that is not a real day (the day as written, cut to 40 characters). */
+  blockDate?: string;
   constructor(message: string, options?: { cause?: unknown }) { super(message, options); this.name = 'RecordError'; }
 }
 
@@ -219,7 +221,11 @@ export function checkRecord(data: unknown): InstallRecord {
   try { r = InstallRecordSchema.safeParse(data); } catch (e) { throw new RecordError('The install record could not be checked, so pipegen won\'t read it.', { cause: e }); }
   if (!r.success) {
     const at = r.error.issues.slice(0, 3).map((i) => safeText(i.path.join('.') || '(top)', 80)).join(', ');
-    throw new RecordError(`The install record doesn't have the form pipegen writes (at ${at}), so pipegen won't read it.`);
+    const err = new RecordError(`The install record doesn't have the form pipegen writes (at ${at}), so pipegen won't read it.`);
+    // PL-E7: a hand-committed record whose only fault is an impossible block date says which date
+    const day = (data as { blockFrom?: unknown }).blockFrom;
+    if (typeof day === 'string' && r.error.issues.every((i) => i.path[0] === 'blockFrom')) err.blockDate = safeText(day, 40);
+    throw err;
   }
   return r.data as InstallRecord;
 }

@@ -34,6 +34,8 @@ export interface TrustedRecord {
    * (G17C-R1, F6/m2) one that can't be read: its note names the file only, and each command adds its own way on.
    */
   why?: 'no-local' | 'mismatch' | 'unreadable';
+  /** PL-E7: the block date of a record on GitHub that is not a real day (the only fault that made it unreadable); the caller names it. */
+  badBlockDate?: string;
   /**
    * G11-R3 (R2-6): for a record trusted by typing, the blockFrom of the full record behind the view (the view drops it: typing never
    * vouched it). finish may only take it as an earlier date, never a later one.
@@ -47,9 +49,9 @@ export interface TrustedRecord {
 export interface RecordConfirm { io: Prompter; interactive: boolean }
 
 /** A record read for the trust decision: an unreadable one counts as present and untrusted; a rate stop or another failure stops. */
-async function readFor(gh: Octokit, central: RepoRef, appRepo: string, branch: string, clock: RateClock): Promise<ReadRecordResult | 'unreadable' | null> {
+async function readFor(gh: Octokit, central: RepoRef, appRepo: string, branch: string, clock: RateClock, badDays?: string[]): Promise<ReadRecordResult | 'unreadable' | null> {
   try { return await readRecord(gh, central, appRepo, { branch, clock }); } catch (e) {
-    if (e instanceof RecordError) return 'unreadable';
+    if (e instanceof RecordError) { if (e.blockDate !== undefined) badDays?.push(e.blockDate); return 'unreadable'; }
     throw e;
   }
 }
@@ -158,10 +160,12 @@ const unvouched = (r: InstallRecord): { unvouchedBlockFrom?: string } => (r.bloc
 
 /** The earlier record, in the trust order of the header. `notes` gets a plain line when a record exists that pipegen doesn't trust. */
 export async function trustedPrevious(gh: Octokit, app: RepoRef, central: RepoRef, centralBranch: string, updateBranch: string | null, local: LocalRecordDeps, clock: RateClock, notes: string[], confirm?: RecordConfirm): Promise<TrustedRecord> {
-  const onDefault = await readFor(gh, central, app.repo, centralBranch, clock);
-  const onBranch = updateBranch === null ? null : await readFor(gh, central, app.repo, updateBranch, clock);
+  const badDays: string[] = [];
+  const onDefault = await readFor(gh, central, app.repo, centralBranch, clock, badDays);
+  const onBranch = updateBranch === null ? null : await readFor(gh, central, app.repo, updateBranch, clock, badDays);
   const exists = onDefault !== null || onBranch !== null;
   if (!exists) return { record: null, exists };
+  const badBlockDate = badDays[0] === undefined ? {} : { badBlockDate: badDays[0] };
   // G17 row 31 (open question 10, as G10-R-sec3): a local record file that can't be read (a link, a folder, not pipegen's form, a records
   // folder pipegen won't use) is a hard "untrusted", like a hash that matches neither record: no question, nothing vouched over it
   const file = await readLocalRecord(app, local).catch((e: unknown) => { if (e instanceof RecordError) return 'unreadable' as const; throw e; });
@@ -170,7 +174,7 @@ export async function trustedPrevious(gh: Octokit, app: RepoRef, central: RepoRe
     try { where = `this machine's local record file ${localRecordPath(app, local)}`; } catch { /* no path for this name */ }
     // G17C-R1 (F6, m2): the note names the file and what may be wrong with it; the command that asked adds its own way on
     notes.push(`The install record of ${safeText(`${central.owner}/${central.repo}`, 120)} can't be checked: ${where} can't be read (it is a link, a folder or not in the form pipegen writes, or the records folder it is in is one pipegen won't use), so pipegen trusts no install record.`);
-    return { record: null, exists, why: 'unreadable' };
+    return { record: null, exists, why: 'unreadable', ...badBlockDate };
   }
   // 1. vouched by this machine's local record file: the newest such record, the central PR branch first (it was built on the default one)
   for (const r of [onBranch, onDefault]) {
@@ -192,5 +196,5 @@ export async function trustedPrevious(gh: Octokit, app: RepoRef, central: RepoRe
     ? `can't be checked from this machine (no local record file holds its hash)${confirm?.interactive === true ? ' and you didn\'t confirm it' : '; run pipegen interactively to confirm it by typing the repo name'}`
     : "doesn't match the hash in this machine's local record file";
   notes.push(`The install record on ${where} of ${safeText(`${central.owner}/${central.repo}`, 120)} ${why}, so pipegen claims nothing from it: it writes a new record, and treats every existing file and secret as not its own.`);
-  return { record: null, exists, why: file === null ? 'no-local' : 'mismatch' };
+  return { record: null, exists, why: file === null ? 'no-local' : 'mismatch', ...badBlockDate };
 }

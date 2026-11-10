@@ -1579,7 +1579,7 @@ describe('G11 exception round 3 (G11-R3)', () => {
         await expect(writeRecord(s.g.octokit(), { record: { ...r, blockFrom: day }, setupPr: s.pr, via: 'direct', files: [], base: s.g.head('o/pipelines'), clock: clock(), now: () => new Date('2026-11-08T12:00:00Z'), local: { home: s.home, env: {} } })).rejects.toThrow(/form pipegen writes \(at blockFrom\)/);
         s.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: recordFileText({ ...r, blockFrom: day }) });
         s.g.x('o/r').variables.delete('PIPEGEN_BLOCK_FROM');
-        await expect(typedRun(s)).rejects.toThrow(/found no install record for .* that it trusts/);
+        await expect(typedRun(s)).rejects.toThrow(/block date 2026-02-30 is not a real day/);
         expect(varOf(s, 'PIPEGEN_BLOCK_FROM'), day).toBeUndefined();
         // G17C-R1 (F4): the control: the same hand commit with a real day is trusted, so the day is the reason
         s.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: recordFileText({ ...r, blockFrom: '2026-11-08' }) });
@@ -1594,6 +1594,22 @@ describe('G11 exception round 3 (G11-R3)', () => {
       await typedRun(s);
       expect(varOf(s, 'PIPEGEN_BLOCK_FROM')?.value, day).toBe(BLOCK_FROM);
     }
+  });
+
+  it('typed finish, record date 2026-02-30 → message names 2026-02-30', async () => {
+    const s = await seed();
+    await finish(s.g.octokit(), app, {}, s.deps());
+    const r = await recordOn(s);
+    s.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: recordFileText({ ...r, blockFrom: '2026-02-30' }) });
+    const msg = await typedRun(s).then(() => '', (e: Error) => e.message);
+    expect(msg).toMatch(/block date 2026-02-30 is not a real day/);
+    expect(msg).toContain(`fix the date in ${recordPath('r')}`);
+    expect(msg).toMatch(/finish stops/);
+    // a record unreadable for another reason keeps the plain message, no date named
+    s.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: '{}' });
+    const other = await typedRun(s).then(() => '', (e: Error) => e.message);
+    expect(other).toMatch(/found no install record/);
+    expect(other).not.toMatch(/block date/);
   });
 
   it('finish: a re-run vouched by an earlier typed confirmation also counts the unvouched blockFrom (R2-6)', async () => {
@@ -1672,7 +1688,7 @@ describe('G11 exception round 3 (G11-R3)', () => {
         if (del) {
           s.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: recordFileText({ ...r, blockFrom: day }) });
           s.g.x('o/r').variables.delete('PIPEGEN_BLOCK_FROM');
-          await expect(typedRun(s), day).rejects.toThrow(/found no install record for .* that it trusts/);
+          await expect(typedRun(s), day).rejects.toThrow(/block date .* is not a real day/);
           expect(varOf(s, 'PIPEGEN_BLOCK_FROM'), day).toBeUndefined();
           continue;
         }
