@@ -1606,7 +1606,7 @@ describe('G11 exception round 3 (G11-R3)', () => {
     expect(msg).toContain(`fix the date in ${recordPath('r')}`);
     expect(msg).toMatch(/finish stops/);
     // a record unreadable for another reason keeps the plain message, no date named
-    s.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: '{}' });
+    s.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: recordFileText({ ...r, blockFrom: '2026-02-30', createdAt: 'not a time' }) });
     const other = await typedRun(s).then(() => '', (e: Error) => e.message);
     expect(other).toMatch(/found no install record/);
     expect(other).not.toMatch(/block date/);
