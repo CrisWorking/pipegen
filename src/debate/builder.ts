@@ -388,6 +388,11 @@ function offersFor(ref: NeedRef, cands: readonly Candidate[], p: RepoProfile, de
     if (categoryOf(ref.id) === 'workflow-lint' && (!workflowLintTools(p).includes(e.id) || !workflowLintAvailable(deps.reviewed))) continue;
     // GJ: a pre-commit or husky repository's hooks are not lefthook's: hooks-ci offers no reviewed tool there (a plain note instead)
     if (categoryOf(ref.id) === 'hooks-ci' && p.precommit !== null && NO_HOOKS_CI_MANAGERS.has(p.precommit)) continue;
+    // PL-C0 (Plan P ruling P-R1), fail closed: kube-linter reads Kubernetes manifests only, so it never covers iac unless the repo's IaC is
+    // Kubernetes alone (with Terraform it would leave Terraform unscanned while the check looks covered)
+    if (categoryOf(ref.id) === 'iac' && e.id === 'kube-linter' && !(p.repoFiles?.kubernetes === true && Array.isArray(p.terraformDirs) && p.terraformDirs.length === 0)) continue;
+    // PL-C0: dependency-review-action needs a public repo or Advanced Security; on a private (or unknown) repo the job would fail
+    if (e.id === 'dependency-review-action' && p.private !== false) continue;
     const plan = choicePlan(e, ref, p);
     if (plan === null) continue;
     seen.add(c.id);

@@ -943,3 +943,49 @@ describe('builder (fix round 2)', () => {
     }
   });
 });
+
+// ---------- PL-C0 (Plan P ruling P-R1): two picks that are correctness bugs, filtered by code before the AI sees them ----------
+
+describe('PL-C0: offers that would leave a check falsely covered or failing', () => {
+  const K8S = { ...emptyRepoFiles(), kubernetes: true };
+  const iacIds = (p: RepoProfile): string[] => {
+    const n = [need('iac', 'merge', undefined, true)];
+    return (builderOffers(n, candidatesFor(n, p), p, deps()).offers.get('iac') ?? []).map((o) => o.entry.id);
+  };
+  const drIds = (p: RepoProfile): string[] => {
+    const n = [need('dependency-review', 'merge', undefined, true)];
+    return (builderOffers(n, candidatesFor(n, p), p, deps()).offers.get('dependency-review') ?? []).map((o) => o.entry.id);
+  };
+
+  it('PL-C0: Terraform + Kubernetes never offers kube-linter for iac; trivy-config is offered', () => {
+    expect(iacIds(profile({ terraformDirs: ['infra'], repoFiles: K8S }))).toEqual(['trivy-config']);
+  });
+  it('PL-C0: Terraform alone never offers kube-linter for iac', () => {
+    expect(iacIds(profile({ terraformDirs: ['infra'] }))).toEqual(['trivy-config']);
+  });
+  it('PL-C0: no Kubernetes manifests found never offers kube-linter for iac (fail closed)', () => {
+    expect(iacIds(profile())).toEqual(['trivy-config']);
+  });
+  it('PL-C0: Kubernetes manifests alone still offer kube-linter and trivy-config (unchanged)', () => {
+    expect(iacIds(profile({ repoFiles: K8S }))).toEqual(['trivy-config', 'kube-linter']);
+  });
+  it('PL-C0: an AI pick of kube-linter on Terraform + Kubernetes is refused, never built', async () => {
+    const p = profile({ terraformDirs: ['infra'], repoFiles: K8S });
+    const n = [need('iac', 'merge', undefined, true)];
+    const { ai } = scripted((req) => answerFor(req, [{ key: 'iac', candidateId: 'kube-linter' }]));
+    await expect(buildChoices(n, candidatesFor(n, p), p, bundle, ai, deps())).rejects.toThrow();
+  });
+  it('PL-C0: a private repo never offers dependency-review-action', () => {
+    expect(drIds(profile({ private: true }))).not.toContain('dependency-review-action');
+    expect(drIds(profile({ private: true, ownerType: 'Organization' }))).not.toContain('dependency-review-action');
+  });
+  it('PL-C0: a public repo still offers dependency-review-action (unchanged)', () => {
+    expect(drIds(profile({ private: false }))).toContain('dependency-review-action');
+  });
+  it('PL-C0: an AI pick of dependency-review-action on a private repo is refused, never built', async () => {
+    const p = profile({ private: true });
+    const n = [need('dependency-review', 'merge', undefined, true)];
+    const { ai } = scripted((req) => answerFor(req, [{ key: 'dependency-review', candidateId: 'dependency-review-action' }]));
+    await expect(buildChoices(n, candidatesFor(n, p), p, bundle, ai, deps())).rejects.toThrow();
+  });
+});

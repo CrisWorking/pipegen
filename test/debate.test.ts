@@ -22,14 +22,16 @@ import { VARIANT_RE } from '../src/proof/snapshot.js';
 import { DEFAULT_MODEL, type AiProvider, type AiRequest, type Candidate, type Need, type RepoProfile } from '../src/types.js';
 import { CLEAN, gitleaksAt, makeStub, scanWith } from './helpers/gitleaks-stub.js';
 import { makeTempDir, writeIn } from './helpers/make-repo.js';
+import { emptyRepoFiles } from '../src/read/quality.js';
 import {
   API, BAR, CAPS, DOC_OPTS, NEEDS, NOW, REVIEWED, WEB, builderDeps, candidatesFor, discovered, need, profile, propertyNames, svc, usageOf,
 } from './helpers/debate-fixtures.js';
 
 // ---------- fixtures ----------
 
-/** The fixtures' api/web profile with Terraform, so the repo-wide iac key offers trivy-config (an AI severity choice) and kube-linter. */
-const PT = profile({ terraformDirs: ['infra'] });
+/** The fixtures' api/web profile with Kubernetes manifests only, so the repo-wide iac key offers trivy-config (an AI severity choice) and
+ * kube-linter (PL-C0: with Terraform, kube-linter is never offered for iac). */
+const PT = profile({ repoFiles: { ...emptyRepoFiles(), kubernetes: true } });
 /** The fixtures' needs plus a repo-wide iac need and a lint need for web (four lint tools offered). */
 const DN: Need[] = [...NEEDS, need('iac', 'merge', undefined), need('lint', 'merge', 'web')];
 const CANDS = candidatesFor(DN, PT, { 'sast--api': [discovered('cool-sast', 'acme/cool-sast', 'sast')] });
