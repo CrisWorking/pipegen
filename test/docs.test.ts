@@ -691,7 +691,7 @@ describe('doc: carries (lines present when they apply, absent when they do not)'
     const wf = wfOf('.github/workflows/pages.yml', ['push'], true, ['deploy'], { staticHosts: ['github-pages'] });
     const prof = profileOf([api, site], { existingWorkflows: [wf] });
     const needs = floorNeeds(prof, CAPS).filter((n) => n.id !== 'dast');
-    const x = planned(prof, { needs, over: { signing: { mode: 'keyless', images: [{ service: 'api', repo: 'ghcr.io/o/r-api' }, { service: 'Site', repo: 'ghcr.io/o/r-site' }] } } });
+    const x = planned(prof, { needs, over: { signing: { mode: 'keyless', images: [{ service: 'api', repo: 'ghcr.io/o/r/api' }, { service: 'Site', repo: 'ghcr.io/o/r/site' }] } } });
     const a = assembleJobs(x.draft, x.plan, { reviewed: REVIEWED, platform: p, mode: 'keyless' });
     const note = a.notes.find((n) => /report-only/.test(n)) as string;
     expect(note).toMatch(/The service "site" builds no image, so its signing is report-only: pipegen signs nothing for it \(sign its deployed files with cosign sign-blob yourself if you need it\)\./);

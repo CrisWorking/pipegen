@@ -25,7 +25,7 @@ function signWorld(mode: Mode) {
   const priv = mode !== 'keyless';
   const caps: Capabilities = mode === 'attest' ? { ...CAPS, attestations: true, environments: true }
     : mode === 'key-env' ? { ...CAPS, environments: true, deploymentBranchPolicies: true, envRequiredReviewers: true } : { ...CAPS, keylessSigningAllowed: true };
-  const images = [{ service: 'app', repo: 'ghcr.io/o/r-app' }];
+  const images = [{ service: 'app', repo: 'ghcr.io/o/r/app' }];
   const signing = mode === 'key-env' ? { mode, images, cosignPubSha256: 'b'.repeat(64) } : { mode, images };
   const x = planned(profileOf([web()], { private: priv }), { caps, over: { ...(priv ? { centralPin: PIN } : {}), signing } as Partial<PipelineDraft> });
   return assembleFiles(x.draft, { gate: GATE, reviewed: REVIEWED, platform: p, mode, layout: priv ? 'central' : 'local', plan: x.plan, deploy: releaseJobs(x.draft, { platform: p }) } as Parameters<typeof assembleFiles>[1]);

@@ -53,7 +53,7 @@ const lastRun = (steps: readonly RenderedStep[]): RenderedStep => [...steps].rev
 /** A public key's text, spelled at run time (see test/no-secret-literals.test.ts). */
 const PEM = [['-----BEGIN', 'PUBLIC KEY-----'].join(' '), 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEexample', [['-----END', 'PUBLIC KEY-----'].join(' ')], ''].join('\n');
 const PUB_SHA = createHash('sha256').update(PEM, 'utf8').digest('hex');
-const IMG = { service: 'app', repo: 'ghcr.io/o/r-app' } as const;
+const IMG = { service: 'app', repo: 'ghcr.io/o/r/app' } as const;
 const COSIGN = entry(COSIGN_ID);
 /** The reviewed pinned gh release entry (G15a, ruling B3 d), or a copy of it with its candidate changed (for the refusals). */
 const ghEntry = (over: Partial<Candidate> = {}): ReviewedTool => {
@@ -109,7 +109,7 @@ describe('G2: signing and verification steps (B3 b, d)', () => {
       expect(run).toContain(`$RUNNER_TEMP/pipegen-out/${imageDigestArtifact('app')}/digest`);
       expect(run.indexOf('^sha256:[0-9a-f]{64}$')).toBeGreaterThan(-1);
       expect(run.indexOf('^sha256:[0-9a-f]{64}$')).toBeLessThan(run.indexOf(' sign --yes'));
-      expect(run).toContain("ref='ghcr.io/o/r-app'\"@$digest\"");
+      expect(run).toContain("ref='ghcr.io/o/r/app'\"@$digest\"");
     }
     const ke = lastRun(keyEnv);
     expect(ke.run).toContain('sign --yes --key env://PIPEGEN_COSIGN_KEY --tlog-upload=false --use-signing-config=false -a pipegen.commit="$GITHUB_SHA" "$ref"');
@@ -125,7 +125,7 @@ describe('G2: signing and verification steps (B3 b, d)', () => {
     expect(() => renderStep(specFor(COSIGN, { needId: 'signing' }), COSIGN, p, { profile: prof })).toThrow(RenderError);
     expect(() => renderSignSteps({ ...COSIGN, id: 'cosign-fork' }, 'key-env', IMG)).toThrow(RenderError);
     expect(() => renderSignSteps({ ...COSIGN, candidate: { ...COSIGN.candidate, reviewed: false } as unknown as ReviewedTool['candidate'] }, 'key-env', IMG)).toThrow(RenderError);
-    for (const repo of ['ghcr.io/o/r-app:latest', 'ghcr.io/o/r-app@sha256:' + 'a'.repeat(64), 'quay.io/o/x', "ghcr.io/o/x'y", 'ghcr.io/o/../x', 'ghcr.io/O/x']) {
+    for (const repo of ['ghcr.io/o/r/app:latest', 'ghcr.io/o/r/app@sha256:' + 'a'.repeat(64), 'quay.io/o/x', "ghcr.io/o/x'y", 'ghcr.io/o/../x', 'ghcr.io/O/x']) {
       expect(() => renderSignSteps(COSIGN, 'key-env', { service: 'app', repo }), repo).toThrow(RenderError);
     }
 
@@ -379,8 +379,8 @@ describe('G2: the image hand-off (B6)', () => {
   });
 
   it('referee: an image base twin whose input equals the head\'s → refused', async () => {
-    const X = `ghcr.io/o/r-app@sha256:${'1'.repeat(64)}`;
-    const Y = `ghcr.io/o/r-app@sha256:${'2'.repeat(64)}`;
+    const X = `ghcr.io/o/r/app@sha256:${'1'.repeat(64)}`;
+    const Y = `ghcr.io/o/r/app@sha256:${'2'.repeat(64)}`;
     const d = draftOf({ profile: imgProf, needs: [needOf('image-scan', 'app')], steps: [scanSpec()] });
     const head = (image: string): Job => {
       const b = renderFindingsBlock(scanSpec(), TRIVY, p, { profile: imgProf, targets: { image } }, GATE);
@@ -414,7 +414,7 @@ describe('G2: the image hand-off (B6)', () => {
       expect(registryNote(r), `${h} / ${b}: ${show(r)}`).toBe(true);
     }
     // a tag with the digest, or upper case: not a form pipegen writes, so the twin is no step of pipegen's at all
-    for (const b of [`ghcr.io/o/r-app:v1@${D1}`, `GHCR.IO/o/r-app@${D1}`, `ghcr.io/O/r-app@${D1}`]) {
+    for (const b of [`ghcr.io/o/r/app:v1@${D1}`, `GHCR.IO/o/r-app@${D1}`, `ghcr.io/O/r-app@${D1}`]) {
       const planted = base(Y);
       const edited = { ...planted, steps: (planted.steps as RenderedStep[]).map((st) => (st.env === undefined ? st : { ...st, env: Object.fromEntries(Object.entries(st.env).map(([k, v]) => [k, v === Y ? b : v])) })) };
       const r = await runWith([rawFile({ 'image-scan--app': head(X), 'base-scan': edited })], d);
@@ -711,7 +711,7 @@ describe('G2 fix round 1 (ruling G2-R1)', () => {
     // packages: write alone (a login with no push) is a registry write too; a no-push build without it is not
     const login = renderPlatformStep('docker-login', p, { username: '${{ github.actor }}', [['pass', 'word'].join('')]: `${'$'}{{ secrets.${['GITHUB', 'TOK' + 'EN'].join('_')} }}` }, { registry: 'ghcr.io' });
     expect(refused(await runWith([imageFile({ 'image-publish': job([login], { permissions: { contents: 'read', packages: 'write' } }) })], pubDraft))).toBe(true);
-    const nopush = renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: 'ghcr.io/o/r-app:x' }, { push: 'false' });
+    const nopush = renderPlatformStep('build-push', p, { file: 'Dockerfile', tags: 'ghcr.io/o/r/app:x' }, { push: 'false' });
     expect(refused(await runWith([imageFile({ 'image-publish': job([...renderJobPrelude({}, p).steps, nopush]) })], pubDraft))).toBe(false);
   });
 

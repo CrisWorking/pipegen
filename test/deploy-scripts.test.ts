@@ -30,7 +30,7 @@ const DIGEST = `sha256:${'c'.repeat(64)}`;
 const RUN = '4242';
 /** G15a-R11 r5-1: the build's imageid on the classic image store (the config digest; the containerd store reports the manifest's, the digest). */
 const IMAGE_ID = `sha256:${'e'.repeat(64)}`;
-const IMAGE_REPO = 'ghcr.io/o/r-app';
+const IMAGE_REPO = 'ghcr.io/o/r/app';
 const ART = '777';
 /** Spelled at run time (test/no-secret-literals.test.ts): the fake job token and the header scheme. */
 const FAKE_T = ['pipegen', 'test', 'value'].join('-');
@@ -316,7 +316,7 @@ describe.skipIf(!READY)('G7-R1 spec I2, G15a-R11 r5-1: the publish digest step r
     for (const [store, id, rd] of [
       ['classic', IMAGE_ID, digests(`${IMAGE_REPO}@${DIGEST}`)],
       ['containerd', DIGEST, digests(`${IMAGE_REPO}@${DIGEST}`)],
-      ['classic, an entry of another repository too', IMAGE_ID, digests(`ghcr.io/o/r-web@sha256:${'d'.repeat(64)}`, `${IMAGE_REPO}@${DIGEST}`)],
+      ['classic, an entry of another repository too', IMAGE_ID, digests(`ghcr.io/o/r/web@sha256:${'d'.repeat(64)}`, `${IMAGE_REPO}@${DIGEST}`)],
     ] as const) {
       const r = await run(step, { PIPEGEN_IMAGE_ID: id, PIPEGEN_TEST_REPO_DIGESTS: rd });
       expect(r.code, `${store}: ${r.err}`).toBe(0);
@@ -330,8 +330,8 @@ describe.skipIf(!READY)('G7-R1 spec I2, G15a-R11 r5-1: the publish digest step r
     const ok = { PIPEGEN_IMAGE_ID: IMAGE_ID, PIPEGEN_TEST_REPO_DIGESTS: digests(`${IMAGE_REPO}@${DIGEST}`) };
     const cases: [string, Record<string, string>][] = [
       ['the swapped digest (another writer\'s manifest)', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: digests(`${IMAGE_REPO}@sha256:${'f'.repeat(64)}`) }],
-      ['the digest under another repository', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: digests(`ghcr.io/o/r-other@${DIGEST}`) }],
-      ['a prefix of the repository', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: digests(`ghcr.io/o/r-app-x@${DIGEST}`) }],
+      ['the digest under another repository', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: digests(`ghcr.io/o/r/other@${DIGEST}`) }],
+      ['a prefix of the repository', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: digests(`ghcr.io/o/r/app-x@${DIGEST}`) }],
       // round 12 (security r6 Nit 2): exactly one entry for the repository; two are refused, whichever the build reported
       ['two entries for the repository, the reported digest second', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: digests(`${IMAGE_REPO}@sha256:${'f'.repeat(64)}`, `${IMAGE_REPO}@${DIGEST}`) }],
       ['two entries for the repository, the reported digest first', { ...ok, PIPEGEN_TEST_REPO_DIGESTS: digests(`${IMAGE_REPO}@${DIGEST}`, `${IMAGE_REPO}@sha256:${'f'.repeat(64)}`) }],
@@ -343,7 +343,7 @@ describe.skipIf(!READY)('G7-R1 spec I2, G15a-R11 r5-1: the publish digest step r
       ['the image is unknown to the daemon', { ...ok, PIPEGEN_TEST_DOCKER_CODE: '1' }],
       ['no image id', { ...ok, PIPEGEN_IMAGE_ID: '' }],
       ['an image id that is an option', { ...ok, PIPEGEN_IMAGE_ID: '--help' }],
-      ['an image id that is a name', { ...ok, PIPEGEN_IMAGE_ID: 'ghcr.io/o/r-app:pipegen' }],
+      ['an image id that is a name', { ...ok, PIPEGEN_IMAGE_ID: 'ghcr.io/o/r/app:pipegen' }],
     ];
     for (const [name, env] of cases) {
       const b = await run(step, env);

@@ -101,8 +101,8 @@ describe('G15a-R7 sec 1: code scanning gets only a scrubbed result', () => {
 const LINTERS: Linters = { actionlint: async () => '/stub', zizmor: async () => '/stub' };
 const deps = { reviewed: reviewedList(), platform: GP };
 const SHA = 'a'.repeat(40);
-const IMG = { service: 'app', repo: 'ghcr.io/o/r-app' };
-const IMG2 = { service: 'web', repo: 'ghcr.io/o/r-web' };
+const IMG = { service: 'app', repo: 'ghcr.io/o/r/app' };
+const IMG2 = { service: 'web', repo: 'ghcr.io/o/r/web' };
 const NEEDS = ['gate', 'image-publish'];
 const CAPS_BASE: Capabilities = { branchProtection: true, environments: false, envRequiredReviewers: false, deploymentBranchPolicies: false, attestations: false, codeScanning: true, keylessSigningAllowed: false };
 const ATTEST_CAPS: Capabilities = { ...CAPS_BASE, attestations: true, environments: true };
@@ -114,7 +114,7 @@ const sjudge = (fs: CreatedFile[], d: PipelineDraft, reviewed: ReviewedTool[] = 
 const sshow = (r: { issues: { check: string; message: string }[] }): string => r.issues.map((i) => `${i.check}: ${i.message}`).join('\n');
 const UNSIGNED = /published unsigned/;
 const publishJob = { 'runs-on': 'ubuntu-24.04', 'timeout-minutes': 30, permissions: { contents: 'read', packages: 'write' }, 'cache-mode': 'none', if: DEPLOY_PUSH_IF, needs: ['gate'],
-  steps: [renderPlatformStep('build-push', GP, { file: 'Dockerfile', tags: 'ghcr.io/o/r-app:pipegen' }, { push: 'true' })] };
+  steps: [renderPlatformStep('build-push', GP, { file: 'Dockerfile', tags: 'ghcr.io/o/r/app:pipegen' }, { push: 'true' })] };
 /** The app's pipegen.yml with the sign caller and an image-publish job. */
 function appWith(d: PipelineDraft, mode: 'attest' | 'key-env', perms?: Obj): CreatedFile {
   const base = workflow(jobsOf(d), { on: DEPLOY_ON });

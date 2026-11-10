@@ -242,14 +242,14 @@ describe('G17B-R1 round 2, risk 1: a service with no Dockerfile at all (none cre
   });
 });
 
-describe('G17 row 21 reverted (G17B-R1 sec I1, open question 13 closed as won\'t fix): always <repo>-<service>', () => {
+describe('G17 row 21 reverted (G17B-R1 sec I1, open question 13 closed as won\'t fix): always a name of pipegen\'s own (PL-F4: <repo>/<service>)', () => {
   it('publishedImageRepo: the double name keeps pipegen\'s package apart from the repository\'s own ghcr.io/<owner>/<repo>, and across repositories', () => {
-    expect(publishedImageRepo('acme', 'acme-shop', 'acme-shop')).toBe('ghcr.io/acme/acme-shop-acme-shop');
-    expect(publishedImageRepo('Acme', 'Acme-Shop', 'acme-shop')).toBe('ghcr.io/acme/acme-shop-acme-shop');
-    expect(publishedImageRepo('acme', 'acme-shop', 'web')).toBe('ghcr.io/acme/acme-shop-web');
+    expect(publishedImageRepo('acme', 'acme-shop', 'acme-shop')).toBe('ghcr.io/acme/acme-shop/acme-shop');
+    expect(publishedImageRepo('Acme', 'Acme-Shop', 'acme-shop')).toBe('ghcr.io/acme/acme-shop/acme-shop');
+    expect(publishedImageRepo('acme', 'acme-shop', 'web')).toBe('ghcr.io/acme/acme-shop/web');
     // the reviewer's P5 pair: two repositories of one owner never share a package name
     expect(publishedImageRepo('acme', 'acme-shop', 'acme-shop')).not.toBe(publishedImageRepo('acme', 'acme', 'shop'));
-    expect(publishedImageRepo('acme', 'acme', 'shop')).toBe('ghcr.io/acme/acme-shop');
+    expect(publishedImageRepo('acme', 'acme', 'shop')).toBe('ghcr.io/acme/acme/shop');
   });
 });
 

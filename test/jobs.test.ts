@@ -145,13 +145,13 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
 
   it('assemble: every gate-feeding, build, image-publish, sign and verify job has cache-mode none; no actions/cache anywhere', async () => {
     const pub = planned(profileOf([node({ dockerfile: 'Dockerfile', port: 3000 })]), {
-      caps: { ...CAPS, keylessSigningAllowed: true }, over: { signing: { mode: 'keyless', images: [{ service: 'app', repo: 'ghcr.io/o/r-app' }] } },
+      caps: { ...CAPS, keylessSigningAllowed: true }, over: { signing: { mode: 'keyless', images: [{ service: 'app', repo: 'ghcr.io/o/r/app' }] } },
     });
     const a = assemble(pub, 'keyless');
     const jobs: [string, Obj][] = [...allJobs(a), ['sign', a.sign as Obj]];
     expect(a.sign).not.toBeNull();
     // the key-env central sign job too (G3), with its egress step
-    const keDraft: PipelineDraft = { ...pub.draft, profile: { ...pub.draft.profile, private: true }, capabilities: { ...CAPS, environments: true, deploymentBranchPolicies: true }, centralPin: { repo: 'o/pipelines', sha: 'a'.repeat(40) }, signing: { mode: 'key-env', images: [{ service: 'app', repo: 'ghcr.io/o/r-app' }], cosignPubSha256: 'b'.repeat(64) } };
+    const keDraft: PipelineDraft = { ...pub.draft, profile: { ...pub.draft.profile, private: true }, capabilities: { ...CAPS, environments: true, deploymentBranchPolicies: true }, centralPin: { repo: 'o/pipelines', sha: 'a'.repeat(40) }, signing: { mode: 'key-env', images: [{ service: 'app', repo: 'ghcr.io/o/r/app' }], cosignPubSha256: 'b'.repeat(64) } };
     const ke = parse((sharedWorkflows(keDraft, 'key-env', { reviewed: REVIEWED, platform: p })[0] as CreatedFile).content) as Obj;
     jobs.push(['central sign', ke.jobs.sign]);
     expect(jobs.map(([id]) => id)).toEqual(expect.arrayContaining(['image-build--app', 'image-scan--app', 'gate', 'base-scan', 'baseline-check', 'nightly', 'sign', SEC_JOB]));
@@ -245,7 +245,7 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
 
   it('assemble: proof mode → signing none, no sign job (Plan E)', () => {
     const x = planned(profileOf([node({ dockerfile: 'Dockerfile', port: 3000 })]), {
-      caps: { ...CAPS, keylessSigningAllowed: true }, over: { signing: { mode: 'keyless', images: [{ service: 'app', repo: 'ghcr.io/o/r-app' }] } },
+      caps: { ...CAPS, keylessSigningAllowed: true }, over: { signing: { mode: 'keyless', images: [{ service: 'app', repo: 'ghcr.io/o/r/app' }] } },
     });
     expect(PROOF_SIGNING_MODE).toBe('none');
     const proof = assemble(x, PROOF_SIGNING_MODE);
@@ -261,7 +261,7 @@ describe('G4: the jobs of each layer (Plan G Task 2, job half)', () => {
     expect(skipped.draft.signing).toBeUndefined();
     // attest (G15a): the attest sign job (actions/attest with the digest step's output), never another mode
     const att = planned(profileOf([node({ dockerfile: 'Dockerfile', port: 3000 })], { private: true }), {
-      caps: { ...CAPS, attestations: true, environments: true }, over: { centralPin: { repo: 'o/pipelines', sha: 'a'.repeat(40) }, signing: { mode: 'attest', images: [{ service: 'app', repo: 'ghcr.io/o/r-app' }] } },
+      caps: { ...CAPS, attestations: true, environments: true }, over: { centralPin: { repo: 'o/pipelines', sha: 'a'.repeat(40) }, signing: { mode: 'attest', images: [{ service: 'app', repo: 'ghcr.io/o/r/app' }] } },
     });
     const at = assemble(att, 'attest');
     expect(at.sign?.steps.map((s) => String(s.uses ?? s.id).replace(/@.*/, ''))).toEqual(['actions/download-artifact', expect.stringMatching(/^pipegen-attest-digest-[0-9a-f]{16}$/), 'actions/attest']);
@@ -512,7 +512,7 @@ describe('G4 carries', () => {
 
   it('referee: COSIGN_, SIGSTORE_ and TUF_ env names refused in a job that holds a cosign step', async () => {
     const pub = planned(profileOf([node({ dockerfile: 'Dockerfile', port: 3000 })]), {
-      caps: { ...CAPS, keylessSigningAllowed: true }, over: { signing: { mode: 'keyless', images: [{ service: 'app', repo: 'ghcr.io/o/r-app' }] } },
+      caps: { ...CAPS, keylessSigningAllowed: true }, over: { signing: { mode: 'keyless', images: [{ service: 'app', repo: 'ghcr.io/o/r/app' }] } },
     });
     const a = assemble(pub, 'keyless');
     const sign = { ...(a.sign as Obj), if: "github.event_name == 'push'", needs: ['gate'] };
