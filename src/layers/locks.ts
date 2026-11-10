@@ -34,6 +34,7 @@ import { CALLER_WORKFLOW, REQUIRED_JOB, requiredWorkflowForm } from '../engine/j
 import { COMMIT_SHA_RE, isGitHubRepo } from '../engine/names.js';
 import type { ShaPinningRead } from '../github/lock-probes.js';
 import { GATE_CHECK_INTEGRATION_ID, GATE_CHECK_NAME, type Capabilities, type CreatedFile, type RepoProfile } from '../types.js';
+import { MAX_LINE } from '../../gate/src/integrity.js';
 import { safeText } from '../util/safe-text.js';
 import { CO_PLACES, coKey } from './co-places.js';
 import { MERGE_CALLER_JOB } from './assemble.js';
@@ -167,6 +168,11 @@ function codeownersPlan(repo: CreatedFile['repo'], found: string | null, existin
     notes.push(`The CODEOWNERS file of ${where} (${path}) is a symbolic link or not a plain file, which pipegen won't write through, so it adds no code owners there and sets no code-owner review: one approval from any writer then lets a pull request change the pipeline files, even add a job that reports under the gate's name (${GATE_CHECK_NAME}). Replace it with a plain file and run pipegen again.`);
     return undefined;
   }
+  // PL-F8: the gate keeps no rule from a line over MAX_LINE characters (gate/src/integrity.ts codeOwners), so say so (comments and blanks are no rules)
+  existing.original.split(/\r?\n/).forEach((raw, k) => {
+    const t = raw.trim();
+    if (raw.length > MAX_LINE && t !== '' && !t.startsWith('#')) notes.push(`Line ${k + 1} of ${show(path)} is over ${MAX_LINE.toLocaleString('en-US')} characters; the gate does not read it, so nobody can approve changes to the paths it covers. Shorten or split it.`);
+  });
   let block: string;
   try { block = codeownersBlock(paths, owners); } catch (e) { throw new LockError(`The CODEOWNERS block of ${where} can't be written: ${e instanceof Error ? e.message : 'unknown error'}.`); }
   const { original, inserted } = existing;
