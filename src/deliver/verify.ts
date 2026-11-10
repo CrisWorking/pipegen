@@ -18,7 +18,8 @@
 // members, so the gate can't check those approvals), and says (G26) that a key rotation resets the baseline.
 import type { Octokit } from '@octokit/rest';
 import { validDate } from '../../gate/src/date.js';
-import { codeOwners, ownersLookup, PIPEGEN_BLOCK_BEGIN, PIPEGEN_BLOCK_END, pipegenBlockOwners } from '../../gate/src/integrity.js';
+import picomatch from 'picomatch';
+import { codeOwners, ownersLookup, PIPEGEN_BLOCK_BEGIN, PIPEGEN_BLOCK_END, pipegenBlockOwners, type CodeownersRule } from '../../gate/src/integrity.js';
 import { centralWorkflowFile } from '../engine/central-path.js';
 import { CENTRAL_PROTECTED_PATHS, CODEOWNERS_END } from '../engine/created-builders.js';
 import type { RateClock } from '../engine/github-rate.js';
@@ -459,27 +460,69 @@ async function findSetupPr(api: SettingsApi, app: RepoRef): Promise<number | und
   return list.map((p) => p.number as number).sort((a, b) => b - a)[0];
 }
 
-/** Paths a protected pattern (the gate's form) stands for, to test a CODEOWNERS rule against: each wildcard filled, a subtree with files
- * of the common kinds and a nested one, a bare name at the root and one folder down. */
-function protectedSamples(paths: readonly string[]): string[] {
-  const out = new Set<string>();
-  const fill = (p: string): string => p.replace(/\*\*\//g, '').replace(/\*\*/g, 'x').replace(/[*?]/g, 'x');
-  for (const raw of paths) {
-    const p = raw.replace(/^\.?\//, '');
-    for (const at of p.includes('/') && !p.startsWith('**/') ? [p] : [p.replace(/^\*\*\//, ''), `a/${p.replace(/^\*\*\//, '')}`]) {
-      if (at.endsWith('/**')) {
-        const dir = fill(at.slice(0, -3));
-        for (const f of ['x', 'x.yml', 'x.yaml', 'x.json', 'x.toml', 'x.md', 'a/x.yml', 'a/x.json']) out.add(`${dir}/${f}`);
-      } else out.add(fill(at));
+const WILD = /[*?[\\]/;
+const fixedPrefix = (p: string): string => { const i = p.search(WILD); return (i < 0 ? p : p.slice(0, i)).toLowerCase(); };
+const globMatch = (glob: string, name: string): boolean => { try { return picomatch(glob, { nocase: true, dot: true })(name); } catch { return true; } };
+
+/**
+ * G-FINREC-R1 (sec M1, review): whether a CODEOWNERS rule can match a path a protected pattern (the gate's form) stands for, decided at the
+ * pattern level and failing closed (anything undecided covers):
+ * - a rule with no '/' but a trailing one matches by name at any depth: it covers every protected folder, a protected file whose name it
+ *   matches, and (a folder rule) any protected file named anywhere;
+ * - an anchored rule covers a protected folder when its fixed prefix (before the first wildcard) and the folder overlap, either way; an
+ *   anchored protected file by the gate's own lookup; a protected name at any depth when it is a folder rule or its last part matches it.
+ * A protected pattern with a wildcard outside a trailing `/**` is compared by its fixed prefix the same way.
+ */
+function ruleCovers(rule: CodeownersRule, protectedPaths: readonly string[]): boolean {
+  const dirRule = rule.pattern.endsWith('/');
+  const body = rule.pattern.replace(/^\//, '').replace(/\/$/, '');
+  if (body === '') return true;
+  const anchored = rule.pattern.startsWith('/') || body.includes('/');
+  const last = body.split('/').at(-1) as string;
+  const prefix = fixedPrefix(body);
+  const overlaps = (dir: string): boolean => prefix.startsWith(dir) || dir.startsWith(prefix);
+  for (const raw of protectedPaths) {
+    const rooted = /^\.?\//.test(raw);
+    let q = raw.replace(/^\.?\//, '');
+    const anyDepth = !rooted && (!q.includes('/') || q.startsWith('**/'));
+    q = q.replace(/^\*\*\//, '');
+    if (q === '' || q.split('/').some((x) => x === '..')) return true;
+    const subtree = q.endsWith('/**');
+    const target = subtree ? q.slice(0, -3) : q;
+    if (WILD.test(target)) {
+      // a wildcard inside the protected pattern: by its fixed prefix (folder part), any-depth names always
+      if (!anchored || anyDepth) return true;
+      const fixed = fixedPrefix(target);
+      if (overlaps(fixed.slice(0, fixed.lastIndexOf('/') + 1))) return true;
+      continue;
     }
+    if (subtree) {
+      if (!anchored || anyDepth) return true;
+      if (overlaps(`${target.toLowerCase()}/`)) return true;
+      continue;
+    }
+    const name = target.split('/').at(-1) as string;
+    if (!anchored) {
+      if (dirRule && anyDepth) return true;
+      if (globMatch(body, name) || target.split('/').slice(0, -1).some((d) => globMatch(body, d))) return true;
+      continue;
+    }
+    if (anyDepth) {
+      if (dirRule || globMatch(last, name)) return true;
+      continue;
+    }
+    const m = ownersLookup([rule], target);
+    if ('unresolved' in m || m.owners !== undefined) return true;
+    const ml = ownersLookup([{ ...rule, pattern: rule.pattern.toLowerCase() }], target.toLowerCase());
+    if ('unresolved' in ml || ml.owners !== undefined) return true;
   }
-  return [...out].filter((x) => x !== '' && !x.split('/').includes(''));
+  return false;
 }
 
 /**
  * G-FINREC-R1 (sec M1): the rules after pipegen's block (they win over it: the last matching rule counts) that cover a protected path and
- * name no owner, or an owner outside the block's (a team, an e-mail, another login). "Covers" is tested from the protected side (sample
- * paths of each protected pattern, matched with the gate's own CODEOWNERS matching, so `*` and `**` count) and from the rule's side. A line
+ * name no owner, or an owner outside the block's (a team, an e-mail, another login). "Covers" is decided at the pattern level (ruleCovers,
+ * failing closed). A line
  * GitHub skips owns nothing; a line the gate can't read counts. Lines before the block lose to it. null: not exactly one begin line and one
  * end line after it (nothing can say where the block ends). pipegen's own output has nothing after its block but what the owner wrote.
  */
@@ -489,8 +532,6 @@ export function overridingRules(text: string, protectedPaths: readonly string[])
   const ends = lines.flatMap((l, i) => (l === PIPEGEN_BLOCK_END ? [i] : []));
   if (begins.length !== 1 || ends.length !== 1 || (ends[0] as number) < (begins[0] as number)) return null;
   const owners = new Set(pipegenBlockOwners(text));
-  const samples = protectedSamples(protectedPaths);
-  const isProt = protectedMatcher(protectedPaths.map((p) => p.replace(/^\.\//, '/')));
   const out: string[] = [];
   for (const raw of lines.slice((ends[0] as number) + 1)) {
     const line = raw.trim();
@@ -500,9 +541,7 @@ export function overridingRules(text: string, protectedPaths: readonly string[])
     if (rule.unreadable !== undefined) { out.push(line.slice(0, 200)); continue; }
     const named = line.split(/\s+/).length - 1;
     if (named > 0 && rule.owners.length === named && rule.owners.every((o) => owners.has(o))) continue;
-    const ruleSample = rule.pattern.replace(/^\//, '').replace(/\/$/, '/x').replace(/\*\*/g, 'x').replace(/[*?]/g, 'x');
-    const covers = isProt(ruleSample) || samples.some((p) => { const m = ownersLookup([rule], p); return 'unresolved' in m || m.owners !== undefined; });
-    if (covers) out.push(line);
+    if (ruleCovers(rule, protectedPaths)) out.push(line);
   }
   return out;
 }
