@@ -27,7 +27,7 @@ import { unlinkSync } from 'node:fs';
 import type { Octokit } from '@octokit/rest';
 import type { Prompter } from '../cli/io.js';
 import { DeliverError, statusOf, type RepoRef } from '../deliver/git-data.js';
-import { localFinishPendingPath, localRecordPath, readLocalLeftovers, readLocalRecord, type Leftover } from '../deliver/record.js';
+import { localFinishPendingPath, localRecordPath, readLocalLeftovers, readLocalRecord, recordPath, type Leftover } from '../deliver/record.js';
 import { isRateStop } from '../engine/github-rate.js';
 import { GitHubAccessError } from '../github/client.js';
 import { assertScratch, githubRead, proofTarget, ProofStopError, SCRATCH_MARKER, ScratchGuardError, validBranchName, type GuardedRepo } from '../proof/target.js';
@@ -267,15 +267,17 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
   // ---------- 5. the local files, only when nothing is left over ----------
   const c = central as CentralOutcome | null;
   const merged = c !== null && c.merged;
-  // V9a (V8 sec M2): `pipelines` the user created, listed as theirs once it holds nothing of pipegen's: this project's files and record
-  // gone (the central PR merged), no other project, no org rule, and nothing about it failed, kept or left as a step in this run
-  const centralFull = `${appRef.owner}/pipelines`;
-  if (c !== null && c.merged && c.last && c.orgRule === null && plan.yourRepos.some((y) => y.kind === 'central')
-    && ![...r.failed, ...r.skipped, ...r.manual].some((x) => x.what.includes(centralFull))) {
-    notes.push(`${centralFull}: you created it, so pipegen doesn't delete it or print a command to. It holds nothing of pipegen's now (this project's files and install record are gone from it, and no other project of pipegen uses it): delete it by hand when you don't need it, once you checked it holds nothing else of yours.`);
-  }
   const unhandled = r.failed.length === 0 && merged ? await unhandledLeftovers() : [];
   const clean = r.failed.length === 0 && merged && unhandled.length === 0;
+  // V9a (V8 sec M2; V9a-R2 sec N1): `pipelines` the user created, listed as theirs only once it holds nothing of pipegen's: a clean run (no
+  // failed item, no unhandled leftover; stillThere re-read this project's files and the locks after the merge), nothing left inside it,
+  // this project's files and record gone (the central PR merged), no other project, no org rule, and no central item kept or left as a step
+  const centralFull = `${appRef.owner}/pipelines`;
+  const centralItem = (what: string): boolean => what.startsWith('central ') || what.includes(centralFull) || what === recordPath(appRef.repo) || what.endsWith(` ${recordPath(appRef.repo)}`);
+  if (clean && c !== null && c.last && c.orgRule === null && (c.inRepo ?? []).length === 0 && plan.yourRepos.some((y) => y.kind === 'central')
+    && ![...r.skipped, ...r.manual].some((x) => centralItem(x.what))) {
+    notes.push(`${centralFull}: you created it, so pipegen doesn't delete it or print a command to. It holds nothing of pipegen's now (this project's files and install record are gone from it, and no other project of pipegen uses it): delete it by hand when you don't need it, once you checked it holds nothing else of yours.`);
+  }
   for (const u of unhandled) r.manual.push(u);
   if (clean) {
     const gone: string[] = [];
@@ -330,16 +332,27 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
     changed(`The install record ${String(rp)} in ${appRef.owner}/pipelines`);
   }
 
+  /** V9a-R2 (sec N3): a cleanup line without its `gh repo delete` advice (the user created the scratch repo: theirs to delete by hand). */
+  function yourScratchText(l: string): string {
+    const t = l.replace(/[,;:]?\s*(?:if it still exists, )?delete (?:it|the repo)\s*:\s*gh repo delete \S+(?:\s+--yes)?/g, '; it is your repo: check it and delete it by hand when you don\'t need it');
+    return t.replace(/gh repo delete \S+(?:\s+--yes)?/g, 'delete it by hand');
+  }
+
   /** 1: a saved proof's leftovers, then the scratch repo emptied (exact name, marker, the id the preview showed) through E's functions. */
   async function scratchStep(): Promise<void> {
+    /** What the saved proof's cleanup left or couldn't do (V9a-R2 sec N2: the scratch note never says "nothing of pipegen's" then). */
+    let proofLeft = 0;
     if (plan.proofCleanup) {
       const what = 'what the saved proof left in GitHub';
       try {
         const res = await api.proofLeftovers(ctx.store, { prompt: ctx.io as Prompter, out: ctx.out, err: ctx.out });
         r.done.push(`${what}: cleaned (as \`pipegen cleanup\` does)`);
-        for (const l of res.leftovers) r.manual.push({ what, why: show(l, 400) });
+        // V9a-R2 (sec N3): E's texts advise `gh repo delete … --yes`; for a scratch repo the user created, uninstall's own words instead
+        for (const l of res.leftovers) r.manual.push({ what, why: show(rec.scratch?.createdByPipegen === true ? l : yourScratchText(l), 400) });
+        proofLeft += res.leftovers.length;
       } catch (e) {
         if (isRateStop(e) || e instanceof GitHubAccessError || statusOf(e) === 401) throw e;
+        proofLeft += 1;
         r.failed.push({ what, why: reasonOf(e), manual: 'Run `pipegen cleanup`.' });
       } finally {
         // Plan V M5: cleanupLeftovers keeps a lease its caller holds (no gap for another pipegen); this is a no-op then, and takes it
@@ -393,6 +406,7 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
         if (!Array.isArray(items)) throw new UninstallError('unreadable');
         if (key !== null && isObj(x) && typeof x.total_count === 'number' && x.total_count > items.length) {
           r.manual.push({ what: `${key.replace(/_/g, ' ')} of ${what}`, why: 'there are more than pipegen reads at once', step: `Run \`pipegen uninstall\` again${orDelete}` });
+          left += 1;   // V9a-R2 (sec N2): read only in part, so not emptied
         }
         return items;
       } catch (e) {
@@ -423,6 +437,7 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
       const id = isObj(x) ? x.id : undefined;
       if (posId(id)) await one(`cache ${id}`, () => api.scratchCleanup(s, { op: 'delete-cache', cacheId: id }));
     }
+    left += proofLeft;
     if (left === 0) r.done.push(`${what}: emptied (its proof/ branches, secrets, variables, workflow runs and caches)`);
     // V8 sec i6: the kept default branch needs nothing from pipegen or the user to finish the uninstall: a note, never a leftover
     if (!plan.deleteRepos.some((x) => x.kind === 'scratch' && x.how === 'delete')) {

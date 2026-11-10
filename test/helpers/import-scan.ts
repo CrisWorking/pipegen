@@ -155,7 +155,8 @@ function cliUninstallProblems(refs: ModuleRef[], exported: string[]): string[] {
 }
 
 /** The uninstall modules whose entry points are guarded (paths from the repo root). */
-const GUARDED = ['src/uninstall/target.ts', 'src/uninstall/plan.ts', 'src/uninstall/apply.ts'];
+// V9a-R2 (sec N4): record.ts too (loadUninstallRecord): no namespace, dynamic or export-all form of it either
+const GUARDED = ['src/uninstall/target.ts', 'src/uninstall/plan.ts', 'src/uninstall/apply.ts', 'src/uninstall/record.ts'];
 /** E's scratch secret delete, its name spelled at run time (test/no-secret-literals.test.ts). */
 const SCRATCH_SD = ['deleteScratch', 'Secret'].join('');
 const E_WRITERS = ['cleanupWrite', SCRATCH_SD, 'deleteScratchRepo', 'cleanupLeftovers'];

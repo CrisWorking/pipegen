@@ -383,7 +383,7 @@ describe('V7: the docs say what was built', () => {
     expect(sec.length).toBeGreaterThan(500);
     expect(sec).toMatch(/Two runs, and why/);
     expect(sec).toMatch(/Administration \(read and write\) is optional/);
-    expect(sec).toMatch(/uninstall doesn't need Members: read/);
+    expect(sec).toMatch(/\. Uninstall doesn't need Members: read/);
     expect(sec).toMatch(/HTTPS_PROXY/);
     expect(sec).toMatch(/no App to remove/);
     expect(sec).toMatch(/--required\.yml.*unfinished until you remove the organisation rule/s);

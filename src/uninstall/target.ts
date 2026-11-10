@@ -934,6 +934,19 @@ export class UninstallApi {
     const previous = entry.previous as EnvSettings;
     for (const k of ENV_KEYS) if (entry.changed.includes(k)) body[k] = previous[k];
     try { await this.#dedicated(ROUTES.environmentPut, { ...body, ...params }); } catch (e) { return this.#outcome(e, 'app', what, manual); }
+    // V9a-R2 (sec N5): GitHub has no conditional PUT, so the list is read once more: a secret the record names that appeared in between
+    // (another pipegen, on another machine) → the settings the preview showed go back at once (narrowed again), and a manual step
+    const after = await this.#recordSecretsIn(entry.name, secrets, what, manual);
+    if (after !== null) {
+      const step = 'manual' in after && typeof after.manual === 'string' ? after.manual : manual;
+      const again = `pipegen's secret appeared in ${what} while its earlier settings went back`;
+      try { await this.#dedicated(ROUTES.environmentPut, { ...shown, ...params }); } catch (e) {
+        if (e instanceof UninstallRefusal) throw e;
+        hardStop(e);
+        return { status: 'leftover', why: `${again}, and pipegen couldn't narrow it again (${statusOf(e) === undefined ? 'no answer' : `HTTP ${statusOf(e)}`}): other branches may use it now`, manual: `Right now: put ${what} back to the default branch only (Settings → Environments → ${show(entry.name, 100)} → Deployment branches), then ${step}` };
+      }
+      return { status: 'kept', why: `${again}, so pipegen narrowed it again (as the preview showed it)`, manual: step };
+    }
     return entry.changed.includes('branch_policies')
       ? { status: 'restored', manual: `the branch and tag rules ${what} had before pipegen are in the install record; add them back in the environment's settings` }
       : { status: 'restored' };

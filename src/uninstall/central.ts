@@ -23,6 +23,7 @@ import { readBlobText, statusOf, type RepoRef, type TreeEntry } from '../deliver
 import { centralUpdateBranch, editWritesChained, recordPath, type RecordedEdit } from '../deliver/record.js';
 import { centralFilesOf } from '../deliver/update.js';
 import { centralProjectName, centralWorkflowFile } from '../engine/central-path.js';
+import { CODEOWNERS_BEGIN, CODEOWNERS_END } from '../engine/created-builders.js';
 import { isRateStop } from '../engine/github-rate.js';
 import { GitHubAccessError } from '../github/client.js';
 import { requiredRulesetName } from '../layers/locks.js';
@@ -363,6 +364,32 @@ export async function runCentral(o: {
     }
     if (locks.codeowners?.created === true && now.entries.has(locks.codeowners.path)) {
       fail(`central ${show(locks.codeowners.path)}`, 'the CODEOWNERS pipegen created is still on the default branch after the central pull request merged', `Remove it from ${full} by hand if it holds only pipegen's block, then run \`pipegen uninstall\` again.`);
+    }
+    // V9a-R2 (sec N1): a CODEOWNERS pipegen edited: its block (or a pipegen marker) still in the file is pipegen's, still there
+    const co = locks.codeowners;
+    const ce = co !== undefined && co.created !== true ? now.entries.get(co.path) : undefined;
+    if (co !== undefined && ce !== undefined) {
+      const eds = rec.edits.filter((x) => x.repo === 'central' && x.kind === 'codeowners' && x.path === co.path);
+      let text: string | null = null;
+      try { text = await readBlobText(o.gh, now.ref, ce.sha, MAX_BLOB, api.clock); } catch (x) {
+        if (isRateStop(x) || x instanceof GitHubAccessError || statusOf(x) === 401) throw x;
+      }
+      const still = text === null || text.includes(CODEOWNERS_BEGIN) || text.includes(CODEOWNERS_END) || eds.some((x) => 'inserted' in x && typeof x.inserted === 'string' && x.inserted !== '' && (text as string).includes(x.inserted));
+      if (still) fail(`central ${show(co.path)}`, text === null ? 'pipegen couldn\'t read it after the central pull request merged, so it can\'t tell pipegen\'s block is gone' : 'pipegen\'s block is still in it after the central pull request merged', `Take pipegen's block out of ${co.path} in ${full} by hand, then run \`pipegen uninstall\` again.`);
+    }
+    // V9a-R2 (sec N1): the Actions access level pipegen set, still set (a kept or declined restore in an earlier run)
+    const prev = locks.actionsAccess?.previous;
+    const set = o.ownerType === 'Organization' ? 'organization' : 'user';
+    if (prev !== undefined && prev !== set) {
+      let level: unknown;
+      try { const d = (await api.read('GET /repos/{owner}/{repo}/actions/permissions/access', { ...now.ref })).data; level = isObj(d) ? d.access_level : undefined; } catch (x) {
+        if (isRateStop(x) || x instanceof GitHubAccessError || statusOf(x) === 401) throw x;
+        level = undefined;
+      }
+      // another level than pipegen's is not pipegen's any more (the owner set it): only pipegen's level, or no answer, is left over
+      if (level === set || typeof level !== 'string') {
+        fail(`central Actions access of ${full}`, level === set ? 'it is still the level pipegen set after the central pull request merged' : 'pipegen can\'t tell it is back to the level before pipegen', `Check Settings → Actions → Access of ${full}: put it back to ${prev} by hand if no other project relies on it (gh api -X PUT repos/${full}/actions/permissions/access -f access_level=${prev}), then run \`pipegen uninstall\` again.`);
+      }
     }
     return out;
   }

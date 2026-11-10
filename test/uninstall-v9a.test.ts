@@ -7,7 +7,7 @@
 // - sec M4: the CLI takes the app's lease before it loads the record.
 // - sec i1, i2, i6; spec minor (the consent screen's create command).
 // No network: the GitHub stand-in of the phase-B tests.
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Octokit } from '@octokit/rest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -21,7 +21,9 @@ import type { LoadedRecord } from '../src/uninstall/record.js';
 import { UninstallApi, UninstallRefusal } from '../src/uninstall/target.js';
 import type { Env } from './helpers/deliver-github.js';
 import { entryImportProblems } from './helpers/import-scan.js';
-import { ACCESS_ROUTE, AT, blob, cleanHomes, deps, gh, loadedOf, local, mergePr, RECORD_TEXT, sampleRecord, SEC, SHA, term, world, type Term, type World } from './helpers/uninstall-world.js';
+import { addLocalLeftovers, localLeftoversPath, recordPath } from '../src/deliver/record.js';
+import type { InstallEdit } from '../src/types.js';
+import { ACCESS_ROUTE, AT, blob, MERGE_WF, cleanHomes, deps, gh, loadedOf, local, mergePr, RECORD_TEXT, sampleRecord, SEC, SHA, term, world, type Term, type World } from './helpers/uninstall-world.js';
 
 const h = vi.hoisted(() => ({ stop: { now: false } }));
 vi.mock('../src/util/exit-hooks.js', async (orig) => ({ ...(await orig<typeof import('../src/util/exit-hooks.js')>()), interrupting: () => h.stop.now, onInterrupt: () => () => {} }));
@@ -399,6 +401,8 @@ describe('V9a docs (V8-R1 sec M2, M4, M5, i1, i6; spec minors)', () => {
     expect(t56).not.toMatch(/prints `gh repo delete`/);
     // sec i1: the residual between the two runs, in T56 and T10
     expect(t56).toMatch(/Between the first and the second run the merge locks are off/);
+    // V9a-R2 (sec N5): the window between the second list and the PUT
+    expect(t56).toMatch(/GitHub has no conditional PUT/);
     expect(tm.split('\n').find((l) => l.startsWith('| T10 |'))).toMatch(/Between uninstall's first and second run/);
   });
 });
@@ -417,5 +421,151 @@ describe('V9a sec i6 (second part): the preview names only the central locks the
     const access = await preview({ createdByPipegen: false, actionsAccess: { previous: 'none' } });
     expect(access).toMatch(/this is the last project in pipelines: its Actions access goes too, as recorded/);
     expect(access).not.toMatch(/central ruleset, CODEOWNERS and Actions access go too/);
+  });
+});
+
+// ---------- fold R2 (ruling V9a-R2; the V9a security re-check's probes) ----------
+
+describe('V9a-R2 N1: the pipelines note only once uninstall has shown it holds nothing of pipegen\'s', () => {
+  const yesRecord = (o: Parameters<typeof term>[0] = {}): Term => term({ ...o, yes: (q) => (q.startsWith('Remove the install record') ? true : undefined) });
+  const centralNote = (r: StepResult): string | undefined => (r.notes ?? []).find((n) => n.startsWith('o/pipelines'));
+
+  it('phase B: a central file of this project still in pipelines after the merge → no "holds nothing of pipegen\'s" note (probe M2-n1)', async () => {
+    const w = world({ central: { [recordPath('shop')]: RECORD_TEXT, '.github/workflows/shop--merge.yml': `${MERGE_WF}# owner edit\n` } });
+    await afterRun1(w);
+    const rec = sampleRecord(w, { central: { createdByPipegen: false }, scratch: { createdByPipegen: false } });
+    await run(w, rec, yesRecord());
+    mergePr(w, w.central, 'pipegen/uninstall-shop');
+    const r = await run(w, rec);
+    expect(r.failed.some((f) => f.what === 'central .github/workflows/shop--merge.yml')).toBe(true);
+    expect(centralNote(r)).toBeUndefined();
+  });
+
+  it('phase B: pipegen\'s Actions access still on pipelines after the merge → a failed item with its step, no note, never exit 0 (probe M2-n3)', async () => {
+    const w = world();
+    await afterRun1(w);
+    w.settings.access = 'user';
+    const rec = sampleRecord(w, { central: { repoId: w.central.id, createdByPipegen: false, actionsAccess: { previous: 'none' } }, scratch: { createdByPipegen: false } });
+    await run(w, rec, yesRecord({ type: (q, exp) => (/Actions access level/.test(q) ? 'no' : exp) }), {}, { typedNames: true, marker: 'differs' });
+    mergePr(w, w.central, 'pipegen/uninstall-shop');
+    const r = await run(w, rec, term(), {}, { typedNames: true, marker: 'differs' });
+    expect(w.settings.access).toBe('user');
+    const f = r.failed.find((x) => x.what === 'central Actions access of o/pipelines');
+    expect(f?.manual).toMatch(/Settings → Actions → Access/);
+    expect(r.status).toBe('b-partial');
+    expect(centralNote(r)).toBeUndefined();
+  });
+
+  it('phase B: pipegen\'s block still in an edited central CODEOWNERS after the merge → a failed item, no note', async () => {
+    const OWN = '/docs/ @writers\n';
+    const INS = '# pipegen:begin\n/.github/workflows/ @o\n# pipegen:end\n';
+    const w = world();
+    // the block twice: pipegen can't take it out (run 2a leaves it as a manual step), and the user lets the record go
+    w.g.commitOn('o/pipelines', 'main', { '.github/CODEOWNERS': `${OWN}${INS}${INS}` });
+    await afterRun1(w);
+    const edit = { repo: 'central', path: '.github/CODEOWNERS', kind: 'codeowners', inserted: INS, originalSha: blob(OWN), writtenShas: [blob(`${OWN}${INS}`)], baseShas: [blob(OWN)] } as InstallEdit;
+    const rec = sampleRecord(w, { central: { createdByPipegen: false, codeowners: { path: '.github/CODEOWNERS', created: false } }, edits: [edit], scratch: { createdByPipegen: false } });
+    await run(w, rec, yesRecord());
+    mergePr(w, w.central, 'pipegen/uninstall-shop');
+    const r = await run(w, rec);
+    expect(r.failed.some((x) => x.what === 'central .github/CODEOWNERS' && /pipegen's block/.test(x.why))).toBe(true);
+    expect(centralNote(r)).toBeUndefined();
+  });
+
+  it('phase B: an org rule that still requires this project\'s file → no note (spec minor 1)', async () => {
+    const w = world({ ownerType: 'Organization' });
+    await afterRun1(w);
+    w.org.set(77, { name: 'pipegen-required--shop', source_type: 'Organization', source: 'o', created_at: AT, rules: [{ type: 'workflows', parameters: { workflows: [{ path: '.github/workflows/shop--required.yml', sha: SHA('c'), repository_id: w.central.id }] } }] });
+    const rec = sampleRecord(w, { central: { createdByPipegen: false }, scratch: { createdByPipegen: false } });
+    await run(w, rec);
+    mergePr(w, w.central, 'pipegen/uninstall-shop');
+    const r = await run(w, rec);
+    expect(centralNote(r)).toBeUndefined();
+    // control: without the rule the same run lists it
+    const w2 = world({ ownerType: 'Organization' });
+    await afterRun1(w2);
+    const rec2 = sampleRecord(w2, { central: { createdByPipegen: false }, scratch: { createdByPipegen: false } });
+    await run(w2, rec2);
+    mergePr(w2, w2.central, 'pipegen/uninstall-shop');
+    expect(centralNote(await run(w2, rec2))).toBeDefined();
+  });
+});
+
+describe('V9a-R2 N2, N3: the scratch note and E\'s cleanup texts', () => {
+  it('phase B: a scratch list read only in part → not "emptied", no "holds nothing of pipegen\'s" (probe M2-n2)', async () => {
+    const w = world();
+    await afterRun1(w);
+    w.g.hooks.unshift((c) => (c.route === `GET /repos/{owner}/{repo}/actions/${SEC}` && c.params.repo === 'pipegen-proof-shop' ? { status: 200, data: { total_count: 150, [SEC]: [] } } : undefined));
+    const r = await run(w, sampleRecord(w, { central: { createdByPipegen: false }, scratch: { createdByPipegen: false } }));
+    expect(r.done.some((d) => /pipegen-proof-shop: emptied/.test(d))).toBe(false);
+    expect((r.notes ?? []).join('\n')).not.toMatch(/holds nothing of pipegen's/);
+    expect(r.manual.some((m) => /more than pipegen reads at once/.test(m.why))).toBe(true);
+  });
+
+  it('phase B: a saved proof state and a scratch repo the user created → no gh repo delete in any line (probe M2-c1)', async () => {
+    const w = world();
+    await afterRun1(w);
+    const store = await StateStore.open({ owner: 'o', repo: 'shop' }, local(w));
+    store.begin('20261106-090000-abc123', { owner: 'o', repo: 'shop', private: true, ownerType: 'User', defaultBranch: 'main' }, { cap: 100, aiCap: null });
+    store.markArmed(true);
+    w.g.hooks.unshift((c) => (String(c.params.repo).startsWith('pipegen-proof-') ? { status: 404 } : undefined));
+    const r = await run(w, sampleRecord(w, { central: { createdByPipegen: false }, scratch: { createdByPipegen: false } }), term(), { deleteRepos: true, canDeleteRepos: false });
+    const text = [...w.out, ...r.lines].join('\n');
+    expect(text).not.toMatch(/gh repo delete/);
+    expect(r.manual.some((m) => m.what === 'what the saved proof left in GitHub' && /delete it by hand/.test(m.why))).toBe(true);
+    expect((r.notes ?? []).join('\n')).not.toMatch(/holds nothing of pipegen's/);
+  });
+});
+
+describe('V9a-R2 N4, N5, spec minor 2', () => {
+  it('scan: a namespace, dynamic or export-all of src/uninstall/record.ts is flagged outside the files that may use it', () => {
+    const cases = [
+      "import * as r from './uninstall/record.js';\nexport const f = () => r.loadUninstallRecord(null as never, null as never, {} as never);\n",
+      "export const f = async () => (await import('./uninstall/record.js')).loadUninstallRecord(null as never, null as never, {} as never);\n",
+      "export * from './uninstall/record.js';\n",
+    ];
+    for (const src of cases) expect(entryImportProblems('src/zz-probe.ts', src).length, src.slice(0, 40)).toBeGreaterThan(0);
+  });
+
+  it('target: a secret pipegen stored that appears between the list and the PUT → narrowed again at once, kept with a manual step (probe P3h)', async () => {
+    const w = world();
+    await afterRun1(w);
+    w.app.envs.set('pipegen-signing', narrowed());
+    // the first list answers without the key, as if it was deleted; the key is stored again right then (before the PUT)
+    let lists = 0;
+    w.g.hooks.unshift((c) => {
+      if (c.route !== ENV_ITEM_LIST) return undefined;
+      lists += 1;
+      const e = w.app.envs.get('pipegen-signing');
+      const l = [...(e?.stored ?? new Map()).keys()].map((n) => ({ name: n }));
+      if (lists === 1) { e?.stored.set(KEY, AT); return { status: 200, data: { total_count: l.length, [SEC]: l } }; }
+      return undefined;
+    });
+    const rec = sampleRecord(w, { [SEC]: [{ name: KEY, scope: 'env:pipegen-signing', created: true, githubCreatedAt: AT }], environments: [envEntry] });
+    const r = await run(w, rec);
+    const e = w.app.envs.get('pipegen-signing');
+    expect(e?.stored.has(KEY)).toBe(true);
+    expect(e?.deployment_branch_policy).toEqual({ protected_branches: false, custom_branch_policies: true });
+    expect(w.g.calls.filter((c) => c.route === ENV_PUT)).toHaveLength(2);
+    expect(r.manual.some((m) => m.what === 'environment pipegen-signing' && /appeared/.test(m.why) && (m.step ?? '').includes(KEY))).toBe(true);
+    expect(e?.policies.map((p) => p.id)).toEqual([3]);
+  });
+
+  it('phase B: a restore target.ts keeps leaves pipegen\'s branch rule and the leftovers entry open (spec minor 2)', async () => {
+    const w = world();
+    await afterRun1(w);
+    w.app.envs.set('pipegen-signing', narrowed());
+    const rec = sampleRecord(w, { [SEC]: [{ name: KEY, scope: 'env:pipegen-signing', created: false, overwritten: true }], environments: [envEntry] });
+    // the leftovers file names the environment as narrowed by pipegen (a stopped delivery wrote it)
+    await addLocalLeftovers({ owner: 'o', repo: 'shop' }, [{ kind: 'environment', name: 'pipegen-signing', repo: 'o/shop', githubCreatedAt: AT, previous: envEntry.previous, changed: ['deployment_branch_policy'] }], new Date(), local(w));
+    await run(w, rec, term({ yes: (q) => (q.startsWith('Remove the install record') ? true : undefined) }));
+    expect(w.app.envs.get('pipegen-signing')?.policies.map((p) => p.id)).toEqual([3]);
+    expect(w.g.calls.some((c) => c.route === 'DELETE /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies/{branch_policy_id}')).toBe(false);
+    mergePr(w, w.central, 'pipegen/uninstall-shop');
+    const r = await run(w, rec);
+    // the restore is still kept: its leftovers entry is not handled, so the leftovers file and the local record stay
+    expect(r.manual.some((m) => m.what === 'environment pipegen-signing (leftovers file)')).toBe(true);
+    expect(existsSync(localLeftoversPath({ owner: 'o', repo: 'shop' }, local(w)))).toBe(true);
+    expect(r.status).toBe('b-partial');
   });
 });

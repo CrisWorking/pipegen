@@ -24,7 +24,7 @@ import type { Capabilities, CreatedFile, InstallEdit, InstallRecord, RepoProfile
 import { uninstallStep, type StepResult } from '../src/uninstall/apply.js';
 import { ProgressFile } from '../src/uninstall/progress.js';
 import { FinishGitHub } from './helpers/finish-github.js';
-import { blob as blobSha, cleanHomes, deps as uDeps, gh as uGh, loadedOf, local, RECORD_TEXT, sampleRecord, SHA, term, world, type World } from './helpers/uninstall-world.js';
+import { blob as blobSha, cleanHomes, deps as uDeps, gh as uGh, loadedOf, local, mergePr, RECORD_TEXT, sampleRecord, SHA, term, world, type World } from './helpers/uninstall-world.js';
 
 vi.mock('../src/util/exit-hooks.js', async (orig) => ({
   ...(await orig<typeof import('../src/util/exit-hooks.js')>()),
@@ -222,6 +222,46 @@ describe('G-FINREC end to end: finish\'s central CODEOWNERS record through unins
     const owned = `${liveCo(s) as string}/api/ @bob\n`;
     const { w } = await uninstallOver(fin, owned);
     expect(filesAtPr(w).get(CO)).toBe(`${own}/api/ @bob\n`);
+  });
+});
+
+// ---------- V9a-R2 (V8 sec i3): the real finish write, then phase B to the central repo delete (target.ts deleteCentralRepo own()) ----------
+
+describe('V9a-R2 sec i3: finish\'s central CODEOWNERS record through phase B and the central repo delete', () => {
+  /** Run 2 (App mode, --delete-repos), merge its central PR, run 2 again: what happened to `o/pipelines`. */
+  async function toDelete(fin: InstallRecord, onCentral: string): Promise<{ w: World; r: StepResult }> {
+    const w = world();
+    w.g.commitOn('o/pipelines', 'main', { [CO]: onCentral });
+    const rec = sampleRecord(w, { central: { repoId: w.central.id, createdByPipegen: true, ...(fin.central?.codeowners === undefined ? {} : { codeowners: fin.central.codeowners }) }, files: [...sampleRecord(w).files, ...fin.files.filter((f) => f.repo === 'central' && f.path === CO)], edits: centralCoOf(fin) as InstallEdit[] });
+    await afterRun1(w);
+    const t = term();
+    await uninstallStep(uGh(w), loadedOf(w, rec), t.p, uDeps(w, { deleteRepos: true, canDeleteRepos: true }));
+    mergePr(w, w.central, prBranch(w));
+    const r = await uninstallStep(uGh(w), loadedOf(w, rec), t.p, uDeps(w, { deleteRepos: true, canDeleteRepos: true }));
+    return { w, r };
+  }
+
+  it('G-FINREC i3: finish creates the central CODEOWNERS (one edit, no files entry) → the central PR removes it → the central repo is deleted', async () => {
+    const s = await seed();
+    const fin = await runFinish(s);
+    // the path is in edits only, never in files and edits both (V6b i2)
+    expect(fin.files.some((f) => f.repo === 'central' && f.path === CO)).toBe(false);
+    expect(centralCoOf(fin)).toHaveLength(1);
+    const { w, r } = await toDelete(fin, liveCo(s) as string);
+    expect(r.failed).toEqual([]);
+    expect(w.deleted).toContain('o/pipelines');
+  });
+
+  it('G-FINREC i3: an older finish\'s files entry, then finish over the owner\'s CODEOWNERS → one edit; after the restore the owner\'s file keeps the central repo', async () => {
+    const own = '/docs/ @writers\n';
+    const s = await seed({ centralFiles: { [CO]: own }, recordOver: (rr) => { rr.files.push({ repo: 'central', path: CO, part: 'codeowners', shas: [gitBlobSha('# earlier\n')] }); } });
+    const fin = await runFinish(s);
+    expect([...fin.files, ...fin.edits].filter((x) => x.repo === 'central' && x.path === CO)).toHaveLength(1);
+    const { w, r } = await toDelete(fin, liveCo(s) as string);
+    // the central PR put the owner's file back; deleteCentralRepo's own() counts no files entry or edit for it: the repo stays
+    expect(w.g.filesAt('o/pipelines', w.g.head('o/pipelines')).get(CO)).toBe(own);
+    expect(w.deleted).not.toContain('o/pipelines');
+    expect([...r.skipped, ...r.manual, ...r.failed].some((x) => /pipelines/.test(x.what) && /CODEOWNERS/.test(x.why))).toBe(true);
   });
 });
 
