@@ -7,15 +7,15 @@ import { CODEOWNERS_BEGIN, CODEOWNERS_END } from '../engine/created-builders.js'
 import { isRateStop, type RateClock } from '../engine/github-rate.js';
 import { SIGNING_ENVIRONMENT } from '../engine/referee.js';
 import { GitHubAccessError } from '../github/client.js';
-import { type ShaPinningRead } from '../github/lock-probes.js';
+import type { ShaPinningRead } from '../github/lock-probes.js';
 import { CO_PLACES, LockError, type LockPlan } from '../layers/locks.js';
-import { type Capabilities, type InstallEdit, type InstallPlanned, type InstallRecord, type Plan, type RepoProfile } from '../types.js';
+import type { Capabilities, InstallEdit, InstallPlanned, InstallRecord, Plan, RepoProfile } from '../types.js';
 import { safeText } from '../util/safe-text.js';
 import type { CosignExec, CosignResolver } from './cosign-keys.js';
 import { DeliverError, isoAt, readBlobText, statusOf, type RepoRef, type TreeEntry } from './git-data.js';
 import type { StateStore } from '../proof/state.js';
 import { localFinishPendingPath, RecordError, writeFinishPending, type FinishPending, type LocalRecordDeps } from './record.js';
-import { SettingsApi } from './settings-api.js';
+import type { SettingsApi } from './settings-api.js';
 
 export const BLOCK_FROM_VAR = 'PIPEGEN_BLOCK_FROM';
 export const COSIGN_PUB_VAR = 'PIPEGEN_COSIGN_PUB';

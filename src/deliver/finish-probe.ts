@@ -1,6 +1,6 @@
 // PL-E1: split out of finish.ts (a pure move, by step); see finish.ts for the whole story.
 import type { Octokit } from '@octokit/rest';
-import { type RateClock } from '../engine/github-rate.js';
+import type { RateClock } from '../engine/github-rate.js';
 import { probeCapabilities } from '../github/capabilities.js';
 import { readGitHubContext } from '../github/client.js';
 import { CENTRAL_REPO } from '../proof/target.js';

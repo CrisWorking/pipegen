@@ -3,11 +3,11 @@ import { COSIGN_KEY_SECRET, storeCosignKey, storeEnvSecret } from '../create/sec
 import { SIGNING_ENVIRONMENT } from '../engine/referee.js';
 import { pubKeySha256 } from '../engine/signing.js';
 import { signingMode } from '../github/signing-mode.js';
-import { type EnvSettings } from '../types.js';
+import type { EnvSettings } from '../types.js';
 import { generateCosignKeys } from '../layers/deploy.js';
 import { ensureSigningEnvironment, readEnv } from './deliver.js';
 import { isoAt } from './git-data.js';
-import { type FinishPending } from './record.js';
+import type { FinishPending } from './record.js';
 import { isObj } from './settings-api.js';
 import { COSIGN_PUB_VAR, PASSWORD_SECRET, SIGNING_SCOPE, show, StepError, type EnvEntry, type VarEntry, type Ctx, isStop, whyOf, step, sameInstant, priorOf, atOf, keepPending, keepMade, guardedWrite, pendEnv, pendVar, apiCmd, appParams } from './finish-base.js';
 

@@ -2,7 +2,7 @@
 import { gitBlobSha } from '../create/guard.js';
 import { CENTRAL_RULESET } from '../layers/locks.js';
 import { pathClash } from './deliver.js';
-import { type RecordedEdit } from './record.js';
+import type { RecordedEdit } from './record.js';
 import { show, type Ctx, step, noteAbout, ownersOf } from './finish-base.js';
 import { type Target, listRulesets, type Upserted, upsertRuleset, printRuleset } from './finish-rulesets.js';
 

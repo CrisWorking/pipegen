@@ -1,5 +1,5 @@
 // PL-E1: split out of finish.ts (a pure move, by step); see finish.ts for the whole story.
-import { type ApiRequest } from '../layers/locks.js';
+import type { ApiRequest } from '../layers/locks.js';
 import { isoAt, type RepoRef } from './git-data.js';
 import { holdsWanted, isObj } from './settings-api.js';
 import { show, StepError, type Ctx, atOf, apiCmd } from './finish-base.js';

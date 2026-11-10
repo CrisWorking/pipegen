@@ -2,7 +2,7 @@
 import { gitBlobSha } from '../create/guard.js';
 import { readShaPinning } from '../github/lock-probes.js';
 import { GATE_RULESET, REVIEWS_RULESET, type ApiRequest } from '../layers/locks.js';
-import { type InstallRecord } from '../types.js';
+import type { InstallRecord } from '../types.js';
 import { compareStatus, readTree, statusOf } from './git-data.js';
 import { ACCESS_LEVELS } from './record.js';
 import { classicPutForm, holdsWanted, isObj, refusedAsUnavailable } from './settings-api.js';
