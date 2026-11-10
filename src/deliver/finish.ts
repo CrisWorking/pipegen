@@ -1,37 +1,20 @@
-// v0.2 Plan G Task 7, finish (sub-task G11; rulings S10, S11, S13, S18, S24; rows S-7, P-7; Plan V pre-flight §5 G11 items 1-3; G8 carries;
-// G10 carries and rulings G10-R1, G10-R4, G10-R5): after the setup pull request is merged, `pipegen finish` applies what must not exist
-// before the merge, and records it.
+// v0.2 Plan G Task 7, finish (sub-task G11; rulings S10, S11, S13, S18, S24; rows S-7, P-7): after the setup pull request is merged,
+// `pipegen finish` applies what must not exist before the merge, and records it. This file is the orchestrator (`finish`, the order of
+// the nine steps, the block date, the pending file and the stop handling); the other steps live in their own modules:
+//   finish-base (types, errors, shared helpers), finish-rulesets (ruleset upsert), finish-settings (steps 1-3), finish-signing (steps 4-5),
+//   finish-central (steps 7 and 9, the central CODEOWNERS), finish-probe (the live probe); step 8 is writeRecord in record.ts.
 //
 // Inputs: ONLY the install record (read through the one trust order, trust.ts) and GitHub as it is now. finish takes the app's name and
-// nothing of the run that delivered it (Review Focus 11: it may run a week later on another machine). It re-probes (the plan and
-// capabilities through `probe`; who can write, the org role and the sha-pinning setting through G8's probes) and calls planLocks again:
-// the requests it sends are the ones planned NOW (a weakened request planted in the record is never sent), for the items the record
-// planned (what the user saw in the preview). A planned item GitHub no longer allows is skipped with a plain reason; a route in the
+// nothing of the run that delivered it (Review Focus 11). It re-probes and calls planLocks again: the requests it sends are the ones
+// planned NOW, for the items the record planned. A planned item GitHub no longer allows is skipped with a plain reason; a route in the
 // record's `planned` that pipegen never makes stops finish before anything is sent. A record trusted by typing (G10-R5) carries no
-// `planned`, merge time, block date or public key: finish re-derives what it can from GitHub and says what it couldn't.
+// `planned`, merge time, block date or public key: finish re-derives what it can and says what it couldn't.
 //
-// The order (each write read back; every refused or failed write named to the user and left out of the record, G8-R3):
-//   1. the app's rulesets `pipegen` and `pipegen-reviews` (an existing one updated by id, never duplicated); classic branch protection only
-//      when GitHub refuses rulesets as not offered on this repo;
-//   2. the Actions setting sha_pinning_required (S10), Dependabot alerts, secret scanning and push protection (public repos only; a private
-//      repo gets a paid add-on note with no public wording, P-7), the central repo's Actions access (private apps);
-//   3. the org required workflow's rule, pinned to the central commit that holds <name>--required.yml (G10-R1), read back;
-//   4. the planned environments (their earlier settings kept once as `previous`);
-//   5. key-env: pipegen-signing re-verified by read-back (S-7; no read-back: no key, mode none, a note); a key pair only for --rotate-key
-//      or when deliver stored none (S11), the private key through its own store path (G10-R1); then PIPEGEN_COSIGN_PUB;
-//   6. PIPEGEN_BLOCK_FROM = the merge day + 7, or the earlier date already recorded (S18: never later, fix round 1 I2);
-//   7. the central ruleset `pipegen` (an existing one reused): a new one is created switched off, so the record commit below can still go
-//      straight to the central default branch with the ruleset's id in it;
-//   8. the record (writeRecord: the central repo, the setup PR body's marker, the local record file), with the central CODEOWNERS file;
-//   9. LAST: the central ruleset switched on (read back active).
-// Every created object records GitHub's id and created_at; a setting pipegen turns on records the value it had, once (a re-run never
-// records pipegen's own value as `previous`; a value pipegen can't know is left unrecorded, so uninstall leaves it as it is). Fix round 1
-// (I1): each value it had is saved to a local 0600 pending file BEFORE the write that changes it, so a run that stops before its record is
-// written (a refused record commit, a rate limit, a rejected token) loses nothing: it prints what it applied, and the next finish records
-// the saved values.
+// Every refused or failed write is named to the user and left out of the record (G8-R3). A setting pipegen turns on records the value it
+// had, once; each such value is saved to a local 0600 pending file BEFORE the write that changes it, so a run that stops before its record
+// is written loses nothing (the next finish records it). The central ruleset is switched on LAST.
 //
-// `--print` applies nothing: it prints the exact `gh api` commands (and the cosign / `gh secret set` commands, which read values from
-// files the user makes), never a secret value. A later `finish` finds what the commands made, applies nothing twice, and records it.
+// `--print` applies nothing: it prints the exact `gh api` commands (never a secret value). A later `finish` finds what they made.
 import type { Octokit } from '@octokit/rest';
 import { COSIGN_KEY_SECRET } from '../create/secrets.js';
 import { centralWorkflowFile } from '../engine/central-path.js';

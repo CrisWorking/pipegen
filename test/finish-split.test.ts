@@ -5,7 +5,7 @@ import * as finish from '../src/deliver/finish.js';
 
 const NEW = ['finish-base', 'finish-rulesets', 'finish-settings', 'finish-signing', 'finish-central', 'finish-probe'];
 const importsOf = (name: string): string[] =>
-  [...readFileSync(new URL(`../src/deliver/${name}.ts`, import.meta.url), 'utf8').matchAll(/from '([^']+)'/g)].map((m) => m[1] as string);
+  [...readFileSync(new URL(`../src/deliver/${name}.ts`, import.meta.url), 'utf8').matchAll(/(?:from\s*|import\s*\(?\s*)['"]([^'"]+)['"]/g)].map((m) => m[1] as string);
 
 describe('finish split (PL-E1)', () => {
   it.each(NEW)('%s does not import finish.ts back', (name) => {
