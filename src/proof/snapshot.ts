@@ -456,7 +456,7 @@ async function pushOrStop(transport: ProofTransport, to: GuardedRepo, from: Push
     const never = 'pipegen never bypasses push protection or a ruleset; the proof stops.';
     if (what === 'base') {
       throw new ProofStopError(`GitHub refused the push of your HEAD to ${to.fullName} (GH013: push protection or a repository rule). Push protection may have `
-        + `found a secret in your code. Remove it from HEAD (and rotate it), or check the rulesets of ${to.fullName}, then run pipegen again. ${never} ${said}`);
+        + `found a secret in your code. Remove it from HEAD (and rotate it), or check the rulesets of ${to.fullName}, then run \`npx pipegen run\` again. ${never} ${said}`);
     }
     if (what === 'central') {
       throw new ProofStopError(`GitHub refused ${branch} in ${to.fullName} (GH013: a repository rule or push protection). A ruleset on ${to.fullName} must `
@@ -629,7 +629,7 @@ async function readCentralHead(gh: Octokit, st: SessionState, central: GuardedRe
   const maxEntries = limits.entries ?? MAX_CENTRAL_ENTRIES;
   const maxBytes = limits.bytes ?? MAX_CENTRAL_BYTES;
   const where = { owner: central.owner, repo: central.repo };
-  const cannot = (why: string) => new ProofStopError(`pipegen couldn't copy the default branch of ${central.fullName} for the proof (${why}). Check ${central.fullName}, then run pipegen again.`);
+  const cannot = (why: string) => new ProofStopError(`pipegen couldn't copy the default branch of ${central.fullName} for the proof (${why}). Check ${central.fullName}, then run \`npx pipegen run\` again.`);
   const get = async (route: string, params: Record<string, unknown>): Promise<unknown> => {
     try {
       return (await githubRead(gh, route, { ...where, ...params }, clock)).data;
@@ -719,7 +719,7 @@ export async function buildCentralDraft(s: ProofSession, gh: Octokit, draft: Cen
   const ownKeys = new Set(own.map((f) => keyOf(f.name)));
   const inherited = (head?.workflows ?? []).filter((w) => !ownKeys.has(keyOf(Buffer.from(w.path, 'utf8'))));
   const problems = checkCentralTriggers(inherited);
-  if (problems.length > 0) throw new ProofStopError(`pipegen won't push proof/${t.runId} to ${central.fullName}: ${problems.join('; ')}. Change that workflow's triggers in ${central.fullName}, then run pipegen again.`);
+  if (problems.length > 0) throw new ProofStopError(`pipegen won't push proof/${t.runId} to ${central.fullName}: ${problems.join('; ')}. Change that workflow's triggers in ${central.fullName}, then run \`npx pipegen run\` again.`);
   const tree = await writeTree(st, entries.values());
   const sha = await commitTree(st, tree, null, `pipegen proof ${t.runId}: central draft for ${t.appRepo}${head === null ? '' : ` on ${head.branch} ${head.commit}`}`);
   const branch = `proof/${t.runId}`;
@@ -970,7 +970,7 @@ export async function disableUserWorkflows(gh: Octokit, scratch: GuardedRepo, pi
     } catch (e) {
       hard(gh, e);
       if (!isWorkflowPath(w.path)) { warn(`pipegen couldn't disable ${safeText(w.path, 120)} in ${scratch.fullName} (${saidOf(e)}).`); continue; }
-      throw new ProofStopError(`pipegen couldn't disable the workflow ${safeText(w.path, 120)} in ${scratch.fullName} (${saidOf(e)}). Disable it there (Actions → the workflow → Disable workflow), then run pipegen again.`);
+      throw new ProofStopError(`pipegen couldn't disable the workflow ${safeText(w.path, 120)} in ${scratch.fullName} (${saidOf(e)}). Disable it there (Actions → the workflow → Disable workflow), then run \`npx pipegen run\` again.`);
     }
     disabled.push(w.path);
   }
@@ -1000,7 +1000,7 @@ async function checkNoRunForBase(gh: Octokit, scratch: GuardedRepo, baseSha: str
   const named = runs.length > 0 ? `: ${runs.join('; ')}${d.total_count > runs.length ? `; and ${d.total_count - runs.length} more` : ''}` : '';
   throw new ProofStopError(`ALERT: a workflow run started in ${scratch.fullName} for the base snapshot (${baseSha.slice(0, 12)}), which holds none of your workflows${named}. `
     + `pipegen stopped before storing any secret there. Disable or remove that workflow in ${scratch.fullName} (Actions → the workflow → Disable workflow; `
-    + `for a dynamic one such as CodeQL default setup, turn it off in Settings → Code security), check its rulesets and installed apps, then run pipegen again.`);
+    + `for a dynamic one such as CodeQL default setup, turn it off in Settings → Code security), check its rulesets and installed apps, then run \`npx pipegen run\` again.`);
 }
 
 // ---------- the caller's pins (S24, review M5) ----------
@@ -1187,7 +1187,7 @@ export async function pushProofSetup(input: ProofSetupInput, deps: ProofSetupDep
       notStopping();
       // Plan G G0 (E-F2 m3): set only to the commit pipegen built and just pushed
       defaultBranchState = await setScratchDefaultBranch(deps.gh, scratch, clock, base.sha);
-      if (defaultBranchState === 'pending') throw new ProofStopError(`${scratch.fullName} still shows no branch after the base push, or the branch is at a commit pipegen didn't build (something else pushed to it); check it on GitHub, then run pipegen again.`);
+      if (defaultBranchState === 'pending') throw new ProofStopError(`${scratch.fullName} still shows no branch after the base push, or the branch is at a commit pipegen didn't build (something else pushed to it); check it on GitHub, then run \`npx pipegen run\` again.`);
     }
     notStopping();
     const disabled = await disableUserWorkflows(deps.gh, scratch, prepared.workflows, clock, warn);

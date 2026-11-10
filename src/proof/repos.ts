@@ -166,7 +166,7 @@ async function readHelper(gh: Octokit, owner: string, name: string, clock: RateC
   const d = (data ?? {}) as { full_name?: unknown; default_branch?: unknown; description?: unknown; allow_forking?: unknown; has_wiki?: unknown; has_projects?: unknown };
   if (typeof d.full_name !== 'string' || d.full_name.toLowerCase() !== `${owner}/${name}`.toLowerCase()) {
     throw new ProofStopError(`GitHub answered for ${safeText(String(d.full_name), 160)} when pipegen asked for ${owner}/${name} (renamed or transferred), `
-      + `so pipegen won't use it. Rename or move that repo away from ${owner}/${name}, then run pipegen again.`);
+      + `so pipegen won't use it. Rename or move that repo away from ${owner}/${name}, then run \`npx pipegen run\` again.`);
   }
   const visibility = visibilityOf(data);
   if (visibility === null || typeof d.default_branch !== 'string') throw new GitHubAccessError(`GitHub's answer about ${owner}/${name} could not be read.`);
@@ -293,7 +293,7 @@ export async function checkScratchAccess(gh: Octokit, t: ProofTarget, io: ProofI
   const seen = await readHelper(gh, scratch.owner, scratch.repo, clock);
   if (!seen.exists) throw new ProofStopError(`pipegen can't see ${scratch.fullName} any more, so it won't store anything there.`);
   if (seen.visibility !== 'private') {
-    throw new ProofStopError(`${scratch.fullName} is no longer private (it is ${seen.visibility}), so pipegen won't store your test keys there. Make it private, then run pipegen again.`);
+    throw new ProofStopError(`${scratch.fullName} is no longer private (it is ${seen.visibility}), so pipegen won't store your test keys there. Make it private, then run \`npx pipegen run\` again.`);
   }
 
   // 2. the org base permission
@@ -477,7 +477,7 @@ export async function checkActionsAllowed(gh: Octokit, scratch: GuardedRepo, act
     return;
   }
   if (perms.enabled === false) {
-    throw new ProofStopError(`Actions is turned off on ${scratch.fullName}, so no proof run can start. Enable Actions on ${scratch.repo}: ${where} → "Allow all actions and reusable workflows", then run pipegen again.`);
+    throw new ProofStopError(`Actions is turned off on ${scratch.fullName}, so no proof run can start. Enable Actions on ${scratch.repo}: ${where} → "Allow all actions and reusable workflows", then run \`npx pipegen run\` again.`);
   }
   if (perms.enabled !== true) { warn(couldnt); return; }
   const owner = scratch.owner.toLowerCase();
@@ -504,7 +504,7 @@ export async function checkActionsAllowed(gh: Octokit, scratch: GuardedRepo, act
   if (blocked.length > 0) {
     throw new ProofStopError(`${scratch.fullName} doesn't allow these actions the proof uses: ${blocked.join(', ')}. Change it: ${where} → `
       + `add them to "Allow specified actions and reusable workflows" (or choose "Allow all actions and reusable workflows")`
-      + `${shaOnly ? '; with "Require actions to be pinned to a full-length commit SHA" on, every action needs a full sha' : ''}, then run pipegen again.`);
+      + `${shaOnly ? '; with "Require actions to be pinned to a full-length commit SHA" on, every action needs a full sha' : ''}, then run \`npx pipegen run\` again.`);
   }
 }
 
@@ -549,7 +549,7 @@ export async function ensureActionsAccess(gh: Octokit, t: ProofTarget, app: Proo
     if (!(typeof status === 'number' && status >= 400 && status < 500)) tell();
     const choice = org ? `Accessible from repositories in the ${t.owner} organization` : `Accessible from repositories owned by the user ${t.owner}`;
     throw new ProofStopError(`pipegen couldn't let ${t.scratch} use the workflows in ${central.fullName} (${saidOf(e)}). `
-      + `Set it by hand: ${central.fullName} → Settings → Actions → General → Access → "${choice}", then run pipegen again.`);
+      + `Set it by hand: ${central.fullName} → Settings → Actions → General → Access → "${choice}", then run \`npx pipegen run\` again.`);
   }
   // G13-R2 3: told at once (outside the refusal handling above: a throw from the callback is not a refused PUT)
   tell();
@@ -588,7 +588,7 @@ export async function setScratchDefaultBranch(gh: Octokit, scratch: GuardedRepo,
   }
   // only a branch at the commit pipegen built becomes the default (never one somebody else pushed)
   if (head !== built) return 'pending';
-  const byHand = `Set it by hand (${scratch.fullName} → Settings → General → Default branch → ${branch}), then run pipegen again.`;
+  const byHand = `Set it by hand (${scratch.fullName} → Settings → General → Default branch → ${branch}), then run \`npx pipegen run\` again.`;
   let res: Awaited<ReturnType<typeof guardedWrite>>;
   // GitHub refusing a write (no Administration write: 403; a 422) is a stop that says what to change (review M4)
   try {
@@ -636,21 +636,21 @@ export async function checkProofRepos(gh: Octokit, app: ProofApp, opts: ProofRep
     if (!s.exists || s.visibility === 'private') continue;
     // ruling M1: the central repo takes { private: true } only, which doesn't change an internal repo: the command, no prompt
     if (r.kind === 'central' && s.visibility === 'internal') {
-      throw new ProofStopError(`${r.fullName} is internal (every member of the enterprise can read it), and pipegen won't use it. Run this, then run pipegen again:\n`
+      throw new ProofStopError(`${r.fullName} is internal (every member of the enterprise can read it), and pipegen won't use it. Run this, then run \`npx pipegen run\` again:\n`
         + `  gh repo edit ${r.fullName} --visibility private --accept-visibility-change-consequences`);
     }
     const msg = s.visibility === 'internal'
       ? `${r.repo} is internal (every member of the enterprise can read it). Make it private? (Y/n)`
       : `${r.repo} is public. Make it private? (Y/n)`;
     if (!(await io.prompt.confirm(msg, true))) {
-      throw new ProofStopError(`pipegen won't use a public helper repo. Make ${r.fullName} private, then run pipegen again.`);
+      throw new ProofStopError(`pipegen won't use a public helper repo. Make ${r.fullName} private, then run \`npx pipegen run\` again.`);
     }
     try {
       await makeRepoPrivate(gh, r, s.visibility, clock);
     } catch (e) {
       if (e instanceof ScratchGuardError || e instanceof ProofStopError) throw e;
       rethrowHard(gh, e);
-      throw new ProofStopError(`pipegen couldn't make ${r.fullName} private (${saidOf(e)}). Run this, then run pipegen again:\n`
+      throw new ProofStopError(`pipegen couldn't make ${r.fullName} private (${saidOf(e)}). Run this, then run \`npx pipegen run\` again:\n`
         + `  gh repo edit ${r.fullName} --visibility private --accept-visibility-change-consequences`);
     }
     seen.set(r, { ...s, visibility: 'private' });
@@ -721,11 +721,11 @@ export async function checkProofRepos(gh: Octokit, app: ProofApp, opts: ProofRep
 
   if (toPrint.length > 0 || unreachable.length > 0) {
     if (toPrint.length > 0) {
-      io.err(['Create these private repos, then run pipegen again:', ...createCommands(t.owner, toPrint.map((r) => r.repo)).map((c) => `  ${c}`)].join('\n'));
+      io.err(['Create these private repos, then run `npx pipegen run` again:', ...createCommands(t.owner, toPrint.map((r) => r.repo)).map((c) => `  ${c}`)].join('\n'));
     }
     const names = [...toPrint, ...unreachable].map((r) => r.fullName).join(', ');
     if (appMode) {
-      io.err(`pipegen's GitHub App can't reach ${names}: a repo made by hand isn't added to the App by itself. Add it: ${APP_CONFIGURE}. Then run pipegen again.`);
+      io.err(`pipegen's GitHub App can't reach ${names}: a repo made by hand isn't added to the App by itself. Add it: ${APP_CONFIGURE}. Then run \`npx pipegen run\` again.`);
     } else if (opts.auth.kind === 'fine-grained') {
       io.err(`Then add these repos to your token: ${names} (${FG_EDIT}). If a repo already exists, only add it.`);
     }
@@ -736,14 +736,14 @@ export async function checkProofRepos(gh: Octokit, app: ProofApp, opts: ProofRep
   const s = seen.get(scratch) as Seen;
   if (s.exists && !result.created.includes(scratch.repo) && s.description !== SCRATCH_MARKER) {
     if (!(await io.prompt.confirm(`${scratch.repo} exists but pipegen didn't create it. pipegen will overwrite its branches and secrets. Use it?`, false))) {
-      throw new ProofStopError(`pipegen won't use ${scratch.fullName}. Rename or delete it, then run pipegen again (pipegen will ask you to create it).`);
+      throw new ProofStopError(`pipegen won't use ${scratch.fullName}. Rename or delete it, then run \`npx pipegen run\` again (pipegen will ask you to create it).`);
     }
     try {
       await guardedWrite(gh, scratch, 'PATCH /repos/{owner}/{repo}', { description: SCRATCH_MARKER }, clock);
     } catch (e) {
       if (e instanceof ScratchGuardError) throw e;
       rethrowHard(gh, e);
-      throw new ProofStopError(`pipegen couldn't mark ${scratch.fullName} as its scratch repo (${saidOf(e)}). Set its description to "${SCRATCH_MARKER}", then run pipegen again.`);
+      throw new ProofStopError(`pipegen couldn't mark ${scratch.fullName} as its scratch repo (${saidOf(e)}). Set its description to "${SCRATCH_MARKER}", then run \`npx pipegen run\` again.`);
     }
   }
 

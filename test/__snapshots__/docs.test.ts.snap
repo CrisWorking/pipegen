@@ -113,7 +113,7 @@ The required check is \`pipegen / gate\`. When it fails, or only warns, its summ
 | A finding of a check that is not meant to block is shown and never blocks. | Read it; nothing is required. | a non-blocking check: never blocks |
 | A required check failed, so the pull request is blocked. | Open the job's log, fix the failure and push again. | required check |
 | A check ran but could not look (for example a scan that reported nothing because it had nothing to read). A required one blocks, because nothing was proven. | Fix what the check could not read, then run the checks again. | no coverage for |
-| You skipped that part with --skip, so it has no job and gives no protection. The summary lists it under Skipped. | Run pipegen again without the skip if you want the part. | skipped, |
+| You skipped that part with --skip, so it has no job and gives no protection. The summary lists it under Skipped. | Run \`npx pipegen run\` again without the skip if you want the part. | skipped, |
 
 ### Before merge
 
@@ -460,7 +460,7 @@ The required check is \`pipegen / gate\`. When it fails, or only warns, its summ
 | A finding of a check that is not meant to block is shown and never blocks. | Read it; nothing is required. | a non-blocking check: never blocks |
 | A required check failed, so the pull request is blocked. | Open the job's log, fix the failure and push again. | required check |
 | A check ran but could not look (for example a scan that reported nothing because it had nothing to read). A required one blocks, because nothing was proven. | Fix what the check could not read, then run the checks again. | no coverage for |
-| You skipped that part with --skip, so it has no job and gives no protection. The summary lists it under Skipped. | Run pipegen again without the skip if you want the part. | skipped, |
+| You skipped that part with --skip, so it has no job and gives no protection. The summary lists it under Skipped. | Run \`npx pipegen run\` again without the skip if you want the part. | skipped, |
 
 ### Before merge
 

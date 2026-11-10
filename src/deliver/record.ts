@@ -576,7 +576,7 @@ export async function writeRecord(gh: Octokit, args: WriteRecordArgs): Promise<W
   if (!repo.private) throw new DeliverError(`${safeText(`${central.owner}/${central.repo}`, 120)} is public; pipegen keeps install records only in a private repo.`);
   const head = await readHead(gh, central, repo.defaultBranch, clock);
   if (head === null) throw new DeliverError(`${safeText(`${central.owner}/${central.repo}`, 120)} has no default branch to write the install record on.`);
-  if (extra.length > 0 && args.base !== head) throw new DeliverError(`${safeText(`${central.owner}/${central.repo}`, 120)} changed while pipegen was delivering, so it doesn't write its central files onto the new head; run pipegen again.`);
+  if (extra.length > 0 && args.base !== head) throw new DeliverError(`${safeText(`${central.owner}/${central.repo}`, 120)} changed while pipegen was delivering, so it doesn't write its central files onto the new head; run \`npx pipegen run\` again.`);
   const files = [...extra.map((f) => ({ path: f.path, content: f.content, mode: '100644' })), { path: recordPath(app.repo), content: text, mode: '100644' }];
   const message = `pipegen: install record for ${record.app.repo}`;
 

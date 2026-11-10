@@ -122,7 +122,7 @@ export const GATE_REASONS: readonly { id: string; part: PartId; message: string;
   { id: 'settings-floor', part: 3, message: 'not-proven can\'t include floor need', means: 'A check every repository needs is listed as not proven, which the gate does not allow.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
   { id: 'settings-skip', part: 3, message: 'can never be skipped', means: 'A check that can never be skipped is listed as skipped.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
   { id: 'settings-warn-first', part: 3, message: 'warn-first can\'t be set on floor need', means: 'A check every repository needs was put in warn-first mode, which the gate does not allow.', todo: 'Run `npx pipegen verify`, then `npx pipegen update`.' },
-  { id: 'skipped', part: 2, message: 'skipped,', means: 'You skipped that part with --skip, so it has no job and gives no protection. The summary lists it under Skipped.', todo: 'Run pipegen again without the skip if you want the part.' },
+  { id: 'skipped', part: 2, message: 'skipped,', means: 'You skipped that part with --skip, so it has no job and gives no protection. The summary lists it under Skipped.', todo: 'Run `npx pipegen run` again without the skip if you want the part.' },
   { id: 'warn-mode', part: 3, message: '(warn mode)', means: 'The summary heading says warn mode: old findings and medium ones warn, and a new critical, high or secret finding still blocks.', todo: 'Fix the warnings before warn mode ends (see Warn mode).' },
   { id: 'warn-ended', part: 3, message: '(block mode)', means: 'The summary heading says block mode: the warn period is over, so what used to warn now blocks.', todo: 'Fix the finding. Nothing else changed.' },
 ]);

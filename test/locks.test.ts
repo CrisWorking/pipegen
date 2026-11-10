@@ -480,6 +480,15 @@ describe('G8: merge locks, central locks, required workflow, CODEOWNERS', () => 
       }
     });
 
+    it('PL-F1: the stops and notes that say to run again name the caller command (default `npx pipegen run`, finish passes its own)', () => {
+      const none = { writers: { app: [], central: [] }, owners: [] };
+      expect(() => planLocks(inputs(none))).toThrow(/then run `npx pipegen run` again\./);
+      expect(() => planLocks(inputs({ ...none, command: 'finish' }))).toThrow(/then run `npx pipegen finish` again\./);
+      const one = { writers: { app: ['alice', 'bob'], central: ['alice'] }, owners: [] };
+      expect(planLocks(inputs(one)).notes.join('\n')).toMatch(/then run `npx pipegen run` again\./);
+      expect(planLocks(inputs({ ...one, command: 'finish' })).notes.join('\n')).toMatch(/then run `npx pipegen finish` again\./);
+    });
+
     it('PL-D1-R1: the org required workflow has the pipegen header and the part banner (version injected, default, or refused)', () => {
       const { a } = assembledPrivate();
       const base = { orgAdmin: true, ids: { app: 11, central: 22 }, files: a.files };

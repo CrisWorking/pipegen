@@ -217,7 +217,7 @@ export async function findOpenPr(gh: Octokit, r: RepoRef, branch: string, clock:
   const d = await ghRead(gh, 'GET /repos/{owner}/{repo}/pulls', r, { head: `${r.owner}:${checkBranch(branch)}`, state: 'open', per_page: 10 }, clock);
   if (!Array.isArray(d)) throw new DeliverError('GitHub\'s list of pull requests could not be read.');
   const mine = d.map(obj).filter((p) => obj(p.head).ref === branch && Number.isSafeInteger(p.number));
-  if (mine.length > 1) throw new DeliverError(`More than one pull request is open from ${safeText(branch, 100)}; close the extra ones, then run pipegen again.`);
+  if (mine.length > 1) throw new DeliverError(`More than one pull request is open from ${safeText(branch, 100)}; close the extra ones, then run \`npx pipegen run\` again.`);
   const p = mine[0];
   return p === undefined ? null : { number: p.number as number, url: typeof p.html_url === 'string' ? p.html_url : '' };
 }

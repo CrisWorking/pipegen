@@ -112,7 +112,7 @@ describe('G-LEASE-R1: the lease without the proof state (spec I1, sec I3)', () =
     chmodSync(s.path, 0o600);
     await tryOpen();   // the wrong format
     expect(stops).toHaveLength(5);
-    for (const m of stops) expect(m).toMatch(/(then run pipegen again|Delete it to start again|Fix it with: chmod 600)/);
+    for (const m of stops) expect(m).toMatch(/(then run `npx pipegen run` again|Delete it to start again|Fix it with: chmod 600)/);
   });
 });
 
@@ -154,7 +154,7 @@ describe('G-LEASE-R1: a stale-lease takeover checks it is still the holder (sec 
     // B judged the same stale lease dead (the other process): it replaces A's fresh lease while A waits before its check
     const b = await StateStore.openForLease(APP, { ...st, alive: () => false, leaseSettle: () => {} });
     const a = await StateStore.openForLease(APP, { ...st, leaseSettle: () => { b.acquireLease('b', 'finish'); } });
-    expect(() => { a.acquireLease('a', 'uninstall'); }).toThrow(/^Another pipegen took the lease .*lease\.json at the same time\. Wait for it to finish, then run pipegen again\.$/);
+    expect(() => { a.acquireLease('a', 'uninstall'); }).toThrow(/^Another pipegen took the lease .*lease\.json at the same time\. Wait for it to finish, then run `npx pipegen uninstall` again\.$/);
     expect(a.holdsLease()).toBe(false);
     expect(b.holdsLease()).toBe(true);
     expect(leaseOf(s0.dir).command).toBe('finish');
@@ -270,7 +270,7 @@ describe('G-LEASE-R1: the stop names the way out when the process id was reused 
     const s = await StateStore.openForLease(APP, { home: d, env: {} });
     const file = join(s.dir, 'lease.json');
     writeFileSync(file, JSON.stringify({ pid: process.ppid, host: hostname(), runId: 'x', [TK]: 't', command: 'finish' }), { mode: 0o600 });
-    expect(() => { s.acquireLease(RUN, 'update'); }).toThrow(`If process ${process.ppid} is not pipegen, remove ${file} and run pipegen again.`);
+    expect(() => { s.acquireLease(RUN, 'update'); }).toThrow(`If process ${process.ppid} is not pipegen, remove ${file} and run \`npx pipegen update\` again.`);
   });
 });
 

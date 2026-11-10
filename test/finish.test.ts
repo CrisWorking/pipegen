@@ -706,7 +706,7 @@ describe('G11 finish: carries (G8, G10)', () => {
     expect(t.g.orgRulesets.size).toBe(0);
     expect(res.skipped.find((x) => /org required workflow/.test(x.what))?.why).toMatch(/doesn't hold/);
     // PL-D1 Fold R2 (security I4): both ways on: merge the open central pull request, or run pipegen again
-    expect(res.skipped.find((x) => /org required workflow/.test(x.what))?.why).toMatch(/central pull request.*still open, merge it.*otherwise run pipegen again/i);
+    expect(res.skipped.find((x) => /org required workflow/.test(x.what))?.why).toMatch(/central pull request.*still open, merge it.*otherwise run `npx pipegen run` again/i);
   });
 
   it('finish: sends only allow-listed routes; a route the record plans that pipegen never makes is refused, never sent', async () => {
@@ -2314,7 +2314,7 @@ describe('Plan V M5: finish holds the app lease', () => {
     const from = s.g.calls.length;
     const e = await finish(s.g.octokit(), app, {}, s.deps()).then(() => null, (x: unknown) => x);
     expect(e).toBeInstanceOf(FinishError);
-    expect((e as Error).message).toMatch(/^Another pipegen \(`pipegen uninstall`, process \d+\) is working on .* Wait for it to finish, or stop it, then run pipegen again\. If process \d+ is not pipegen, remove \S+lease\.json and run pipegen again\. Nothing was applied\.$/);
+    expect((e as Error).message).toMatch(/^Another pipegen \(`pipegen uninstall`, process \d+\) is working on .* Wait for it to finish, or stop it, then run `npx pipegen finish` again\. If process \d+ is not pipegen, remove \S+lease\.json and run `npx pipegen finish` again\. Nothing was applied\.$/);
     expect(s.g.calls.length).toBe(from);
     // --print too: it reads what the uninstall is changing
     await expect(finish(s.g.octokit(), app, { print: true }, s.deps())).rejects.toThrow(/`pipegen uninstall`/);

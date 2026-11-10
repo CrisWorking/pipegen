@@ -782,7 +782,7 @@ export async function holdUninstallLease(app: RepoRef, state: StateDeps | undefi
 /** The app's lease (the proof's state folder): another pipegen run on this repo → a stop, nothing read or sent. */
 async function takeLease(app: RepoRef, deps: StateDeps | undefined): Promise<StateStore> {
   try {
-    const store = await StateStore.open(app, deps ?? {});
+    const store = await StateStore.open(app, { ...deps, command: 'uninstall' });
     store.acquireLease(`uninstall-${randomBytes(6).toString('hex')}`, 'uninstall');
     return store;
   } catch (e) {

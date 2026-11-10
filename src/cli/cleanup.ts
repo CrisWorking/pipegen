@@ -35,7 +35,7 @@ export async function cleanupCommand(dir: string, io: CliIO, opts: { allowBroad:
   }
   let store: StateStore;
   try {
-    store = await StateStore.open({ owner, repo }, { env: io.env, ...(deps.home === undefined ? {} : { home: deps.home }), ...(deps.uid === undefined ? {} : { uid: deps.uid }) });
+    store = await StateStore.open({ owner, repo }, { command: 'cleanup', env: io.env, ...(deps.home === undefined ? {} : { home: deps.home }), ...(deps.uid === undefined ? {} : { uid: deps.uid }) });
   } catch (e) {
     if (!(e instanceof StateError)) throw e;
     fail(safeText(e.message, 600));

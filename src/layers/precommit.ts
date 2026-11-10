@@ -143,7 +143,7 @@ export async function precommitFiles(draft: PipelineDraft, reviewed: readonly Re
   const biome = reviewed.find((t) => t.id === 'biome')?.step.cli?.install;
   const asksFormat = draft.needs.some((n) => n.layer === 'pre-commit' && n.id === 'format-lint') && draft.steps.some((s) => s?.needId === 'format-lint' && s.tool?.id === 'biome');
   if (asksFormat && !wanted.includes('pipegen-biome') && biome !== undefined) {
-    notes.push(`The format and lint hook runs the repository's own Biome, so pipegen adds it only when the lockfile holds ${biome.package}@${biome.version}; add that exact devDependency and run pipegen again to get it.`);
+    notes.push(`The format and lint hook runs the repository's own Biome, so pipegen adds it only when the lockfile holds ${biome.package}@${biome.version}; add that exact devDependency and run \`npx pipegen run\` again to get it.`);
   }
 
   const built = hookFile(manager, original, draft, reviewed);

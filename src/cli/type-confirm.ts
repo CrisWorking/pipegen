@@ -1,4 +1,4 @@
-// Plan J sub-task J5 (DECISIONS #124; rulings B1, S9, S10, S14): the type question `npx pipegen` asks at a terminal,
+// Plan J sub-task J5 (DECISIONS #124; rulings B1, S9, S10, S14): the type question `npx pipegen run` asks at a terminal,
 // after the local read and before any GitHub call, and the `--type` values. The question shows each service's detected
 // type with its evidence and asks "Is this right? (Y/n)"; No asks for each service's type (or "keep"). Repo text (service
 // names; the evidence holds only fixed wording and checked paths) is shown through safeText. Only a user cancel (Ctrl+C,

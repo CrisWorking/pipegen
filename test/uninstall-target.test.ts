@@ -975,7 +975,7 @@ describe('V3 fix round 1', () => {
       [{ issues: [{ number: 5, pull_request: {} }], pulls: [{ number: 5, head: { ref: 'my-work', repo: { id: CENTRAL_ID } } }] }, /pull request/],
       [{ issues: [{ number: 5, pull_request: {} }], pulls: [{ number: 5, head: { ref: 'pipegen/update-shop', repo: { id: 999 } } }] }, /pull request/],
       [{ issues: [{ number: 5, pull_request: {} }], pulls: [{ number: 5, head: { ref: 'pipegen/update-shop', repo: null } }] }, /pull request/],
-      [{ repo: { ...base, has_wiki: true } }, /wiki/],
+      [{ repo: { ...base, has_wiki: true } }, /wiki.*then run `npx pipegen uninstall` again/],
       [{ repo: { ...base, has_wiki: undefined } }, /wiki/],
       [{ repo: { ...base, forks_count: 3 } }, /fork/],
       [{ repo: { ...base, forks_count: undefined } }, /fork/],
