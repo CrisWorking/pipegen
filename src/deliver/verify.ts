@@ -98,6 +98,11 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
         drift.push({ what: `pipegen's lines in ${label(ed.repo, ed.path)}`, expected: 'pipegen\'s inserted text, once', actual: 'it can\'t be read' });
         continue;
       }
+      // the text must be the blob GitHub reads: a file that isn't UTF-8 decodes with replacements, and nothing is judged on that text
+      if (gitBlobSha(coText) !== e.sha) {
+        drift.push({ what: `pipegen's lines in ${label(ed.repo, ed.path)}`, expected: 'pipegen\'s inserted text, once', actual: 'it can\'t be read as UTF-8 text, so pipegen can\'t check it' });
+        continue;
+      }
     }
     if (coText !== null) {
       const over = overrides(coText, ed.repo === 'app' ? [...new Set([...protectedListOf(r, 'app'), ...PROTECTED_PATHS_BASE])] : CENTRAL_PROTECTED_PATHS);
@@ -237,7 +242,12 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
   for (const path of CO_PLACES) {
     const e = tree?.get(path);
     if (e === undefined) continue;
-    if (e.type === 'blob' && e.mode !== '120000') warnings.push(...teamOnly(await readBlobText(gh, app, e.sha, MAX_TEXT, clock), r, path));
+    if (e.type === 'blob' && e.mode !== '120000') {
+      const text = await readBlobText(gh, app, e.sha, MAX_TEXT, clock);
+      // G-FINREC-R2: only text that hashes back to the blob is judged; the per-edit check already named a file pipegen edited
+      if (gitBlobSha(text) === e.sha) warnings.push(...teamOnly(text, r, path));
+      else if (!r.edits.some((x) => x.repo === 'app' && x.kind === 'codeowners' && x.path === path)) drift.push({ what: `the CODEOWNERS GitHub reads in the app repo (${label('app', path)})`, expected: 'UTF-8 text pipegen can check', actual: 'it can\'t be read as UTF-8 text, so pipegen can\'t check it' });
+    }
     break;
   }
   // G26
