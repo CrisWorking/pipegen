@@ -693,6 +693,32 @@ describe('short report by parts (PL-A4)', () => {
     expect(renderTerminal({ ...report(), coverage: rows, wouldAdd: [] }, SHORT)).toContain('Code scan (SAST) for a and b');
   });
 
+  it('"for all services" is said once per mark line, after the checks that name their own services', () => {
+    const r = report();
+    const svc = (name: string) => ({ ...r.profile.services[0]!, name });
+    const two = { ...r.profile, services: [svc('web'), svc('api')] };
+    const miss = (id: string, services: string[]): Coverage[] => services.map((s) => ({ need: need('push', id, s), status: 'missing', why: `No ${id}.` }));
+    const rows: Coverage[] = [...miss('secrets', ['web', 'api']), ...miss('lint', ['web']), ...miss('sast', ['web', 'api'])];
+    const t = renderTerminal({ ...r, profile: two, coverage: rows, wouldAdd: [] }, SHORT);
+    const two2 = blocks(t).find((b) => b.id === 2) as { lines: string[] };
+    const line = two2.lines.join('\n').replace(/\n {4}/g, ' ').split('\n').find((l) => l.startsWith('  ✗ ')) as string;
+    expect(line.match(/for all services/g)).toHaveLength(1);
+    // the named check comes first, the all-services group last and the one suffix covers the group
+    expect(line).toBe('  ✗ Lint for web; Secret scan; Code scan (SAST) for all services');
+    // one check on every service alone still says so; a check for some services names them
+    const alone = renderTerminal({ ...r, profile: two, coverage: miss('sast', ['web', 'api']), wouldAdd: [] }, SHORT);
+    expect(alone).toContain('  ✗ Code scan (SAST) for all services');
+    // a check for the two services and one more is not "all services": it names them
+    const extra = renderTerminal({ ...r, profile: two, coverage: miss('sast', ['web', 'api', 'other']), wouldAdd: [] }, SHORT);
+    expect(extra).toContain('  ✗ Code scan (SAST) for web, api and other');
+    // a cut line says it only when a check for every service is still shown: here the cut leaves only named ones
+    const named = ['lint', 'format', 'coverage', 'licences', 'dead-code', 'duplication', 'iac', 'workflow-lint'].flatMap((id) => miss(id, ['web']));
+    const cut = renderTerminal({ ...r, profile: two, coverage: [...named, ...miss('sast', ['web', 'api'])], wouldAdd: [] }, SHORT);
+    expect(flat(cut)).toMatch(/ ✗ Lint for web;.*and \d+ more \(--verbose\)/);
+    expect(cut).not.toContain('for all services');
+    expect(cut).not.toContain('Code scan (SAST) for all services');
+  });
+
   it('a partial check says so; the tool the setup names is in brackets', () => {
     const t = renderTerminal(report(), SHORT);
     expect(flat(t)).toContain('Dependency check (partial)');

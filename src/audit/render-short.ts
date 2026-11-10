@@ -154,26 +154,39 @@ function fit(s: string, room: number): string {
   return `${at > room / 2 ? cut.slice(0, at) : cut}…`;
 }
 
+/** What closes a group of checks that are for every service: said once per line, not on each check. */
+const ALL_SERVICES = ' for all services';
+
 /**
  * `items` joined by `sep` after `lead`, in at most `maxLines` lines of the short report: as many as fit, then "and N more
- * (--verbose)". At least one item is always shown (it wraps if it is longer than a line).
+ * (--verbose)". At least one item is always shown (it wraps if it is longer than a line). The items from `groupFrom` on
+ * are for every service: when any of them is shown the line says "for all services" once, after the last one shown.
  */
-function capLine(items: string[], sep: string, lead: string, maxLines: number): string {
+function capLine(items: string[], sep: string, lead: string, maxLines: number, groupFrom = items.length): string {
   const rest = ' '.repeat([...lead].length);
   const more = (left: number) => `${sep}and ${num(left)} more (--verbose)`;
-  for (let k = items.length; k > 1; k--) {
-    const text = items.slice(0, k).join(sep) + (k < items.length ? more(items.length - k) : '');
-    if (w80(text, lead, rest).length <= maxLines) return text;
-  }
-  return items.slice(0, 1).join(sep) + (items.length > 1 ? more(items.length - 1) : '');
+  const text = (k: number) => items.slice(0, k).join(sep) + (k > groupFrom ? ALL_SERVICES : '') + (k < items.length ? more(items.length - k) : '');
+  for (let k = items.length; k > 1; k--) if (w80(text(k), lead, rest).length <= maxLines) return text(k);
+  return text(1);
 }
 
-/** "Check for a and b (partial) [tool]": one check as it reads inside a part line. A one-service repo leaves the service out, a check on every service says "all services". */
+/** Whether a check is for every service of a repo that has more than one (the one line says so once: see capLine). */
+function forEveryService(g: ShortGap, all: readonly string[]): boolean {
+  return all.length > 1 && g.services.length === all.length && all.every((x) => g.services.includes(x));
+}
+
+/** A part's checks of one mark as the items of capLine (the named ones first, then those for every service) and `groupFrom`. */
+function markItems(c: RenderCtx, gs: ShortGap[], all: readonly string[]): { items: string[]; groupFrom: number } {
+  const own = gs.filter((g) => !forEveryService(g, all));
+  const everyone = gs.filter((g) => forEveryService(g, all));
+  return { items: [...own, ...everyone].map((g) => gapText(c, g, all)), groupFrom: own.length };
+}
+
+/** "Check for a and b (partial) [tool]": one check as it reads inside a part line. A one-service repo leaves the service out, and a check on every service leaves it to the line (markItems). */
 function gapText(c: RenderCtx, g: ShortGap, all: readonly string[]): string {
-  const everyone = g.services.length === all.length && all.every((x) => g.services.includes(x));
-  const named = g.services.length > 0 && !(everyone && all.length === 1);
-  const who = everyone ? 'all services' : andList(g.services.map((x) => c.v(x)));
-  const head = `${c.v(g.check)}${named ? ` for ${who}` : ''}${g.partial ? ' (partial)' : ''}`;
+  const onlyService = all.length === 1 && g.services.length === 1 && g.services[0] === all[0];
+  const named = g.services.length > 0 && !forEveryService(g, all) && !onlyService;
+  const head = `${c.v(g.check)}${named ? ` for ${andList(g.services.map((x) => c.v(x)))}` : ''}${g.partial ? ' (partial)' : ''}`;
   return g.tool === null ? head : `${head} [${c.v(g.tool)}]`;
 }
 
@@ -276,8 +289,10 @@ export function buildShortDoc(r: AuditReport, c: RenderCtx): Doc {
   for (const p of parts) {
     if (p.fix.length + p.consider.length + p.good.length + p.notes.length === 0) continue;
     out.push(`${p.part} ${p.title}`);
-    if (p.fix.length > 0) out.push(...w80(capLine(p.fix.map((x) => gapText(c, x, all)), '; ', '  ✗ ', MAX_FIX_LINES), '  ✗ ', '    '));
-    if (p.consider.length > 0) out.push(...w80(capLine(p.consider.map((x) => gapText(c, x, all)), '; ', '  ⚠ ', 1), '  ⚠ ', '    '));
+    const fix = markItems(c, p.fix, all);
+    const consider = markItems(c, p.consider, all);
+    if (p.fix.length > 0) out.push(...w80(capLine(fix.items, '; ', '  ✗ ', MAX_FIX_LINES, fix.groupFrom), '  ✗ ', '    '));
+    if (p.consider.length > 0) out.push(...w80(capLine(consider.items, '; ', '  ⚠ ', 1, consider.groupFrom), '  ⚠ ', '    '));
     if (p.good.length > 0) out.push(...w80(capLine(p.good.map((x) => c.v(x)), ', ', '  ✓ ', 1), '  ✓ ', '    '));
     for (const n of p.notes) out.push(...w80(`Note: ${c.v(n, OUTPUT_CAP.text)}`, '  ', '    '));
   }
