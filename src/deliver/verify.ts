@@ -467,14 +467,17 @@ const globMatch = (glob: string, name: string): boolean => { try { return picoma
 /**
  * G-FINREC-R1 (sec M1, review): whether a CODEOWNERS rule can match a path a protected pattern (the gate's form) stands for, decided at the
  * pattern level and failing closed (anything undecided covers):
- * - a rule with no '/' but a trailing one matches by name at any depth: it covers every protected folder, a protected file whose name it
- *   matches, and (a folder rule) any protected file named anywhere;
+ * - a folder rule (the gate's `ancestors`: a trailing '/', or a last part with no wildcard) can name a folder holding any file;
+ * - a rule with no '/' but a trailing one matches by name at any depth: it covers every protected folder, a protected file whose name (or
+ *   folder name) it matches, and (a folder rule) any protected file named anywhere;
  * - an anchored rule covers a protected folder when its fixed prefix (before the first wildcard) and the folder overlap, either way; an
- *   anchored protected file by the gate's own lookup; a protected name at any depth when it is a folder rule or its last part matches it.
+ *   anchored protected file by the gate's own lookup; a protected name at any depth unless its last part is a wildcard glob that doesn't
+ *   match the name.
  * A protected pattern with a wildcard outside a trailing `/**` is compared by its fixed prefix the same way.
  */
 function ruleCovers(rule: CodeownersRule, protectedPaths: readonly string[]): boolean {
-  const dirRule = rule.pattern.endsWith('/');
+  // the gate's `ancestors`: a trailing '/', or a last part with no (unescaped) wildcard, can name a folder and so every file under it
+  const folderRule = rule.pattern.endsWith('/') || !/(^|[^\\])[*?]/.test(rule.pattern.replace(/\/$/, '').split('/').at(-1) as string);
   const body = rule.pattern.replace(/^\//, '').replace(/\/$/, '');
   if (body === '') return true;
   const anchored = rule.pattern.startsWith('/') || body.includes('/');
@@ -503,12 +506,12 @@ function ruleCovers(rule: CodeownersRule, protectedPaths: readonly string[]): bo
     }
     const name = target.split('/').at(-1) as string;
     if (!anchored) {
-      if (dirRule && anyDepth) return true;
+      if (folderRule && anyDepth) return true;
       if (globMatch(body, name) || target.split('/').slice(0, -1).some((d) => globMatch(body, d))) return true;
       continue;
     }
     if (anyDepth) {
-      if (dirRule || globMatch(last, name)) return true;
+      if (folderRule || globMatch(last, name)) return true;
       continue;
     }
     const m = ownersLookup([rule], target);
