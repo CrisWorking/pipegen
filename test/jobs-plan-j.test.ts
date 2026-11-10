@@ -70,7 +70,8 @@ describe('GJ: G2/G3, G4 and G5 follow Plan J (a project type per service, fewer 
       for (const id of ['secrets', `sast--${svc.name}`, `deps--${svc.name}`, 'workflow-lint', 'workflow-pin-check', 'gate']) expect(a.merge[id], `${name} ${id}`).toBeDefined();
       expect(shown(await judge(files(a), a.draft)), name).toBe('');
     }
-  });
+  // G17-F1 (spec-2 I5): one assembly and one full referee run per fixture (about 18 s alone); not a timing check, so a longer limit under load
+  }, 240_000);
 
   it('GJ: a static site gets no image build, image scan, DAST or API DAST job; the same service with no type gets them', () => {
     const [, site] = FIXTURES[0] as [string, Service];

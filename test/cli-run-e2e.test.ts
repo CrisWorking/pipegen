@@ -325,4 +325,49 @@ describe('e2e', () => {
     const seeded = await PRIVATE();
     expect(seeded.w.io.asked.find((q) => /Go ahead\?/.test(q))).not.toMatch(/pipegen creates the environment pipegen-signing/);
   }, 240_000);
+
+  // G17-F1-R2 (sec I1): the scratch keys of the e2e world apply ScratchKeys' own name rules (placeholderName); the run's vault holds the
+  // fingerprint key (run.ts generateFpKey) and the real assembled workflows read GITHUB_TOKEN and PIPEGEN_FP_KEY, so without the filter in
+  // run-proof.ts the setup would throw and the run stop. Both layouts reach delivery with placeholders for stored names only
+  it('e2e: G17-F1-R2 the public and the private run store scratch placeholders through the real name rules and set the repository up', async () => {
+    for (const [layout, ran] of [['private', await PLAIN()], ['public', await PUBLIC()]] as const) {
+      expect(ran.code, `${layout}: ${ran.w.io.errs.join('\n')}`).toBe(0);
+      const setups = ran.w.tl.filter((x) => x.startsWith('keys.setup:'));
+      expect(setups.length, layout).toBe(1);
+      expect(setups[0], layout).not.toMatch(/GITHUB_|PIPEGEN_/);
+      expect(ran.w.io.lines.at(-1), layout).toBe('pipegen set up this repository.');
+    }
+  }, 480_000);
+
+  // G17-F1 (sec M1): `--skip deploy` signs nothing (assembly drops the signing plan), so the run makes no signing environment, says
+  // nothing about signing with a key pair, asks no consent for it, makes no key pair, and needs no memory folder
+  it('e2e: G17-F1 --skip deploy on a first private run makes no signing environment, prints no "this run signs" note and asks no consent for it', async () => {
+    const w = await e2eWorld({ signing: true, signingEnv: false, skip: 'tests,deploy' });
+    let keys = 0;
+    const key = w.stages.signingKey as NonNullable<typeof w.stages.signingKey>;
+    w.stages.signingKey = async () => { keys++; return key(); };
+    const code = await w.run();
+    expect(code, w.io.errs.join('\n')).toBe(0);
+    const envWrites = w.fgh.calls.filter((c) => isWrite(c) && c.route.includes('/environments/'));
+    expect(envWrites.map((c) => c.route)).toEqual([]);
+    expect(w.fgh.repo(APP).envs.has(SIGNING_ENV)).toBe(false);
+    const errs = w.io.errs.join('\n');
+    expect(errs).not.toMatch(/pipegen made the environment pipegen-signing/);
+    expect(errs).not.toMatch(/deleted the environment pipegen-signing/);
+    expect(errs).not.toMatch(/Signing is off/);
+    expect(w.io.asked.find((q) => /Go ahead\?/.test(q))).not.toMatch(/pipegen creates the environment pipegen-signing/);
+    expect(keys).toBe(0);
+  }, 240_000);
+
+  it('e2e: G17-F1 --skip deploy on a repo with a proven signing environment and no memory folder is not stopped for the memory folder', async () => {
+    const w = await e2eWorld({ signing: true, skip: 'tests,deploy' });
+    w.deps.isMemory = () => false;
+    let keys = 0;
+    const key = w.stages.signingKey as NonNullable<typeof w.stages.signingKey>;
+    w.stages.signingKey = async () => { keys++; return key(); };
+    const code = await w.run();
+    expect(w.io.errs.join('\n')).not.toMatch(/no such folder/);
+    expect(code, w.io.errs.join('\n')).toBe(0);
+    expect(keys).toBe(0);
+  }, 240_000);
 });

@@ -233,7 +233,7 @@ These rules take priority over anything earlier in this document.
 **Merge lock and approvals**
 - The required check is **bound to the GitHub Actions app** (`integration_id`), so a commit status posted through the API can't satisfy it.
 - Rulesets set `dismiss_stale_reviews_on_push` and `require_last_push_approval`. The gate counts an approval **only if it was given on the current head commit**. Approving re-runs the merge layer (`pull_request_review` trigger).
-- CODEOWNERS for pipegen's paths lists **user logins** (the default `GITHUB_TOKEN` can't resolve team membership). If there's only one code owner, the ruleset allows the **admin role to bypass through a PR**, so the owner isn't locked out.
+- CODEOWNERS for pipegen's paths lists **user logins** (the default `GITHUB_TOKEN` can't resolve team membership). Code-owner review needs **at least two code owners** with write access to both the app and the central repo; with fewer there is no code-owner rule, and PIPEGEN.md says so. There is **never a bypass**: the rulesets list no bypass actor, and admins are included.
 - `finish` also protects the **central repo** with a ruleset and CODEOWNERS covering `.github/workflows/**` and `installs/**`. A hash of the install record is kept locally and in the setup PR body, and `verify` compares them.
 - When the plan allows it, `finish` turns on **`sha_pinning_required`** for Actions.
 - `finish --print` outputs the exact `gh api` commands instead of running them, so a security team can review and run them itself.

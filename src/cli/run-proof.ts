@@ -37,7 +37,7 @@ import { evaluateProof, jobNameMatches, userMainStatuses, type EvalContext, type
 import { proveWithFixes, type FixDeps, type FixKeys, type FixOutcome, type ProofRun, type PushedWorkflow } from '../proof/fix.js';
 import { readSnapshot } from '../proof/git.js';
 import { HARNESS_PATH, proofAppFiles, type ProofAssemble } from '../proof/harness.js';
-import { SCRATCH_FP_KEY, ScratchKeys, scratchSecretStore, workflowSecretNames } from '../proof/keys.js';
+import { placeable, SCRATCH_FP_KEY, ScratchKeys, scratchSecretStore, workflowSecretNames } from '../proof/keys.js';
 import { MinutesMeter, minutesStop, proofStart } from '../proof/minutes.js';
 import { checkProofRepos, type ProofRepoOptions, type ProofRepos } from '../proof/repos.js';
 import { proveVariant, rerunFailedJobs, resetBase, type ProofWorkflows, type RunOutcome, type VariantProof, type WaitOptions } from '../proof/run.js';
@@ -345,7 +345,10 @@ export function makeRunProof(over: Partial<ProofOps> = {}): RunProof {
       // the planted files (F-8): basePaths from HEAD; the names every proof workflow reads get placeholders (E-a2: stored here, once)
       const basePaths = await o.basePaths(i.dir);
       const planted = plantedFiles(p, { basePaths });
-      const names = [...new Set([...vault.names(), ...(readBy ?? [])])];
+      // G17-F1-R2 (sec I1): only names ScratchKeys gives a placeholder (the fix loop's `placeable` rule): never GitHub's GITHUB_TOKEN or
+      // pipegen's own PIPEGEN_* (the vault's fingerprint key; the throwaway one is stored apart). readBy stays whole for readByWorkflows and
+      // sameNames, so the org-secret check still counts every name the workflows read
+      const names = [...new Set([...vault.names(), ...(readBy ?? [])])].filter((n) => placeable(n.toUpperCase()));
       let stores = 0;
       const storeStep: SecretStoreStep = async (scratch, ctx) => {
         if (++stores > 1) throw new ProofStopError('pipegen stores the scratch secrets once before the proof; nothing was stored again.');

@@ -2029,7 +2029,7 @@ tools:
   # and looks up the trusted baseline. It is pipegen's own code, reviewed in this repository, so the 7-day cooldown does not apply to
   # it (loader and scripts/cooldown.ts exempt exactly `crisworking/pipegen`, nothing else). Every input is the renderer's (RENDERER_INPUTS);
   # the entry fixes none and offers no choice (ACTION_POLICIES row: none).
-  # Reach (ruling S6, DECISIONS #83): the repository stays private until v0.4, so in v0.2 only CrisWorking-owned repositories can use it.
+  # Reach (ruling S6, DECISIONS #120, which replaces #83): the repository is public (not launched; release at v0.2); v0.2 sets up only CrisWorking-owned repositories (a release-scope choice).
   # Self-pin (C6 scheme; re-pinned 2026-11-07, Plan G task G15b, fix round G15b-R1): pinned to 468dd79 (the last commit that changes
   #   gate/dist or gate/action.yml, bundle sha256 9ab707b220eba3a6b7c5ff4c0752367528ff08eef15e972f6a1b35be78b7a0ed), which is the commit
   #   of the annotated tag gate-v0.2.3. The version is bundle content (GATE_VERSION in the gate view), so it changes before the tag, never

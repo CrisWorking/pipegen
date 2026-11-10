@@ -1679,5 +1679,6 @@ describe('G17A-R3: the gap list is re-derived, never trusted', () => {
     const mixed = world('keyless', [[A, DEPLOY_A], [LINT, 'on: pull_request\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make lint\n']], { profile: { existingWorkflows: [wfOf(A), { ...wfOf(LINT, ['pull_request']), deploys: false }] }, draft: { skipped: [{ part: 'deploy', reason: 'the user skipped it' }] } });
     expect(mixed.v.gaps.map((g) => g.path)).toEqual([A]);
     expect(shown(await judge(mixed))).toBe('');
-  });
+  // G17-F1 (spec-2 I5): ten referee runs (3 modes x 3 layouts, and the mixed case); not a timing check, so a longer limit under load
+  }, 240_000);
 });

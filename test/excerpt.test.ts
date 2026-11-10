@@ -14,6 +14,7 @@ import { betterleaksAt, CLEAN, gitleaksAt, makeStub } from './helpers/gitleaks-s
 import { cleanupRepos } from './helpers/make-repo.js';
 import { EVIDENCE_ATTEMPT, EVIDENCE_RUN, placeholderEvidence } from './helpers/scratch-secrets.js';
 import { fake } from './helpers/secret-repo.js';
+import { expectScaling } from './helpers/scaling.js';
 
 afterEach(() => cleanupRepos());
 
@@ -329,15 +330,23 @@ describe('errorExcerpt: scrub before cutting (E0a)', () => {
   it('excerpt: scan 6: the shape checks stay linear on hostile lines just under 4 KB', async () => {
     const v = vault();
     // a messy line (an OSC) with a `:` then blanks: the block-opener check; a line of blanks then one other character: the armor check
-    const opener = `${ESC}]0;t\u0007:${' '.repeat(4080)}x`;
-    const blanks = `${' '.repeat(4090)}!`;
-    for (const log of [`Error: x\n${Array.from({ length: 300 }, () => opener).join('\n')}`, `${ESC}(B\n${Array.from({ length: 300 }, () => blanks).join('\n')}\nError: y`]) {
-      const t0 = performance.now();
-      await errorExcerpt(log, composed(v), clean());
-      expect(performance.now() - t0).toBeLessThan(3000);
+    const opener = (n: number): string => `${ESC}]0;t\u0007:${' '.repeat(n)}x`;
+    const blanks = (n: number): string => `${' '.repeat(n)}!`;
+    // G17-F1 (sec I4, spec-2 I5): a ratio (expectScaling), not a wall-clock budget, so a loaded machine doesn't fail it. The same total
+    // size in short lines (about 256 characters) and in the hostile lines just under 4 KB: a linear check costs about the same for both,
+    // a check that rescans the line from each position grows with the line (16 times longer lines: about 16 times slower)
+    const lines = (line: string, total: number): string[] => Array.from({ length: Math.ceil(total / (line.length + 1)) }, () => line);
+    const TOTAL = 300 * 4092;
+    const logs = [
+      { small: `Error: x\n${lines(opener(250), TOTAL).join('\n')}`, big: `Error: x\n${lines(opener(4080), TOTAL).join('\n')}` },
+      { small: `${ESC}(B\n${lines(blanks(255), TOTAL).join('\n')}\nError: y`, big: `${ESC}(B\n${lines(blanks(4090), TOTAL).join('\n')}\nError: y` },
+    ];
+    const scanner = clean();
+    for (const [i, log] of logs.entries()) {
+      await expectScaling(`scan 6 shape ${i}`, async (size) => { const t0 = performance.now(); await errorExcerpt(log[size], composed(v), scanner); return performance.now() - t0; }, 4);
     }
     v.wipe();
-  });
+  }, 120_000);
 
   it('excerpt: scan 6: a line with a control or an invisible character (not only SGR codes) gets the fail-closed name rules', async () => {
     const v = vault();

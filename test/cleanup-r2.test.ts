@@ -135,7 +135,8 @@ describe('E8 fix round 2: secret names from the decoded YAML (O-1)', () => {
     expect(read('a: 1\n---\nb: ${{ secrets.X }}\n')).toBeNull();                         // two documents
     expect(read('env:\n  K: "${{ \\x53ECRETS[env.N] }}"\n')).toBeNull();                 // decoded, then dynamic
     expect(read('run: echo ${{ toJSON(SECRETS) }}\n')).toBeNull();
-    expect(read('name: check secrets\n')).toBeNull();                                    // the word, no name
+    expect(read('name: check secrets\n')).toEqual([]);                                   // G17-F1 (sec I1): the word outside an expression reads nothing
+    expect(read('run: echo ${{ secrets }}\n')).toBeNull();                               // the context with no name
     expect(read(`${LIST.toUpperCase()}:\n  T: x\n`)).toBeNull();                                       // an upper-case key is not the reusable-workflow key
     expect(read(`env:\n  K: \${{ \u017fecrets.X }}\n`)).toEqual(['X']);                   // ſ (U+017F) folds to s: counted as read
     expect(workflowSecretNames([{ content: Buffer.from('env:\n  K: ${{ secrets.Y }}\n') }])).toEqual(['Y']);

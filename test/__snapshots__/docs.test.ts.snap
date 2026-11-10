@@ -232,7 +232,7 @@ Warn mode lasts until 7 days after you merge (the exact date is set by \`npx pip
 
 In warn mode old findings and medium ones warn, and a new critical, high or secret finding still blocks.
 
-There are two timers. The first (7 days after you merge) is for the whole gate: it warns until then and blocks after. The second is for one check: a new blocking check can start in its own warn mode for about 14 days, and then the nightly run opens an issue to switch it to blocking.
+There are two timers. The first (7 days after you merge) is for the whole gate: it warns until then and blocks after. The second is for one check: a new blocking check can start in its own warn mode for about 14 days, and then the nightly run opens an issue to switch it to blocking. In this version that switch is made by hand: \`npx pipegen update\` names the issue and says how.
 
 These checks start in warn mode:
 
@@ -293,7 +293,7 @@ VERSION is the exact pipegen version that wrote the hook. The first commit trust
 - Code owner: A person named in CODEOWNERS whose review is required for the files they own.
 - Ruleset: GitHub's rules for a branch, such as a required check or a required review.
 - Not proven: A check pipegen could not prove on your repository yet. It warns and does not block.
-- Verify-first: A job that runs before a deploy and checks the commit passed the gate and the image is the signed one.
+- Verify-first: A job that runs before a deploy and checks the commit passed the gate and, where pipegen signs the image, that the image is the signed one.
 - Signing: A signature on an image that shows which workflow made it.
 - Digest: The checksum that names one exact image. A digest never changes; a tag can move.
 - Suggestion: A tool pipegen mentions but does not run.
@@ -498,7 +498,7 @@ Warn mode lasts until 7 days after you merge (the exact date is set by \`npx pip
 
 In warn mode old findings and medium ones warn, and a new critical, high or secret finding still blocks.
 
-There are two timers. The first (7 days after you merge) is for the whole gate: it warns until then and blocks after. The second is for one check: a new blocking check can start in its own warn mode for about 14 days, and then the nightly run opens an issue to switch it to blocking.
+There are two timers. The first (7 days after you merge) is for the whole gate: it warns until then and blocks after. The second is for one check: a new blocking check can start in its own warn mode for about 14 days, and then the nightly run opens an issue to switch it to blocking. In this version that switch is made by hand: \`npx pipegen update\` names the issue and says how.
 
 ## Deploying old commits and retention
 
@@ -535,7 +535,7 @@ pipegen wrote no hook file, so there is no setup command. The notes in The four 
 - Code owner: A person named in CODEOWNERS whose review is required for the files they own.
 - Ruleset: GitHub's rules for a branch, such as a required check or a required review.
 - Not proven: A check pipegen could not prove on your repository yet. It warns and does not block.
-- Verify-first: A job that runs before a deploy and checks the commit passed the gate and the image is the signed one.
+- Verify-first: A job that runs before a deploy and checks the commit passed the gate and, where pipegen signs the image, that the image is the signed one.
 - Signing: A signature on an image that shows which workflow made it.
 - Digest: The checksum that names one exact image. A digest never changes; a tag can move.
 - Suggestion: A tool pipegen mentions but does not run.

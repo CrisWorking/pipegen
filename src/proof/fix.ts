@@ -60,7 +60,7 @@ import { safeText } from '../util/safe-text.js';
 import { capMessage, capReached, type CapReached } from './caps.js';
 import { cleanLog, EMPTY_SECRET_RE, KEY_REFUSED_RE, mentionsName, NEEDS_REAL_KEY, type EvidenceSource, type PartEvidence } from './evaluate.js';
 import { errorExcerpt, errorSignature } from './excerpt.js';
-import { SCRATCH_FP_KEY, ScratchKeysError, workflowSecretNames, type ExcerptEvidence, type RunTicket, type ScratchKeys } from './keys.js';
+import { placeable, SCRATCH_FP_KEY, ScratchKeysError, workflowSecretNames, type ExcerptEvidence, type RunTicket, type ScratchKeys } from './keys.js';
 import type { MinutesMeter } from './minutes.js';
 
 export type FailureClass = 'missing-secret' | 'needs-real-keys' | 'runner-error' | 'rate-limit' | 'tool-error' | 'needs-fix';
@@ -363,8 +363,6 @@ const DECLINED = 'you chose not to run AI-written code with your keys';
 const st = (s: unknown, n = 300): string => safeText(String(s ?? ''), n);
 const isRec = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null;
 const EMPTY_RESULT: ProofResult = { ok: false, parts: [], findings: [], minutesUsed: 0, runUrls: [] };
-/** A secret name ScratchKeys gives a placeholder (GITHUB_* is GitHub's, PIPEGEN_* pipegen's own: never one). */
-const placeable = (n: string): boolean => /^[A-Z_][A-Z0-9_]{0,199}$/.test(n) && !/^(?:GITHUB|PIPEGEN)_/.test(n);
 /**
  * The secret names `workflows` read (upper-cased, sorted), or null when unknown: none given, an EMPTY list (Plan G G0, E-F2 m2:
  * every proof pushes at least one workflow, so an empty list is never "reads no secret"), or one that can't be read.
