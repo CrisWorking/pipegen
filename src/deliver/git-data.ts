@@ -166,11 +166,25 @@ export async function readBlobText(gh: Octokit, r: RepoRef, sha: string, maxByte
   return buf.toString('utf8');
 }
 
-/** One commit: the files on top of `baseTree`, one parent. Returns the commit and its tree. */
-export async function commitFiles(gh: Octokit, r: RepoRef, c: { parent: string; baseTree: string; files: readonly { path: string; content: string; mode: string }[]; message: string }, clock: RateClock): Promise<{ commit: string; tree: string }> {
+/** A file a commit writes (`content`), or removes (`sha: null`, PL-E6: a tree entry with a null sha). */
+export type CommitFile = { path: string; content: string; mode: string } | { path: string; sha: null };
+
+/**
+ * One commit: the files on top of `baseTree`, one parent. Returns the commit and its tree. A delete (`sha: null`) names a path that is
+ * in `baseTree` (read whole, never a truncated list): GitHub would drop a missing one silently, so a stale plan is refused, not sent.
+ */
+export async function commitFiles(gh: Octokit, r: RepoRef, c: { parent: string; baseTree: string; files: readonly CommitFile[]; message: string }, clock: RateClock): Promise<{ commit: string; tree: string }> {
   if (!SHA_RE.test(c.parent) || !SHA_RE.test(c.baseTree)) throw new DeliverError('A commit id is not a full sha.');
   if (c.files.length === 0) throw new DeliverError('A delivery commit holds no file.');
-  const t = obj(await ghWrite(gh, 'POST /repos/{owner}/{repo}/git/trees', r, { base_tree: c.baseTree, tree: c.files.map((f) => ({ path: f.path, mode: f.mode, type: 'blob', content: f.content })) }, clock)).sha;
+  const deletes = c.files.filter((f): f is { path: string; sha: null } => 'sha' in f && f.sha === null);
+  if (deletes.length > 0) {
+    const d = obj(await ghRead(gh, 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}', r, { tree_sha: c.baseTree, recursive: '1' }, clock));
+    if (d.truncated !== false || !Array.isArray(d.tree) || d.tree.length > MAX_TREE_ENTRIES) throw new DeliverError(`The file list of ${safeText(`${r.owner}/${r.repo}`, 120)} could not be read whole, so pipegen can't check what it removes there.`);
+    const there = new Set(d.tree.map(obj).filter((e) => e.type === 'blob' || e.type === 'commit').map((e) => e.path));
+    for (const f of deletes) if (!there.has(f.path)) throw new DeliverError(`${safeText(String(f.path), 100)} is not in ${safeText(`${r.owner}/${r.repo}`, 120)}, so pipegen doesn't remove it.`);
+  }
+  const tree = c.files.map((f) => ('sha' in f && f.sha === null ? { path: f.path, mode: '100644', type: 'blob', sha: null } : { path: f.path, mode: (f as { mode: string }).mode, type: 'blob', content: (f as { content: string }).content }));
+  const t = obj(await ghWrite(gh, 'POST /repos/{owner}/{repo}/git/trees', r, { base_tree: c.baseTree, tree }, clock)).sha;
   if (typeof t !== 'string' || !SHA_RE.test(t)) throw new DeliverError('GitHub\'s answer to a new file tree could not be read.');
   const commit = obj(await ghWrite(gh, 'POST /repos/{owner}/{repo}/git/commits', r, { message: c.message, tree: t, parents: [c.parent] }, clock)).sha;
   if (typeof commit !== 'string' || !SHA_RE.test(commit)) throw new DeliverError('GitHub\'s answer to a new commit could not be read.');

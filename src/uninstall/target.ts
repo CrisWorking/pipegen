@@ -39,7 +39,7 @@
 import type { Octokit } from '@octokit/rest';
 import { gitBlobSha } from '../create/guard.js';
 import { readEnv, SETUP_BRANCH } from '../deliver/deliver.js';
-import { checkBranch, ghWrite, isoAt, openOrUpdatePr, readTree, setBranch, statusOf, type RepoRef, type TreeEntry } from '../deliver/git-data.js';
+import { checkBranch, commitFiles, DeliverError, ghWrite, isoAt, openOrUpdatePr, readTree, setBranch, statusOf, type RepoRef, type TreeEntry } from '../deliver/git-data.js';
 import { centralUpdateBranch, editWritesChained, recordPath, type RecordedEdit } from '../deliver/record.js';
 import { centralFilesOf, UPDATE_BRANCH } from '../deliver/update.js';
 import { centralProjectName, centralWorkflowFile } from '../engine/central-path.js';
@@ -1101,9 +1101,9 @@ export class UninstallApi {
       ...c.files.map((f) => {
         if (f.mode !== '100644' && f.mode !== '100755') refuse(`${show(String(f.path), 100)} has a mode uninstall doesn't write.`);
         if (typeof f.content !== 'string') refuse('a file\'s content is not text.');
-        return { path: plain(f.path), mode: f.mode, type: 'blob', content: f.content };
+        return { path: plain(f.path), content: f.content, mode: f.mode };
       }),
-      ...c.deletes.map((p) => ({ path: plain(p), mode: '100644', type: 'blob', sha: null })),
+      ...c.deletes.map((p) => ({ path: plain(p), sha: null as null })),
     ];
     if (where === 'central') {
       const removable = new Set([...centralFilesOf(this.app.repo), recordPath(this.app.repo)]);
@@ -1144,11 +1144,13 @@ export class UninstallApi {
       const written = codeownersEdit !== undefined && Array.isArray(codeownersEdit.writtenShas) ? codeownersEdit.writtenShas : [];
       if (!isObj(e) || e.type !== 'blob' || typeof e.sha !== 'string' || !written.includes(e.sha)) refuse(`${show(ownersGone, 100)} on ${show(`${r.owner}/${r.repo}`)} is not a version pipegen wrote (changed since, or GitHub's file list could not be read), so uninstall doesn't remove it.`);
     }
-    const t = (await ghWrite(this.#stopping, 'POST /repos/{owner}/{repo}/git/trees', r, { base_tree: c.baseTree, tree }, this.clock) as Body | null)?.sha;
-    if (typeof t !== 'string' || !SHA_RE.test(t)) throw new UninstallRefusal('GitHub\'s answer to the new file tree could not be read.');
-    const commit = (await ghWrite(this.#stopping, 'POST /repos/{owner}/{repo}/git/commits', r, { message: c.message, tree: t, parents: [c.parent] }, this.clock) as Body | null)?.sha;
-    if (typeof commit !== 'string' || !SHA_RE.test(commit)) throw new UninstallRefusal('GitHub\'s answer to the new commit could not be read.');
-    return { commit, tree: t };
+    // PL-E6: the one commit writer (deliver's): it refuses a delete of a path the base tree doesn't hold
+    try {
+      return await commitFiles(this.#stopping, r, { parent: c.parent, baseTree: c.baseTree, files: tree, message: c.message }, this.clock);
+    } catch (e) {
+      if (e instanceof DeliverError) throw new UninstallRefusal(e.message);
+      throw e;
+    }
   }
 
   /** Points the uninstall branch of `where` at `sha` (created, or moved: pipegen's own branch). */

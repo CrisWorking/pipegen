@@ -663,6 +663,8 @@ describe('V3 target: pull requests and branches', () => {
       if (route === 'POST /repos/{owner}/{repo}/git/trees') return { sha: sha(1) };
       if (route === 'POST /repos/{owner}/{repo}/git/commits') return { sha: sha(2) };
       if (route === 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}') return { sha: SHA, tree: { sha: SHA } };
+      // PL-E6: commitFiles checks a delete against the base tree
+      if (route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}') return { truncated: false, tree: [{ path: '.github/workflows/pipegen.yml', sha: SHA, mode: '100644', type: 'blob' }] };
       if (route === 'GET /repos/{owner}/{repo}/git/ref/{ref}') throw httpErr(404);
       if (route === 'GET /repos/{owner}/{repo}/pulls') return [];
       if (route === 'POST /repos/{owner}/{repo}/pulls') return { number: 12, html_url: 'u' };
@@ -674,6 +676,10 @@ describe('V3 target: pull requests and branches', () => {
       { path: 'package.json', mode: '100644', type: 'blob', content: '{}\n' },
       { path: '.github/workflows/pipegen.yml', mode: '100644', type: 'blob', sha: null },
     ] });
+    // PL-E6: a delete of a path the base tree doesn't hold is an uninstall refusal, nothing written
+    const gone = await f.api.commitUninstall('app', { parent: SHA, baseTree: SHA, files: [], deletes: ['.github/workflows/gone.yml'], message: 'm' }).catch((e: unknown) => e);
+    expect(gone).toBeInstanceOf(UninstallRefusal);
+    expect(f.calls.filter((x) => x.route.startsWith('POST')).length).toBe(2);
     expect(await f.api.setUninstallBranch('central', sha(2))).toBe('created');
     expect(f.calls.at(-1)).toEqual({ route: 'POST /repos/{owner}/{repo}/git/refs', params: { owner: OWNER, repo: 'pipelines', ref: 'refs/heads/pipegen/uninstall-shop', sha: sha(2) } });
     expect(await f.api.openUninstallPr('app', { base: 'main', title: 't', body: 'b' })).toEqual({ number: 12, url: 'u', opened: true });
@@ -1069,8 +1075,10 @@ describe('V3 fix round 1', () => {
 
   it('R1 sec M5: the central commit changes only this project\'s files, on a base tree that is the parent\'s', async () => {
     const sha = (n: number) => String(n).repeat(40).slice(0, 40);
-    const mk = (tree = SHA) => api((route) => {
+    const mk = (tree = SHA) => api((route, params) => {
       if (route === 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}') return { sha: SHA, tree: { sha: tree } };
+      // PL-E6: commitFiles checks a delete against the base tree
+      if (route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}' && params.tree_sha === SHA) return { truncated: false, tree: [centralWorkflowFile('shop', 'merge'), 'installs/shop.json'].map((path) => ({ path, sha: SHA, mode: '100644', type: 'blob' })) };
       if (route === 'POST /repos/{owner}/{repo}/git/trees') return { sha: sha(1) };
       if (route === 'POST /repos/{owner}/{repo}/git/commits') return { sha: sha(2) };
       return {};
@@ -1361,7 +1369,7 @@ describe('V3 fix round 2', () => {
     const sha = (n: number) => String(n).repeat(40).slice(0, 40);
     const mk = () => api((route) => {
       if (route === 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}') return { sha: SHA, tree: { sha: SHA } };
-      if (route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}') return { truncated: false, tree: [{ path: '.github/CODEOWNERS', sha: sha(3), mode: '100644', type: 'blob' }] };
+      if (route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}') return { truncated: false, tree: [{ path: '.github/CODEOWNERS', sha: sha(3), mode: '100644', type: 'blob' }, { path: 'installs/shop.json', sha: sha(7), mode: '100644', type: 'blob' }] };
       if (route === 'POST /repos/{owner}/{repo}/git/trees') return { sha: sha(1) };
       if (route === 'POST /repos/{owner}/{repo}/git/commits') return { sha: sha(2) };
       return {};
@@ -1552,10 +1560,11 @@ describe('V3 fix round 2', () => {
         await expect(del(g.api), JSON.stringify(tree)).rejects.toBeInstanceOf(UninstallRefusal);
         expect(g.writes()).toEqual([]);
       }
-      const ok = mk({ truncated: false, tree: [{ path: 'README.md', sha: sha(6), mode: '100644', type: 'blob' }, entry(sha(4))] });
+      const ok = mk({ truncated: false, tree: [{ path: 'README.md', sha: sha(6), mode: '100644', type: 'blob' }, entry(sha(4)), { path: 'installs/shop.json', sha: sha(7), mode: '100644', type: 'blob' }] });
       expect(await del(ok.api)).toEqual({ commit: sha(2), tree: sha(1) });
-      // the parent tree once (V6's read of the central default branch, CENTRAL_HEAD, is the last-project check)
-      expect(ok.calls.filter((c) => c.route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}' && c.params.tree_sha !== CENTRAL_HEAD).map((c) => c.params)).toEqual([{ owner: OWNER, repo: 'pipelines', tree_sha: SHA, recursive: '1' }]);
+      // the parent tree only (V6's read of the central default branch, CENTRAL_HEAD, is the last-project check): the CODEOWNERS check,
+      // then PL-E6's delete check in commitFiles
+      expect(ok.calls.filter((c) => c.route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}' && c.params.tree_sha !== CENTRAL_HEAD).map((c) => c.params)).toEqual([{ owner: OWNER, repo: 'pipelines', tree_sha: SHA, recursive: '1' }, { owner: OWNER, repo: 'pipelines', tree_sha: SHA, recursive: '1' }]);
     });
 
     it('V6b (G17C m4): the central CODEOWNERS is deleted only when the record\'s writes chain from null, never over an owner blob an older record holds', async () => {
