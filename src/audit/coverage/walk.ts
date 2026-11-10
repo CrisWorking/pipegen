@@ -275,7 +275,7 @@ function actionFinds(ctx: Ctx, tools: readonly ToolSignature[], uses: string, w:
       return { ...f, partialWhy: `${f.subject} runs, but this action is on pipegen's never-use list (${plainNeverReason(never)}); pin a reviewed alternative.` };
     }
     const verdict = refVerdict(t, uses);
-    const available = t.availability === undefined || (t.availability === 'public' ? !ctx.p.private : codeSecurityAvailable(ctx.p, ctx.caps));
+    const available = t.availability === undefined || (t.availability === 'public' ? ctx.p.private === false : codeSecurityAvailable(ctx.p, ctx.caps));
     // fix round 1: an action that works only on some GitHub-hosted runners, outside a container
     const runnerOk = t.runners === undefined || (!c.container && c.runner !== null && t.runners.includes(c.runner));
     const required = requiredInputsHeld(t, w);

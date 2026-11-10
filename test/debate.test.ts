@@ -28,10 +28,11 @@ import {
 
 // ---------- fixtures ----------
 
-/** The fixtures' api/web profile with Terraform, so the repo-wide iac key offers trivy-config (an AI severity choice) and kube-linter. */
-const PT = profile({ terraformDirs: ['infra'] });
-/** The fixtures' needs plus a repo-wide iac need and a lint need for web (four lint tools offered). */
-const DN: Need[] = [...NEEDS, need('iac', 'merge', undefined), need('lint', 'merge', 'web')];
+/** The fixtures' api/web profile (a public repo), so the repo-wide dependency-review key offers osv-scanner and dependency-review-action
+ * (PL-C0 fold R1: iac offers trivy-config alone, so the disputes argue over dependency-review instead). */
+const PT = profile();
+/** The fixtures' needs plus a repo-wide dependency-review need and a lint need for web (four lint tools offered). */
+const DN: Need[] = [...NEEDS, need('dependency-review', 'merge', undefined), need('lint', 'merge', 'web')];
 const CANDS = candidatesFor(DN, PT, { 'sast--api': [discovered('cool-sast', 'acme/cool-sast', 'sast')] });
 const ddeps = (over: Partial<DebateDeps> = {}): DebateDeps => ({ reviewed: REVIEWED, bar: BAR, now: NOW, ...over });
 const NO_RULE = { requireDeployApproval: false };
@@ -43,7 +44,7 @@ const LEAK_KEY = ['sec', 'rets'].join('');
 /** The builder's picks per AI key. */
 const PICKS: Record<string, string> = {
   [LEAK_KEY]: 'betterleaks', 'sast--api': 'semgrep', 'sast--web': 'semgrep', 'coverage--web': 'vitest-coverage', 'dast--web': 'zap-baseline',
-  iac: 'kube-linter', 'lint--web': 'biome',
+  'dependency-review': 'dependency-review-action', 'lint--web': 'biome',
 };
 
 type Node = { properties?: Record<string, Node>; items?: Node; enum?: string[]; anyOf?: Node[] };
@@ -163,11 +164,11 @@ describe('debate (plan Task 3)', () => {
   });
 
   it('debate: accepted objection applied', async () => {
-    // o1: iac kube-linter → trivy-config (the builder accepts, with a severity the tool offers); o2: lint--web biome → eslint (accepted
-    // with a tuning value trivy-config doesn't have, picked for the wrong tool → eslint's template defaults); o3: secrets → gitleaks rebutted, withdrawn
+    // o1: dependency-review dependency-review-action → osv-scanner (the builder accepts, naming a severity osv-scanner has no choice for: never read); o2: lint--web biome → eslint (accepted
+    // with a tuning value osv-scanner doesn't have, picked for the wrong tool → eslint's template defaults); o3: secrets → gitleaks rebutted, withdrawn
     const f = routed({
       builder: [built()],
-      judge: [critiqued([{ key: 'iac', counter: 'trivy-config' }, { key: 'lint--web', counter: 'eslint' }, { key: 'secrets', counter: 'gitleaks' }])],
+      judge: [critiqued([{ key: 'dependency-review', counter: 'osv-scanner' }, { key: 'lint--web', counter: 'eslint' }, { key: 'secrets', counter: 'gitleaks' }])],
       'debate-builder': [replies({
         o1: { accept: true, choices: { severity: 'MEDIUM,HIGH,CRITICAL' } },
         o2: { accept: true, tuning: { 'skip-generated': ['web/dist'] }, choices: { severity: 'MEDIUM,HIGH,CRITICAL' } },
@@ -175,11 +176,11 @@ describe('debate (plan Task 3)', () => {
       'debate-judge': [verdicts({ o3: 'withdraw' })],
     });
     const r = await run(f.ai);
-    const iac = byKey(r, 'iac');
-    expect(iac.chosen.tool.id).toBe('trivy-config');
-    expect(iac.chosen.choices.severity).toBe('MEDIUM,HIGH,CRITICAL');   // the builder's accepted pick, offered for this key
-    expect(iac.ranked.map((c) => c.id)).toEqual(['trivy-config', 'kube-linter']);   // the counter first, then the builder's order (S22)
-    expect(iac.reason).toMatch(/^trivy-config instead of kube-linter, because the judge objected: /);
+    const iac = byKey(r, 'dependency-review');
+    expect(iac.chosen.tool.id).toBe('osv-scanner');
+    expect(iac.chosen).toEqual(specFor(refOf(DN, PT, 'dependency-review'), offerOf(DN, PT, 'dependency-review', 'osv-scanner'), PT));   // a choice the tool lacks is never read
+    expect(iac.ranked.map((c) => c.id)).toEqual(['osv-scanner', 'dependency-review-action']);   // the counter first, then the builder's order (S22)
+    expect(iac.reason).toMatch(/^osv-scanner instead of dependency-review-action, because the judge objected: /);
     // o2: tuning skip-generated is an eslint option; severity is not an eslint choice and is never read; the whole pick is checked by specFor's fence
     const lint = byKey(r, 'lint--web');
     expect(lint.chosen.tool.id).toBe('eslint');
@@ -190,15 +191,15 @@ describe('debate (plan Task 3)', () => {
     expect(f.count('debate-judge')).toBe(1);
     expect(f.calls.find((c) => c.schemaName === 'debate-judge')!.user).not.toContain('"o1"');   // an accepted objection is not sent to the judge
 
-    // a pick the counter tool does not offer for this key (a tuning option trivy-config doesn't have) → its template's first values
+    // a pick the counter tool does not offer for this key (a tuning option osv-scanner doesn't have) → its template's first values
     const g = routed({
       builder: [built()],
-      judge: [critiqued([{ key: 'iac', counter: 'trivy-config' }, { key: 'lint--web', counter: 'eslint' }])],
+      judge: [critiqued([{ key: 'dependency-review', counter: 'osv-scanner' }, { key: 'lint--web', counter: 'eslint' }])],
       'debate-builder': [replies({ o1: { accept: true, choices: { severity: 'MEDIUM,HIGH,CRITICAL' }, tuning: { 'skip-generated': ['web/dist'] } }, o2: 'accept' })],
     });
     const r2 = await run(g.ai);
-    expect(byKey(r2, 'iac').chosen).toEqual(specFor(refOf(DN, PT, 'iac'), offerOf(DN, PT, 'iac', 'trivy-config'), PT));
-    expect(byKey(r2, 'iac').chosen.choices.severity).toBe('HIGH,CRITICAL');
+    expect(byKey(r2, 'dependency-review').chosen).toEqual(specFor(refOf(DN, PT, 'dependency-review'), offerOf(DN, PT, 'dependency-review', 'osv-scanner'), PT));
+    expect(byKey(r2, 'dependency-review').chosen.choices).not.toHaveProperty('severity');
     expect(byKey(r2, 'lint--web').chosen).toEqual(specFor(refOf(DN, PT, 'lint--web'), offerOf(DN, PT, 'lint--web', 'eslint'), PT));
     expect(g.count('debate-judge')).toBe(0);   // nothing rebutted: no judge round
 
@@ -222,7 +223,7 @@ describe('debate (plan Task 3)', () => {
     const claim = 'Gitleaks reads the history more completely here.';
     const f = routed({
       builder: [built()],
-      judge: [critiqued([{ key: 'secrets', counter: 'gitleaks', claim }, { key: 'iac', counter: 'trivy-config' }])],
+      judge: [critiqued([{ key: 'secrets', counter: 'gitleaks', claim }, { key: 'dependency-review', counter: 'osv-scanner' }])],
       'debate-builder': [replies({}, 'Betterleaks is faster on this repository.')],
       'debate-judge': [verdicts({}), verdicts({ o2: 'withdraw' }), verdicts({})],
     });
@@ -238,7 +239,7 @@ describe('debate (plan Task 3)', () => {
     expect(d.options[0]!.choice).toEqual(byKey(r, 'secrets'));   // the builder option is the current choice
     expect(d.options[0]!.argument).toBe('Betterleaks is faster on this repository.');
     expect(d.options[1]!.argument).toBe(claim);
-    expect(byKey(r, 'iac').chosen.tool.id).toBe('kube-linter');   // withdrawn in round 2: no dispute
+    expect(byKey(r, 'dependency-review').chosen.tool.id).toBe('dependency-review-action');   // withdrawn in round 2: no dispute
 
     // the builder's option is the key's CURRENT choice: o1 (eslint) accepted in round 1, o2 (oxlint-typeaware) kept to the end
     const g = routed({
@@ -326,7 +327,7 @@ describe('debate (plan Task 3)', () => {
     const planted = plantedFiles(PT).expected.map((e) => e.id);
     const f = routed({
       builder: [built({ because: { [LEAK_KEY]: hostile }, suggestions: [{ id: 's1', why: hostile }] })],
-      judge: [critiqued([{ key: 'secrets', counter: 'gitleaks', claim: hostile }, { key: 'iac', counter: 'trivy-config', claim: hostile }, { addNeed: { id: 'deps', layer: 'merge', service: 'web' }, claim: hostile }], { approval: true, reason: hostile })],
+      judge: [critiqued([{ key: 'secrets', counter: 'gitleaks', claim: hostile }, { key: 'dependency-review', counter: 'osv-scanner', claim: hostile }, { addNeed: { id: 'deps', layer: 'merge', service: 'web' }, claim: hostile }], { approval: true, reason: hostile })],
       'debate-builder': [replies({ o2: 'accept' }, hostile)],
       'debate-judge': [verdicts({}, hostile)],
     });
@@ -367,9 +368,9 @@ describe('debate (plan Task 3)', () => {
     const shapes = ['1.ab_cdefgh99', '42)xy_zw_kk17', 'tok&en_lime88', 'a.b.c.d_9911q', `quo"te'zz_55m`, 'uni\u2014dash\u2013x77k', '9.kl_mnop!'];
     const at = (v: string, i: number) => [`${v} leaked here.`, `The typed ${v} leaked.`, `It leaked: ${v}`, v][i % 4]!;
     const n = routed({
-      builder: [built({ because: { [LEAK_KEY]: at(shapes[0]!, 0), iac: at(shapes[1]!, 1) }, suggestions: [{ id: 's1', why: at(shapes[2]!, 2) }] })],
+      builder: [built({ because: { [LEAK_KEY]: at(shapes[0]!, 0), 'dependency-review': at(shapes[1]!, 1) }, suggestions: [{ id: 's1', why: at(shapes[2]!, 2) }] })],
       judge: [critiqued([
-        ...shapes.slice(0, 6).map((v, i) => ({ key: [LEAK_KEY, 'iac', 'lint--web', 'sast--api', LEAK_KEY, 'lint--web'][i]!, counter: ['gitleaks', 'trivy-config', 'eslint', 'bandit', 'gitleaks', 'oxlint-typeaware'][i]!, claim: at(v, i + 1) })),
+        ...shapes.slice(0, 6).map((v, i) => ({ key: [LEAK_KEY, 'dependency-review', 'lint--web', 'sast--api', LEAK_KEY, 'lint--web'][i]!, counter: ['gitleaks', 'osv-scanner', 'eslint', 'bandit', 'gitleaks', 'oxlint-typeaware'][i]!, claim: at(v, i + 1) })),
         { key: 'coverage--web', counter: 'c8', claim: at(shapes[6]!, 2) },   // after other words, at the end of a text: its own form
       ], { approval: true, reason: at(shapes[3]!, 3) })],
       'debate-builder': [replies({}, at(shapes[4]!, 0))],
@@ -416,7 +417,7 @@ describe('debate (added)', () => {
     const f = routed({
       builder: [built()],
       judge: [critiqued([
-        { key: LEAK_KEY, counter: 'gitleaks', claim: `Gitleaks reads more; the typed ${TYPED} leaked.` }, { key: 'iac', counter: 'trivy-config' }, { key: 'lint--web', counter: 'eslint' },
+        { key: LEAK_KEY, counter: 'gitleaks', claim: `Gitleaks reads more; the typed ${TYPED} leaked.` }, { key: 'dependency-review', counter: 'osv-scanner' }, { key: 'lint--web', counter: 'eslint' },
         { key: 'sast--api' },                        // no counter: nothing to apply or prove, not debated
         { key: 'sast--web', counter: 'semgrep' },    // the builder's own tool: nothing changes, not debated
       ])],
@@ -466,11 +467,11 @@ describe('debate (added)', () => {
   });
 
   it('debate: the judge option\'s spec is built by code from the template\'s first values (no AI value)', async () => {
-    // the builder picked trivy-config with MEDIUM; the judge counters with kube-linter… and the other way round: the judge's option
+    // the builder picked osv-scanner with MEDIUM; the judge counters with dependency-review-action… and the other way round: the judge's option
     // never carries a value from any AI, even when the builder's rebuttal names choices for the counter tool
     const f = routed({
-      builder: [built({ picks: { iac: 'kube-linter' } })],
-      judge: [critiqued([{ key: 'iac', counter: 'trivy-config' }])],
+      builder: [built({ picks: { 'dependency-review': 'dependency-review-action' } })],
+      judge: [critiqued([{ key: 'dependency-review', counter: 'osv-scanner' }])],
       'debate-builder': [(req) => {
         const a = replies()(req);
         a.answers = a.answers.map((x) => ({ ...x, choices: nulls(props(req, 'answers').choices, { severity: 'MEDIUM,HIGH,CRITICAL' }) }));
@@ -480,9 +481,9 @@ describe('debate (added)', () => {
     });
     const r = await run(f.ai);
     const judge = r.disputes[0]!.options.find((o) => o.label === 'judge')!;
-    expect(judge.choice.chosen).toEqual(specFor(refOf(DN, PT, 'iac'), offerOf(DN, PT, 'iac', 'trivy-config'), PT));
-    expect(judge.choice.chosen.choices.severity).toBe('HIGH,CRITICAL');
-    expect(judge.choice.ranked[0]!.id).toBe('trivy-config');
+    expect(judge.choice.chosen).toEqual(specFor(refOf(DN, PT, 'dependency-review'), offerOf(DN, PT, 'dependency-review', 'osv-scanner'), PT));
+    expect(judge.choice.chosen.choices).not.toHaveProperty('severity');   // the rebuttal's named choice never reaches the judge option
+    expect(judge.choice.ranked[0]!.id).toBe('osv-scanner');
     expect(judge.choice.by).toBe('ai');
   });
 
@@ -491,13 +492,13 @@ describe('debate (added)', () => {
       builder: [built()],
       judge: [critiqued([
         { key: 'lint--web', counter: 'eslint' }, { key: 'lint--web', counter: 'oxlint-typeaware' }, { key: 'lint--web', counter: 'eslint-typescript' },
-        { key: 'iac', counter: 'trivy-config' }, { key: 'secrets', counter: 'gitleaks' }, { key: 'sast--api', counter: 'bandit' },
+        { key: 'dependency-review', counter: 'osv-scanner' }, { key: 'secrets', counter: 'gitleaks' }, { key: 'sast--api', counter: 'bandit' },
       ])],
       'debate-builder': [replies()],
       'debate-judge': [verdicts()],
     });
     const r = await run(f.ai);
-    expect(r.disputes.map((d) => [d.id, d.key])).toEqual([['d1', 'secrets'], ['d2', 'sast--api'], ['d3', 'iac'], ['d4', 'lint--web']]);
+    expect(r.disputes.map((d) => [d.id, d.key])).toEqual([['d1', 'secrets'], ['d2', 'sast--api'], ['d3', 'dependency-review'], ['d4', 'lint--web']]);
     const variants = r.disputes.flatMap((d) => d.options.map((o) => o.variant));
     expect(variants).toContain('dispute-d4-3-b');
     expect(new Set(variants).size).toBe(variants.length);
@@ -559,7 +560,7 @@ describe('debate (added)', () => {
     const f = routed({
       builder: [notOffered, built()],
       judge: [badCritique, critiqued([
-        { key: LEAK_KEY, counter: 'gitleaks' }, { key: 'iac', counter: 'trivy-config' }, { key: 'sast--api', counter: 'bandit' },
+        { key: LEAK_KEY, counter: 'gitleaks' }, { key: 'dependency-review', counter: 'osv-scanner' }, { key: 'sast--api', counter: 'bandit' },
         { key: 'lint--web', counter: 'eslint' }, { key: 'lint--web', counter: 'oxlint-typeaware' },
       ])],
       'debate-builder': [replies()],
@@ -573,7 +574,7 @@ describe('debate (added)', () => {
     expect(f.calls.map((c) => c.schemaName)).toEqual(['builder', 'builder', 'judge', 'judge', 'debate-builder', 'debate-judge', 'debate-builder', 'debate-judge', 'debate-builder']);
     expect(f.calls.filter((c) => c.user.includes(bundleText(bundle))).length).toBe(2);
     expect(r.rounds).toBe(3);
-    expect(r.disputes.map((d) => d.key)).toEqual([LEAK_KEY, 'sast--api', 'iac', 'lint--web']);
+    expect(r.disputes.map((d) => d.key)).toEqual([LEAK_KEY, 'sast--api', 'dependency-review', 'lint--web']);
     expect(r.transcript.some((l) => /at most 9 AI calls/.test(l))).toBe(true);
     for (const req of f.calls) expect(req.maxOutputTokens).toBeGreaterThan(0);
 
@@ -593,7 +594,9 @@ describe('debate (added)', () => {
       largest.set(kind(req.schemaName), Math.max(largest.get(kind(req.schemaName)) ?? 0, bytes));
     }
     // sized from the largest measurement of each kind with the stated margin, not far above it
-    for (const [k, bytes] of largest) expect((k as { prompt: number }).prompt).toBeLessThan(bytes * DEBATE_MARGIN + 1_000);
+    // PL-C0 fold R1: the builder row stays at its pre-fold measurement (14,201 bytes, when iac offered trivy-config and kube-linter); the
+    // swapped fixture measures 13,478, so the estimate is a little higher than needed (never lower), hence its wider slack
+    for (const [k, bytes] of largest) expect((k as { prompt: number }).prompt).toBeLessThan(bytes * DEBATE_MARGIN + (k === DEBATE_CALLS.builder ? 2_000 : 1_000));
     expect(largest.size).toBe(3);
     const row = estimate(PT, { 'pre-commit': [], push: [], merge: [], deploy: [], nightly: [] }, 2, { pushes: 0, prs: 0, capped: false }, { name: 'claude', model: DEFAULT_MODEL })
       .aiTokens.find((s) => s.stage === 'debate')!;
@@ -730,7 +733,7 @@ describe('debate (final review fixes)', () => {
   it('debate: the call bound is stated with its retry: at most 9 AI calls, each retried at most once (m2)', async () => {
     const f = routed({
       builder: [(req) => ({ ...built()(req), choices: built({ picks: { 'sast--web': 'bandit' } })(req).choices }), built()],
-      judge: [critiqued([{ key: 'secrets', counter: 'bandit' }]), critiqued([{ key: LEAK_KEY, counter: 'gitleaks' }, { key: 'iac', counter: 'trivy-config' }])],
+      judge: [critiqued([{ key: 'secrets', counter: 'bandit' }]), critiqued([{ key: LEAK_KEY, counter: 'gitleaks' }, { key: 'dependency-review', counter: 'osv-scanner' }])],
       'debate-builder': [replies()],
       'debate-judge': [verdicts()],
     });
@@ -738,5 +741,49 @@ describe('debate (final review fixes)', () => {
     const line = r.transcript.find((l) => /at most 9 AI calls/.test(l));
     expect(line).toBe('pipegen makes at most 9 AI calls in a debate, each retried at most once when its answer can not be read, so the judge was not asked again; the open objections stay kept.');
     expect(pipegenDocProblems(`# PIPEGEN\n\n- ${line}\n`, DOC_OPTS)).toEqual([]);
+  });
+});
+// ---------- reviewer R1 proposal: an accepted choice value is applied (a test-only list where a two-tool key has an AI choice) ----------
+describe('debate (reviewer R1 proposal)', () => {
+  /** The real list, but dependency-review-action offers fail-on-severity low or moderate (its input policy allows the input: tool-flags.ts). */
+  const RV = REVIEWED.map((t) => (t.id === 'dependency-review-action' ? { ...t, choices: { 'fail-on-severity': ['low', 'moderate'] } } : t));
+  const cands = () => candidatesFor(DN, PT, { 'sast--api': [discovered('cool-sast', 'acme/cool-sast', 'sast')] }, RV);
+  const drOffer = () => builderOffers(DN, cands(), PT, builderDeps({ reviewed: RV })).offers.get('dependency-review')!.find((o) => o.entry.id === 'dependency-review-action')!;
+
+  it('debate: an accepted counter applies the builder\'s choice value; a rebutted one and the judge option keep the template\'s first value', async () => {
+    expect(drOffer().aiChoices).toEqual({ 'fail-on-severity': ['low', 'moderate'] });   // the fixture really offers the AI a choice
+    const f = routed({
+      builder: [built({ picks: { 'dependency-review': 'osv-scanner' } })],
+      judge: [critiqued([{ key: 'dependency-review', counter: 'dependency-review-action' }])],
+      'debate-builder': [replies({ o1: { accept: true, choices: { 'fail-on-severity': 'moderate' } } })],
+    });
+    const r = await run(f.ai, { cands: cands(), deps: ddeps({ reviewed: RV }) });
+    const dr = byKey(r, 'dependency-review');
+    expect(dr.chosen.tool.id).toBe('dependency-review-action');
+    expect(dr.chosen.choices['fail-on-severity']).toBe('moderate');   // the accepted pick, offered for this key
+    expect(dr.chosen).toEqual(specFor(refOf(DN, PT, 'dependency-review'), drOffer(), PT, { choices: { 'fail-on-severity': 'moderate' } }));
+
+    // a valid choice beside a tuning value the tool doesn't have → the whole pick is dropped (ruling S7): the template's first value
+    // (the lint--web counter puts eslint's tuning option skip-generated into the reply schema)
+    const g = routed({
+      builder: [built({ picks: { 'dependency-review': 'osv-scanner' } })],
+      judge: [critiqued([{ key: 'dependency-review', counter: 'dependency-review-action' }, { key: 'lint--web', counter: 'eslint' }])],
+      'debate-builder': [replies({ o1: { accept: true, choices: { 'fail-on-severity': 'moderate' }, tuning: { 'skip-generated': ['web/dist'] } }, o2: 'accept' })],
+    });
+    expect(byKey(await run(g.ai, { cands: cands(), deps: ddeps({ reviewed: RV }) }), 'dependency-review').chosen.choices['fail-on-severity']).toBe('low');
+
+    // rebutted and kept: the judge's option is the template's first value, never a value an AI named
+    const h = routed({
+      builder: [built({ picks: { 'dependency-review': 'osv-scanner' } })],
+      judge: [critiqued([{ key: 'dependency-review', counter: 'dependency-review-action' }])],
+      'debate-builder': [(req) => {
+        const a = replies()(req);
+        a.answers = a.answers.map((x) => ({ ...x, choices: nulls(props(req, 'answers').choices, { 'fail-on-severity': 'moderate' }) }));
+        return a;
+      }],
+      'debate-judge': [verdicts()],
+    });
+    const judge = (await run(h.ai, { cands: cands(), deps: ddeps({ reviewed: RV }) })).disputes[0]!.options.find((o) => o.label === 'judge')!;
+    expect(judge.choice.chosen.choices['fail-on-severity']).toBe('low');
   });
 });

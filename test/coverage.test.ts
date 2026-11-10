@@ -2593,6 +2593,8 @@ describe('mapCoverage (Plan P Task 3)', () => {
     expect(r).toMatchObject({ status: 'partial', by: 'harden-runner' });
     expect(r.why).toMatch(/private repo/);
     expect(await rowOf(rel(block), 'deploy', 'egress', over, 'app')).toMatchObject({ status: 'covered', by: 'harden-runner' }); // public
+    // PL-C0 fold R2: a visibility pipegen can't read counts as private (fail closed)
+    for (const v of [undefined, null, 'internal']) expect((await rowOf(rel(block), 'deploy', 'egress', { ...over, private: v as never }, 'app')).status).toBe('partial');
     // fix round 1 (E7, ruling P8): disable-sudo alone leaves docker, which is root-equivalent
     expect((await rowOf(rel('          egress-policy: block\n          disable-sudo: true\n'), 'deploy', 'egress', over, 'app')).status).toBe('partial');
     expect((await rowOf(rel('          egress-policy: block\n'), 'deploy', 'egress', over, 'app')).status).toBe('partial'); // sudo can undo it
@@ -2779,8 +2781,9 @@ describe('mapCoverage (Plan P Task 3)', () => {
     expect(await st(ciUses('hadolint/hadolint-action@v3.1.0', '          failure-threshold: ignore\n'), 'merge', 'dockerfile-lint', docker, 'app')).toBe('partial hadolint');
     expect(await st(ciRun('docker run --rm -i hadolint/hadolint < Dockerfile'), 'merge', 'dockerfile-lint', docker, 'app')).toBe('covered hadolint');
     const k8s = { repoFiles: { ...emptyRepoFiles(), kubernetes: true } };
-    expect(await st(ciRun('kube-linter lint k8s/'), 'merge', 'iac', k8s)).toBe('covered kube-linter');
-    expect(await st(ciUses('stackrox/kube-linter-action@v1', '          directory: k8s\n'), 'merge', 'iac', k8s)).toBe('covered kube-linter');
+    // PL-C0 fold R2: kube-linter reads Kubernetes manifests only, so it never marks iac covered (a Kubernetes-manifests note instead)
+    expect(await st(ciRun('kube-linter lint k8s/'), 'merge', 'iac', k8s)).toBe('partial kube-linter');
+    expect(await st(ciUses('stackrox/kube-linter-action@v1', '          directory: k8s\n'), 'merge', 'iac', k8s)).toBe('partial kube-linter');
     expect(await st(ciRun('conftest test k8s/'), 'merge', 'iac', k8s)).toBe('covered conftest');
     expect(await st(ciRun('conftest test --no-fail k8s/'), 'merge', 'iac', k8s)).toBe('partial conftest');
     expect(await st(ciRun('trivy config --exit-code 1 k8s/'), 'merge', 'iac', k8s)).toBe('covered trivy-config');
@@ -2829,6 +2832,14 @@ describe('mapCoverage (Plan P Task 3)', () => {
       const above: string[] = [];
       for (let i = at - 1; i >= 0 && (text[i] as string).trimStart().startsWith('#'); i--) above.push(text[i] as string);
       expect(above.some((l) => /https:\/\/\S+/.test(l)), `${id} has no source URL comment above it`).toBe(true);
+    }
+  });
+  it('PL-C0: Terraform plus kube-linter in CI shows iac as not covered; the why names Kubernetes manifests only', async () => {
+    const tfK8s = { terraformDirs: ['infra'], repoFiles: { ...emptyRepoFiles(), kubernetes: true } };
+    for (const body of [ciRun('kube-linter lint k8s/'), ciUses('stackrox/kube-linter-action@v1', '          directory: k8s\n')]) {
+      const r = await rowOf(body, 'merge', 'iac', tfK8s);
+      expect(r.status).not.toBe('covered');
+      expect(r.why).toMatch(/Kubernetes manifests only/);
     }
   });
 });
@@ -4086,4 +4097,5 @@ describe('coverage: closing patch (ruling P60)', () => {
     const unknown = await both2('prek run --all-files --skip "$S"');
     expect(unknown.every((x) => x.startsWith('unknown')), unknown.join()).toBe(true);
   });
+
 });

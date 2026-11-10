@@ -943,3 +943,70 @@ describe('builder (fix round 2)', () => {
     }
   });
 });
+
+// ---------- PL-C0 (Plan P ruling P-R1): two picks that are correctness bugs, filtered by code before the AI sees them ----------
+
+describe('PL-C0: offers that would leave a check falsely covered or failing', () => {
+  const K8S = { ...emptyRepoFiles(), kubernetes: true };
+  const iacIds = (p: RepoProfile): string[] => {
+    const n = [need('iac', 'merge', undefined, true)];
+    return (builderOffers(n, candidatesFor(n, p), p, deps()).offers.get('iac') ?? []).map((o) => o.entry.id);
+  };
+  const drIds = (p: RepoProfile): string[] => {
+    const n = [need('dependency-review', 'merge', undefined, true)];
+    return (builderOffers(n, candidatesFor(n, p), p, deps()).offers.get('dependency-review') ?? []).map((o) => o.entry.id);
+  };
+
+  it('PL-C0: Terraform + Kubernetes never offers kube-linter for iac; trivy-config is offered', () => {
+    expect(iacIds(profile({ terraformDirs: ['infra'], repoFiles: K8S }))).toEqual(['trivy-config']);
+  });
+  it('PL-C0: Terraform alone never offers kube-linter for iac', () => {
+    expect(iacIds(profile({ terraformDirs: ['infra'] }))).toEqual(['trivy-config']);
+  });
+  it('PL-C0: no Kubernetes manifests found never offers kube-linter for iac (fail closed)', () => {
+    expect(iacIds(profile())).toEqual(['trivy-config']);
+  });
+  it('PL-C0: Kubernetes manifests alone never offer kube-linter for iac either; trivy-config scans them (fold R1, I1)', () => {
+    expect(iacIds(profile({ repoFiles: K8S }))).toEqual(['trivy-config']);
+  });
+  it('PL-C0: a profile without terraformDirs or repoFiles never offers kube-linter for iac (fold R1, M3)', () => {
+    expect(iacIds(profile({ terraformDirs: undefined as never, repoFiles: K8S }))).toEqual(['trivy-config']);
+    expect(iacIds(profile({ repoFiles: undefined as never }))).not.toContain('kube-linter');
+  });
+  it('PL-C0: an AI pick of kube-linter on Terraform + Kubernetes is refused, never built', async () => {
+    const p = profile({ terraformDirs: ['infra'], repoFiles: K8S });
+    const n = [need('iac', 'merge', undefined, true)];
+    const { ai } = scripted((req) => answerFor(req, [{ key: 'iac', candidateId: 'kube-linter' }]));
+    await expect(buildChoices(n, candidatesFor(n, p), p, bundle, ai, deps())).rejects.toMatchObject({ kind: 'invalid' });
+  });
+  it('PL-C0: a private repo never offers dependency-review-action', () => {
+    expect(drIds(profile({ private: true }))).not.toContain('dependency-review-action');
+    expect(drIds(profile({ private: true, ownerType: 'Organization' }))).not.toContain('dependency-review-action');
+  });
+  it('PL-C0: unknown visibility never offers dependency-review-action (fold R1, M3)', () => {
+    for (const v of [null, undefined, 'internal', 0]) expect(drIds(profile({ private: v as never }))).toEqual(['osv-scanner']);
+  });
+  it('PL-C0: a public repo still offers dependency-review-action (unchanged)', () => {
+    expect(drIds(profile({ private: false }))).toContain('dependency-review-action');
+  });
+  it('PL-C0: an AI pick of dependency-review-action on a private repo is refused, never built', async () => {
+    const p = profile({ private: true });
+    const n = [need('dependency-review', 'merge', undefined, true)];
+    const { ai } = scripted((req) => answerFor(req, [{ key: 'dependency-review', candidateId: 'dependency-review-action' }]));
+    await expect(buildChoices(n, candidatesFor(n, p), p, bundle, ai, deps())).rejects.toMatchObject({ kind: 'invalid' });
+  });
+});
+
+describe('PL-C0 fold R1 (M2): the shared visibility helpers fail closed', () => {
+  it('PL-C0: codeSecurityAvailable and dependencyReviewActionUsable treat unknown visibility as private', async () => {
+    const { codeSecurityAvailable, dependencyReviewActionUsable } = await import('../src/github/availability.js');
+    for (const v of [null, undefined, 'internal', 0]) {
+      expect(codeSecurityAvailable({ private: v as never, ownerType: 'User' })).toBe(false);
+      expect(dependencyReviewActionUsable({ private: v as never })).toBe(false);
+    }
+    expect(codeSecurityAvailable({ private: false, ownerType: 'User' })).toBe(true);
+    expect(codeSecurityAvailable({ private: true, ownerType: 'Organization' }, { codeScanning: true })).toBe(true);
+    expect(dependencyReviewActionUsable({ private: true })).toBe(false);
+    expect(dependencyReviewActionUsable({ private: false })).toBe(true);
+  });
+});

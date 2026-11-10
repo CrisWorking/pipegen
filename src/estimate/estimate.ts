@@ -119,8 +119,9 @@ export const DEBATE_MARGIN = 1.5;
 /**
  * The debate's AI calls (Plan F F4, rulings S10 and F4-R12 m1): the worst case of at most 9 calls (debate.ts MAX_DEBATE_CALLS),
  * each counted at its size measured in test/debate.test.ts (7 need keys; bytes, which are at least tokens) times DEBATE_MARGIN:
- * - builder: its first call and its repair, the only 2 with the code bundle (MAX_BUNDLE_CALLS); prompt 14,201 bytes → 22k, plus the
- *   bundle at the needs row's 30k;
+ * - builder: its first call and its repair, the only 2 with the code bundle (MAX_BUNDLE_CALLS); prompt 14,201 bytes → 22k (measured before
+ *   PL-C0 fold R1; the fixture now arguing over dependency-review measures 13,478 bytes, so 22k stays a conservative bound),
+ *   plus the bundle at the needs row's 30k;
  * - critique: the judge's critique and its re-ask; 19,869 and 20,045 bytes → 31k;
  * - round: the 5 round requests left after both re-asks (builder answers and judge verdicts); 11,069 to 12,504 bytes → 19k.
  * Output is what one answer usually takes (the meter, not this row, bounds each request's full output limit).

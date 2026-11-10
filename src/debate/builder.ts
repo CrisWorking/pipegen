@@ -21,6 +21,7 @@
 //   planNeeds or the judge) never goes in: pipegen's own needWhy does. Every request sets maxOutputTokens and timeoutMs.
 // - reason and suggestion why go through cleanForDoc (Plan F F1): the reason is built by code from enum ids plus the cleaned
 //   "because", so it is fit for PIPEGEN.md as it is (ruling S5: never escaped again).
+import { dependencyReviewActionUsable } from '../github/availability.js';
 import { z } from 'zod';
 import { AiError, count } from '../ai/errors.js';
 import { BUILDER_INSTRUCTIONS, BUILDER_NEEDS_TAG, BUILDER_SUGGESTIONS_TAG, BUILDER_SYSTEM, builderRepairText } from '../ai/prompts/builder.js';
@@ -388,6 +389,11 @@ function offersFor(ref: NeedRef, cands: readonly Candidate[], p: RepoProfile, de
     if (categoryOf(ref.id) === 'workflow-lint' && (!workflowLintTools(p).includes(e.id) || !workflowLintAvailable(deps.reviewed))) continue;
     // GJ: a pre-commit or husky repository's hooks are not lefthook's: hooks-ci offers no reviewed tool there (a plain note instead)
     if (categoryOf(ref.id) === 'hooks-ci' && p.precommit !== null && NO_HOOKS_CI_MANAGERS.has(p.precommit)) continue;
+    // PL-C0 (Plan P rulings P-R1, P-R2 I1), fail closed: kube-linter reads Kubernetes manifests only, and the profile can't prove a repo has
+    // no other IaC (it sees only *.tf), so kube-linter never covers iac; trivy config scans Terraform, Kubernetes and Helm
+    if (categoryOf(ref.id) === 'iac' && e.id === 'kube-linter') continue;
+    // PL-C0: dependency-review-action needs a public repo or Advanced Security; on a private (or unknown) repo the job would fail
+    if (e.id === 'dependency-review-action' && !dependencyReviewActionUsable(p)) continue;
     const plan = choicePlan(e, ref, p);
     if (plan === null) continue;
     seen.add(c.id);
