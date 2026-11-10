@@ -211,7 +211,7 @@ export function buildShortDoc(r: AuditReport, c: RenderCtx): Doc {
   out.push('');
   if (g.serious.length > 0) list(c, 'Fix first', g.serious, out);
   else out.push('Fix first: nothing serious.');
-  const notes = creditNotes(r.coverage, r.profile).map((n) => c.v(n, OUTPUT_CAP.text));
+  const notes = creditNotes(r.coverage, r.profile, r.hostDeploys).map((n) => c.v(n, OUTPUT_CAP.text));
   if (g.other.length > 0 || notes.length > 0) list(c, 'Consider', g.other, out, notes);
   const unknown = new Set(r.coverage.filter((x) => x.status === 'unknown').map((x) => `${x.need.id}\u0000${groupOf(x)}\u0000${x.need.service ?? ''}`)).size;
   if (unknown > 0) out.push(...wrap(`Couldn't tell: ${plural(unknown, 'check', 'checks')} (--verbose)`, ''));
