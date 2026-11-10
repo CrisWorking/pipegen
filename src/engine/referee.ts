@@ -62,7 +62,7 @@ import { expectedSigningSteps, signedImageOwner } from './signing.js';
 import { NO_IMAGE_CATEGORIES, noImageServices, publishedImageServices, WORKFLOW_LINT_TOOL } from './needs.js';
 import { FIND_RUN_STEP_ID, PUBLISH_TAG, publishedImageRepo, renderDigestStep, renderHeadCheckStep, renderPublishDigestStep } from './deploy-steps.js';
 import { callsWorkflow, strongReason } from './deploy-gating.js';
-import { calledHeadCheckEdit, deployGating, INSERT_REFUSED_GAP, isDeployWorkflow, localCallOf, SKIP_DEPLOY_GAP } from '../layers/deploy.js';
+import { calledHeadCheckEdit, deployGating, INSERT_REFUSED_GAP, insertRefusedGap, isDeployWorkflow, localCallOf, SKIP_DEPLOY_GAP } from '../layers/deploy.js';
 import { ARCHIVE_TOOL_IDS, imageBuildTag, imageProfile, renderImageArchiveScan, renderImageBuild } from './image-handoff.js';
 import { dastStartOf, nightlyDastSpec, NIGHTLY_DAST_TOOL, renderDastRun, renderDastScrub, zapActiveSpec, ZAP_ACTIVE_LANE, ZAP_ACTIVE_TOOL } from './dast-handoff.js';
 import { ATTEST_VERIFY_SETS, KEYLESS_VERIFY_SETS, SHARED_CDN_SETS } from './egress.js';
@@ -2895,9 +2895,13 @@ function judgeDeployBatch(files: readonly CreatedFile[], draft: PipelineDraft, t
     const text = typeof path === 'string' ? texts.get(path) : undefined;
     if (wf === undefined || !isDeployWorkflow(wf) || typeof text !== 'string') continue;
     const parsed = parseYaml(text, 'user');
-    if (!('parsed' in parsed) || 'gap' in deployGating(parsed.parsed.js, draft.profile.defaultBranch)) continue;
+    if (!('parsed' in parsed)) continue;
+    const gating = deployGating(parsed.parsed.js, draft.profile.defaultBranch);
+    if ('gap' in gating) continue;
     const why = typeof g.why === 'string' ? g.why : '';
-    if (!(why.startsWith(INSERT_REFUSED_GAP) || (skipped && why === SKIP_DEPLOY_GAP))) add(wf.path, 'template', `The deploy workflow ${safeText(wf.path, 200)} is listed as a gap, but pipegen's deploy layer protects it; a gap there is only the layer's own (pipegen could not add its check without changing the file${skipped ? ', or the deploy part is skipped' : ''}).`, undefined, 'app');
+    // PL-F3: an insert-refusal gap is proven by re-running the layer's insert on the text read: it must refuse, with this very reason
+    const refused = (): boolean => { try { return insertRefusedGap(text, gating, draft.profile.defaultBranch) === why; } catch { return false; } };
+    if (!((why.startsWith(INSERT_REFUSED_GAP) && refused()) || (skipped && why === SKIP_DEPLOY_GAP))) add(wf.path, 'template', `The deploy workflow ${safeText(wf.path, 200)} is listed as a gap, but pipegen's deploy layer protects it; a gap there is only the layer's own (pipegen could not add its check without changing the file${skipped ? ', or the deploy part is skipped' : ''}).`, undefined, 'app');
   }
 }
 

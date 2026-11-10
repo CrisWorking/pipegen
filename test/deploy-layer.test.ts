@@ -1617,8 +1617,11 @@ describe('G17A-R2: the referee binds the batch to the plan\'s inputs', () => {
     // a plain deploy whose insert is dropped is refused too, unless the doc lists it as a gap (PIPEGEN.md then says it is unprotected)
     const plain = world('keyless', [[A, DEPLOY_A]]);
     expect((await judge(plain, [])).issues.some((i) => notHandled(A).test(i.message))).toBe(true);
-    // (G17A-R3 r3-M1: a gap for a workflow the layer gates carries the layer's own reason, here insertVerify's refusal)
-    expect(shown(await judge(plain, [], plain.texts, [{ path: A, triggers: ['push'], why: 'pipegen can not add its check without changing the rest of the file: listed' }]))).toBe('');
+    // (G17A-R3 r3-M1: a gap for a workflow the layer gates carries the layer's own reason, here insertVerify's refusal; PL-F3: the reason
+    // insertVerify really gives on this text, re-run by the referee)
+    const quoted = DEPLOY_A.replace('needs: build', 'needs: "build"');
+    const why = 'pipegen can not add its check without changing the rest of the file: the needs of its job "deploy" use a YAML anchor or a quoted job name; write the job names plainly';
+    expect(shown(await judge(plain, [], new Map([[A, quoted]]), [{ path: A, triggers: ['push'], why }]))).toBe('');
     // only pipegen's marked edit counts: the same text written as a whole file (no mark) is not an edit of the user's workflow (R2 mutation survivor)
     const whole = { ...(plain.v.inserts[0] as VerifyPlan['inserts'][number]).file, inserted: undefined } as unknown as CreatedFile;
     expect((await judge(plain, [whole])).issues.some((i) => notHandled(A).test(i.message)), 'whole file').toBe(true);
@@ -1648,10 +1651,13 @@ describe('G17A-R3: the gap list is re-derived, never trusted', () => {
     const ta = insertAt(two, A)?.file as CreatedFile;
     const fg1 = await judge(two, [ta], two.texts, [{ path: B, triggers: ['push'], why: 'forged' }, { path: SHIP, triggers: ['workflow_call'], why: 'forged' }]);
     expect(fg1.issues.some((i) => forgedGap(B).test(i.message)), shown(fg1)).toBe(true);
-    // a plain deploy listed with the layer's own insert-refusal reason: accepted (the reason pipegen writes when insertVerify refuses)
+    // a plain deploy listed with the layer's own insert-refusal reason: accepted only when insertVerify refuses that text with that reason (PL-F3)
     const plain = world('keyless', [[A, DEPLOY_A]]);
+    const quoted = DEPLOY_A.replace('needs: build', 'needs: "build"');
+    const why = 'pipegen can not add its check without changing the rest of the file: the needs of its job "deploy" use a YAML anchor or a quoted job name; write the job names plainly';
+    expect(shown(await judge(plain, [], new Map([[A, quoted]]), [{ path: A, triggers: ['push'], why }]))).toBe('');
     const refusal = await judge(plain, [], plain.texts, [{ path: A, triggers: ['push'], why: 'pipegen can not add its check without changing the rest of the file: x' }]);
-    expect(shown(refusal)).toBe('');
+    expect(refusal.issues.some((i) => forgedGap(A).test(i.message)), shown(refusal)).toBe(true);
     const other = await judge(plain, [], plain.texts, [{ path: A, triggers: ['push'], why: 'listed' }]);
     expect(other.issues.some((i) => forgedGap(A).test(i.message)), shown(other)).toBe(true);
     // the skip reason only when the deploy part is skipped

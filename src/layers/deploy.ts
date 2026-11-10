@@ -22,7 +22,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { Octokit } from '@octokit/rest';
 import { Document, isMap, isScalar, isSeq, parseDocument, type Node as YamlNode, type Pair } from 'yaml';
 import { callsWorkflow, plainUbuntu, readsContents, strongReason, weakReason } from '../engine/deploy-gating.js';
-import { BUILD_PUSH_STEP_ID, HEAD_CHECK_STEP_ID, imageDigestArtifact, publishedImageRepo, PUBLISH_TAG, renderPublishDigestStep } from '../engine/deploy-steps.js';
+import { BUILD_PUSH_STEP_ID, HEAD_CHECK_STEP_ID, imageDigestArtifact, publishedImageRepo, PUBLISH_TAG, renderHeadCheckStep, renderPublishDigestStep } from '../engine/deploy-steps.js';
 import type { RateClock } from '../engine/github-rate.js';
 import { CALLER_WORKFLOW, isDangerousName, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PUSH_WORKFLOW, type RenderedStep } from '../engine/job-rules.js';
 import { publishedImageServices } from '../engine/needs.js';
@@ -533,6 +533,19 @@ export const isDeployWorkflow = (wf: ExistingWorkflow): boolean => wf.deploys ==
 export const SKIP_DEPLOY_GAP = 'you skipped the deploy part (--skip deploy), so pipegen adds no check before its deploy';
 /** G17A-R3 r3-M1: how the gap reason starts when insertVerify refuses the edit of a workflow the layer gates (the one gap the referee accepts there). */
 export const INSERT_REFUSED_GAP = 'pipegen can not add its check without changing the rest of the file: ';
+
+/**
+ * PL-F3: the gap reason planVerifyInserts writes for this workflow when insertVerify refuses its edit, re-run here with a stand-in verify job
+ * (only the head check: the refusals read the user's file, not the job's body), or null when the insert goes through. The referee accepts an
+ * INSERT_REFUSED_GAP gap only when this gives the same reason.
+ */
+export function insertRefusedGap(text: string, gating: Pick<DeployGating, 'deployJobs' | 'needsOnly'>, defaultBranch: string): string | null {
+  const standIn = { 'runs-on': 'ubuntu-latest', steps: [renderHeadCheckStep(defaultBranch)] } as unknown as Job;
+  try { insertVerify(text, gating.deployJobs, standIn, gating.needsOnly); return null; } catch (e) {
+    if (!(e instanceof EditRefused || e instanceof RenderError)) throw e;
+    return `${INSERT_REFUSED_GAP}${safeText(e.message, 200)}`;
+  }
+}
 
 /**
  * The verify inserts of a draft's deploy workflows (see the file header). `texts`: each workflow's text as read (path → text); `verify`: the
