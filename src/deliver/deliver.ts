@@ -900,18 +900,35 @@ async function checkPinnedOwn(gh: Octokit, c: RepoRef, pin: string, pinned: read
  * Whether a new file at `path` would clash with the tree: a file of another letter case, a file where one of its folders would be, or a
  * folder of that name (a blob under it). Only for a path the tree doesn't hold as such. Shared with finish's central CODEOWNERS (G-FINREC-R1).
  */
-export function pathClash(path: string, entries: ReadonlyMap<string, TreeEntry>): boolean {
+export function pathClash(path: string, entries: ReadonlyMap<string, TreeEntry>, index: ClashIndex = clashIndex(entries)): boolean {
   // G-COCASE-R2 M3: names compared by coKey (letter case and look-alike letters), fail closed
   const lower = coKey(path);
-  return [...entries.keys()].some((key) => { const k = coKey(key); return k === lower || lower.startsWith(`${k}/`) || k.startsWith(`${lower}/`); });
+  if (index.keys.has(lower) || index.folders.has(lower)) return true;
+  // a file where one of the path's folders would be: any leading part of the key (cut at a "/") is a key of the tree
+  for (let i = lower.indexOf('/'); i !== -1; i = lower.indexOf('/', i + 1)) if (index.keys.has(lower.slice(0, i))) return true;
+  return false;
+}
+
+/** The tree's names by coKey, and every folder name leading to one: built once per tree (PL-F6), so each path costs its own length. */
+export interface ClashIndex { keys: ReadonlySet<string>; folders: ReadonlySet<string> }
+export function clashIndex(entries: ReadonlyMap<string, TreeEntry>): ClashIndex {
+  const keys = new Set<string>();
+  const folders = new Set<string>();
+  for (const name of entries.keys()) {
+    const k = coKey(name);
+    keys.add(k);
+    for (let i = k.indexOf('/'); i !== -1; i = k.indexOf('/', i + 1)) folders.add(k.slice(0, i));
+  }
+  return { keys, folders };
 }
 
 /** Base-tree checks of the app files (step 2): what changes, and the mode each file keeps. Throws before anything is written. */
 function checkBase(files: readonly CreatedFile[], entries: ReadonlyMap<string, TreeEntry>, prev: InstallRecord | null, repo: 'app' | 'central', adopted: Set<CreatedFile>): Map<CreatedFile, string> {
   const changed = new Map<CreatedFile, string>();
+  const index = clashIndex(entries);
   for (const f of files) {
     const e = entries.get(f.path);
-    if (e === undefined && pathClash(f.path, entries)) throw new DeliverError(`${show(f.path)} clashes with a file of another letter case, a file where its folder would be, or a folder of that name.`);
+    if (e === undefined && pathClash(f.path, entries, index)) throw new DeliverError(`${show(f.path)} clashes with a file of another letter case, a file where its folder would be, or a folder of that name.`);
     if (e !== undefined && (e.mode === '120000' || e.type !== 'blob')) throw new DeliverError(`${show(f.path)} is a symbolic link or not a plain file in your repository; pipegen won't write through it.`);
     const original = f.inserted?.original ?? f.edited?.original;
     if (original !== undefined) {
