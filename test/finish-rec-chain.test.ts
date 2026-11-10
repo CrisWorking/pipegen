@@ -271,7 +271,7 @@ describe('G-FINREC-R1 sec M1 / spec I1: verify reports a rule after pipegen\'s b
     const s = await seed();
     await runFinish(s);
     expect(await coDrift(s)).toEqual([]);
-    tamper(s, 'o/pipelines', CO, `${liveCo(s) as string}/src/ @bob\n`);
+    tamper(s, 'o/pipelines', CO, `${liveCo(s) as string}/src/main.c @bob\n`);
     expect(await coDrift(s)).toEqual([]);
   });
 
@@ -331,7 +331,7 @@ describe('G-FINREC-R1 sec M1 / spec I1: verify reports a rule after pipegen\'s b
     for (const bad of ['*', '* @bob', '** @bob', '/installs/', '/installs/** @a @bob', '.github/ @bob', '/.github/workflows/*.yml @bob', '*.yaml @bob', '*.json @bob', 'installs/ @o/team', 'CODEOWNERS @bob', '/.github/ @a @o/team', 'docs/CODEOWNERS @bob', '/docs/ @bob']) {
       expect(after(`${bad}\n`), bad).toEqual([bad]);
     }
-    for (const ok of ['/web/ @bob', '/installs/ @a', '* @A @b', '# a comment', '', '/src/** @bob', 'README.md']) {
+    for (const ok of ['/src/main.c @bob', '/installs/ @a', '* @A @b', '# a comment', '', '/README.md', '/.github/workflows/ @a @b']) {
       expect(after(`${ok}\n`), ok).toEqual([]);
     }
     // before the block: the block wins (last match), never drift
@@ -339,6 +339,22 @@ describe('G-FINREC-R1 sec M1 / spec I1: verify reports a rule after pipegen\'s b
     // not exactly one begin and one end line, in order: unreadable (null), drift
     expect(overridingRules(`${block}# pipegen:end\n`, CENTRAL_PROTECTED_PATHS)).toBeNull();
     expect(overridingRules('/installs/ @a\n', CENTRAL_PROTECTED_PATHS)).toBeNull();
+  });
+
+  it('G-FINREC-R1 M1 (review): coverage is decided at the pattern level, failing closed', () => {
+    const block = codeownersBlock(CENTRAL_PROTECTED_PATHS, ['@a', '@b']);
+    const over = (rule: string, paths: readonly string[] = CENTRAL_PROTECTED_PATHS): string[] | null => overridingRules(`${codeownersBlock(paths, ['@a', '@b'])}${rule}\n`, paths);
+    // a name with no '/' (or only a trailing one) matches at any depth: it can take a file inside every protected folder
+    for (const rule of ['*.sh @bob', 'deploy.sh @bob', '*.ts @bob', 'notes.txt', 'docs/ @bob', 'x.py @o/team']) expect(over(rule), rule).toEqual([rule]);
+    // anchored: a fixed prefix (before the first wildcard) that overlaps a protected folder, either way
+    for (const rule of ['**/foo @bob', '/.github/** @bob', '/.git* @bob', '/.github/workflows @bob', '/installs/sub/** @bob', '/* @bob', '/**/x.yml @bob']) expect(over(rule), rule).toEqual([rule]);
+    // a protected file named anywhere (a bare name): a folder rule, or a last part that matches the name
+    for (const rule of ['/src/ @bob', '/src/** @bob', '/a/b/CODEOWNERS @bob', '/a/*OWNERS @bob']) expect(over(rule), rule).toEqual([rule]);
+    // no overlap
+    const dirs = ['.github/workflows/**', 'installs/**', '.github/CODEOWNERS'];
+    for (const rule of ['/docs/ @bob', '/src/*.ts @bob', '/.github/workflows.bak/x @bob', '/README.md', '/.github/dependabot.yml @bob']) expect(over(rule, dirs), rule).toEqual([]);
+    // a rule pipegen writes itself (its own owners) is never drift, wherever it stands
+    for (const line of block.split('\n').filter((l) => l !== '' && !l.startsWith('#'))) expect(over(line), line).toEqual([]);
   });
 
   it('G-FINREC-R1 M1: no false drift on pipegen\'s own output, for every layout pipegen writes', () => {
