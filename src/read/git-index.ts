@@ -10,12 +10,13 @@
 //   - over 500,000 entries, a path over 4,096 bytes, a v4 strip count over the previous path, a path git itself
 //     would refuse (empty, absolute, `.`, `..` or `.git` parts).
 // `.git` is a real folder in `dir`, or (PL-B3) a linked worktree's `.git` file: a regular file of one line
-// `gitdir: <path>` whose target is a real folder (no link at any level) holding `commondir` (a submodule has none) and a
-// `gitdir` back-pointer that resolves to `<dir>/.git` exactly, so the file can't point the read at another checkout's
-// index. The index is `<gitdir>/index`, the config `<commondir>/config`. Anything else is null, as before.
+// `gitdir: <path>` whose target is a real folder (no link at any level, read as written: a link followed by `..` is
+// refused, as git refuses it) holding `commondir` (a submodule has none, read the same way) and a `gitdir` back-pointer
+// that resolves to `<dir>/.git` exactly, so the file can't point the read at another checkout's index. The index is
+// `<gitdir>/index`, the config `<commondir>/config`. Anything else is null, as before.
 import { createHash } from 'node:crypto';
 import { lstat, realpath } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, resolve, sep } from 'node:path';
 import { readBytesLimited, readTextLimitedWithReason, regexLines } from './limits.js';
 
 export const GIT_INDEX_LIMITS = Object.freeze({ maxBytes: 64 * 1024 * 1024, maxEntries: 500_000, maxPathBytes: 4096 });
@@ -43,11 +44,16 @@ export async function readGitIndexPaths(dir: string): Promise<ReadonlySet<string
   return buf === null ? null : parseGitIndex(buf);
 }
 
-/** A real folder with no link at any level (its real path is the path itself), or null. */
-async function realFolder(path: string): Promise<string | null> {
+/**
+ * `target` (from `base`) as a real folder with no link at any level, or null. The path is resolved as written (a link
+ * followed by `..` is not folded away, as git does not fold it) and must equal its lexical form.
+ */
+async function realFolder(base: string, target: string): Promise<string | null> {
+  const path = resolve(base, target);
   const info = await lstat(path).catch(() => null);
   if (info === null || !info.isDirectory()) return null;
-  return (await realpath(path).catch(() => null)) === path ? path : null;
+  const written = isAbsolute(target) ? target : `${base}${sep}${target}`;
+  return (await realpath(written).catch(() => null)) === path ? path : null;
 }
 
 /** One line of a small text file under `root` (a trailing newline allowed), or null. */
@@ -65,13 +71,13 @@ async function readWorktreeIndex(dir: string): Promise<ReadonlySet<string> | nul
   const pointer = await oneLine(join(dir, '.git'), dir);
   const target = pointer === null ? null : /^gitdir: (.+)$/.exec(pointer)?.[1];
   if (target === undefined || target === null) return null;
-  const gitdir = await realFolder(resolve(realDir, target));
+  const gitdir = await realFolder(realDir, target);
   if (gitdir === null) return null;
   const common = await oneLine(join(gitdir, 'commondir'), gitdir);
   if (common === null) return null; // a submodule's git folder has no commondir
   const back = await oneLine(join(gitdir, 'gitdir'), gitdir);
   if (back === null || resolve(gitdir, back) !== join(realDir, '.git')) return null;
-  const commondir = await realFolder(resolve(gitdir, common));
+  const commondir = await realFolder(gitdir, common);
   if (commondir === null) return null;
   if (!(await sha1Repo(join(commondir, 'config'), commondir))) return null;
   const buf = await readBytesLimited(join(gitdir, 'index'), gitdir, GIT_INDEX_LIMITS.maxBytes);

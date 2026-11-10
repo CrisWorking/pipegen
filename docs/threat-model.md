@@ -104,16 +104,24 @@
 | T51 | **A folder of the repo is swapped for a link while pipegen reads a file** (a second local process that can write to the repo folder, during an audit), so the read lands outside the repo | Every repo file is read through readTextLimitedWithReason, and every lockfile through readLinesLimited, with the repo root (both share the same checks): no level may be a link (checked before and after the open), the open never follows a last-level link and never blocks, fstat must match the checked file, and on Linux the opened descriptor's own path (/proc/self/fd) must be inside the root's real path (P46a, P49). Measured: 1.4 million renameat2 swaps in 25 s, no read outside the repo (before P49: 133 in 8 s) | Without /proc (Linux with /proc not mounted), on macOS (Node does not expose O_NOFOLLOW_ANY, so the open can't refuse a link at every level) and on Windows, only the path checks remain, and a process that swaps a folder back and forth fast enough can still win between two of them. Accepted for v0.1: the attacker needs write access to the repo folder while the audit runs, which is usually the user or a process running as the user (who can read the outside file anyway); a shared or group-writable repo folder widens this. What pipegen would do with the file is put facts from it in the report or (with `--ai`) the secret-scanned bundle |
 
 **Known limits of the `.gitignore` support (DECISIONS #126).** pipegen reads `.gitignore` files, `.git/info/exclude`
-and the git index itself (no git process), and reads `info/exclude` and the index only when `.git` is a real folder
-(not a link, not a `.git` file). Two cases follow from that:
+and the git index itself (no git process). It reads `info/exclude` only when `.git` is a real folder, and the index
+when `.git` is a real folder or a verified linked worktree's `.git` file (PL-B3); a link is never followed. Three cases
+follow from that:
 - **A git submodule:** the repo's index lists only the submodule's commit, not its files. A file committed in the
   submodule that the submodule's own `.gitignore` lists therefore reads as "not committed and ignored", and the quick
   secret check (advisory) skips it. The AI bundle leaves every submodule file out when the index is known, which is safe.
-- **A linked worktree** (`git worktree add`): `.git` is a file there, so pipegen has no index, and the worktree's shared
-  `info/exclude` (kept in the main repo's `.git` folder) and the user's `core.excludesFile` are not applied: a file the
-  user excludes only there would reach the AI bundle. Today's audit refuses a worktree (it reads the remote from a
-  real `.git` folder only), so this applies once a later command reads worktrees. Without an index, a `node_modules`
-  folder in a worktree counts as committed for T41's stop, and the stop says the folder is a worktree.
+- **A linked worktree** (`git worktree add`): `.git` is a one-line `gitdir:` file. pipegen reads the worktree's own
+  index through it only when the target is a real folder (no link at any level, read as written), holds `commondir`,
+  and its `gitdir` back-pointer names this worktree's `.git` exactly. Then an uncommitted `node_modules` gives no T41
+  stop and a committed one stops, and the AI bundle leaves out the worktree's files that are not in its index. The
+  shared `info/exclude` (kept in the main repo's `.git` folder) and the user's `core.excludesFile` are still not
+  applied; a file listed only there stays out of the bundle only because it is not in the index.
+- **An unverifiable worktree or a submodule** (`.git` file that fails any check above): no index, as before; a
+  `node_modules` folder there counts as committed for T41's stop, and the stop says the folder is a worktree or
+  submodule.
+- **Residual risk:** a folder git did not create can ship its own git metadata (a `.git` folder, or a `.git` file plus
+  a matching gitdir folder with `commondir` and back-pointer). pipegen then trusts that index as git would; a downloaded
+  folder can therefore claim any file is (or is not) committed.
 
 ### Which threats matter in which milestone
 

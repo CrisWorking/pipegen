@@ -266,7 +266,7 @@ describe('readGitIndexPaths: linked worktrees (PL-B3)', () => {
   });
 
   it('gitdir whose back-pointer names another folder → null', async () => {
-    const { main, wt } = worktree();
+    const { wt } = worktree();
     const gitdir = /^gitdir: (.+)$/m.exec(readFileSync(join(wt, '.git'), 'utf8'))?.[1] as string;
     // a second checkout points its .git file at the first worktree's git folder: the back-pointer names wt, not it
     const other = makeTempDir();
@@ -275,7 +275,14 @@ describe('readGitIndexPaths: linked worktrees (PL-B3)', () => {
     // a relative back-pointer that resolves elsewhere is refused too
     writeFileSync(join(gitdir, 'gitdir'), '../../../../elsewhere/.git\n');
     expect(await readGitIndexPaths(wt)).toBeNull();
-    expect(main).toBeTruthy();
+  });
+
+  it("worktree → its own index, not the main checkout's", async () => {
+    const { main, wt } = worktree();
+    writeIn(wt, 'only-wt.txt', '\n');
+    git(wt, 'add', '--', 'only-wt.txt');
+    expect(await readGitIndexPaths(wt)).toContain('only-wt.txt');
+    expect(await readGitIndexPaths(main)).not.toContain('only-wt.txt');
   });
 
   it('submodule .git file → null', async () => {
@@ -313,10 +320,31 @@ describe('readGitIndexPaths: linked worktrees (PL-B3)', () => {
     symlinkSync(join(gitdir, '../..'), up);
     writeFileSync(join(wt, '.git'), `gitdir: ${join(up, 'worktrees/wt')}\n`);
     expect(await readGitIndexPaths(wt)).toBeNull();
+    // a link to the main work tree, the gitdir path written through it
+    const up2 = join(makeTempDir(), 'up2');
+    symlinkSync(join(gitdir, '../../..'), up2);
+    writeFileSync(join(wt, '.git'), `gitdir: ${join(up2, '.git/worktrees/wt')}\n`);
+    expect(await readGitIndexPaths(wt)).toBeNull();
+  });
+
+  it('gitdir path with a link followed by .. (git refuses it) → null', async () => {
+    const { wt } = worktree();
+    const gitdir = /^gitdir: (.+)$/m.exec(readFileSync(join(wt, '.git'), 'utf8'))?.[1] as string;
+    const lnk = join(gitdir, '../lnk');
+    symlinkSync(makeTempDir(), lnk);
+    writeFileSync(join(wt, '.git'), `gitdir: ${lnk}/../wt\n`);
+    expect(await readGitIndexPaths(wt)).toBeNull();
+  });
+
+  it('commondir with a link followed by .. → null', async () => {
+    const { wt } = worktree();
+    const gitdir = /^gitdir: (.+)$/m.exec(readFileSync(join(wt, '.git'), 'utf8'))?.[1] as string;
+    symlinkSync(makeTempDir(), join(gitdir, 'lnk'));
+    writeFileSync(join(gitdir, 'commondir'), 'lnk/../../..\n');
+    expect(await readGitIndexPaths(wt)).toBeNull();
   });
 });
 
 function rmIn(dir: string, f: string): void {
   rmSync(join(dir, f));
 }
-

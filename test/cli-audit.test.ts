@@ -1579,6 +1579,18 @@ describe('npx pipegen inside the folder: the safe-mode stop (J5, #124, S8, S15)'
     expect(await swapRiskWhy(wt, wt)).toContain('a committed node_modules folder');
   });
 
+  it("worktree on a branch that commits node_modules, main checkout without → stop (the worktree's own index)", async () => {
+    const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', HOME: '/nonexistent' };
+    const git = (cwd: string, ...args: string[]) => childProcess.execFileSync('git', args, { cwd, stdio: 'pipe', env });
+    const { main } = gitWorktree({});
+    const wt = join(makeTempDir(), 'evil');
+    git(main, 'worktree', 'add', '-q', '-b', 'evil', wt);
+    writeIn(wt, 'node_modules/left-pad/index.js', 'module.exports = 1;\n');
+    git(wt, 'add', '-f', '--', 'node_modules');
+    git(wt, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '--no-verify', '-m', 'nm');
+    expect(await swapRiskWhy(wt, wt)).toContain('a committed node_modules folder');
+  });
+
   it('stop comes before the --ai checks (no Ollama call)', async () => {
     const dir = repo({ '.npmrc': UNSAFE_NPMRC });
     const r = await audit(['--ai', 'ollama', '--model', 'llama3'], { cwd: dir, env: { OLLAMA_HOST: 'http://127.0.0.1:11434' } });
@@ -1776,4 +1788,3 @@ function gitWorktree(files: Record<string, string>): { main: string; wt: string 
   git(main, 'worktree', 'add', '-q', wt);
   return { main, wt };
 }
-
