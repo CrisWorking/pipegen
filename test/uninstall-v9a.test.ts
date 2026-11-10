@@ -720,3 +720,92 @@ describe('PL-F5: V9a follow-ups', () => {
     expect(r.status).not.toBe('b-done');
   });
 });
+
+// ---------- PL-F5 fold R1: the narrow-again paths with GitHub's own answers ----------
+
+describe('PL-F5 R1: narrowing again after the second secrets list', () => {
+  const RATE = { status: 403, headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '9999999999' } };
+  const WIDE = { protected_branches: false, custom_branch_policies: true };
+  const recOf = (w: World): InstallRecord => sampleRecord(w, { [SEC]: [{ name: KEY, scope: 'env:pipegen-signing', created: true, githubCreatedAt: AT }], environments: [envEntry] });
+  /** first list empty (key gone); `second` answers the list after the PUT; `put2` answers the second PUT (the narrow-again). */
+  const setup = (w: World, second: () => { status: number; data?: unknown; headers?: Record<string, string> } | undefined, put2?: () => { status: number; headers?: Record<string, string> } | undefined, onPut1?: () => void): void => {
+    w.app.envs.set('pipegen-signing', narrowed());
+    let lists = 0; let puts = 0;
+    w.g.hooks.unshift((c) => {
+      if (c.route === ENV_ITEM_LIST) {
+        lists += 1;
+        if (lists === 1) { w.app.envs.get('pipegen-signing')?.stored.delete(KEY); return { status: 200, data: { total_count: 0, [SEC]: [] } }; }
+        return second();
+      }
+      if (c.route === ENV_PUT) { puts += 1; if (puts === 1) { onPut1?.(); return undefined; } return put2?.(); }
+      return undefined;
+    });
+  };
+  const fail = (w: World, rec: InstallRecord): Promise<unknown> => uninstallStep(gh(w), loadedOf(w, rec), term().p, deps(w)).then(() => null, (e: unknown) => e);
+
+  it('a GitHub rate answer on the second list and on the narrow-again PUT → a rate stop that says it couldn\'t narrow it again', async () => {
+    const w = world();
+    await afterRun1(w);
+    setup(w, () => RATE, () => RATE);
+    const err = await fail(w, recOf(w));
+    expect(isRateStop(err)).toBe(true);
+    expect((err as Error).message).toMatch(/couldn't narrow it again/);
+    expect((err as Error).message).toMatch(/Right now: put the environment pipegen-signing back to the default branch only/);
+    expect(w.app.envs.get('pipegen-signing')?.deployment_branch_policy).toBeNull();
+  });
+
+  it('a 401 on the second list → GitHubAccessError 401, narrowed it again, run uninstall again', async () => {
+    const w = world();
+    await afterRun1(w);
+    setup(w, () => ({ status: 401 }));
+    const err = await fail(w, recOf(w));
+    expect((err as Error).name).toBe('GitHubAccessError');
+    expect((err as { status?: unknown }).status).toBe(401);
+    expect((err as Error).message).toMatch(/narrowed it again/);
+    expect((err as Error).message).toMatch(/Run `pipegen uninstall` again/);
+    expect(w.app.envs.get('pipegen-signing')?.deployment_branch_policy).toEqual(WIDE);
+  });
+
+  it('a secret appears between the lists and the narrow-again PUT is rate-stopped → a rate stop with the Right now step', async () => {
+    const w = world();
+    await afterRun1(w);
+    setup(w, () => ({ status: 200, data: { total_count: 1, [SEC]: [{ name: KEY }] } }), () => RATE);
+    const err = await fail(w, recOf(w));
+    expect(isRateStop(err)).toBe(true);
+    expect((err as Error).message).toMatch(/couldn't narrow it again/);
+    expect((err as Error).message).toMatch(/Right now: put the environment pipegen-signing back to the default branch only/);
+    expect(w.app.envs.get('pipegen-signing')?.deployment_branch_policy).toBeNull();
+  });
+
+  it('a secret appears between the lists and the narrow-again PUT answers 401 → GitHubAccessError with the Right now step', async () => {
+    const w = world();
+    await afterRun1(w);
+    setup(w, () => ({ status: 200, data: { total_count: 1, [SEC]: [{ name: KEY }] } }), () => ({ status: 401 }));
+    const err = await fail(w, recOf(w));
+    expect((err as Error).name).toBe('GitHubAccessError');
+    expect((err as Error).message).toMatch(/Right now: put the environment pipegen-signing back to the default branch only/);
+  });
+
+  it('Ctrl-C between the widening PUT and the narrow-again PUT → a leftover with the Right now step, not a bare stop', async () => {
+    const w = world();
+    await afterRun1(w);
+    setup(w, () => ({ status: 200, data: { total_count: 1, [SEC]: [{ name: KEY }] } }), undefined, () => { h.stop.now = true; });
+    const r = await run(w, recOf(w));
+    const f = r.failed.find((x) => x.what === 'environment pipegen-signing');
+    expect(f?.why).toMatch(/stopped before it could narrow/);
+    expect(f?.manual).toMatch(/Right now: put the environment pipegen-signing back to the default branch only/);
+  });
+
+  it('phase B: owner typed keep → no "holds nothing of pipegen\'s" note for o/pipelines', async () => {
+    const w = world();
+    await afterRun1(w);
+    w.settings.access = 'user';
+    const rec = sampleRecord(w, { central: { repoId: w.central.id, createdByPipegen: false, actionsAccess: { previous: 'none' } }, scratch: { createdByPipegen: false } });
+    const yes = (q: string): boolean | undefined => (q.startsWith('Remove the install record') ? true : undefined);
+    await run(w, rec, term({ type: (q, exp) => (/Actions access level/.test(q) ? (exp === 'keep' ? 'keep' : 'no') : exp), yes }), {}, { typedNames: true, marker: 'differs' });
+    mergePr(w, w.central, 'pipegen/uninstall-shop');
+    const r = await run(w, rec, term({ yes }), {}, { typedNames: true, marker: 'differs' });
+    expect(r.status).toBe('b-done');
+    expect((r.notes ?? []).join('\n')).not.toMatch(/o\/pipelines: you created it[^\n]*holds nothing of pipegen's/);
+  });
+});

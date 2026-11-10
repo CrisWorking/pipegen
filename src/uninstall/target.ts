@@ -939,19 +939,14 @@ export class UninstallApi {
     // (narrowed again), and a manual step. PL-F5 (R2-i2): a 401 or a rate stop on that list narrows it again too, then stops the run.
     const narrowAgain = async (): Promise<unknown> => {
       try { await this.#dedicated(ROUTES.environmentPut, { ...shown, ...params }); return null; } catch (e) {
-        if (e instanceof UninstallRefusal) throw e;
+        // PL-F5 R1: a Ctrl-C between the two PUTs refuses this write; it is reported as not narrowed (a leftover with the step)
+        if (e instanceof UninstallRefusal && !interrupting()) throw e;
         return e;
       }
     };
-    const rightNow = `put ${what} back to the default branch only (Settings → Environments → ${show(entry.name, 100)} → Deployment branches)`;
-    let after: { outcome: DeleteOutcome; unread: boolean } | null;
-    try { after = await this.#recordSecretsIn(entry.name, secrets, what, manual); } catch (e) {
-      if (e instanceof UninstallRefusal) throw e;
-      const failed = await narrowAgain();
+    /** PL-F5 R1: a rate stop or a 401 rethrown as the same kind of stop, its text followed by `extra`; anything else returns. */
+    const stopWith = (e: unknown, extra: string): void => {
       const msg = e instanceof Error ? e.message : String(e);
-      const extra = failed === null
-        ? `pipegen couldn't read the secrets of ${what} again after its earlier settings went back, so it narrowed it again (as the preview showed it). Run \`pipegen uninstall\` again.`
-        : `pipegen couldn't read the secrets of ${what} again after its earlier settings went back, and couldn't narrow it again: other branches may use it now. Right now: ${rightNow}, then run \`pipegen uninstall\` again.`;
       if (isRateStop(e)) {
         const r = e instanceof GitHubRateLimitError ? e : undefined;
         throw new GitHubRateLimitError(`${msg}\n${extra}`, { cause: e, budgetSpent: r?.budgetSpent ?? false, resetAt: r?.resetAt ?? null });
@@ -960,6 +955,16 @@ export class UninstallApi {
         const a = e instanceof Error && e.name === 'GitHubAccessError' ? e : githubTokenRejected();
         throw new GitHubAccessError(`${a.message}\n${extra}`, { status: 401 });
       }
+    };
+    const rightNow = `put ${what} back to the default branch only (Settings → Environments → ${show(entry.name, 100)} → Deployment branches)`;
+    let after: { outcome: DeleteOutcome; unread: boolean } | null;
+    try { after = await this.#recordSecretsIn(entry.name, secrets, what, manual); } catch (e) {
+      if (e instanceof UninstallRefusal) throw e;
+      const failed = await narrowAgain();
+      const extra = failed === null
+        ? `pipegen couldn't read the secrets of ${what} again after its earlier settings went back, so it narrowed it again (as the preview showed it). Run \`pipegen uninstall\` again.`
+        : `pipegen couldn't read the secrets of ${what} again after its earlier settings went back, and couldn't narrow it again: other branches may use it now. Right now: ${rightNow}, then run \`pipegen uninstall\` again.`;
+      stopWith(e, extra);
       throw e;
     }
     if (after !== null) {
@@ -969,8 +974,9 @@ export class UninstallApi {
         : `pipegen's secret appeared in ${what} while its earlier settings went back`;
       const failed = await narrowAgain();
       if (failed !== null) {
-        hardStop(failed);
-        return { status: 'leftover', why: `${again}, and pipegen couldn't narrow it again (${statusOf(failed) === undefined ? 'no answer' : `HTTP ${statusOf(failed)}`}): other branches may use it now`, manual: `Right now: ${rightNow}, then ${step}` };
+        stopWith(failed, `${again}, and pipegen couldn't narrow it again: other branches may use it now. Right now: ${rightNow}, then ${step}`);
+        const how = failed instanceof UninstallRefusal ? 'pipegen was stopped before it could narrow it again (Ctrl-C)' : `pipegen couldn't narrow it again (${statusOf(failed) === undefined ? 'no answer' : `HTTP ${statusOf(failed)}`})`;
+        return { status: 'leftover', why: `${again}, and ${how}: other branches may use it now`, manual: `Right now: ${rightNow}, then ${step}` };
       }
       return { status: 'kept', why: `${again}, so pipegen narrowed it again (as the preview showed it)`, manual: step };
     }

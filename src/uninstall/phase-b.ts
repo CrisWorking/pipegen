@@ -278,7 +278,8 @@ export async function applyPhaseB(gh: Octokit, plan: PhasePlan, api: PhaseApi, c
   // this project's files and record gone (the central PR merged), no other project, no org rule, and no central item kept or left as a step
   const centralFull = `${appRef.owner}/pipelines`;
   const centralItem = (what: string): boolean => what.startsWith('central ') || what.includes(centralFull) || what === recordPath(appRef.repo) || what.endsWith(` ${recordPath(appRef.repo)}`);
-  if (clean && c !== null && c.last && c.orgRule === null && (c.inRepo ?? []).length === 0 && plan.yourRepos.some((y) => y.kind === 'central')
+  // PL-F5 R1: a typed keep leaves pipegen's Actions access level on it, so it doesn't hold nothing of pipegen's
+  if (clean && accessKept === undefined && c !== null && c.last && c.orgRule === null && (c.inRepo ?? []).length === 0 && plan.yourRepos.some((y) => y.kind === 'central')
     && ![...r.skipped, ...r.manual].some((x) => centralItem(x.what))) {
     notes.push(`${centralFull}: you created it, so pipegen doesn't delete it or print a command to. It holds nothing of pipegen's now (this project's files and install record are gone from it, and no other project of pipegen uses it): delete it by hand when you don't need it, once you checked it holds nothing else of yours.`);
   }
