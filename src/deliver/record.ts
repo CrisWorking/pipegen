@@ -49,6 +49,9 @@ const DAY = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine((d) => validDate(d) =
 const TEXT = z.string().max(500);
 const PATH = z.string().max(400).refine((p) => createdPathProblem(p) === null, 'not a plain repository path');
 const SECRET_NAME = z.string().regex(/^[A-Z_][A-Z0-9_]{0,127}$/);
+/** V9a-R2: the Actions access levels GitHub names (a record's `actionsAccess.previous` is one of them; it is printed in manual steps). */
+export const ACCESS_LEVELS = ['none', 'user', 'organization', 'enterprise'] as const;
+const ACCESS_PREVIOUS = z.strictObject({ previous: z.enum(ACCESS_LEVELS) });
 const ENV_NAME = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/).refine((n) => n !== '.' && n !== '..' && !n.includes('..'));
 const SCOPE_ENV = z.string().regex(/^env:[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/).refine((s) => !s.includes('..')) as unknown as z.ZodType<`env:${string}`>;
 const LOGIN = z.string().regex(/^@[A-Za-z0-9](?:[A-Za-z0-9_-]{0,38})$/);
@@ -140,7 +143,7 @@ export const InstallRecordSchema = z.strictObject({
     shaPinningRequired: z.strictObject({ previous: z.boolean() }).optional(), vulnerabilityAlerts: z.strictObject({ previous: z.boolean() }).optional(),
     secretScanning: z.strictObject({ previous: z.boolean() }).optional(), pushProtection: z.strictObject({ previous: z.boolean() }).optional(),
   }).optional(),
-  central: z.strictObject({ repoId: ID.optional(), createdByPipegen: z.boolean(), rulesetId: ID.optional(), rulesetCreatedAt: ISO.optional(), codeowners: z.strictObject({ path: PATH, created: z.boolean() }).optional(), actionsAccess: z.strictObject({ previous: z.string().max(40) }).optional() }).optional(),
+  central: z.strictObject({ repoId: ID.optional(), createdByPipegen: z.boolean(), rulesetId: ID.optional(), rulesetCreatedAt: ISO.optional(), codeowners: z.strictObject({ path: PATH, created: z.boolean() }).optional(), actionsAccess: ACCESS_PREVIOUS.optional() }).optional(),
   scratch: z.strictObject({ repoId: ID.optional(), createdByPipegen: z.boolean() }).optional(),
   planned: z.strictObject({
     rulesets: z.strictObject({ gate: API, reviews: API.optional() }).optional(),
@@ -401,7 +404,7 @@ export interface FinishPending {
 const RS = InstallRecordSchema.shape;
 const PENDING = z.strictObject({
   updatedAt: z.string().max(40), repoId: ID, environments: RS.environments, variables: RS.variables, repoSettings: RS.repoSettings.unwrap(),
-  classicProtection: RS.classicProtection, actionsAccess: z.strictObject({ previous: z.string().max(40) }).optional(),
+  classicProtection: RS.classicProtection, actionsAccess: ACCESS_PREVIOUS.optional(),
 });
 const PENDING_SUFFIX = '.finish-pending';
 export const emptyFinishPending = (): FinishPending => ({ environments: [], variables: [], repoSettings: {} });

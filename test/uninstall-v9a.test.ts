@@ -21,7 +21,7 @@ import type { LoadedRecord } from '../src/uninstall/record.js';
 import { UninstallApi, UninstallRefusal } from '../src/uninstall/target.js';
 import type { Env } from './helpers/deliver-github.js';
 import { entryImportProblems } from './helpers/import-scan.js';
-import { addLocalLeftovers, localLeftoversPath, recordPath } from '../src/deliver/record.js';
+import { addLocalLeftovers, checkRecord, localLeftoversPath, recordPath } from '../src/deliver/record.js';
 import type { InstallEdit } from '../src/types.js';
 import { ACCESS_ROUTE, AT, blob, MERGE_WF, cleanHomes, deps, gh, loadedOf, local, mergePr, RECORD_TEXT, sampleRecord, SEC, SHA, term, world, type Term, type World } from './helpers/uninstall-world.js';
 
@@ -567,5 +567,69 @@ describe('V9a-R2 N4, N5, spec minor 2', () => {
     expect(r.manual.some((m) => m.what === 'environment pipegen-signing (leftovers file)')).toBe(true);
     expect(existsSync(localLeftoversPath({ owner: 'o', repo: 'shop' }, local(w)))).toBe(true);
     expect(r.status).toBe('b-partial');
+  });
+});
+
+describe('V9a-R2 mutant follow-ups and the printed-value check', () => {
+  const centralNote = (r: StepResult): string | undefined => (r.notes ?? []).find((n) => n.startsWith('o/pipelines'));
+  const merged2 = async (w: World, rec: InstallRecord, t: Term = term()): Promise<StepResult> => {
+    await run(w, rec, term({ yes: (q) => (q.startsWith('Remove the install record') ? true : undefined) }));
+    mergePr(w, w.central, 'pipegen/uninstall-shop');
+    return run(w, rec, t);
+  };
+
+  it('phase B: a failed step outside central (an app secret) → no pipelines note on that run', async () => {
+    const w = world();
+    await afterRun1(w);
+    w.app.stored.set('PIPEGEN_X', AT);
+    const rec = sampleRecord(w, { [SEC]: [{ name: 'PIPEGEN_X', scope: 'repo', created: true, githubCreatedAt: AT }], central: { createdByPipegen: false }, scratch: { createdByPipegen: false } });
+    await run(w, rec, term({ yes: (q) => (q.startsWith('Remove the install record') ? true : undefined) }));
+    mergePr(w, w.central, 'pipegen/uninstall-shop');
+    w.app.stored.set('PIPEGEN_X', AT);
+    w.g.hooks.unshift((c) => (c.route === `DELETE /repos/{owner}/{repo}/actions/${SEC}/{secret_name}` ? { status: 500 } : undefined));
+    const r = await run(w, rec);
+    expect(r.failed.some((f) => /PIPEGEN_X/.test(f.what))).toBe(true);
+    expect(centralNote(r)).toBeUndefined();
+  });
+
+  it('phase B: a central item left as a manual step (not one of this project\'s files) → no pipelines note', async () => {
+    const w = world();
+    await afterRun1(w);
+    const rec = sampleRecord(w, { files: [...sampleRecord(w).files, { repo: 'central', path: '.github/workflows/other--merge.yml', part: 'pipeline', shas: [blob(MERGE_WF)] }], central: { createdByPipegen: false }, scratch: { createdByPipegen: false } });
+    const r = await merged2(w, rec);
+    expect(r.manual.some((m) => m.what === 'central .github/workflows/other--merge.yml')).toBe(true);
+    expect(r.failed).toEqual([]);
+    expect(centralNote(r)).toBeUndefined();
+  });
+
+  it('phase B: a restore target.ts keeps leaves the branch rules pipegen added (spec minor 2, the rules recorded as changed)', async () => {
+    const w = world();
+    await afterRun1(w);
+    w.app.envs.set('pipegen-signing', narrowed());
+    const entry = { ...envEntry, changed: ['deployment_branch_policy' as const, 'branch_policies' as const] };
+    const rec = sampleRecord(w, { [SEC]: [{ name: KEY, scope: 'env:pipegen-signing', created: false, overwritten: true }], environments: [entry] });
+    await run(w, rec);
+    expect(w.g.calls.some((c) => c.route === 'DELETE /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies/{branch_policy_id}')).toBe(false);
+    expect(w.app.envs.get('pipegen-signing')?.policies.map((p) => p.id)).toEqual([3]);
+  });
+
+  it('record and central: an access level with shell text is refused by the schema, and never printed in a command', async () => {
+    const BAD = 'user; rm -rf ~';
+    const w0 = world();
+    expect(() => checkRecord(JSON.parse(JSON.stringify(sampleRecord(w0, { central: { createdByPipegen: false, actionsAccess: { previous: BAD } } }))))).toThrow();
+    expect(() => checkRecord(JSON.parse(JSON.stringify(sampleRecord(w0, { central: { createdByPipegen: false, actionsAccess: { previous: 'none' } } }))))).not.toThrow();
+    // past the schema (a loaded record handed in directly): the declined name and, after the merge, the access still set print no such value
+    const w = world();
+    await afterRun1(w);
+    w.settings.access = 'user';
+    const rec = sampleRecord(w, { central: { repoId: w.central.id, createdByPipegen: false, actionsAccess: { previous: BAD } }, scratch: { createdByPipegen: false } });
+    const lo = { typedNames: true, marker: 'differs' as const };
+    const r1 = await run(w, rec, term({ type: (q, exp) => (/Actions access level/.test(q) ? 'no' : exp), yes: (q) => (q.startsWith('Remove the install record') ? true : undefined) }), {}, lo);
+    mergePr(w, w.central, 'pipegen/uninstall-shop');
+    const r2 = await run(w, rec, term(), {}, lo);
+    const text = [...w.out, ...r1.lines, ...r2.lines, ...[...r1.manual, ...r2.manual].map((m) => m.step ?? ''), ...[...r1.failed, ...r2.failed].map((f) => f.manual ?? '')].join('\n');
+    expect(r2.failed.some((f) => f.what === 'central Actions access of o/pipelines')).toBe(true);
+    expect(text).not.toMatch(/rm -rf/);
+    expect(text).toMatch(/put it back to the level it had before pipegen by hand/);
   });
 });

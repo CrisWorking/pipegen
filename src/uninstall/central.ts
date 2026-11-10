@@ -20,7 +20,7 @@
 import type { Octokit } from '@octokit/rest';
 import type { Prompter } from '../cli/io.js';
 import { readBlobText, statusOf, type RepoRef, type TreeEntry } from '../deliver/git-data.js';
-import { centralUpdateBranch, editWritesChained, recordPath, type RecordedEdit } from '../deliver/record.js';
+import { ACCESS_LEVELS, centralUpdateBranch, editWritesChained, recordPath, type RecordedEdit } from '../deliver/record.js';
 import { centralFilesOf } from '../deliver/update.js';
 import { centralProjectName, centralWorkflowFile } from '../engine/central-path.js';
 import { CODEOWNERS_BEGIN, CODEOWNERS_END } from '../engine/created-builders.js';
@@ -38,6 +38,8 @@ const show = (s: unknown, n = 200): string => safeText(String(s), n);
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const posId = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v > 0;
 const SHA_RE = /^[0-9a-f]{40}$/;
+/** V9a-R2: a recorded access level is printed in a command only when it is one GitHub names (never a shell-special text from the record). */
+const accessLevel = (v: unknown): string | null => (typeof v === 'string' && (ACCESS_LEVELS as readonly string[]).includes(v) ? v : null);
 /** The central workflow of some project, by the layers pipegen writes: `<project>--<layer>.yml` (the brief's lastProject rule). */
 const CENTRAL_LAYER_RE = /^\.github\/workflows\/.+--(?:merge|push|nightly|sign|required)\.ya?ml$/;
 const RECORD_RE = /^installs\/[^/]+\.json$/;
@@ -246,7 +248,7 @@ export async function runCentral(o: {
     }
     const prev = locks.actionsAccess?.previous;
     if (prev !== undefined) {
-      const accessStep = `Put the Actions access of ${full} back by hand (Settings → Actions → Access) if pipegen set it and no other project relies on it, or run \`pipegen uninstall\` again and type ${CENTRAL_REPO}.`;
+      const accessStep = `Put the Actions access of ${full} back by hand (Settings → Actions → Access${accessLevel(prev) === null ? '' : `, to ${accessLevel(prev)}`}) if pipegen set it and no other project relies on it, or run \`pipegen uninstall\` again and type ${CENTRAL_REPO}.`;
       await o.outcome(`central Actions access of ${full}`, undefined, async () => {
         // V9a (V8 sec M1): a typed-names run puts it back only after `pipelines` is typed for it (V1-R1: every restore asks then)
         let typed: TypedName | undefined;
@@ -369,12 +371,12 @@ export async function runCentral(o: {
     const co = locks.codeowners;
     const ce = co !== undefined && co.created !== true ? now.entries.get(co.path) : undefined;
     if (co !== undefined && ce !== undefined) {
-      const eds = rec.edits.filter((x) => x.repo === 'central' && x.kind === 'codeowners' && x.path === co.path);
       let text: string | null = null;
       try { text = await readBlobText(o.gh, now.ref, ce.sha, MAX_BLOB, api.clock); } catch (x) {
         if (isRateStop(x) || x instanceof GitHubAccessError || statusOf(x) === 401) throw x;
       }
-      const still = text === null || text.includes(CODEOWNERS_BEGIN) || text.includes(CODEOWNERS_END) || eds.some((x) => 'inserted' in x && typeof x.inserted === 'string' && x.inserted !== '' && (text as string).includes(x.inserted));
+      // pipegen's block always sits between its markers (revert.ts textFormProblem): a marker left is its block, or part of it
+      const still = text === null || text.includes(CODEOWNERS_BEGIN) || text.includes(CODEOWNERS_END);
       if (still) fail(`central ${show(co.path)}`, text === null ? 'pipegen couldn\'t read it after the central pull request merged, so it can\'t tell pipegen\'s block is gone' : 'pipegen\'s block is still in it after the central pull request merged', `Take pipegen's block out of ${co.path} in ${full} by hand, then run \`pipegen uninstall\` again.`);
     }
     // V9a-R2 (sec N1): the Actions access level pipegen set, still set (a kept or declined restore in an earlier run)
@@ -388,7 +390,9 @@ export async function runCentral(o: {
       }
       // another level than pipegen's is not pipegen's any more (the owner set it): only pipegen's level, or no answer, is left over
       if (level === set || typeof level !== 'string') {
-        fail(`central Actions access of ${full}`, level === set ? 'it is still the level pipegen set after the central pull request merged' : 'pipegen can\'t tell it is back to the level before pipegen', `Check Settings → Actions → Access of ${full}: put it back to ${prev} by hand if no other project relies on it (gh api -X PUT repos/${full}/actions/permissions/access -f access_level=${prev}), then run \`pipegen uninstall\` again.`);
+        fail(`central Actions access of ${full}`, level === set ? 'it is still the level pipegen set after the central pull request merged' : 'pipegen can\'t tell it is back to the level before pipegen', (accessLevel(prev) === null
+          ? `Check Settings → Actions → Access of ${full}: put it back to the level it had before pipegen by hand if no other project relies on it, then run \`pipegen uninstall\` again.`
+          : `Check Settings → Actions → Access of ${full}: put it back to ${accessLevel(prev)} by hand if no other project relies on it (gh api -X PUT repos/${full}/actions/permissions/access -f access_level=${accessLevel(prev)}), then run \`pipegen uninstall\` again.`));
       }
     }
     return out;

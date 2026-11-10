@@ -60,7 +60,7 @@ import { ensureSigningEnvironment, pathClash, plannedOfLocks, readEnv, SETUP_BRA
 import { compareStatus, DeliverError, isoAt, readBlobText, readHead, readRepo, readTree, statusOf, type RepoRef, type TreeEntry } from './git-data.js';
 import { holdAppLease, isLeaseStop, stateDepsOf, type ReleaseLease } from '../proof/lease.js';
 import type { StateStore } from '../proof/state.js';
-import { centralOf, centralUpdateBranch, localFinishPendingPath, protectedPathsOfRecord, readFinishPending, readLocalRecord, RecordError, writeFinishPending, type RecordedEdit, writeRecord, type FinishPending, type LocalRecordDeps } from './record.js';
+import { ACCESS_LEVELS, centralOf, centralUpdateBranch, localFinishPendingPath, protectedPathsOfRecord, readFinishPending, readLocalRecord, RecordError, writeFinishPending, type RecordedEdit, writeRecord, type FinishPending, type LocalRecordDeps } from './record.js';
 import { classicPutForm, holdsWanted, isObj, PLANNED_ROUTES, refusedAsUnavailable, SettingsApi } from './settings-api.js';
 import { trustedPrevious } from './trust.js';
 
@@ -490,7 +490,8 @@ async function actionsAccess(x: Ctx): Promise<void> {
       return;
     }
     if (x.print) { x.commands.push(apiCmd('PUT', '/repos/{owner}/{repo}/actions/permissions/access', p, { access_level: level })); return; }
-    const prev = prior ?? (cur !== null && /^[a-z_]{1,40}$/.test(cur) ? { previous: cur } : undefined);
+    // V9a-R2: only a level GitHub names is recorded (the record schema takes no other; uninstall prints it in a step)
+    const prev = prior ?? (cur !== null && (ACCESS_LEVELS as readonly string[]).includes(cur) ? { previous: cur } : undefined);
     if (prior === undefined && prev !== undefined) await keepPending(x, (q) => { q.actionsAccess = prev; });
     await guardedWrite(x, prior === undefined && prev !== undefined ? (q) => { delete q.actionsAccess; } : undefined, () => x.api.write('PUT /repos/{owner}/{repo}/actions/permissions/access', { ...p, access_level: level }));
     if (await read() !== level) throw new StepError('The access level doesn\'t read back as set.');
