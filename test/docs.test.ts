@@ -5,14 +5,16 @@ import { parse as parseJs } from 'acorn';
 import { transformSync } from 'esbuild';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { redact } from '../src/ai/redact.js';
 import { PUSH_CREDIT_WARNING } from '../src/audit/coverage/equivalents.js';
 import { SecretVault } from '../src/create/secrets.js';
 import { cleanForDoc } from '../src/debate/clean.js';
 import { keyOffers } from '../src/debate/builder.js';
 import { prBody } from '../src/deliver/deliver.js';
+import { partOf, PART_TITLE, type PartId } from '../src/audit/parts.js';
 import { docRecomputeProblem, GATE_REASONS, HISTORY_REWRITE_NOTE, pipegenDoc, pipegenDocWith, PipegenDocError, SECTION_TITLES, WARN_MODE_TEXT, ZAP_JSON_VERIFIED, ZAP_TOOL } from '../src/deliver/docs.js';
+import { NEED_ID_CATEGORY } from '../src/engine/need-ids.js';
 import { pipegenDocProblems } from '../src/engine/created-judges/pipegen-doc.js';
 import { referee } from '../src/engine/referee.js';
 import { BOOTSTRAP_PROOFS_NOTE } from '../src/engine/reviewed.js';
@@ -161,14 +163,15 @@ function gateStrings(file: string): { literals: string[]; reasons: string[]; tex
 const count = (text: string, part: string): number => text.split(part).length - 1;
 
 describe('doc: the 18 sections', () => {
-  it('doc: plan limits section comes first', () => {
+  it('doc: plan limits section comes right after What runs when', () => {
     for (const [label, make] of SHAPES) {
       const text = docOf(make());
-      expect(h2(text)[0], label).toBe('What your GitHub plan allows');
+      expect(h2(text)[0], label).toBe('What runs when');
+      expect(h2(text)[1], label).toBe('What your GitHub plan allows');
       expect(text.indexOf('## What your GitHub plan allows'), label).toBeLessThan(text.indexOf('## What pipegen set up'));
-      // all 18, in plan order
+      // all 19, in plan order
       expect(h2(text), label).toEqual([...SECTION_TITLES]);
-      expect(SECTION_TITLES).toHaveLength(18);
+      expect(SECTION_TITLES).toHaveLength(19);
     }
     // the limits are said in the first section: a private repo without branch rules or environments, a Pro/Team suggestion, never "make it public"
     const free = shapeA({ capabilities: { ...ALL_CAPS, branchProtection: false, environments: false }, profile: { ...shapeA().profile, plan: 'free' } });
@@ -182,19 +185,21 @@ describe('doc: the 18 sections', () => {
   it('doc: "Fix a blocked PR" table has a row for every gate block and warn reason', () => {
     for (const [label, make] of SHAPES) {
       const sec = headingAt(docOf(make()), 'Fix a blocked pull request');
-      const rows = sec.split('\n').filter((l) => l.startsWith('|'));
-      expect(rows[0], label).toBe('| Message | What it means | What to do |');
-      expect(rows[1], label).toBe('| --- | --- | --- |');
-      expect(rows.length - 2, label).toBe(GATE_REASONS.length);
+      const lines = sec.split('\n').filter((l) => l.startsWith('|'));
+      // one small table for each part that has rows: a header and a separator, then the rows
+      expect(lines[0], label).toBe('| What it means | What to do | The gate says |');
+      expect(lines[1], label).toBe('| --- | --- | --- |');
+      const rows = lines.filter((l) => l !== '| What it means | What to do | The gate says |' && l !== '| --- | --- | --- |');
+      expect(rows.length, label).toBe(GATE_REASONS.length);
       for (const r of GATE_REASONS) {
-        const row = rows.find((x) => x.startsWith(`| ${r.message} |`));
+        const row = rows.find((x) => x.endsWith(` | ${r.message} |`));
         expect(row, `${label}: ${r.id}`).toBeDefined();
         expect(row?.split(' | ').length, r.id).toBe(3);
         expect(row).toContain(r.means);
         expect(row).toContain(r.todo);
       }
     }
-    // the first column is the gate's own leading text: each one is found in a string of the gate's CODE (decide.ts, settings.ts, integrity.ts; comments do not count),
+    // the last column is the gate's own leading text: each one is found in a string of the gate's CODE (decide.ts, settings.ts, integrity.ts; comments do not count),
     // so a user can copy a line of the summary and find its row
     const ids = GATE_REASONS.map((r) => r.id);
     const decide = gateStrings('decide.ts');
@@ -434,7 +439,7 @@ describe('doc: the referee and the judge', () => {
       // pure: the same draft gives the same bytes
       expect(pipegenDoc(d, REVIEWED), label).toEqual(f);
       // one changed byte that the line judge accepts: refused by the recompute
-      for (const [what, bad] of [['an appended word', `${f.content}Extra.\n`], ['a changed word', f.content.replace('plain English', 'plain Englis')], ['a dropped line', f.content.replace(/^- Gate: .*\n/m, '')]] as const) {
+      for (const [what, bad] of [['an appended word', `${f.content}\nExtra.\n`], ['a changed word', f.content.replace('plain English', 'plain Englis')], ['a dropped line', f.content.replace(/^- Gate: .*\n/m, '')]] as const) {
         const file = { ...f, content: bad };
         expect(pipegenDocProblems(bad, judgeOpts(d)), `${label} ${what} passes the line judge`).toEqual([]);
         expect(docIssues(await run([file], d)).join('\n'), `${label} ${what}`).toMatch(/not the file pipegen builds from the draft/);
@@ -1259,7 +1264,9 @@ describe('doc: fix round 1 (ruling G9-R1)', () => {
     const two: CreatedFile = { ...inserted, path: '.github/workflows/site.yml' };
     const d = shapeB({ created: [inserted, two], notProven: [] });
     const sec = headingAt(docOf(d), 'Not proven yet');
-    expect(sec).toContain('Part deploy-verify: pipegen edited ".github/workflows/deploy.yml" (it added the verify job, `needs` entries and its head check as the first step of each deploy job, except a job that calls another workflow, or one pipegen gates only for its runner or vars and can not start with the check (see the notes)). Check the edit by hand before you rely on it.');
+    // PL-D6: the long text is cut between sentences into bullets of at most 300 characters
+    expect(sec).toContain('- Part deploy-verify: pipegen edited ".github/workflows/deploy.yml". It added the verify job, `needs` entries and its head check as the first step of each deploy job, except a job that calls another workflow, or one it gates only for its runner or vars (see the notes).');
+    expect(sec).toContain('Check the edit by hand before you rely on it.');
     expect(sec).toContain('".github/workflows/site.yml"');
     expect(sec).not.toContain('Every check pipegen set up is proven.');
     expect(headingAt(docOf(base), 'Not proven yet')).toContain('Every check pipegen set up is proven.');
@@ -1416,12 +1423,12 @@ describe('doc: fix round 1 (ruling G9-R1)', () => {
     expect(warn).not.toMatch(/\bblock/i);
     const table = headingAt(text, 'Fix a blocked pull request');
     expect(table).toContain('Nothing requires it to pass on this repository');
-    for (const row of table.split('\n').filter((l) => l.startsWith('| ') && !l.startsWith('| Message') && !l.startsWith('| ---'))) {
+    for (const row of table.split('\n').filter((l) => l.startsWith('| ') && !l.startsWith('| What it means') && !l.startsWith('| ---'))) {
       const cells = row.split(' | ');
-      expect(cells.slice(1).join(' | '), row.slice(0, 50)).not.toMatch(/\bblock/i);
+      expect(cells.slice(0, 2).join(' | '), row.slice(0, 50)).not.toMatch(/\bblock/i);
     }
     expect(table).toContain('fails the gate');
-    // the first column is still the gate's own words
+    // the last column is still the gate's own words
     expect(table).toContain('| a new critical, high or secret finding blocks in any mode |');
     // required: the words stay
     const req = docOf(shapeA());
@@ -1561,5 +1568,214 @@ describe('doc: G17 group E (rows 57-61, 65 and the G16 carry)', () => {
     expect(night2).toContain('the app the nightly run starts in containers.');
     expect(night2).not.toContain('image build');
     for (const d of [withScorecard, noCs, zz]) expect(problems(d), 'judge').toEqual([]);
+  });
+});
+
+// Plan P Task PL-D6: PIPEGEN.md by parts. The file opens with "What runs when" in the report's six parts, the long bullets are split, the gate table
+// puts plain words first and the gate's own message last, grouped by part, and the glossary is folded away. Version and date come from the draft.
+describe('PL-D6: PIPEGEN.md by parts', () => {
+  const PARTS = [1, 2, 3, 4, 5, 6] as const;
+  const stamped = (make: (o?: Partial<PipelineDraft>, d?: Partial<PipelineDoc>) => PipelineDraft, over: Partial<PipelineDraft> = {}): PipelineDraft => make(over, { version: '0.2.0', date: '2026-11-10' });
+  /** The fixtures of the file: both shapes, and the variants that print the most (no plan features, hook files, long notes). */
+  const FIXTURES: readonly [string, PipelineDraft][] = [
+    ['A', stamped(shapeA)], ['B', stamped(shapeB)],
+    ['A without branch rules', stamped(shapeA, { capabilities: { ...ALL_CAPS, branchProtection: false, environments: false }, profile: { ...shapeA().profile, plan: 'free' } })],
+    ['A with hooks', { ...shapeAHooks(SETUP_COMMANDS.husky, {}, { version: '0.2.0', date: '2026-11-10' }) }],
+    ['A with no signing', stamped(shapeA, { signing: undefined })],
+  ];
+  const sectionOf = (text: string, title: string): string => headingAt(text, title);
+  const NEED_CAT = (n: Need): string => (Object.hasOwn(NEED_ID_CATEGORY, n.id) ? (NEED_ID_CATEGORY as Readonly<Record<string, string>>)[n.id] as string : n.category);
+  /** The part each gate reason is grouped under (written out here so a row moved to another part is seen): the checks of every pull request, the gate's own rules and settings, the image scan. */
+  const IDS_BY_PART: Readonly<Record<number, readonly string[]>> = {
+    2: ['new-finding', 'secret-in-range', 'range-unproven', 'malicious', 'licence', 'tool-error', 'did-not-report', 'fork-not-run', 'not-proven', 'non-blocking', 'warn-first',
+      'warn-first-finding', 'not-proven-finding', 'non-blocking-finding', 'failed-check', 'no-coverage', 'skipped'],
+    3: ['dependency-review', 'protected-path', 'suppression', 'incomplete-list', 'no-patch', 'case-extension', 'integrity-banner', 'installing', 'missing-check', 'empty-list', 'tampered', 'no-base',
+      'settings-input-refused', 'settings-input-missing', 'settings-jobs', 'settings-mode-name', 'settings-mode', 'settings-policy', 'settings-floor', 'settings-skip', 'settings-warn-first', 'warn-mode', 'warn-ended'],
+    4: ['image-no-base'],
+  };
+  const GATE_PART: Readonly<Record<string, PartId>> = Object.fromEntries(Object.entries(IDS_BY_PART).flatMap(([part, ids]) => ids.map((id) => [id, Number(part) as PartId])));
+
+  it('first section is What runs when, parts in order', () => {
+    expect(SECTION_TITLES[0]).toBe('What runs when');
+    expect(SECTION_TITLES[1]).toBe('What your GitHub plan allows');
+    for (const [label, d] of FIXTURES) {
+      const text = docOf(d);
+      expect(h2(text)[0], label).toBe('What runs when');
+      expect(h2(text)[1], label).toBe('What your GitHub plan allows');
+      expect(h2(text), label).toEqual([...SECTION_TITLES]);
+      const sec = sectionOf(text, 'What runs when');
+      const heads = sec.split('\n').filter((l) => l.startsWith('### ')).map((l) => l.slice(4));
+      expect(heads, label).toEqual(PARTS.map((n) => PART_TITLE[n]));
+      // every need of the draft is printed once, under the part partOf gives it; an empty part says so
+      const bodyOf = (part: PartId): string[] => {
+        const at = sec.indexOf(`### ${PART_TITLE[part]}\n`);
+        const next = part === 6 ? -1 : sec.indexOf(`### ${PART_TITLE[(part + 1) as PartId]}\n`);
+        return sec.slice(at, next < 0 ? undefined : next).split('\n').filter((l) => l.startsWith('- '));
+      };
+      const total = PARTS.reduce((n, part) => n + bodyOf(part).filter((l) => !l.startsWith('- No check')).length, 0);
+      expect(total, label).toBe(d.needs.length);
+      for (const part of PARTS) {
+        const mine = d.needs.filter((n) => partOf({ category: NEED_CAT(n), layer: n.layer }) === part);
+        const lines = bodyOf(part);
+        if (mine.length === 0) { expect(lines, `${label} part ${part}`).toEqual(['- No check of this part is set up here.']); continue; }
+        expect(lines.length, `${label} part ${part}`).toBe(mine.length);
+      }
+      // the mode of a check is never left out: a check that is not set up says so here too
+      for (const n of d.needs.filter((x) => x.layer === 'pre-commit')) expect(sec, label).toMatch(/Blocks the commit|Warns only|Not set up/);
+      expect(problems(d, text), label).toEqual([]);
+    }
+    // a push-layer check says so, so it is not taken for the merge-layer check of the same name
+    const scanLines = sectionOf(docOf(FIXTURES[0]![1]), 'What runs when').split('\n').filter((l) => l.startsWith('- Secret scan'));
+    expect(scanLines.filter((l) => l.startsWith('- Secret scan (on a push, no pull request), tool ')).length).toBe(1);
+    expect(scanLines.length).toBe(3);   // pre-commit, push, merge
+    // a check with no tool is printed as not set up in its part
+    const none = stamped(shapeA, { steps: [] });
+    const line = sectionOf(docOf(none), 'What runs when').split('\n').find((l) => l.startsWith('- Code scan')) as string;
+    expect(line).toMatch(/Not set up|Runs for information/);
+  });
+
+  it('no bullet over 300 characters', () => {
+    const long = new Set<string>();
+    for (const [, d] of FIXTURES) for (const l of docOf(d).split('\n')) if (/^\s*- /.test(l) && l.length > 300) long.add(`${l.length}: ${l.slice(0, 70)}`);
+    expect([...long]).toEqual([]);
+    // sec M3: the edited-deploy-file note with the longest path q keeps (160) stays within the cap too
+    const longPath = `.github/workflows/${'d'.repeat(200)}.yml`;
+    const edited: CreatedFile = { path: longPath, content: 'x', part: 'deploy-verify', reason: 'verify', repo: 'app', inserted: { original: 'o', jobs: ['pipegen-verify'], needs: [] } };
+    const editedLines = headingAt(docOf(shapeB({ created: [edited], notProven: [] })), 'Not proven yet').split('\n').filter((l) => l.startsWith('- '));
+    expect(editedLines.some((l) => l.includes('pipegen edited'))).toBe(true);
+    for (const l of editedLines) expect(l.length, l.slice(0, 70)).toBeLessThanOrEqual(300);
+    // the fixtures do not reach every line the builder can print (compose file, publishing, edited deploy files): so no fixed bullet of the source is over 300 either
+    // (a longer text goes through d.lis, which cuts it between sentences), read from the syntax tree
+    const js = transformSync(readFileSync(new URL('../src/deliver/docs.ts', import.meta.url), 'utf8'), { loader: 'ts', target: 'esnext', format: 'esm' }).code;
+    type N = { type: string; [k: string]: unknown };
+    const texts = (n: N | undefined): string[] => {
+      if (n === undefined) return [];
+      if (n.type === 'Literal' && typeof n.value === 'string') return [n.value];
+      if (n.type === 'TemplateLiteral') return [(n.quasis as { value: { cooked: string } }[]).map((x) => x.value.cooked).join('')];
+      if (n.type === 'ConditionalExpression') return [...texts(n.consequent as N), ...texts(n.alternate as N)];
+      return [];
+    };
+    const over: string[] = [];
+    let seen = 0;
+    const walk = (n: unknown): void => {
+      if (n === null || typeof n !== 'object') return;
+      if (Array.isArray(n)) { n.forEach(walk); return; }
+      const node = n as N;
+      if (node.type === 'CallExpression') {
+        const c = node.callee as N;
+        if (c.type === 'MemberExpression' && (c.object as N).name === 'd' && (c.property as N).name === 'li') for (const t of texts((node.arguments as N[])[0])) { seen++; if (t.length > 300) over.push(`${t.length}: ${t.slice(0, 60)}`); }
+      }
+      for (const k of Object.keys(node)) walk(node[k]);
+    };
+    walk(parseJs(js, { ecmaVersion: 'latest', sourceType: 'module' }));
+    expect(seen).toBeGreaterThan(80);
+    expect(over).toEqual([]);
+  });
+
+  it('gate table rows start with words, end with the rule id', () => {
+    for (const [label, d] of FIXTURES) {
+      const sec = sectionOf(docOf(d), 'Fix a blocked pull request');
+      const rows = sec.split('\n').filter((l) => l.startsWith('|') && !/^\|[ |:-]+$/.test(l));
+      const heads = rows.filter((l) => l.startsWith('| What it means |'));
+      expect(heads.length, label).toBeGreaterThan(0);
+      for (const h of heads) expect(h, label).toBe('| What it means | What to do | The gate says |');
+      const body = rows.filter((l) => !l.startsWith('| What it means |'));
+      expect(body.length, label).toBe(GATE_REASONS.length);
+      for (const r of GATE_REASONS) {
+        const row = body.find((x) => x.endsWith(`| ${r.message} |`));
+        expect(row, `${label}: ${r.id}`).toBeDefined();
+        const cells = (row as string).slice(2, -2).split(' | ');
+        expect(cells, r.id).toHaveLength(3);
+        expect(cells[0], r.id).toMatch(/^[A-Za-z]+ [A-Za-z]+/);   // words first
+        expect(cells[2], r.id).toBe(r.message);                   // the gate's own text or rule name last
+        expect(cells[0], r.id).not.toBe(r.message);
+      }
+      // grouped by part: one table for each part that has rows, in part order, under that part's title
+      const heads3 = sec.split('\n').filter((l) => l.startsWith('### ')).map((l) => l.slice(4));
+      expect(heads3.length, label).toBeGreaterThan(0);
+      const order = heads3.map((t) => PARTS.find((n) => PART_TITLE[n] === t));
+      expect(order.every((x) => x !== undefined), label).toBe(true);
+      expect(order, label).toEqual([...order].sort((a, b) => (a as number) - (b as number)));
+      // every row sits under the part GATE_PART gives it
+      for (const r of GATE_REASONS) {
+        const at = sec.split('\n').findIndex((l) => l.endsWith(`| ${r.message} |`));
+        const above = sec.split('\n').slice(0, at).filter((l) => l.startsWith('### ')).pop();
+        expect(above, r.id).toBe(`### ${PART_TITLE[GATE_PART[r.id] as PartId]}`);
+      }
+      for (const r of GATE_REASONS) {
+        expect(GATE_PART[r.id], `${r.id} has a part`).toBeDefined();
+      }
+    }
+  });
+
+  it('glossary inside <details>', () => {
+    for (const [label, d] of FIXTURES) {
+      const text = docOf(d);
+      const lines = text.split('\n');
+      const words = lines.indexOf('## Words used');
+      expect(words, label).toBeGreaterThan(0);
+      expect(lines[words + 1], label).toBe('');
+      expect(lines[words + 2], label).toBe('<details>');
+      expect(lines[words + 3], label).toBe('<summary>Show the words used</summary>');
+      expect(lines[words + 4], label).toBe('');
+      const end = lines.indexOf('</details>');
+      expect(end, label).toBeGreaterThan(words + 5);
+      expect(lines[end - 1], label).toBe('');
+      expect(lines[end - 2], label).not.toBe('');
+      expect(lines.slice(words + 5, end).filter((l) => l.startsWith('- ')).length, label).toBeGreaterThanOrEqual(12);
+      expect(lines.slice(end + 1).join('').trim(), label).toBe('');
+      expect(text.split('<details>').length - 1, label).toBe(1);
+      expect(text.split('</details>').length - 1, label).toBe(1);
+      expect(problems(d, text), label).toEqual([]);
+    }
+  });
+
+  it('docRecomputeProblem → null for every fixture', () => {
+    for (const [label, d] of FIXTURES) {
+      const file = pipegenDoc(d, REVIEWED);
+      expect(docRecomputeProblem(file, d, REVIEWED), label).toBeNull();
+    }
+    // the date and the version come from the draft, never from the clock: another day on the clock changes nothing
+    const d = stamped(shapeA);
+    try {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2031-05-06T07:08:09Z'));
+      const a = pipegenDoc(d, REVIEWED);
+      vi.setSystemTime(new Date('2031-05-07T07:08:09Z'));
+      const b = pipegenDoc(d, REVIEWED);
+      expect(a.content).toBe(b.content);
+      expect(a.content).toContain('2026-11-10');
+      expect(a.content).not.toContain('2031');
+      expect(docRecomputeProblem(a, d, REVIEWED)).toBeNull();
+    } finally { vi.useRealTimers(); }
+    // a file with another date than the draft's is not the file the builder makes
+    const file = pipegenDoc(d, REVIEWED);
+    expect(docRecomputeProblem({ ...file, content: file.content.replace('2026-11-10', '2026-11-11') }, d, REVIEWED)).toMatch(/not the file pipegen builds/);
+  });
+
+  it('CrisWorking line present', () => {
+    for (const [label, d] of FIXTURES) {
+      const sec = sectionOf(docOf(d), 'What pipegen set up');
+      expect(sec, label).toContain('- pipegen v0.2 is for repositories owned by CrisWorking. A public repository uses the gate in the normal way.');
+    }
+  });
+
+  it('version and date sit under the title; a missing or odd one is left out', () => {
+    const lines = docOf(stamped(shapeA)).split('\n');
+    expect(lines[0]).toBe('# What pipegen set up in this repository');
+    expect(lines[2]).toBe('Written by pipegen 0.2.0 on 2026-11-10.');
+    expect(lines[4]).toMatch(/^pipegen wrote this file in plain English/);
+    expect(docOf(shapeA({}, { version: '0.2.0' })).split('\n')[2]).toBe('Written by pipegen 0.2.0.');
+    expect(docOf(shapeA({}, { date: '2026-11-10' })).split('\n')[2]).toBe('Written by pipegen on 2026-11-10.');
+    expect(docOf(shapeA()).split('\n')[2]).toMatch(/^pipegen wrote this file in plain English/);
+    for (const bad of ['0.2', 'v0.2.0', '0.2.0 and more', '0.2.0\n- injected', '<b>1.2.3</b>', '1.2.3-' + 'x'.repeat(50)]) {
+      expect(docOf(shapeA({}, { version: bad, date: '2026-11-10' })).split('\n')[2], bad).toBe('Written by pipegen on 2026-11-10.');
+    }
+    for (const bad of ['2026-13-01', '2026-02-30', '26-11-10', '2026-11-10T00:00:00Z', 'today', '2026-11-10\n- injected', '2026-1-1']) {
+      expect(docOf(shapeA({}, { version: '0.2.0', date: bad })).split('\n')[2], bad).toBe('Written by pipegen 0.2.0.');
+    }
+    // the doc's own shape check refuses a version or date that is not text
+    expect(docRecomputeProblem(pipegenDoc(stamped(shapeA), REVIEWED), { ...stamped(shapeA), doc: { ...EMPTY_DOC, version: 7 as unknown as string } }, REVIEWED)).toMatch(/version/);
+    expect(docRecomputeProblem(pipegenDoc(stamped(shapeA), REVIEWED), { ...stamped(shapeA), doc: { ...EMPTY_DOC, date: 7 as unknown as string } }, REVIEWED)).toMatch(/date/);
   });
 });

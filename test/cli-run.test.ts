@@ -562,6 +562,17 @@ describe('G13: stages 8-15', () => {
     expect(doc.transcript).toEqual(['t']);
   });
 
+  it('PL-D6: the run hands PIPEGEN.md its version and day, and docFor carries them into draft.doc', async () => {
+    const w = world();
+    await run(w);
+    expect(w.builds[0]?.today).toBe(TODAY);
+    expect(w.builds[0]?.version === null || /^\d+\.\d+\.\d+/.test(w.builds[0]?.version ?? '')).toBe(true);
+    const base = { transcript: [], verify: { gaps: [], notes: [], preview: [] }, locks: { notes: [], gateRequired: true }, precommit: { setupCommand: '', notes: [] }, jobs: { notes: [], uncoveredMinimum: [] }, assembledNotes: [], testNotes: [], credits: [], estimates: { monthlyMinutes: 1, includedMinutes: 2 }, prWaitMinutes: 3, strictness: 'standard' as const };
+    expect(docFor({ ...base, version: '0.2.0', date: '2026-11-06' })).toMatchObject({ version: '0.2.0', date: '2026-11-06' });
+    const bare = docFor(base);
+    expect('version' in bare || 'date' in bare).toBe(false);
+  });
+
   it('run: the workflow-call note (VerifyPlan.notes) lands in draft.doc.notes for PIPEGEN.md (G7 spec m3)', () => {
     const note = 'it is started by workflow_call, not only by a push, so pipegen adds no check to it';
     const doc = docFor({ transcript: [], verify: { gaps: [], notes: [note], preview: [] }, locks: { notes: [], gateRequired: true }, precommit: { setupCommand: '', notes: [] }, jobs: { notes: [], uncoveredMinimum: [] }, assembledNotes: [], testNotes: [], credits: [], estimates: { monthlyMinutes: 1, includedMinutes: 2 }, prWaitMinutes: 1, strictness: 'standard' });

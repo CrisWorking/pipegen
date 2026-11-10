@@ -342,7 +342,7 @@ describe('G17B-R1 round 2: PIPEGEN.md says the DAST limits', () => {
     const doc = pipegenDoc(a.draft, REVIEWED).content;
     expect(doc).toContain('The running app scan talks to ZAP through its API, which answers only 127.0.0.1, so the scanned app can not reach it.');
     expect(doc).toContain('With pipegen\'s compose file, the running app scan builds the app\'s image itself, in its own job: a second build of the same Dockerfile. The image scan reads the other build.');
-    expect(doc).toContain('The app containers in pipegen\'s compose file run with no Linux capability and no privilege gain, and the database and queue containers with no privilege gain. An app image that needs a capability (a root entrypoint that switches users or changes file owners) does not start: run the app as a non-root user.');
+    expect(doc).toContain('The app containers in pipegen\'s compose file run with no Linux capability and no privilege gain, and the database and queue containers with no privilege gain.\n- An app image that needs a capability (a root entrypoint that switches users or changes file owners) does not start: run the app as a non-root user.');
     // without a compose file, the archive start: no second build line
     const b = assemble(planned(profileOf([web()]), { over: SKIP_DEPLOY }));
     const docB = pipegenDoc(b.draft, REVIEWED).content;

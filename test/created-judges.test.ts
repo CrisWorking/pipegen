@@ -837,6 +837,45 @@ describe('pipegen-doc judge', () => {
     expect(docText('# t\n\n```\r\nx\r\n```\r\n')).toBe('');
     expect(docText('# t\n\n```\nx\n```\n```\ny\n```\n')).toBe('');
   });
+  it('PL-D6: the three fixed folding lines pass; any other HTML, a changed summary, a loose or unclosed line is refused', () => {
+    const FOLD = '<details>\n<summary>Show the words used</summary>\n\n- Gate: the check.\n\n</details>\n';
+    expect(docText(`# t\n\n## Words used\n\n${FOLD}`)).toBe('');
+    // a fence and a table inside the folded part are as safe as outside it
+    expect(docText('# t\n\n<details>\n<summary>Show the words used</summary>\n\n```text\n<div>x</div>\n```\n\n| a | b |\n\n</details>\n')).toBe('');
+    // each wrong line sits where the right one belongs, in an otherwise correct fold, so only that line can be the reason
+    const S = '<summary>Show the words used</summary>';
+    for (const bad of ['<details open>', '<details >', ' <details>', '<details> x', '<DETAILS>', '<details/>', '<details>\t', '<details class="x">']) {
+      expect(docText(`# t\n\n${bad}\n${S}\n\n- x\n\n</details>\n`), JSON.stringify(bad)).not.toBe('');
+    }
+    for (const bad of [`${S} x`, '<summary>Other words</summary>', '<summary class="x">Show the words used</summary>', '<summary>Show the words used</summary >', ' <summary>Show the words used</summary>', '<summary>Show the words used']) {
+      expect(docText(`# t\n\n<details>\n${bad}\n\n- x\n\n</details>\n`), JSON.stringify(bad)).not.toBe('');
+    }
+    for (const bad of ['</details> x', '</ details>', '</details >', ' </details>', '</DETAILS>', '</details>\t']) {
+      expect(docText(`# t\n\n<details>\n${S}\n\n- x\n\n${bad}\n\n</details>\n`), JSON.stringify(bad)).not.toBe('');
+    }
+    for (const bad of ['<script>alert(1)</script>', `<details>${S}`, '<img src=x>', '<b>x</b>']) {
+      expect(docText(`# t\n\n${bad}\n\n- x\n`), JSON.stringify(bad)).not.toBe('');
+    }
+    // the lines must come in order and in pairs
+    expect(docText('# t\n\n<details>\n\n- x\n\n</details>\n')).toMatch(/summary/);
+    expect(docText('# t\n\n<summary>Show the words used</summary>\n\n- x\n')).toMatch(/summary/);
+    expect(docText('# t\n\n</details>\n')).toMatch(/details/);
+    expect(docText('# t\n\n<details>\n<summary>Show the words used</summary>\n\n- x\n')).toMatch(/never closed/);
+    expect(docText('# t\n\n<details>\n<summary>Show the words used</summary>\n<details>\n<summary>Show the words used</summary>\n\n</details>\n</details>\n')).toMatch(/inside a folded section/);
+    expect(docText('# t\n\n<details>\n<summary>Show the words used</summary>\n\n</details>\n</details>\n')).toMatch(/no <details>/);
+    // sec I1/M2 (PL-D6 fold R2): GitHub ends the HTML block a fold line opens only at a blank line, so a fence right after a fold line is swallowed
+    // as HTML and the "fenced" text renders as live Markdown; the summary must come right after <details>, an empty line right after the other two
+    const PAY = '```text\n[a](https://evil.example) <img src=x> @octocat\n```\n';
+    expect(docText(`# t\n\n<details>\n${S}\n${PAY}\n</details>\n`)).toMatch(/not followed by an empty line/);
+    expect(docText(`# t\n\n<details>\n${PAY}${S}\n\n</details>\n`)).toMatch(/not followed right away by its <summary>/);
+    expect(docText(`# t\n\n<details>\n${S}\n\n- x\n\n</details>\n${PAY}`)).toMatch(/not followed by an empty line/);
+    expect(docText(`# t\n\n<details>\nhidden words\n${S}\n\n- x\n\n</details>\n`)).toMatch(/not followed right away by its <summary>/);
+    // the end of the file right after </details> is fine
+    expect(docText(`# t\n\n<details>\n${S}\n\n- x\n\n</details>`)).toBe('');
+    // inside a fence the three lines are plain text, so they do not count
+    expect(docText('# t\n\n```text\n</details>\n```\n')).toBe('');
+    expect(docText('# t\n\n```text\n<details>\n```\n')).toBe('');
+  });
   it('fuzz: a line built from allowed words with one forbidden character in it is always refused', () => {
     let seed = 12345;
     const rnd = (n: number) => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; };

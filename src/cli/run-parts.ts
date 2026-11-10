@@ -193,6 +193,8 @@ export interface DocInputs {
   estimates: Pick<Estimates, 'monthlyMinutes' | 'includedMinutes'>;
   prWaitMinutes: number;
   strictness: Strictness;
+  /** PL-D6: shown under the title of PIPEGEN.md; the builder prints them only when plain. */
+  version?: string; date?: string;
 }
 
 /** draft.doc, filled completely (carry 31): every note list in one generic list, the AI note dropped, the transcript as the debate gave it. */
@@ -209,6 +211,8 @@ export function docFor(i: DocInputs): PipelineDoc {
     uncoveredMinimum: i.jobs.uncoveredMinimum.map((u) => ({ category: u.category, why: u.why, ...(u.service === undefined ? {} : { service: u.service }) })),
     notes: [...new Set(notes)],
     credits: i.credits.map((c) => ({ text: c.text, kind: c.kind })),
+    ...(i.version === undefined ? {} : { version: i.version }),
+    ...(i.date === undefined ? {} : { date: i.date }),
     ...(i.precommit.inPlace === undefined || i.precommit.inPlace.length === 0 ? {} : { hooksInPlace: i.precommit.inPlace.map((h) => ({ path: h.path, runs: [...h.runs] })) }),
   };
 }
