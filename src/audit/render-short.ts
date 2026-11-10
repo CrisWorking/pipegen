@@ -84,10 +84,12 @@ function gapsOf(r: AuditReport): { serious: Gap[]; other: Gap[] } {
   const lines = new Map<string, Gap>();
   for (const { cov, serious } of perService.values()) {
     const svc = cov.need.service;
-    const key = `${cov.need.id}\u0000${groupOf(cov)}\u0000${cov.status}\u0000${serious ? 1 : 0}\u0000${svc === undefined ? cov.why : ''}`;
+    // PL-A3: the tool is the service's own, so services with different tools split into one line per tool
+    const tool = toolFor(tools, cov.need.id, svc);
+    const key = `${cov.need.id}\u0000${groupOf(cov)}\u0000${cov.status}\u0000${serious ? 1 : 0}\u0000${svc === undefined ? cov.why : ''}\u0000${tool ?? ''}`;
     const prev = lines.get(key);
     if (prev === undefined) {
-      lines.set(key, { check: label(cov), services: svc === undefined ? [] : [svc], why: cov.why, tool: tools.get(cov.need.id) ?? null, partial: cov.status === 'partial', serious, floor: cov.need.floor, category: cov.need.category });
+      lines.set(key, { check: label(cov), services: svc === undefined ? [] : [svc], why: cov.why, tool, partial: cov.status === 'partial', serious, floor: cov.need.floor, category: cov.need.category });
     } else if (svc !== undefined) prev.services.push(svc);
   }
   const all = [...lines.values()];
@@ -95,18 +97,30 @@ function gapsOf(r: AuditReport): { serious: Gap[]; other: Gap[] } {
   return { serious: ranked.filter((g) => g.serious), other: ranked.filter((g) => !g.serious) };
 }
 
-/** The tool the setup names for each check id (the first row with one): a reviewed tool, or the repo's own tool or script. pipegen's own checks name none. */
+const toolKey = (id: string, service: string | undefined) => `${id}\u0000${service ?? ''}`;
+
+/**
+ * The tool the setup names for each check id and service (the first row with one): a reviewed tool, or the repo's own
+ * tool or script. pipegen's own checks name none. PL-A3: keyed by service too, so a node and a python service each name
+ * their own lint tool.
+ */
 function toolsOf(r: AuditReport): Map<string, string> {
   const out = new Map<string, string>();
   for (const w of r.wouldAdd) {
     const t = w.tool;
-    if (t === null || out.has(w.need.id)) continue;
+    const key = toolKey(w.need.id, w.need.service);
+    if (t === null || out.has(key)) continue;
     if ('kind' in t) {
-      if (t.kind === 'repo-tool') out.set(w.need.id, `your own ${t.tool}`);
-      else if (t.kind === 'project-script') out.set(w.need.id, `your own ${t.script} script`);
-    } else out.set(w.need.id, t.candidate.name);
+      if (t.kind === 'repo-tool') out.set(key, `your own ${t.tool}`);
+      else if (t.kind === 'project-script') out.set(key, `your own ${t.script} script`);
+    } else out.set(key, t.candidate.name);
   }
   return out;
+}
+
+/** The tool for a check on a service: the service's own row, else a repo-wide row of the check; never another service's. */
+function toolFor(tools: Map<string, string>, id: string, service: string | undefined): string | null {
+  return tools.get(toolKey(id, service)) ?? tools.get(toolKey(id, undefined)) ?? null;
 }
 
 const plainLine = (g: Gap): GapLine => ({ check: g.check, services: g.services, why: g.why, tool: g.tool });

@@ -11,7 +11,7 @@ import { cantSeeFor, CANT_SEE, ctxFor, layerViews, renderJson, renderLocalTermin
 import { newRateBudget } from '../src/engine/github-rate.js';
 import type { Capabilities, ProjectType, RepoProfile, ServiceType } from '../src/types.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
-import { CHECK, freePrivateReport, need, TREE } from './fixtures/audit-report.js';
+import { CHECK, freePrivateReport, need, reviewedTool, TREE } from './fixtures/audit-report.js';
 
 afterEach(cleanupRepos);
 
@@ -311,6 +311,36 @@ describe('short report: ranking, merging and plan limits', () => {
     expect(g.fixFirst).toHaveLength(1);
     expect(g.fixFirst[0]?.services).toEqual(['a', 'b', 'c']);
     expect(renderTerminal({ ...r, coverage: rows, wouldAdd: [] }, SHORT)).toContain('Code scan (SAST) for a, b and c');
+  });
+
+  it('two services, node and python, missing lint → each names its own tool', () => {
+    const r = report();
+    const rows: Coverage[] = ['web', 'api'].map((s) => ({ need: need('push', 'lint', s), status: 'missing', why: 'No lint.' }));
+    const eslint = reviewedTool('eslint', 'eslint/eslint', 'v9.0.0', ['lint']);
+    const ruff = reviewedTool('ruff', 'astral-sh/ruff-action', 'v3.0.0', ['lint']);
+    const wouldAdd = [
+      { need: rows[0]!.need, status: 'missing' as const, tool: eslint, also: [], note: 'reviewed tool' },
+      { need: rows[1]!.need, status: 'missing' as const, tool: ruff, also: [], note: 'reviewed tool' },
+    ];
+    const g = rankGaps({ ...r, coverage: rows, wouldAdd });
+    const all = [...g.fixFirst, ...g.consider];
+    expect(all.map((x) => `${x.services.join(',')}=${x.tool}`).sort()).toEqual(['api=ruff', 'web=eslint']);
+    const t = renderTerminal({ ...r, coverage: rows, wouldAdd }, SHORT);
+    expect(t).toContain('Lint for web: No lint. [eslint]');
+    expect(t).toContain('Lint for api: No lint. [ruff]');
+  });
+
+  it('two node services, same tool → one line, one tool', () => {
+    const r = report();
+    const rows: Coverage[] = ['web', 'api'].map((s) => ({ need: need('push', 'lint', s), status: 'missing', why: 'No lint.' }));
+    const eslint = reviewedTool('eslint', 'eslint/eslint', 'v9.0.0', ['lint']);
+    const wouldAdd = rows.map((c) => ({ need: c.need, status: 'missing' as const, tool: eslint, also: [], note: 'reviewed tool' }));
+    const g = rankGaps({ ...r, coverage: rows, wouldAdd });
+    const all = [...g.fixFirst, ...g.consider];
+    expect(all).toHaveLength(1);
+    expect(all[0]).toMatchObject({ services: ['web', 'api'], tool: 'eslint' });
+    const t = renderTerminal({ ...r, coverage: rows, wouldAdd }, SHORT);
+    expect(t.split('\n').filter((l) => l.includes('eslint'))).toHaveLength(1);
   });
 
   it('short: at most five in each list, with the count and --verbose for the rest', () => {
