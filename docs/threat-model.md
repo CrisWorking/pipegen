@@ -73,7 +73,7 @@
 | T35 | **Abusing `not-proven`** to switch off the gate | Floor needs can never be not-proven (built into the gate). For private repos, the list lives in central | Non-floor needs marked not-proven by a code owner |
 | T36 | **Scanner config auto-loaded from the repo** turns rules off | Explicit pinned configs, and declared config/ignore files are protected paths | Scanners with undocumented auto-load files (handled by review) |
 | T37 | **Compat copies reach real infrastructure** (self-hosted runners, OIDC) | GitHub-hosted runners only, no `id-token`, `environment` or secrets, `contents: read` | None known |
-| T38 | **The scratch repo is visible to org members** | Base-permission check and warning, delete after proof when possible, HEAD only | An org admin |
+| T38 | **The scratch repo is visible to org members** | Base-permission check and warning, scratch repo emptied after the proof (deleted once the GitHub App login ships), HEAD only | An org admin |
 | T39 | **Runaway AI cost** | Estimate split into input/output, a hard AI cost cap (2×), prompt caching, rule-based failure classification | Estimates can be off for unusual repos |
 
 ### Added in version 5 (spikes S2 and S3, measured on real repos)

@@ -409,7 +409,7 @@ describe('V7 fold 3 (DECISIONS #127): v0.2 uses a fine-grained token; the App is
     const access = readme.slice(readme.indexOf('- **Access:**'), readme.indexOf('- **Shown before anything runs:**'));
     expect(access).toMatch(/in v0\.2 you use a \*\*fine-grained token\*\*/);
     expect(access).not.toMatch(/a GitHub App or fine-grained token/);
-    for (const part of [/gh repo create <owner>\/pipelines --private/, /pipegen-proof-<repo> --private/, /empties the scratch repo after the proof instead of deleting it/, /never deletes these repos or prints a delete command for them/, /GitHub App login \(which makes and deletes these repos itself\) is planned next\./]) expect(access, String(part)).toMatch(part);
+    for (const part of [/gh repo create <owner>\/pipelines --private/, /pipegen-proof-<repo> --private/, /empties the scratch repo after the proof instead of deleting it/, /never deletes these repos itself \(you created them\)/, /GitHub App login \(which makes and deletes these repos itself\) is planned next\./]) expect(access, String(part)).toMatch(part);
     const design = read('docs/design.md');
     const s12 = design.slice(design.indexOf('## 12. Access'), design.indexOf('## 13.'));
     expect(s12).toMatch(/\*\*v0\.2 uses a fine-grained token\*\*/);
