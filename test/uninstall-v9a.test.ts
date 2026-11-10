@@ -38,8 +38,8 @@ const run = (w: World, rec: InstallRecord, t: Term = term(), over: Partial<StepD
   uninstallStep(gh(w), loadedOf(w, rec, lo), t.p, deps(w, over));
 const KEY = ['PIPEGEN_COSIGN', 'KEY'].join('_');
 const ENV_PUT = 'PUT /repos/{owner}/{repo}/environments/{environment_name}';
-const ENV_SECRET_DELETE = `DELETE /repos/{owner}/{repo}/environments/{environment_name}/${SEC}/{secret_name}`;
-const ENV_SECRET_LIST = `GET /repos/{owner}/{repo}/environments/{environment_name}/${SEC}`;
+const ENV_ITEM_DELETE = `DELETE /repos/{owner}/{repo}/environments/{environment_name}/${SEC}/{secret_name}`;
+const ENV_ITEM_LIST = `GET /repos/{owner}/{repo}/environments/{environment_name}/${SEC}`;
 const narrowed = (): Env => ({ id: 9, created_at: AT, wait_timer: 0, prevent_self_review: false, reviewers: [], can_admins_bypass: true,
   deployment_branch_policy: { protected_branches: false, custom_branch_policies: true }, policies: [{ id: 3, name: 'main', type: 'branch' }], stored: new Map([[KEY, AT]]) });
 const envEntry = { name: 'pipegen-signing', created: false, githubCreatedAt: AT, changed: ['deployment_branch_policy' as const], branchPolicyIds: [3],
@@ -60,13 +60,13 @@ describe('V9a sec I1: an environment pipegen narrowed is not widened while its s
     const w = world();
     await afterRun1(w);
     w.app.envs.set('pipegen-signing', narrowed());
-    w.g.hooks.unshift((c) => (c.route === ENV_SECRET_DELETE ? { status: 500 } : undefined));
+    w.g.hooks.unshift((c) => (c.route === ENV_ITEM_DELETE ? { status: 500 } : undefined));
     const rec = sampleRecord(w, { [SEC]: [{ name: KEY, scope: 'env:pipegen-signing', created: true, githubCreatedAt: AT }], environments: [envEntry] });
     const r = await run(w, rec);
     held(w, r);
     // phase B holds it back itself (the delete of its secret was not done in this run): no list read, no restore attempt
     expect(r.manual.find((m) => m.what === 'environment pipegen-signing')?.why).toMatch(/was not deleted in this run/);
-    expect(w.g.calls.some((c) => c.route === ENV_SECRET_LIST)).toBe(false);
+    expect(w.g.calls.some((c) => c.route === ENV_ITEM_LIST)).toBe(false);
     // the branch rule pipegen added stays too (the environment is put back whole, in a later run)
     expect(w.app.envs.get('pipegen-signing')?.policies.map((p) => p.id)).toEqual([3]);
     expect(r.status).toBe('b-partial');
@@ -95,7 +95,7 @@ describe('V9a sec I1: an environment pipegen narrowed is not widened while its s
     const r = await run(w, rec, t, {}, { typedNames: true, marker: 'differs' });
     held(w, r);
     expect(r.manual.find((m) => m.what === 'environment pipegen-signing')?.why).toMatch(/was not deleted in this run/);
-    expect(w.g.calls.some((c) => c.route === ENV_SECRET_LIST)).toBe(false);
+    expect(w.g.calls.some((c) => c.route === ENV_ITEM_LIST)).toBe(false);
   });
 
   it('phase B: control: the key deleted in this run, the environment\'s earlier settings go back', async () => {
@@ -109,7 +109,7 @@ describe('V9a sec I1: an environment pipegen narrowed is not widened while its s
     expect(w.g.calls.filter((c) => c.route === ENV_PUT)).toHaveLength(1);
     expect(e?.deployment_branch_policy).toBeNull();
     // the list was read right before the PUT
-    const list = w.g.calls.findIndex((c) => c.route === ENV_SECRET_LIST);
+    const list = w.g.calls.findIndex((c) => c.route === ENV_ITEM_LIST);
     expect(list).toBeGreaterThan(-1);
     expect(list).toBeLessThan(w.g.calls.findIndex((c) => c.route === ENV_PUT));
     expect(r.done).toContain('environment pipegen-signing: put back as it was before pipegen');
@@ -120,7 +120,7 @@ describe('V9a sec I1: an environment pipegen narrowed is not widened while its s
       const w = world();
       w.app.envs.set('pipegen-signing', narrowed());
       w.app.envs.get('pipegen-signing')?.stored.clear();
-      w.g.hooks.unshift((c) => (c.route === ENV_SECRET_LIST ? answer : undefined));
+      w.g.hooks.unshift((c) => (c.route === ENV_ITEM_LIST ? answer : undefined));
       const api = new UninstallApi(gh(w), { owner: 'o', repo: 'shop', repoId: w.app.id }, { askName: async () => true });
       const t = await api.confirm({ kind: 'environment-restore', entry: envEntry });
       const shown = { wait_timer: 0, prevent_self_review: false, reviewers: [], can_admins_bypass: true, deployment_branch_policy: { protected_branches: false, custom_branch_policies: true } };
@@ -270,7 +270,7 @@ describe('V9a sec i1: run 1 names the time the signing environment is open', () 
     const r = await run(w, rec);
     expect(r.status).toBe('a-done');
     expect(r.lines.join('\n')).toMatch(/until the second run, anyone who can push to main can use pipegen's environment pipegen-signing/);
-    // no environment secret: no such line
+    // nothing stored in an environment: no such line
     const w2 = world();
     const r2 = await run(w2, sampleRecord(w2));
     expect(r2.lines.join('\n')).not.toMatch(/anyone who can push/);
