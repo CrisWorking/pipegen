@@ -37,6 +37,7 @@ import { RenderError, show } from '../engine/render-error.js';
 import { renderPlatformStep, stepsToYaml } from '../engine/render-step.js';
 import { COSIGN_ID, imageDigestArtifact, renderAttestDigestStep, renderSignSteps, SIGN_REGISTRY, signedImageOwner, type SignedImage } from '../engine/signing.js';
 import { egressSetsForTool, renderEgressStep } from '../engine/egress.js';
+import { lookOf, workflowHeader } from './workflow-look.js';
 import { signingMode, type SigningMode } from '../github/signing-mode.js';
 import type { Capabilities, CreatedFile, PipelineDraft, RepoProfile, ReviewedTool, SigningPlan } from '../types.js';
 
@@ -229,7 +230,7 @@ const recordsOnly = (draft: PipelineDraft): boolean => draft.profile.private !==
  * The central files of the project that are not per layer: its sign workflow, `.github/workflows/<project>--sign.yml` (workflow_call only,
  * no input, the one job `sign`), or nothing for mode none, the proof, a records-only `pipelines`, and a plan whose services build no image (GJ). Throws as signJob does.
  */
-export function sharedWorkflows(draft: PipelineDraft, mode: SigningMode, deps: { reviewed: readonly ReviewedTool[]; platform: PlatformActions }): CreatedFile[] {
+export function sharedWorkflows(draft: PipelineDraft, mode: SigningMode, deps: { reviewed: readonly ReviewedTool[]; platform: PlatformActions; /** PL-D1: the version the header names (null or absent: none) */ version?: string | null }): CreatedFile[] {
   if (recordsOnly(draft)) return [];
   if (planFor(draft, mode) === null) return [];
   const job = signJob(draft, mode, deps);
@@ -238,7 +239,9 @@ export function sharedWorkflows(draft: PipelineDraft, mode: SigningMode, deps: {
   const { steps, ...rest } = job;
   doc.contents = doc.createNode({ name: 'pipegen sign', on: { workflow_call: {} }, permissions: {}, jobs: { [SIGN_JOB_ID]: rest } });
   doc.setIn(['jobs', SIGN_JOB_ID, 'steps'], stepsToYaml(steps));
-  doc.commentBefore = ` pipegen: signs ${draft.profile.repo}'s images (${job.environment === undefined ? '' : `environment ${SIGNING_ENVIRONMENT}, `}${mode}); called only by its deploy job, written by pipegen.`;
+  const comment = `pipegen: signs ${draft.profile.repo}'s images (${job.environment === undefined ? '' : `environment ${SIGNING_ENVIRONMENT}, `}${mode}); called only by its deploy job, written by pipegen.`;
+  // PL-D1: the same header and banner as every pipegen workflow (the sign job is "build and release")
+  lookOf(doc, [{ id: SIGN_JOB_ID, part: 4 }], workflowHeader({ comment, runs: 'It runs when pipegen.yml calls it (after the images are published, on a push to the default branch)', version: deps.version ?? null }));
   return [{ path, content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: `Signs the images of ${draft.profile.repo} after a push to its default branch (${mode}).`, repo: 'central' }];
 }
 
