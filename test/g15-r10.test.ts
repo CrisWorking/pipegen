@@ -76,9 +76,9 @@ describe('G15a-R10 r4-1: image-publish and any pushing build refused outside pip
       for (const sid of ['sign', 'Sign']) {
         const w = editApp(a, (js) => {
           const jobs = js.jobs as Obj;
-          jobs['image-publish'] = { ...standIn(a, 'pipegen image publish', ['pipegen']), if: DEPLOY_IF };
+          jobs['image-publish'] = { ...standIn(a, 'Publish the images', ['pipegen']), if: DEPLOY_IF };
           jobs.release = { uses: './.github/workflows/release.yml', if: DEPLOY_IF, needs: ['pipegen', 'image-publish'], permissions: pubCopy(a).permissions };
-        }, [calledFile('.github/workflows/release.yml', { 'image-publish': pubCopy(a), [sid]: standIn(a, 'pipegen sign', ['image-publish']) })]);
+        }, [calledFile('.github/workflows/release.yml', { 'image-publish': pubCopy(a), [sid]: standIn(a, 'Sign the images', ['image-publish']) })]);
         await refused(w, `S3 ${mode} ${sid}`, OUTSIDE);
       }
     }
@@ -89,9 +89,9 @@ describe('G15a-R10 r4-1: image-publish and any pushing build refused outside pip
       const a = signWorld(mode);
       const w = editApp(a, (js) => {
         const jobs = js.jobs as Obj;
-        jobs['image-publish'] = { ...standIn(a, 'pipegen image publish', ['pipegen']), if: DEPLOY_IF };
+        jobs['image-publish'] = { ...standIn(a, 'Publish the images', ['pipegen']), if: DEPLOY_IF };
         jobs.release = { uses: `o/pipelines/.github/workflows/r--release.yml@${'c'.repeat(40)}`, if: DEPLOY_IF, needs: ['pipegen', 'image-publish'], permissions: pubCopy(a).permissions };
-      }, [calledFile('.github/workflows/r--release.yml', { 'image-publish': pubCopy(a), sign: standIn(a, 'pipegen sign', ['image-publish']) }, 'central')]);
+      }, [calledFile('.github/workflows/r--release.yml', { 'image-publish': pubCopy(a), sign: standIn(a, 'Sign the images', ['image-publish']) }, 'central')]);
       await refused(w, `S3c ${mode}`, OUTSIDE);
     }
   });
@@ -109,7 +109,7 @@ describe('G15a-R10 r4-1: image-publish and any pushing build refused outside pip
       pub.steps = steps.slice(0, steps.findIndex((s) => s.id === 'pipegen-build-push') + 1);
       const s2b = editApp(a, (js) => {
         (js.jobs as Obj).release = { uses: './.github/workflows/release.yml', if: DEPLOY_IF, needs: ['pipegen', 'image-publish'], permissions: pubCopy(a).permissions };
-      }, [calledFile('.github/workflows/release.yml', { 'image-publish': pub, sign: standIn(a, 'pipegen sign', ['image-publish']) })]);
+      }, [calledFile('.github/workflows/release.yml', { 'image-publish': pub, sign: standIn(a, 'Sign the images', ['image-publish']) })]);
       await refused(s2b, `S2b ${mode}`, OUTSIDE);
     }
   });

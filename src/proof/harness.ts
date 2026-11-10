@@ -298,7 +298,7 @@ function testsRepeatJobs(draft: PipelineDraft, opts: HarnessOptions, reviewed: r
     const image = baseImageRef(nodeBaseImageId(svc.runtimeVersion, list).id, list);
     const artifact = `pipegen-out-junit-repeat-${s}`;
     steps.push(...renderStarterTestRun(svc, { vitest, image, nodeMajor: major, artifact }));
-    steps.push({ ...renderPlatformStep('upload-artifact', opts.platform, { name: artifact, path: `\${{ runner.temp }}/pipegen-out/${artifact}` }), name: `Upload ${artifact}`, if: 'always()' });
+    steps.push({ ...renderPlatformStep('upload-artifact', opts.platform, { name: artifact, path: `\${{ runner.temp }}/pipegen-out/${artifact}` }), name: `Upload the repeated test results of ${s}`, if: 'always()' });
     sets.push(...egressSetsForTool(vitest), imageSet(image));
   }
   if (node === null || steps.length === 0) return null;

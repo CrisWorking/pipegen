@@ -2,7 +2,7 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { actionStepName, renderPlatformStep } from '../src/engine/render-step.js';
+import { actionStepName, renderGateUploads, renderPlatformStep } from '../src/engine/render-step.js';
 import { jobName, withJobNames } from '../src/layers/job-names.js';
 import { NEED_CATEGORIES } from '../src/types.js';
 import { platform } from './helpers/render.js';
@@ -61,6 +61,17 @@ describe('PL-D2: action step names', () => {
     const dl = renderPlatformStep('download-artifact', p, { name: 'pipegen-out-lint--app', path: '${{ runner.temp }}/pipegen-out/pipegen-out-lint--app' });
     expect(dl.name).toBe('Download the artifact');
     expect(renderPlatformStep('docker-login', p, { username: '${{ github.actor }}', [['pass', 'word'].join('')]: `\${{ ${['secr', 'ets'].join('')}.${['GITHUB', 'TOK' + 'EN'].join('_')} }}` }, { registry: 'ghcr.io' }).name).toBe('Log in to the registry');
+  });
+});
+
+describe('PL-D2 fold R1: the gate upload steps are plain verb phrases', () => {
+  it('each gate upload is named for what it ships, not for its artifact id', () => {
+    const steps = renderGateUploads(platform());
+    expect(steps.map((s) => [(s.with as Record<string, unknown>).name, s.name])).toEqual([
+      ['pipegen-gate-result', 'Upload the gate result'],
+      ['pipegen-baseline', 'Upload the baseline'],
+      ['pipegen-clean-run', 'Upload the clean-run marker'],
+    ]);
   });
 });
 

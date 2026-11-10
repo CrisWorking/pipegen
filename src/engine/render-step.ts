@@ -644,7 +644,7 @@ export function renderDockerActionStep(tool: ReviewedTool): RenderedStep {
   if (Object.keys(tool.choices).length > 0) throw new RenderError(`${show(tool.id)} has choices; a docker step takes only its fixed inputs.`);
   const fixed = tool.fixedInputs.with ?? {};
   if (!same(tool.step.action.with ?? {}, fixed)) throw new RenderError(`The reviewed entry ${show(tool.id)} has a step template that disagrees with its fixed inputs.`);
-  const step: RenderedStep = { name: `Run ${path} (its image, by digest)`, uses: `docker://${image}@${w.digest}`, with: { ...fixed, ...(own(DOCKER_STEP_INPUTS, path) ?? {}) } };
+  const step: RenderedStep = { name: `Run the ${path.split('/').at(-1) ?? path} image by digest`, uses: `docker://${image}@${w.digest}`, with: { ...fixed, ...(own(DOCKER_STEP_INPUTS, path) ?? {}) } };
   checkExpressions(step);
   return step;
 }
@@ -685,6 +685,9 @@ export function renderUpload(artifact: string, path: string, platform: PlatformA
   return { ...step, name: 'Upload the result', if: 'always()' };
 }
 
+/** The step name of each gate upload: what it ships, not its artifact id. */
+const GATE_UPLOAD_STEP_NAMES: Readonly<Record<string, string>> = Object.freeze({ 'pipegen-gate-result': 'Upload the gate result', 'pipegen-baseline': 'Upload the baseline', 'pipegen-clean-run': 'Upload the clean-run marker' });
+
 /**
  * The gate job's uploads (C5b ruling 2), rendered after its gate step: `pipegen-gate-result` from `${{ runner.temp }}/pipegen-gate/result.json`
  * (always written, a missing file is an error), then `pipegen-baseline` and `pipegen-clean-run` from `baseline.json` and `marker.json`, which
@@ -697,7 +700,7 @@ export function renderGateUploads(platform: PlatformActions): RenderedStep[] {
     const step = renderPlatformStep('upload-artifact', platform, { name, path: gateUploadPath(name) });
     // fix round 1 (ruling 2): a failed baseline or marker upload is never a gate failure (C3); the result upload stays strict
     const optional = uploadIfNoFiles(name) === 'ignore';
-    return { ...step, name: `Upload ${name}`, if: 'always()', with: { ...step.with, 'if-no-files-found': uploadIfNoFiles(name) }, ...(optional ? { 'continue-on-error': true } : {}) };
+    return { ...step, name: GATE_UPLOAD_STEP_NAMES[name] ?? 'Upload the gate file', if: 'always()', with: { ...step.with, 'if-no-files-found': uploadIfNoFiles(name) }, ...(optional ? { 'continue-on-error': true } : {}) };
   });
 }
 

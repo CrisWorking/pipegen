@@ -134,6 +134,7 @@ describe('G15a round 3 (a): Scorecard weekly in the nightly file', () => {
     expect(steps.some((s) => /actions\/checkout/.test(String(s.uses)))).toBe(false);
     const step = cardStep(w.doc);
     expect(step.uses).toBe(`docker://${IMAGE}`);
+    expect(step.name).toBe('Run the scorecard-action image by digest');   // PL-D2 fold R1: a verb phrase, not the action path
     expect(step.with).toEqual({ publish_results: 'false', results_format: 'sarif', results_file: 'scorecard.sarif', [TOK]: JOB_TOK });
     expect(step.env).toBeUndefined();
     const scrub = steps.find((s) => (s.with as Obj | undefined)?.mode === 'scrub') as Obj;

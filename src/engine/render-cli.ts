@@ -417,7 +417,7 @@ function rulesStep(tool: ReviewedTool, a: NonNullable<ArgvPolicy['archive']>, ar
     // a speed bump, not a guard (review-6b-r2 C3)
     'chmod -R a-w "$rules"',
   ];
-  return runStep(`Fetch the ${a.repo.split('/')[1]} rules (pinned commit and tree)`, script(lines), {
+  return runStep(`Fetch the ${a.repo.split('/')[1]} (pinned commit and tree)`, script(lines), {
     PIPEGEN_RULES_REMOTE: `${base}${a.repo}`, PIPEGEN_RULES_COMMIT: commit, PIPEGEN_RULES_TREE_WANT: tree,
   }, `tool-install-${sha16(`rules:${artifact}`)}`);
 }

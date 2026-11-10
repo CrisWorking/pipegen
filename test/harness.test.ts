@@ -380,6 +380,7 @@ describe('harness: tests-repeat (S6, D7-R7)', () => {
     expect(up.with!.name).toBe('pipegen-out-junit-repeat-api');
     expect(up.with!.path).toBe('${{ runner.temp }}/pipegen-out/pipegen-out-junit-repeat-api');
     expect(up.if).toBe('always()');
+    expect(up.name).toBe('Upload the repeated test results of api');   // PL-D2 fold R1: a verb phrase, not the artifact id
     expect(text).toContain('"$RUNNER_TEMP/pipegen-out/pipegen-out-junit-repeat-api/junit.xml"');
   });
 

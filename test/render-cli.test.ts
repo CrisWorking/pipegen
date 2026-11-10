@@ -160,6 +160,12 @@ describe('6b: docker (S26)', () => {
     expect(() => render('registry')).toThrow(/service/);
   });
 
+  it('PL-D2 fold R1: the rules fetch step has no doubled word ("semgrep-rules rules")', () => {
+    const names = render('semgrep').steps.map((s) => s.name ?? '');
+    expect(names.some((n) => /^Fetch the semgrep-rules\b/.test(n))).toBe(true);
+    expect(names.filter((n) => /\brules rules\b/.test(n) || /-rules rules\b/.test(n))).toEqual([]);
+  });
+
   it('docker: a docker entry without a reviewed mount is refused', () => {
     const t = entry('zap-baseline');
     expect(() => renderStepWith(spec(t), t, platform(), ctx, withPolicy('zap-baseline', ['slots', 'mount']))).toThrow(/mount/);
