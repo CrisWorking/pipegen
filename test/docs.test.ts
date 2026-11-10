@@ -439,7 +439,7 @@ describe('doc: the referee and the judge', () => {
       // pure: the same draft gives the same bytes
       expect(pipegenDoc(d, REVIEWED), label).toEqual(f);
       // one changed byte that the line judge accepts: refused by the recompute
-      for (const [what, bad] of [['an appended word', `${f.content}Extra.\n`], ['a changed word', f.content.replace('plain English', 'plain Englis')], ['a dropped line', f.content.replace(/^- Gate: .*\n/m, '')]] as const) {
+      for (const [what, bad] of [['an appended word', `${f.content}\nExtra.\n`], ['a changed word', f.content.replace('plain English', 'plain Englis')], ['a dropped line', f.content.replace(/^- Gate: .*\n/m, '')]] as const) {
         const file = { ...f, content: bad };
         expect(pipegenDocProblems(bad, judgeOpts(d)), `${label} ${what} passes the line judge`).toEqual([]);
         expect(docIssues(await run([file], d)).join('\n'), `${label} ${what}`).toMatch(/not the file pipegen builds from the draft/);
@@ -1265,8 +1265,8 @@ describe('doc: fix round 1 (ruling G9-R1)', () => {
     const d = shapeB({ created: [inserted, two], notProven: [] });
     const sec = headingAt(docOf(d), 'Not proven yet');
     // PL-D6: the long text is cut between sentences into bullets of at most 300 characters
-    expect(sec).toContain('- Part deploy-verify: pipegen edited ".github/workflows/deploy.yml" (it added the verify job, `needs` entries and its head check as the first step of each deploy job, except a job that calls another workflow, or one pipegen gates only for its runner or vars and can not start with the check (see the notes)).');
-    expect(sec).toContain('\n- Check the edit by hand before you rely on it.\n');
+    expect(sec).toContain('- Part deploy-verify: pipegen edited ".github/workflows/deploy.yml". It added the verify job, `needs` entries and its head check as the first step of each deploy job, except a job that calls another workflow, or one it gates only for its runner or vars (see the notes).');
+    expect(sec).toContain('Check the edit by hand before you rely on it.');
     expect(sec).toContain('".github/workflows/site.yml"');
     expect(sec).not.toContain('Every check pipegen set up is proven.');
     expect(headingAt(docOf(base), 'Not proven yet')).toContain('Every check pipegen set up is proven.');
@@ -1638,6 +1638,12 @@ describe('PL-D6: PIPEGEN.md by parts', () => {
     const long = new Set<string>();
     for (const [, d] of FIXTURES) for (const l of docOf(d).split('\n')) if (/^\s*- /.test(l) && l.length > 300) long.add(`${l.length}: ${l.slice(0, 70)}`);
     expect([...long]).toEqual([]);
+    // sec M3: the edited-deploy-file note with the longest path q keeps (160) stays within the cap too
+    const longPath = `.github/workflows/${'d'.repeat(200)}.yml`;
+    const edited: CreatedFile = { path: longPath, content: 'x', part: 'deploy-verify', reason: 'verify', repo: 'app', inserted: { original: 'o', jobs: ['pipegen-verify'], needs: [] } };
+    const editedLines = headingAt(docOf(shapeB({ created: [edited], notProven: [] })), 'Not proven yet').split('\n').filter((l) => l.startsWith('- '));
+    expect(editedLines.some((l) => l.includes('pipegen edited'))).toBe(true);
+    for (const l of editedLines) expect(l.length, l.slice(0, 70)).toBeLessThanOrEqual(300);
     // the fixtures do not reach every line the builder can print (compose file, publishing, edited deploy files): so no fixed bullet of the source is over 300 either
     // (a longer text goes through d.lis, which cuts it between sentences), read from the syntax tree
     const js = transformSync(readFileSync(new URL('../src/deliver/docs.ts', import.meta.url), 'utf8'), { loader: 'ts', target: 'esnext', format: 'esm' }).code;

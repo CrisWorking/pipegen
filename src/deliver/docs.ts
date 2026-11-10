@@ -253,7 +253,7 @@ class Doc {
   h(level: 1 | 2 | 3, text: string): void { this.close(); this.lines.push(`${'#'.repeat(level)} ${text}`, ''); }
   p(text: string): void { this.close(); this.lines.push(text, ''); }
   li(text: string): void { this.open = true; this.lines.push(`- ${text}`); }
-  /** PL-D6: a long fixed text as several bullets, cut between sentences so none is over LI_MAX characters (one bullet when it fits). Fixed text only. */
+  /** PL-D6: a long fixed text as several bullets, cut between sentences so none is over LI_MAX characters (one bullet when it fits). Fixed text, plus at most one quoted path with no blank in it as its own sentence, so a cut never falls inside it. */
   lis(text: string): void {
     let cur = '';
     for (const sentence of text.split(/(?<=\.) (?=[A-Z`])/)) {
@@ -875,7 +875,7 @@ function notProvenSection(d: Doc, draft: PipelineDraft, data: DocData, reviewed:
     const secrets = names.length === 0 ? '' : ` Secret names to set: ${names.map((x) => (SECRET_NAME_RE.test(x) ? `\`${x}\`` : fit(x, 60))).join(', ')}.`;
     d.li(`Part ${fit(n.part, 40)}${label === '' ? '' : `, ${label}`}: ${fit(n.reason)}${secrets}`);
   }
-  for (const f of edits) d.lis(`Part deploy-verify: pipegen edited ${q(f.path, 160)} (it added the verify job, \`needs\` entries and its head check as the first step of each deploy job, except a job that calls another workflow, or one pipegen gates only for its runner or vars and can not start with the check (see the notes)). Check the edit by hand before you rely on it.`);
+  for (const f of edits) d.lis(`Part deploy-verify: pipegen edited ${q(f.path, 160)}. It added the verify job, \`needs\` entries and its head check as the first step of each deploy job, except a job that calls another workflow, or one it gates only for its runner or vars (see the notes). Check the edit by hand before you rely on it.`);
   const link = secretsLink(p.owner, p.repo);
   d.p(`Set a missing secret in the repository settings: Settings, Secrets and variables, Actions${link === null ? '' : ` (${link})`}. When the key exists, the nightly run opens an issue with the exact patch: run \`npx pipegen update\` and it applies the change as a pull request. CI never edits workflow files itself.`);
   const where = p.private ? `\`.github/workflows/${centralProjectName(p.repo)}--merge.yml\` in the pipelines repository` : `\`${LOCAL_MERGE_WORKFLOW}\``;

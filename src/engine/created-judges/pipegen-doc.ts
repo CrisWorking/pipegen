@@ -97,17 +97,25 @@ function grammarProblems(text: string, o: PipegenDocOpts): string[] {
   const found = new Set<string>();
   const say = (m: string) => found.add(`PIPEGEN.md holds ${m}`);
   let inFence = false;
-  let folded: 'closed' | 'open' | 'summarised' = 'closed';   // the state of the one folded section: its summary comes right after its opening line, and it closes before the file ends
+  // the state of the current folded section (the builder writes one; the judge takes any number, each closed before the next opens and before the file ends)
+  let folded: 'closed' | 'open' | 'summarised' = 'closed';
+  // GitHub ends the HTML block a fold line starts only at a blank line, so a fence opener right after one is swallowed as HTML and the fenced
+  // (unchecked) text renders as Markdown: the line after <details> must be its summary, the line after the summary or </details> empty or the end of the file
+  let next: 'summary' | 'blank' | null = null;
   for (const line of text.split(/\r\n|\r|\n/)) {
     if (inFence) {
       if (line === '```') inFence = false;
       else if (FENCE_START_RE.test(line)) say('a line inside a code fence that looks like a fence marker but is not exactly three backticks (a renderer may close the fence there)');
       continue;
     }
+    if (next !== null) {
+      if (next === 'summary' ? line !== DETAILS_SUMMARY : line !== '') say(next === 'summary' ? 'a <details> line not followed right away by its <summary> line' : 'a <summary> or </details> line not followed by an empty line (GitHub would read the next lines as HTML)');
+      next = null;
+    }
     if (line === '') continue;
-    if (line === DETAILS_OPEN) { if (folded !== 'closed') say('a <details> line inside a folded section'); folded = 'open'; continue; }
-    if (line === DETAILS_SUMMARY) { if (folded !== 'open') say('a <summary> line that does not follow a <details> line'); folded = 'summarised'; continue; }
-    if (line === DETAILS_CLOSE) { if (folded !== 'summarised') say('a </details> line with no <details> and <summary> above it'); folded = 'closed'; continue; }
+    if (line === DETAILS_OPEN) { if (folded !== 'closed') say('a <details> line inside a folded section'); folded = 'open'; next = 'summary'; continue; }
+    if (line === DETAILS_SUMMARY) { if (folded !== 'open') say('a <summary> line that does not follow a <details> line'); folded = 'summarised'; next = 'blank'; continue; }
+    if (line === DETAILS_CLOSE) { if (folded !== 'summarised') say('a </details> line with no <details> and <summary> above it'); folded = 'closed'; next = 'blank'; continue; }
     if (OPENER_RE.test(line)) { inFence = true; continue; }
     if (FENCE_START_RE.test(line)) { say('a code fence in a form pipegen does not write (it must be exactly three backticks at the start of a line, with no info string or one of yaml, sh, bash, json, text)'); continue; }
     let why: string | null;

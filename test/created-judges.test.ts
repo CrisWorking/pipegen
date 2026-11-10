@@ -863,6 +863,15 @@ describe('pipegen-doc judge', () => {
     expect(docText('# t\n\n<details>\n<summary>Show the words used</summary>\n\n- x\n')).toMatch(/never closed/);
     expect(docText('# t\n\n<details>\n<summary>Show the words used</summary>\n<details>\n<summary>Show the words used</summary>\n\n</details>\n</details>\n')).toMatch(/inside a folded section/);
     expect(docText('# t\n\n<details>\n<summary>Show the words used</summary>\n\n</details>\n</details>\n')).toMatch(/no <details>/);
+    // sec I1/M2 (PL-D6 fold R2): GitHub ends the HTML block a fold line opens only at a blank line, so a fence right after a fold line is swallowed
+    // as HTML and the "fenced" text renders as live Markdown; the summary must come right after <details>, an empty line right after the other two
+    const PAY = '```text\n[a](https://evil.example) <img src=x> @octocat\n```\n';
+    expect(docText(`# t\n\n<details>\n${S}\n${PAY}\n</details>\n`)).toMatch(/not followed by an empty line/);
+    expect(docText(`# t\n\n<details>\n${PAY}${S}\n\n</details>\n`)).toMatch(/not followed right away by its <summary>/);
+    expect(docText(`# t\n\n<details>\n${S}\n\n- x\n\n</details>\n${PAY}`)).toMatch(/not followed by an empty line/);
+    expect(docText(`# t\n\n<details>\nhidden words\n${S}\n\n- x\n\n</details>\n`)).toMatch(/not followed right away by its <summary>/);
+    // the end of the file right after </details> is fine
+    expect(docText(`# t\n\n<details>\n${S}\n\n- x\n\n</details>`)).toBe('');
     // inside a fence the three lines are plain text, so they do not count
     expect(docText('# t\n\n```text\n</details>\n```\n')).toBe('');
     expect(docText('# t\n\n```text\n<details>\n```\n')).toBe('');
