@@ -16,7 +16,7 @@ import { newRateBudget } from '../src/engine/github-rate.js';
 import { pubKeySha256 } from '../src/engine/signing.js';
 import { ensureSigningEnvironment, plannedOfLocks, readEnv, SETUP_BRANCH } from '../src/deliver/deliver.js';
 import { earliestBlockFrom, finish, FinishError, FINISH_WRITE_ROUTES, githubFinishProbe, type FinishDeps, type FinishProbe } from '../src/deliver/finish.js';
-import { checkRecord, protectedPathsForRecord, recordFileText, recordPath, localFinishPendingPath, readLocalRecord, readRecord, recordHash, recordMarkerOf, writeFinishPending, writeLocalRecord, writeRecord } from '../src/deliver/record.js';
+import { checkRecord, protectedPathsForRecord, recordFileText, recordPath, localFinishPendingPath, localRecordPath, readLocalRecord, readRecord, recordHash, recordMarkerOf, writeFinishPending, writeLocalRecord, writeRecord } from '../src/deliver/record.js';
 import { SettingsApi } from '../src/deliver/settings-api.js';
 import { verify } from '../src/deliver/verify.js';
 import { isMemoryFolder } from '../src/layers/deploy.js';
@@ -1605,6 +1605,16 @@ describe('G11 exception round 3 (G11-R3)', () => {
     expect(msg).toMatch(/block date 2026-02-30 is not a real day/);
     expect(msg).toContain(`fix the date in ${recordPath('r')}`);
     expect(msg).toMatch(/finish stops/);
+    // Fold R1: the message does not claim a branch, and the notes of the generic stop are kept
+    expect(msg.split("claims nothing")[0]).not.toMatch(/fix the date in [^,]*default branch/);
+    expect(msg).toMatch(/pipegen claims nothing from it/);
+    const lp = localRecordPath(app, { home: s.home, env: {} });
+    mkdirSync(dirname(lp), { recursive: true });
+    mkdirSync(lp);
+    const withNotes = await finish(s.g.octokit(), app, {}, s.deps({ io, interactive: true })).then(() => '', (e: Error) => e.message);
+    expect(withNotes).toMatch(/block date 2026-02-30 is not a real day/);
+    expect(withNotes).toMatch(/can't be checked|local record file/);
+    rmSync(lp, { recursive: true, force: true });
     // a record unreadable for another reason keeps the plain message, no date named
     s.g.commitOn('o/pipelines', 'main', { [recordPath('r')]: recordFileText({ ...r, blockFrom: '2026-02-30', createdAt: 'not a time' }) });
     const other = await typedRun(s).then(() => '', (e: Error) => e.message);
