@@ -119,9 +119,9 @@ describe('GJ: G2/G3, G4 and G5 follow Plan J (a project type per service, fewer 
       const a = assemble(picks);
       for (const layer of [a.merge, a.push]) {
         const names = (layer['workflow-lint'] as Job).steps.map((st) => st.name).join('\n');
-        expect(names, name).toMatch(/run zizmor/);
+        expect(names, name).toMatch(/Run zizmor/);
         expect(names, name).not.toMatch(/actionlint/);
-        expect(/run poutine/.test(names), name).toBe(want.includes(WORKFLOW_LINT_EXTRA));
+        expect(/Run poutine/.test(names), name).toBe(want.includes(WORKFLOW_LINT_EXTRA));
       }
       expect(a.draft.steps.filter((st) => st.needId === 'workflow-lint').map((st) => st.tool.id).sort(), name).toEqual([...want].sort());
       expect(shown(await judge(files(a), a.draft)), name).toBe('');

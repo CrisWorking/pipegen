@@ -1,5 +1,5 @@
 - id: tool-install-8f869db3aaed8790
-  name: "pipegen: install trivy"
+  name: Install trivy
   run: |-
     set -euo pipefail
     unset CDPATH
@@ -35,7 +35,7 @@
     PIPEGEN_DL_URL: https://github.com/aquasecurity/trivy/releases/download/v0.76.0/trivy_0.76.0_Linux-64bit.tar.gz
     PIPEGEN_DL_SHA256: e24b1c51293c1b15e4ba8d45bbc7891ba053f90278ec2698f3562c993e145fe7
 - id: tool-run-8f869db3aaed8790
-  name: "pipegen: run trivy"
+  name: Run trivy
   run: |-
     set -euo pipefail
     unset CDPATH

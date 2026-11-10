@@ -539,7 +539,7 @@ export function releaseJobs(draft: PipelineDraft, deps: { platform: PlatformActi
       { ...renderPlatformStep('upload-artifact', deps.platform, { name: artifact, path: `\${{ runner.temp }}/pipegen-out/${artifact}` }), name: `Upload the image digest of ${name}` },
     ];
   } catch (e) { if (e instanceof RenderError) return fail(e.message); throw e; }
-  return { 'image-publish': { name: 'pipegen image publish', 'runs-on': JOB_RUNNER, 'timeout-minutes': JOB_MINUTES, permissions: { contents: 'read', packages: 'write' }, 'cache-mode': 'none', steps } };
+  return { 'image-publish': { name: 'Publish the images', 'runs-on': JOB_RUNNER, 'timeout-minutes': JOB_MINUTES, permissions: { contents: 'read', packages: 'write' }, 'cache-mode': 'none', steps } };
 }
 
 // ---------- environments ----------

@@ -219,7 +219,7 @@ describe('G3: central shared files (Plan G Task 1)', () => {
     // the central sign file and the app's caller job, judged together (one referee call): the caller is a deploy job of pipegen.yml
     const d = keDraft();
     const caller = signCallerJob(d, 'key-env', NEEDS) as Record<string, unknown>;
-    expect(caller).toEqual({ uses: `o/pipelines/.github/workflows/r--sign.yml@${SHA}`, if: DEPLOY_PUSH_IF, needs: NEEDS, permissions: { contents: 'read', packages: 'write' } });
+    expect(caller).toEqual({ name: 'Sign the images', uses: `o/pipelines/.github/workflows/r--sign.yml@${SHA}`, if: DEPLOY_PUSH_IF, needs: NEEDS, permissions: { contents: 'read', packages: 'write' } });
     // no input and no secret is passed: the environment's secrets reach the called job through its own environment
     expect(caller).not.toHaveProperty('with');
     expect(caller).not.toHaveProperty('secrets');
@@ -470,7 +470,7 @@ describe('G3 fix round 2 (G3-R3)', () => {
       const d = mode === 'key-env' ? keDraft() : draftOf({ profile: imageProf, capabilities: { ...CAPS_BASE, keylessSigningAllowed: true }, signing: { mode: 'keyless', images: [IMG] } });
       const j = signJob(d, mode, deps);
       // G4: key-env starts with the egress step (the one exception); keyless has none (its Sigstore and OIDC hosts are in no reviewed set)
-      expect(j.steps.map((s) => (s.uses?.split('@')[0] ?? (s.id === step?.id ? 'sign' : s.name))), mode).toEqual([...(mode === 'key-env' ? ['bullfrogsec/bullfrog'] : []), 'actions/download-artifact', 'pipegen: install cosign', 'sign']);
+      expect(j.steps.map((s) => (s.uses?.split('@')[0] ?? (s.id === step?.id ? 'sign' : s.name))), mode).toEqual([...(mode === 'key-env' ? ['bullfrogsec/bullfrog'] : []), 'actions/download-artifact', 'Install cosign', 'sign']);
     }
     // the login sends the workflow token, so an image off ghcr.io is refused by the renderer itself
     expect(() => renderSignSteps(cosign, 'key-env', { service: 'app', repo: 'docker.io/o/app' })).toThrow(/ghcr\.io/);

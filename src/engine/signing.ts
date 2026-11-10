@@ -159,7 +159,7 @@ export function renderSignSteps(cosign: ReviewedTool, mode: 'key-env' | 'keyless
     ? [COMMIT_LINE, `COSIGN_PASSWORD="$PIPEGEN_COSIGN_PASSWORD" ${bin} sign --yes --key env://PIPEGEN_COSIGN_KEY --tlog-upload=false --use-signing-config=false -a pipegen.commit="$GITHUB_SHA" "$ref"`]
     : [`${bin} sign --yes --oidc-provider=github-actions "$ref"`];
   const env = mode === 'key-env' ? { ...SIGN_STEP_ENV } : { PIPEGEN_REGISTRY_TOKEN: SIGN_STEP_ENV.PIPEGEN_REGISTRY_TOKEN as string };
-  return [install.step, runStep(signStepId(repo), `pipegen: sign ${repo} (${mode})`, [...refLines(repo, artifact), ...recheck, ...login, ...sign], env)];
+  return [install.step, runStep(signStepId(repo), `Sign ${repo} (${mode})`, [...refLines(repo, artifact), ...recheck, ...login, ...sign], env)];
 }
 
 /**
@@ -173,7 +173,7 @@ export function renderSignSteps(cosign: ReviewedTool, mode: 'key-env' | 'keyless
 export function renderAttestDigestStep(image: SignedImage): RenderedStep {
   const { repo, artifact } = imageRepo(image);
   if (!repo.startsWith(`${SIGN_REGISTRY}/`)) throw new RenderError(`The image ${show(repo)} is not on ${SIGN_REGISTRY}: the attest job logs in with the workflow token, which goes to ${SIGN_REGISTRY} only.`);
-  return runStep(attestDigestStepId(repo), `pipegen: the digest of ${repo} to attest`, [
+  return runStep(attestDigestStepId(repo), `Read the digest of ${repo} to attest`, [
     ...refLines(repo, artifact),
     `printf '%s' "$PIPEGEN_REGISTRY_TOKEN" | /usr/bin/docker login ${SIGN_REGISTRY} -u "$GITHUB_ACTOR" --password-stdin > /dev/null`,
     'unset PIPEGEN_REGISTRY_TOKEN',
@@ -191,7 +191,7 @@ export function renderVerifySteps(tool: ReviewedTool, draft: PipelineDraft, imag
   if (plan === undefined) throw new RenderError('The draft records no signing, so there is nothing to verify.');
   const { repo, artifact } = imageRepo(image);
   const id = verifyStepId(repo);
-  const name = `pipegen: verify ${repo} (${plan.mode})`;
+  const name = `Verify ${repo} (${plan.mode})`;
   if (plan.mode === 'attest') {
     reviewedRelease(tool, GH_ID, GH_REPO, 'gh');
     // G15a-R0b: attest mode is only a private repository's (signingMode), whose attestations GitHub's own instance signs, so gh runs with

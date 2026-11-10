@@ -183,7 +183,7 @@ export function signJob(draft: PipelineDraft, mode: SigningMode, deps: { reviewe
   const install = rendered[0]?.[0] as RenderedStep;
   for (const r of rendered) if (r.length !== 2 || JSON.stringify(r[0]) !== JSON.stringify(install)) throw new RenderError('The cosign install differs between images, so the sign job can not be written.');
   const job: SignJob = {
-    name: 'pipegen sign', 'runs-on': SIGN_RUNNER, 'timeout-minutes': SIGN_JOB_MINUTES, permissions: signPermissions(plan.mode),
+    name: 'Sign the images', 'runs-on': SIGN_RUNNER, 'timeout-minutes': SIGN_JOB_MINUTES, permissions: signPermissions(plan.mode),
     'cache-mode': 'none', steps: [...downloads, install, ...rendered.map((r) => r[1] as RenderedStep)],
   };
   // G4 (carry G3 ruling 5): key-env's egress block first; keyless has none (see the header)
@@ -213,7 +213,7 @@ function attestJob(plan: SigningPlan & { mode: SignMode }, platform: PlatformAct
     const digest = renderAttestDigestStep(i);
     return [digest, renderPlatformStep('attest', platform, { 'subject-name': i.repo, 'subject-digest': `\${{ steps.${digest.id as string}.outputs.digest }}` })];
   })];
-  return { name: 'pipegen sign', 'runs-on': SIGN_RUNNER, 'timeout-minutes': SIGN_JOB_MINUTES, permissions: signPermissions('attest'), 'cache-mode': 'none', steps };
+  return { name: 'Sign the images', 'runs-on': SIGN_RUNNER, 'timeout-minutes': SIGN_JOB_MINUTES, permissions: signPermissions('attest'), 'cache-mode': 'none', steps };
 }
 
 /** The project's central sign workflow path (central-path.ts), from the draft's repository name. */
@@ -264,5 +264,5 @@ export function signCallerJob(draft: PipelineDraft, mode: SigningMode, needs: re
   if (pin === undefined || typeof pin.repo !== 'string' || typeof pin.sha !== 'string' || typeof owner !== 'string' || pin.repo.toLowerCase() !== `${owner.toLowerCase()}/pipelines` || !isGitHubRepo(pin.repo) || !COMMIT_SHA_RE.test(pin.sha)) {
     throw new RenderError('The sign workflow is called from the central <owner>/pipelines repo at the commit pipegen recorded, and the draft has no such central pin.');
   }
-  return { uses: `${pin.repo}/${signFilePath(draft)}@${pin.sha}`, if: DEPLOY_PUSH_IF, needs: [...needs], permissions: signPermissions(plan.mode) };
+  return { name: 'Sign the images', uses: `${pin.repo}/${signFilePath(draft)}@${pin.sha}`, if: DEPLOY_PUSH_IF, needs: [...needs], permissions: signPermissions(plan.mode) };
 }

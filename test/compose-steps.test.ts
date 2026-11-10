@@ -60,7 +60,7 @@ describe('renderRuntimeEnv', () => {
       "printf '%s=%s\\n' 'PIPEGEN_APP_PGDATABASE' \"pipegen\" >> \"$GITHUB_ENV\"",
     ].join('\n');
     expect(renderRuntimeEnv(PG).run).toBe(want);
-    expect(renderRuntimeEnv(PG).name).toBe('pipegen: set the test database environment');
+    expect(renderRuntimeEnv(PG).name).toBe('Set the test database environment');
   });
 
   it('every dependency and kind has a fixed value', () => {

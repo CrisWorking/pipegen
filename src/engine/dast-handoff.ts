@@ -104,7 +104,7 @@ export function renderDastAppStart(service: string, port: number): RenderedStep 
   const s = slug(service);
   const tag = imageBuildTag(service);
   const ctr = `pipegen-dast-${s}`;
-  return pipegenScriptStep(dastAppStepId(service), `pipegen: start ${s} from its checked image (container only, 127.0.0.1:${port})`, [
+  return pipegenScriptStep(dastAppStepId(service), `Start ${s} from its checked image (container only, 127.0.0.1:${port})`, [
     `file="$RUNNER_TEMP/pipegen-out/${imageArchiveArtifact(service)}/${IMAGE_ARCHIVE_FILE}"`,
     'if [ ! -f "$file" ] || [ -L "$file" ]; then pg_fail "the image archive is missing or not a regular file"; fi',
     'loaded="$(/usr/bin/docker load --input "$file")"',
@@ -134,7 +134,7 @@ function rawOf(r: RenderResult, service: string, lane: DastLane): { path: string
 /** The hand-off step: the app still answers (C1a), then the raw result is copied to its hand-off folder and its sha256 written as the job output. */
 export function renderDastHandoffStep(service: string, file: string, url: string, lane: DastLane = 'dast'): RenderedStep {
   const raw = dastRawArtifact(service, lane);
-  return pipegenScriptStep(DAST_HANDOFF_STEP_ID, `pipegen: hand the raw scan result of ${slug(service)} on`, [
+  return pipegenScriptStep(DAST_HANDOFF_STEP_ID, `Hand the raw scan result of ${slug(service)} on`, [
     `code="$(/usr/bin/curl --silent --max-time 10 --output /dev/null --write-out '%{http_code}' ${url}/ || true)"`,
     'case "$code" in [1-4][0-9][0-9]) ;; *) pg_fail "the app no longer answers after the scan (HTTP $code), so the scan can not be shown to have reached it" ;; esac',
     `src="$RUNNER_TEMP/pipegen-raw/${dastResultArtifact(service, lane)}/${file}"`,
@@ -153,7 +153,7 @@ export function renderDastHandoffStep(service: string, file: string, url: string
 export function renderDastCheckStep(service: string, file: string, lane: DastLane = 'dast'): RenderedStep {
   const raw = dastRawArtifact(service, lane);
   const artifact = dastResultArtifact(service, lane);
-  return pipegenScriptStep(dastCheckStepId(service, lane), `pipegen: check the raw scan result of ${slug(service)}`, [
+  return pipegenScriptStep(dastCheckStepId(service, lane), `Check the raw scan result of ${slug(service)}`, [
     `src="$RUNNER_TEMP/pipegen-out/${raw}/${file}"`,
     `if ! [[ "$${DAST_RAW_SHA_ENV}" =~ ^[0-9a-f]{64}$ ]]; then pg_fail "the DAST run gave no sha256 for its raw result"; fi`,
     'if [ ! -f "$src" ] || [ -L "$src" ]; then pg_fail "the raw scan result is missing or not a regular file"; fi',

@@ -453,7 +453,7 @@ describe('R-F: hardening (findings 6, 8, 9, 10)', () => {
     expect(own({ a: 1 }, 'toString')).toBeUndefined();
     expect(EXPR).toBe('${{');
     expect(() => refuse('x')).toThrow(RenderError);
-    expect(lastRun(render('eslint')).name).toBe('pipegen: run eslint');
+    expect(lastRun(render('eslint')).name).toBe('Run eslint');
   });
 });
 

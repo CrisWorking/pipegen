@@ -248,6 +248,19 @@ function chosenInputs(tool: ReviewedTool, given: Readonly<Record<string, string>
  * the chosen ones, then the renderer-filled ones. A key is set once. Every template or chosen value must be plain
  * words; a filled value passes its own RENDERER_INPUTS checker.
  */
+/**
+ * PL-D2: the display name of an action step, in plain words ("Download the artifact", not the action's path). An action nobody listed is named
+ * by what pipegen does with it, "Run <path>". The name is a label: the step's `uses`, its pin and its inputs say what runs.
+ */
+const ACTION_STEP_NAMES: Readonly<Record<string, string>> = Object.freeze({
+  'actions/checkout': 'Check out the repository', 'actions/setup-node': 'Set up Node.js', 'actions/setup-python': 'Set up Python',
+  'actions/upload-artifact': 'Upload the artifact', 'actions/download-artifact': 'Download the artifact',
+  'github/codeql-action/upload-sarif': 'Upload the result to code scanning', 'actions/attest': 'Attest the image',
+  'docker/login-action': 'Log in to the registry', 'docker/setup-buildx-action': 'Set up Docker Buildx', 'docker/build-push-action': 'Build the image',
+  'actions/dependency-review-action': 'Review the dependencies', 'pypa/gh-action-pypi-publish': 'Publish to PyPI',
+});
+export const actionStepName = (path: string): string => (Object.hasOwn(ACTION_STEP_NAMES, path) ? (ACTION_STEP_NAMES as Record<string, string>)[path] as string : `Run ${path}`);
+
 function actionStep(tool: ReviewedTool, name: string, choices: Readonly<Record<string, string>>, filled: Readonly<Record<string, string>>): RenderedStep {
   const { path, uses } = usesOf(tool);
   const fixed = tool.fixedInputs.with ?? {};
@@ -297,7 +310,7 @@ export function renderPlatformStep(key: keyof PlatformActions, platform: Platfor
     const offered = own(tool.choices, k);
     if (offered === undefined || !offered.includes(choices[k] as string)) throw new RenderError(`${key} has no choice ${show(k)} = ${show(choices[k])}.`);
   }
-  return actionStep(tool, `pipegen: ${usesOf(tool).path}`, choices, filled);
+  return actionStep(tool, actionStepName(usesOf(tool).path), choices, filled);
 }
 
 // ---------- renderStep ----------
@@ -346,7 +359,7 @@ export function renderStepWith(given: StepSpec, tool: ReviewedTool, platform: Pl
 
   const { path } = usesOf(tool);
   const service = spec.service === undefined ? undefined : ctx.profile.services.find((s) => s.name === spec.service);
-  const step = actionStep(tool, `pipegen: ${path}`, textChoices(spec.choices), rendererFill(path, service, ctx, typeof spec.choices.registry === 'string' ? spec.choices.registry : tool.choices.registry?.[0]));
+  const step = actionStep(tool, actionStepName(path), textChoices(spec.choices), rendererFill(path, service, ctx, typeof spec.choices.registry === 'string' ? spec.choices.registry : tool.choices.registry?.[0]));
   const secrets = spec.secrets ?? [];
   if (secrets.length > 0) step.env = Object.fromEntries(secrets.map((n) => [n, `\${{ secrets.${n} }}`]));
   return { steps: [step], output: null };
@@ -524,7 +537,7 @@ export function renderScrub(artifact: string, rawPath: string, tool: string, for
   const staged: Record<string, string> = isStagedTool(tool) && artifact !== SECRETS_RANGE_ARTIFACT && artifact !== SECRETS_HISTORY_ARTIFACT ? { stage: stagePath(artifact) } : {};
   // G15a-R7 sec 3: no key for a key-free scrub (Scorecard): its job then names no secret at all
   const key: Record<string, string> = NO_KEY_SCRUB_TOOLS.has(tool) ? {} : { 'fp-key': '${{ secrets.PIPEGEN_FP_KEY }}' };
-  const step = actionStep(gate, 'pipegen: scrub the result', {}, { mode: 'scrub', artifact, tool, format, raw: rawPath, out, ...key, ...staged });
+  const step = actionStep(gate, 'Scrub the result', {}, { mode: 'scrub', artifact, tool, format, raw: rawPath, out, ...key, ...staged });
   return { id: scrubStepId(artifact), ...step, if: 'always()' };
 }
 
@@ -537,7 +550,7 @@ export function renderScrub(artifact: string, rawPath: string, tool: string, for
 export function renderStage(artifact: string, tool: string, gate: ReviewedTool): RenderedStep {
   checkGateEntry(gate);
   if (!isStagedTool(tool)) throw new RenderError(`${show(tool)} does not scan a stage folder, so it has no stage step.`);
-  const step = actionStep(gate, 'pipegen: stage the files for the secrets scan', {}, { mode: 'stage', artifact, tool, stage: stagePath(artifact) });
+  const step = actionStep(gate, 'Stage the files for the secrets scan', {}, { mode: 'stage', artifact, tool, stage: stagePath(artifact) });
   return { id: stageStepId(artifact), ...step };
 }
 
@@ -631,7 +644,7 @@ export function renderDockerActionStep(tool: ReviewedTool): RenderedStep {
   if (Object.keys(tool.choices).length > 0) throw new RenderError(`${show(tool.id)} has choices; a docker step takes only its fixed inputs.`);
   const fixed = tool.fixedInputs.with ?? {};
   if (!same(tool.step.action.with ?? {}, fixed)) throw new RenderError(`The reviewed entry ${show(tool.id)} has a step template that disagrees with its fixed inputs.`);
-  const step: RenderedStep = { name: `pipegen: ${path} (its image, by digest)`, uses: `docker://${image}@${w.digest}`, with: { ...fixed, ...(own(DOCKER_STEP_INPUTS, path) ?? {}) } };
+  const step: RenderedStep = { name: `Run ${path} (its image, by digest)`, uses: `docker://${image}@${w.digest}`, with: { ...fixed, ...(own(DOCKER_STEP_INPUTS, path) ?? {}) } };
   checkExpressions(step);
   return step;
 }
@@ -646,7 +659,7 @@ export function renderScorecardBlock(tool: ReviewedTool, platform: PlatformActio
   const docker = renderDockerActionStep(tool);
   const raw = `\${{ runner.temp }}/pipegen-raw/${SCORECARD_ARTIFACT}/scorecard.sarif`;
   const move: RenderedStep = {
-    id: SCORECARD_MOVE_STEP_ID, name: 'pipegen: move the Scorecard result under the runner temp folder',
+    id: SCORECARD_MOVE_STEP_ID, name: 'Move the Scorecard result under the runner temp folder',
     run: [
       'set -euo pipefail',
       'src="$GITHUB_WORKSPACE/scorecard.sarif"',
@@ -703,7 +716,7 @@ export function renderGateStep(gate: ReviewedTool, draft: PipelineDraft): Render
     if (e instanceof GateJobListError || e instanceof ArtifactNameError) throw new RenderError(e.message);
     throw e;
   }
-  return actionStep(gate, 'pipegen: the merge gate', {}, filled);
+  return actionStep(gate, 'Run the merge gate', {}, filled);
 }
 
 /**
@@ -720,7 +733,7 @@ export function renderNightlyStep(gate: ReviewedTool, draft: PipelineDraft): Ren
     if (e instanceof GateJobListError || e instanceof ArtifactNameError) throw new RenderError(e.message);
     throw e;
   }
-  return actionStep(gate, 'pipegen: nightly issues', {}, filled);
+  return actionStep(gate, 'Open the nightly issues', {}, filled);
 }
 
 /**
@@ -737,7 +750,7 @@ export function renderFindRunStep(gate: ReviewedTool, opts: { central?: { repo: 
   };
   if (opts.central !== undefined) { filled['central-workflow'] = centralWorkflowPath(opts.central.repo, opts.central.project); filled['central-sha'] = opts.central.sha; }
   if (opts.timeoutMinutes !== undefined) filled['timeout-minutes'] = String(opts.timeoutMinutes);
-  return actionStep(gate, 'pipegen: find the gated run', {}, filled);
+  return actionStep(gate, 'Find the gated run', {}, filled);
 }
 
 /**
@@ -748,7 +761,7 @@ export function renderFindRunStep(gate: ReviewedTool, opts: { central?: { repo: 
 export function renderBaselineCheckStep(gate: ReviewedTool): RenderedStep {
   checkGateEntry(gate);
   // G1 (G22): the step's id is BASELINE_CHECK_STEP_ID, so the job's `found` output is its output (jobOutputsFor / jobOutputsProblems)
-  return { id: BASELINE_CHECK_STEP_ID, ...actionStep(gate, 'pipegen: check the stored baseline', {}, {
+  return { id: BASELINE_CHECK_STEP_ID, ...actionStep(gate, 'Check the stored baseline', {}, {
     mode: 'baseline-check', 'github-token': '${{ secrets.GITHUB_TOKEN }}', 'fp-key': '${{ secrets.PIPEGEN_FP_KEY }}',
   }) };
 }
@@ -868,7 +881,7 @@ export function renderRuntimeEnv(rt: RuntimeEnv): RenderedStep {
     lines.push(`printf '%s=%s\\n' '${APP_PREFIX}${name}' "${containerValue(dep, kind)}" >> "$GITHUB_ENV"`);
   }
   const id = `runtime-env-${sha16(JSON.stringify(rt.vars.map((v) => [v.name, v.kind, v.dep])))}`;
-  return bashStep('pipegen: set the test database environment', lines.join('\n'), id);
+  return bashStep('Set the test database environment', lines.join('\n'), id);
 }
 
 /** Where the proof harness's app-start writes its compose override (E3, ruling B7): in runner temp, never in the checkout. */
@@ -891,11 +904,11 @@ export const COMPOSE_UP_FAILED = '|| { echo "::error::pipegen: the containers di
 
 export function renderComposeUp(opts: { proofOverride?: true } = {}): RenderedStep {
   if (opts.proofOverride === true) {
-    return bashStep('pipegen: start the services with docker compose (proof images, no build)',
+    return bashStep('Start the services with docker compose (proof images, no build)',
       `set -euo pipefail\ndocker compose --env-file /dev/null -f docker-compose.pipegen.yml -f "${PROOF_OVERRIDE_PATH}" up -d --wait --no-build ${COMPOSE_UP_FAILED}`, `repocode-${sha16('compose-up-proof')}`);
   }
   if (opts.proofOverride !== undefined) throw new RenderError('proofOverride is true or absent.');
-  return bashStep('pipegen: start the services with docker compose', `set -euo pipefail\ndocker compose --env-file /dev/null -f docker-compose.pipegen.yml up -d --wait ${COMPOSE_UP_FAILED}`, `repocode-${sha16('compose-up')}`);
+  return bashStep('Start the services with docker compose', `set -euo pipefail\ndocker compose --env-file /dev/null -f docker-compose.pipegen.yml up -d --wait ${COMPOSE_UP_FAILED}`, `repocode-${sha16('compose-up')}`);
 }
 
 /** Put on every job that feeds the gate, builds, signs or verifies (Plan G): no cache of any kind. */

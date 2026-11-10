@@ -417,7 +417,7 @@ function rulesStep(tool: ReviewedTool, a: NonNullable<ArgvPolicy['archive']>, ar
     // a speed bump, not a guard (review-6b-r2 C3)
     'chmod -R a-w "$rules"',
   ];
-  return runStep(`pipegen: fetch the ${a.repo.split('/')[1]} rules (pinned commit and tree)`, script(lines), {
+  return runStep(`Fetch the ${a.repo.split('/')[1]} rules (pinned commit and tree)`, script(lines), {
     PIPEGEN_RULES_REMOTE: `${base}${a.repo}`, PIPEGEN_RULES_COMMIT: commit, PIPEGEN_RULES_TREE_WANT: tree,
   }, `tool-install-${sha16(`rules:${artifact}`)}`);
 }
@@ -560,7 +560,7 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
     prefix = releaseLauncher(exe);
   } else if (kind === 'docker') {
     const image = imageOf(tool, install);
-    steps.push(runStep(`pipegen: pull the ${exe} image`, script([...prologue(artifact), '"${sys[@]}" /usr/bin/docker pull --quiet "$PIPEGEN_IMAGE" > /dev/null']), { PIPEGEN_IMAGE: image }, `tool-pull-${sha16(artifact)}`));
+    steps.push(runStep(`Pull the ${exe} image`, script([...prologue(artifact), '"${sys[@]}" /usr/bin/docker pull --quiet "$PIPEGEN_IMAGE" > /dev/null']), { PIPEGEN_IMAGE: image }, `tool-pull-${sha16(artifact)}`));
     env.PIPEGEN_IMAGE = image;
     // E9 (ruling E3-R7): no bind mount. Bullfrog with sudo off refuses every host path a container mounts (spike S8), so the folders go
     // in with `docker cp -a` (owner and mode kept, so the tool's user can write its result) and the result comes out with `docker cp`,
@@ -798,7 +798,7 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   // fail closed: the run is repo code unless the policy says it only reads (readsOnly), and never for an app-running category
   const appRunning = tool.categories.some((c) => APP_RUNNING_CATEGORIES.has(c));
   const runId = runsRepoCode(pol, appRunning) ? `repocode-${sha16(artifact)}` : checker ? `checker-run-${sha16(artifact)}` : `tool-run-${sha16(artifact)}`;
-  steps.push(runStep(`pipegen: run ${exe}`, run, env, runId));
+  steps.push(runStep(`Run ${exe}`, run, env, runId));
   return { steps, output: out === null ? null : { path: `\${{ runner.temp }}/pipegen-raw/${artifact}/${out}`, format: resultFormat(tool.step.output.format) }, ...(built.fullHistory ? { fullHistory: true as const } : {}) };
 }
 
@@ -1033,8 +1033,8 @@ export function renderRangeScan(tool: ReviewedTool, mode: 'range' | 'history' = 
   const env: Record<string, string> = { ...(history ? HISTORY_STEP_ENV : RANGE_STEP_ENV), PIPEGEN_CONFIG: RANGE_PREFILTER + config.content };
   return {
     steps: [releaseInstall(tool, install, exe, artifact), history
-      ? runStep('pipegen: scan the whole history for secrets', run, env, historyScanStepId)
-      : runStep('pipegen: scan the pull request\'s commits for secrets', run, env, rangeScanStepId)],
+      ? runStep('Scan the whole history for secrets', run, env, historyScanStepId)
+      : runStep('Scan the pull request\'s commits for secrets', run, env, rangeScanStepId)],
     output: { path: `\${{ runner.temp }}/pipegen-raw/${artifact}/${out}`, format: 'sarif' },
     fullHistory: true,
   };
@@ -1079,7 +1079,7 @@ function releaseInstall(tool: ReviewedTool, install: InstallSpec, exe: string, a
     `if [ ! -f "$bin/${exe}" ] || [ -L "$bin/${exe}" ]; then pg_fail "the tool is not a regular file"; fi`,
     `chmod 0755 "$bin/${exe}"`,
   ];
-  return runStep(`pipegen: install ${exe}`, script(lines), { PIPEGEN_DL_URL: url, PIPEGEN_DL_SHA256: hash }, `tool-install-${sha16(artifact)}`);
+  return runStep(`Install ${exe}`, script(lines), { PIPEGEN_DL_URL: url, PIPEGEN_DL_SHA256: hash }, `tool-install-${sha16(artifact)}`);
 }
 
 // ---------- docker (ruling S26) ----------
@@ -1235,7 +1235,7 @@ function repoInstall(pins: readonly (NpmPin & { resolved: string })[], artifact:
   const { hash, marker } = installMarker(workingDir);
   const expect = { PIPEGEN_NPM_EXPECT: JSON.stringify(pins) };
   const common = [...prologue(artifact, { nodeMajor }), ...cdLines(workingDir), ...allowlist(`$nodebin:${FIXED_PATH}`, [])];
-  const ci = runStep('pipegen: install the project dependencies (npm ci, no scripts)', script([
+  const ci = runStep('Install the project dependencies (npm ci, no scripts)', script([
     ...common,
     `js=${q(NPM_PRECHECK_JS)}`,
     '"${pg_env[@]}" "PIPEGEN_NPM_EXPECT=$PIPEGEN_NPM_EXPECT" "$nodebin/node" -e "$js"',
@@ -1243,7 +1243,7 @@ function repoInstall(pins: readonly (NpmPin & { resolved: string })[], artifact:
     'mkdir -p "$RUNNER_TEMP/pipegen-npm-ci"',
     `: > "${marker}"`,
   ]), expect, `pipegen-npm-ci-${hash}`);
-  const verify = runStep('pipegen: check the installed tool against the lockfile', script([
+  const verify = runStep('Check the installed tool against the lockfile', script([
     ...common,
     `[ -f "${marker}" ] && [ ! -L "${marker}" ] || pg_fail "the dependencies were not installed by pipegen's own npm ci step"`,
     `js=${q(NPM_VERIFY_JS)}`,
@@ -1266,7 +1266,7 @@ export function projectScriptSteps(artifact: string, which: 'test' | 'lint', nod
     ...allowlist(`$nodebin:${FIXED_PATH}`, [], ['CI=true']),
     `"\${pg_env[@]}" "$nodebin/npm" ${which === 'test' ? 'test' : 'run lint'}`,
   ]);
-  return [ci, runStep(`pipegen: run the project's ${which} script`, run, {}, `repocode-${sha16(`project-script:${artifact}:${which}`)}`)];
+  return [ci, runStep(`Run the project's ${which} script`, run, {}, `repocode-${sha16(`project-script:${artifact}:${which}`)}`)];
 }
 
 // ---------- the repo's own tools (G4b, DECISIONS #95) ----------
@@ -1419,7 +1419,7 @@ export function repoToolSteps(artifact: string, tool: string, nodeMajor: string,
     '"${pg_env[@]}" "$nodebin/node" -e "$guard" "$cfg"',
     `${launch} ${t.args.join(' ')}`,
   ]);
-  return [ci, runStep(`pipegen: run the repository's own ${tool} (its lockfile version)`, run, {}, `repocode-${sha16(`repo-tool:${artifact}:${tool}`)}`)];
+  return [ci, runStep(`Run the repository's own ${tool} (its lockfile version)`, run, {}, `repocode-${sha16(`repo-tool:${artifact}:${tool}`)}`)];
 }
 
 // ---------- the proof harness's helpers (Plan E E3) ----------
@@ -1486,8 +1486,8 @@ export function renderStarterTestRun(svc: Service, opts: { vitest: ReviewedTool;
     `mv -- "$got/junit.xml" "${out}/junit.xml"`,
     'exit "$rc"',
   ]);
-  const pull = runStep('pipegen: pull the Node image for the starter tests', script([...prologue(artifact), '"${sys[@]}" /usr/bin/docker pull --quiet "$PIPEGEN_IMAGE" > /dev/null']), { PIPEGEN_IMAGE: image }, `tool-pull-${sha16(`starter:${artifact}`)}`);
-  return [ci, verify, pull, runStep('pipegen: run the created tests (no network, isolated)', run, { PIPEGEN_IMAGE: image }, `repocode-${sha16(`starter-tests:${artifact}`)}`)];
+  const pull = runStep('Pull the Node image for the starter tests', script([...prologue(artifact), '"${sys[@]}" /usr/bin/docker pull --quiet "$PIPEGEN_IMAGE" > /dev/null']), { PIPEGEN_IMAGE: image }, `tool-pull-${sha16(`starter:${artifact}`)}`);
+  return [ci, verify, pull, runStep('Run the created tests (no network, isolated)', run, { PIPEGEN_IMAGE: image }, `repocode-${sha16(`starter-tests:${artifact}`)}`)];
 }
 
 // ---------- pip (ruling B5; R-C) ----------
@@ -1525,7 +1525,7 @@ function pipSteps(tool: ReviewedTool, install: InstallSpec, artifact: string, ho
   }
   checkClosure(tool, install, closure);
   const req = `$RUNNER_TEMP/pipegen-pip/${artifact}/requirements.txt`;
-  const installStep = runStep(`pipegen: install ${tool.step.cli?.command[0] ?? 'tool'} (pip, hashes required)`, script([
+  const installStep = runStep(`Install ${tool.step.cli?.command[0] ?? 'tool'} (pip, hashes required)`, script([
     ...prologue(artifact, { discover: ['py="$(command -v python3 || true)"', '[ -n "$py" ] || pg_fail "python3 was not found; the Python setup step must run first"'] }),
     `venv="$RUNNER_TEMP/pipegen-venv/${artifact}"`,
     'mkdir -p "$RUNNER_TEMP/pipegen-pip" "$RUNNER_TEMP/pipegen-venv"',

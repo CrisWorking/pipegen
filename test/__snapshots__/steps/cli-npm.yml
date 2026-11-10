@@ -5,7 +5,7 @@
     package-manager-cache: "false"
     node-version: "24"
 - id: repocode-c283698d8c9e3537
-  name: "pipegen: run prettier"
+  name: Run prettier
   run: |-
     set -euo pipefail
     unset CDPATH

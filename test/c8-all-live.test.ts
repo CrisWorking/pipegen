@@ -55,7 +55,7 @@ describe.skipIf(!live)('E9: c8 --all (live, npm registry only)', () => {
     expect(list.at(-1)?.run).toContain('--check-coverage --all --lines="$PIPEGEN_ARG_0" -- "$nodebin/npm" test');
     // a test script that loads no code: every file under the folder counts at 0%
     const empty = runSteps(list, fixture('true'));
-    expect(empty.name).toBe('pipegen: run c8');
+    expect(empty.name).toBe('Run c8');
     expect(empty.status).toBe(1);
     expect(empty.out).toMatch(/Coverage for lines \(0%\) does not meet global threshold \(60%\)/);
     // the same with a repo .c8rc.json that turns --all off: the command line wins

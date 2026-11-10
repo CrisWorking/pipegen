@@ -40,12 +40,12 @@ describe('G17-F1 sec I1: workflowSecretNames counts `secrets` only as the contex
     expect(seen).toEqual(expect.arrayContaining(['.github/workflows/r--merge.yml', '.github/workflows/r--push.yml', '.github/workflows/r--sign.yml', '.github/workflows/pipegen-merge.yml', '.github/workflows/pipegen-nightly.yml']));
     // the secrets job's step name and output names really are in them (else this test would prove nothing)
     const all = Object.values(realAssembled()).flat().map((f) => f.content).join('\n');
-    expect(all).toContain(`stage the files for the ${SEC} scan`);
+    expect(all).toContain(`Stage the files for the ${SEC} scan`);
     expect(all).toContain(`pipegen-out-${SEC}-sha256`);
   });
 
   it('keys: the word in a name, a step name, an output or job name outside an expression reads no secret; inside one it is the context', () => {
-    expect(read(`jobs:\n  ${SEC}:\n    steps:\n      - name: "pipegen: stage the files for the ${SEC} scan"\n        run: echo ${ref('A')}\n`)).toEqual(['A']);
+    expect(read(`jobs:\n  ${SEC}:\n    steps:\n      - name: "Stage the files for the ${SEC} scan"\n        run: echo ${ref('A')}\n`)).toEqual(['A']);
     expect(read(`name: check ${SEC}\n`)).toEqual([]);
     expect(read(`needs: [${SEC}]\nenv:\n  K: \${{ needs.${SEC}.outputs.pipegen-out-${SEC}-sha256 }}\n`)).toEqual([]);
     expect(read(`env:\n  K: \${{ steps.x.outputs.pipegen-out-${SEC}-status }}\n`)).toEqual([]);

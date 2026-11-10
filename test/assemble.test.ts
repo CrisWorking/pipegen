@@ -5,6 +5,7 @@
 // secret is mapped by name, the not-proven list is the gate step's literal on one marked line of the merge file, and every file goes through
 // one referee call.
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { Document, parse } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { composeText } from '../src/create/compose.js';
@@ -790,3 +791,138 @@ function insertedDeploy(j: Job): CreatedFile {
   const e = insertVerify(original, ['deploy'], j);
   return { path: '.github/workflows/deploy.yml', content: e.text, part: 'deploy-verify', reason: 't', repo: 'app', inserted: e.inserted };
 }
+
+// ---------- Plan P Task PL-D2: human names on every job and step, one style ----------
+
+describe('PL-D2: human names on every job and step, one style', () => {
+  const VERSION = '9.8.7';
+  let built: [string, AssembledFiles, Planned][] | undefined;
+  const sets = (): [string, AssembledFiles, Planned][] => {
+    if (built !== undefined) return built;
+    const a = pub(); const b = priv(); const c = keyless(); const d = keyEnv();
+    built = [
+      ['public', lay(a, { version: VERSION }), a], ['private', lay(b, { version: VERSION }), b],
+      ['public keyless', lay(c, { mode: 'keyless', deploy: DEPLOY, version: VERSION }), c], ['private key-env', lay(d, { mode: 'key-env', deploy: DEPLOY, version: VERSION }), d],
+    ];
+    return built;
+  };
+  const stepsOf = (j: Obj): Obj[] => (j.steps ?? []) as Obj[];
+  /** The caller jobs: they call a reusable workflow and keep the names the check names and the rulesets rely on. */
+  const CALLERS: Readonly<Record<string, string>> = { [MERGE_CALLER_JOB]: 'pipegen', 'pipegen-push': 'pipegen push', 'pipegen-nightly': 'pipegen nightly' };
+
+  it('every job and step has a name', () => {
+    let jobs = 0; let steps = 0;
+    for (const [label, a] of sets()) {
+      for (const f of workflows(a)) {
+        for (const [id, j] of Object.entries(jobsOfFile(f))) {
+          jobs++;
+          expect(typeof j.name, `${label} ${f.path} job ${id}`).toBe('string');
+          expect((j.name as string).trim(), `${label} ${f.path} job ${id}`).not.toBe('');
+          if (id !== 'gate' && !Object.hasOwn(CALLERS, id)) expect(j.name, `${label} ${f.path} job ${id}: not the raw id`).not.toBe(id);   // the gate job is `gate` (the check is pipegen / gate)
+          for (const [i, st] of stepsOf(j).entries()) {
+            steps++;
+            expect(typeof st.name, `${label} ${f.path} job ${id} step ${i + 1} (${String(st.id ?? st.uses)})`).toBe('string');
+            expect((st.name as string).trim(), `${label} ${f.path} job ${id} step ${i + 1}`).not.toBe('');
+          }
+        }
+      }
+    }
+    expect(jobs).toBeGreaterThan(40);
+    expect(steps).toBeGreaterThan(200);
+  });
+
+  it('no step name starts with "pipegen:"', () => {
+    for (const [label, a] of sets()) {
+      for (const f of workflows(a)) {
+        for (const [id, j] of Object.entries(jobsOfFile(f))) {
+          for (const st of stepsOf(j)) expect(String(st.name), `${label} ${f.path} job ${id}`).not.toMatch(/^pipegen\b\s*:/i);
+        }
+      }
+    }
+  });
+
+  it('step names are sentence case: a capital letter first, no full stop at the end', () => {
+    for (const [label, a] of sets()) {
+      for (const f of workflows(a)) {
+        for (const [id, j] of Object.entries(jobsOfFile(f))) {
+          for (const st of stepsOf(j)) {
+            const n = String(st.name);
+            expect(n, `${label} ${f.path} job ${id}`).toMatch(/^[A-Z]/);
+            expect(n, `${label} ${f.path} job ${id}`).not.toMatch(/[.:]$/);
+            expect(n, `${label} ${f.path} job ${id}`).not.toMatch(/\$\{\{/);
+          }
+        }
+      }
+    }
+  });
+
+  it('every job id and step id equal before and after', () => {
+    const golden = JSON.parse(readFileSync(new URL('./fixtures/pl-d2-ids.json', import.meta.url), 'utf8')) as Record<string, Record<string, [string, string[]][]>>;   // label → file → [job id, step ids] (pairs: a `secrets` key would read as a secret to the scan)
+    for (const [label, a] of sets()) {
+      const now: Record<string, [string, string[]][]> = {};
+      for (const f of workflows(a)) {
+        const jobs: [string, string[]][] = [];
+        for (const [id, j] of Object.entries(jobsOfFile(f))) jobs.push([id, stepsOf(j).map((st) => String(st.id ?? st.uses ?? '(run)').split('@')[0] as string)]);   // an action pin (a 40-hex sha) stays out of the committed file
+        now[`${f.repo}:${f.path}`] = jobs;
+      }
+      expect(now, label).toEqual(golden[label]);
+    }
+  });
+
+  it('a job of one service is named "<What> · <service>", a repo-wide job has no service in its name', () => {
+    let perService = 0; let repoWide = 0;
+    for (const [label, a] of sets()) {
+      for (const f of workflows(a)) {
+        for (const [id, j] of Object.entries(jobsOfFile(f))) {
+          const name = String(j.name);
+          if (Object.hasOwn(CALLERS, id)) { expect(name, `${label} ${id}`).toBe(CALLERS[id]); continue; }
+          if (id === 'gate') { expect(name).toBe('gate'); continue; }
+          const m = /--([a-z0-9-]+)$/.exec(id);
+          if (m !== null) { perService++; expect(name, `${label} ${id}`).toMatch(new RegExp(` · ${m[1]}$`)); expect(name, `${label} ${id}`).toMatch(/^[A-Z]/); }
+          else { repoWide++; expect(name, `${label} ${id}`).not.toContain(' · '); expect(name, `${label} ${id}`).toMatch(/^[A-Z]/); }
+        }
+      }
+    }
+    expect(perService).toBeGreaterThan(10);
+    expect(repoWide).toBeGreaterThan(10);
+    const merge = jobsOfFile(fileAt(lay(pub()), 'app', LOCAL_MERGE_WORKFLOW));
+    expect(merge['sast--app']?.name).toBe('Code scan · app');
+    expect(merge.secrets?.name).toBe('Secret scan');
+  });
+
+  it('the caller jobs and the gate job keep their names (the required check stays pipegen / gate)', () => {
+    for (const [, a] of sets()) {
+      for (const f of workflows(a)) {
+        const jobs = jobsOfFile(f);
+        for (const [id, name] of Object.entries(CALLERS)) if (jobs[id] !== undefined) expect(jobs[id]?.name, `${f.path} ${id}`).toBe(name);
+        if (jobs.gate !== undefined) expect(jobs.gate.name, f.path).toBe('gate');
+      }
+    }
+    expect(GATE_CHECK_NAME).toBe('pipegen / gate');
+  });
+
+  it('the image publish, sign and verify jobs have plain names, not "pipegen ..."', () => {
+    const k = lay(keyless(), { mode: 'keyless', deploy: DEPLOY });
+    const yml = jobsOfFile(fileAt(k, 'app', CALLER_WORKFLOW));
+    expect(yml['image-publish']?.name).toBe('Publish the images');
+    expect(yml.sign?.name).toBe('Sign the images');
+    const ke = lay(keyEnv(), { mode: 'key-env', deploy: DEPLOY });
+    const central = ke.files.filter((f) => f.repo === 'central' && f.path.endsWith('--sign.yml'));
+    expect(central.length).toBe(1);
+    expect(jobsOfFile(central[0] as CreatedFile).sign?.name).toBe('Sign the images');
+    const v = verifyJob(keyEnv().draft, { gate: GATE, reviewed: REVIEWED, platform: p, waitMinutes: 5 });
+    expect(v.name).toBe('Verify before deploy');
+    // the verify job's steps (the head check, the digest, the signature check) are named like every other step
+    expect(v.steps.length).toBeGreaterThan(2);
+    for (const st of v.steps) { expect(st.name).toMatch(/^[A-Z]/); expect(st.name).not.toMatch(/^pipegen\b\s*:/i); }
+    expect(v.steps.some((st) => /^Verify /.test(st.name))).toBe(true);
+  });
+
+  it('the gate job and its needs carry no new name that changes a check name', () => {
+    // a job's name is the check run's name; only the gate's is read (by name), so it is the one name that must not move
+    const a = lay(pub());
+    const gate = jobsOfFile(fileAt(a, 'app', LOCAL_MERGE_WORKFLOW)).gate as Obj;
+    expect(gate.name).toBe('gate');
+    for (const [, j] of Object.entries(jobsOfFile(fileAt(a, 'app', LOCAL_MERGE_WORKFLOW)))) expect(j.name).not.toBe(GATE_CHECK_NAME);
+  });
+});

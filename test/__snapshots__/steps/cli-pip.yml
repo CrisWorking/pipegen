@@ -4,7 +4,7 @@
   with:
     python-version: "3.11"
 - id: tool-install-ed4f8358c8fde1c3
-  name: "pipegen: install mypy (pip, hashes required)"
+  name: Install mypy (pip, hashes required)
   run: |-
     set -euo pipefail
     unset CDPATH
@@ -41,7 +41,7 @@
 
       typing-extensions==4.12.2 --hash=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
 - id: repocode-ed4f8358c8fde1c3
-  name: "pipegen: run mypy"
+  name: Run mypy
   run: |-
     set -euo pipefail
     unset CDPATH

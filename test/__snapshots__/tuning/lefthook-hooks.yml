@@ -1,5 +1,5 @@
 - id: tool-install-fd142d42ba6c712d
-  name: "pipegen: install lefthook"
+  name: Install lefthook
   run: |-
     set -euo pipefail
     unset CDPATH
@@ -29,7 +29,7 @@
     PIPEGEN_DL_URL: https://github.com/evilmartians/lefthook/releases/download/v2.2.2/lefthook_2.2.2_Linux_x86_64
     PIPEGEN_DL_SHA256: 4fbf89eb7748c6aed84d833ee1a29edac48fae614468ca9a82896ec32f2800b6
 - id: repocode-fd142d42ba6c712d
-  name: "pipegen: run lefthook"
+  name: Run lefthook
   run: |-
     set -euo pipefail
     unset CDPATH

@@ -76,7 +76,7 @@ describe('C2: every rendered step has a recognised id, and a checker is one step
       try { r = renderStepWith(specFor(t, { needId: needFor(t) }), t, platform(), ctx); } catch (e) { if (e instanceof RenderError) continue; throw e; }
       rendered++;
       // the check of a repo-code tool's install has no id on purpose: it follows the repo's own `npm ci`, so it is repo code
-      for (const s of r.steps.filter((x) => x.run !== undefined && !x.name.includes('check the installed tool'))) expect(s.id, `${t.id}: ${s.name}`).toMatch(RECOGNISED);
+      for (const s of r.steps.filter((x) => x.run !== undefined && !x.name.includes('Check the installed tool'))) expect(s.id, `${t.id}: ${s.name}`).toMatch(RECOGNISED);
       expect(new Set(r.steps.map((s) => s.id).filter((i) => i !== undefined)).size, t.id).toBe(r.steps.filter((s) => s.id !== undefined).length);
       expect(checkJobOrder(dedupeJobSteps(r.steps, { scans: NO_SCANS })), t.id).toEqual([]);
     }

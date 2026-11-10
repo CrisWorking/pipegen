@@ -59,6 +59,7 @@ import type { EgressSet } from '../engine/egress-sets.js';
 import { publishedImageServices } from '../engine/needs.js';
 import { COSIGN_ID, GH_ID, renderVerifySteps, type SignedImage } from '../engine/signing.js';
 import type { BaseImage } from '../engine/base-images.js';
+import { jobName } from './job-names.js';
 import { IMAGE_PUBLISH_JOB, sharedWorkflows, signCallerJob, signPermissions, SIGN_JOB_ID } from './central.js';
 import { AssembleError, assembleJobs, egressStepFor, JOB_RUNNER, type Job, type JobsPlan, type UncoveredMinimum } from './jobs.js';
 import type { CreatedFile, PipelineDraft, ReviewedTool } from '../types.js';
@@ -321,7 +322,7 @@ function markNotProven(doc: Document): void {
 /** The pr-check job (BP-6): the egress step and the one lookup step; `pull-requests: read`; its output has-pr. */
 function prCheckJob(): Job {
   const steps: RenderedStep[] = [egressStepFor([], { userSecret: false, dockerNetworks: false, job: PR_CHECK_JOB }), renderPrCheckStep()];
-  return { 'runs-on': JOB_RUNNER, 'timeout-minutes': PR_CHECK_MINUTES, permissions: { contents: 'read', 'pull-requests': 'read' }, 'cache-mode': 'none', outputs: jobOutputsFor(steps), steps };
+  return { name: jobName(PR_CHECK_JOB), 'runs-on': JOB_RUNNER, 'timeout-minutes': PR_CHECK_MINUTES, permissions: { contents: 'read', 'pull-requests': 'read' }, 'cache-mode': 'none', outputs: jobOutputsFor(steps), steps };
 }
 
 /** The central pin of a private draft, checked (C8r1): `<owner>/pipelines` at a 40-character commit. */
@@ -525,7 +526,7 @@ export function verifyJob(draft: PipelineDraft, deps: { gate: ReviewedTool; revi
   // the verified digest (G22): the job output of the digest step, when there is an image (a static deploy has none)
   const outputs = jobOutputsFor(steps);
   return {
-    'runs-on': JOB_RUNNER, 'timeout-minutes': wait + VERIFY_MARGIN_MINUTES, permissions: verifyPermissions(draft),
+    name: jobName(VERIFY_JOB_ID), 'runs-on': JOB_RUNNER, 'timeout-minutes': wait + VERIFY_MARGIN_MINUTES, permissions: verifyPermissions(draft),
     ...(draft.capabilities.environments === true ? { environment: SIGNING_ENVIRONMENT } : {}), 'cache-mode': 'none',
     ...(Object.keys(outputs).length > 0 ? { outputs } : {}), steps,
   };

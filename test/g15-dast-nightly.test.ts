@@ -153,13 +153,13 @@ describe('G15a round 4 (b3): the nightly DAST scan', () => {
     // 8. the nightly run job copied whole under another job id of the nightly file (mutant N2)
     const d2 = parseDocument(night.content);
     d2.setIn(['jobs', 'other-scan'], (d2.getIn(['jobs', 'dast-run--app']) as { clone: () => unknown }).clone());
-    expect(shown(await judge(withFile(fs, { ...night, content: d2.toString({ lineWidth: 0 }) }), a.draft))).toMatch(/the nightly DAST step "pipegen: run nuclei[^"]*" runs only in its own job dast-run--app/);
+    expect(shown(await judge(withFile(fs, { ...night, content: d2.toString({ lineWidth: 0 }) }), a.draft))).toMatch(/the nightly DAST step "Run nuclei[^"]*" runs only in its own job dast-run--app/);
   });
 
   it('referee: the nightly scan is recognised only for a DAST check of the merge layer (mutant N12)', async () => {
     const { a, fs } = world();
     const draft = { ...a.draft, needs: a.draft.needs.map((n) => (n.id === 'dast' ? { ...n, layer: 'push' as const } : n)) };
-    expect(shown(await judge(fs, draft))).toMatch(/"pipegen: install nuclei" is not a step pipegen renders/);
+    expect(shown(await judge(fs, draft))).toMatch(/"Install nuclei" is not a step pipegen renders/);
     expect(shown(await judge(fs, a.draft))).toBe('');
   });
 });

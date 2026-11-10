@@ -85,6 +85,7 @@ import { signedImageOwner } from '../engine/signing.js';
 import { codeSecurityAvailable } from '../github/availability.js';
 import type { SigningMode } from '../github/signing-mode.js';
 import { signJob, type SignJob } from './central.js';
+import { withJobNames } from './job-names.js';
 import type { Need, NeedCategory, PipelineDraft, ReviewedTool, Service, SkippablePart, StepSpec } from '../types.js';
 import { FLOOR_NEEDS } from '../types.js';
 import { safeText } from '../util/safe-text.js';
@@ -886,7 +887,8 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     if (j.if !== undefined) fail(`The nightly job ${show(id)} already has a condition, so it can not be limited to the nightly cron.`);
     nightly[id] = { ...j, if: NIGHTLY_IF };
   }
-  return { draft, push, merge, nightly, sign, notes, uncoveredMinimum: [...uncoveredMinimum.values()] };
+  // PL-D2: a display name on every job (the gate's and the callers' stay); the ids, keys and needs are untouched
+  return { draft, push: withJobNames(push), merge: withJobNames(merge), nightly: withJobNames(nightly), sign, notes, uncoveredMinimum: [...uncoveredMinimum.values()] };
 }
 
 function addNote(notes: string[], line: string): void { if (!notes.includes(line)) notes.push(line); }
