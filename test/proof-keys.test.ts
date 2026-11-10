@@ -424,6 +424,22 @@ describe('E4 excerpt evidence (DECISIONS #113)', () => {
 });
 
 describe('E4 scratch keys: E2 seam and the source', () => {
+  it('vault STRIPE_KEY and read stripe_key → one refusal, nothing written', async () => {
+    // PL-F2: names that differ only in case are one secret on GitHub; setup refuses before any request, naming both
+    const up = ['STRIPE', 'KEY'].join('_');
+    const low = up.toLowerCase();
+    const { g, s } = keysWorld();
+    const keys = keysFor(g, vaultWith({ [up]: TYPED }));
+    const before = g.calls.length;
+    const err = await keys.setup([up, low]).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(ScratchKeysError);
+    expect((err as Error).message).toBe(`${up} and ${low} differ only in case; GitHub keeps one secret for both, so pipegen won't store either.`);
+    expect(g.calls.length).toBe(before);
+    expect(g.writes()).toEqual([]);
+    expect(s.values.size).toBe(0);
+    expect(keys.stored()).toEqual({});
+  });
+
   it('the E2 seam (scratchSecretStore) is the real store for pushProofSetup, only for its own scratch repo', async () => {
     const { g, s } = keysWorld();
     const keys = keysFor(g);
