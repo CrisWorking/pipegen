@@ -21,7 +21,7 @@ import { statfsSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import type { Octokit } from '@octokit/rest';
 import { Document, isMap, isScalar, isSeq, parseDocument, type Node as YamlNode, type Pair } from 'yaml';
-import { callsWorkflow, deployGating, deployTriggers, plainUbuntu, readsContents, stepsGated, userTopProblem, type DeployGating } from '../engine/deploy-gating.js';
+import { callsWorkflow, deployGating, deployTriggers, plainUbuntu, readsContents, show, stepsGated, userTopProblem, type DeployGating } from '../engine/deploy-gating.js';
 import { BUILD_PUSH_STEP_ID, HEAD_CHECK_STEP_ID, imageDigestArtifact, publishedImageRepo, PUBLISH_TAG, renderHeadCheckStep, renderPublishDigestStep } from '../engine/deploy-steps.js';
 import type { RateClock } from '../engine/github-rate.js';
 import { CALLER_WORKFLOW, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PUSH_WORKFLOW, type RenderedStep } from '../engine/job-rules.js';
@@ -59,7 +59,6 @@ const OWN_WORKFLOWS: ReadonlySet<string> = new Set([CALLER_WORKFLOW, PUSH_WORKFL
 
 type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => v !== null && typeof v === 'object' && !Array.isArray(v);
-const show = (s: unknown): string => JSON.stringify(safeText(String(s), 100));
 const fail = (m: string): never => { throw new AssembleError(m); };
 /** Not an edit pipegen can make without touching the user's bytes: becomes a gap. */
 class EditRefused extends Error {}

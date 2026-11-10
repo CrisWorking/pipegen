@@ -33,3 +33,43 @@ describe('PL-E5 referee <-> deploy cycle', () => {
     expect(read('src/layers/deploy.ts')).not.toMatch(/function deployGating\(/);
   });
 });
+
+// PL-E5 R1: the whole static value-import graph, not only the direct edges. Type-only imports are erased at build, so they are no edge.
+import { existsSync } from 'node:fs';
+import { dirname } from 'node:path';
+
+const SRC = resolve(__dirname, '..', 'src');
+const valueImports = (file: string): string[] => {
+  const src = readFileSync(file, 'utf8');
+  const out: string[] = [];
+  for (const m of src.matchAll(/^\s*(import|export)\b(\s+type\b)?([^;]*?)\bfrom\s+'(\.[^']*)'/gms)) {
+    if (m[2]) continue;
+    const to = resolve(dirname(file), (m[4] as string).replace(/\.js$/, '.ts'));
+    if (existsSync(to)) out.push(to);
+  }
+  return out;
+};
+/** A value-import path from `from` to `to` (file names relative to src), or null. */
+const pathBetween = (from: string, to: string): string[] | null => {
+  const seen = new Set<string>();
+  const walk = (f: string, trail: string[]): string[] | null => {
+    if (f === to) return trail;
+    if (seen.has(f)) return null;
+    seen.add(f);
+    for (const n of valueImports(f)) { const r = walk(n, [...trail, n.slice(SRC.length + 1)]); if (r) return r; }
+    return null;
+  };
+  return walk(resolve(SRC, from), [from]);
+};
+
+describe('PL-E5 R1 no transitive cycle through referee.ts', () => {
+  it('referee.ts reaches the deploy layer, but no path leads from the deploy layer back to referee.ts', () => {
+    expect(pathBetween('engine/referee.ts', resolve(SRC, 'layers/deploy.ts'))).not.toBeNull();
+    expect(pathBetween('layers/deploy.ts', resolve(SRC, 'engine/referee.ts'))).toBeNull();
+  });
+  it('deliver.ts and central.ts take SIGNING_ENVIRONMENT from referee-shared.ts, not referee.ts', () => {
+    for (const f of ['src/deliver/deliver.ts', 'src/layers/central.ts']) {
+      expect(specifiers(read(f)).filter((x) => /(^|\/)referee\.js$/.test(x)), f).toEqual([]);
+    }
+  });
+});

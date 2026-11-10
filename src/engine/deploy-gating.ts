@@ -80,7 +80,7 @@ export function weakReason(job: unknown): string | null {
 
 // ---------- PL-E5: deployGating, moved from src/layers/deploy.ts (it imports it back; the referee imports it from here) ----------
 
-const show = (s: unknown): string => JSON.stringify(safeText(String(s), 100));
+export const show = (s: unknown): string => JSON.stringify(safeText(String(s), 100));
 /** The permissions a user's workflow may set at the top without refusing the insert (the referee's judgeUserTop: the verify job's ceiling). */
 const VERIFY_CEILING: Readonly<Record<string, number>> = Object.freeze({ contents: 1, actions: 1, packages: 1, attestations: 1 });
 const LEVEL: Readonly<Record<string, number>> = Object.freeze({ none: 0, read: 1, write: 2 });

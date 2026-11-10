@@ -36,7 +36,7 @@ import { centralProjectName } from '../engine/central-path.js';
 import { CREATED_RULES } from '../engine/created-files.js';
 import type { RateClock } from '../engine/github-rate.js';
 import { createdPathProblem } from '../engine/job-rules.js';
-import { SIGNING_ENVIRONMENT } from '../engine/referee.js';
+import { SIGNING_ENVIRONMENT } from '../engine/referee-shared.js';
 import { pubKeySha256 } from '../engine/signing.js';
 import { clockOf } from '../github/client.js';
 import type { ApiRequest, LockPlan } from '../layers/locks.js';
