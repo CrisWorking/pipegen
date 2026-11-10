@@ -20,6 +20,7 @@ import type { Octokit } from '@octokit/rest';
 import { validDate } from '../../gate/src/date.js';
 import picomatch from 'picomatch';
 import { codeOwners, ownersLookup, PIPEGEN_BLOCK_BEGIN, PIPEGEN_BLOCK_END, pipegenBlockOwners, type CodeownersRule } from '../../gate/src/integrity.js';
+import { gitBlobSha } from '../create/guard.js';
 import { centralWorkflowFile } from '../engine/central-path.js';
 import { CENTRAL_PROTECTED_PATHS, CODEOWNERS_END } from '../engine/created-builders.js';
 import type { RateClock } from '../engine/github-rate.js';
@@ -89,7 +90,15 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
     const readText = async (): Promise<string> => (e === undefined || e.type !== 'blob' ? '' : await readBlobText(gh, ed.repo === 'app' ? app : central, e.sha, MAX_TEXT, clock));
     // G-FINREC-R1 (sec M1): in every CODEOWNERS pipegen created or edited (app or central, its own write included), a rule after pipegen's
     // block wins over it; one that takes a protected path from the block's owners is drift (inserted text alone can't show that)
-    const coText = ed.kind === 'codeowners' && e !== undefined && e.type === 'blob' && e.mode !== '120000' ? await readText() : null;
+    let coText: string | null = null;
+    if (ed.kind === 'codeowners' && e !== undefined && e.type === 'blob' && e.mode !== '120000') {
+      try { coText = await readText(); } catch (err) {
+        // an unreadable CODEOWNERS is drift, never a crash (G-FINREC-R2 i1 review)
+        if (!(err instanceof DeliverError) && statusOf(err) !== 404 && statusOf(err) !== 422) throw err;
+        drift.push({ what: `pipegen's lines in ${label(ed.repo, ed.path)}`, expected: 'pipegen\'s inserted text, once', actual: 'it can\'t be read' });
+        continue;
+      }
+    }
     if (coText !== null) {
       const over = overrides(coText, ed.repo === 'app' ? [...new Set([...protectedListOf(r, 'app'), ...PROTECTED_PATHS_BASE])] : CENTRAL_PROTECTED_PATHS);
       // markers missing with the inserted text gone too: the check below names it once
@@ -118,14 +127,39 @@ export async function verify(gh: Octokit, app: RepoRef, deps: VerifyDeps = {}): 
     const ours = [...edited].map((p) => show(p)).join(', ');
     drift.push({ what: `the CODEOWNERS GitHub reads in the ${repo === 'app' ? 'app' : 'central'} repo`, expected: `${ours} (the file with pipegen's block) read first`, actual: `${show(first)} is the CODEOWNERS GitHub reads, so pipegen's block in ${ours} has no effect: take ${show(first)} out, or move its rules into ${ours} above \`# pipegen:begin\`` });
   }
-  // G-FINREC-R2 i1: code-owner review planned on central (finish ran) needs pipegen's block in the CODEOWNERS central reads (finish may have
-  // skipped writing it: not UTF-8, a clash, lines it couldn't append)
+  // G-FINREC-R2 i1 (and its review): code-owner review planned on central (finish ran) needs, in the CODEOWNERS central reads, pipegen's
+  // block with exactly the planned owners and no rule after it that takes a protected path (finish may have skipped writing it, or reused a
+  // block it recorded no edit for). Unreadable is drift too.
   if (r.mergedAt !== undefined && r.planned.owners.central.length > 0 && trees.central !== null) {
+    const what = 'pipegen\'s block in the central CODEOWNERS';
     const first = CO_PLACES.find((p) => trees.central?.has(p) === true);
     const e = first === undefined ? undefined : trees.central.get(first);
-    const text = e === undefined || e.type !== 'blob' || e.mode === '120000' ? null : await readBlobText(gh, central, e.sha, MAX_TEXT, clock);
-    if (text === null || pipegenBlockOwners(text).length === 0) {
-      drift.push({ what: 'pipegen\'s block in the central CODEOWNERS', expected: `pipegen's block in ${show(first ?? '.github/CODEOWNERS')} (the central ruleset asks for code-owner review)`, actual: first === undefined ? null : 'no pipegen block: run `npx pipegen finish` again (it says why it left the file)' });
+    const where = show(first ?? '.github/CODEOWNERS');
+    let text: string | null = null;
+    let why: string | null = null;
+    if (first === undefined) why = null;
+    else if (e === undefined || e.type !== 'blob' || e.mode === '120000') why = 'it is a link or not a plain file, so it can\'t be read';
+    else {
+      try {
+        text = await readBlobText(gh, central, e.sha, MAX_TEXT, clock);
+        if (gitBlobSha(text) !== e.sha) { text = null; why = 'it can\'t be read as UTF-8 text'; }
+      } catch (err) {
+        if (!(err instanceof DeliverError) && statusOf(err) !== 404 && statusOf(err) !== 422) throw err;
+        why = 'it can\'t be read';
+      }
+    }
+    const want = [...new Set(r.planned.owners.central.map((o) => o.replace(/^@/, '').toLowerCase()))].sort();
+    const got = text === null ? [] : pipegenBlockOwners(text);
+    const planned = `pipegen's block in ${where} with the planned owners ${want.map((o) => `@${o}`).join(' ')} (the central ruleset asks for code-owner review)`;
+    if (first === undefined) drift.push({ what, expected: planned, actual: null });
+    else if (text === null) drift.push({ what, expected: planned, actual: why });
+    else if (got.length === 0) drift.push({ what, expected: planned, actual: 'no pipegen block: run `npx pipegen finish` again (it says why it left the file)' });
+    else if (got.join(' ') !== want.join(' ')) drift.push({ what, expected: planned, actual: `the block names ${got.map((o) => `@${o}`).join(' ')}` });
+    // an override after the block: the per-edit check already read a file pipegen recorded an edit for
+    if (text !== null && got.length > 0 && !r.edits.some((x) => x.repo === 'central' && x.kind === 'codeowners' && x.path === first)) {
+      const over = overrides(text, CENTRAL_PROTECTED_PATHS);
+      if (over === null) drift.push({ what: `a CODEOWNERS rule after pipegen's block in ${label('central', first as string)}`, expected: 'keep exactly one `# pipegen:begin` and one `# pipegen:end` line', actual: 'pipegen\'s begin or end line is missing or repeated, so nothing can say where its block ends' });
+      else if (over.length > 0) drift.push({ what: `a CODEOWNERS rule after pipegen's block in ${label('central', first as string)}`, expected: 'rules after `# pipegen:end` win over pipegen\'s block: move them above `# pipegen:begin`, or give them only pipegen\'s owners', actual: show(over.map((o) => `${o.line} (${o.covers})`).join(' | '), 600) });
     }
   }
 
