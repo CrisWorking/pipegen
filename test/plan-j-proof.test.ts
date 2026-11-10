@@ -11,7 +11,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { buildAudit, type AuditReport } from '../src/audit/model.js';
 import { PART_TITLE, partOf } from '../src/audit/parts.js';
 import { shortParts } from '../src/audit/render-short.js';
-import { renderTerminal } from '../src/audit/render.js';
+import { renderMarkdown, renderTerminal } from '../src/audit/render.js';
 import { MINIMUM_CATEGORIES, STATIC_SKIP } from '../src/engine/needs.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import type { Capabilities, ServiceType } from '../src/types.js';
@@ -177,6 +177,31 @@ describe('Plan J proof set: credits only where the repo has the equivalent', () 
   it('the credited rows are shown with their credit text in the full report', async () => {
     const t = renderTerminal(await audit('static-next-export'), { knownValues: [], now: () => NOW, verbose: true });
     for (const c of (await audit('static-next-export')).coverage.filter((x) => x.credit !== undefined)) expect(t.replace(/\s+/g, ' ')).toContain(c.credit!.replace(/\s+/g, ' '));
+  });
+  it('verbose: the same part titles in the same order as the short report, for every fixture (PL-A5)', async () => {
+    const head = (t: string) => t.split('\n').filter((l) => /^[1-6] /.test(l) && l === `${l[0]} ${PART_TITLE[Number(l[0]) as keyof typeof PART_TITLE]}`);
+    for (const f of FIXTURES) {
+      const r = await audit(f);
+      const short = head(renderTerminal(r, { knownValues: [], now: () => NOW }));
+      const full = head(renderTerminal(r, { knownValues: [], now: () => NOW, verbose: true }));
+      // the full report shows a part the short one counts only in its summary (every row there is unknown): never fewer parts, same order
+      expect(full.filter((h) => short.includes(h)), f).toEqual(short);
+      const view = new Map(shortParts(r).map((p) => [`${p.part} ${p.title}`, p]));
+      for (const h of full.filter((x) => !short.includes(x))) {
+        const p = view.get(h)!;
+        expect(p.fix.length + p.consider.length + p.good.length + p.notes.length, `${f}: ${h}`).toBe(0);
+      }
+      // every coverage row is in a part of the full report, and the parts are the ones partOf gives
+      expect(full, f).toEqual([...new Set(r.coverage.map((c) => partOf(c.need)))].sort().map((n) => `${n} ${PART_TITLE[n]}`));
+    }
+  });
+  it('no ", plus " in any fixture\'s verbose text (PL-A5: one tool per check, named once)', async () => {
+    // a ", plus <tool> <version> (<owner>/<repo>)" pair; other prose may use the word ("plus 30% for re-runs")
+    const PLUS_TOOL = /, plus [^\s,]+ \S+ \([\w.-]+\/[\w.-]+\)/;
+    for (const f of FIXTURES) {
+      const r = await audit(f);
+      for (const text of [renderTerminal(r, { knownValues: [], now: () => NOW, verbose: true }), renderMarkdown(r, { knownValues: [], now: () => NOW })]) expect(text, f).not.toMatch(PLUS_TOOL);
+    }
   });
   it('no fixture has a covered signing, attestation or sbom row (nothing here signs or builds an SBOM)', async () => {
     for (const f of FIXTURES) {

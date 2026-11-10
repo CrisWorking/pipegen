@@ -1,0 +1,959 @@
+{
+  "profile": {
+    "owner": "acme",
+    "repo": "shop-api",
+    "defaultBranch": "main",
+    "private": true,
+    "ownerType": "User",
+    "plan": "free",
+    "monorepo": "none",
+    "services": [
+      {
+        "name": "shop-api",
+        "path": ".",
+        "language": "node",
+        "packageManager": "npm",
+        "runtimeVersion": "20",
+        "hasTests": true,
+        "testFramework": "jest",
+        "envVars": [
+          "DATABASE_URL"
+        ],
+        "dependsOn": [
+          {
+            "kind": "postgres",
+            "name": "postgres",
+            "evidence": "package.json: pg",
+            "envVars": [
+              "DATABASE_URL"
+            ]
+          }
+        ],
+        "scripts": [
+          "start",
+          "test",
+          "lint"
+        ],
+        "frameworks": [
+          "express"
+        ],
+        "quality": {
+          "tsconfig": false,
+          "versions": {},
+          "fromRange": [],
+          "eslintConfig": "none",
+          "configs": [],
+          "uiFrameworks": [],
+          "pythonTyped": false,
+          "fuzzTargets": false,
+          "apiSpec": null
+        }
+      }
+    ],
+    "terraformDirs": [],
+    "hasCompose": false,
+    "existingWorkflows": [
+      {
+        "path": ".github/workflows/ci.yml",
+        "triggers": [
+          "push",
+          "pull_request"
+        ],
+        "deploys": false,
+        "secretsUsed": [],
+        "jobs": [
+          "test",
+          "audit",
+          "zap"
+        ]
+      }
+    ],
+    "precommit": "husky",
+    "repoFiles": {
+      "dependabot": null,
+      "codeowners": null,
+      "renovate": null,
+      "actionsLock": false,
+      "kubernetes": false,
+      "licenceConfig": null,
+      "secretsBaseline": false
+    }
+  },
+  "commit": {
+    "sha": "f4bcfaba7c85be3c6332cc74a20819f586dcdbc6",
+    "short": "f4bcfab",
+    "branch": "main"
+  },
+  "capabilities": {
+    "branchProtection": false,
+    "environments": true,
+    "envRequiredReviewers": false,
+    "deploymentBranchPolicies": true,
+    "attestations": false,
+    "codeScanning": false,
+    "keylessSigningAllowed": false
+  },
+  "support": {
+    "level": "full",
+    "reasons": [],
+    "nextStep": "The full setup arrives in v0.2 for single-package Node/TypeScript repos.",
+    "nextCommand": null
+  },
+  "coverage": [
+    {
+      "need": {
+        "id": "hooks",
+        "layer": "pre-commit",
+        "category": "hooks",
+        "why": "Why hooks.",
+        "blocking": true,
+        "floor": false
+      },
+      "status": "covered",
+      "why": "The repo uses husky to run git hooks.",
+      "by": "husky",
+      "where": ".husky/pre-commit"
+    },
+    {
+      "need": {
+        "id": "secrets",
+        "layer": "pre-commit",
+        "category": "secrets",
+        "why": "Why secrets.",
+        "blocking": true,
+        "floor": true
+      },
+      "status": "missing",
+      "why": "Without a secret scan before each commit, a key can be committed without anyone noticing."
+    },
+    {
+      "need": {
+        "id": "format-lint",
+        "layer": "pre-commit",
+        "category": "format-lint",
+        "service": "shop-api",
+        "why": "Why format-lint.",
+        "blocking": false,
+        "floor": false
+      },
+      "status": "missing",
+      "why": "Without a format and lint hook, style problems are only found later, in CI or in review."
+    },
+    {
+      "need": {
+        "id": "hooks-ci",
+        "layer": "push",
+        "category": "hooks-ci",
+        "why": "Why hooks-ci.",
+        "blocking": true,
+        "floor": false
+      },
+      "status": "missing",
+      "why": "Without running the hooks in CI, anyone who skips them locally is never caught."
+    },
+    {
+      "need": {
+        "id": "secrets",
+        "layer": "push",
+        "category": "secrets",
+        "why": "Why secrets.",
+        "blocking": true,
+        "floor": true
+      },
+      "status": "missing",
+      "why": "Without a secret scan in CI, a key committed without the local hook is only found after it leaks."
+    },
+    {
+      "need": {
+        "id": "sast",
+        "layer": "push",
+        "category": "sast",
+        "service": "shop-api",
+        "why": "Why sast.",
+        "blocking": true,
+        "floor": true
+      },
+      "status": "missing",
+      "why": "Without a code scan, common security bugs reach the main branch unnoticed."
+    },
+    {
+      "need": {
+        "id": "deps",
+        "layer": "push",
+        "category": "deps",
+        "service": "shop-api",
+        "why": "Why deps.",
+        "blocking": true,
+        "floor": true
+      },
+      "status": "partial",
+      "why": "npm-audit runs, but its failure is ignored (continue-on-error), so it can never fail the build.",
+      "by": "npm-audit",
+      "where": ".github/workflows/ci.yml (job audit)"
+    },
+    {
+      "need": {
+        "id": "unit-tests",
+        "layer": "push",
+        "category": "unit-tests",
+        "service": "shop-api",
+        "why": "Why unit-tests.",
+        "blocking": true,
+        "floor": true
+      },
+      "status": "covered",
+      "why": "Your own `npm test` runs on every push.",
+      "by": "your own `npm test`",
+      "where": ".github/workflows/ci.yml (job test)"
+    },
+    {
+      "need": {
+        "id": "lint",
+        "layer": "push",
+        "category": "lint",
+        "service": "shop-api",
+        "why": "Why lint.",
+        "blocking": true,
+        "floor": false
+      },
+      "status": "covered",
+      "why": "Your own `npm run lint` runs on every push.",
+      "by": "your own `npm run lint`",
+      "where": ".github/workflows/ci.yml (job test)"
+    },
+    {
+      "need": {
+        "id": "secrets",
+        "layer": "merge",
+        "category": "secrets",
+        "why": "Why secrets.",
+        "blocking": true,
+        "floor": true
+      },
+      "status": "missing",
+      "why": "Without a secret scan in CI, a key committed without the local hook is only found after it leaks."
+    },
+    {
+      "need": {
+        "id": "unit-tests",
+        "layer": "merge",
+        "category": "unit-tests",
+        "service": "shop-api",
+        "why": "Why unit-tests.",
+        "blocking": true,
+        "floor": true
+      },
+      "status": "covered",
+      "why": "Your own `npm test` runs on every pull request.",
+      "by": "your own `npm test`",
+      "where": ".github/workflows/ci.yml (job test)"
+    },
+    {
+      "need": {
+        "id": "full-tests",
+        "layer": "merge",
+        "category": "full-tests",
+        "service": "shop-api",
+        "why": "Why full-tests.",
+        "blocking": true,
+        "floor": true
+      },
+      "status": "covered",
+      "why": "Your own `npm test` runs on every pull request.",
+      "by": "your own `npm test`",
+      "where": ".github/workflows/ci.yml (job test)"
+    },
+    {
+      "need": {
+        "id": "gate",
+        "layer": "merge",
+        "category": "gate",
+        "why": "Why gate.",
+        "blocking": true,
+        "floor": true
+      },
+      "status": "missing",
+      "why": "No single required check sums up every scan, so a failing scan does not stop a merge."
+    },
+    {
+      "need": {
+        "id": "dast",
+        "layer": "merge",
+        "category": "dast",
+        "service": "shop-api",
+        "why": "Why dast.",
+        "blocking": true,
+        "floor": false
+      },
+      "status": "unknown",
+      "why": "A job calls a reusable workflow from another repo, and pipegen can't see inside it.",
+      "by": "acme/security/.github/workflows/zap.yml@v2",
+      "where": ".github/workflows/ci.yml (job zap)"
+    },
+    {
+      "need": {
+        "id": "sbom",
+        "layer": "deploy",
+        "category": "sbom",
+        "service": "shop-api",
+        "why": "Why sbom.",
+        "blocking": true,
+        "floor": false
+      },
+      "status": "missing",
+      "why": "Without an SBOM, nobody can tell later which components a release shipped."
+    },
+    {
+      "need": {
+        "id": "deploy-verify",
+        "layer": "deploy",
+        "category": "deploy-verify",
+        "service": "shop-api",
+        "why": "Why deploy-verify.",
+        "blocking": true,
+        "floor": false
+      },
+      "status": "missing",
+      "why": "Deploys don't check that the commit passed the pipeline."
+    },
+    {
+      "need": {
+        "id": "type-check",
+        "layer": "push",
+        "category": "type-check",
+        "service": "shop-api",
+        "why": "Why type-check.",
+        "blocking": true,
+        "floor": false
+      },
+      "status": "missing",
+      "why": "Why type-check."
+    },
+    {
+      "need": {
+        "id": "duplication",
+        "layer": "merge",
+        "category": "duplication",
+        "why": "Why duplication.",
+        "blocking": false,
+        "floor": false
+      },
+      "status": "missing",
+      "why": "Why duplication."
+    },
+    {
+      "need": {
+        "id": "dead-code",
+        "layer": "merge",
+        "category": "dead-code",
+        "service": "shop-api",
+        "why": "Why dead-code.",
+        "blocking": false,
+        "floor": false
+      },
+      "status": "missing",
+      "why": "Why dead-code."
+    },
+    {
+      "need": {
+        "id": "update-config",
+        "layer": "merge",
+        "category": "update-config",
+        "why": "Why update-config.",
+        "blocking": false,
+        "floor": false
+      },
+      "status": "missing",
+      "why": "Why update-config."
+    },
+    {
+      "need": {
+        "id": "scorecard",
+        "layer": "merge",
+        "category": "scorecard",
+        "why": "Why scorecard.",
+        "blocking": false,
+        "floor": false
+      },
+      "status": "missing",
+      "why": "Why scorecard."
+    },
+    {
+      "need": {
+        "id": "fuzzing",
+        "layer": "merge",
+        "category": "fuzzing",
+        "service": "shop-api",
+        "why": "Why fuzzing.",
+        "blocking": false,
+        "floor": false
+      },
+      "status": "missing",
+      "why": "Why fuzzing."
+    },
+    {
+      "need": {
+        "id": "workflow-lint",
+        "layer": "merge",
+        "category": "workflow-lint",
+        "why": "Why workflow-lint.",
+        "blocking": true,
+        "floor": false
+      },
+      "status": "missing",
+      "why": "Why workflow-lint."
+    }
+  ],
+  "wouldAdd": [
+    {
+      "need": {
+        "id": "secrets",
+        "layer": "pre-commit",
+        "category": "secrets",
+        "why": "Why secrets.",
+        "blocking": true,
+        "floor": true
+      },
+      "status": "missing",
+      "tool": {
+        "kind": "reviewed",
+        "id": "gitleaks",
+        "name": "gitleaks",
+        "repo": "gitleaks/gitleaks-action",
+        "version": "v2.3.9"
+      },
+      "also": [],
+      "note": "reviewed tool"
+    },
+    {
+      "need": {
+        "id": "format-lint",
+        "layer": "pre-commit",
+        "category": "format-lint",
+        "service": "shop-api",
+        "why": "Why format-lint.",
+        "blocking": false,
+        "floor": false
+      },
+      "status": "missing",
+      "tool": null,
+      "also": [],
+      "note": "no reviewed tool yet; pipegen would only mention one, never run it as a check"
+    },
+    {
+      "need": {
+        "id": "hooks-ci",
+        "layer": "push",
+        "category": "hooks-ci",
+        "why": "Why hooks-ci.",
+        "blocking": true,
+        "floor": false
+      },
+      "status": "missing",
+      "tool": null,
+      "also": [],
+      "note": "no reviewed tool yet; pipegen would only mention one, never run it as a check"
+    },
+    {
+      "need": {
+        "id": "secrets",
+        "layer": "push",
+        "category": "secrets",
+        "why": "Why secrets.",
+        "blocking": true,
+        "floor": true
+      },
+      "status": "missing",
+      "tool": {
+        "kind": "reviewed",
+        "id": "gitleaks",
+        "name": "gitleaks",
+        "repo": "gitleaks/gitleaks-action",
+        "version": "v2.3.9"
+      },
+      "also": [],
+      "note": "reviewed tool"
+    },
+    {
+      "need": {
+        "id": "sast",
+        "layer": "push",
+        "category": "sast",
+        "service": "shop-api",
+        "why": "Why sast.",
+        "blocking": true,
+        "floor": true
+      },
+      "status": "missing",
+      "tool": {
+        "kind": "reviewed",
+        "id": "semgrep",
+        "name": "semgrep",
+        "repo": "semgrep/semgrep",
+        "version": "1.95.0"
+      },
+      "also": [],
+      "note": "reviewed tool"
+    },
+    {
+      "need": {
+        "id": "deps",
+        "layer": "push",
+        "category": "deps",
+        "service": "shop-api",
+        "why": "Why deps.",
+        "blocking": true,
+        "floor": true
+      },
+      "status": "partial",
+      "tool": null,
+      "also": [],
+      "note": "no reviewed tool yet; pipegen would only mention one, never run it as a check"
+    },
+    {
+      "need": {
+        "id": "secrets",
+        "layer": "merge",
+        "category": "secrets",
+        "why": "Why secrets.",
+        "blocking": true,
+        "floor": true
+      },
+      "status": "missing",
+      "tool": {
+        "kind": "reviewed",
+        "id": "gitleaks",
+        "name": "gitleaks",
+        "repo": "gitleaks/gitleaks-action",
+        "version": "v2.3.9"
+      },
+      "also": [],
+      "note": "reviewed tool"
+    },
+    {
+      "need": {
+        "id": "gate",
+        "layer": "merge",
+        "category": "gate",
+        "why": "Why gate.",
+        "blocking": true,
+        "floor": true
+      },
+      "status": "missing",
+      "tool": {
+        "kind": "built-in"
+      },
+      "also": [],
+      "note": "pipegen's own check"
+    },
+    {
+      "need": {
+        "id": "dast",
+        "layer": "merge",
+        "category": "dast",
+        "service": "shop-api",
+        "why": "Why dast.",
+        "blocking": true,
+        "floor": false
+      },
+      "status": "unknown",
+      "tool": null,
+      "also": [],
+      "note": "no reviewed tool yet; pipegen would only mention one, never run it as a check"
+    },
+    {
+      "need": {
+        "id": "sbom",
+        "layer": "deploy",
+        "category": "sbom",
+        "service": "shop-api",
+        "why": "Why sbom.",
+        "blocking": true,
+        "floor": false
+      },
+      "status": "missing",
+      "tool": null,
+      "also": [],
+      "note": "no reviewed tool yet; pipegen would only mention one, never run it as a check"
+    },
+    {
+      "need": {
+        "id": "deploy-verify",
+        "layer": "deploy",
+        "category": "deploy-verify",
+        "service": "shop-api",
+        "why": "Why deploy-verify.",
+        "blocking": true,
+        "floor": false
+      },
+      "status": "missing",
+      "tool": {
+        "kind": "built-in"
+      },
+      "also": [],
+      "note": "pipegen's own check"
+    },
+    {
+      "need": {
+        "id": "type-check",
+        "layer": "push",
+        "category": "type-check",
+        "service": "shop-api",
+        "why": "Why type-check.",
+        "blocking": true,
+        "floor": false
+      },
+      "status": "missing",
+      "tool": {
+        "kind": "repo-tool",
+        "id": "type-check",
+        "name": "tsc",
+        "version": "7.0.2"
+      },
+      "also": [],
+      "note": "tsc is in the lockfile"
+    },
+    {
+      "need": {
+        "id": "duplication",
+        "layer": "merge",
+        "category": "duplication",
+        "why": "Why duplication.",
+        "blocking": false,
+        "floor": false
+      },
+      "status": "missing",
+      "tool": {
+        "kind": "reviewed",
+        "id": "jscpd",
+        "name": "jscpd",
+        "repo": "kucherenko/jscpd",
+        "version": "5.4.2"
+      },
+      "also": [],
+      "note": "jscpd: finds copy-pasted code; warning only"
+    },
+    {
+      "need": {
+        "id": "dead-code",
+        "layer": "merge",
+        "category": "dead-code",
+        "service": "shop-api",
+        "why": "Why dead-code.",
+        "blocking": false,
+        "floor": false
+      },
+      "status": "missing",
+      "tool": {
+        "kind": "reviewed",
+        "id": "knip",
+        "name": "knip",
+        "repo": "webpro-nl/knip",
+        "version": "5.50.0"
+      },
+      "also": [],
+      "note": "Knip: finds unused files"
+    },
+    {
+      "need": {
+        "id": "update-config",
+        "layer": "merge",
+        "category": "update-config",
+        "why": "Why update-config.",
+        "blocking": false,
+        "floor": false
+      },
+      "status": "missing",
+      "tool": {
+        "kind": "built-in"
+      },
+      "also": [],
+      "note": "pipegen would write `.github/dependabot.yml`"
+    },
+    {
+      "need": {
+        "id": "scorecard",
+        "layer": "merge",
+        "category": "scorecard",
+        "why": "Why scorecard.",
+        "blocking": false,
+        "floor": false
+      },
+      "status": "missing",
+      "tool": null,
+      "also": [],
+      "note": "OpenSSF Scorecard: scores the repo weekly"
+    },
+    {
+      "need": {
+        "id": "fuzzing",
+        "layer": "merge",
+        "category": "fuzzing",
+        "service": "shop-api",
+        "why": "Why fuzzing.",
+        "blocking": false,
+        "floor": false
+      },
+      "status": "missing",
+      "tool": null,
+      "also": [],
+      "note": "pipegen builds fuzzing in v0.3"
+    },
+    {
+      "need": {
+        "id": "workflow-lint",
+        "layer": "merge",
+        "category": "workflow-lint",
+        "why": "Why workflow-lint.",
+        "blocking": true,
+        "floor": false
+      },
+      "status": "missing",
+      "tool": {
+        "kind": "reviewed",
+        "id": "actionlint",
+        "name": "actionlint",
+        "repo": "rhysd/actionlint",
+        "version": "1.7.12"
+      },
+      "also": [
+        {
+          "kind": "reviewed",
+          "id": "zizmor",
+          "name": "zizmor",
+          "repo": "zizmorcore/zizmor",
+          "version": "1.31.1"
+        }
+      ],
+      "note": "actionlint and zizmor: check the workflows"
+    }
+  ],
+  "skipped": [
+    {
+      "why": "no services found",
+      "categories": [
+        "format",
+        "coverage"
+      ],
+      "services": []
+    },
+    {
+      "why": "no Dockerfile found",
+      "categories": [
+        "dockerfile-lint"
+      ],
+      "services": [
+        "shop-api",
+        "worker"
+      ]
+    }
+  ],
+  "wouldSet": [
+    {
+      "setting": "sha-pinning",
+      "why": "Makes GitHub refuse any action that is not pinned to a commit."
+    },
+    {
+      "setting": "dependabot-alerts",
+      "why": "Tells you when a dependency has a known vulnerability."
+    },
+    {
+      "setting": "secret-scanning",
+      "why": "A paid add-on (GitHub Secret Protection); pipegen can't turn it on here."
+    }
+  ],
+  "wouldCreate": [
+    {
+      "what": "docker",
+      "why": "shop-api runs but has no Dockerfile: pipegen would create one, so the image can be built and scanned."
+    },
+    {
+      "what": "compose",
+      "why": "The app uses postgres: pipegen would create a Compose file that starts them for the tests."
+    }
+  ],
+  "testsNote": null,
+  "estimates": {
+    "setupMinutes": 70,
+    "setupMinutesCap": 140,
+    "monthlyMinutes": 1240,
+    "includedMinutes": 2000,
+    "aiTokens": [
+      {
+        "stage": "needs",
+        "input": 30000,
+        "output": 3000
+      }
+    ],
+    "aiCostUsd": {
+      "input": {
+        "low": 1.2,
+        "high": 3.6
+      },
+      "output": {
+        "low": 0.9,
+        "high": 2.7
+      },
+      "low": 2.1,
+      "high": 6.3
+    },
+    "aiCostCapUsd": 12.6,
+    "durationMinutes": {
+      "low": 12,
+      "high": 24
+    },
+    "basis": [
+      "Setup runs the pipeline for 2 proof variants (the real changes, and the same with planted problems), plus 30% for re-runs (× 1.3).",
+      "Activity: at least 300 pushes and at least 41 pull requests in the last 30 days (GitHub lists only the last 300 events and pipegen reads at most 1,000 pull requests).",
+      "Your free plan has 2,000 included minutes a month for private repos (docs.github.com, checked 2026-10-26).",
+      "The AI cost cap is twice the high estimate ($12.60); pipegen stops calling the AI there."
+    ],
+    "pricedFor": {
+      "provider": "claude",
+      "model": "claude-opus-5-5"
+    }
+  },
+  "permissions": [
+    {
+      "permission": "Contents: read and write",
+      "why": "Opens the pull request with the pipeline files."
+    },
+    {
+      "permission": "Workflows: read and write",
+      "why": "Adds the pipeline workflow files."
+    }
+  ],
+  "limits": [
+    "No merge lock: anyone with write access can merge without checks (GitHub Pro for personal accounts, GitHub Team for organisations, adds it).",
+    "Without a merge lock, a pull request could replace the gate with a fake one; only code-owner review stops it.",
+    "No deploy approvals: GitHub does not let this repo require a reviewer before a deploy.",
+    "No artifact attestations: GitHub does not offer them for this repo.",
+    "No code scanning: GitHub does not show scan results in the Security tab for this repo."
+  ],
+  "secretsInTree": [
+    {
+      "file": ".env",
+      "rule": "generic-api-key",
+      "note": "(never sent to the AI; check it isn't committed)"
+    },
+    {
+      "file": "config/dev.json",
+      "rule": "aws-access-key"
+    },
+    {
+      "file": "config/dev.json",
+      "rule": "private-key"
+    }
+  ],
+  "secretCheck": {
+    "kind": "quick-format-check",
+    "looksFor": "private keys, a few known token formats (AWS, GitHub, Slack, Stripe, Google and npm tokens, and sk- API keys), JWTs, passwords inside connection strings, and file names that look like a secret.",
+    "doesNotLookFor": "`name = value` lines, such as an API key or a password set in code, in a config file or in a .env file (in a .env file only a password inside a connection string is found), and any token format not listed. So this is not a secret scan: finding nothing here does not mean the repo holds no secrets.",
+    "fullScans": "`pipegen audit --ai` runs a full secret scanner (betterleaks, or gitleaks) on the files it would send, before anything is sent; the pipeline pipegen sets up (v0.2) runs betterleaks or gitleaks on every push and pull request."
+  },
+  "aiBundle": {
+    "files": 142,
+    "bytes": 431000,
+    "truncated": false,
+    "excludedPatterns": [
+      "**/.env*",
+      "!**/.env.example",
+      "!**/.env.sample",
+      "**/.env*/**",
+      "**/*.pem",
+      "**/*.key",
+      "**/id_rsa*",
+      "**/id_dsa*",
+      "**/id_ecdsa*",
+      "**/id_ed25519*",
+      "**/*secret*",
+      "**/*secret*/**",
+      "**/*.tfstate",
+      "**/*.tfstate.backup",
+      "**/*.tfvars",
+      "**/*.tfvars.json",
+      "**/.npmrc",
+      "**/.netrc",
+      "**/*.p12",
+      "**/*.pfx",
+      "**/*.jks",
+      "**/kubeconfig",
+      "**/kubeconfig.*",
+      "**/*.kubeconfig",
+      "**/.kube/config",
+      "**/.kube/**",
+      "**/.git-credentials",
+      "**/.aws/credentials",
+      "**/.aws/config",
+      "**/credentials.json",
+      "**/.pgpass",
+      "**/.pypirc",
+      "**/.docker/config.json",
+      "**/*.env",
+      "**/*.keystore",
+      "**/*.ppk",
+      "**/*.p8",
+      "**/.htpasswd",
+      "**/service-account*.json",
+      "**/package-lock.json",
+      "**/npm-shrinkwrap.json",
+      "**/yarn.lock",
+      "**/pnpm-lock.yaml",
+      "**/bun.lockb",
+      "**/bun.lock",
+      "**/poetry.lock",
+      "**/uv.lock",
+      "**/Pipfile.lock",
+      "**/Cargo.lock",
+      "**/Gemfile.lock",
+      "**/composer.lock",
+      "**/go.sum",
+      "**/node_modules/**",
+      "**/.git/**",
+      "**/.venv/**",
+      "**/dist/**",
+      "**/build/**",
+      "**/vendor/**",
+      "**/target/**"
+    ],
+    "topFolders": [
+      "src",
+      "test",
+      "scripts"
+    ],
+    "gitExcluded": [
+      "files your .gitignore lists",
+      "files that aren't committed, when pipegen can read git's file list (.git/index)"
+    ]
+  },
+  "warnings": [],
+  "notes": [
+    "The quick secret check did not check dependency and build folders (node_modules, .venv, dist, build, vendor, target) or .git, so committed build output was not checked either.",
+    "pipegen reads the files on disk without git, so files that aren't committed (for example a local .env) are in this list too."
+  ],
+  "reviewedUnavailable": false,
+  "githubIncomplete": null,
+  "wouldAddNote": null,
+  "cantSee": [
+    "pipegen checks that a tool runs on the right trigger and can fail the build; it doesn't check the tool's other settings.",
+    "Workflows limited by `paths:` or `paths-ignore:`, and jobs or steps with an `if:` condition, show as partial: pipegen can't tell when they run.",
+    "A tool and a test joined on one line, like `{ tool; [[ … ]] } || true`, can hide a failing tool, and pipegen may still count it as covered (rare).",
+    "Commands inside `bash -c '…'` or a quoted `\"$(…)\"` aren't read, so a tool run there shows as partial or missing.",
+    "A `runs-on` set by an expression is read as Linux.",
+    "Tools inside shell functions, and jobs whose matrix includes Windows, show as partial.",
+    "Very large repos show some checks as unknown: past 200 workflow files, 100 jobs in a workflow, 200 steps in a job or action, 100 local workflows and actions followed, 16 MB of run text, 50,000 steps visited in all, 100,000 tool findings, 10,000 folders with runs, or 5,000 services.",
+    "Reusable workflows from other repos, and actions from your own account, can't be looked inside: those checks show as unknown.",
+    "Shell tricks such as `trap … EXIT`, `alias`, or a function named like the test tool aren't modelled, so a repo built to fool the audit could make a check look covered.",
+    "A local action or reusable workflow that calls another local one isn't followed past the first level, so those checks show as unknown.",
+    "Commands given through a variable aren't read.",
+    "A tool counts only for services in the languages pipegen lists for it (mypy and Ruff for Python, ESLint and tsc for JavaScript and TypeScript); a tool set up to check other languages as well isn't credited for them.",
+    "A test or lint script whose runner pipegen doesn't know (like `node test.js`) is trusted by its name: pipegen only lowers it when the script clearly does nothing or can't fail.",
+    "Coverage minimums in JS or TS config files (like jest.config.js or vitest.config.ts) are read as text: pipegen finds the setting but can't run the file, so it can't confirm the minimum.",
+    "Repo settings on GitHub (required checks, secret scanning, the default token permissions) aren't read, so pipegen can't say whether they are already on.",
+    "A workflow without a `permissions:` block gets the repo's default token permissions, a setting pipegen can't see.",
+    "A deploy workflow that uses no secret and no write grant isn't seen as a release.",
+    "Network egress control (blocking unexpected traffic from release jobs) is only partly read on larger runners.",
+    "Environment variables set by third-party actions aren't seen, so a check one of them turns off can show as covered.",
+    "The quick secret check on the files on disk looks only for a few secret formats (private keys, some token formats, JWTs, passwords in connection strings); it doesn't read `name = value` lines, such as an API key or a password set in code or in a .env file, so it is not a secret scan."
+  ]
+}

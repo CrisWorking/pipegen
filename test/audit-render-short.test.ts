@@ -145,13 +145,14 @@ describe('short report: invented repos of different kinds', () => {
     expect(lines(t)[lines(t).length - 1]).toBe('  More: pipegen --verbose (file, line, how to fix) · --out report.md');
     // nothing the full report says about the checks by layer or the caveats
     expect(t).not.toContain('Checks by layer');
+    expect(t).not.toContain('Checks by part');
     expect(t).not.toContain("What this audit can't see");
   });
 
   it("verbose → today's full doc minus caveats that don't apply", async () => {
     const r = await auditOf(STATIC_NEXT_PAGES);
     const t = renderTerminal(r, FULL);
-    for (const section of ['Verdict:', 'Checks by layer', 'What pipegen would add', 'Costs of the full setup', "What this audit can't see", 'Next step']) expect(t).toContain(section);
+    for (const section of ['Verdict:', 'Checks by part', 'What pipegen would add', 'Costs of the full setup', "What this audit can't see", 'Next step']) expect(t).toContain(section);
     // the Type line is in the full report too
     expect(t).toContain('output: "export"');
     // a static site with a Node CI has none of these caveats
@@ -207,7 +208,7 @@ describe('short report: invented repos of different kinds', () => {
     // Markdown keeps every section the full terminal report has, whatever the option
     const md = renderMarkdown(r, SHORT);
     expect(renderMarkdown(r, FULL)).toBe(md);
-    for (const title of ['Checks by layer', 'What pipegen would add', 'Costs of the full setup (estimates)', "What this audit can't see", 'Next step']) expect(md).toContain(`## ${title}`);
+    for (const title of ['Checks by part', 'What pipegen would add', 'Costs of the full setup (estimates)', "What this audit can't see", 'Next step']) expect(md).toContain(`## ${title}`);
     expect(md.slice(md.indexOf("## What this audit can't see"))).not.toMatch(/tox|Kubernetes|Renovate|PyPI/i);
   });
 });
@@ -541,9 +542,9 @@ describe('short report: severity by project type (PL-A2)', () => {
     expect(rank(pt(['static-site', 'container'])).fix.some((c) => /coverage/i.test(c))).toBe(true);
   });
 
-  it('small static site: the full report and its layer verdict agree (no ⚠ on format and coverage)', () => {
+  it('small static site: the full report and its layer verdict agree (no ✗ on format and coverage)', () => {
     const only = (projectType: ProjectType) => ({ ...withType(freePrivateReport(EXCLUDED_PATTERNS), projectType), coverage: rows().slice(0, 2), wouldAdd: [] });
-    const md = (projectType: ProjectType) => renderMarkdown(only(projectType), FULL).split('\n').filter((l) => /^\| ⚠ \| missing/.test(l));
+    const md = (projectType: ProjectType) => renderMarkdown(only(projectType), FULL).split('\n').filter((l) => /^\| ✗ \| missing/.test(l));
     expect(md(pt(['static-site']))).toEqual([]);
     expect(md(pt(['server']))).toHaveLength(2);
     expect(layerViews(only(pt(['static-site']))).some((v) => v.serious)).toBe(false);

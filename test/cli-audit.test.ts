@@ -227,7 +227,7 @@ describe('pipegen audit (brief)', () => {
     expect(r.out).toContain('pipegen changed nothing in the repo or on GitHub.');
     expect(r.out).toContain('Nothing was sent to an AI.');
     expect(r.out).toMatch(/Verdict: /);
-    expect(r.out).toContain('Checks by layer');
+    expect(r.out).toContain('Checks by part');
     expect(r.calls.length).toBeGreaterThan(0);
     for (const c of r.calls) expect(`${c.method} ${c.url.href}`).toMatch(/^GET https:\/\/api\.github\.com\//);
     expect(globalFetch).not.toHaveBeenCalled();
@@ -243,7 +243,7 @@ describe('pipegen audit (brief)', () => {
     const file = join(work, 'report.md');
     const md = readFileSync(file, 'utf8');
     expect(md).toMatch(/^# pipegen audit: o\/r\n/);
-    expect(md).toContain('## Checks by layer');
+    expect(md).toContain('## Checks by part');
     expect(statSync(file).mode & 0o777).toBe(0o600);
     expect(listTree(dir)).toEqual(before); // nothing written in the repo (and no git: nothing committed)
     expect(readFileSync(join(dir, '.git/config'), 'utf8')).toBe('[remote "origin"]\n\turl = https://github.com/o/r.git\n');
@@ -639,7 +639,7 @@ describe('pipegen audit (auth and GitHub, ruling B1)', () => {
     expect(r.out).toContain('Secret-like text in the files on disk now');
     expect(r.out).toContain('.github/workflows/ci.yml');
     expect(r.out).toContain('What the full setup would send to the AI');
-    expect(r.out).not.toMatch(/Verdict|Checks by layer|What your GitHub plan allows|Costs of the full setup|Permissions the full setup needs/);
+    expect(r.out).not.toMatch(/Verdict|Checks by layer|Checks by part|What your GitHub plan allows|Costs of the full setup|Permissions the full setup needs/);
     expect(r.err).toContain("GitHub: not read: pipegen couldn't reach https://api.github.com to check o/r (HTTP 503");
     // --json: the local parts as JSON, github "not read"
     const j = await audit(['audit', '--verbose', '--json'], { cwd: dir, routes: down });
@@ -1132,7 +1132,7 @@ describe('GitHub rate limit (DoD)', () => {
     const r = await audit(['audit', '--verbose'], { cwd: dir, routes });
     expect(r.code).toBe(3);
     expect(r.out).toContain('Verdict:');
-    expect(r.out).toContain('Checks by layer');
+    expect(r.out).toContain('Checks by part');
     const flatOut = r.out.replace(/\n {2,}/g, ' ');
     expect(flatOut).toContain("GitHub's rate limit was reached, so pipegen couldn't read everything it needs from GitHub.");
     expect(flatOut).toMatch(/GitHub's limit resets by \d\d:\d\d \S+ \(your local time\), within 5[56] minutes\./);

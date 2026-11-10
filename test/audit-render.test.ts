@@ -9,6 +9,7 @@ import { CHECKS } from '../src/engine/needs.js';
 import type { RepoToolStep } from '../src/engine/reviewed.js';
 import type { Layer } from '../src/types.js';
 import { CANT_SEE as CANT_SEE_ALL, renderJson, renderLocalJson, renderLocalTerminal, renderMarkdown, renderTerminal, type RenderOptions } from '../src/audit/render.js';
+import { PART_TITLE, partOf } from '../src/audit/parts.js';
 import { K8S_FOLDERS } from '../src/read/quality.js';
 import { safeMarkdown } from '../src/util/safe-text.js';
 import { EMPTY_PLACEHOLDER, safeOutput, TOO_LONG } from '../src/util/safe-output.js';
@@ -47,7 +48,7 @@ const json = (r: AuditReport, o: RenderOptions = OPTS) => renderJson(r, o);
 
 /** Section titles, in the order the brief sets (1-9), with notes and the fixed limits just before the next step. */
 const TITLES = [
-  'What your GitHub plan allows', 'Checks by layer', 'What pipegen would add', 'Costs of the full setup',
+  'What your GitHub plan allows', 'Checks by part', 'What pipegen would add', 'Costs of the full setup',
   'What the full setup would send to the AI', 'Permissions the full setup needs', 'Notes', "What this audit can't see", 'Next step',
 ];
 
@@ -101,7 +102,7 @@ describe('renderTerminal / renderMarkdown (brief)', () => {
     }
     // the limits come first in their section: before what is available and before the repo line
     const t = term(r);
-    const section = t.slice(t.indexOf('What your GitHub plan allows'), t.indexOf('Checks by layer'));
+    const section = t.slice(t.indexOf('What your GitHub plan allows'), t.indexOf('Checks by part'));
     const firstLimit = section.indexOf('No merge lock');
     expect(firstLimit).toBeGreaterThan(-1);
     expect(firstLimit).toBeLessThan(section.indexOf('Available here'));
@@ -268,7 +269,7 @@ describe('snapshots', () => {
 });
 
 describe('rulings', () => {
-  it('S14: serious = a blocking need missing or partial; a layer with no needs is "not needed" and not counted', () => {
+  it('S14: serious = a blocking need missing or partial; a layer with no needs is left out and not counted', () => {
     const r = report();
     // pre-commit: blocking secrets missing (serious); push: deps partial (serious); merge: gate missing (serious);
     // deploy: sbom missing (serious)
@@ -279,9 +280,11 @@ describe('rulings', () => {
     // no deploy needs: "not needed", and the count is of 3 layers
     const noDeploy = { ...r, coverage: r.coverage.filter((c) => c.need.layer !== 'deploy') };
     const t = term(noDeploy);
-    expect(t).toContain('not needed: nothing here runs or deploys');
+    // PL-A5: a layer with no checks has no row, and a part with no check is left out (no "not needed" line)
+    expect(partLines(t).map((l) => l.slice(0, 1))).not.toContain('4'); // the SBOM row (deploy layer) is gone, so is its part
+    expect(t).not.toContain('not needed');
     expect(t).toContain('Verdict: 3 of 3 layers have gaps; 3 are serious.');
-    expect(md(noDeploy)).toContain('not needed: nothing here runs or deploys');
+    expect(md(noDeploy)).not.toContain('<summary>4 ');
     // an unknown row is not a gap and not serious, but the verdict says pipegen couldn't check it
     const unknownOnly = {
       ...r,
@@ -565,8 +568,8 @@ describe('fix round 1', () => {
     const t = term(builtInsOnly);
     expect(t).toContain('Verdict: 2 of 4 layers have gaps; none is serious.');
     expect(t).not.toContain('serious gaps');
-    expect(t).not.toMatch(/⚠ missing/); // no row marker on pipegen's own checks
-    expect(t).toMatch(/ {6}missing {2}Merge gate \(pipegen\)/);
+    expect(t).not.toMatch(/✗ missing/); // never "fix first" for pipegen's own checks (PL-A5: ⚠ is "consider", as in the short report)
+    expect(t).toMatch(/ ⚠ missing {2}Merge gate \(pipegen\)/);
     expect(flat(t)).toContain("Merge gate (pipegen), on every pull request (now missing): pipegen's own check"); // still a gap pipegen fills
     expect(md(builtInsOnly)).toContain('2 of 4 layers have gaps; none is serious.');
     // the realistic report still has a third-party gap in every layer
@@ -756,20 +759,21 @@ function planPReport(): AuditReport {
     ],
   };
 }
-const GROUP = 'On a schedule and in repo files';
 
 describe('Plan P Task 9: the report shows every catalogue check', () => {
   it('report: scheduled group after deploy, with its own status line (PS37)', () => {
     const r = planPReport();
+    const P6 = `6 ${PART_TITLE[6]}`;
     for (const text of [term(r), md(r)]) {
-      const deploy = lineOf(text, 'When the code is deployed or released');
-      const sched = lineOf(text, GROUP);
+      const deploy = lineOf(text, `5 ${PART_TITLE[5]}`);
+      const sched = lineOf(text, P6);
+      expect(deploy).toBeGreaterThan(-1);
       expect(sched).toBeGreaterThan(deploy);
       expect(lineOf(text, 'Dependency update config')).toBeGreaterThan(sched);
       expect(lineOf(text, 'OpenSSF Scorecard')).toBeGreaterThan(sched);
-      // the merge view doesn't list a scheduled row, so nothing is counted twice
-      const merge = lineOf(text, 'On every pull request, before merge');
-      const mergeRows = text.split('\n').slice(merge, deploy).join('\n');
+      // the pull request part doesn't list a scheduled row, so nothing is counted twice
+      const merge = lineOf(text, `2 ${PART_TITLE[2]}`);
+      const mergeRows = text.split('\n').slice(merge, lineOf(text, `3 ${PART_TITLE[3]}`)).join('\n');
       expect(mergeRows).not.toContain('Dependency update config');
       expect(mergeRows).not.toContain('Fuzzing');
     }
@@ -778,16 +782,15 @@ describe('Plan P Task 9: the report shows every catalogue check', () => {
     expect(tflat(r)).not.toContain('OpenSSF Scorecard, on every pull request');
     // PS37: the verdict stays over the four layers; the scheduled group has its own status line
     expect(term(r)).toContain('Verdict: 4 of 4 layers have gaps; 4 are serious.');
-    expect(term(r)).toMatch(new RegExp(`${GROUP}: gaps \\(0 of 3 checks covered\\)`));
     expect(term(r)).not.toMatch(/of 5 layers/);
     for (const text of [term(r), md(r)]) expect(text).toContain('Scheduled and repo-file checks: gaps (0 of 3 checks covered).');
     expect(term(report())).not.toContain('Scheduled and repo-file checks');
-    // a group with no rows is left out
-    expect(term(report())).not.toContain(GROUP);
+    // a part with no rows is left out
+    expect(term(report())).not.toContain(P6);
     expect(term(report())).toContain('Verdict: 4 of 4 layers have gaps; 4 are serious.');
-    // all scheduled rows covered: the group reads covered and the verdict doesn't change
+    // all scheduled rows covered: the status line reads covered and the verdict doesn't change
     const covered = { ...r, coverage: r.coverage.map((c) => (['update-config', 'scorecard', 'fuzzing'].includes(c.need.id) ? { ...c, status: 'covered' as const } : c)) };
-    expect(term(covered)).toMatch(new RegExp(`${GROUP}: covered \\(3 of 3 checks covered\\)`));
+    expect(term(covered)).toContain('Scheduled and repo-file checks: covered (3 of 3 checks covered).');
     expect(term(covered)).toContain('Verdict: 4 of 4 layers have gaps; 4 are serious.');
   });
 
@@ -798,17 +801,18 @@ describe('Plan P Task 9: the report shows every catalogue check', () => {
       const line = t.split('\n').find((l) => l.includes(label) && /missing/.test(l));
       expect(line, label).toBeDefined();
       expect(line, label).toContain('(warning only)');
-      expect(line, label).not.toContain('⚠');
+      expect(line, label).toContain('⚠'); // "consider", as in the short report
+      expect(line, label).not.toContain('✗'); // never "fix first"
     }
     // a blocking row is neither marked nor lowered
     const blocking = t.split('\n').find((l) => l.includes('Workflow lint') && /missing/.test(l));
-    expect(blocking).toContain('⚠');
+    expect(blocking).toContain('✗');
     expect(blocking).not.toContain('warning only');
     expect(md(r)).toMatch(/\| missing \| Copy-paste check \(warning only\) \|/);
     // a dead-code check that blocks (a knip config) is not marked
     const blockingDead = { ...r, coverage: r.coverage.map((c) => (c.need.id === 'dead-code' ? { ...c, need: { ...c.need, blocking: true } } : c)) };
     const dead = term(blockingDead).split('\n').find((l) => l.includes('Dead code and unused dependencies') && /missing/.test(l));
-    expect(dead).toContain('⚠');
+    expect(dead).toContain('✗');
     expect(dead).not.toContain('warning only');
   });
 
@@ -816,7 +820,9 @@ describe('Plan P Task 9: the report shows every catalogue check', () => {
     const r = planPReport();
     // Markdown escapes `1.` (an ordered-list start) with a backslash: compare the words
     for (const text of [tflat(r), md(r).replace(/\\/g, '')]) {
-      expect(text).toContain('actionlint 1.7.12 (rhysd/actionlint), plus zizmor 1.31.1 (zizmorcore/zizmor), actionlint and zizmor: check the workflows');
+      // PL-A5: one tool per check, named once: the second tool is in the model's note, not repeated as ", plus ..."
+      expect(text).toContain('actionlint 1.7.12 (rhysd/actionlint), actionlint and zizmor: check the workflows');
+      expect(text).not.toContain('plus zizmor');
       expect(text).toContain('your own `tsc` 7.0.2 (from your lockfile) would run here');
       expect(text).not.toContain('version from package.json');
     }
@@ -841,7 +847,7 @@ describe('Plan P Task 9: the report shows every catalogue check', () => {
     const t = tflat(r);
     const title = "Checks that don't apply here";
     const section = t.slice(t.indexOf(title), t.indexOf('What pipegen would add'));
-    expect(t.indexOf(title)).toBeGreaterThan(t.indexOf('Checks by layer'));
+    expect(t.indexOf(title)).toBeGreaterThan(t.indexOf('Checks by part'));
     // terminal: one line per reason, the checks together
     expect(section).toContain('Format check, Test coverage minimum: no services found');
     expect(section).toContain('Dockerfile lint (for shop-api, worker): no Dockerfile found');
@@ -1016,8 +1022,8 @@ describe('rows shared by several services (DoD fastapi)', () => {
       expect(out).toContain('Lint for frontend and app');
       expect(out).toContain('Lint for emails');
     }
-    // the layer still counts checks, one per service, and JSON keeps one row per check
-    expect(tflat(twoServices())).toContain('(1 of 6 checks covered)');
+    // the part's summary counts the rows shown (✗ code scan, ✗ two lint services, ✓ one), and JSON keeps one row per check
+    expect(md(twoServices())).toContain('<summary>2 Every pull request (✗ 2 · ⚠ 0 · ✓ 1)</summary>');
     expect((JSON.parse(json(twoServices())) as { coverage: unknown[] }).coverage).toHaveLength(6);
   });
 });
@@ -1083,5 +1089,126 @@ describe('the quick secret check says what it does and does not look for (hand c
 
   it("report: what this audit can't see names the gap", () => {
     expect(CANT_SEE.some((l) => l.includes('quick secret check') && l.includes('`name = value`'))).toBe(true);
+  });
+});
+
+// ---------- PL-A5: --verbose and --out Markdown by the same parts as the short report ----------
+
+const esc = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const PART_LINE = new RegExp(`^[1-6] (?:${Object.values(PART_TITLE).map(esc).join('|')})$`);
+/** The part header lines of a terminal report (the short and the verbose report write them the same way). */
+const partLines = (t: string) => t.split('\n').filter((l) => PART_LINE.test(l));
+/** The lines under one part header, up to the next part header or the next top-level title. */
+function underPart(t: string, header: string): string {
+  const lines = t.split('\n');
+  const at = lines.indexOf(header);
+  if (at < 0) return '';
+  let end = lines.length;
+  for (let i = at + 1; i < lines.length; i++) if (PART_LINE.test(lines[i] as string) || /^\S/.test(lines[i] as string)) { end = i; break; }
+  return lines.slice(at + 1, end).join('\n');
+}
+const SHORT: RenderOptions = { knownValues: [], now: () => NOW };
+const planPCovered = (): AuditReport => ({ ...planPReport(), coverage: planPReport().coverage.map((c) => ({ ...c, status: 'covered' as const })) });
+const noPart5 = (): AuditReport => ({ ...planPReport(), coverage: planPReport().coverage.filter((c) => partOf(c.need) !== 5) });
+const noDeployReport = (): AuditReport => ({ ...report(), coverage: report().coverage.filter((c) => c.need.layer !== 'deploy') });
+
+describe('PL-A5: the full report and the Markdown report by parts', () => {
+  it('json unchanged (golden): the parts change the human reports only', async () => {
+    await expect(json(planPReport())).toMatchFileSnapshot('./__snapshots__/audit-render.plan-p.json');
+    await expect(json({ ...report(), ai: aiPart(), warnings: [SWAP] })).toMatchFileSnapshot('./__snapshots__/audit-render.free-private.json');
+  });
+
+  it('verbose: same part titles and order as the short report', () => {
+    for (const r of [report(), planPReport(), planPCovered(), everyCaveat()]) {
+      const short = partLines(term(r, SHORT));
+      expect(short.length).toBeGreaterThan(0);
+      expect(partLines(term(r))).toEqual(short);
+    }
+    // the headers are the six titles, in part order, and a part with no check is left out
+    const t = term(noPart5());
+    expect(partLines(t).map((l) => l.slice(2))).toEqual([PART_TITLE[1], PART_TITLE[2], PART_TITLE[3], PART_TITLE[4], PART_TITLE[6]]);
+    expect(partLines(term(noPart5(), SHORT))).toEqual(partLines(t));
+    expect(t).not.toContain('Checks by layer');
+    expect(t).not.toContain('When the code is deployed or released');
+    // the short report counts a part whose only row is "couldn't tell" in its summary and leaves the part out; the full report
+    // still shows that row (nothing dropped), so its part is the one extra header
+    const unknownOnly = noDeployReport(); // the DAST row (part 5) is unknown, and nothing else is left in part 5
+    expect(partLines(term(unknownOnly, SHORT)).map((l) => l.slice(2))).not.toContain(PART_TITLE[5]);
+    expect(partLines(term(unknownOnly)).map((l) => l.slice(2))).toContain(PART_TITLE[5]);
+    expect(underPart(term(unknownOnly), `5 ${PART_TITLE[5]}`)).toMatch(/\? unknown {2}Running-app scan/);
+  });
+
+  it('verbose: every coverage row sits under its own part, with the short report\'s marks (fix first, consider, good)', () => {
+    const r = planPReport();
+    const t = term(r);
+    for (const c of r.coverage) {
+      expect(underPart(t, `${partOf(c.need)} ${PART_TITLE[partOf(c.need)]}`), `${c.need.layer} ${c.need.id}`).toContain(needLabel(c.need.id) as string);
+    }
+    const line = (label: string) => t.split('\n').find((l) => l.includes(label) && /missing|covered/.test(l)) as string;
+    // a blocking gap pipegen's setup fills: ✗; a warning-only gap: ⚠; a covered check: ✓
+    expect(line('Workflow lint')).toContain('✗');
+    expect(line('Copy-paste check')).toContain('⚠');
+    expect(line('Copy-paste check')).not.toContain('✗');
+    expect(term(report()).split('\n').find((l) => l.includes('Unit tests') && l.includes('covered'))).toContain('✓');
+    expect(term(report()).split('\n').find((l) => l.includes('Merge gate'))).toBeDefined();
+    // pipegen's own check that is missing is a gap pipegen fills: ⚠, never ✗ (U16)
+    expect(md(report())).toMatch(/\| ⚠ \| missing \| [^|]*(?:[Gg]ate|merge)[^|]* \|/);
+    // the old serious-only marker is gone: no row starts with the bare ⚠ and a blank status column
+    expect(md(report())).not.toMatch(/\| \| (?:missing|partial|covered|unknown) \|/);
+  });
+
+  it('verbose: the same check on two layers of one part says when each runs', () => {
+    const t = term(report());
+    const part2 = underPart(t, `2 ${PART_TITLE[2]}`);
+    expect(part2).toMatch(/Secret scan, on every push/);
+    expect(part2).toMatch(/Secret scan, on every pull request/);
+    // a check that appears once in its part is not suffixed
+    expect(part2).not.toMatch(/Code scan, on every push/);
+  });
+
+  it('verbose: a scheduled check is never said to run on a push or a pull request', () => {
+    const r = planPReport();
+    const score = (layer: Layer) => ({ need: need(layer, 'scorecard', undefined, false), status: 'missing' as const, why: 'Why scorecard.' });
+    const t = term({ ...r, coverage: [...r.coverage.filter((c) => c.need.id !== 'scorecard'), score('push'), score('merge')] });
+    const part6 = underPart(t, `6 ${PART_TITLE[6]}`);
+    expect(part6.match(/OpenSSF Scorecard/g)?.length).toBe(2);
+    expect(part6).not.toMatch(/on every (?:push|pull request)/);
+    expect(part6).not.toContain(', on a schedule'); // both rows say the same, so neither is suffixed
+  });
+
+  it('markdown: one <details> per non-empty part', () => {
+    for (const r of [report(), planPReport(), planPCovered(), noDeployReport()]) {
+      const text = md(r);
+      const n = partLines(term(r)).length;
+      expect(n).toBeGreaterThan(0);
+      expect(text.match(/^<details>$/gm)?.length).toBe(n);
+      expect(text.match(/^<\/details>$/gm)?.length).toBe(n);
+      const summaries = [...text.matchAll(/^<summary>(.*)<\/summary>$/gm)].map((m) => m[1] as string);
+      expect(summaries.map((x) => x.replace(/ \(.*\)$/, ''))).toEqual(partLines(term(r)));
+      // each folded part holds its rows as a table, between its own tags
+      for (const block of text.split('<details>').slice(1)) expect(block.split('</details>')[0]).toMatch(/\| Status \| Check \|/);
+    }
+    // an empty part is left out; the terminal and JSON have no <details>
+    expect(md(noPart5())).not.toContain(`5 ${PART_TITLE[5]}`);
+    expect(term(report())).not.toContain('<details>');
+    expect(json(report())).not.toContain('<details>');
+    // the summary tells what is inside without opening it
+    expect(md(report())).toMatch(/<summary>2 Every pull request \(✗ \d+ · ⚠ \d+ · ✓ \d+\)<\/summary>/);
+  });
+
+  it('markdown: a hostile service or check name stays cleaned inside the folded part', () => {
+    const t = md(hostileReport());
+    expect(t.match(/^<details>$/gm)?.length).toBeGreaterThan(0);
+    expect(t).not.toMatch(/<(?:script|img|b|i)\b/i);
+    for (const line of t.split('\n')) if (/^<\/?(?:details|summary)/.test(line)) expect(line).toMatch(/^<\/?(?:details|summary)>|^<summary>[^<]*<\/summary>$/);
+  });
+
+  it('no ", plus " in any report text', () => {
+    const r = planPReport();
+    // a ", plus <tool> <version> (<owner>/<repo>)" pair; other prose may use the word ("plus 30% for re-runs")
+    for (const text of [term(r), md(r), tflat(r), term(r, SHORT)]) expect(text).not.toMatch(/, plus [^\s,]+ \S+ \([\w.-]+\/[\w.-]+\)/);
+    expect(tflat(r)).not.toContain('plus zizmor');
+    // the tool the row names stays, and its note still names the second tool (the model's own words)
+    expect(tflat(r)).toContain('actionlint 1.7.12 (rhysd/actionlint), actionlint and zizmor: check the workflows');
   });
 });
