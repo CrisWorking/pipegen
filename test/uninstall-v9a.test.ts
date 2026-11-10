@@ -402,3 +402,20 @@ describe('V9a docs (V8-R1 sec M2, M4, M5, i1, i6; spec minors)', () => {
     expect(tm.split('\n').find((l) => l.startsWith('| T10 |'))).toMatch(/Between uninstall's first and second run/);
   });
 });
+
+describe('V9a sec i6 (second part): the preview names only the central locks the record holds', () => {
+  it('plan: last project → the preview lists only the central locks the record holds, and none when it holds none', async () => {
+    const preview = async (central: InstallRecord['central']): Promise<string> => {
+      const w = world();
+      await afterRun1(w);
+      await run(w, sampleRecord(w, { central }), term({ go: false }));
+      return w.out.join('\n');
+    };
+    const none = await preview({ createdByPipegen: false });
+    expect(none).not.toMatch(/go too, as recorded/);
+    expect(none).toMatch(/this is the last project in pipelines; the install record lists no central ruleset, CODEOWNERS or Actions access of pipegen's/);
+    const access = await preview({ createdByPipegen: false, actionsAccess: { previous: 'none' } });
+    expect(access).toMatch(/this is the last project in pipelines: its Actions access goes too, as recorded/);
+    expect(access).not.toMatch(/central ruleset, CODEOWNERS and Actions access go too/);
+  });
+});

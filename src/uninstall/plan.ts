@@ -1007,9 +1007,15 @@ export function previewUninstall(u: UninstallPlan): string {
     if (on.length > 0) later.push(`  - settings pipegen turned on and leaves on (you can turn them off yourself): ${on.map((s) => SETTING_LABEL[s.key]).join(', ')}`);
   }
   later.push(`  - a central pull request in ${show(`${u.app.owner}/${CENTRAL_REPO}`)} removes this project's files: ${u.centralFiles.map((p) => show(p, 200)).join(', ')} (the install record last)`);
-  // sec M1: the central locks go only when the plan holds them (full trust, last project)
-  later.push(u.centralLocks !== undefined
-    ? `  - this is the last project in ${CENTRAL_REPO}: its central ruleset, CODEOWNERS and Actions access go too, as recorded`
+  // sec M1: the central locks go only when the plan holds them (full trust, last project); V8 sec i6: only those the record holds are named
+  const held = u.centralLocks === undefined ? [] : [
+    ...(u.centralLocks.rulesetId !== undefined ? ['central ruleset'] : []),
+    ...(u.centralLocks.codeowners !== undefined ? ['CODEOWNERS block'] : []),
+    ...(u.centralLocks.actionsAccess !== undefined ? ['Actions access'] : []),
+  ];
+  const heldText = held.length <= 1 ? held.join('') : `${held.slice(0, -1).join(', ')} and ${held[held.length - 1]}`;
+  later.push(held.length > 0
+    ? `  - this is the last project in ${CENTRAL_REPO}: its ${heldText} ${held.length === 1 ? 'goes' : 'go'} too, as recorded`
     : u.lastProject
       ? u.manual.some((m) => m.what === CENTRAL_MANUAL)
         ? `  - this is the last project in ${CENTRAL_REPO}, but the install record doesn't vouch for its central ruleset, CODEOWNERS and Actions access: pipegen doesn't touch them (see the manual steps)`
