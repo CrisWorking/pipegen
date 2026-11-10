@@ -26,12 +26,18 @@ describe('PL-D1: workflow look helpers', () => {
   });
 
   it('workflowHeader: what it does, when it runs, how to change it, PIPEGEN.md, the version (or none)', () => {
-    const lines = workflowHeader({ comment: 'pipegen: c', runs: 'It runs on a push', version: '1.2.3' }).split('\n');
+    const lines = workflowHeader({ comment: 'pipegen: c', runs: 'on a push', version: '1.2.3' }).split('\n');
     expect(lines).toEqual([
-      ' pipegen: c', ' ', ' When it runs: It runs on a push.',
+      ' pipegen: c', ' ', ' When it runs: on a push.',
       ' How to change it: through `npx pipegen update`. The file is protected (a code owner reviews every change), so edits by hand are refused or undone.',
       ' See PIPEGEN.md for what each check does and what is not covered.', ' Written by pipegen 1.2.3.',
     ]);
     expect(workflowHeader({ comment: 'c', runs: 'r', version: null }).split('\n').at(-1)).toBe(' Written by pipegen.');
+  });
+
+  it('workflowHeader: no "It runs" after "When it runs:", and "written by pipegen" once (the tail line only)', () => {
+    const h = workflowHeader({ comment: 'pipegen: c', runs: 'on a push', version: '1.2.3' });
+    expect(h).not.toMatch(/when it runs: it runs/i);
+    expect(h.match(/written by pipegen/gi)).toHaveLength(1);
   });
 });

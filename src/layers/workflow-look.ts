@@ -5,7 +5,10 @@
 import { isMap, type Document, type Scalar } from 'yaml';
 import { PART_TITLE, type PartId } from '../audit/parts.js';
 
-/** The comment block (YAML comment text, one line per `\n`; a lone space is an empty `#` line). */
+/**
+ * The comment block (YAML comment text, one line per `\n`; a lone space is an empty `#` line). `runs` completes "When it runs:" (it does not
+ * start with "It runs") and `comment` does not say "written by pipegen": the tail line says it once, with the version.
+ */
 export function workflowHeader(w: { comment: string; runs: string; version: string | null }): string {
   return [
     ` ${w.comment}`,
@@ -19,7 +22,9 @@ export function workflowHeader(w: { comment: string; runs: string; version: stri
 
 /**
  * The jobs in part order (a stable sort: inside a part, the order the jobs were given). A job no part is known for (a helper written after its
- * check: the DAST scrub, the code-scanning upload) stays with the job before it; with none before it, it is part 2.
+ * check: the DAST scrub, the code-scanning upload) stays with the job before it; with none before it, it is part 2. PL-D1-R1 (accepted): a job
+ * stays in its own part even when it needs a job of a later part (the gate, part 3, needs the pin check of part 6 in the merge file): a banner says
+ * what the job is for, and `needs` already says the order it runs in.
  */
 export function byPart(ids: readonly string[], partOfJob: (id: string) => PartId | undefined): { id: string; part: PartId }[] {
   let last: PartId = 2;

@@ -265,7 +265,7 @@ function ordered(j: Job): Job {
 
 interface WorkflowSpec {
   path: string; repo: CreatedFile['repo']; name: string; on: Obj; concurrency?: boolean; jobs: Readonly<Record<string, Job | CallerJob>>; reason: string; comment: string;
-  /** PL-D1: when the file runs (one sentence, no trailing full stop), and the part each job belongs to (PL-A1 `partOf`). */
+  /** PL-D1: when the file runs (finishes "When it runs:", no trailing full stop), and the part each job belongs to (PL-A1 `partOf`). */
   runs: string; version: string | null; partOfJob: (id: string) => PartId | undefined;
 }
 
@@ -377,9 +377,9 @@ export function assemble(input: PipelineDraft, opts: AssembleOpts): AssembledFil
   const mergeCaller = callerOf(CALLER_NAME.merge, pin === null ? `./${LOCAL_MERGE_WORKFLOW}` : centralUses(pin, project, 'merge'), a.merge);
   files.push(workflowFile({
     path: mergePath, repo: mergeRepo, name: 'pipegen merge', on: callTrigger(mergeCaller.secrets ?? {}), jobs: orderedAll(a.merge),
-    runs: 'It runs when pipegen.yml calls it (on pull requests and pull request reviews, and on pushes to the default branch)', version, partOfJob,
+    runs: 'when pipegen.yml calls it (on pull requests and pull request reviews, and on pushes to the default branch)', version, partOfJob,
     reason: `The merge layer of ${project}: every check, the base scan and the gate (the required check ${CALLER_NAME.merge} / gate).`,
-    comment: `pipegen: the merge layer of ${project}, called by its pipegen.yml only; written by pipegen. The not-proven list, when there is one, is the gate step's marked line.`,
+    comment: `pipegen: the merge layer of ${project}, called by its pipegen.yml only; the not-proven list, when there is one, is the gate step's marked line.`,
   }));
   const appJobs: Record<string, Job | CallerJob> = { [MERGE_CALLER_JOB]: mergeCaller };
   // the deploy jobs (G7) run on a push to the default branch only, after the gate
@@ -425,9 +425,9 @@ export function assemble(input: PipelineDraft, opts: AssembleOpts): AssembledFil
   const callerOn = { push: guard(() => defaultPushTrigger(def)), pull_request: null, pull_request_review: { types: [...PR_REVIEW_TRIGGER.types] } };
   files.push(workflowFile({
     path: CALLER_WORKFLOW, repo: 'app', name: 'pipegen', on: callerOn, concurrency: true, jobs: appJobs,
-    runs: 'It runs on pull requests, on pull request reviews and on pushes to the default branch', version, partOfJob,
+    runs: 'on pull requests, on pull request reviews and on pushes to the default branch', version, partOfJob,
     reason: 'Runs the merge layer on pull requests, reviews and pushes to the default branch (the required check), then the deploy jobs on the default branch.',
-    comment: 'pipegen: the merge layer and the gate for pull requests and the default branch; written by pipegen (code-owner protected).',
+    comment: 'pipegen: the merge layer and the gate for pull requests and the default branch; code-owner protected.',
   }));
 
   // 5. push: pr-check and the push-layer checks, each skipped when the branch has an open pull request
@@ -438,13 +438,13 @@ export function assemble(input: PipelineDraft, opts: AssembleOpts): AssembledFil
       pushJobs[id] = ordered({ ...j, needs: uniq([PR_CHECK_JOB, ...(j.needs ?? [])]), if: PR_CHECK_IF });
     }
     const pushOn = { push: guard(() => featurePushTrigger(def)) };
-    const comment = 'pipegen: the push layer for every branch but the default (its checks skip when the branch has an open pull request); written by pipegen.';
+    const comment = 'pipegen: the push layer for every branch but the default (its checks skip when the branch has an open pull request).';
     const reason = 'Runs the push layer on pushes to other branches than the default, unless the branch has an open pull request.';
-    const runs = 'It runs on pushes to every branch but the default one, and its checks skip when the branch has an open pull request';
+    const runs = 'on pushes to every branch but the default one, and its checks skip when the branch has an open pull request';
     if (pin === null) files.push(workflowFile({ path: PUSH_WORKFLOW, repo: 'app', name: 'pipegen push', on: pushOn, concurrency: true, jobs: pushJobs, reason, comment, runs, version, partOfJob }));
     else {
       const caller = callerOf(CALLER_NAME.push, centralUses(pin, project, 'push'), pushJobs);
-      files.push(workflowFile({ path: centralWorkflowFile(project, 'push'), repo: 'central', name: 'pipegen push', on: callTrigger(caller.secrets ?? {}), jobs: pushJobs, reason, comment: `pipegen: the push layer of ${project}, called by its pipegen-push.yml only; written by pipegen.`, runs: 'It runs when pipegen-push.yml calls it (on pushes to every branch but the default one)', version, partOfJob }));
+      files.push(workflowFile({ path: centralWorkflowFile(project, 'push'), repo: 'central', name: 'pipegen push', on: callTrigger(caller.secrets ?? {}), jobs: pushJobs, reason, comment: `pipegen: the push layer of ${project}, called by its pipegen-push.yml only.`, runs: 'when pipegen-push.yml calls it (on pushes to every branch but the default one)', version, partOfJob }));
       files.push(workflowFile({ path: PUSH_WORKFLOW, repo: 'app', name: 'pipegen push', on: pushOn, concurrency: true, jobs: { [PUSH_CALLER_JOB]: caller }, reason, comment, runs, version, partOfJob }));
     }
   }
@@ -454,13 +454,13 @@ export function assemble(input: PipelineDraft, opts: AssembleOpts): AssembledFil
     // G15a round 3 (PF-3): the weekly Scorecard entry, only when the scorecard job is written (its job runs on that entry alone)
     const nightlyOn = { schedule: [{ cron: NIGHTLY_CRON }, ...(Object.hasOwn(a.nightly, SCORECARD_JOB) ? [{ cron: SCORECARD_CRON }] : [])] };
     const nightlyJobs = orderedAll(a.nightly);
-    const comment = 'pipegen: the nightly issues (warn-ending, finish-missing, updates); written by pipegen. It never pushes a file.';
+    const comment = 'pipegen: the nightly issues (warn-ending, finish-missing, updates). It never pushes a file.';
     const reason = 'Opens the nightly issues: the warning period ending, finish not run, pipegen updates.';
-    const runs = 'It runs every night on a schedule (never on a push or a pull request)';
+    const runs = 'every night on a schedule (never on a push or a pull request)';
     if (pin === null) files.push(workflowFile({ path: NIGHTLY_WORKFLOW, repo: 'app', name: 'pipegen nightly', on: nightlyOn, jobs: nightlyJobs, reason, comment, runs, version, partOfJob }));
     else {
       const caller = callerOf(CALLER_NAME.nightly, centralUses(pin, project, 'nightly'), nightlyJobs);
-      files.push(workflowFile({ path: centralWorkflowFile(project, 'nightly'), repo: 'central', name: 'pipegen nightly', on: callTrigger(caller.secrets ?? {}), jobs: nightlyJobs, reason, comment: `pipegen: the nightly job of ${project}, called by its pipegen-nightly.yml only; written by pipegen.`, runs: 'It runs when pipegen-nightly.yml calls it (every night)', version, partOfJob }));
+      files.push(workflowFile({ path: centralWorkflowFile(project, 'nightly'), repo: 'central', name: 'pipegen nightly', on: callTrigger(caller.secrets ?? {}), jobs: nightlyJobs, reason, comment: `pipegen: the nightly job of ${project}, called by its pipegen-nightly.yml only.`, runs: 'when pipegen-nightly.yml calls it (every night)', version, partOfJob }));
       files.push(workflowFile({ path: NIGHTLY_WORKFLOW, repo: 'app', name: 'pipegen nightly', on: nightlyOn, jobs: { [NIGHTLY_CALLER_JOB]: caller }, reason, comment, runs, version, partOfJob }));
     }
   }

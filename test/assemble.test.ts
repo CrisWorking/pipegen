@@ -628,7 +628,9 @@ describe('PL-D1: workflow header, part banners, blank lines', () => {
         expect(h, at).toContain('PIPEGEN.md');
         expect(h, at).toContain('npx pipegen update');
         expect(h, at).toMatch(/protected/);
-        expect(h, at).toMatch(/\bruns (on|when|every)\b/i);
+        expect(h, at).toMatch(/When it runs: (on|when|every) /);
+        expect(h, at).not.toMatch(/it runs: it runs/i);   // PL-D1-R1: the sentence does not say "it runs" twice
+        expect(h.match(/written by pipegen/gi), at).toHaveLength(1);   // PL-D1-R1: once, in the tail line
         expect(h, at).not.toMatch(/\d{4}-\d{2}-\d{2}/);   // a version, never a date
         expect(h.split('\n').length, at).toBeGreaterThanOrEqual(4);
       }

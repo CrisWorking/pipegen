@@ -34,9 +34,11 @@ import { CALLER_WORKFLOW, REQUIRED_JOB, requiredWorkflowForm } from '../engine/j
 import { COMMIT_SHA_RE, isGitHubRepo } from '../engine/names.js';
 import type { ShaPinningRead } from '../github/lock-probes.js';
 import { GATE_CHECK_INTEGRATION_ID, GATE_CHECK_NAME, type Capabilities, type CreatedFile, type RepoProfile } from '../types.js';
+import { packageVersion, PLAIN_VERSION_RE } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
 import { CO_PLACES, coKey } from './co-places.js';
 import { MERGE_CALLER_JOB } from './assemble.js';
+import { lookOf, workflowHeader } from './workflow-look.js';
 
 /** A plan pipegen refuses to make (an owner that is not a user login or can't write to both repos, an inconsistent input). */
 export class LockError extends Error {
@@ -92,6 +94,8 @@ export interface LockInputs {
   ids?: { app: number; central: number };
   /** The delivered files (assemble's AssembledFiles.files): the required workflow calls the merge workflow pipegen.yml calls. */
   files: readonly CreatedFile[];
+  /** PL-D1-R1: the pipegen version the required workflow's header names (a plain version, or null for none). Absent: the running package's version. Never a date. */
+  version?: string | null;
 }
 
 export interface LockPlan {
@@ -190,6 +194,8 @@ function codeownersPlan(repo: CreatedFile['repo'], found: string | null, existin
 
 function requiredWorkflow(i: LockInputs, ids: { app: number; central: number }): { file: CreatedFile; rule: ApiRequest } {
   const { profile: p, central } = i;
+  const version = i.version === undefined ? packageVersion() : i.version;
+  if (version !== null && (typeof version !== 'string' || !PLAIN_VERSION_RE.test(version))) throw new LockError('The pipegen version for the required workflow\'s header is not a plain version (like 1.2.3).');
   const merge = centralWorkflowFile(p.repo, 'merge');
   const uses = `${central.repo}/${merge}@${central.sha}`;
   const app = i.files.find((f) => f.repo === 'app' && f.path === CALLER_WORKFLOW);
@@ -202,7 +208,9 @@ function requiredWorkflow(i: LockInputs, ids: { app: number; central: number }):
   const path = centralWorkflowFile(p.repo, 'required');
   const doc = new Document();
   doc.contents = doc.createNode(requiredWorkflowForm(uses, { permissions: caller.permissions, secrets: caller.secrets }));
-  doc.commentBefore = ` pipegen: the org required workflow of ${p.repo}; GitHub runs it from this repo on every pull request to the default branch, so a pull request can't change it. It calls the merge workflow at the same commit: every check and the gate run again on their own results. Written by pipegen.`;
+  // PL-D1-R1: the same header and banner as every pipegen workflow (this one is "before merge": it runs the merge workflow's checks and the gate)
+  const comment = `pipegen: the org required workflow of ${p.repo}; GitHub runs it from this repo, so a pull request can't change it. It calls the merge workflow at the same commit: every check and the gate run again on their own results.`;
+  lookOf(doc, [{ id: REQUIRED_JOB, part: 3 }], workflowHeader({ comment, runs: 'on every pull request to the default branch', version }));
   const file: CreatedFile = { path, content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: 'The org required workflow: the checks and the gate, run from the central repo on every pull request.', repo: 'central' };
   const rule: ApiRequest = {
     method: 'POST', route: '/orgs/{org}/rulesets', params: { org: p.owner },

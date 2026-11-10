@@ -239,9 +239,9 @@ export function sharedWorkflows(draft: PipelineDraft, mode: SigningMode, deps: {
   const { steps, ...rest } = job;
   doc.contents = doc.createNode({ name: 'pipegen sign', on: { workflow_call: {} }, permissions: {}, jobs: { [SIGN_JOB_ID]: rest } });
   doc.setIn(['jobs', SIGN_JOB_ID, 'steps'], stepsToYaml(steps));
-  const comment = `pipegen: signs ${draft.profile.repo}'s images (${job.environment === undefined ? '' : `environment ${SIGNING_ENVIRONMENT}, `}${mode}); called only by its deploy job, written by pipegen.`;
+  const comment = `pipegen: signs ${draft.profile.repo}'s images (${job.environment === undefined ? '' : `environment ${SIGNING_ENVIRONMENT}, `}${mode}); called only by its deploy job.`;
   // PL-D1: the same header and banner as every pipegen workflow (the sign job is "build and release")
-  lookOf(doc, [{ id: SIGN_JOB_ID, part: 4 }], workflowHeader({ comment, runs: 'It runs when pipegen.yml calls it (after the images are published, on a push to the default branch)', version: deps.version ?? null }));
+  lookOf(doc, [{ id: SIGN_JOB_ID, part: 4 }], workflowHeader({ comment, runs: 'when pipegen.yml calls it (after the images are published, on a push to the default branch)', version: deps.version ?? null }));
   return [{ path, content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: `Signs the images of ${draft.profile.repo} after a push to its default branch (${mode}).`, repo: 'central' }];
 }
 

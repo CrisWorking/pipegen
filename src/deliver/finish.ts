@@ -1066,6 +1066,7 @@ async function finishHeld(gh: Octokit, app: RepoRef, opts: FinishOpts, deps: Fin
       central: { repo: `${central.owner}/${central.repo}`, sha: rec.centralSha ?? centralHead, branchProtection: probed.centralBranchProtection, codeowners: { path: centralCo.path, original: centralCo.text, isSymlink: centralCo.isSymlink, inserted: centralCo.block } },
       writers, owners, orgAdmin, shaPinning: shaRead, protectedPaths,
       appCodeowners: { original: appCo.text, isSymlink: appCo.isSymlink, inserted }, ids: { app: appRepo.id, central: centralRepo.id }, files,
+      version: rec.pipegenVersion,   // PL-D1-R1: the required workflow's header names the version that delivered it, so its text (and blob sha) is the one in the central repo
     });
     let planned = rec.planned;
     if (typed) {
