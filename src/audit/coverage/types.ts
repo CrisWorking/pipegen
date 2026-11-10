@@ -81,6 +81,8 @@ export interface Found {
   envGate?: 'tox' | 'nox' | 'npm' | 'pytest';
   /** Fix round 1 (U23): a script counted by name (test, lint[:x]); its text, when readable, can only lower it. */
   byName?: string;
+  /** PL-B1: `cosign sign-blob` (signs files, not an image): the only signing run that counts for a service with no image. */
+  releaseSign?: true;
   /**
    * Task 5: `pre-commit run` (or prek) over all files at the pre-commit stage: the hooks' lint tools run here too (SKIP
    * drops it). P55 (batch B): 'changed' = it runs over the files between two refs only (`--from-ref … --to-ref …`), so
@@ -146,6 +148,8 @@ export interface Hit {
   hookRun?: boolean | 'changed' | 'part';
   /** J3b fix round 1 (ruling I3): pipegen's own sentence the covered row adds (SAFE_SHA_NOTE). */
   coveredNote?: string;
+  /** PL-B1: Found.releaseSign. */
+  releaseSign?: true;
   /** Plan P Task 3 (PB5): found in a local composite action's later step, so not the first step of its job. */
   laterStep?: boolean;
   /** Fix round 1: config files the tool loads by itself (checked for after the walk), and a CI pre-commit run's job env. */
