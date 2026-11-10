@@ -32,7 +32,7 @@ import { centralWorkflowFile } from '../engine/central-path.js';
 import { DEPLOY_PUSH_IF, type RenderedStep } from '../engine/job-rules.js';
 import { COMMIT_SHA_RE, isGitHubRepo } from '../engine/names.js';
 import type { PlatformActions } from '../engine/pin.js';
-import { SIGNING_ENVIRONMENT } from '../engine/referee.js';
+import { SIGNING_ENVIRONMENT } from '../engine/referee-shared.js';
 import { RenderError, show } from '../engine/render-error.js';
 import { renderPlatformStep, stepsToYaml } from '../engine/render-step.js';
 import { COSIGN_ID, imageDigestArtifact, renderAttestDigestStep, renderSignSteps, SIGN_REGISTRY, signedImageOwner, type SignedImage } from '../engine/signing.js';

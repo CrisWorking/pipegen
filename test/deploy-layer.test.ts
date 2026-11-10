@@ -15,12 +15,13 @@ import { checkExpressions, isFindRunStep, isKnownHarmless } from '../src/engine/
 import { githubHosted } from '../src/engine/deploy-gating.js';
 import { deployGateOf } from '../src/audit/coverage/deploy-gate.js';
 import { floorNeeds } from '../src/engine/needs.js';
+import { deployGating, deployTriggers } from '../src/engine/deploy-gating.js';
 import { RenderError } from '../src/engine/render-error.js';
 import { renderVerifySteps } from '../src/engine/signing.js';
 import { assemble, judgeAssembled, keylessVerifyNote, verifyPermissions, verifyTail, type AssembledFiles } from '../src/layers/assemble.js';
 import { EGRESS_DOMAIN_SETS, KEYLESS_VERIFY_SETS, renderEgressStep } from '../src/engine/egress.js';
 import {
-  deployTriggers, environmentPlan, generateCosignKeys, insertVerify, isMemoryFolder, MEMORY_DIR, planVerifyInserts, releaseJobs, renewVerifyJob, verifyJobYaml, type VerifyPlan,
+  environmentPlan, generateCosignKeys, INSERT_REFUSED_GAP, insertRefusedGap, insertVerify, isMemoryFolder, MEMORY_DIR, planVerifyInserts, releaseJobs, renewVerifyJob, verifyJobYaml, type VerifyPlan,
 } from '../src/layers/deploy.js';
 import { JOB_MINUTES, RELEASE_ONLY_NOTES, type Job } from '../src/layers/jobs.js';
 import type { Capabilities, CreatedFile, ExistingWorkflow, PipelineDraft, RepoProfile, ReviewedTool, Service, SigningPlan } from '../src/types.js';
@@ -1617,8 +1618,11 @@ describe('G17A-R2: the referee binds the batch to the plan\'s inputs', () => {
     // a plain deploy whose insert is dropped is refused too, unless the doc lists it as a gap (PIPEGEN.md then says it is unprotected)
     const plain = world('keyless', [[A, DEPLOY_A]]);
     expect((await judge(plain, [])).issues.some((i) => notHandled(A).test(i.message))).toBe(true);
-    // (G17A-R3 r3-M1: a gap for a workflow the layer gates carries the layer's own reason, here insertVerify's refusal)
-    expect(shown(await judge(plain, [], plain.texts, [{ path: A, triggers: ['push'], why: 'pipegen can not add its check without changing the rest of the file: listed' }]))).toBe('');
+    // (G17A-R3 r3-M1: a gap for a workflow the layer gates carries the layer's own reason, here insertVerify's refusal; PL-F3: the reason
+    // insertVerify really gives on this text, re-run by the referee)
+    const quoted = DEPLOY_A.replace('needs: build', 'needs: "build"');
+    const why = 'pipegen can not add its check without changing the rest of the file: the needs of its job "deploy" use a YAML anchor or a quoted job name; write the job names plainly';
+    expect(shown(await judge(plain, [], new Map([[A, quoted]]), [{ path: A, triggers: ['push'], why }]))).toBe('');
     // only pipegen's marked edit counts: the same text written as a whole file (no mark) is not an edit of the user's workflow (R2 mutation survivor)
     const whole = { ...(plain.v.inserts[0] as VerifyPlan['inserts'][number]).file, inserted: undefined } as unknown as CreatedFile;
     expect((await judge(plain, [whole])).issues.some((i) => notHandled(A).test(i.message)), 'whole file').toBe(true);
@@ -1648,15 +1652,32 @@ describe('G17A-R3: the gap list is re-derived, never trusted', () => {
     const ta = insertAt(two, A)?.file as CreatedFile;
     const fg1 = await judge(two, [ta], two.texts, [{ path: B, triggers: ['push'], why: 'forged' }, { path: SHIP, triggers: ['workflow_call'], why: 'forged' }]);
     expect(fg1.issues.some((i) => forgedGap(B).test(i.message)), shown(fg1)).toBe(true);
-    // a plain deploy listed with the layer's own insert-refusal reason: accepted (the reason pipegen writes when insertVerify refuses)
+    // a plain deploy listed with the layer's own insert-refusal reason: accepted only when insertVerify refuses that text with that reason (PL-F3)
     const plain = world('keyless', [[A, DEPLOY_A]]);
+    const quoted = DEPLOY_A.replace('needs: build', 'needs: "build"');
+    const why = 'pipegen can not add its check without changing the rest of the file: the needs of its job "deploy" use a YAML anchor or a quoted job name; write the job names plainly';
+    expect(shown(await judge(plain, [], new Map([[A, quoted]]), [{ path: A, triggers: ['push'], why }]))).toBe('');
     const refusal = await judge(plain, [], plain.texts, [{ path: A, triggers: ['push'], why: 'pipegen can not add its check without changing the rest of the file: x' }]);
-    expect(shown(refusal)).toBe('');
+    expect(refusal.issues.some((i) => forgedGap(A).test(i.message)), shown(refusal)).toBe(true);
     const other = await judge(plain, [], plain.texts, [{ path: A, triggers: ['push'], why: 'listed' }]);
     expect(other.issues.some((i) => forgedGap(A).test(i.message)), shown(other)).toBe(true);
     // the skip reason only when the deploy part is skipped
     const skipWhy = await judge(plain, [], plain.texts, [{ path: A, triggers: ['push'], why: 'you skipped the deploy part (--skip deploy), so pipegen adds no check before its deploy' }]);
     expect(skipWhy.issues.some((i) => forgedGap(A).test(i.message)), shown(skipWhy)).toBe(true);
+  });
+  it('PL-F3 R1: the planner\'s own refusal reason is the one the referee re-derives (planner -> doc.deployGaps -> referee)', async () => {
+    const quoted = DEPLOY_A.replace('needs: build', 'needs: "build"');
+    for (const kind of ['keyless', 'key-env', 'none'] as const) {
+      const w = world(kind, [[A, quoted]]);
+      expect(w.v.inserts, kind).toEqual([]);
+      expect(w.v.gaps[0]?.why.startsWith(INSERT_REFUSED_GAP), kind).toBe(true);
+      expect(shown(await judge(w)), kind).toBe('');
+      const ok = world(kind, [[A, DEPLOY_A]]);
+      expect(ok.v.inserts.length, kind).toBe(1);
+      const g = deployGating(parse(DEPLOY_A) as Obj, 'main');
+      if ('gap' in g) throw new Error('gated');
+      expect(insertRefusedGap(DEPLOY_A, g, 'main'), kind).toBeNull();
+    }
   });
   it('G17A-R3 r3-M1: a workflow both edited and listed as a gap is refused (probe FG3)', async () => {
     const w = world('keyless', [[A, DEPLOY_A]]);

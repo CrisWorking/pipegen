@@ -196,3 +196,37 @@ describe('G17A-R2 spec M-2: the referee\'s verify job id is assemble\'s', () => 
     expect(VERIFY_JOB).toBe(VERIFY_JOB_ID);
   });
 });
+
+// ---------- PL-F3: an insert-refusal gap is proven by re-running the deploy layer's insert ----------
+describe('PL-F3: the referee re-runs the insert for an insert-refusal gap', () => {
+  const DEPLOY = '.github/workflows/deploy.yml';
+  const deployText = (needs: string): string => ['on:', '  push:', '    branches: [main]', 'jobs:', '  build:', '    runs-on: ubuntu-latest', '    steps:', '      - run: npm run build', '  deploy:', `    needs: ${needs}`, '    runs-on: ubuntu-latest', '    environment: production', '    steps:', '      - run: ./scripts/ship.sh', ''].join('\n');
+  const forged = /deploy\.yml is listed as a gap, but pipegen's deploy layer protects it/;
+  const judgeGap = (text: string, why: string, branch = 'main'): Promise<RefereeReport> => {
+    const dr = { ...d, profile: { ...d.profile, defaultBranch: branch, existingWorkflows: [{ path: DEPLOY, triggers: ['push'], deploys: true, jobs: [] }] }, doc: { transcript: [], deployGaps: [{ path: DEPLOY, triggers: ['push'], why }], lockNotes: [], estimates: { monthlyMinutes: 0, includedMinutes: null }, setupCommand: '', testNotes: [], uncoveredMinimum: [], notes: [] } } as unknown as PipelineDraft;
+    return referee([gateFile()], dr, p, reviewedList(), { actionlint: async () => '/stub', zizmor: async () => '/stub' }, 'tok', { runLinters: async () => [], workflowTexts: new Map([[DEPLOY, text]]) });
+  };
+  it('gap text starts with INSERT_REFUSED_GAP but the insert succeeds → refused', async () => {
+    const r = await judgeGap(deployText('build'), 'pipegen can not add its check without changing the rest of the file: x');
+    expect(r.issues.some((i) => forged.test(i.message)), JSON.stringify(r.issues)).toBe(true);
+  });
+  it('real refusal → accepted', async () => {
+    const why = 'pipegen can not add its check without changing the rest of the file: the needs of its job "deploy" use a YAML anchor or a quoted job name; write the job names plainly';
+    const r = await judgeGap(deployText('"build"'), why);
+    expect(r.issues.some((i) => forged.test(i.message)), JSON.stringify(r.issues)).toBe(false);
+    // the same file with another refusal reason than the insert's own: refused
+    const other = await judgeGap(deployText('"build"'), 'pipegen can not add its check without changing the rest of the file: x');
+    expect(other.issues.some((i) => forged.test(i.message)), JSON.stringify(other.issues)).toBe(true);
+  });
+  it('PL-F3 R1: the re-run keeps the needs-only jobs (a weak self-hosted job with flow steps is not refused) → a forged steps reason is refused', async () => {
+    const text = ['on:', '  push:', '    branches: [main]', 'permissions:', '  contents: read', 'jobs:', '  warm:', '    runs-on: self-hosted', '    steps: [{run: ./warm.sh}]', '  deploy:', '    needs: warm', '    runs-on: ubuntu-latest', '    environment: production', '    steps:', '      - run: ./scripts/ship.sh', ''].join('\n');
+    const why = 'pipegen can not add its check without changing the rest of the file: its job "warm" has no block list of steps to start with pipegen\'s head check; write its steps as a - list, then run pipegen again';
+    const r = await judgeGap(text, why);
+    expect(r.issues.some((i) => forged.test(i.message)), JSON.stringify(r.issues)).toBe(true);
+  });
+  it('PL-F3 R1: the re-run throws (a default branch that is not a plain name) → the gap is refused (fail closed)', async () => {
+    const text = deployText('build').replace('branches: [main]', 'branches: [release+1]');
+    const r = await judgeGap(text, 'pipegen can not add its check without changing the rest of the file: x', 'release+1');
+    expect(r.issues.some((i) => forged.test(i.message)), JSON.stringify(r.issues)).toBe(true);
+  });
+});
