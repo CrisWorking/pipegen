@@ -29,7 +29,7 @@ describe('PL-D1: workflow look helpers', () => {
     const lines = workflowHeader({ comment: 'pipegen: c', runs: 'on a push', version: '1.2.3' }).split('\n');
     expect(lines).toEqual([
       ' pipegen: c', ' ', ' When it runs: on a push.',
-      ' How to change it: through `npx pipegen update`. The file is protected (a code owner reviews every change), so edits by hand are refused or undone.',
+      ' How to change it: through `npx pipegen update`. Edit it through pipegen; pipegen\'s locks protect it once they are on (see PIPEGEN.md).',
       ' See PIPEGEN.md for what each check does and what is not covered.', ' Written by pipegen 1.2.3.',
     ]);
     expect(workflowHeader({ comment: 'c', runs: 'r', version: null }).split('\n').at(-1)).toBe(' Written by pipegen.');
@@ -39,5 +39,26 @@ describe('PL-D1: workflow look helpers', () => {
     const h = workflowHeader({ comment: 'pipegen: c', runs: 'on a push', version: '1.2.3' });
     expect(h).not.toMatch(/when it runs: it runs/i);
     expect(h.match(/written by pipegen/gi)).toHaveLength(1);
+  });
+
+  // PL-D1 Fold R2 (security M1): the header checks its own version; no control or line-break character reaches a comment line
+  for (const [name, v] of [['LF', '1.2.3\non: push'], ['CR', '1.2.3\ron: push'], ['NEL U+0085', '1.2.3\u0085on: push'], ['LS U+2028', '1.2.3\u2028on: push'],
+    ['PS U+2029', '1.2.3\u2029on: push'], ['NUL', '1.2.3\u0000'], ['TAB', '1.2.3\t'], ['DEL', '1.2.3\u007f'], ['C1 U+009B', '1.2.3\u009b'], ['not plain', '1.2.3 # x']] as const) {
+    it(`workflowHeader: refuses a version with ${name}`, () => {
+      expect(() => workflowHeader({ comment: 'c', runs: 'r', version: v })).toThrow(/not a plain pipegen version/);
+    });
+  }
+
+  it('workflowHeader: refuses a control or line-break character in comment or runs', () => {
+    for (const bad of ['a\nb', 'a\rb', 'a\u0085b', 'a\u2028b', 'a\u2029b', 'a\u0007b']) {
+      expect(() => workflowHeader({ comment: bad, runs: 'r', version: null })).toThrow(/control or line-break/);
+      expect(() => workflowHeader({ comment: 'c', runs: bad, version: null })).toThrow(/control or line-break/);
+    }
+  });
+
+  it('workflowHeader: the protection line stays true when locks are skipped (no unconditional claim)', () => {
+    const h = workflowHeader({ comment: 'c', runs: 'r', version: '1.2.3' });
+    expect(h).toContain('once they are on');
+    expect(h).not.toMatch(/The file is protected/);
   });
 });

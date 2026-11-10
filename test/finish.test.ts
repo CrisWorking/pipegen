@@ -705,6 +705,8 @@ describe('G11 finish: carries (G8, G10)', () => {
     const res = await finish(t.g.octokit(), { owner: 'o', repo: 'r' }, {}, t.deps());
     expect(t.g.orgRulesets.size).toBe(0);
     expect(res.skipped.find((x) => /org required workflow/.test(x.what))?.why).toMatch(/doesn't hold/);
+    // PL-D1 Fold R2 (security I4): both ways on: merge the open central pull request, or run pipegen again
+    expect(res.skipped.find((x) => /org required workflow/.test(x.what))?.why).toMatch(/central pull request.*still open, merge it.*otherwise run pipegen again/i);
   });
 
   it('finish: sends only allow-listed routes; a route the record plans that pipegen never makes is refused, never sent', async () => {

@@ -4,17 +4,24 @@
 // Pure: the version comes from the caller (never a date, never the clock).
 import { isMap, type Document, type Scalar } from 'yaml';
 import { PART_TITLE, type PartId } from '../audit/parts.js';
+import { PLAIN_VERSION_RE } from '../util/package-data.js';
+
+// PL-D1 Fold R2 (security M1): C0, DEL, C1 (NEL U+0085 included) and the Unicode line/paragraph separators; any of them could end a comment line.
+const CONTROL_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
 /**
  * The comment block (YAML comment text, one line per `\n`; a lone space is an empty `#` line). `runs` completes "When it runs:" (it does not
  * start with "It runs") and `comment` does not say "written by pipegen": the tail line says it once, with the version.
  */
 export function workflowHeader(w: { comment: string; runs: string; version: string | null }): string {
+  // PL-D1 Fold R2 (security M1): the header is the one check point; a caller can't forget it
+  if (w.version !== null && (typeof w.version !== 'string' || !PLAIN_VERSION_RE.test(w.version))) throw new Error('The workflow header\'s version is not a plain pipegen version (like 1.2.3).');
+  if (CONTROL_RE.test(w.comment) || CONTROL_RE.test(w.runs)) throw new Error('A workflow header line holds a control or line-break character.');
   return [
     ` ${w.comment}`,
     ' ',
     ` When it runs: ${w.runs}.`,
-    ' How to change it: through `npx pipegen update`. The file is protected (a code owner reviews every change), so edits by hand are refused or undone.',
+    ' How to change it: through `npx pipegen update`. Edit it through pipegen; pipegen\'s locks protect it once they are on (see PIPEGEN.md).',
     ' See PIPEGEN.md for what each check does and what is not covered.',
     ` Written by pipegen${w.version === null ? '' : ` ${w.version}`}.`,
   ].join('\n');

@@ -518,7 +518,7 @@ async function orgRequired(x: Ctx): Promise<void> {
   // G10-R1: the rule runs the file at the commit it names; the file exists only from the record's commit on (it calls the pinned one)
   const e = x.centralTree.get(F.file.path);
   if (e === undefined || e.type !== 'blob' || e.mode !== '100644' || e.sha !== gitBlobSha(F.file.content)) {
-    x.skipped.push({ what, why: `The central default branch of ${show(`${x.central.owner}/${x.central.repo}`)} doesn't hold ${show(F.file.path)} as pipegen wrote it, so pipegen adds no rule that would run it; run pipegen again to deliver it.` });
+    x.skipped.push({ what, why: `The central default branch of ${show(`${x.central.owner}/${x.central.repo}`)} doesn't hold ${show(F.file.path)} as pipegen wrote it, so pipegen adds no rule that would run it. If the central pull request pipegen opened is still open, merge it, then run \`npx pipegen finish\` again; otherwise run pipegen again to deliver it.` });
     return;
   }
   const body = structuredClone(F.rule.body);
