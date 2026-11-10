@@ -705,4 +705,18 @@ describe('PL-F5: V9a follow-ups', () => {
     // control: the keep is pipegen's level only; the owner changed it since → not pipegen's any more, nothing to say either way
     expect(w.g.calls.filter((c) => c.route === ACCESS_ROUTE)).toHaveLength(0);
   });
+
+  it('owner typed keep, but the level can\'t be read after the merge → still a failed item (keep covers only pipegen\'s level)', async () => {
+    const w = world();
+    await afterRun1(w);
+    w.settings.access = 'user';
+    const rec = sampleRecord(w, { central: { repoId: w.central.id, createdByPipegen: false, actionsAccess: { previous: 'none' } }, scratch: { createdByPipegen: false } });
+    const yes = (q: string): boolean | undefined => (q.startsWith('Remove the install record') ? true : undefined);
+    await run(w, rec, term({ type: (q, exp) => (/Actions access level/.test(q) ? (exp === 'keep' ? 'keep' : 'no') : exp), yes }), {}, { typedNames: true, marker: 'differs' });
+    mergePr(w, w.central, 'pipegen/uninstall-shop');
+    w.g.hooks.unshift((c) => (c.route === 'GET /repos/{owner}/{repo}/actions/permissions/access' ? { status: 500, data: { message: 'boom' } } : undefined));
+    const r = await run(w, rec, term({ yes }), {}, { typedNames: true, marker: 'differs' });
+    expect(r.failed.some((x) => x.what === 'central Actions access of o/pipelines')).toBe(true);
+    expect(r.status).not.toBe('b-done');
+  });
 });
