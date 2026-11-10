@@ -70,7 +70,7 @@ import {
 } from '../engine/job-rules.js';
 import { NEED_ID_CATEGORY, SCHEDULED_CATEGORIES } from '../engine/need-ids.js';
 import { MINIMUM_CATEGORIES, NO_HOOKS_CI_MANAGERS, NO_IMAGE_CATEGORIES, noImageServices, publishedImageServices, riskyTriggersOf, WORKFLOW_LINT_EXTRA, WORKFLOW_LINT_TOOL, workflowLintTools } from '../engine/needs.js';
-import { parseImageRef } from '../engine/names.js';
+import { parseImageRef, servicesByName } from '../engine/names.js';
 import { PLATFORM_ACTION_IDS, type PlatformActions } from '../engine/pin.js';
 import { APP_RUNNING_CATEGORIES, renderStarterTestRun } from '../engine/render-cli.js';
 import { RenderError } from '../engine/render-error.js';
@@ -278,7 +278,7 @@ const blocks = (draft: PipelineDraft, needId: string, service: string | undefine
   const m = draft.needs.filter((n) => n.id === needId && n.service === service);
   return m.length === 0 || m.some((n) => n.blocking !== false);
 };
-const serviceNamed = (draft: PipelineDraft, name: string | undefined): Service | undefined => (name === undefined ? undefined : draft.profile.services.find((s) => s.name === name));
+const serviceNamed = (draft: PipelineDraft, name: string | undefined): Service | undefined => (name === undefined ? undefined : servicesByName(draft.profile).get(name));
 
 /** G17B-R1 spec I2: the next step after an image stop, fixed text by the service's facts (no repo text). */
 function imageNextStep(svc: Service | undefined): string {
@@ -537,7 +537,8 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     const cp = planCompose(draft.profile, list, dockerfilesOf(draft.created));
     if (cp.text !== null && cp.text === composeFile.content) {
       // G17B-R2 (sec M2): compose up builds every app image of the file (no --no-build), so the job reaches what their image builds reach
-      const apps = cp.apps.map((a) => draft.profile.services.find((x) => x.name === a.service));
+      const byName = servicesByName(draft.profile);
+      const apps = cp.apps.map((a) => byName.get(a.service));
       // L1 (sec r4): ghcr only for an app built from the repository's own Dockerfile (its FROM may name ghcr.io); pipegen's created Dockerfiles and the compose images are Docker Hub only
       const made = new Set(dockerfilesOf(draft.created));
       const ownDockerfile = cp.apps.some((a) => !made.has(a.context === '.' ? 'Dockerfile' : `${a.context.replace(/^\.\//, '')}/Dockerfile`));
@@ -575,7 +576,8 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
   // can not start keeps its own reason (and its --type tip). G17B-R0/R1 round 2: a Dockerfile pipegen creates in this draft is the service's
   // (imageProfile), and a service with no Dockerfile at all (none created) stops too (risk 1); each stop says the next step (spec I2).
   let imageStop: string | null = null;
-  const imgSvc = (name: string | undefined): Service | undefined => (name === undefined ? undefined : imageProfile(draft.profile, draft.created).services.find((x) => x.name === name));
+  let imgByName: ReadonlyMap<string, Service> | undefined;
+  const imgSvc = (name: string | undefined): Service | undefined => (name === undefined ? undefined : (imgByName ??= servicesByName(imageProfile(draft.profile, draft.created))).get(name));
   for (const service of new Set<string | undefined>([...unbuilt.keys(), ...noBuild])) {
     const why = (service === undefined ? undefined : unbuilt.get(service)) ?? 'no image-build step of pipegen builds it';
     const lost = draft.needs.filter((n) => n.layer === 'merge' && n.service === service && draft.steps.some((st) => st.needId === n.id && st.service === service && leaveOut.has(st)) && draft.steps.every((st) => st.needId !== n.id || st.service !== service || leaveOut.has(st)));
@@ -601,6 +603,7 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
   c.draft = draft;
   // G4-R1: where each DAST check's app starts (containers only); a blocking one that can not start stops, a non-blocking one leaves with a note
   const starts = new Map<StepSpec, DastStart>();
+  const dastByName = servicesByName(draft.profile);
   const noStart = new Set<Need>();
   for (const s of draft.steps) {
     if (categoryOf(s.needId) !== 'dast' || s.service === undefined || !draft.needs.some((n) => n.layer === 'merge' && n.id === s.needId && n.service === s.service)) continue;
@@ -609,7 +612,7 @@ export function assembleJobs(input: PipelineDraft, plan: JobsPlan, deps: JobsDep
     const st = dastStartOf(draft, s.service, list);
     if (!('problem' in st)) { starts.set(s, st); continue; }
     // GJ-R3 (O3): an unsure type is a server by rule; the user may say it is a static site
-    const unsure = draft.profile.services.find((x) => x.name === s.service)?.projectType?.unsure === true;
+    const unsure = dastByName.get(s.service)?.projectType?.unsure === true;
     const tip = unsure ? ` Its type is unsure, so pipegen treats it as a server; if it is a static site, run with --type ${safeText(s.service, 60)}=static-site.` : '';
     if (blocks(draft, s.needId, s.service)) fail(`The blocking check ${where(s)} can not run: ${st.problem}. pipegen never makes it warn-only or leaves it out.${tip}`);
     addNote(notes, `The non-blocking check ${where(s)} is not run: ${st.problem}.`);
@@ -932,6 +935,7 @@ function narrowed(draft: PipelineDraft, drop: ReadonlySet<Need>): PipelineDraft 
 
 /** Whether osv-scanner has a lockfile to read: the service's own (or, repo-wide, any service's) package manager the reader found. */
 function hasLockfile(draft: PipelineDraft, service: string | undefined): boolean {
-  const svcs = service === undefined ? draft.profile.services : draft.profile.services.filter((s) => s.name === service);
+  const named = service === undefined ? undefined : servicesByName(draft.profile).get(service);
+  const svcs = service === undefined ? draft.profile.services : named === undefined ? [] : [named];
   return svcs.some((s) => s.packageManager !== undefined || (s.alsoPackageManagers ?? []).length > 0);
 }

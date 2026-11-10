@@ -10,7 +10,6 @@
 // - No base twin: the base commit's app is not started (C-MUST-1); the gate reads "couldn't run on the base".
 // Residual (PIPEGEN.md): the raw result is uploaded unscrubbed between the two jobs of one run; it holds only what an app with no secret
 // answered. A hostile app can always answer a scanner cleanly: DAST finds honest mistakes, it does not judge a hostile pull request.
-import { servicesByName } from './names.js';
 import { planCompose, COMPOSE_PATH } from '../create/compose.js';
 import type { PipelineDraft, ReviewedTool, RuntimeEnv, StepSpec } from '../types.js';
 import { slug } from './artifact-names.js';
@@ -21,6 +20,7 @@ import {
   DAST_HANDOFF_STEP_ID, DAST_RAW_SHA_ENV, DAST_RAW_SHA_OUTPUT, dastAppStepId, dastCheckStepId, dastLaneOf, dastRawArtifact, dastRawShaRef, dastResultArtifact, ZAP_ACTIVE_LANE, type DastLane,
   IMAGE_ARCHIVE_FILE, imageArchiveArtifact, imageBuildJobId, IMAGE_BUILD_NEED, stepOutputForm, type RenderedStep, type ScanFact,
 } from './job-rules.js';
+import { servicesByName } from './names.js';
 import { PLATFORM_ACTION_IDS, type PlatformActions } from './pin.js';
 import { pipegenScriptStep } from './pipegen-script.js';
 import { RenderError } from './render-error.js';

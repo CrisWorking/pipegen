@@ -8,11 +8,11 @@
 //   BEFORE anything reads it, then scans it with `--input` (trivy) or `docker-archive:` (syft). The scan step is the reviewed tool's own
 //   rendered step with its image target replaced by the archive (one transform, used by the renderer and the referee alike).
 // - No base twin of an archive scan exists (B6: there is no base build yet); the gate reads "couldn't run on the base".
-import { servicesByName } from './names.js';
 import { slug } from './artifact-names.js';
 import {
   IMAGE_ARCHIVE_FILE, IMAGE_ARCHIVE_STEP_ID, IMAGE_SHA_ENV, IMAGE_SHA_OUTPUT, imageArchiveArtifact, imageCheckStepId, imageShaRef, stepOutputForm, type RenderedStep,
 } from './job-rules.js';
+import { servicesByName } from './names.js';
 import type { PlatformActions } from './pin.js';
 import { pipegenScriptStep } from './pipegen-script.js';
 import { RenderError, show } from './render-error.js';

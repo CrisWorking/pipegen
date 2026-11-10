@@ -13,7 +13,6 @@
 //   All YAML is built with the `yaml` Document API (stepsToYaml); no step text is concatenated into YAML.
 // - 6a builds the action kind completely; 6b the CLI kinds (github-release, docker, npm, pip) in render-cli.ts; 6c the rule
 //   archives, the run-time slots (slots.ts), container actions and renderProjectScript.
-import { servicesByName } from './names.js';
 import { isDeepStrictEqual } from 'node:util';
 import { Scalar, YAMLMap, YAMLSeq } from 'yaml';
 import { activeSafeText as safeText } from '../util/known-values.js';
@@ -21,6 +20,7 @@ import { DEPENDENCY_KINDS, type OutputFormat, type PipelineDraft, type RepoProfi
 import { APP_PREFIX, containerValue, DB_PASSWORD_BYTES, DB_PASSWORD_NAME, DB_USER, ENV_TABLE, isDepKey, VALUE_TABLE, VAR_KINDS } from '../create/compose-tables.js';
 import { COMMIT_SHA_RE } from './names.js';
 import { centralWorkflowPath } from './central-path.js';
+import { servicesByName } from './names.js';
 import { NEED_IDS, toolCoversNeed } from './need-ids.js';
 import type { PlatformActions } from './pin.js';
 import { tuningProblems } from './tuning.js';

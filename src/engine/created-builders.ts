@@ -1,10 +1,10 @@
 // The pure builders for the files Plan G writes and the D0b judges re-check (v0.2 Plan D, D0b; preflight 4.2). Plan G calls these to
 // produce a CODEOWNERS block and a dependabot entry; the judges call the same functions and compare byte for byte (or value for value),
-// so the producer and the referee can not drift. A leaf: types, the protected-path leaf and the gate's LOGIN_RE only.
-import { servicesByName } from './names.js';
+// so the producer and the referee can not drift. A leaf: types, the names and protected-path leaves and the gate's LOGIN_RE only.
 import { LOGIN_RE, MAX_LINE, PIPEGEN_BLOCK_BEGIN, PIPEGEN_BLOCK_END } from '../../gate/src/integrity.js';
 import type { PipelineDraft, ReviewedTool } from '../types.js';
 import { packageVersion } from '../util/package-data.js';
+import { servicesByName } from './names.js';
 import { effectiveProtectedPaths } from './protected-paths.js';
 import { isObj, parseYaml } from './yaml-parse.js';
 

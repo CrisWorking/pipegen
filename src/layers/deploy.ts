@@ -17,7 +17,6 @@
 //   flag, B-T1a: only environments a deploy job really uses) and pipegen-signing whenever the repository has environments; existing ones
 //   are read first (created false, their previous settings kept for uninstall).
 // - generateCosignKeys: the key pair made by the pinned cosign in a memory-backed folder only (never on disk), removed after.
-import { servicesByName } from '../engine/names.js';
 import { statfsSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import type { Octokit } from '@octokit/rest';
@@ -26,6 +25,7 @@ import { callsWorkflow, deployGating, deployTriggers, plainUbuntu, readsContents
 import { BUILD_PUSH_STEP_ID, HEAD_CHECK_STEP_ID, imageDigestArtifact, publishedImageRepo, PUBLISH_TAG, renderHeadCheckStep, renderPublishDigestStep } from '../engine/deploy-steps.js';
 import type { RateClock } from '../engine/github-rate.js';
 import { CALLER_WORKFLOW, LOCAL_MERGE_WORKFLOW, NIGHTLY_WORKFLOW, PUSH_WORKFLOW, type RenderedStep } from '../engine/job-rules.js';
+import { servicesByName } from '../engine/names.js';
 import { publishedImageServices } from '../engine/needs.js';
 import type { PlatformActions } from '../engine/pin.js';
 import { SIGNING_ENVIRONMENT, triggersOf } from '../engine/referee-shared.js';

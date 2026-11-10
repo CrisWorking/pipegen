@@ -27,6 +27,7 @@ import { safeText } from '../util/safe-text.js';
 import type { Service, StepSpec, ReviewedTool } from '../types.js';
 import { EXPR, RenderError, own, show } from './render-error.js';
 import type { RenderContext } from './render-step.js';
+import { servicesByName } from './names.js';
 import { slotProblem } from './slots.js';
 
 export const TUNING_KINDS = ['adds', 'scope-lint'] as const;
@@ -113,7 +114,7 @@ function plainPath(v: unknown): v is string {
 
 function factsOf(spec: SpecLike, ctx: RenderContext, tool: ReviewedTool): Facts {
   const all = ctx.profile?.services ?? [];
-  const named = typeof spec.service === 'string' ? all.find((s) => s.name === spec.service) : undefined;
+  const named = typeof spec.service === 'string' ? servicesByName({ services: all }).get(spec.service) : undefined;
   const wdGiven = spec.workingDir !== undefined;
   const badWd = wdGiven && !(plainPath(spec.workingDir) && spec.workingDir !== '.');
   return {
